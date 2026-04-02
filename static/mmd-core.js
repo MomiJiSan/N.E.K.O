@@ -933,6 +933,9 @@ class MMDCore {
         }
 
         this.manager.enablePhysics = hadPhysics;
+
+        // 标记 T-Pose 状态，让鼠标跟踪模块跳过眼骨旋转
+        this.manager._isTPose = true;
     }
 
     resetModelPosition() {
