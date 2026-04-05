@@ -15,7 +15,7 @@
 - `utils/tutorial_prompt_state.py`
   负责状态持久化、资格判断、token/ack、漏斗统计、配置读取
 - `main_routers/system_router.py`
-  暴露 `/api/tutorial-prompt/state|heartbeat|shown|decision`
+  暴露 `/api/tutorial-prompt/state|heartbeat|shown|decision|tutorial-started|tutorial-completed`，其中后两个生命周期路由用于记录教程真正开始/完成，便于排查“接受了却没开始”与“开始了却没完成”
 - `static/app-tutorial-prompt.js`
   负责主页 heartbeat、弱/强操作采集、弹窗、前端日志
 - `static/universal-tutorial-manager.js`

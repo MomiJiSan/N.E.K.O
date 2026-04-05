@@ -613,7 +613,21 @@ def test_missing_prompt_threshold_config_uses_default_values(tmp_path):
 
     runtime_config = load_tutorial_prompt_runtime_config(config)
 
-    assert runtime_config["min_prompt_foreground_ms"] == MIN_PROMPT_FOREGROUND_MS
+    assert MIN_PROMPT_FOREGROUND_MS == 15_000
+    assert runtime_config["min_prompt_foreground_ms"] == 15_000
+    assert runtime_config["later_cooldown_ms"] == LATER_COOLDOWN_MS
+    assert runtime_config["failure_cooldown_ms"] == 2 * 60 * 60 * 1000
+    assert runtime_config["max_prompt_shows"] == 2
+
+
+@pytest.mark.unit
+def test_malformed_prompt_threshold_config_uses_default_values(tmp_path):
+    config = DummyConfig(tmp_path)
+    (config.config_dir / "tutorial_prompt_config.json").write_text("{", encoding="utf-8")
+
+    runtime_config = load_tutorial_prompt_runtime_config(config)
+
+    assert runtime_config["min_prompt_foreground_ms"] == 15_000
     assert runtime_config["later_cooldown_ms"] == LATER_COOLDOWN_MS
     assert runtime_config["failure_cooldown_ms"] == 2 * 60 * 60 * 1000
     assert runtime_config["max_prompt_shows"] == 2

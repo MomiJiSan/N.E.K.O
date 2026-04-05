@@ -30,6 +30,15 @@
         "user": "使用者",
         "project": "專案"
     },
+    "tutorialPrompt": {
+        "title": "要開始快速教學嗎？",
+        "message": "看起來你剛打開 N.E.K.O，還沒有開始使用它。要不要快速瀏覽一下首頁上的主要操作？",
+        "note": "教學會從首頁開始，並標示主要按鈕與互動入口。",
+        "startNow": "開始教學",
+        "later": "稍後再說",
+        "never": "不要再提醒我",
+        "startFailed": "目前無法開始教學，請稍後再試。"
+    },
     "characterProfile": {
         "gender": "性別",
         "age": "年齡",

@@ -666,7 +666,7 @@ DEFAULT_ASSIST_API_KEY_FIELDS = {
 }
 
 DEFAULT_TUTORIAL_PROMPT_CONFIG = {
-    'min_prompt_foreground_ms': 90 * 1000,
+    'min_prompt_foreground_ms': 15 * 1000,
     'later_cooldown_ms': 24 * 60 * 60 * 1000,
     'failure_cooldown_ms': 2 * 60 * 60 * 1000,
     'max_prompt_shows': 2,

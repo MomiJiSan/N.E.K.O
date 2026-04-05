@@ -499,30 +499,37 @@ class UniversalTutorialManager {
             delayMs: delayMs || 0,
         });
 
-        const ready = await this.waitUntilInitialized();
-        if (!ready) {
-            throw new Error('tutorial_not_initialized');
-        }
+        try {
+            const ready = await this.waitUntilInitialized();
+            if (!ready) {
+                this.pendingTutorialStartSource = null;
+                throw new Error('tutorial_not_initialized');
+            }
 
-        if (this.isTutorialRunning) {
-            return true;
-        }
+            if (this.isTutorialRunning) {
+                this.pendingTutorialStartSource = null;
+                return true;
+            }
 
-        if (this.currentPage === 'home') {
-            await this.waitForFloatingButtons();
+            if (this.currentPage === 'home') {
+                await this.waitForFloatingButtons();
+                this.startTutorialWhenI18nReady(delayMs);
+                return true;
+            }
+
+            if (this.currentPage === 'chara_manager') {
+                await this.waitForCatgirlCards();
+                await this.prepareCharaManagerForTutorial();
+                this.startTutorialWhenI18nReady(delayMs);
+                return true;
+            }
+
             this.startTutorialWhenI18nReady(delayMs);
             return true;
+        } catch (error) {
+            this.pendingTutorialStartSource = null;
+            throw error;
         }
-
-        if (this.currentPage === 'chara_manager') {
-            await this.waitForCatgirlCards();
-            await this.prepareCharaManagerForTutorial();
-            this.startTutorialWhenI18nReady(delayMs);
-            return true;
-        }
-
-        this.startTutorialWhenI18nReady(delayMs);
-        return true;
     }
 
     /**

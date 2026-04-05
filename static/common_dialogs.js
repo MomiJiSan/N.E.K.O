@@ -486,12 +486,16 @@
 
             if (typeof modalConfig.onShown === 'function') {
                 const notifyShown = function () {
-                    Promise.resolve(modalConfig.onShown({
-                        overlay: overlay,
-                        dialog: dialog,
-                    })).catch(function (error) {
-                        console.warn('[Dialog] onShown failed:', error);
-                    });
+                    Promise.resolve()
+                        .then(function () {
+                            return modalConfig.onShown({
+                                overlay: overlay,
+                                dialog: dialog,
+                            });
+                        })
+                        .catch(function (error) {
+                            console.warn('[Dialog] onShown failed:', error);
+                        });
                 };
                 if (typeof requestAnimationFrame === 'function') {
                     requestAnimationFrame(notifyShown);
