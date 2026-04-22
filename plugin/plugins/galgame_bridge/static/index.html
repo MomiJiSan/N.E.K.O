@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Galgame Bridge</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">N.E.K.O Phase 2</p>
+        <h1>Galgame Bridge</h1>
+        <p class="hero-copy">在 Phase 1 稳定桥接之上，展示当前连接状态、快照、解释/总结/选项建议，以及 Game LLM Agent 的运行状态与推送记录。</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshBtn" class="primary">刷新全部</button>
+        <span id="summaryText" class="summary-pill">等待首次刷新</span>
+      </div>
+    </header>
+
+    <section class="panel panel-controls">
+      <div class="panel-title-row">
+        <h2>控制</h2>
+      </div>
+      <div class="control-grid">
+        <label class="field">
+          <span>模式</span>
+          <select id="modeSelect">
+            <option value="silent">silent</option>
+            <option value="companion">companion</option>
+            <option value="choice_advisor">choice_advisor</option>
+          </select>
+        </label>
+        <label class="field checkbox-field">
+          <input id="pushToggle" type="checkbox">
+          <span>push_notifications</span>
+        </label>
+        <button id="saveModeBtn" class="secondary">保存模式</button>
+        <div class="inline-actions">
+          <button id="standbyOnBtn" class="ghost">进入待机</button>
+          <button id="standbyOffBtn" class="ghost">恢复活跃</button>
+        </div>
+      </div>
+      <div class="control-grid bind-grid">
+        <label class="field grow">
+          <span>手动绑定 game_id</span>
+          <input id="bindInput" type="text" placeholder="例如 nekoforge.my-renpy-demo">
+        </label>
+        <button id="bindBtn" class="secondary">绑定</button>
+        <button id="clearBindBtn" class="ghost">恢复自动</button>
+      </div>
+      <div class="control-grid agent-grid">
+        <label class="field grow">
+          <span>给 Agent 的文本</span>
+          <input id="agentPromptInput" type="text" placeholder="例如：现在在讲什么？">
+        </label>
+        <button id="queryContextBtn" class="secondary">查询上下文</button>
+        <button id="sendMessageBtn" class="secondary">发送消息</button>
+      </div>
+      <div id="flashMessage" class="flash-message" hidden></div>
+    </section>
+
+    <section class="dashboard-grid">
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>状态</h2>
+        </div>
+        <dl id="statusGrid" class="data-grid"></dl>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>当前快照</h2>
+        </div>
+        <dl id="snapshotGrid" class="data-grid"></dl>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>Agent 状态</h2>
+        </div>
+        <dl id="agentStatusGrid" class="data-grid"></dl>
+        <div class="reply-box">
+          <h3>Agent 最近响应</h3>
+          <p id="agentReplyText">暂无交互</p>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>当前台词解释</h2>
+        </div>
+        <div id="explainPanel" class="result-panel empty-state">暂无数据</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>场景总结</h2>
+        </div>
+        <div id="summaryPanel" class="result-panel empty-state">暂无数据</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>当前选项建议</h2>
+        </div>
+        <div id="suggestPanel" class="result-panel empty-state">暂无数据</div>
+      </article>
+
+      <article class="panel panel-full">
+        <div class="panel-title-row">
+          <h2>Agent 推送记录</h2>
+        </div>
+        <div id="pushesList" class="stack-list empty-state">暂无数据</div>
+      </article>
+
+      <article class="panel panel-full">
+        <div class="panel-title-row">
+          <h2>最近稳定台词</h2>
+        </div>
+        <div id="linesList" class="stack-list empty-state">暂无数据</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>最近选项</h2>
+        </div>
+        <div id="choicesList" class="stack-list empty-state">暂无数据</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>最近事件</h2>
+        </div>
+        <div id="eventsList" class="stack-list empty-state">暂无数据</div>
+      </article>
+    </section>
+  </div>
+
+  <script src="./main.js"></script>
+</body>
+</html>

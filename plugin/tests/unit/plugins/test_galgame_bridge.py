@@ -1,0 +1,2293 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from fastapi import FastAPI
+
+from plugin.plugins.galgame_bridge import GalgameBridgePlugin
+from plugin.plugins.galgame_bridge.game_llm_agent import GameLLMAgent
+from plugin.plugins.galgame_bridge.host_agent_adapter import HostAgentAdapter
+from plugin.plugins.galgame_bridge.llm_gateway import LLMGateway
+from plugin.plugins.galgame_bridge.memory_reader import (
+    DetectedGameProcess,
+    MemoryReaderBridgeWriter,
+    MemoryReaderManager,
+)
+from plugin.plugins.galgame_bridge.models import DATA_SOURCE_BRIDGE_SDK, DATA_SOURCE_MEMORY_READER
+from plugin.plugins.galgame_bridge.reader import (
+    expand_bridge_root,
+    read_session_json,
+    tail_events_jsonl,
+)
+from plugin.plugins.galgame_bridge.service import (
+    build_explain_context,
+    build_suggest_context,
+    build_summarize_context,
+)
+from plugin.sdk.plugin import Ok
+
+
+class _Logger:
+    def info(self, *args, **kwargs):
+        return None
+
+    def warning(self, *args, **kwargs):
+        return None
+
+    def error(self, *args, **kwargs):
+        return None
+
+    def debug(self, *args, **kwargs):
+        return None
+
+    def exception(self, *args, **kwargs):
+        return None
+
+
+class _Ctx:
+    plugin_id = "galgame_bridge"
+    metadata = {}
+    bus = None
+
+    def __init__(self, plugin_dir: Path, effective_config: dict[str, object]) -> None:
+        self.logger = _Logger()
+        self.config_path = plugin_dir / "plugin.toml"
+        self._effective_config = {
+            "plugin": {"store": {"enabled": True}, "database": {"enabled": False}},
+            "plugin_state": {"backend": "memory"},
+        }
+        self._config = effective_config
+        self.pushed_messages: list[dict[str, object]] = []
+        self.entry_calls: list[dict[str, object]] = []
+        self.entry_handler = None
+
+    async def get_own_config(self, timeout: float = 5.0):
+        return {"config": self._config}
+
+    async def get_own_base_config(self, timeout: float = 5.0):
+        return {"config": self._config}
+
+    async def get_own_profiles_state(self, timeout: float = 5.0):
+        return {"profiles": [], "active": None}
+
+    async def get_own_profile_config(self, profile_name: str, timeout: float = 5.0):
+        return {"profile_name": profile_name, "config": self._config}
+
+    async def get_own_effective_config(self, profile_name: str | None = None, timeout: float = 5.0):
+        return {"config": self._config}
+
+    async def update_own_config(self, updates, timeout: float = 10.0):
+        self._config = dict(self._config)
+        self._config.update(dict(updates or {}))
+        return {"config": self._config}
+
+    async def query_plugins(self, filters, timeout: float = 5.0):
+        return {"plugins": []}
+
+    async def trigger_plugin_event(self, **kwargs):
+        self.entry_calls.append(dict(kwargs))
+        if self.entry_handler is None:
+            raise RuntimeError("no fake trigger_plugin_event configured")
+        handler = self.entry_handler
+        if callable(handler):
+            result = handler(**kwargs)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        return handler
+
+    async def get_system_config(self, timeout: float = 5.0):
+        return {}
+
+    async def query_memory(self, bucket_id: str, query: str, timeout: float = 5.0):
+        return {"items": []}
+
+    async def run_update(self, **kwargs):
+        return {"ok": True}
+
+    async def export_push(self, **kwargs):
+        return {"ok": True}
+
+    async def finish(self, **kwargs):
+        return {"ok": True}
+
+    def push_message(self, **kwargs):
+        self.pushed_messages.append(dict(kwargs))
+        return {"ok": True}
+
+    def update_status(self, status):
+        return None
+
+
+def _session_state(
+    *,
+    speaker: str = "",
+    text: str = "",
+    choices: list[dict[str, object]] | None = None,
+    scene_id: str = "boot",
+    line_id: str = "",
+    route_id: str = "",
+    is_menu_open: bool = False,
+    ts: str = "2026-04-21T08:30:00Z",
+) -> dict[str, object]:
+    return {
+        "speaker": speaker,
+        "text": text,
+        "choices": list(choices or []),
+        "scene_id": scene_id,
+        "line_id": line_id,
+        "route_id": route_id,
+        "is_menu_open": is_menu_open,
+        "save_context": {
+            "kind": "unknown",
+            "slot_id": "",
+            "display_name": "",
+        },
+        "ts": ts,
+    }
+
+
+def _session(
+    *,
+    game_id: str,
+    session_id: str,
+    last_seq: int,
+    state: dict[str, object],
+    started_at: str = "2026-04-21T08:30:00Z",
+) -> dict[str, object]:
+    return {
+        "protocol_version": 1,
+        "game_id": game_id,
+        "game_title": game_id,
+        "engine": "renpy",
+        "session_id": session_id,
+        "started_at": started_at,
+        "last_seq": last_seq,
+        "locale": "ja-JP",
+        "bridge_sdk_version": "1.0.0",
+        "state": state,
+    }
+
+
+def _event(
+    *,
+    seq: int,
+    event_type: str,
+    session_id: str,
+    game_id: str,
+    payload: dict[str, object],
+    ts: str,
+) -> dict[str, object]:
+    return {
+        "protocol_version": 1,
+        "seq": seq,
+        "ts": ts,
+        "type": event_type,
+        "session_id": session_id,
+        "game_id": game_id,
+        "payload": payload,
+    }
+
+
+def _write_session(path: Path, payload: dict[str, object], *, bom: bool = False) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if bom:
+        text = "\ufeff" + text
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_events(
+    path: Path,
+    events: list[dict[str, object]],
+    *,
+    trailing: bytes = b"",
+    crlf: bool = False,
+) -> int:
+    line_end = b"\r\n" if crlf else b"\n"
+    data = b"".join(
+        json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + line_end
+        for event in events
+    )
+    data += trailing
+    path.write_bytes(data)
+    return len(data)
+
+
+def _make_plugin_dirs(tmp_path: Path) -> tuple[Path, Path]:
+    plugin_dir = tmp_path / "plugin_cfg"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.toml").write_text("", encoding="utf-8")
+    static_dir = plugin_dir / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html><title>ui</title>", encoding="utf-8")
+    bridge_root = tmp_path / "bridge_root"
+    bridge_root.mkdir()
+    return plugin_dir, bridge_root
+
+
+def _make_effective_config(bridge_root: Path, **overrides: object) -> dict[str, object]:
+    config: dict[str, object] = {
+        "galgame": {
+            "bridge_root": str(bridge_root),
+            "active_poll_interval_seconds": 0.1,
+            "idle_poll_interval_seconds": 0.1,
+            "stale_after_seconds": 0.2,
+            "history_events_limit": 500,
+            "history_lines_limit": 200,
+            "history_choices_limit": 50,
+            "dedupe_window_limit": 64,
+            "warmup_replay_bytes_limit": 65536,
+            "warmup_replay_events_limit": 50,
+            "default_mode": "companion",
+            "push_notifications": True,
+        },
+        "llm": {
+            "llm_call_timeout_seconds": 15,
+            "llm_max_in_flight": 2,
+            "llm_request_cache_ttl_seconds": 2,
+            "target_entry_ref": "",
+        },
+        "memory_reader": {
+            "enabled": False,
+            "textractor_path": "",
+            "auto_detect": True,
+            "poll_interval_seconds": 1,
+        },
+    }
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(config.get(key), dict):
+            merged = dict(config[key])  # type: ignore[index]
+            merged.update(value)
+            config[key] = merged
+        else:
+            config[key] = value
+    return config
+
+
+def _create_game_dir(
+    bridge_root: Path,
+    *,
+    game_id: str,
+    session_payload: dict[str, object],
+    events: list[dict[str, object]] | None = None,
+) -> Path:
+    game_dir = bridge_root / game_id
+    game_dir.mkdir(parents=True, exist_ok=True)
+    _write_session(game_dir / "session.json", session_payload)
+    _write_events(game_dir / "events.jsonl", events or [])
+    return game_dir
+
+
+def _shared_state(
+    *,
+    mode: str = "choice_advisor",
+    push_notifications: bool = True,
+    connection_state: str = "active",
+    stream_reset_pending: bool = False,
+    game_id: str = "demo.alpha",
+    session_id: str = "sess-a",
+    last_seq: int = 2,
+    snapshot: dict[str, object] | None = None,
+    history_lines: list[dict[str, object]] | None = None,
+    history_choices: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "push_notifications": push_notifications,
+        "current_connection_state": connection_state,
+        "stream_reset_pending": stream_reset_pending,
+        "active_game_id": game_id,
+        "active_session_id": session_id,
+        "last_seq": last_seq,
+        "latest_snapshot": snapshot or _session_state(
+            speaker="雪乃",
+            text="当前台词",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:30:02Z",
+        ),
+        "history_lines": list(history_lines or []),
+        "history_choices": list(history_choices or []),
+    }
+
+
+class _FakeHostAdapter:
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = ready
+        self.started: list[str] = []
+        self.cancelled: list[str] = []
+        self.tasks: dict[str, dict[str, object]] = {}
+        self._counter = 0
+
+    async def get_computer_use_availability(self, *, timeout: float = 1.5):
+        if self.ready:
+            return {"ready": True, "reasons": []}
+        return {"ready": False, "reasons": ["computer_use unavailable"]}
+
+    async def run_computer_use_instruction(self, instruction: str, *, lanlan_name: str = "", timeout: float = 5.0):
+        self._counter += 1
+        task_id = f"task-{self._counter}"
+        self.started.append(instruction)
+        self.tasks[task_id] = {"id": task_id, "status": "running", "result": None}
+        return {"task_id": task_id, "status": "running"}
+
+    async def get_task(self, task_id: str, *, timeout: float = 2.0):
+        return dict(self.tasks[task_id])
+
+    async def cancel_task(self, task_id: str, *, timeout: float = 5.0):
+        self.cancelled.append(task_id)
+        self.tasks[task_id] = {"id": task_id, "status": "cancelled", "error": "Cancelled by test"}
+        return {"success": True, "task_id": task_id, "status": "cancelled"}
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _FakeLLMGateway:
+    def __init__(
+        self,
+        *,
+        suggest_payload: dict[str, object] | None = None,
+        reply_payload: dict[str, object] | None = None,
+        delay: float = 0.0,
+    ) -> None:
+        self.suggest_payload = suggest_payload or {"degraded": True, "choices": [], "diagnostic": "no llm"}
+        self.reply_payload = reply_payload or {"degraded": True, "reply": "fallback", "diagnostic": "no llm"}
+        self.delay = delay
+        self.suggest_calls: list[dict[str, object]] = []
+        self.reply_calls: list[dict[str, object]] = []
+
+    async def suggest_choice(self, context: dict[str, object]):
+        self.suggest_calls.append(dict(context))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return dict(self.suggest_payload)
+
+    async def agent_reply(self, context: dict[str, object]):
+        self.reply_calls.append(dict(context))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return dict(self.reply_payload)
+
+
+class _FakeTextractorHandle:
+    def __init__(self, lines: list[str] | None = None) -> None:
+        self.lines = list(lines or [])
+        self.writes: list[str] = []
+        self.returncode: int | None = None
+        self.terminated = False
+
+    async def write(self, payload: str) -> None:
+        self.writes.append(payload)
+
+    async def readline(self, timeout: float) -> str | None:
+        del timeout
+        if not self.lines:
+            return None
+        return self.lines.pop(0)
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    async def terminate(self) -> None:
+        self.terminated = True
+        if self.returncode is None:
+            self.returncode = 0
+
+    async def wait(self, timeout: float) -> int | None:
+        del timeout
+        return self.returncode
+
+
+def _memory_reader_session(
+    *,
+    game_id: str,
+    session_id: str,
+    state: dict[str, object],
+    last_seq: int,
+) -> dict[str, object]:
+    payload = _session(
+        game_id=game_id,
+        session_id=session_id,
+        last_seq=last_seq,
+        state=state,
+    )
+    payload["bridge_sdk_version"] = "memory-reader-0.1.0"
+    payload["engine"] = "unknown"
+    payload["metadata"] = {
+        "source": "memory_reader",
+        "game_process_name": "RenPy Demo.exe",
+        "game_pid": 4242,
+    }
+    return payload
+
+
+@pytest.mark.plugin_unit
+def test_expand_bridge_root_and_read_bom_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    expanded = expand_bridge_root("%LOCALAPPDATA%/N.E.K.O/galgame-bridge")
+    assert expanded == tmp_path / "Local" / "N.E.K.O" / "galgame-bridge"
+
+    session_path = tmp_path / "session.json"
+    _write_session(
+        session_path,
+        _session(
+            game_id="demo.game",
+            session_id="sess-1",
+            last_seq=1,
+            state=_session_state(speaker="雪乃", text="你好"),
+        ),
+        bom=True,
+    )
+    result = read_session_json(session_path)
+    assert result.error == ""
+    assert result.session is not None
+    assert result.session["state"]["speaker"] == "雪乃"
+
+
+@pytest.mark.plugin_unit
+def test_tail_events_handles_utf8_crlf_and_partial_line(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    game_id = "demo.game"
+    session_id = "sess-1"
+    first = _event(
+        seq=1,
+        event_type="line_changed",
+        session_id=session_id,
+        game_id=game_id,
+        payload={"speaker": "雪乃", "text": "今天也一起回家吧。", "line_id": "line-1", "scene_id": "scene-a", "route_id": ""},
+        ts="2026-04-21T08:31:00Z",
+    )
+    second = _event(
+        seq=2,
+        event_type="choices_shown",
+        session_id=session_id,
+        game_id=game_id,
+        payload={"line_id": "line-1", "scene_id": "scene-a", "route_id": "", "choices": []},
+        ts="2026-04-21T08:31:01Z",
+    )
+    partial = json.dumps(
+        _event(
+            seq=3,
+            event_type="heartbeat",
+            session_id=session_id,
+            game_id=game_id,
+            payload={"state_ts": "2026-04-21T08:31:01Z", "idle_seconds": 5},
+            ts="2026-04-21T08:31:06Z",
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    cutoff = len(partial) // 2
+    total_size = _write_events(events_path, [first, second], trailing=partial[:cutoff], crlf=True)
+
+    result = tail_events_jsonl(events_path, offset=0, line_buffer=b"")
+    assert len(result.events) == 2
+    assert result.next_offset == total_size
+    assert result.line_buffer == partial[:cutoff]
+
+    with events_path.open("ab") as handle:
+        handle.write(partial[cutoff:] + b"\n")
+
+    resumed = tail_events_jsonl(
+        events_path,
+        offset=result.next_offset,
+        line_buffer=result.line_buffer,
+    )
+    assert [event["seq"] for event in resumed.events] == [3]
+    assert resumed.line_buffer == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_startup_binds_latest_session_and_exposes_ui(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.alpha",
+        session_payload=_session(
+            game_id="demo.alpha",
+            session_id="sess-a",
+            last_seq=1,
+            state=_session_state(text="alpha"),
+        ),
+    )
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.beta",
+        session_payload=_session(
+            game_id="demo.beta",
+            session_id="sess-b",
+            last_seq=3,
+            state=_session_state(text="beta"),
+        ),
+    )
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    startup = await plugin.startup()
+    assert isinstance(startup, Ok)
+
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+    open_ui = await plugin.galgame_open_ui()
+
+    assert isinstance(status, Ok)
+    assert status.value["bound_game_id"] == ""
+    assert status.value["active_session_id"] == "sess-b"
+    assert status.value["available_game_ids"] == ["demo.alpha", "demo.beta"]
+    assert isinstance(snapshot, Ok)
+    assert snapshot.value["session_id"] == "sess-b"
+    assert isinstance(open_ui, Ok)
+    assert open_ui.value["available"] is True
+    assert open_ui.value["path"] == "/plugin/galgame_bridge/ui/"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.alpha",
+        session_payload=_session(
+            game_id="demo.alpha",
+            session_id="sess-a",
+            last_seq=1,
+            state=_session_state(text="alpha"),
+        ),
+    )
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    startup = await plugin.startup()
+    assert isinstance(startup, Ok)
+
+    entry_ids = sorted(
+        entry_id
+        for entry_id, handler in plugin.collect_entries().items()
+        if handler.meta.event_type == "plugin_entry"
+    )
+    assert entry_ids == [
+        "galgame_agent_command",
+        "galgame_bind_game",
+        "galgame_explain_line",
+        "galgame_get_history",
+        "galgame_get_snapshot",
+        "galgame_get_status",
+        "galgame_open_ui",
+        "galgame_set_mode",
+        "galgame_suggest_choice",
+        "galgame_summarize_scene",
+    ]
+    for phase1_entry in (
+        "galgame_bind_game",
+        "galgame_get_history",
+        "galgame_get_snapshot",
+        "galgame_get_status",
+        "galgame_open_ui",
+        "galgame_set_mode",
+    ):
+        assert phase1_entry in entry_ids
+
+    assert plugin.get_list_actions() == [
+        {
+            "id": "open_ui",
+            "kind": "ui",
+            "target": "/plugin/galgame_bridge/ui/",
+            "open_in": "new_tab",
+        }
+    ]
+
+    static_ui = plugin.get_static_ui_config()
+    assert static_ui is not None
+    assert static_ui["plugin_id"] == "galgame_bridge"
+    assert Path(str(static_ui["directory"])).name == "static"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_mode_and_bind_game_persist_across_restart(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.alpha",
+        session_payload=_session(
+            game_id="demo.alpha",
+            session_id="sess-a",
+            last_seq=2,
+            state=_session_state(text="alpha"),
+        ),
+    )
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.beta",
+        session_payload=_session(
+            game_id="demo.beta",
+            session_id="sess-b",
+            last_seq=1,
+            state=_session_state(text="beta"),
+        ),
+    )
+
+    ctx1 = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin1 = GalgameBridgePlugin(ctx1)
+    await plugin1.startup()
+
+    mode_result = await plugin1.galgame_set_mode(
+        mode="choice_advisor",
+        push_notifications=False,
+    )
+    bind_result = await plugin1.galgame_bind_game(game_id="demo.beta")
+    assert isinstance(mode_result, Ok)
+    assert isinstance(bind_result, Ok)
+
+    ctx2 = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin2 = GalgameBridgePlugin(ctx2)
+    await plugin2.startup()
+    status = await plugin2.galgame_get_status()
+    assert isinstance(status, Ok)
+    assert status.value["mode"] == "choice_advisor"
+    assert status.value["push_notifications"] is False
+    assert status.value["bound_game_id"] == "demo.beta"
+    assert status.value["active_session_id"] == "sess-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_save_loaded_and_repeated_line_do_not_duplicate_stable_history(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "demo.alpha"
+    session_id = "sess-a"
+    events = [
+        _event(
+            seq=1,
+            event_type="session_started",
+            session_id=session_id,
+            game_id=game_id,
+            payload={
+                "game_title": "demo.alpha",
+                "engine": "renpy",
+                "locale": "ja-JP",
+                "started_at": "2026-04-21T08:30:00Z",
+                "scene_id": "boot",
+                "line_id": "",
+                "route_id": "",
+                "is_menu_open": False,
+                "speaker": "",
+                "text": "",
+                "choices": [],
+                "save_context": {"kind": "unknown", "slot_id": "", "display_name": ""},
+            },
+            ts="2026-04-21T08:30:00Z",
+        ),
+        _event(
+            seq=2,
+            event_type="line_changed",
+            session_id=session_id,
+            game_id=game_id,
+            payload={
+                "speaker": "雪乃",
+                "text": "今天也一起回家吧。",
+                "line_id": "script/ch1.rpy:120",
+                "scene_id": "ch1_after_school",
+                "route_id": "",
+            },
+            ts="2026-04-21T08:31:00Z",
+        ),
+        _event(
+            seq=3,
+            event_type="save_loaded",
+            session_id=session_id,
+            game_id=game_id,
+            payload={
+                "reason": "rollback",
+                "scene_id": "ch1_after_school",
+                "line_id": "script/ch1.rpy:120",
+                "route_id": "",
+                "save_context": {"kind": "rollback", "slot_id": "", "display_name": "rollback"},
+            },
+            ts="2026-04-21T08:31:10Z",
+        ),
+        _event(
+            seq=4,
+            event_type="line_changed",
+            session_id=session_id,
+            game_id=game_id,
+            payload={
+                "speaker": "雪乃",
+                "text": "今天也一起回家吧。",
+                "line_id": "script/ch1.rpy:120",
+                "scene_id": "ch1_after_school",
+                "route_id": "",
+            },
+            ts="2026-04-21T08:31:11Z",
+        ),
+    ]
+    _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=4,
+            state=_session_state(
+                speaker="雪乃",
+                text="今天也一起回家吧。",
+                scene_id="ch1_after_school",
+                line_id="script/ch1.rpy:120",
+                ts="2026-04-21T08:31:11Z",
+            ),
+        ),
+        events=events,
+    )
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    history = await plugin.galgame_get_history(limit=20, include_events=True)
+    assert isinstance(history, Ok)
+    assert len(history.value["events"]) == 4
+    assert len(history.value["stable_lines"]) == 1
+    assert history.value["stable_lines"][0]["line_id"] == "script/ch1.rpy:120"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_restart_restores_cursor_and_processes_new_tail(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "demo.alpha"
+    session_id = "sess-a"
+    game_dir = _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(
+                speaker="雪乃",
+                text="旧台词",
+                line_id="line-1",
+                scene_id="scene-a",
+                ts="2026-04-21T08:30:02Z",
+            ),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="session_started",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "game_title": game_id,
+                    "engine": "renpy",
+                    "locale": "ja-JP",
+                    "started_at": "2026-04-21T08:30:00Z",
+                    "scene_id": "boot",
+                    "line_id": "",
+                    "route_id": "",
+                    "is_menu_open": False,
+                    "speaker": "",
+                    "text": "",
+                    "choices": [],
+                    "save_context": {"kind": "unknown", "slot_id": "", "display_name": ""},
+                },
+                ts="2026-04-21T08:30:00Z",
+            ),
+            _event(
+                seq=2,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "雪乃",
+                    "text": "旧台词",
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:30:02Z",
+            ),
+        ],
+    )
+
+    ctx1 = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin1 = GalgameBridgePlugin(ctx1)
+    await plugin1.startup()
+
+    new_event = _event(
+        seq=3,
+        event_type="line_changed",
+        session_id=session_id,
+        game_id=game_id,
+        payload={
+            "speaker": "雪乃",
+            "text": "重启后新增台词",
+            "line_id": "line-2",
+            "scene_id": "scene-a",
+            "route_id": "",
+        },
+        ts="2026-04-21T08:30:05Z",
+    )
+    with (game_dir / "events.jsonl").open("ab") as handle:
+        handle.write(
+            json.dumps(new_event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+    _write_session(
+        game_dir / "session.json",
+        _session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=3,
+            state=_session_state(
+                speaker="雪乃",
+                text="重启后新增台词",
+                line_id="line-2",
+                scene_id="scene-a",
+                ts="2026-04-21T08:30:05Z",
+            ),
+        ),
+    )
+
+    ctx2 = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin2 = GalgameBridgePlugin(ctx2)
+    await plugin2.startup()
+    history = await plugin2.galgame_get_history(limit=20, include_events=True)
+    assert isinstance(history, Ok)
+    assert history.value["events"][-1]["seq"] == 3
+    assert history.value["stable_lines"][-1]["line_id"] == "line-2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_truncation_sets_stream_reset_pending(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "demo.alpha"
+    session_id = "sess-a"
+    game_dir = _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(text="alpha"),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="session_started",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "game_title": game_id,
+                    "engine": "renpy",
+                    "locale": "ja-JP",
+                    "started_at": "2026-04-21T08:30:00Z",
+                    "scene_id": "boot",
+                    "line_id": "",
+                    "route_id": "",
+                    "is_menu_open": False,
+                    "speaker": "",
+                    "text": "",
+                    "choices": [],
+                    "save_context": {"kind": "unknown", "slot_id": "", "display_name": ""},
+                },
+                ts="2026-04-21T08:30:00Z",
+            ),
+            _event(
+                seq=2,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "雪乃",
+                    "text": "旧台词",
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:30:02Z",
+            ),
+        ],
+    )
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    (game_dir / "events.jsonl").write_bytes(b"")
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+    assert isinstance(status, Ok)
+    assert status.value["stream_reset_pending"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_stale_then_new_event_recovers_to_active(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "demo.alpha"
+    session_id = "sess-a"
+    game_dir = _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=1,
+            state=_session_state(text="alpha"),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "雪乃",
+                    "text": "旧台词",
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:30:02Z",
+            )
+        ],
+    )
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    with plugin._state_lock:
+        plugin._state.last_seen_data_monotonic = time.monotonic() - 5.0
+
+    await plugin._poll_bridge(force=True)
+    stale_status = await plugin.galgame_get_status()
+    assert isinstance(stale_status, Ok)
+    assert stale_status.value["connection_state"] == "stale"
+
+    with (game_dir / "events.jsonl").open("ab") as handle:
+        handle.write(
+            json.dumps(
+                _event(
+                    seq=2,
+                    event_type="line_changed",
+                    session_id=session_id,
+                    game_id=game_id,
+                    payload={
+                        "speaker": "雪乃",
+                        "text": "新台词",
+                        "line_id": "line-2",
+                        "scene_id": "scene-a",
+                        "route_id": "",
+                    },
+                    ts="2026-04-21T08:30:06Z",
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+    _write_session(
+        game_dir / "session.json",
+        _session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(
+                speaker="雪乃",
+                text="新台词",
+                line_id="line-2",
+                scene_id="scene-a",
+                ts="2026-04-21T08:30:06Z",
+            ),
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    active_status = await plugin.galgame_get_status()
+    assert isinstance(active_status, Ok)
+    assert active_status.value["connection_state"] == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_memory_reader_fallback_activates_when_bridge_sdk_is_missing(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "enabled": True,
+            "textractor_path": str(textractor_path),
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    clock = {"now": 1710000000.0}
+    handle = _FakeTextractorHandle(
+        ["[4242:100:0:0] 雪乃：来自内存读取的台词。"]
+    )
+    async def _process_factory(path: str):
+        del path
+        return handle
+    plugin._memory_reader_manager = MemoryReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="RenPy Demo.exe",
+                create_time=1709999999.0,
+                engine="renpy",
+            )
+        ],
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert status.value["memory_reader_enabled"] is True
+    assert status.value["active_data_source"] == DATA_SOURCE_MEMORY_READER
+    assert status.value["summary"].startswith("已通过内存读取连接（降级模式）")
+    assert status.value["memory_reader_runtime"]["status"] == "active"
+    assert snapshot.value["snapshot"]["text"] == "来自内存读取的台词。"
+    assert handle.writes == ["attach -P4242\n"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_bridge_sdk_session_preempts_memory_reader_candidate(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "enabled": True,
+            "textractor_path": str(textractor_path),
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    clock = {"now": 1710000000.0}
+    handle = _FakeTextractorHandle(
+        ["[4242:100:0:0] 雪乃：先走内存读取链路。"]
+    )
+    async def _process_factory(path: str):
+        del path
+        return handle
+    plugin._memory_reader_manager = MemoryReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="RenPy Demo.exe",
+                create_time=1709999999.0,
+                engine="renpy",
+            )
+        ],
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    memory_reader_status = await plugin.galgame_get_status()
+    assert isinstance(memory_reader_status, Ok)
+    assert memory_reader_status.value["active_data_source"] == DATA_SOURCE_MEMORY_READER
+
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.bridge",
+        session_payload=_session(
+            game_id="demo.bridge",
+            session_id="sdk-sess",
+            last_seq=3,
+            state=_session_state(
+                speaker="桥接",
+                text="Bridge SDK 已接管。",
+                line_id="sdk-line",
+                scene_id="sdk-scene",
+            ),
+        ),
+    )
+
+    clock["now"] += 1.0
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+
+    assert isinstance(status, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_BRIDGE_SDK
+    assert status.value["active_session_id"] == "sdk-sess"
+    assert status.value["memory_reader_runtime"]["detail"] == "bridge_sdk_available"
+    assert handle.terminated is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_phase2_entries_return_structured_degraded_results_without_target_entry(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "demo.alpha"
+    session_id = "sess-a"
+    _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(
+                speaker="雪乃",
+                text="今天一起回家吗？",
+                scene_id="scene-a",
+                line_id="line-1",
+                choices=[
+                    {"choice_id": "choice-1", "text": "好啊", "index": 0, "enabled": True},
+                    {"choice_id": "choice-2", "text": "下次吧", "index": 1, "enabled": True},
+                ],
+                is_menu_open=True,
+                ts="2026-04-21T08:31:00Z",
+            ),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "雪乃",
+                    "text": "今天一起回家吗？",
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:31:00Z",
+            ),
+            _event(
+                seq=2,
+                event_type="choices_shown",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                    "choices": [
+                        {"choice_id": "choice-1", "text": "好啊", "index": 0, "enabled": True},
+                        {"choice_id": "choice-2", "text": "下次吧", "index": 1, "enabled": True},
+                    ],
+                },
+                ts="2026-04-21T08:31:01Z",
+            ),
+        ],
+    )
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    explain = await plugin.galgame_explain_line()
+    summarize = await plugin.galgame_summarize_scene()
+    suggest = await plugin.galgame_suggest_choice()
+    agent_status = await plugin.galgame_agent_command(action="query_status")
+    agent_reply = await plugin.galgame_agent_command(action="query_context", context_query="当前场景在讲什么？")
+
+    assert isinstance(explain, Ok)
+    assert explain.value["degraded"] is True
+    assert explain.value["line_id"] == "line-1"
+    assert "gateway_unavailable" in explain.value["diagnostic"]
+
+    assert isinstance(summarize, Ok)
+    assert summarize.value["degraded"] is True
+    assert summarize.value["scene_id"] == "scene-a"
+
+    assert isinstance(suggest, Ok)
+    assert suggest.value["degraded"] is True
+    assert suggest.value["choices"] == []
+
+    assert isinstance(agent_status, Ok)
+    assert agent_status.value["action"] == "query_status"
+    assert isinstance(agent_status.value["recent_pushes"], list)
+
+    assert isinstance(agent_reply, Ok)
+    assert agent_reply.value["action"] == "query_context"
+    assert "场景" in agent_reply.value["result"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_phase2_entries_mark_memory_reader_input_as_degraded_even_when_llm_succeeds(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "mem:1a2b3c4d5e6f"
+    session_id = "mem-session"
+    _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_memory_reader_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(
+                speaker="雪乃",
+                text="这是内存读取来的台词。",
+                scene_id="mem:unknown_scene",
+                line_id="mem:line-1",
+                choices=[
+                    {"choice_id": "mem:line-1#choice0", "text": "去教室", "index": 0, "enabled": True},
+                    {"choice_id": "mem:line-1#choice1", "text": "去天台", "index": 1, "enabled": True},
+                ],
+                is_menu_open=True,
+                ts="2026-04-21T08:31:00Z",
+            ),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "雪乃",
+                    "text": "这是内存读取来的台词。",
+                    "line_id": "mem:line-1",
+                    "scene_id": "mem:unknown_scene",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:31:00Z",
+            ),
+            _event(
+                seq=2,
+                event_type="choices_shown",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "line_id": "mem:line-1",
+                    "scene_id": "mem:unknown_scene",
+                    "route_id": "",
+                    "choices": [
+                        {"choice_id": "mem:line-1#choice0", "text": "去教室", "index": 0, "enabled": True},
+                        {"choice_id": "mem:line-1#choice1", "text": "去天台", "index": 1, "enabled": True},
+                    ],
+                },
+                ts="2026-04-21T08:31:01Z",
+            ),
+        ],
+    )
+
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            llm={"target_entry_ref": "fake_llm:run"},
+        ),
+    )
+
+    async def _handler(**kwargs):
+        params = kwargs.get("params") or {}
+        operation = params.get("operation")
+        if operation == "explain_line":
+            return {"explanation": "这是对台词的解释。", "evidence": []}
+        if operation == "summarize_scene":
+            return {
+                "summary": "这是对场景的总结。",
+                "key_points": [{"type": "plot", "text": "剧情仍在推进。"}],
+            }
+        if operation == "suggest_choice":
+            context = params.get("context") or {}
+            visible_choices = context.get("visible_choices") or []
+            return {
+                "choices": [
+                    {
+                        "choice_id": visible_choices[0]["choice_id"],
+                        "text": visible_choices[0]["text"],
+                        "rank": 1,
+                        "reason": "优先继续主线。",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected operation: {operation}")
+
+    ctx.entry_handler = _handler
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._memory_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        tick=lambda **kwargs: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                warnings=[],
+                should_rescan=False,
+                runtime={
+                    "enabled": True,
+                    "status": "active",
+                    "detail": "fixture_active",
+                    "process_name": "RenPy Demo.exe",
+                    "pid": 4242,
+                    "engine": "unknown",
+                    "game_id": game_id,
+                    "session_id": session_id,
+                    "last_seq": 2,
+                    "last_event_ts": "2026-04-21T08:31:01Z",
+                },
+            ),
+        ),
+        shutdown=lambda: asyncio.sleep(0, result=None),
+    )
+    await plugin._poll_bridge(force=True)
+
+    status = await plugin.galgame_get_status()
+    explain = await plugin.galgame_explain_line()
+    summarize = await plugin.galgame_summarize_scene()
+    suggest = await plugin.galgame_suggest_choice()
+
+    assert isinstance(status, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_MEMORY_READER
+
+    assert isinstance(explain, Ok)
+    assert explain.value["degraded"] is True
+    assert "memory_reader_input" in explain.value["diagnostic"]
+    assert explain.value["explanation"] == "这是对台词的解释。"
+
+    assert isinstance(summarize, Ok)
+    assert summarize.value["degraded"] is True
+    assert "memory_reader_input" in summarize.value["diagnostic"]
+    assert summarize.value["summary"] == "这是对场景的总结。"
+
+    assert isinstance(suggest, Ok)
+    assert suggest.value["degraded"] is True
+    assert "memory_reader_input" in suggest.value["diagnostic"]
+    assert suggest.value["choices"][0]["choice_id"] == "mem:line-1#choice0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_gateway_reuses_inflight_and_ttl_cache(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            llm={"target_entry_ref": "fake_llm:run", "llm_request_cache_ttl_seconds": 2},
+        ),
+    )
+
+    calls = {"count": 0}
+
+    async def _handler(**kwargs):
+        calls["count"] += 1
+        await asyncio.sleep(0.05)
+        params = kwargs.get("params") or {}
+        if params.get("operation") == "summarize_scene":
+            return {
+                "summary": "场景总结",
+                "key_points": [
+                    {
+                        "type": "plot",
+                        "text": "剧情推进",
+                        "line_id": "line-1",
+                        "speaker": "雪乃",
+                        "scene_id": "scene-a",
+                        "route_id": "",
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected operation: {params}")
+
+    ctx.entry_handler = _handler
+    plugin = GalgameBridgePlugin(ctx)
+    gateway = LLMGateway(plugin, _Logger(), plugin._cfg or type("Cfg", (), {
+        "llm_max_in_flight": 2,
+        "llm_request_cache_ttl_seconds": 2,
+        "llm_call_timeout_seconds": 15,
+        "llm_target_entry_ref": "fake_llm:run",
+    })())
+
+    context = {
+        "scene_id": "scene-a",
+        "route_id": "",
+        "game_id": "demo.alpha",
+        "session_id": "sess-a",
+        "recent_lines": [],
+        "recent_choices": [],
+        "current_snapshot": _session_state(scene_id="scene-a", line_id="line-1"),
+    }
+
+    first, second = await asyncio.gather(
+        gateway.summarize_scene(context),
+        gateway.summarize_scene(context),
+    )
+    third = await gateway.summarize_scene(context)
+
+    assert first["degraded"] is False
+    assert second["summary"] == "场景总结"
+    assert third["summary"] == "场景总结"
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_gateway_degrades_on_invalid_result(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(bridge_root, llm={"target_entry_ref": "fake_llm:run"}),
+    )
+    ctx.entry_handler = {"summary": 123, "key_points": "oops"}
+    plugin = GalgameBridgePlugin(ctx)
+    gateway = LLMGateway(plugin, _Logger(), type("Cfg", (), {
+        "llm_max_in_flight": 2,
+        "llm_request_cache_ttl_seconds": 0,
+        "llm_call_timeout_seconds": 15,
+        "llm_target_entry_ref": "fake_llm:run",
+    })())
+
+    payload = await gateway.summarize_scene(
+        build_summarize_context(
+            _shared_state(history_lines=[{"line_id": "line-1", "speaker": "雪乃", "text": "台词", "scene_id": "scene-a", "route_id": "", "ts": "2026-04-21T08:31:00Z"}]),
+            scene_id="scene-a",
+        )
+    )
+    assert payload["degraded"] is True
+    assert "invalid_result" in payload["diagnostic"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_host_agent_adapter_round_trip_and_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = FastAPI()
+    task_state = {"status": "running"}
+
+    @app.get("/computer_use/availability")
+    async def _availability():
+        return {"ready": True, "reasons": []}
+
+    @app.post("/computer_use/run")
+    async def _run(payload: dict[str, Any]):
+        return {"success": True, "task_id": "task-1", "status": "running", "instruction": payload["instruction"]}
+
+    @app.get("/tasks/task-1")
+    async def _task():
+        return {"id": "task-1", "status": task_state["status"]}
+
+    @app.post("/tasks/task-1/cancel")
+    async def _cancel():
+        task_state["status"] = "cancelled"
+        return {"success": True, "task_id": "task-1", "status": "cancelled"}
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        adapter = HostAgentAdapter(_Logger(), tool_server_port=48915)
+        monkeypatch.setattr(adapter, "_get_client", lambda: client)
+
+        availability = await adapter.get_computer_use_availability()
+        started = await adapter.run_computer_use_instruction("advance once")
+        task = await adapter.get_task("task-1")
+        cancelled = await adapter.cancel_task("task-1")
+
+    assert availability["ready"] is True
+    assert started["task_id"] == "task-1"
+    assert task["status"] == "running"
+    assert cancelled["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_uses_rank1_choice_and_records_push_history(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        suggest_payload={
+            "degraded": False,
+            "choices": [
+                {
+                    "choice_id": "choice-2",
+                    "text": "右边",
+                    "rank": 1,
+                    "reason": "更符合当前目标",
+                }
+            ],
+            "diagnostic": "",
+        }
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="你要走哪边？",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[
+                {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+                {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+            ],
+            is_menu_open=True,
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_lines=[
+            {
+                "line_id": "line-1",
+                "speaker": "雪乃",
+                "text": "你要走哪边？",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "ts": "2026-04-21T08:31:00Z",
+            }
+        ],
+    )
+
+    await agent.tick(shared)
+    await asyncio.sleep(0)
+    await agent.tick(shared)
+    assert "右边" in fake_host.started[-1]
+
+    fake_host.tasks["task-1"]["status"] = "completed"
+    shared_after = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="那就走这边吧。",
+            scene_id="scene-a",
+            line_id="line-2",
+            ts="2026-04-21T08:31:02Z",
+        ),
+        history_lines=[
+            {
+                "line_id": "line-1",
+                "speaker": "雪乃",
+                "text": "你要走哪边？",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "ts": "2026-04-21T08:31:00Z",
+            },
+            {
+                "line_id": "line-2",
+                "speaker": "雪乃",
+                "text": "那就走这边吧。",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "ts": "2026-04-21T08:31:02Z",
+            },
+        ],
+        history_choices=[
+            {
+                "choice_id": "choice-2",
+                "text": "右边",
+                "line_id": "line-1",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "index": 1,
+                "action": "selected",
+                "ts": "2026-04-21T08:31:01Z",
+            }
+        ],
+        last_seq=3,
+    )
+    await agent.tick(shared_after)
+    status = await agent.query_status(shared_after)
+
+    assert len(ctx.pushed_messages) == 1
+    assert status["recent_pushes"][0]["kind"] == "choice_reason"
+    assert "推荐理由" in status["recent_pushes"][0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_falls_back_to_first_choice_when_suggest_is_degraded(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        suggest_payload={"degraded": True, "choices": [], "diagnostic": "busy"}
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="你要走哪边？",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[
+                {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+                {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+            ],
+            is_menu_open=True,
+        ),
+    )
+
+    await agent.tick(shared)
+    await asyncio.sleep(0)
+    await agent.tick(shared)
+
+    assert "左边" in fake_host.started[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_send_message_interrupts_pending_planning(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        suggest_payload={"degraded": False, "choices": [], "diagnostic": ""},
+        reply_payload={"degraded": False, "reply": "收到，当前还在选项界面。", "diagnostic": ""},
+        delay=0.2,
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="你要走哪边？",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[
+                {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+                {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+            ],
+            is_menu_open=True,
+        ),
+    )
+
+    await agent.tick(shared)
+    response = await agent.send_message(shared, message="先别操作，告诉我当前状态")
+
+    assert response["result"] == "收到，当前还在选项界面。"
+    assert fake_host.started == []
+    assert fake_gateway.reply_calls[-1]["prompt"] == "先别操作，告诉我当前状态"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_retries_dialogue_with_alternate_advance_strategy(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+    )
+
+    await agent.tick(shared)
+    assert "press Enter exactly once" in fake_host.started[-1]
+
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+    assert agent._actuation is not None
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 6.0
+
+    await agent.tick(shared)
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared)
+
+    assert len(fake_host.started) == 2
+    assert "click the usual continue area exactly once" in fake_host.started[-1]
+    assert agent._failure_memory[-1]["strategy_id"] == "advance_enter"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_recovers_unknown_ui_after_stall(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="",
+            text="",
+            scene_id="scene-a",
+            line_id="",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_lines=[],
+    )
+
+    await agent.tick(shared)
+    agent._scene_state["last_scene_change_at"] = time.monotonic() - 1.0
+
+    await agent.tick(shared)
+    await agent.tick(shared)
+
+    assert len(fake_host.started) == 1
+    assert "dismiss that overlay exactly once" in fake_host.started[-1]
+    assert agent._scene_state["stage"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_choice_failure_retries_variant_then_next_candidate(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        suggest_payload={
+            "degraded": False,
+            "choices": [
+                {
+                    "choice_id": "choice-2",
+                    "text": "右边",
+                    "rank": 1,
+                    "reason": "更符合当前目标",
+                },
+                {
+                    "choice_id": "choice-1",
+                    "text": "左边",
+                    "rank": 2,
+                    "reason": "保守路线",
+                },
+            ],
+            "diagnostic": "",
+        }
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="你要走哪边？",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[
+                {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+                {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+            ],
+            is_menu_open=True,
+        ),
+    )
+
+    await agent.tick(shared)
+    await asyncio.sleep(0)
+    await agent.tick(shared)
+    assert "\"右边\"" in fake_host.started[-1]
+
+    fake_host.tasks["task-1"]["status"] = "failed"
+    fake_host.tasks["task-1"]["error"] = "missed first choice"
+    await agent.tick(shared)
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared)
+
+    assert len(fake_host.started) == 2
+    assert "menu item index 2 exactly once" in fake_host.started[-1]
+
+    fake_host.tasks["task-2"]["status"] = "failed"
+    fake_host.tasks["task-2"]["error"] = "still missed"
+    await agent.tick(shared)
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared)
+
+    assert len(fake_host.started) == 3
+    assert "\"左边\"" in fake_host.started[-1]
+    assert [item["strategy_id"] for item in agent._failure_memory[-2:]] == [
+        "choose_rank_1_variant_1",
+        "choose_rank_1_variant_2",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_set_standby_cancels_inflight_actuation_and_keeps_query_available(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        reply_payload={"degraded": False, "reply": "待机中，当前台词是「当前台词」。", "diagnostic": ""}
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state()
+
+    await agent.tick(shared)
+    assert fake_host.started
+
+    standby_result = await agent.set_standby(shared, standby=True)
+    query_result = await agent.query_context(shared, context_query="现在是什么状态？")
+
+    assert standby_result["status"] == "standby"
+    assert fake_host.cancelled == ["task-1"]
+    assert query_result["status"] == "standby"
+    assert query_result["result"] == "待机中，当前台词是「当前台词」。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_no_bridge_delta_walks_full_recovery_chain(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="剧情还在原地。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:32:00Z",
+        ),
+    )
+
+    async def _fail_current_by_no_delta() -> None:
+        task_id = str(agent._actuation["task_id"])
+        fake_host.tasks[task_id]["status"] = "completed"
+        await agent.tick(shared)
+        assert agent._actuation is not None
+        agent._actuation["bridge_wait_started_at"] = time.monotonic() - 6.0
+        await agent.tick(shared)
+        agent._next_actuation_at = 0.0
+        await agent.tick(shared)
+
+    await agent.tick(shared)
+    assert "press Enter exactly once" in fake_host.started[-1]
+
+    await _fail_current_by_no_delta()
+    await _fail_current_by_no_delta()
+    await _fail_current_by_no_delta()
+    await _fail_current_by_no_delta()
+
+    assert len(fake_host.started) == 5
+    assert "press Enter exactly once" in fake_host.started[0]
+    assert "click the usual continue area exactly once" in fake_host.started[1]
+    assert "press Space exactly once" in fake_host.started[2]
+    assert "dismiss that overlay exactly once" in fake_host.started[3]
+    assert "close that overlay once" in fake_host.started[4]
+    assert [item["strategy_id"] for item in agent._failure_memory[-4:]] == [
+        "advance_enter",
+        "advance_click",
+        "advance_space",
+        "recover_focus",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_scene_transition_stall_uses_recover_strategy(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot={
+            **_session_state(
+                speaker="",
+                text="",
+                scene_id="scene-a",
+                line_id="",
+                ts="2026-04-21T08:32:00Z",
+            ),
+            "save_context": {
+                "kind": "rollback",
+                "slot_id": "",
+                "display_name": "rollback",
+            },
+        },
+        history_lines=[],
+    )
+
+    await agent.tick(shared)
+    agent._scene_state["last_scene_change_at"] = time.monotonic() - 1.0
+    await agent.tick(shared)
+
+    assert agent._scene_state["stage"] == "scene_transition"
+    assert len(fake_host.started) == 1
+    assert "dismiss that overlay exactly once" in fake_host.started[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_send_message_interrupts_awaiting_bridge_without_host_cancel(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        reply_payload={"degraded": False, "reply": "当前还没确认桥接回包。", "diagnostic": ""}
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state()
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    response = await agent.send_message(shared, message="先停一下，说明现在卡在哪")
+
+    assert response["status"] == "active"
+    assert response["result"] == "当前还没确认桥接回包。"
+    assert agent._actuation is None
+    assert fake_host.cancelled == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_set_standby_interrupts_awaiting_bridge_without_host_cancel(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state()
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    response = await agent.set_standby(shared, standby=True)
+
+    assert response["status"] == "standby"
+    assert agent._actuation is None
+    assert fake_host.cancelled == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("mode", "expected_kinds"),
+    [
+        ("silent", []),
+        ("companion", ["scene_summary"]),
+        ("choice_advisor", ["scene_summary", "choice_reason"]),
+    ],
+)
+async def test_game_llm_agent_mode_controls_push_types(
+    tmp_path: Path,
+    mode: str,
+    expected_kinds: list[str],
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+
+    shared_before = _shared_state(
+        mode=mode,
+        connection_state="idle",
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第一幕开场。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:32:00Z",
+        ),
+        history_lines=[
+            {
+                "line_id": "line-1",
+                "speaker": "雪乃",
+                "text": "第一幕开场。",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "ts": "2026-04-21T08:32:00Z",
+            }
+        ],
+    )
+    await agent.tick(shared_before)
+
+    agent._remember_suggestion_reason("choice-1", "这里更符合当前目标")
+    shared_after = _shared_state(
+        mode=mode,
+        connection_state="idle",
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第二幕开场。",
+            scene_id="scene-b",
+            line_id="line-2",
+            ts="2026-04-21T08:32:03Z",
+        ),
+        history_lines=[
+            {
+                "line_id": "line-1",
+                "speaker": "雪乃",
+                "text": "第一幕开场。",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "ts": "2026-04-21T08:32:00Z",
+            },
+            {
+                "line_id": "line-2",
+                "speaker": "雪乃",
+                "text": "第二幕开场。",
+                "scene_id": "scene-b",
+                "route_id": "",
+                "ts": "2026-04-21T08:32:03Z",
+            },
+        ],
+        history_choices=[
+            {
+                "choice_id": "choice-1",
+                "text": "继续",
+                "line_id": "line-1",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "index": 0,
+                "action": "selected",
+                "ts": "2026-04-21T08:32:02Z",
+            }
+        ],
+    )
+    await agent.tick(shared_after)
+
+    assert [item["metadata"]["kind"] for item in ctx.pushed_messages] == expected_kinds
+    status = await agent.query_status(shared_after)
+    assert [item["kind"] for item in status["recent_pushes"]] == expected_kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_internal_memories_stay_bounded_over_long_run(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+
+    for idx in range(80):
+        if idx:
+            agent._remember_suggestion_reason(f"choice-{idx}", f"理由 {idx}")
+        shared = _shared_state(
+            mode="choice_advisor",
+            connection_state="idle",
+            last_seq=idx,
+            snapshot=_session_state(
+                speaker="雪乃",
+                text=f"台词 {idx}",
+                scene_id=f"scene-{idx}",
+                line_id=f"line-{idx}",
+                ts=f"2026-04-21T08:32:{idx:02d}Z",
+            ),
+            history_lines=[
+                {
+                    "line_id": f"line-{idx}",
+                    "speaker": "雪乃",
+                    "text": f"台词 {idx}",
+                    "scene_id": f"scene-{idx}",
+                    "route_id": "",
+                    "ts": f"2026-04-21T08:32:{idx:02d}Z",
+                }
+            ],
+            history_choices=(
+                []
+                if idx == 0
+                else [
+                    {
+                        "choice_id": f"choice-{idx}",
+                        "text": f"选项 {idx}",
+                        "line_id": f"line-{idx}",
+                        "scene_id": f"scene-{idx}",
+                        "route_id": "",
+                        "index": idx,
+                        "action": "selected",
+                        "ts": f"2026-04-21T08:32:{idx:02d}Z",
+                    }
+                ]
+            ),
+        )
+        await agent.tick(shared)
+
+    for idx in range(20):
+        agent._record_failure(
+            kind="recover",
+            strategy_id=f"recover-{idx}",
+            reason=f"failure-{idx}",
+            scene_id=f"scene-{idx}",
+        )
+    for idx in range(40):
+        agent._remember_suggestion_reason(f"pending-choice-{idx}", f"pending-reason-{idx}")
+
+    assert len(agent._scene_memory) == 32
+    assert agent._scene_memory[0]["scene_id"] == "scene-48"
+    assert agent._scene_memory[-1]["scene_id"] == "scene-79"
+
+    assert len(agent._choice_memory) == 64
+    assert agent._choice_memory[0]["choice_id"] == "choice-16"
+    assert agent._choice_memory[-1]["choice_id"] == "choice-79"
+
+    assert len(agent._recent_pushes) == 20
+    assert agent._recent_pushes[-1]["kind"] == "choice_reason"
+
+    assert len(agent._failure_memory) == 16
+    assert agent._failure_memory[0]["strategy_id"] == "recover-4"
+    assert agent._failure_memory[-1]["strategy_id"] == "recover-19"
+
+    assert len(agent._suggestion_reasons) == 32
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_recovers_after_temporary_host_unavailable(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter(ready=False)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="继续前进。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:32:00Z",
+        ),
+    )
+
+    await agent.tick(shared)
+    first_status = await agent.query_status(shared)
+
+    assert first_status["status"] == "error"
+    assert "computer_use unavailable" in first_status["result"]
+    assert fake_host.started == []
+
+    fake_host.ready = True
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared)
+    recovered_status = await agent.query_status(shared)
+
+    assert recovered_status["status"] == "active"
+    assert fake_host.started
+    assert agent._actuation is not None

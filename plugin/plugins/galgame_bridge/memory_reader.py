@@ -1,0 +1,975 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+import re
+import sys
+import time
+from typing import Any, Awaitable, Callable, Protocol
+from uuid import uuid4
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - psutil is available in the project runtime.
+    psutil = None
+
+from .models import (
+    DATA_SOURCE_MEMORY_READER,
+    GalgameConfig,
+    sanitize_choice,
+    sanitize_save_context,
+)
+from .reader import normalize_text
+
+MEMORY_READER_VERSION = "0.1.0"
+MEMORY_READER_BRIDGE_VERSION = f"memory-reader-{MEMORY_READER_VERSION}"
+MEMORY_READER_UNKNOWN_SCENE = "mem:unknown_scene"
+MEMORY_READER_ROUTE_ID = ""
+MEMORY_READER_DEFAULT_ENGINE = "unknown"
+MEMORY_READER_MAX_HOOK_CACHE = 256
+_MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
+_SPEAKER_QUOTE_RE = re.compile(r"^\s*([^「」:：]{1,40})[「『](.+)[」』]\s*$")
+_SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
+_ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def is_windows_platform() -> bool:
+    return os.name == "nt" or sys.platform.startswith("win")
+
+
+def utc_now_iso(now: float | None = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now))
+
+
+def compute_memory_reader_game_id(process_name: str) -> str:
+    digest = hashlib.sha1(process_name.encode("utf-8")).hexdigest()[:12]
+    return f"mem:{digest}"
+
+
+def _coerce_choice_lines(lines: list[str]) -> list[str]:
+    if len(lines) < 2:
+        return []
+    choices: list[str] = []
+    for line in lines:
+        match = _MENU_PREFIX_RE.match(line)
+        if match is None:
+            return []
+        text = match.group(1).strip()
+        if not text:
+            return []
+        choices.append(text)
+    return choices
+
+
+def _split_speaker_text(raw_text: str) -> tuple[str, str]:
+    match = _SPEAKER_QUOTE_RE.match(raw_text)
+    if match is not None:
+        return match.group(1).strip(), match.group(2).strip()
+    match = _SPEAKER_COLON_RE.match(raw_text)
+    if match is not None:
+        return match.group(1).strip(), match.group(2).strip()
+    return "", raw_text.strip()
+
+
+def _engine_from_text(text: str) -> str:
+    lowered = text.lower()
+    if "renpy" in lowered or "ren'py" in lowered:
+        return "renpy"
+    if "unity" in lowered:
+        return "unity"
+    if "kirikiri" in lowered or "krkr" in lowered:
+        return "kirikiri"
+    return ""
+
+
+@dataclass(slots=True)
+class DetectedGameProcess:
+    pid: int
+    name: str
+    create_time: float
+    engine: str
+
+
+@dataclass(slots=True)
+class ParsedTextractorLine:
+    pid: int
+    hook_addr: str
+    ctx: str
+    sub_ctx: str
+    text: str
+
+    @property
+    def hook_id(self) -> str:
+        return f"{self.pid}:{self.hook_addr}:{self.ctx}:{self.sub_ctx}"
+
+
+@dataclass(slots=True)
+class MemoryReaderRuntime:
+    enabled: bool = False
+    status: str = "disabled"
+    detail: str = ""
+    process_name: str = ""
+    pid: int = 0
+    engine: str = ""
+    game_id: str = ""
+    session_id: str = ""
+    last_seq: int = 0
+    last_event_ts: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "status": self.status,
+            "detail": self.detail,
+            "process_name": self.process_name,
+            "pid": self.pid,
+            "engine": self.engine,
+            "game_id": self.game_id,
+            "session_id": self.session_id,
+            "last_seq": self.last_seq,
+            "last_event_ts": self.last_event_ts,
+        }
+
+
+@dataclass(slots=True)
+class MemoryReaderTickResult:
+    warnings: list[str] = field(default_factory=list)
+    should_rescan: bool = False
+    runtime: dict[str, Any] = field(default_factory=dict)
+
+
+class TextractorProcessHandle(Protocol):
+    async def write(self, payload: str) -> None: ...
+
+    async def readline(self, timeout: float) -> str | None: ...
+
+    def poll(self) -> int | None: ...
+
+    async def terminate(self) -> None: ...
+
+    async def wait(self, timeout: float) -> int | None: ...
+
+
+class _AsyncioTextractorHandle:
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self._process = process
+
+    async def write(self, payload: str) -> None:
+        if self._process.stdin is None:
+            raise RuntimeError("textractor stdin is unavailable")
+        self._process.stdin.write(payload.encode("utf-8"))
+        await self._process.stdin.drain()
+
+    async def readline(self, timeout: float) -> str | None:
+        if self._process.stdout is None:
+            return None
+        try:
+            raw = await asyncio.wait_for(self._process.stdout.readline(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        if not raw:
+            return ""
+        return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+
+    def poll(self) -> int | None:
+        return self._process.returncode
+
+    async def terminate(self) -> None:
+        if self._process.stdin is not None and not self._process.stdin.is_closing():
+            self._process.stdin.close()
+        if self._process.returncode is None:
+            self._process.terminate()
+
+    async def wait(self, timeout: float) -> int | None:
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            if self._process.returncode is None:
+                self._process.kill()
+                await self._process.wait()
+        return self._process.returncode
+
+
+async def _default_process_factory(path: str) -> TextractorProcessHandle:
+    process = await asyncio.create_subprocess_exec(
+        path,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    return _AsyncioTextractorHandle(process)
+
+
+def _loaded_module_names(proc: Any) -> set[str]:
+    names: set[str] = set()
+    try:
+        mappings = proc.memory_maps(grouped=False)
+    except Exception:
+        return names
+    for item in mappings:
+        path = getattr(item, "path", "") or ""
+        if not path:
+            continue
+        names.add(Path(path).name.lower())
+    return names
+
+
+def _default_process_scanner() -> list[DetectedGameProcess]:
+    if psutil is None:
+        return []
+    detected: list[DetectedGameProcess] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+        try:
+            info = proc.info
+            name = str(info.get("name") or "")
+            cmdline_parts = info.get("cmdline") or []
+            cmdline = " ".join(str(item) for item in cmdline_parts)
+            lowered_name = name.lower()
+            lowered_cmdline = cmdline.lower()
+            modules = _loaded_module_names(proc)
+            engine = ""
+            if "python" in lowered_name and "renpy" in lowered_cmdline:
+                engine = "renpy"
+            elif "renpy.pyd" in modules or "pygame" in modules:
+                engine = "renpy"
+            elif "unity" in lowered_name or "unity" in lowered_cmdline:
+                engine = "unity"
+            elif "unityplayer.dll" in modules or "assembly-csharp.dll" in modules:
+                engine = "unity"
+            elif "kirikiri" in lowered_name or "krkr" in lowered_name:
+                engine = "kirikiri"
+            elif "krkr.dll" in modules:
+                engine = "kirikiri"
+            if not engine:
+                continue
+            detected.append(
+                DetectedGameProcess(
+                    pid=int(info.get("pid") or 0),
+                    name=name or f"pid-{int(info.get('pid') or 0)}",
+                    create_time=float(info.get("create_time") or 0.0),
+                    engine=engine,
+                )
+            )
+        except Exception:
+            continue
+    detected.sort(key=lambda item: (-item.create_time, item.pid))
+    return detected
+
+
+class MemoryReaderBridgeWriter:
+    def __init__(
+        self,
+        *,
+        bridge_root: Path,
+        version: str = MEMORY_READER_BRIDGE_VERSION,
+        time_fn: Callable[[], float] | None = None,
+    ) -> None:
+        self._bridge_root = bridge_root
+        self._version = version
+        self._time_fn = time_fn or time.time
+        self._game_id = ""
+        self._session_id = ""
+        self._process_name = ""
+        self._pid = 0
+        self._engine = MEMORY_READER_DEFAULT_ENGINE
+        self._started_at = ""
+        self._last_seq = 0
+        self._last_event_ts = ""
+        self._state = self._initial_state("")
+        self._text_to_line_id: dict[str, str] = {}
+        self._line_id_owner: dict[str, str] = {}
+
+    @property
+    def bridge_root(self) -> Path:
+        return self._bridge_root
+
+    @property
+    def game_id(self) -> str:
+        return self._game_id
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def engine(self) -> str:
+        return self._engine
+
+    @property
+    def last_seq(self) -> int:
+        return self._last_seq
+
+    @property
+    def last_event_ts(self) -> str:
+        return self._last_event_ts
+
+    def update_engine(self, engine: str) -> bool:
+        normalized = engine or MEMORY_READER_DEFAULT_ENGINE
+        if normalized == self._engine or not self._session_id:
+            return False
+        self._engine = normalized
+        self._write_session_snapshot()
+        return True
+
+    def start_session(self, process: DetectedGameProcess) -> None:
+        started_at = utc_now_iso(self._time_fn())
+        self._game_id = compute_memory_reader_game_id(process.name)
+        self._session_id = f"mem-{uuid4()}"
+        self._process_name = process.name
+        self._pid = process.pid
+        self._engine = process.engine or MEMORY_READER_DEFAULT_ENGINE
+        self._started_at = started_at
+        self._last_seq = 0
+        self._last_event_ts = started_at
+        self._state = self._initial_state(started_at)
+        self._text_to_line_id.clear()
+        self._line_id_owner.clear()
+        self._bridge_dir().mkdir(parents=True, exist_ok=True)
+        self._events_path().write_bytes(b"")
+        self._write_session_snapshot()
+        self._append_event(
+            "session_started",
+            {
+                "game_title": process.name,
+                "engine": self._engine,
+                "locale": "",
+                "started_at": started_at,
+                "scene_id": self._state["scene_id"],
+                "line_id": self._state["line_id"],
+                "route_id": self._state["route_id"],
+                "is_menu_open": self._state["is_menu_open"],
+                "speaker": self._state["speaker"],
+                "text": self._state["text"],
+                "choices": self._state["choices"],
+                "save_context": self._state["save_context"],
+            },
+            ts=started_at,
+        )
+
+    def emit_line(self, raw_text: str, *, ts: str) -> bool:
+        cleaned = raw_text.strip()
+        if not cleaned or not self._session_id:
+            return False
+        speaker, text = _split_speaker_text(cleaned)
+        if not text:
+            return False
+        line_id = self._line_id_for_text(text)
+        self._state = {
+            **self._state,
+            "speaker": speaker,
+            "text": text,
+            "choices": [],
+            "scene_id": MEMORY_READER_UNKNOWN_SCENE,
+            "line_id": line_id,
+            "route_id": MEMORY_READER_ROUTE_ID,
+            "is_menu_open": False,
+            "save_context": sanitize_save_context(self._state.get("save_context")),
+            "ts": ts,
+        }
+        self._append_event(
+            "line_changed",
+            {
+                "speaker": speaker,
+                "text": text,
+                "line_id": line_id,
+                "line_id_source": "text_hash",
+                "scene_id": self._state["scene_id"],
+                "route_id": self._state["route_id"],
+            },
+            ts=ts,
+        )
+        return True
+
+    def emit_choices(self, choices: list[str], *, ts: str) -> bool:
+        if not choices or not self._session_id:
+            return False
+        line_id = str(self._state.get("line_id") or "")
+        if not line_id:
+            return False
+        payload_choices = [
+            sanitize_choice(
+                {
+                    "choice_id": f"{line_id}#choice{index}",
+                    "text": text,
+                    "index": index,
+                    "enabled": True,
+                }
+            )
+            for index, text in enumerate(choices)
+        ]
+        self._state = {
+            **self._state,
+            "choices": payload_choices,
+            "is_menu_open": True,
+            "ts": ts,
+        }
+        self._append_event(
+            "choices_shown",
+            {
+                "line_id": line_id,
+                "scene_id": self._state["scene_id"],
+                "route_id": self._state["route_id"],
+                "choices": payload_choices,
+            },
+            ts=ts,
+        )
+        return True
+
+    def emit_heartbeat(self, *, ts: str) -> bool:
+        if not self._session_id:
+            return False
+        self._append_event(
+            "heartbeat",
+            {
+                "state_ts": str(self._state.get("ts") or ""),
+                "idle_seconds": 0,
+                "scene_id": self._state["scene_id"],
+                "line_id": self._state["line_id"],
+                "route_id": self._state["route_id"],
+            },
+            ts=ts,
+            update_snapshot=False,
+        )
+        return True
+
+    def emit_error(self, message: str, *, ts: str, details: dict[str, Any] | None = None) -> bool:
+        if not self._session_id:
+            return False
+        payload: dict[str, Any] = {
+            "message": message,
+            "source": DATA_SOURCE_MEMORY_READER,
+            "scene_id": self._state["scene_id"],
+            "line_id": self._state["line_id"],
+            "route_id": self._state["route_id"],
+        }
+        if details:
+            payload["details"] = dict(details)
+        self._append_event("error", payload, ts=ts, update_snapshot=False)
+        return True
+
+    def end_session(self, *, ts: str) -> bool:
+        if not self._session_id:
+            return False
+        payload = {
+            "scene_id": self._state["scene_id"],
+            "line_id": self._state["line_id"],
+            "route_id": self._state["route_id"],
+        }
+        self._append_event("session_ended", payload, ts=ts, update_snapshot=False)
+        return True
+
+    def runtime(self) -> MemoryReaderRuntime:
+        return MemoryReaderRuntime(
+            enabled=True,
+            status="active" if self._session_id else "idle",
+            detail="",
+            process_name=self._process_name,
+            pid=self._pid,
+            engine=self._engine,
+            game_id=self._game_id,
+            session_id=self._session_id,
+            last_seq=self._last_seq,
+            last_event_ts=self._last_event_ts,
+        )
+
+    def _initial_state(self, ts: str) -> dict[str, Any]:
+        return {
+            "speaker": "",
+            "text": "",
+            "choices": [],
+            "scene_id": MEMORY_READER_UNKNOWN_SCENE,
+            "line_id": "",
+            "route_id": MEMORY_READER_ROUTE_ID,
+            "is_menu_open": False,
+            "save_context": {
+                "kind": "unknown",
+                "slot_id": "",
+                "display_name": "",
+            },
+            "ts": ts,
+        }
+
+    def _bridge_dir(self) -> Path:
+        return self._bridge_root / self._game_id
+
+    def _session_path(self) -> Path:
+        return self._bridge_dir() / "session.json"
+
+    def _events_path(self) -> Path:
+        return self._bridge_dir() / "events.jsonl"
+
+    def _session_snapshot(self) -> dict[str, Any]:
+        return {
+            "protocol_version": 1,
+            "game_id": self._game_id,
+            "game_title": self._process_name,
+            "engine": self._engine,
+            "session_id": self._session_id,
+            "started_at": self._started_at,
+            "last_seq": self._last_seq,
+            "locale": "",
+            "bridge_sdk_version": self._version,
+            "metadata": {
+                "source": DATA_SOURCE_MEMORY_READER,
+                "game_process_name": self._process_name,
+                "game_pid": self._pid,
+            },
+            "state": {
+                "speaker": str(self._state.get("speaker") or ""),
+                "text": str(self._state.get("text") or ""),
+                "choices": [sanitize_choice(item) for item in self._state.get("choices", [])],
+                "scene_id": str(self._state.get("scene_id") or MEMORY_READER_UNKNOWN_SCENE),
+                "line_id": str(self._state.get("line_id") or ""),
+                "route_id": str(self._state.get("route_id") or MEMORY_READER_ROUTE_ID),
+                "is_menu_open": bool(self._state.get("is_menu_open", False)),
+                "save_context": sanitize_save_context(self._state.get("save_context")),
+                "ts": str(self._state.get("ts") or self._started_at),
+            },
+        }
+
+    def _write_session_snapshot(self) -> None:
+        self._bridge_dir().mkdir(parents=True, exist_ok=True)
+        tmp_path = self._session_path().with_suffix(".json.tmp")
+        payload = json.dumps(
+            self._session_snapshot(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with tmp_path.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self._session_path())
+
+    def _append_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        ts: str,
+        update_snapshot: bool = True,
+    ) -> None:
+        self._last_seq += 1
+        self._last_event_ts = ts
+        event = {
+            "protocol_version": 1,
+            "seq": self._last_seq,
+            "ts": ts,
+            "type": event_type,
+            "session_id": self._session_id,
+            "game_id": self._game_id,
+            "payload": payload,
+        }
+        with self._events_path().open("ab") as handle:
+            handle.write(
+                json.dumps(
+                    event,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            handle.flush()
+        if update_snapshot:
+            self._write_session_snapshot()
+            return
+        self._write_session_snapshot()
+
+    def _line_id_for_text(self, text: str) -> str:
+        normalized = normalize_text(text)
+        cached = self._text_to_line_id.get(normalized)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        widths = list(range(12, len(digest) + 1, 4))
+        if widths[-1] != len(digest):
+            widths.append(len(digest))
+        for width in widths:
+            candidate = f"mem:{digest[:width]}"
+            owner = self._line_id_owner.get(candidate)
+            if owner in {None, normalized}:
+                self._line_id_owner[candidate] = normalized
+                self._text_to_line_id[normalized] = candidate
+                return candidate
+        suffix = 1
+        while True:
+            candidate = f"mem:{digest}#{suffix}"
+            owner = self._line_id_owner.get(candidate)
+            if owner in {None, normalized}:
+                self._line_id_owner[candidate] = normalized
+                self._text_to_line_id[normalized] = candidate
+                return candidate
+            suffix += 1
+
+
+class MemoryReaderManager:
+    def __init__(
+        self,
+        *,
+        logger,
+        config: GalgameConfig,
+        process_factory: Callable[[str], Awaitable[TextractorProcessHandle]] | None = None,
+        process_scanner: Callable[[], list[DetectedGameProcess]] | None = None,
+        time_fn: Callable[[], float] | None = None,
+        platform_fn: Callable[[], bool] | None = None,
+        writer: MemoryReaderBridgeWriter | None = None,
+    ) -> None:
+        self._logger = logger
+        self._config = config
+        self._process_factory = process_factory or _default_process_factory
+        self._process_scanner = process_scanner or _default_process_scanner
+        self._time_fn = time_fn or time.time
+        self._platform_fn = platform_fn or is_windows_platform
+        self._writer = writer or MemoryReaderBridgeWriter(
+            bridge_root=config.bridge_root,
+            time_fn=self._time_fn,
+        )
+        self._runtime = MemoryReaderRuntime(enabled=config.memory_reader_enabled)
+        self._process: TextractorProcessHandle | None = None
+        self._attached_process: DetectedGameProcess | None = None
+        self._attach_started_at = 0.0
+        self._backoff_until = 0.0
+        self._restart_attempts = 0
+        self._last_hook_text: dict[str, str] = {}
+        self._last_heartbeat_at = 0.0
+
+    def update_config(self, config: GalgameConfig) -> None:
+        self._config = config
+        self._runtime.enabled = config.memory_reader_enabled
+        if self._writer.bridge_root != config.bridge_root:
+            self._writer = MemoryReaderBridgeWriter(
+                bridge_root=config.bridge_root,
+                time_fn=self._time_fn,
+            )
+
+    async def shutdown(self) -> None:
+        await self._stop_textractor()
+
+    async def tick(self, *, bridge_sdk_available: bool) -> MemoryReaderTickResult:
+        now = self._time_fn()
+        result = MemoryReaderTickResult(runtime=self._runtime.to_dict())
+        if not self._config.memory_reader_enabled:
+            self._runtime = MemoryReaderRuntime(enabled=False, status="disabled", detail="disabled_by_config")
+            await self._stop_textractor()
+            result.runtime = self._runtime.to_dict()
+            return result
+        if not self._platform_fn():
+            await self._stop_textractor()
+            self._runtime = MemoryReaderRuntime(
+                enabled=True,
+                status="idle",
+                detail="unsupported_platform",
+            )
+            result.warnings.append("memory_reader is Windows-only")
+            result.runtime = self._runtime.to_dict()
+            return result
+        textractor_path = str(self._config.memory_reader_textractor_path or "").strip()
+        if not textractor_path or not Path(textractor_path).is_file():
+            await self._stop_textractor()
+            self._runtime = MemoryReaderRuntime(
+                enabled=True,
+                status="idle",
+                detail="invalid_textractor_path",
+            )
+            result.warnings.append("memory_reader.textractor_path is invalid or missing")
+            result.runtime = self._runtime.to_dict()
+            return result
+        if not self._config.memory_reader_auto_detect:
+            await self._stop_textractor()
+            self._runtime = MemoryReaderRuntime(
+                enabled=True,
+                status="idle",
+                detail="manual_pid_unimplemented",
+            )
+            result.warnings.append("memory_reader auto_detect=false is not implemented in this release")
+            result.runtime = self._runtime.to_dict()
+            return result
+        if bridge_sdk_available:
+            await self._stop_textractor()
+            self._runtime = MemoryReaderRuntime(
+                enabled=True,
+                status="idle",
+                detail="bridge_sdk_available",
+                process_name=self._runtime.process_name,
+                pid=self._runtime.pid,
+                engine=self._runtime.engine,
+                game_id=self._runtime.game_id,
+                session_id=self._runtime.session_id,
+                last_seq=self._runtime.last_seq,
+                last_event_ts=self._runtime.last_event_ts,
+            )
+            result.runtime = self._runtime.to_dict()
+            return result
+        if self._backoff_until and now < self._backoff_until:
+            self._runtime.status = "backoff"
+            self._runtime.detail = "waiting_before_restart"
+            result.runtime = self._runtime.to_dict()
+            return result
+
+        if self._attached_process is None:
+            self._runtime.status = "scanning"
+            self._runtime.detail = "scanning_processes"
+        processes = self._process_scanner()
+        if self._attached_process is not None:
+            process_lookup = {item.pid: item for item in processes}
+            attached = process_lookup.get(self._attached_process.pid)
+            if attached is None:
+                if self._writer.end_session(ts=utc_now_iso(now)):
+                    result.should_rescan = True
+                await self._stop_textractor()
+                self._attached_process = None
+                self._runtime = MemoryReaderRuntime(
+                    enabled=True,
+                    status="idle",
+                    detail="no_detected_game_process",
+                )
+                result.runtime = self._runtime.to_dict()
+                return result
+            self._attached_process = attached
+
+        if self._process is not None and self._process.poll() is not None:
+            crash_warning = await self._handle_textractor_crash(now)
+            if crash_warning:
+                result.warnings.append(crash_warning)
+                if self._runtime.status == "error" and self._writer.emit_error(
+                    crash_warning,
+                    ts=utc_now_iso(now),
+                ):
+                    result.should_rescan = True
+                result.runtime = self._runtime.to_dict()
+                return result
+
+        if self._attached_process is None:
+            if not processes:
+                self._runtime = MemoryReaderRuntime(
+                    enabled=True,
+                    status="idle",
+                    detail="no_detected_game_process",
+                )
+                result.runtime = self._runtime.to_dict()
+                return result
+            target = processes[0]
+            if not self._writer.session_id or self._writer.game_id != compute_memory_reader_game_id(target.name):
+                self._writer.start_session(target)
+                result.should_rescan = True
+            self._attached_process = target
+            self._last_heartbeat_at = now
+            self._runtime.status = "starting"
+            self._runtime.detail = "starting_textractor"
+            await self._ensure_textractor_started(textractor_path)
+            try:
+                if self._process is None:
+                    raise RuntimeError("textractor process is unavailable")
+                await self._process.write(f"attach -P{target.pid}\n")
+            except Exception as exc:
+                self._runtime = MemoryReaderRuntime(
+                    enabled=True,
+                    status="backoff",
+                    detail="attach_command_failed",
+                    process_name=target.name,
+                    pid=target.pid,
+                    engine=target.engine,
+                    game_id=self._writer.game_id,
+                    session_id=self._writer.session_id,
+                    last_seq=self._writer.last_seq,
+                    last_event_ts=self._writer.last_event_ts,
+                )
+                self._backoff_until = now + 5.0
+                result.warnings.append(f"memory_reader attach failed: {exc}")
+                if self._writer.emit_error(f"attach failed: {exc}", ts=utc_now_iso(now)):
+                    result.should_rescan = True
+                result.runtime = self._runtime.to_dict()
+                return result
+            self._attach_started_at = now
+            self._runtime = MemoryReaderRuntime(
+                enabled=True,
+                status="attaching",
+                detail="waiting_for_attach_confirmation",
+                process_name=target.name,
+                pid=target.pid,
+                engine=target.engine,
+                game_id=self._writer.game_id,
+                session_id=self._writer.session_id,
+                last_seq=self._writer.last_seq,
+                last_event_ts=self._writer.last_event_ts,
+            )
+
+        parsed_lines, log_lines, parse_warnings = await self._drain_stdout()
+        result.warnings.extend(parse_warnings)
+        engine_override = self._engine_from_logs(log_lines)
+        if engine_override and self._writer.update_engine(engine_override):
+            result.should_rescan = True
+        if self._attached_process is not None and self._runtime.status == "attaching":
+            if any(line.pid == self._attached_process.pid for line in parsed_lines) or log_lines:
+                self._restart_attempts = 0
+                self._runtime.status = "active"
+                self._runtime.detail = "attached"
+        if self._runtime.status == "attaching" and now - self._attach_started_at > 5.0:
+            message = "memory_reader attach confirmation timed out"
+            result.warnings.append(message)
+            if self._writer.emit_error(message, ts=utc_now_iso(now)):
+                result.should_rescan = True
+            self._runtime.status = "backoff"
+            self._runtime.detail = "attach_timeout"
+            self._backoff_until = now + 5.0
+            await self._stop_textractor()
+            self._attached_process = None
+            result.runtime = self._runtime.to_dict()
+            return result
+
+        emitted = False
+        if self._attached_process is not None and parsed_lines:
+            emitted = self._consume_parsed_lines(
+                [line for line in parsed_lines if line.pid == self._attached_process.pid],
+                ts=utc_now_iso(now),
+            )
+        if emitted:
+            result.should_rescan = True
+            self._last_heartbeat_at = now
+        elif self._runtime.status == "active" and now - self._last_heartbeat_at >= float(
+            self._config.memory_reader_poll_interval_seconds
+        ):
+            if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+                result.should_rescan = True
+                self._last_heartbeat_at = now
+
+        self._runtime = MemoryReaderRuntime(
+            enabled=True,
+            status=self._runtime.status,
+            detail=self._runtime.detail,
+            process_name=self._attached_process.name if self._attached_process else "",
+            pid=self._attached_process.pid if self._attached_process else 0,
+            engine=self._writer.engine or MEMORY_READER_DEFAULT_ENGINE,
+            game_id=self._writer.game_id,
+            session_id=self._writer.session_id,
+            last_seq=self._writer.last_seq,
+            last_event_ts=self._writer.last_event_ts,
+        )
+        result.runtime = self._runtime.to_dict()
+        return result
+
+    async def _ensure_textractor_started(self, textractor_path: str) -> None:
+        if self._process is not None and self._process.poll() is None:
+            return
+        self._process = await self._process_factory(textractor_path)
+
+    async def _handle_textractor_crash(self, now: float) -> str:
+        self._restart_attempts += 1
+        await self._stop_textractor()
+        if self._restart_attempts > 3:
+            self._runtime.status = "error"
+            self._runtime.detail = "textractor_crash_limit_exceeded"
+            return "memory_reader Textractor crashed too many times"
+        self._runtime.status = "backoff"
+        self._runtime.detail = "textractor_crashed"
+        self._backoff_until = now + 5.0
+        return "memory_reader Textractor crashed; scheduling restart"
+
+    async def _stop_textractor(self) -> None:
+        attached_process = self._attached_process
+        if self._process is None:
+            self._attached_process = None
+            return
+        try:
+            if attached_process is not None:
+                try:
+                    await self._process.write(f"detach -P{attached_process.pid}\n")
+                except Exception:
+                    pass
+            await self._process.terminate()
+            await self._process.wait(timeout=1.0)
+        finally:
+            self._process = None
+            self._attached_process = None
+            self._attach_started_at = 0.0
+            self._last_heartbeat_at = 0.0
+            self._last_hook_text.clear()
+
+    async def _drain_stdout(self) -> tuple[list[ParsedTextractorLine], list[str], list[str]]:
+        parsed: list[ParsedTextractorLine] = []
+        logs: list[str] = []
+        warnings: list[str] = []
+        if self._process is None:
+            return parsed, logs, warnings
+        for _ in range(64):
+            line = await self._process.readline(timeout=0.01)
+            if line is None:
+                break
+            if line == "":
+                break
+            if not line.startswith("["):
+                logs.append(line)
+                continue
+            parsed_line, error = self._parse_textractor_line(line)
+            if error:
+                warnings.append(error)
+                continue
+            if parsed_line is None:
+                continue
+            previous = self._last_hook_text.get(parsed_line.hook_id)
+            if previous == parsed_line.text:
+                continue
+            self._last_hook_text[parsed_line.hook_id] = parsed_line.text
+            if len(self._last_hook_text) > MEMORY_READER_MAX_HOOK_CACHE:
+                oldest_key = next(iter(self._last_hook_text))
+                self._last_hook_text.pop(oldest_key, None)
+            parsed.append(parsed_line)
+        return parsed, logs, warnings
+
+    @staticmethod
+    def _parse_textractor_line(raw_line: str) -> tuple[ParsedTextractorLine | None, str]:
+        close = raw_line.find("]")
+        if close <= 1:
+            return None, f"memory_reader failed to parse Textractor line: {raw_line}"
+        metadata = raw_line[1:close]
+        text = raw_line[close + 1 :].lstrip()
+        parts = metadata.split(":")
+        if len(parts) != 4:
+            return None, f"memory_reader failed to parse Textractor metadata: {raw_line}"
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            return None, f"memory_reader invalid Textractor pid: {raw_line}"
+        return (
+            ParsedTextractorLine(
+                pid=pid,
+                hook_addr=parts[1],
+                ctx=parts[2],
+                sub_ctx=parts[3],
+                text=text,
+            ),
+            "",
+        )
+
+    @staticmethod
+    def _engine_from_logs(lines: list[str]) -> str:
+        for line in lines:
+            engine = _engine_from_text(line)
+            if engine:
+                return engine
+        return ""
+
+    def _consume_parsed_lines(self, lines: list[ParsedTextractorLine], *, ts: str) -> bool:
+        texts: list[str] = []
+        seen: set[str] = set()
+        for item in lines:
+            cleaned = normalize_text(item.text)
+            if not cleaned:
+                continue
+            if cleaned in seen:
+                continue
+            seen.add(cleaned)
+            texts.append(cleaned)
+        if not texts:
+            return False
+        choices = _coerce_choice_lines(texts)
+        if choices and self._writer.emit_choices(choices, ts=ts):
+            return True
+        emitted = False
+        for text in texts:
+            emitted = self._writer.emit_line(text, ts=ts) or emitted
+        return emitted
