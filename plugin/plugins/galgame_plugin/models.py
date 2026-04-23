@@ -215,6 +215,7 @@ class GalgameConfig:
     memory_reader_install_target_dir: str
     memory_reader_install_timeout_seconds: float
     memory_reader_auto_detect: bool
+    memory_reader_hook_codes: list[str]
     memory_reader_poll_interval_seconds: float
     ocr_reader_enabled: bool
     ocr_reader_tesseract_path: str

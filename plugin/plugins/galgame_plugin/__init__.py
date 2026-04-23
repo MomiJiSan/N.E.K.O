@@ -19,6 +19,7 @@ from .game_llm_agent import GameLLMAgent
 from .host_agent_adapter import HostAgentAdapter
 from .llm_gateway import LLMGateway
 from .memory_reader import MemoryReaderManager
+from .ocr_reader import OcrReaderManager
 from .models import (
     DATA_SOURCE_NONE,
     MODE_COMPANION,
@@ -32,6 +33,7 @@ from .models import (
     STORE_LAST_ERROR,
     STORE_LAST_SEQ,
     STORE_MODE,
+    STORE_OCR_CAPTURE_PROFILES,
     STORE_PUSH_NOTIFICATIONS,
     STORE_SESSION_ID,
     json_copy,
@@ -54,6 +56,7 @@ from .service import (
     choose_candidate,
     derive_connection_state,
     filter_memory_reader_candidates,
+    filter_ocr_reader_candidates,
     next_poll_interval_for_state,
     rebuild_histories_from_events,
     scan_session_candidates,
@@ -79,6 +82,7 @@ class GalgamePlugin(NekoPluginBase):
         self._llm_gateway: LLMGateway | None = None
         self._game_agent: GameLLMAgent | None = None
         self._memory_reader_manager: MemoryReaderManager | None = None
+        self._ocr_reader_manager: OcrReaderManager | None = None
 
     def _snapshot_state(self) -> dict[str, Any]:
         with self._state_lock:
@@ -108,6 +112,8 @@ class GalgamePlugin(NekoPluginBase):
                 "last_seen_data_monotonic": state.last_seen_data_monotonic,
                 "warmup_session_id": state.warmup_session_id,
                 "memory_reader_runtime": json_copy(state.memory_reader_runtime),
+                "ocr_reader_runtime": json_copy(state.ocr_reader_runtime),
+                "ocr_capture_profiles": dict(state.ocr_capture_profiles),
                 "plugin_error": state.plugin_error,
             }
 
@@ -138,6 +144,8 @@ class GalgamePlugin(NekoPluginBase):
             state.last_seen_data_monotonic = float(payload["last_seen_data_monotonic"])
             state.warmup_session_id = str(payload["warmup_session_id"])
             state.memory_reader_runtime = json_copy(payload["memory_reader_runtime"])
+            state.ocr_reader_runtime = json_copy(payload["ocr_reader_runtime"])
+            state.ocr_capture_profiles = dict(payload["ocr_capture_profiles"])
             state.plugin_error = str(payload["plugin_error"])
 
     def _record_error(self, error: dict[str, Any]) -> None:
@@ -176,6 +184,8 @@ class GalgamePlugin(NekoPluginBase):
             self._state.last_error = json_copy(restored.get(STORE_LAST_ERROR, {}))
             self._state.active_data_source = DATA_SOURCE_NONE
             self._state.memory_reader_runtime = {}
+            self._state.ocr_reader_runtime = {}
+            self._state.ocr_capture_profiles = restored.get(STORE_OCR_CAPTURE_PROFILES, {})
             if warnings and not self._state.last_error:
                 self._state.last_error = make_error(
                     "; ".join(warnings),
@@ -200,6 +210,8 @@ class GalgamePlugin(NekoPluginBase):
                 "phase": "phase_1",
                 "memory_reader_enabled": False,
                 "memory_reader_runtime": {},
+                "ocr_reader_enabled": False,
+                "ocr_reader_runtime": {},
                 "textractor": {
                     "install_supported": False,
                     "installed": False,
@@ -248,6 +260,11 @@ class GalgamePlugin(NekoPluginBase):
             logger=self.logger,
             config=self._cfg,
         )
+        self._ocr_reader_manager = OcrReaderManager(
+            logger=self.logger,
+            config=self._cfg,
+        )
+        self._ocr_reader_manager.update_capture_profiles(self._state.ocr_capture_profiles)
 
         self.register_static_ui("static")
         self.set_list_actions(
@@ -269,6 +286,11 @@ class GalgamePlugin(NekoPluginBase):
         if self._memory_reader_manager is not None:
             try:
                 await self._memory_reader_manager.shutdown()
+            except Exception:
+                pass
+        if self._ocr_reader_manager is not None:
+            try:
+                await self._ocr_reader_manager.shutdown()
             except Exception:
                 pass
         if self._game_agent is not None:
@@ -321,6 +343,7 @@ class GalgamePlugin(NekoPluginBase):
         raw_available_game_ids: list[str] = []
         raw_candidates: dict[str, Any] = {}
         memory_reader_runtime = json_copy(local.get("memory_reader_runtime") or {})
+        ocr_reader_runtime = json_copy(local.get("ocr_reader_runtime") or {})
 
         try:
             raw_available_game_ids, raw_candidates, scan_warnings = scan_session_candidates(
@@ -347,13 +370,14 @@ class GalgamePlugin(NekoPluginBase):
                 pass
             return
 
+        bridge_sdk_available = any(
+            candidate.data_source == "bridge_sdk"
+            for candidate in raw_candidates.values()
+        )
+
         if self._memory_reader_manager is not None:
             self._memory_reader_manager.update_config(self._cfg)
             try:
-                bridge_sdk_available = any(
-                    candidate.data_source == "bridge_sdk"
-                    for candidate in raw_candidates.values()
-                )
                 memory_reader_tick = await self._memory_reader_manager.tick(
                     bridge_sdk_available=bridge_sdk_available,
                 )
@@ -369,11 +393,36 @@ class GalgamePlugin(NekoPluginBase):
             except Exception as exc:
                 warnings.append(f"memory_reader tick failed: {exc}")
 
+        if self._ocr_reader_manager is not None:
+            self._ocr_reader_manager.update_config(self._cfg)
+            try:
+                ocr_reader_tick = await self._ocr_reader_manager.tick(
+                    bridge_sdk_available=bridge_sdk_available,
+                    memory_reader_runtime=memory_reader_runtime,
+                )
+                warnings.extend(ocr_reader_tick.warnings)
+                ocr_reader_runtime = ocr_reader_tick.runtime
+                if ocr_reader_tick.should_rescan:
+                    (
+                        raw_available_game_ids,
+                        raw_candidates,
+                        rescan_warnings,
+                    ) = scan_session_candidates(self._cfg.bridge_root)
+                    warnings.extend(rescan_warnings)
+            except Exception as exc:
+                warnings.append(f"ocr_reader tick failed: {exc}")
+
         local["memory_reader_runtime"] = memory_reader_runtime
+        local["ocr_reader_runtime"] = ocr_reader_runtime
         available_game_ids, candidates = filter_memory_reader_candidates(
             raw_available_game_ids,
             raw_candidates,
             runtime=memory_reader_runtime,
+        )
+        available_game_ids, candidates = filter_ocr_reader_candidates(
+            available_game_ids,
+            candidates,
+            runtime=ocr_reader_runtime,
         )
         local["available_game_ids"] = available_game_ids
 

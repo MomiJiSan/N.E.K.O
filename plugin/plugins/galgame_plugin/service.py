@@ -8,6 +8,7 @@ from typing import Any, Iterable
 from .models import (
     DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
+    DATA_SOURCE_OCR_READER,
     GalgameConfig,
     MODE_CHOICE_ADVISOR,
     MODE_COMPANION,
@@ -27,6 +28,7 @@ from .models import (
     sanitize_snapshot_state,
 )
 from .reader import expand_bridge_root, normalize_text, read_session_json
+from .tesseract_support import inspect_tesseract_installation
 from .textractor_support import (
     DEFAULT_TEXTRACTOR_RELEASE_API_URL,
     inspect_textractor_installation,
@@ -82,6 +84,8 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
     galgame_obj = galgame if isinstance(galgame, dict) else {}
     llm_obj = llm if isinstance(llm, dict) else {}
     memory_reader_obj = memory_reader if isinstance(memory_reader, dict) else {}
+    ocr_reader = raw_config.get("ocr_reader")
+    ocr_reader_obj = ocr_reader if isinstance(ocr_reader, dict) else {}
 
     default_mode_obj = galgame_obj.get("default_mode")
     default_mode = (
@@ -149,8 +153,44 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             memory_reader_obj.get("install_timeout_seconds"), 60.0, minimum=1.0
         ),
         memory_reader_auto_detect=bool(memory_reader_obj.get("auto_detect", True)),
+        memory_reader_hook_codes=list(
+            memory_reader_obj.get("hook_codes")
+            or []
+        ),
         memory_reader_poll_interval_seconds=_coerce_float(
             memory_reader_obj.get("poll_interval_seconds"), 1.0, minimum=0.1
+        ),
+        ocr_reader_enabled=_coerce_bool(
+            ocr_reader_obj.get("enabled"), False,
+        ),
+        ocr_reader_tesseract_path=str(ocr_reader_obj.get("tesseract_path") or ""),
+        ocr_reader_install_manifest_url=str(
+            ocr_reader_obj.get("install_manifest_url") or ""
+        ).strip(),
+        ocr_reader_install_target_dir=str(
+            ocr_reader_obj.get("install_target_dir") or ""
+        ).strip(),
+        ocr_reader_install_timeout_seconds=_coerce_float(
+            ocr_reader_obj.get("install_timeout_seconds"), 60.0, minimum=1.0
+        ),
+        ocr_reader_poll_interval_seconds=_coerce_float(
+            ocr_reader_obj.get("poll_interval_seconds"), 2.0, minimum=0.1
+        ),
+        ocr_reader_no_text_takeover_after_seconds=_coerce_float(
+            ocr_reader_obj.get("no_text_takeover_after_seconds"), 30.0, minimum=0.0
+        ),
+        ocr_reader_languages=str(ocr_reader_obj.get("languages") or "chi_sim+eng"),
+        ocr_reader_left_inset_ratio=_coerce_float(
+            ocr_reader_obj.get("left_inset_ratio"), 0.05, minimum=0.0
+        ),
+        ocr_reader_right_inset_ratio=_coerce_float(
+            ocr_reader_obj.get("right_inset_ratio"), 0.05, minimum=0.0
+        ),
+        ocr_reader_top_ratio=_coerce_float(
+            ocr_reader_obj.get("top_ratio"), 0.3, minimum=0.0
+        ),
+        ocr_reader_bottom_inset_ratio=_coerce_float(
+            ocr_reader_obj.get("bottom_inset_ratio"), 0.3, minimum=0.0
         ),
     )
 
@@ -199,6 +239,12 @@ def infer_session_data_source(session: dict[str, Any]) -> str:
         return DATA_SOURCE_MEMORY_READER
     if str(session.get("game_id") or "").startswith(("mem:", "mem-")):
         return DATA_SOURCE_MEMORY_READER
+    if str(metadata_obj.get("source") or "") == DATA_SOURCE_OCR_READER:
+        return DATA_SOURCE_OCR_READER
+    if str(session.get("bridge_sdk_version") or "").startswith("ocr-reader-"):
+        return DATA_SOURCE_OCR_READER
+    if str(session.get("game_id") or "").startswith(("ocr:", "ocr-")):
+        return DATA_SOURCE_OCR_READER
     return DATA_SOURCE_BRIDGE_SDK
 
 
@@ -225,6 +271,29 @@ def filter_memory_reader_candidates(
     return filtered_ids, filtered_candidates
 
 
+def filter_ocr_reader_candidates(
+    available_game_ids: list[str],
+    candidates: dict[str, SessionCandidate],
+    *,
+    runtime: dict[str, Any],
+) -> tuple[list[str], dict[str, SessionCandidate]]:
+    runtime_status = str(runtime.get("status") or "")
+    runtime_game_id = str(runtime.get("game_id") or "")
+    ocr_reader_live = runtime_status in {"starting", "active"} and bool(runtime_game_id)
+    filtered_candidates: dict[str, SessionCandidate] = {}
+    filtered_out: set[str] = set()
+    for game_id, candidate in candidates.items():
+        if candidate.data_source != DATA_SOURCE_OCR_READER:
+            filtered_candidates[game_id] = candidate
+            continue
+        if ocr_reader_live and candidate.game_id == runtime_game_id:
+            filtered_candidates[game_id] = candidate
+            continue
+        filtered_out.add(game_id)
+    filtered_ids = [game_id for game_id in available_game_ids if game_id not in filtered_out]
+    return filtered_ids, filtered_candidates
+
+
 def choose_candidate(
     candidates: dict[str, SessionCandidate],
     *,
@@ -237,6 +306,10 @@ def choose_candidate(
     preferred_candidates = [
         item for item in candidates.values() if item.data_source == DATA_SOURCE_BRIDGE_SDK
     ]
+    if not preferred_candidates:
+        preferred_candidates = [
+            item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER
+        ]
     if not preferred_candidates:
         preferred_candidates = list(candidates.values())
     if keep_current and current_game_id:
@@ -308,7 +381,9 @@ def summarize_status(
     last_error: dict[str, Any],
     active_data_source: str,
 ) -> str:
-    if active_data_source == DATA_SOURCE_MEMORY_READER and active_session_id:
+    if active_data_source == DATA_SOURCE_OCR_READER and active_session_id:
+        prefix = "已通过 OCR 读取连接（降级模式）"
+    elif active_data_source == DATA_SOURCE_MEMORY_READER and active_session_id:
         prefix = "已通过内存读取连接（降级模式）"
     elif active_data_source == DATA_SOURCE_BRIDGE_SDK and active_session_id:
         prefix = "已通过 Bridge SDK 连接"
@@ -560,6 +635,11 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         configured_path=config.memory_reader_textractor_path,
         install_target_dir_raw=config.memory_reader_install_target_dir,
     )
+    tesseract = inspect_tesseract_installation(
+        configured_path=config.ocr_reader_tesseract_path,
+        install_target_dir_raw=config.ocr_reader_install_target_dir,
+        languages=config.ocr_reader_languages,
+    )
     return {
         "connection_state": state.current_connection_state,
         "mode": state.mode,
@@ -572,6 +652,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "last_seq": state.last_seq,
         "last_error": json_copy(state.last_error),
         "memory_reader_runtime": json_copy(state.memory_reader_runtime),
+        "ocr_reader_runtime": json_copy(state.ocr_reader_runtime),
         "summary": summarize_status(
             connection_state=state.current_connection_state,
             mode=state.mode,
@@ -583,7 +664,9 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         ),
         "phase": "phase_1",
         "memory_reader_enabled": config.memory_reader_enabled,
+        "ocr_reader_enabled": config.ocr_reader_enabled,
         "textractor": textractor,
+        "tesseract": tesseract,
     }
 
 
@@ -717,6 +800,10 @@ def _is_memory_reader_identifier(value: object) -> bool:
     return isinstance(value, str) and value.startswith("mem:")
 
 
+def _is_ocr_reader_identifier(value: object) -> bool:
+    return isinstance(value, str) and value.startswith("ocr:")
+
+
 def _build_input_degraded_context(
     local_state: dict[str, Any],
     *,
@@ -728,12 +815,20 @@ def _build_input_degraded_context(
     reasons: list[str] = []
     if input_source == DATA_SOURCE_MEMORY_READER:
         reasons.append("memory_reader_source")
+    if input_source == DATA_SOURCE_OCR_READER:
+        reasons.append("ocr_reader_source")
     if _is_memory_reader_identifier(scene_id):
         reasons.append("memory_reader_scene")
+    if _is_ocr_reader_identifier(scene_id):
+        reasons.append("ocr_reader_scene")
     if _is_memory_reader_identifier(line_id):
         reasons.append("memory_reader_line")
+    if _is_ocr_reader_identifier(line_id):
+        reasons.append("ocr_reader_line")
     if any(_is_memory_reader_identifier(choice_id) for choice_id in choice_ids):
         reasons.append("memory_reader_choice")
+    if any(_is_ocr_reader_identifier(choice_id) for choice_id in choice_ids):
+        reasons.append("ocr_reader_choice")
     return input_source, bool(reasons), reasons
 
 
@@ -741,6 +836,12 @@ def _memory_reader_input_diagnostic(context: dict[str, Any]) -> str:
     reasons = list(context.get("degraded_reasons") or [])
     if not reasons:
         return ""
+    input_source = str(context.get("input_source") or "")
+    if input_source == DATA_SOURCE_OCR_READER:
+        return (
+            "ocr_reader_input: input comes from ocr_reader, semantic granularity is "
+            "weaker than bridge_sdk (" + ",".join(reasons) + ")"
+        )
     return (
         "memory_reader_input: input comes from memory_reader, semantic granularity is "
         "weaker than bridge_sdk (" + ",".join(reasons) + ")"

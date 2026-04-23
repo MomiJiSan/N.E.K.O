@@ -4,7 +4,10 @@ import asyncio
 import hashlib
 import json
 import os
+import queue
 import shutil
+import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -178,53 +181,91 @@ class TextractorProcessHandle(Protocol):
 
 
 class _AsyncioTextractorHandle:
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
+    """Wraps a TextractorCLI subprocess with asyncio-safe I/O.
+
+    Uses synchronous subprocess.Popen so that stdin/stdout are not bound
+    to any particular asyncio event loop.  A dedicated reader thread drains
+    stdout into a plain ``queue.Queue``; the async ``readline`` method
+    pulls from that queue with a timeout via ``asyncio.to_thread``.
+    """
+
+    def __init__(self, process: subprocess.Popen) -> None:
         self._process = process
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._start_reader()
+
+    def _start_reader(self) -> None:
+        if self._process.stdout is None:
+            return
+
+        def _reader():
+            try:
+                while True:
+                    raw = self._process.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    self._queue.put(line)
+            except Exception:
+                pass
+            finally:
+                self._queue.put(None)  # sentinel for EOF
+
+        threading.Thread(target=_reader, daemon=True).start()
 
     async def write(self, payload: str) -> None:
         if self._process.stdin is None:
             raise RuntimeError("textractor stdin is unavailable")
-        self._process.stdin.write(payload.encode("utf-8"))
-        await self._process.stdin.drain()
+        await asyncio.to_thread(self._process.stdin.write, payload.encode("utf-8"))
+        await asyncio.to_thread(self._process.stdin.flush)
 
     async def readline(self, timeout: float) -> str | None:
-        if self._process.stdout is None:
-            return None
+        """Read one line. Returns str on success, '' on EOF, None on timeout."""
         try:
-            raw = await asyncio.wait_for(self._process.stdout.readline(), timeout=timeout)
-        except asyncio.TimeoutError:
+            return await asyncio.to_thread(self._queue.get, timeout=timeout)
+        except queue.Empty:
             return None
-        if not raw:
-            return ""
-        return raw.decode("utf-8", errors="replace").rstrip("\r\n")
 
     def poll(self) -> int | None:
         return self._process.returncode
 
     async def terminate(self) -> None:
-        if self._process.stdin is not None and not self._process.stdin.is_closing():
-            self._process.stdin.close()
+        if self._process.stdin is not None and not self._process.stdin.closed:
+            try:
+                self._process.stdin.close()
+            except Exception:
+                pass
         if self._process.returncode is None:
             self._process.terminate()
 
     async def wait(self, timeout: float) -> int | None:
         try:
-            await asyncio.wait_for(self._process.wait(), timeout=timeout)
+            await asyncio.wait_for(asyncio.to_thread(self._process.wait), timeout=timeout)
         except asyncio.TimeoutError:
             if self._process.returncode is None:
                 self._process.kill()
-                await self._process.wait()
+                await asyncio.to_thread(self._process.wait)
         return self._process.returncode
 
 
 async def _default_process_factory(path: str) -> TextractorProcessHandle:
-    process = await asyncio.create_subprocess_exec(
+    process = await asyncio.to_thread(
+        subprocess.Popen,
         path,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
     )
     return _AsyncioTextractorHandle(process)
+
+
+def _is_event_loop_binding_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        "bound to a different event loop" in message
+        or "attached to a different loop" in message
+    )
 
 
 def _expand_candidate_path(raw_path: str) -> Path:
@@ -875,6 +916,22 @@ class MemoryReaderManager:
                     target.engine,
                 )
                 await self._process.write(f"attach -P{target.pid}\n")
+                # Send user-configured hook codes after attach (needed for IL2CPP etc.)
+                hook_codes = self._config.memory_reader_hook_codes
+                self._logger.info(
+                    "memory_reader hook_codes config: %s (count=%d)",
+                    hook_codes,
+                    len(hook_codes),
+                )
+                if hook_codes:
+                    self._logger.info(
+                        "memory_reader sending %d hook code(s) for %s(%s)",
+                        len(hook_codes),
+                        target.name,
+                        target.pid,
+                    )
+                    for code in hook_codes:
+                        await self._process.write(f"{code}\n")
             except Exception as exc:
                 self._runtime = MemoryReaderRuntime(
                     enabled=True,
@@ -908,7 +965,33 @@ class MemoryReaderManager:
                 last_event_ts=self._writer.last_event_ts,
             )
 
-        parsed_lines, log_lines, parse_warnings = await self._drain_stdout()
+        try:
+            parsed_lines, log_lines, parse_warnings = await self._drain_stdout()
+        except RuntimeError as exc:
+            if not _is_event_loop_binding_error(exc):
+                raise
+            self._logger.warning(
+                "memory_reader detected event-loop-bound Textractor handle; restarting: %s",
+                exc,
+            )
+            result.warnings.append(
+                "memory_reader Textractor handle was bound to a different event loop; restarting"
+            )
+            self._runtime.status = "backoff"
+            self._runtime.detail = "event_loop_mismatch"
+            self._backoff_until = now + 2.0
+            await self._stop_textractor()
+            self._attached_process = None
+            result.runtime = MemoryReaderRuntime(
+                enabled=True,
+                status="backoff",
+                detail="event_loop_mismatch",
+                game_id=self._writer.game_id,
+                session_id=self._writer.session_id,
+                last_seq=self._writer.last_seq,
+                last_event_ts=self._writer.last_event_ts,
+            ).to_dict()
+            return result
         result.warnings.extend(parse_warnings)
         engine_override = self._engine_from_logs(log_lines)
         if engine_override and self._writer.update_engine(engine_override):
