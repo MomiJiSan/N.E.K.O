@@ -4,7 +4,7 @@ name = "Galgame LLM Target"
 description = "Real single-entry LLM backend for galgame_bridge Phase 2 operations."
 short_description = "LLM target entry for explain, summarize, suggest, and agent_reply."
 keywords = ["galgame", "llm", "bridge", "visual novel", "agent"]
-version = "0.1.0"
+version = "0.5.0"
 type = "plugin"
 entry = "plugin.plugins.galgame_llm_target:GalgameLLMTargetPlugin"
 
