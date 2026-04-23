@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from plugin.sdk.shared.models import Err
 
+from .llm_backend import GalgameLLMBackend
 from .models import json_copy
 from .service import (
     build_explain_degraded_result,
@@ -19,10 +20,11 @@ _KEY_POINT_TYPES = frozenset({"plot", "emotion", "decision", "reveal", "objectiv
 
 
 class LLMGateway:
-    def __init__(self, plugin, logger, config) -> None:
+    def __init__(self, plugin, logger, config, *, backend: GalgameLLMBackend | None = None) -> None:
         self._plugin = plugin
         self._logger = logger
         self._config = config
+        self._backend = backend or GalgameLLMBackend(logger)
         self._lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -41,6 +43,7 @@ class LLMGateway:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._backend.shutdown()
 
     async def explain_line(self, context: dict[str, Any]) -> dict[str, Any]:
         return await self._invoke_cached(
@@ -160,7 +163,12 @@ class LLMGateway:
     ) -> dict[str, Any]:
         target_entry_ref = str(self._config.llm_target_entry_ref or "").strip()
         if not target_entry_ref:
-            return degraded("gateway_unavailable: target_entry_ref is not configured")
+            return await self._call_internal_backend(
+                operation=operation,
+                context=context,
+                validate=validate,
+                degraded=degraded,
+            )
 
         try:
             response = await asyncio.wait_for(
@@ -185,6 +193,37 @@ class LLMGateway:
 
         try:
             return validate(dict(response.value))
+        except Exception as exc:
+            return degraded(f"invalid_result: {exc}")
+
+    async def _call_internal_backend(
+        self,
+        *,
+        operation: str,
+        context: dict[str, Any],
+        validate: Callable[[dict[str, Any]], dict[str, Any]],
+        degraded: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            response = await asyncio.wait_for(
+                self._backend.invoke(
+                    operation=operation,
+                    context=context,
+                ),
+                timeout=float(self._config.llm_call_timeout_seconds) + 0.5,
+            )
+        except asyncio.TimeoutError:
+            return degraded("timeout: internal llm backend timed out")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return degraded(f"internal_error: {exc}")
+
+        if not isinstance(response, dict):
+            return degraded("invalid_result: internal llm backend returned non-object payload")
+
+        try:
+            return validate(dict(response))
         except Exception as exc:
             return degraded(f"invalid_result: {exc}")
 

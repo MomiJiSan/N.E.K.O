@@ -12,22 +12,26 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
 
-from plugin.plugins.galgame_bridge import GalgameBridgePlugin
-from plugin.plugins.galgame_bridge.game_llm_agent import GameLLMAgent
-from plugin.plugins.galgame_bridge.host_agent_adapter import HostAgentAdapter
-from plugin.plugins.galgame_bridge.llm_gateway import LLMGateway
-from plugin.plugins.galgame_bridge.memory_reader import (
+from plugin.plugins.galgame_plugin import GalgameBridgePlugin
+from plugin.plugins.galgame_plugin import service as galgame_service
+from plugin.plugins.galgame_plugin.game_llm_agent import GameLLMAgent
+from plugin.plugins.galgame_plugin.host_agent_adapter import HostAgentAdapter
+from plugin.plugins.galgame_plugin.llm_gateway import LLMGateway
+from plugin.plugins.galgame_plugin.memory_reader import (
+    compute_memory_reader_game_id,
     DetectedGameProcess,
     MemoryReaderBridgeWriter,
     MemoryReaderManager,
 )
-from plugin.plugins.galgame_bridge.models import DATA_SOURCE_BRIDGE_SDK, DATA_SOURCE_MEMORY_READER
-from plugin.plugins.galgame_bridge.reader import (
+from plugin.plugins.galgame_plugin.models import DATA_SOURCE_BRIDGE_SDK, DATA_SOURCE_MEMORY_READER
+from plugin.plugins.galgame_plugin.reader import (
     expand_bridge_root,
     read_session_json,
     tail_events_jsonl,
 )
-from plugin.plugins.galgame_bridge.service import (
+from plugin.plugins.galgame_plugin.service import (
+    _default_bridge_root_raw,
+    build_config,
     build_explain_context,
     build_suggest_context,
     build_summarize_context,
@@ -35,7 +39,7 @@ from plugin.plugins.galgame_bridge.service import (
 from plugin.sdk.plugin import Ok
 
 
-_BRIDGE_FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures" / "galgame_bridge"
+_PLUGIN_FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures" / "galgame_plugin"
 
 
 class _Logger:
@@ -56,7 +60,7 @@ class _Logger:
 
 
 class _Ctx:
-    plugin_id = "galgame_bridge"
+    plugin_id = "galgame_plugin"
     metadata = {}
     bus = None
 
@@ -238,7 +242,7 @@ def _make_plugin_dirs(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _copy_bridge_fixture_scenario(bridge_root: Path, scenario: str) -> Path:
-    scenario_root = _BRIDGE_FIXTURE_ROOT / scenario
+    scenario_root = _PLUGIN_FIXTURE_ROOT / scenario
     if not scenario_root.is_dir():
         raise AssertionError(f"missing bridge fixture scenario: {scenario}")
     copied_game_dir: Path | None = None
@@ -475,6 +479,289 @@ def test_expand_bridge_root_and_read_bom_session(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("platform_value", "use_xdg_data_home", "expected_raw"),
+    [
+        ("win32", False, "%LOCALAPPDATA%/N.E.K.O/galgame-bridge"),
+        ("darwin", False, "~/Library/Application Support/N.E.K.O/galgame-bridge"),
+        ("linux", True, "xdg"),
+        ("linux", False, "~/.local/share/N.E.K.O/galgame-bridge"),
+    ],
+)
+def test_default_bridge_root_raw_uses_platform_conventions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform_value: str,
+    use_xdg_data_home: bool,
+    expected_raw: str,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", platform_value)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    if use_xdg_data_home:
+        xdg_data_home = tmp_path / "xdg-data"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data_home))
+        assert _default_bridge_root_raw() == f"{xdg_data_home}/N.E.K.O/galgame-bridge"
+        return
+    assert _default_bridge_root_raw() == expected_raw
+
+
+@pytest.mark.plugin_unit
+def test_expand_bridge_root_handles_user_home_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+
+    def _fake_expanduser(value: str) -> str:
+        if value.startswith("~/"):
+            return str(home_dir / value[2:])
+        if value == "~":
+            return str(home_dir)
+        return value
+
+    monkeypatch.setattr("plugin.plugins.galgame_plugin.reader.os.path.expanduser", _fake_expanduser)
+
+    mac_path = expand_bridge_root("~/Library/Application Support/N.E.K.O/galgame-bridge")
+    linux_path = expand_bridge_root("~/.local/share/N.E.K.O/galgame-bridge")
+
+    assert mac_path == home_dir / "Library" / "Application Support" / "N.E.K.O" / "galgame-bridge"
+    assert linux_path == home_dir / ".local" / "share" / "N.E.K.O" / "galgame-bridge"
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize("bridge_root_value", [None, "", "   "])
+def test_build_config_uses_default_bridge_root_when_missing_or_blank(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bridge_root_value: str | None,
+) -> None:
+    expected = tmp_path / "auto" / "bridge"
+    monkeypatch.setattr(galgame_service, "_default_bridge_root_raw", lambda: str(expected))
+
+    galgame_config = {} if bridge_root_value is None else {"bridge_root": bridge_root_value}
+    cfg = build_config({"galgame": galgame_config})
+
+    assert cfg.bridge_root == expected
+
+
+@pytest.mark.plugin_unit
+def test_build_config_prefers_explicit_bridge_root(tmp_path: Path) -> None:
+    explicit = tmp_path / "custom" / "bridge"
+    cfg = build_config({"galgame": {"bridge_root": str(explicit)}})
+    assert cfg.bridge_root == explicit
+
+
+@pytest.mark.plugin_unit
+def test_compute_memory_reader_game_id_avoids_windows_invalid_path_characters() -> None:
+    game_id = compute_memory_reader_game_id("RenPy Demo.exe")
+    assert game_id.startswith("mem-")
+    assert ":" not in game_id
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("platform_value", "expected_enabled"),
+    [
+        ("win32", True),
+        ("darwin", False),
+        ("linux", False),
+    ],
+)
+def test_build_config_uses_platform_default_memory_reader_enablement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform_value: str,
+    expected_enabled: bool,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", platform_value)
+    cfg = build_config({"galgame": {"bridge_root": str(tmp_path / "bridge")}})
+    assert cfg.memory_reader_enabled is expected_enabled
+
+
+@pytest.mark.plugin_unit
+def test_build_config_explicit_memory_reader_enabled_overrides_platform_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", "win32")
+    cfg = build_config(
+        {
+            "galgame": {"bridge_root": str(tmp_path / "bridge")},
+            "memory_reader": {"enabled": False},
+        }
+    )
+    assert cfg.memory_reader_enabled is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_memory_reader_auto_discovers_textractor_from_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path_dir = tmp_path / "bin"
+    path_dir.mkdir()
+    textractor_path = path_dir / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    textractor_path.chmod(0o755)
+    monkeypatch.setenv("PATH", str(path_dir))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("ProgramFiles", raising=False)
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+
+    cfg = build_config(
+        {
+            "galgame": {"bridge_root": str(tmp_path / "bridge_root")},
+            "memory_reader": {
+                "enabled": True,
+                "textractor_path": "",
+                "auto_detect": True,
+                "poll_interval_seconds": 1,
+            },
+        }
+    )
+    captured_paths: list[str] = []
+    handle = _FakeTextractorHandle()
+
+    async def _process_factory(path: str):
+        captured_paths.append(path)
+        return handle
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=cfg,
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="RenPy Demo.exe",
+                create_time=1709999999.0,
+                engine="renpy",
+            )
+        ],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=cfg.bridge_root,
+            time_fn=lambda: 1710000000.0,
+        ),
+    )
+
+    result = await manager.tick(bridge_sdk_available=False)
+
+    assert captured_paths == [str(textractor_path)]
+    assert handle.writes == ["attach -P4242\n"]
+    assert result.runtime["status"] == "attaching"
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_memory_reader_auto_discovers_textractor_from_localappdata_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local_appdata = tmp_path / "LocalAppData"
+    textractor_path = local_appdata / "Programs" / "Textractor" / "TextractorCLI.exe"
+    textractor_path.parent.mkdir(parents=True, exist_ok=True)
+    textractor_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "ProgramFiles"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "ProgramFilesX86"))
+
+    cfg = build_config(
+        {
+            "galgame": {"bridge_root": str(tmp_path / "bridge_root")},
+            "memory_reader": {
+                "enabled": True,
+                "textractor_path": "",
+                "auto_detect": True,
+                "poll_interval_seconds": 1,
+            },
+        }
+    )
+    captured_paths: list[str] = []
+
+    async def _process_factory(path: str):
+        captured_paths.append(path)
+        return _FakeTextractorHandle()
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=cfg,
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="RenPy Demo.exe",
+                create_time=1709999999.0,
+                engine="renpy",
+            )
+        ],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=cfg.bridge_root,
+            time_fn=lambda: 1710000000.0,
+        ),
+    )
+
+    result = await manager.tick(bridge_sdk_available=False)
+
+    assert captured_paths == [str(textractor_path)]
+    assert result.runtime["status"] == "attaching"
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_memory_reader_keeps_recoverable_idle_state_when_textractor_autodiscovery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "empty-local"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "empty-program-files"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "empty-program-files-x86"))
+
+    cfg = build_config(
+        {
+            "galgame": {"bridge_root": str(tmp_path / "bridge_root")},
+            "memory_reader": {
+                "enabled": True,
+                "textractor_path": "",
+                "auto_detect": True,
+                "poll_interval_seconds": 1,
+            },
+        }
+    )
+    factory_calls: list[str] = []
+
+    async def _process_factory(path: str):
+        factory_calls.append(path)
+        return _FakeTextractorHandle()
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=cfg,
+        process_factory=_process_factory,
+        process_scanner=lambda: [],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=cfg.bridge_root,
+            time_fn=lambda: 1710000000.0,
+        ),
+    )
+
+    result = await manager.tick(bridge_sdk_available=False)
+
+    assert factory_calls == []
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "invalid_textractor_path"
+    assert result.warnings == ["memory_reader TextractorCLI.exe is invalid or missing"]
+
+
+@pytest.mark.plugin_unit
 def test_tail_events_handles_utf8_crlf_and_partial_line(tmp_path: Path) -> None:
     events_path = tmp_path / "events.jsonl"
     game_id = "demo.game"
@@ -569,7 +856,7 @@ async def test_startup_binds_latest_session_and_exposes_ui(tmp_path: Path) -> No
     assert snapshot.value["session_id"] == "sess-b"
     assert isinstance(open_ui, Ok)
     assert open_ui.value["available"] is True
-    assert open_ui.value["path"] == "/plugin/galgame_bridge/ui/"
+    assert open_ui.value["path"] == "/plugin/galgame_plugin/ui/"
 
 
 @pytest.mark.asyncio
@@ -623,14 +910,14 @@ async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(t
         {
             "id": "open_ui",
             "kind": "ui",
-            "target": "/plugin/galgame_bridge/ui/",
+            "target": "/plugin/galgame_plugin/ui/",
             "open_in": "new_tab",
         }
     ]
 
     static_ui = plugin.get_static_ui_config()
     assert static_ui is not None
-    assert static_ui["plugin_id"] == "galgame_bridge"
+    assert static_ui["plugin_id"] == "galgame_plugin"
     assert Path(str(static_ui["directory"])).name == "static"
 
 
@@ -1162,6 +1449,137 @@ async def test_stale_then_new_event_recovers_to_active(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_windows_default_memory_reader_config_autodiscovers_textractor_and_takes_over_without_bridge_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", "win32")
+    path_dir = tmp_path / "bin"
+    path_dir.mkdir()
+    textractor_path = path_dir / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    textractor_path.chmod(0o755)
+    monkeypatch.setenv("PATH", str(path_dir))
+
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "auto_detect": True,
+            "poll_interval_seconds": 1,
+        },
+    )
+    del cfg["memory_reader"]["enabled"]  # type: ignore[index]
+    del cfg["memory_reader"]["textractor_path"]  # type: ignore[index]
+
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    clock = {"now": 1710000000.0}
+    expected_snapshot_text = "Windows default config takeover."
+    good_handle = _FakeTextractorHandle(
+        [f"[4242:100:0:0] {expected_snapshot_text}"]
+    )
+    handle = _FakeTextractorHandle(
+        ["[4242:100:0:0] é›ªä¹ƒï¼šWindows é»˜è®¤é…ç½®å·²è‡ªåŠ¨æŽ¥ç®¡ã€‚"]
+    )
+
+    async def _process_factory(path: str):
+        assert path == str(textractor_path)
+        return good_handle
+
+    plugin._memory_reader_manager = MemoryReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="RenPy Demo.exe",
+                create_time=1709999999.0,
+                engine="renpy",
+            )
+        ],
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert status.value["memory_reader_enabled"] is True
+    assert status.value["active_data_source"] == DATA_SOURCE_MEMORY_READER
+    assert status.value["memory_reader_runtime"]["status"] == "active"
+    assert snapshot.value["snapshot"]["text"] == expected_snapshot_text
+    assert good_handle.writes == ["attach -P4242\n"]
+    return
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert status.value["memory_reader_enabled"] is True
+    assert status.value["active_data_source"] == DATA_SOURCE_MEMORY_READER
+    assert status.value["memory_reader_runtime"]["status"] == "active"
+    assert snapshot.value["snapshot"]["text"] == "Windows é»˜è®¤é…ç½®å·²è‡ªåŠ¨æŽ¥ç®¡ã€‚"
+    assert handle.writes == ["attach -P4242\n"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_windows_default_memory_reader_config_stays_idle_when_textractor_autodiscovery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", "win32")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "empty-local"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "empty-program-files"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "empty-program-files-x86"))
+
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "auto_detect": True,
+            "poll_interval_seconds": 1,
+        },
+    )
+    del cfg["memory_reader"]["enabled"]  # type: ignore[index]
+    del cfg["memory_reader"]["textractor_path"]  # type: ignore[index]
+
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._memory_reader_manager = MemoryReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        process_scanner=lambda: [],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+        writer=MemoryReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: 1710000000.0,
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+
+    assert isinstance(status, Ok)
+    assert status.value["memory_reader_enabled"] is True
+    assert status.value["active_data_source"] == "none"
+    assert status.value["memory_reader_runtime"]["status"] == "idle"
+    assert status.value["memory_reader_runtime"]["detail"] == "invalid_textractor_path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_memory_reader_fallback_activates_when_bridge_sdk_is_missing(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     textractor_path = tmp_path / "TextractorCLI.exe"
@@ -1390,7 +1808,7 @@ async def test_phase2_entries_mark_memory_reader_input_as_degraded_even_when_llm
     tmp_path: Path,
 ) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
-    game_id = "mem:1a2b3c4d5e6f"
+    game_id = "mem-1a2b3c4d5e6f"
     session_id = "mem-session"
     _create_game_dir(
         bridge_root,

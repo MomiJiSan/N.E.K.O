@@ -353,7 +353,7 @@ class GameLLMAgent:
             return
         ts = str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         self._plugin.push_message(
-            source="galgame_bridge",
+            source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
             message_type="proactive_notification",
             description=f"Galgame Agent · {kind}",
             priority=6,

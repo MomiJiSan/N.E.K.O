@@ -5,15 +5,7 @@ import json
 import re
 from typing import Any
 
-from plugin.sdk.plugin import (
-    Err,
-    NekoPluginBase,
-    Ok,
-    SdkError,
-    lifecycle,
-    neko_plugin,
-    plugin_entry,
-)
+from plugin.sdk.plugin import SdkError
 
 from utils.config_manager import get_config_manager
 from utils.file_utils import robust_json_loads
@@ -47,21 +39,13 @@ def _strip_code_fences(raw_text: str) -> str:
     return text
 
 
-@neko_plugin
-class GalgameLLMTargetPlugin(NekoPluginBase):
-    def __init__(self, ctx):
-        super().__init__(ctx)
-        self.file_logger = self.enable_file_logging(log_level="INFO")
-        self.logger = self.file_logger
+class GalgameLLMBackend:
+    def __init__(self, logger) -> None:
+        self._logger = logger
         self._llm_cache: dict[tuple[Any, ...], ChatOpenAI] = {}
         self._llm_cache_lock = asyncio.Lock()
 
-    @lifecycle(id="startup")
-    async def startup(self, **_):
-        return Ok({"status": "ready"})
-
-    @lifecycle(id="shutdown")
-    async def shutdown(self, **_):
+    async def shutdown(self) -> None:
         async with self._llm_cache_lock:
             llms = list(self._llm_cache.values())
             self._llm_cache.clear()
@@ -70,43 +54,18 @@ class GalgameLLMTargetPlugin(NekoPluginBase):
                 await llm.aclose()
             except Exception:
                 pass
-        return Ok({"status": "stopped"})
 
-    @plugin_entry(
-        id="galgame_llm_target_invoke",
-        name="Galgame LLM Target Invoke",
-        description="Internal single-entry LLM target for galgame_bridge Phase 2.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": sorted(_ALLOWED_OPERATIONS),
-                },
-                "context": {"type": "object"},
-            },
-            "required": ["operation", "context"],
-        },
-        timeout=45.0,
-        llm_result_fields=["reply", "summary", "explanation"],
-    )
-    async def galgame_llm_target_invoke(
+    async def invoke(
         self,
+        *,
         operation: str,
         context: dict[str, Any],
-        **_,
-    ):
+    ) -> dict[str, Any]:
         if operation not in _ALLOWED_OPERATIONS:
-            return Err(SdkError(f"unsupported operation: {operation!r}"))
+            raise SdkError(f"unsupported operation: {operation!r}")
         if not isinstance(context, dict):
-            return Err(SdkError("context must be an object"))
-        try:
-            payload = await self._invoke_operation(operation, dict(context))
-        except SdkError as exc:
-            return Err(exc)
-        except Exception as exc:
-            return Err(SdkError(f"galgame_llm_target invoke failed: {exc}"))
-        return Ok(payload)
+            raise SdkError("context must be an object")
+        return await self._invoke_operation(operation, dict(context))
 
     async def _invoke_operation(
         self,

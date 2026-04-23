@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -49,6 +51,25 @@ def _coerce_int(value: object, default: int, *, minimum: int) -> int:
     return parsed
 
 
+def _coerce_bool(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _default_bridge_root_raw() -> str:
+    if sys.platform.startswith("win"):
+        return "%LOCALAPPDATA%/N.E.K.O/galgame-bridge"
+    if sys.platform == "darwin":
+        return "~/Library/Application Support/N.E.K.O/galgame-bridge"
+    xdg_data_home = str(os.getenv("XDG_DATA_HOME") or "").strip()
+    if xdg_data_home:
+        return f"{xdg_data_home}/N.E.K.O/galgame-bridge"
+    return "~/.local/share/N.E.K.O/galgame-bridge"
+
+
+def _default_memory_reader_enabled() -> bool:
+    return sys.platform.startswith("win")
+
+
 def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
     galgame = raw_config.get("galgame")
     llm = raw_config.get("llm")
@@ -64,9 +85,10 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         if isinstance(default_mode_obj, str) and default_mode_obj in MODES
         else MODE_COMPANION
     )
-    bridge_root_raw = str(
-        galgame_obj.get("bridge_root") or "%LOCALAPPDATA%/N.E.K.O/galgame-bridge"
-    )
+    bridge_root_value = galgame_obj.get("bridge_root")
+    bridge_root_raw = str(bridge_root_value).strip() if bridge_root_value is not None else ""
+    if not bridge_root_raw:
+        bridge_root_raw = _default_bridge_root_raw()
 
     return GalgameConfig(
         bridge_root=expand_bridge_root(bridge_root_raw),
@@ -107,7 +129,10 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             llm_obj.get("llm_request_cache_ttl_seconds"), 2.0, minimum=0.0
         ),
         llm_target_entry_ref=str(llm_obj.get("target_entry_ref") or "").strip(),
-        memory_reader_enabled=bool(memory_reader_obj.get("enabled", False)),
+        memory_reader_enabled=_coerce_bool(
+            memory_reader_obj.get("enabled"),
+            _default_memory_reader_enabled(),
+        ),
         memory_reader_textractor_path=str(memory_reader_obj.get("textractor_path") or ""),
         memory_reader_auto_detect=bool(memory_reader_obj.get("auto_detect", True)),
         memory_reader_poll_interval_seconds=_coerce_float(
@@ -158,7 +183,7 @@ def infer_session_data_source(session: dict[str, Any]) -> str:
         return DATA_SOURCE_MEMORY_READER
     if str(session.get("bridge_sdk_version") or "").startswith("memory-reader-"):
         return DATA_SOURCE_MEMORY_READER
-    if str(session.get("game_id") or "").startswith("mem:"):
+    if str(session.get("game_id") or "").startswith(("mem:", "mem-")):
         return DATA_SOURCE_MEMORY_READER
     return DATA_SOURCE_BRIDGE_SDK
 

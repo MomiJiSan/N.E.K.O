@@ -5,14 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from plugin.plugins.galgame_bridge.memory_reader import (
+from plugin.plugins.galgame_plugin.memory_reader import (
     DetectedGameProcess,
     MemoryReaderBridgeWriter,
     MemoryReaderManager,
     _default_process_scanner,
 )
-from plugin.plugins.galgame_bridge.reader import read_session_json, tail_events_jsonl
-from plugin.plugins.galgame_bridge.service import build_config
+from plugin.plugins.galgame_plugin.reader import read_session_json, tail_events_jsonl
+from plugin.plugins.galgame_plugin.service import build_config
 
 
 pytestmark = pytest.mark.plugin_unit
@@ -172,7 +172,7 @@ def test_default_process_scanner_orders_candidates_by_create_time_then_pid(
         ]
     )
     monkeypatch.setattr(
-        "plugin.plugins.galgame_bridge.memory_reader.psutil",
+        "plugin.plugins.galgame_plugin.memory_reader.psutil",
         fake_psutil,
     )
 

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -27,10 +28,12 @@ from .reader import normalize_text
 
 MEMORY_READER_VERSION = "0.1.0"
 MEMORY_READER_BRIDGE_VERSION = f"memory-reader-{MEMORY_READER_VERSION}"
+MEMORY_READER_GAME_ID_PREFIX = "mem-"
 MEMORY_READER_UNKNOWN_SCENE = "mem:unknown_scene"
 MEMORY_READER_ROUTE_ID = ""
 MEMORY_READER_DEFAULT_ENGINE = "unknown"
 MEMORY_READER_MAX_HOOK_CACHE = 256
+TEXTRACTOR_EXECUTABLE = "TextractorCLI.exe"
 _MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
 _SPEAKER_QUOTE_RE = re.compile(r"^\s*([^「」:：]{1,40})[「『](.+)[」』]\s*$")
 _SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
@@ -47,7 +50,7 @@ def utc_now_iso(now: float | None = None) -> str:
 
 def compute_memory_reader_game_id(process_name: str) -> str:
     digest = hashlib.sha1(process_name.encode("utf-8")).hexdigest()[:12]
-    return f"mem:{digest}"
+    return f"{MEMORY_READER_GAME_ID_PREFIX}{digest}"
 
 
 def _coerce_choice_lines(lines: list[str]) -> list[str]:
@@ -202,6 +205,62 @@ async def _default_process_factory(path: str) -> TextractorProcessHandle:
         stderr=asyncio.subprocess.STDOUT,
     )
     return _AsyncioTextractorHandle(process)
+
+
+def _expand_candidate_path(raw_path: str) -> Path:
+    return Path(os.path.expanduser(os.path.expandvars(raw_path)))
+
+
+def _candidate_path_from_env(env_name: str, *parts: str) -> Path | None:
+    base = str(os.getenv(env_name) or "").strip()
+    if not base:
+        return None
+    return Path(base).joinpath(*parts)
+
+
+def _iter_textractor_candidates(configured_path: str) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(candidate: Path | None) -> None:
+        if candidate is None:
+            return
+        key = os.path.normcase(str(candidate))
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(candidate)
+
+    configured = str(configured_path or "").strip()
+    if configured:
+        _add(_expand_candidate_path(configured))
+    path_hit = shutil.which(TEXTRACTOR_EXECUTABLE)
+    if path_hit:
+        _add(Path(path_hit))
+    _add(
+        _candidate_path_from_env(
+            "LOCALAPPDATA",
+            "Programs",
+            "Textractor",
+            TEXTRACTOR_EXECUTABLE,
+        )
+    )
+    _add(_candidate_path_from_env("ProgramFiles", "Textractor", TEXTRACTOR_EXECUTABLE))
+    _add(
+        _candidate_path_from_env(
+            "ProgramFiles(x86)",
+            "Textractor",
+            TEXTRACTOR_EXECUTABLE,
+        )
+    )
+    return candidates
+
+
+def resolve_textractor_path(configured_path: str) -> str:
+    for candidate in _iter_textractor_candidates(configured_path):
+        if candidate.is_file():
+            return str(candidate)
+    return ""
 
 
 def _loaded_module_names(proc: Any) -> set[str]:
@@ -667,15 +726,15 @@ class MemoryReaderManager:
             result.warnings.append("memory_reader is Windows-only")
             result.runtime = self._runtime.to_dict()
             return result
-        textractor_path = str(self._config.memory_reader_textractor_path or "").strip()
-        if not textractor_path or not Path(textractor_path).is_file():
+        textractor_path = resolve_textractor_path(self._config.memory_reader_textractor_path)
+        if not textractor_path:
             await self._stop_textractor()
             self._runtime = MemoryReaderRuntime(
                 enabled=True,
                 status="idle",
                 detail="invalid_textractor_path",
             )
-            result.warnings.append("memory_reader.textractor_path is invalid or missing")
+            result.warnings.append("memory_reader TextractorCLI.exe is invalid or missing")
             result.runtime = self._runtime.to_dict()
             return result
         if not self._config.memory_reader_auto_detect:

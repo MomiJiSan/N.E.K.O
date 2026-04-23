@@ -64,7 +64,7 @@ from .ui_api import build_open_ui_payload
 
 
 @neko_plugin
-class GalgameBridgePlugin(NekoPluginBase):
+class GalgamePlugin(NekoPluginBase):
     def __init__(self, ctx):
         super().__init__(ctx)
         self.file_logger = self.enable_file_logging(log_level="INFO")
@@ -214,7 +214,7 @@ class GalgameBridgePlugin(NekoPluginBase):
             self._record_error(
                 make_error(f"load config failed: {exc}", source="config", kind="error")
             )
-            return Err(SdkError(f"failed to load galgame_bridge config: {exc}"))
+            return Err(SdkError(f"failed to load galgame_plugin config: {exc}"))
 
         try:
             restored, warnings = self._persist.load()
@@ -223,7 +223,7 @@ class GalgameBridgePlugin(NekoPluginBase):
             self._record_error(
                 make_error(f"restore store failed: {exc}", source="store", kind="error")
             )
-            return Err(SdkError(f"failed to restore galgame_bridge store: {exc}"))
+            return Err(SdkError(f"failed to restore galgame_plugin store: {exc}"))
 
         self._host_agent_adapter = HostAgentAdapter(self.logger)
         self._llm_gateway = LLMGateway(self, self.logger, self._cfg)
@@ -554,14 +554,14 @@ class GalgameBridgePlugin(NekoPluginBase):
 
     @plugin_entry(
         id="galgame_get_status",
-        name="获取 galgame bridge 状态",
+        name="获取 galgame 插件状态",
         description="返回当前 bridge 连接状态、绑定游戏、最近错误与模式。",
         input_schema={"type": "object", "properties": {}},
         llm_result_fields=["summary"],
     )
     async def galgame_get_status(self, **_):
         if self._cfg is None:
-            return Err(SdkError("galgame_bridge is not configured"))
+            return Err(SdkError("galgame_plugin is not configured"))
         with self._state_lock:
             payload = build_status_payload(self._state, config=self._cfg)
         return Ok(payload)
@@ -685,7 +685,7 @@ class GalgameBridgePlugin(NekoPluginBase):
     @plugin_entry(
         id="galgame_open_ui",
         name="打开 galgame UI",
-        description="返回 galgame_bridge 静态 UI 的访问路径。",
+        description="返回 galgame_plugin 静态 UI 的访问路径。",
         input_schema={"type": "object", "properties": {}},
         llm_result_fields=["message"],
     )
@@ -709,7 +709,7 @@ class GalgameBridgePlugin(NekoPluginBase):
     )
     async def galgame_explain_line(self, line_id: str = "", **_):
         if self._llm_gateway is None:
-            return Err(SdkError("galgame_bridge llm_gateway is not initialized"))
+            return Err(SdkError("galgame_plugin llm_gateway is not initialized"))
         local = self._snapshot_state()
         try:
             context = build_explain_context(local, line_id=line_id.strip())
@@ -737,7 +737,7 @@ class GalgameBridgePlugin(NekoPluginBase):
     )
     async def galgame_summarize_scene(self, scene_id: str = "", **_):
         if self._llm_gateway is None:
-            return Err(SdkError("galgame_bridge llm_gateway is not initialized"))
+            return Err(SdkError("galgame_plugin llm_gateway is not initialized"))
         local = self._snapshot_state()
         context = build_summarize_context(local, scene_id=scene_id.strip())
         payload = apply_input_degraded_result(
@@ -757,7 +757,7 @@ class GalgameBridgePlugin(NekoPluginBase):
     )
     async def galgame_suggest_choice(self, **_):
         if self._llm_gateway is None:
-            return Err(SdkError("galgame_bridge llm_gateway is not initialized"))
+            return Err(SdkError("galgame_plugin llm_gateway is not initialized"))
         local = self._snapshot_state()
         context = build_suggest_context(local)
         if not context["visible_choices"]:
@@ -811,7 +811,7 @@ class GalgameBridgePlugin(NekoPluginBase):
         **_,
     ):
         if self._game_agent is None:
-            return Err(SdkError("galgame_bridge game agent is not initialized"))
+            return Err(SdkError("galgame_plugin game agent is not initialized"))
         local = self._snapshot_state()
         if action == "query_status":
             return Ok(await self._game_agent.query_status(local))
@@ -838,3 +838,6 @@ class GalgameBridgePlugin(NekoPluginBase):
                 return Err(SdkError("standby is required for set_standby"))
             return Ok(await self._game_agent.set_standby(local, standby=bool(standby)))
         return Err(SdkError(f"unsupported agent action: {action!r}"))
+
+
+GalgameBridgePlugin = GalgamePlugin

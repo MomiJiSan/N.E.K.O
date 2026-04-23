@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from plugin.plugins.galgame_bridge import GalgameBridgePlugin
+from plugin.plugins.galgame_plugin import GalgameBridgePlugin
 from plugin.sdk.plugin import Ok
 
 
@@ -32,7 +32,7 @@ class _Logger:
 
 
 class _Ctx:
-    plugin_id = "galgame_bridge"
+    plugin_id = "galgame_plugin"
     metadata = {}
     bus = None
 
@@ -325,7 +325,7 @@ async def test_galgame_agent_set_standby_entry_interrupts_awaiting_bridge(
 
 
 @pytest.mark.asyncio
-async def test_galgame_bridge_tick_recovers_after_temporary_host_unavailable(
+async def test_galgame_plugin_tick_recovers_after_temporary_host_unavailable(
     tmp_path: Path,
 ) -> None:
     plugin, _ctx = await _make_active_plugin(tmp_path)

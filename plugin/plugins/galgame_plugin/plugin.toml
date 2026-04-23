@@ -1,0 +1,59 @@
+[plugin]
+id = "galgame_plugin"
+name = "Galgame游玩助手"
+description = "让猫娘陪伴你一起玩galgame"
+short_description = "Monitor galgame sessions, bridge data, memory-reader fallback, and the plugin UI."
+keywords = ["galgame", "bridge", "renpy", "visual novel", "game state", "剧情", "台词", "选项"]
+version = "0.1.0"
+type = "plugin"
+entry = "plugin.plugins.galgame_plugin:GalgamePlugin"
+
+[plugin.author]
+name = "N.E.K.O Team"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[plugin.store]
+enabled = true
+
+[galgame]
+# Leave empty to use the platform default bridge root.
+# Windows: %LOCALAPPDATA%/N.E.K.O/galgame-bridge
+# macOS: ~/Library/Application Support/N.E.K.O/galgame-bridge
+# Linux/other: XDG_DATA_HOME/N.E.K.O/galgame-bridge, or ~/.local/share/N.E.K.O/galgame-bridge
+bridge_root = ""
+active_poll_interval_seconds = 1
+idle_poll_interval_seconds = 3
+stale_after_seconds = 15
+history_events_limit = 500
+history_lines_limit = 200
+history_choices_limit = 50
+dedupe_window_limit = 64
+warmup_replay_bytes_limit = 65536
+warmup_replay_events_limit = 50
+default_mode = "companion"
+push_notifications = true
+
+[llm]
+llm_call_timeout_seconds = 15
+llm_max_in_flight = 2
+llm_request_cache_ttl_seconds = 2
+# Leave empty to use the built-in galgame_plugin LLM backend.
+# Set a plugin entry ref only for advanced development overrides.
+target_entry_ref = ""
+
+[memory_reader]
+# Leave `enabled` unset to use platform defaults.
+# Windows: enabled by default and only takes over when Bridge SDK has no usable session.
+# macOS/Linux: disabled by default.
+# Leave `textractor_path` empty on Windows to auto-discover TextractorCLI.exe from PATH
+# or common install locations under LOCALAPPDATA / Program Files.
+textractor_path = ""
+auto_detect = true
+poll_interval_seconds = 1

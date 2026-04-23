@@ -17,8 +17,8 @@ pytestmark = pytest.mark.plugin_integration
 
 
 @pytest.fixture
-def galgame_bridge_plugin_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "plugins" / "galgame_bridge"
+def galgame_plugin_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "plugins" / "galgame_plugin"
 
 
 @pytest.fixture
@@ -37,27 +37,27 @@ async def plugin_ui_async_client(plugin_ui_test_app: FastAPI) -> AsyncIterator[A
 
 
 @pytest.fixture
-def registered_galgame_bridge_meta(galgame_bridge_plugin_dir: Path) -> Iterator[None]:
+def registered_galgame_plugin_meta(galgame_plugin_dir: Path) -> Iterator[None]:
     plugins_backup = copy.deepcopy(state.plugins)
     try:
         with state.acquire_plugins_write_lock():
             state.plugins.clear()
-            state.plugins["galgame_bridge"] = {
-                "id": "galgame_bridge",
-                "name": "Galgame Bridge",
-                "config_path": str(galgame_bridge_plugin_dir / "plugin.toml"),
+            state.plugins["galgame_plugin"] = {
+                "id": "galgame_plugin",
+                "name": "Galgame Plugin",
+                "config_path": str(galgame_plugin_dir / "plugin.toml"),
                 "static_ui_config": {
                     "enabled": True,
-                    "directory": str(galgame_bridge_plugin_dir / "static"),
+                    "directory": str(galgame_plugin_dir / "static"),
                     "index_file": "index.html",
                     "cache_control": "no-store, no-cache, must-revalidate, max-age=0",
-                    "plugin_id": "galgame_bridge",
+                    "plugin_id": "galgame_plugin",
                 },
                 "list_actions": [
                     {
                         "id": "open_ui",
                         "kind": "ui",
-                        "target": "/plugin/galgame_bridge/ui/",
+                        "target": "/plugin/galgame_plugin/ui/",
                         "open_in": "new_tab",
                     }
                 ],
@@ -70,26 +70,26 @@ def registered_galgame_bridge_meta(galgame_bridge_plugin_dir: Path) -> Iterator[
 
 
 @pytest.mark.asyncio
-async def test_galgame_bridge_ui_index_route_serves_static_dashboard(
+async def test_galgame_plugin_ui_index_route_serves_static_dashboard(
     plugin_ui_async_client: AsyncClient,
-    registered_galgame_bridge_meta,
+    registered_galgame_plugin_meta,
 ) -> None:
-    response = await plugin_ui_async_client.get("/plugin/galgame_bridge/ui/")
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/")
 
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
-    assert "<title>Galgame Bridge</title>" in response.text
+    assert "<title>Galgame Plugin</title>" in response.text
     assert "N.E.K.O Phase 2" in response.text
     assert "Game LLM Agent 的运行状态与推送记录" in response.text
 
 
 @pytest.mark.asyncio
-async def test_galgame_bridge_ui_script_uses_runs_api_only(
+async def test_galgame_plugin_ui_script_uses_runs_api_only(
     plugin_ui_async_client: AsyncClient,
-    registered_galgame_bridge_meta,
+    registered_galgame_plugin_meta,
 ) -> None:
-    response = await plugin_ui_async_client.get("/plugin/galgame_bridge/ui/main.js")
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/main.js")
 
     assert response.status_code == 200
     assert "javascript" in response.headers["content-type"]
@@ -107,18 +107,18 @@ async def test_galgame_bridge_ui_script_uses_runs_api_only(
 
 
 @pytest.mark.asyncio
-async def test_galgame_bridge_ui_info_reports_registered_assets(
+async def test_galgame_plugin_ui_info_reports_registered_assets(
     plugin_ui_async_client: AsyncClient,
-    registered_galgame_bridge_meta,
+    registered_galgame_plugin_meta,
 ) -> None:
-    response = await plugin_ui_async_client.get("/plugin/galgame_bridge/ui-info")
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui-info")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["plugin_id"] == "galgame_bridge"
+    assert payload["plugin_id"] == "galgame_plugin"
     assert payload["has_ui"] is True
     assert payload["explicitly_registered"] is True
-    assert payload["ui_path"] == "/plugin/galgame_bridge/ui/"
+    assert payload["ui_path"] == "/plugin/galgame_plugin/ui/"
     assert payload["static_files_count"] >= 3
     assert "index.html" in payload["static_files"]
     assert "main.js" in payload["static_files"]
@@ -126,11 +126,11 @@ async def test_galgame_bridge_ui_info_reports_registered_assets(
 
 
 @pytest.mark.asyncio
-async def test_galgame_bridge_ui_rejects_path_traversal(
+async def test_galgame_plugin_ui_rejects_path_traversal(
     plugin_ui_async_client: AsyncClient,
-    registered_galgame_bridge_meta,
+    registered_galgame_plugin_meta,
 ) -> None:
-    response = await plugin_ui_async_client.get("/plugin/galgame_bridge/ui/%2e%2e/plugin.toml")
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/%2e%2e/plugin.toml")
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Access denied: path traversal detected"

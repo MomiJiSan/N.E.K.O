@@ -1,4 +1,4 @@
-const PLUGIN_ID = 'galgame_bridge';
+const PLUGIN_ID = 'galgame_plugin';
 const RUNS_URL = '/runs';
 
 let latestAgentReply = '暂无交互';

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from plugin.plugins.galgame_bridge import GalgameBridgePlugin
-from plugin.plugins.galgame_bridge.memory_reader import (
+from plugin.plugins.galgame_plugin import GalgameBridgePlugin
+from plugin.plugins.galgame_plugin.memory_reader import (
     DetectedGameProcess,
     MemoryReaderBridgeWriter,
     MemoryReaderManager,
@@ -35,7 +35,7 @@ class _Logger:
 
 
 class _Ctx:
-    plugin_id = "galgame_bridge"
+    plugin_id = "galgame_plugin"
     metadata = {}
     bus = None
 
@@ -386,7 +386,7 @@ async def test_memory_reader_phase2_entries_and_agent_commands_stay_callable_in_
     startup = await plugin.startup()
     assert isinstance(startup, Ok)
 
-    game_id = "mem:417f0b11d197"
+    game_id = "mem-417f0b11d197"
     session_id = "mem-phase2-session"
     game_dir = bridge_root / game_id
     game_dir.mkdir(parents=True, exist_ok=True)
