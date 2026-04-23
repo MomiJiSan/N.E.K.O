@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,12 +15,19 @@ from .models import DATA_SOURCE_OCR_READER, GalgameConfig
 from .reader import normalize_text
 from .tesseract_support import inspect_tesseract_installation, resolve_tesseract_path
 
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
+
 OCR_READER_VERSION = "0.1.0"
 OCR_READER_BRIDGE_VERSION = f"ocr-reader-{OCR_READER_VERSION}"
 OCR_READER_GAME_ID_PREFIX = "ocr-"
 OCR_READER_UNKNOWN_SCENE = "ocr:unknown_scene"
 OCR_READER_ROUTE_ID = ""
 OCR_READER_DEFAULT_ENGINE = "unknown"
+
+_MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -28,6 +37,21 @@ def utc_now_iso(now: float | None = None) -> str:
 def _ocr_game_id_from_process(name: str) -> str:
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
     return f"{OCR_READER_GAME_ID_PREFIX}{digest}"
+
+
+def _coerce_choice_lines(lines: list[str]) -> list[str]:
+    if len(lines) < 2:
+        return []
+    choices: list[str] = []
+    for line in lines:
+        match = _MENU_PREFIX_RE.match(line)
+        if match is None:
+            return []
+        text = match.group(1).strip()
+        if not text:
+            return []
+        choices.append(text)
+    return choices
 
 
 @dataclass(slots=True)
@@ -120,15 +144,93 @@ class OcrBackend(Protocol):
     def extract_text(self, image: Any) -> str: ...
 
 
-class StubCaptureBackend:
+class Win32CaptureBackend:
+    def __init__(self, *, logger=None) -> None:
+        self._logger = logger
+
     def is_available(self) -> bool:
-        return False
+        try:
+            import win32gui
+            import win32ui
+            import win32con
+            return True
+        except ImportError:
+            return False
 
     def describe_target(self, target: DetectedGameWindow) -> str:
         return f"{target.process_name}({target.pid}) {target.title}"
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
-        raise NotImplementedError("Screen capture is not implemented in this skeleton")
+        import win32gui
+        import win32ui
+        import win32con
+        from PIL import Image
+
+        hwnd = target.hwnd
+        rect = win32gui.GetWindowRect(hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Invalid window dimensions: {width}x{height}")
+
+        hdc = win32gui.GetWindowDC(hwnd)
+        if not hdc:
+            raise RuntimeError("Failed to get window DC")
+
+        bmp = None
+        mem_dc = None
+        hdc_mem = None
+        try:
+            hdc_mem = win32ui.CreateDCFromHandle(hdc)
+            mem_dc = hdc_mem.CreateCompatibleDC()
+
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(hdc_mem, width, height)
+            mem_dc.SelectObject(bmp)
+
+            # Try PrintWindow with PW_RENDERFULLCONTENT (3) for better game capture
+            PW_RENDERFULLCONTENT = 3
+            success = ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+            if not success:
+                mem_dc.BitBlt((0, 0), (width, height), hdc_mem, (0, 0), win32con.SRCCOPY)
+
+            bmp_info = bmp.GetInfo()
+            bmp_str = bmp.GetBitmapBits(True)
+            image = Image.frombuffer(
+                "RGB",
+                (bmp_info["bmWidth"], bmp_info["bmHeight"]),
+                bmp_str,
+                "raw",
+                "BGRX",
+                0,
+                1,
+            )
+        finally:
+            if mem_dc is not None:
+                mem_dc.DeleteDC()
+            if hdc_mem is not None:
+                hdc_mem.DeleteDC()
+            if bmp is not None:
+                win32gui.DeleteObject(bmp.GetHandle())
+            win32gui.ReleaseDC(hwnd, hdc)
+
+        left = int(width * profile.left_inset_ratio)
+        right = int(width * (1.0 - profile.right_inset_ratio))
+        top = int(height * profile.top_ratio)
+        bottom = int(height * (1.0 - profile.bottom_inset_ratio))
+
+        left = max(0, min(left, width))
+        right = max(left, min(right, width))
+        top = max(0, min(top, height))
+        bottom = max(top, min(bottom, height))
+
+        crop_w = right - left
+        crop_h = bottom - top
+        if crop_w < 10 or crop_h < 10:
+            raise RuntimeError(f"Crop region too small: {crop_w}x{crop_h}")
+
+        return image.crop((left, top, right, bottom))
 
 
 class TesseractOcrBackend:
@@ -148,11 +250,74 @@ class TesseractOcrBackend:
         return bool(inspection.get("installed"))
 
     def extract_text(self, image: Any) -> str:
-        raise NotImplementedError("OCR extraction is not implemented in this skeleton")
+        import pytesseract
+        path = resolve_tesseract_path(self._tesseract_path)
+        if path:
+            pytesseract.pytesseract.tesseract_cmd = path
+        lang = self._languages
+        # PSM 6 = Assume a single uniform block of text (good for VN dialogue boxes)
+        config = "--psm 6"
+        text = pytesseract.image_to_string(image, lang=lang, config=config)
+        return text.strip()
 
 
 def _default_window_scanner() -> list[DetectedGameWindow]:
-    return []
+    try:
+        import win32gui
+    except ImportError:
+        return []
+
+    results: list[tuple[int, DetectedGameWindow]] = []
+
+    excluded_classes = {
+        "Shell_TrayWnd",
+        "Windows.UI.Core.CoreWindow",
+        "ApplicationFrameWindow",
+        "Windows.UI.Composition.DesktopWindowContentBridge",
+    }
+    excluded_title_substrings = {
+        "program manager",
+        "settings",
+        "microsoft text input application",
+        "nvidia overlay",
+        "task manager",
+        "visual studio code",
+        "obs",
+    }
+
+    def callback(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        if win32gui.IsIconic(hwnd):
+            return
+        rect = win32gui.GetWindowRect(hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+        if width < 400 or height < 300:
+            return
+        title = win32gui.GetWindowText(hwnd)
+        if not title or len(title) < 2:
+            return
+        class_name = win32gui.GetClassName(hwnd)
+        if class_name in excluded_classes:
+            return
+        lower_title = title.lower()
+        if any(ex in lower_title for ex in excluded_title_substrings):
+            return
+        _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+        process_name = ""
+        if psutil is not None:
+            try:
+                proc = psutil.Process(pid)
+                process_name = proc.name()
+            except Exception:
+                pass
+        area = width * height
+        results.append((area, DetectedGameWindow(hwnd=hwnd, title=title, process_name=process_name, pid=pid)))
+
+    win32gui.EnumWindows(callback, None)
+    results.sort(key=lambda item: -item[0])
+    return [item[1] for item in results]
 
 
 def _is_windows_platform() -> bool:
@@ -495,7 +660,6 @@ class OcrReaderBridgeWriter:
 
     @staticmethod
     def _split_speaker_text(raw_text: str) -> tuple[str, str]:
-        import re
         _SPEAKER_QUOTE_RE = re.compile(r"^\s*([^「」:：]{1,40})[「『](.+)[」』]\s*$")
         _SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
         match = _SPEAKER_QUOTE_RE.match(raw_text)
@@ -525,7 +689,7 @@ class OcrReaderManager:
         self._time_fn = time_fn or time.time
         self._platform_fn = platform_fn or _is_windows_platform
         self._window_scanner = window_scanner or _default_window_scanner
-        self._capture_backend = capture_backend or StubCaptureBackend()
+        self._capture_backend = capture_backend or Win32CaptureBackend(logger=logger)
         self._ocr_backend = ocr_backend
         self._writer = writer or OcrReaderBridgeWriter(
             bridge_root=config.bridge_root,
@@ -536,6 +700,9 @@ class OcrReaderManager:
         self._last_memory_reader_text_at = 0.0
         self._last_heartbeat_at = 0.0
         self._attached_window: DetectedGameWindow | None = None
+        self._last_raw_ocr_text = ""
+        self._ocr_repeat_count = 0
+        self._stable_ocr_text = ""
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -682,7 +849,7 @@ class OcrReaderManager:
             self._runtime = OcrReaderRuntime(
                 enabled=True,
                 status="candidate",
-                detail="capture_backend_unimplemented",
+                detail="capture_backend_unavailable",
                 tesseract_path=tesseract_path,
                 languages=self._config.ocr_reader_languages,
                 takeover_reason="capture_backend_not_available",
@@ -692,6 +859,7 @@ class OcrReaderManager:
                 last_event_ts=self._runtime.last_event_ts,
             )
             await self._end_session_if_needed(now)
+            result.warnings.append("ocr_reader capture backend is not available")
             result.runtime = self._runtime.to_dict()
             return result
 
@@ -726,6 +894,9 @@ class OcrReaderManager:
                 result.should_rescan = True
             self._attached_window = target
             self._last_heartbeat_at = now
+            self._last_raw_ocr_text = ""
+            self._ocr_repeat_count = 0
+            self._stable_ocr_text = ""
             self._runtime = OcrReaderRuntime(
                 enabled=True,
                 status="starting",
@@ -747,10 +918,36 @@ class OcrReaderManager:
         if self._attached_window is not None:
             self._attached_window = target
 
+        emitted = False
+        try:
+            frame = self._capture_backend.capture_frame(target, profile)
+            raw_text = self._ocr_backend.extract_text(frame)
+            emitted = self._consume_ocr_text(raw_text, now=now)
+        except Exception as exc:
+            self._logger.warning("ocr_reader capture/OCR failed: %s", exc)
+            result.warnings.append(f"ocr_reader capture failed: {exc}")
+
+        status = self._runtime.status
+        detail = self._runtime.detail
+
+        if emitted:
+            result.should_rescan = True
+            self._last_heartbeat_at = now
+            status = "active"
+            detail = "receiving_text"
+        elif self._writer.session_id and now - self._last_heartbeat_at >= float(self._config.ocr_reader_poll_interval_seconds):
+            if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+                result.should_rescan = True
+                self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            if detail == "starting_capture":
+                detail = "attached_no_text_yet"
+
         self._runtime = OcrReaderRuntime(
             enabled=True,
-            status=self._runtime.status,
-            detail=self._runtime.detail,
+            status=status,
+            detail=detail,
             process_name=target.process_name,
             pid=target.pid,
             window_title=target.title,
@@ -765,7 +962,36 @@ class OcrReaderManager:
         result.runtime = self._runtime.to_dict()
         return result
 
+    def _consume_ocr_text(self, raw_text: str, *, now: float) -> bool:
+        cleaned = normalize_text(raw_text)
+        if not cleaned:
+            return False
+
+        if cleaned == self._last_raw_ocr_text:
+            self._ocr_repeat_count += 1
+        else:
+            self._ocr_repeat_count = 1
+            self._last_raw_ocr_text = cleaned
+
+        if self._ocr_repeat_count < 2:
+            return False
+
+        if cleaned == self._stable_ocr_text:
+            return False
+
+        self._stable_ocr_text = cleaned
+
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        choices = _coerce_choice_lines(lines)
+        if choices:
+            return self._writer.emit_choices(choices, ts=utc_now_iso(now))
+
+        return self._writer.emit_line(raw_text, ts=utc_now_iso(now))
+
     async def _end_session_if_needed(self, now: float) -> None:
         if self._writer.session_id:
             self._writer.end_session(ts=utc_now_iso(now))
             self._attached_window = None
+            self._last_raw_ocr_text = ""
+            self._ocr_repeat_count = 0
+            self._stable_ocr_text = ""
