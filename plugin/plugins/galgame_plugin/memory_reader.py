@@ -218,7 +218,11 @@ def _candidate_path_from_env(env_name: str, *parts: str) -> Path | None:
     return Path(base).joinpath(*parts)
 
 
-def _iter_textractor_candidates(configured_path: str) -> list[Path]:
+def _iter_textractor_candidates(
+    configured_path: str,
+    *,
+    install_target_dir_raw: str = "",
+) -> list[Path]:
     candidates: list[Path] = []
     seen: set[str] = set()
 
@@ -234,6 +238,9 @@ def _iter_textractor_candidates(configured_path: str) -> list[Path]:
     configured = str(configured_path or "").strip()
     if configured:
         _add(_expand_candidate_path(configured))
+    install_target_dir = str(install_target_dir_raw or "").strip()
+    if install_target_dir:
+        _add(_expand_candidate_path(f"{install_target_dir}/{TEXTRACTOR_EXECUTABLE}"))
     path_hit = shutil.which(TEXTRACTOR_EXECUTABLE)
     if path_hit:
         _add(Path(path_hit))
@@ -256,8 +263,11 @@ def _iter_textractor_candidates(configured_path: str) -> list[Path]:
     return candidates
 
 
-def resolve_textractor_path(configured_path: str) -> str:
-    for candidate in _iter_textractor_candidates(configured_path):
+def resolve_textractor_path(configured_path: str, *, install_target_dir_raw: str = "") -> str:
+    for candidate in _iter_textractor_candidates(
+        configured_path,
+        install_target_dir_raw=install_target_dir_raw,
+    ):
         if candidate.is_file():
             return str(candidate)
     return ""
@@ -726,7 +736,10 @@ class MemoryReaderManager:
             result.warnings.append("memory_reader is Windows-only")
             result.runtime = self._runtime.to_dict()
             return result
-        textractor_path = resolve_textractor_path(self._config.memory_reader_textractor_path)
+        textractor_path = resolve_textractor_path(
+            self._config.memory_reader_textractor_path,
+            install_target_dir_raw=self._config.memory_reader_install_target_dir,
+        )
         if not textractor_path:
             await self._stop_textractor()
             self._runtime = MemoryReaderRuntime(

@@ -60,6 +60,7 @@ from .service import (
 )
 from .state import GalgameSharedState, build_initial_state
 from .store import GalgameStore
+from .textractor_support import install_textractor
 from .ui_api import build_open_ui_payload
 
 
@@ -70,6 +71,7 @@ class GalgamePlugin(NekoPluginBase):
         self.file_logger = self.enable_file_logging(log_level="INFO")
         self.logger = self.file_logger
         self._state_lock = threading.Lock()
+        self._textractor_install_lock = threading.Lock()
         self._cfg = None
         self._state = build_initial_state(mode=MODE_COMPANION, push_notifications=True)
         self._persist = GalgameStore(self.store, self.logger)
@@ -198,6 +200,15 @@ class GalgamePlugin(NekoPluginBase):
                 "phase": "phase_1",
                 "memory_reader_enabled": False,
                 "memory_reader_runtime": {},
+                "textractor": {
+                    "install_supported": False,
+                    "installed": False,
+                    "can_install": False,
+                    "detected_path": "",
+                    "target_dir": "",
+                    "expected_executable_path": "",
+                    "detail": "config_not_loaded",
+                },
             }
         return build_status_payload(self._state, config=self._cfg)
 
@@ -565,6 +576,68 @@ class GalgamePlugin(NekoPluginBase):
         with self._state_lock:
             payload = build_status_payload(self._state, config=self._cfg)
         return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_install_textractor",
+        name="安装 Textractor",
+        description="检测并下载安装 TextractorCLI.exe，随后刷新 galgame_plugin 的桥接与读内存状态。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+            },
+        },
+        timeout=180.0,
+        llm_result_fields=["summary"],
+    )
+    async def galgame_install_textractor(self, force: bool = False, **_):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
+        if not self._textractor_install_lock.acquire(blocking=False):
+            return Err(SdkError("Textractor install is already in progress"))
+        current_run_id = str(getattr(self.ctx, "run_id", "") or "").strip()
+
+        async def _progress_update(event: dict[str, Any]) -> None:
+            if not current_run_id:
+                return
+            await self.run_update(
+                run_id=current_run_id,
+                status="running",
+                progress=float(event.get("progress") or 0.0),
+                stage=str(event.get("phase") or ""),
+                message=str(event.get("message") or ""),
+                metrics={
+                    "phase": str(event.get("phase") or ""),
+                    "downloaded_bytes": int(event.get("downloaded_bytes") or 0),
+                    "total_bytes": int(event.get("total_bytes") or 0),
+                    "resume_from": int(event.get("resume_from") or 0),
+                    "asset_name": str(event.get("asset_name") or ""),
+                    "release_name": str(event.get("release_name") or ""),
+                },
+            )
+        try:
+            install_result = await install_textractor(
+                logger=self.logger,
+                configured_path=self._cfg.memory_reader_textractor_path,
+                install_target_dir_raw=self._cfg.memory_reader_install_target_dir,
+                release_api_url=self._cfg.memory_reader_install_release_api_url,
+                timeout_seconds=self._cfg.memory_reader_install_timeout_seconds,
+                force=bool(force),
+                task_id=current_run_id or None,
+                progress_callback=_progress_update,
+            )
+            await self._poll_bridge(force=True)
+            return Ok(
+                {
+                    "summary": str(install_result.get("summary") or "Textractor 安装完成"),
+                    "install_result": install_result,
+                    "status": self._current_status_payload(),
+                }
+            )
+        except Exception as exc:
+            return Err(SdkError(f"Textractor install failed: {exc}"))
+        finally:
+            self._textractor_install_lock.release()
 
     @plugin_entry(
         id="galgame_get_snapshot",

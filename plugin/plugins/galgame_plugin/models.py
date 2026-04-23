@@ -203,6 +203,9 @@ class GalgameConfig:
     llm_target_entry_ref: str
     memory_reader_enabled: bool
     memory_reader_textractor_path: str
+    memory_reader_install_release_api_url: str
+    memory_reader_install_target_dir: str
+    memory_reader_install_timeout_seconds: float
     memory_reader_auto_detect: bool
     memory_reader_poll_interval_seconds: float
 

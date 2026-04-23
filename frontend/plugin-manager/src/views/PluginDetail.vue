@@ -76,6 +76,12 @@
           <EntryList :entries="plugin.entries || []" :plugin-id="pluginId" :plugin-status="pluginStatus" />
         </el-tab-pane>
 
+        <el-tab-pane v-if="hasPluginUI" :label="$t('plugins.ui.open')" name="ui">
+          <div class="ui-section">
+            <PluginUIFrame :plugin-id="pluginId" height="calc(100vh - 360px)" />
+          </div>
+        </el-tab-pane>
+
         <el-tab-pane :label="$t('plugins.performance')" name="metrics">
           <MetricsCard :plugin-id="pluginId" />
         </el-tab-pane>
@@ -106,6 +112,7 @@ import MetricsCard from '@/components/metrics/MetricsCard.vue'
 import PluginConfigEditor from '@/components/plugin/PluginConfigEditor.vue'
 import LogViewer from '@/components/logs/LogViewer.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import PluginUIFrame from '@/components/plugin/PluginUIFrame.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -114,10 +121,15 @@ const pluginStore = usePluginStore()
 const pluginId = computed(() => route.params.id as string)
 const activeTab = ref('info')
 const loading = ref(true)
-const allowedTabs = new Set(['info', 'entries', 'metrics', 'config', 'logs'])
+const allowedTabs = new Set(['info', 'entries', 'ui', 'metrics', 'config', 'logs'])
 
 const plugin = computed(() => {
   return pluginStore.pluginsWithStatus.find(p => p.id === pluginId.value)
+})
+
+const hasPluginUI = computed(() => {
+  return Array.isArray(plugin.value?.list_actions)
+    && plugin.value.list_actions.some(action => action.kind === 'ui')
 })
 
 const isExtension = computed(() => plugin.value?.type === 'extension')
@@ -166,19 +178,21 @@ function resolveActiveTab(value: unknown): string {
 
 onMounted(async () => {
   try {
-    activeTab.value = resolveActiveTab(route.query.tab)
     await pluginStore.fetchPlugins()
     await pluginStore.fetchPluginStatus(pluginId.value)
     pluginStore.setSelectedPlugin(pluginId.value)
+    const requestedTab = resolveActiveTab(route.query.tab)
+    activeTab.value = requestedTab === 'ui' && !hasPluginUI.value ? 'info' : requestedTab
   } finally {
     loading.value = false
   }
 })
 
 watch(
-  () => route.query.tab,
-  (tab) => {
-    activeTab.value = resolveActiveTab(tab)
+  [() => route.query.tab, hasPluginUI],
+  ([tab, uiAvailable]) => {
+    const requestedTab = resolveActiveTab(tab)
+    activeTab.value = requestedTab === 'ui' && !uiAvailable ? 'info' : requestedTab
   },
 )
 </script>
@@ -226,6 +240,10 @@ watch(
 
 .info-section {
   padding: 20px 0;
+}
+
+.ui-section {
+  padding-top: 16px;
 }
 
 .bound-extensions {

@@ -1,0 +1,6 @@
+{
+  "unit/plugins/test_galgame_bridge.py::test_memory_reader_keeps_recoverable_idle_state_when_textractor_autodiscovery_fails": true,
+  "unit/plugins/test_galgame_bridge.py::test_public_surface_preserves_phase1_entries_and_adds_phase2_entries": true,
+  "unit/plugins/test_galgame_bridge.py::test_windows_default_memory_reader_config_stays_idle_when_textractor_autodiscovery_fails": true,
+  "unit/plugins/test_galgame_bridge.py::test_install_textractor_entry_returns_install_result_and_refreshed_status": true
+}

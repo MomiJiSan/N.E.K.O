@@ -852,6 +852,7 @@ async def test_startup_binds_latest_session_and_exposes_ui(tmp_path: Path) -> No
     assert status.value["bound_game_id"] == ""
     assert status.value["active_session_id"] == "sess-b"
     assert status.value["available_game_ids"] == ["demo.alpha", "demo.beta"]
+    assert "textractor" in status.value
     assert isinstance(snapshot, Ok)
     assert snapshot.value["session_id"] == "sess-b"
     assert isinstance(open_ui, Ok)
@@ -889,6 +890,7 @@ async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(t
         "galgame_bind_game",
         "galgame_explain_line",
         "galgame_get_history",
+        "galgame_install_textractor",
         "galgame_get_snapshot",
         "galgame_get_status",
         "galgame_open_ui",
@@ -1576,6 +1578,61 @@ async def test_windows_default_memory_reader_config_stays_idle_when_textractor_a
     assert status.value["active_data_source"] == "none"
     assert status.value["memory_reader_runtime"]["status"] == "idle"
     assert status.value["memory_reader_runtime"]["detail"] == "invalid_textractor_path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_install_textractor_entry_returns_install_result_and_refreshed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "TextractorInstalled"
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            memory_reader={
+                "enabled": True,
+                "install_target_dir": str(install_root),
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    async def _fake_install_textractor(**kwargs):
+        del kwargs
+        install_root.mkdir(parents=True, exist_ok=True)
+        (install_root / "TextractorCLI.exe").write_text("", encoding="utf-8")
+        return {
+            "installed": True,
+            "already_installed": False,
+            "detected_path": str(install_root / "TextractorCLI.exe"),
+            "target_dir": str(install_root),
+            "expected_executable_path": str(install_root / "TextractorCLI.exe"),
+            "install_supported": True,
+            "can_install": False,
+            "detail": "installed",
+            "summary": "Textractor 安装完成",
+            "release_name": "v1.0.0",
+            "asset_name": "Textractor-x64.zip",
+        }
+
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.install_textractor",
+        _fake_install_textractor,
+    )
+
+    result = await plugin.galgame_install_textractor()
+
+    assert isinstance(result, Ok)
+    assert result.value["summary"] == "Textractor 安装完成"
+    assert result.value["install_result"]["installed"] is True
+    assert result.value["status"]["textractor"]["installed"] is True
+    assert result.value["status"]["textractor"]["detected_path"] == str(
+        install_root / "TextractorCLI.exe"
+    )
 
 
 @pytest.mark.asyncio

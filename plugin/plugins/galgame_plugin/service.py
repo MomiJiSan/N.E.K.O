@@ -27,6 +27,10 @@ from .models import (
     sanitize_snapshot_state,
 )
 from .reader import expand_bridge_root, normalize_text, read_session_json
+from .textractor_support import (
+    DEFAULT_TEXTRACTOR_RELEASE_API_URL,
+    inspect_textractor_installation,
+)
 
 
 def _coerce_float(value: object, default: float, *, minimum: float) -> float:
@@ -134,6 +138,16 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             _default_memory_reader_enabled(),
         ),
         memory_reader_textractor_path=str(memory_reader_obj.get("textractor_path") or ""),
+        memory_reader_install_release_api_url=str(
+            memory_reader_obj.get("install_release_api_url")
+            or DEFAULT_TEXTRACTOR_RELEASE_API_URL
+        ).strip(),
+        memory_reader_install_target_dir=str(
+            memory_reader_obj.get("install_target_dir") or ""
+        ).strip(),
+        memory_reader_install_timeout_seconds=_coerce_float(
+            memory_reader_obj.get("install_timeout_seconds"), 60.0, minimum=1.0
+        ),
         memory_reader_auto_detect=bool(memory_reader_obj.get("auto_detect", True)),
         memory_reader_poll_interval_seconds=_coerce_float(
             memory_reader_obj.get("poll_interval_seconds"), 1.0, minimum=0.1
@@ -542,6 +556,10 @@ def rebuild_histories_from_events(
 
 
 def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
+    textractor = inspect_textractor_installation(
+        configured_path=config.memory_reader_textractor_path,
+        install_target_dir_raw=config.memory_reader_install_target_dir,
+    )
     return {
         "connection_state": state.current_connection_state,
         "mode": state.mode,
@@ -565,6 +583,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         ),
         "phase": "phase_1",
         "memory_reader_enabled": config.memory_reader_enabled,
+        "textractor": textractor,
     }
 
 

@@ -59,6 +59,28 @@
         <button id="queryContextBtn" class="secondary">查询上下文</button>
         <button id="sendMessageBtn" class="secondary">发送消息</button>
       </div>
+      <div id="textractorPrompt" class="textractor-banner" hidden>
+        <div class="textractor-copy">
+          <p id="textractorPromptKicker" class="list-kicker">Textractor</p>
+          <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
+          <p id="textractorPromptBody">用于 Windows 读内存兜底的 TextractorCLI.exe 检测结果会显示在这里。</p>
+          <p id="textractorPathText" class="result-note"></p>
+          <div id="textractorInstallState" class="install-task-card" hidden>
+            <div class="install-task-head">
+              <p id="textractorInstallStatusText" class="install-task-status">等待安装任务</p>
+              <p id="textractorInstallPercent" class="install-task-percent">0%</p>
+            </div>
+            <div class="install-task-bar">
+              <div id="textractorInstallBar" class="install-task-bar-fill"></div>
+            </div>
+            <p id="textractorInstallMessage" class="result-note"></p>
+            <p id="textractorInstallDetail" class="result-note"></p>
+          </div>
+        </div>
+        <div class="textractor-actions">
+          <button id="textractorInstallBtn" class="primary">一键安装 Textractor</button>
+        </div>
+      </div>
       <div id="flashMessage" class="flash-message" hidden></div>
     </section>
 

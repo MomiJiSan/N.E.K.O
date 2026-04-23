@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from plugin.plugins.galgame_plugin.memory_reader import (
@@ -13,6 +14,11 @@ from plugin.plugins.galgame_plugin.memory_reader import (
 )
 from plugin.plugins.galgame_plugin.reader import read_session_json, tail_events_jsonl
 from plugin.plugins.galgame_plugin.service import build_config
+from plugin.plugins.galgame_plugin.textractor_support import (
+    _download_file,
+    inspect_textractor_installation,
+    install_textractor,
+)
 
 
 pytestmark = pytest.mark.plugin_unit
@@ -288,3 +294,114 @@ async def test_memory_reader_manager_attaches_consumes_textractor_output_and_emi
 
     await manager.shutdown()
     assert handle.terminated is True
+
+
+def test_inspect_textractor_installation_reports_custom_install_target(tmp_path: Path) -> None:
+    install_root = tmp_path / "TextractorCustom"
+    executable = install_root / "TextractorCLI.exe"
+    install_root.mkdir(parents=True, exist_ok=True)
+    executable.write_text("", encoding="utf-8")
+
+    status = inspect_textractor_installation(
+        configured_path="",
+        install_target_dir_raw=str(install_root),
+        platform_fn=lambda: True,
+    )
+
+    assert status["install_supported"] is True
+    assert status["installed"] is True
+    assert status["detected_path"] == str(executable)
+    assert status["target_dir"] == str(install_root)
+
+
+@pytest.mark.asyncio
+async def test_install_textractor_downloads_and_extracts_latest_release_zip(tmp_path: Path) -> None:
+    install_root = tmp_path / "TextractorInstalled"
+    archive_root = tmp_path / "archive"
+    archive_root.mkdir()
+    archive_path = archive_root / "Textractor.zip"
+    inner_dir = archive_root / "Textractor"
+    inner_dir.mkdir()
+    (inner_dir / "TextractorCLI.exe").write_text("stub", encoding="utf-8")
+    (inner_dir / "Textractor.exe").write_text("stub", encoding="utf-8")
+
+    import zipfile
+
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(inner_dir / "TextractorCLI.exe", arcname="Textractor/TextractorCLI.exe")
+        archive.write(inner_dir / "Textractor.exe", arcname="Textractor/Textractor.exe")
+
+    release_payload = {
+        "name": "Textractor v1.0.0",
+        "assets": [
+            {
+                "name": "Textractor-x64.zip",
+                "browser_download_url": "https://example.test/Textractor-x64.zip",
+            }
+        ],
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://example.test/latest":
+            return httpx.Response(200, json=release_payload)
+        if str(request.url) == "https://example.test/Textractor-x64.zip":
+            return httpx.Response(200, content=archive_path.read_bytes())
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    try:
+        result = await install_textractor(
+            logger=_Logger(),
+            configured_path="",
+            install_target_dir_raw=str(install_root),
+            release_api_url="https://example.test/latest",
+            timeout_seconds=5.0,
+            platform_fn=lambda: True,
+            client_factory=lambda: client,
+        )
+    finally:
+        await client.aclose()
+
+    assert result["installed"] is True
+    assert result["already_installed"] is False
+    assert result["asset_name"] == "Textractor-x64.zip"
+    assert result["detected_path"] == str(install_root / "TextractorCLI.exe")
+    assert (install_root / "TextractorCLI.exe").is_file()
+
+
+@pytest.mark.asyncio
+async def test_download_file_resumes_with_http_range(tmp_path: Path) -> None:
+    destination = tmp_path / "Textractor.zip"
+    original = b"abcdefghij"
+    destination.write_bytes(original[:4])
+    requests: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.headers.get("Range") or ""))
+        if request.headers.get("Range") == "bytes=4-":
+            return httpx.Response(
+                206,
+                content=original[4:],
+                headers={
+                    "Content-Range": "bytes 4-9/10",
+                    "Content-Length": str(len(original[4:])),
+                },
+            )
+        raise AssertionError(f"unexpected headers: {dict(request.headers)}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    try:
+        result = await _download_file(
+            client,
+            url="https://example.test/Textractor.zip",
+            destination=destination,
+            timeout_seconds=5.0,
+        )
+    finally:
+        await client.aclose()
+
+    assert requests == ["bytes=4-"]
+    assert result["resumed"] is True
+    assert result["resume_from"] == 4
+    assert result["total_bytes"] == 10
+    assert destination.read_bytes() == original

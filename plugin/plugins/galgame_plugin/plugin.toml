@@ -4,7 +4,7 @@ name = "Galgame游玩助手"
 description = "让猫娘陪伴你一起玩galgame"
 short_description = "Monitor galgame sessions, bridge data, memory-reader fallback, and the plugin UI."
 keywords = ["galgame", "bridge", "renpy", "visual novel", "game state", "剧情", "台词", "选项"]
-version = "0.1.0"
+version = "0.5.0"
 type = "plugin"
 entry = "plugin.plugins.galgame_plugin:GalgamePlugin"
 
@@ -55,5 +55,12 @@ target_entry_ref = ""
 # Leave `textractor_path` empty on Windows to auto-discover TextractorCLI.exe from PATH
 # or common install locations under LOCALAPPDATA / Program Files.
 textractor_path = ""
+# Leave empty to use the latest Textractor release metadata from GitHub.
+install_release_api_url = ""
+# Leave empty to use the platform default install directory.
+# Windows default: %LOCALAPPDATA%/Programs/Textractor
+install_target_dir = ""
+# Used by the one-click installer download and extraction flow.
+install_timeout_seconds = 60
 auto_detect = true
 poll_interval_seconds = 1

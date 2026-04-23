@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from plugin._types.models import RunCreateResponse
 from plugin.core.state import state
+from plugin.plugins.galgame_plugin import install_tasks as install_task_module
 from plugin.server.infrastructure.exceptions import register_exception_handlers
 from plugin.server.routes import plugin_ui as plugin_ui_route_module
 
@@ -34,6 +37,14 @@ async def plugin_ui_async_client(plugin_ui_test_app: FastAPI) -> AsyncIterator[A
     transport = ASGITransport(app=plugin_ui_test_app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
+
+
+@pytest.fixture
+def galgame_install_runtime_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    local_appdata = tmp_path / "LocalAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setattr(install_task_module.sys, "platform", "win32")
+    return local_appdata
 
 
 @pytest.fixture
@@ -81,11 +92,12 @@ async def test_galgame_plugin_ui_index_route_serves_static_dashboard(
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
     assert "<title>Galgame Plugin</title>" in response.text
     assert "N.E.K.O Phase 2" in response.text
-    assert "Game LLM Agent 的运行状态与推送记录" in response.text
+    assert "Textractor" in response.text
+    assert "一键安装 Textractor" in response.text
 
 
 @pytest.mark.asyncio
-async def test_galgame_plugin_ui_script_uses_runs_api_only(
+async def test_galgame_plugin_ui_script_uses_runs_and_textractor_ui_api(
     plugin_ui_async_client: AsyncClient,
     registered_galgame_plugin_meta,
 ) -> None:
@@ -94,6 +106,9 @@ async def test_galgame_plugin_ui_script_uses_runs_api_only(
     assert response.status_code == 200
     assert "javascript" in response.headers["content-type"]
     assert "const RUNS_URL = '/runs';" in response.text
+    assert "const TEXTRACTOR_INSTALL_URL = `${UI_API_BASE}/textractor/install`;" in response.text
+    assert "new EventSource(" in response.text
+    assert "restoreTextractorInstallState" in response.text
     assert "session.json" not in response.text
     assert "events.jsonl" not in response.text
     assert "galgame_explain_line" in response.text
@@ -101,9 +116,11 @@ async def test_galgame_plugin_ui_script_uses_runs_api_only(
     assert "galgame_get_status" in response.text
     assert "galgame_get_snapshot" in response.text
     assert "galgame_get_history" in response.text
+    assert "galgame_install_textractor" in response.text
     assert "galgame_agent_command" in response.text
     assert "active_data_source" in response.text
     assert "memory_reader_runtime" in response.text
+    assert "textractor" in response.text
 
 
 @pytest.mark.asyncio
@@ -134,3 +151,120 @@ async def test_galgame_plugin_ui_rejects_path_traversal(
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Access denied: path traversal detected"
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_textractor_install_start_route_creates_run_and_seeds_state(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_create_run(payload, *, client_host):
+        del client_host
+        assert payload.plugin_id == "galgame_plugin"
+        assert payload.entry_id == "galgame_install_textractor"
+        assert payload.args == {"force": True}
+        return RunCreateResponse(run_id="run-textractor-1", status="queued")
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "create_run", _fake_create_run)
+
+    response = await plugin_ui_async_client.post(
+        "/plugin/galgame_plugin/ui-api/textractor/install",
+        json={"force": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["task_id"] == "run-textractor-1"
+    assert payload["state"]["status"] == "queued"
+    assert payload["state"]["phase"] == "queued"
+    saved = install_task_module.load_install_task_state("run-textractor-1")
+    assert saved is not None
+    assert saved["message"] == "Textractor install queued"
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_textractor_install_status_route_reads_persisted_state(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+) -> None:
+    install_task_module.update_install_task_state(
+        "run-textractor-2",
+        run_id="run-textractor-2",
+        status="running",
+        phase="downloading",
+        message="Downloading Textractor-x64.zip",
+        progress=0.42,
+        downloaded_bytes=42,
+        total_bytes=100,
+        asset_name="Textractor-x64.zip",
+    )
+
+    response = await plugin_ui_async_client.get(
+        "/plugin/galgame_plugin/ui-api/textractor/install/run-textractor-2"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["phase"] == "downloading"
+    assert payload["downloaded_bytes"] == 42
+    assert payload["total_bytes"] == 100
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_textractor_install_latest_route_returns_latest_state(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+) -> None:
+    install_task_module.update_install_task_state(
+        "run-textractor-latest",
+        run_id="run-textractor-latest",
+        status="completed",
+        phase="completed",
+        message="Textractor installation completed",
+        progress=1.0,
+    )
+
+    response = await plugin_ui_async_client.get(
+        "/plugin/galgame_plugin/ui-api/textractor/install/latest"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["task_id"] == "run-textractor-latest"
+    assert payload["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_textractor_install_stream_route_emits_sse_payload(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+) -> None:
+    install_task_module.update_install_task_state(
+        "run-textractor-stream",
+        run_id="run-textractor-stream",
+        status="completed",
+        phase="completed",
+        message="Textractor installation completed",
+        progress=1.0,
+    )
+
+    async with plugin_ui_async_client.stream(
+        "GET",
+        "/plugin/galgame_plugin/ui-api/textractor/install/run-textractor-stream/stream",
+    ) as response:
+        assert response.status_code == 200
+        body = ""
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                body = line[len("data: "):]
+                break
+
+    payload = json.loads(body)
+    assert payload["task_id"] == "run-textractor-stream"
+    assert payload["status"] == "completed"

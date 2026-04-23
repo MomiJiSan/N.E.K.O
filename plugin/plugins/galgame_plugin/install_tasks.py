@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+INSTALL_TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
+
+
+def _runtime_root() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        return Path(base) / "N.E.K.O" / "plugin-runtime" / "galgame_plugin"
+    if sys.platform == "darwin":
+        return Path(os.path.expanduser("~/Library/Application Support")) / "N.E.K.O" / "plugin-runtime" / "galgame_plugin"
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(os.path.expanduser(os.path.expandvars(state_home))) / "N.E.K.O" / "plugin-runtime" / "galgame_plugin"
+    return Path(os.path.expanduser("~/.local/state")) / "N.E.K.O" / "plugin-runtime" / "galgame_plugin"
+
+
+def _tasks_dir() -> Path:
+    path = _runtime_root() / "textractor-installs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _normalize_task_id(task_id: str) -> str:
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        raise ValueError("task_id is required")
+    return normalized
+
+
+def install_task_state_path(task_id: str) -> Path:
+    return _tasks_dir() / f"{_normalize_task_id(task_id)}.json"
+
+
+def latest_install_task_path() -> Path:
+    return _tasks_dir() / "latest.json"
+
+
+def build_install_task_state(
+    *,
+    task_id: str,
+    run_id: str | None = None,
+    plugin_id: str = "galgame_plugin",
+    status: str = "queued",
+    phase: str = "queued",
+    message: str = "",
+    progress: float = 0.0,
+    downloaded_bytes: int = 0,
+    total_bytes: int = 0,
+    resume_from: int = 0,
+    release_name: str = "",
+    asset_name: str = "",
+    target_dir: str = "",
+    detected_path: str = "",
+    error: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = time.time()
+    payload: dict[str, Any] = {
+        "task_id": _normalize_task_id(task_id),
+        "run_id": str(run_id or task_id or ""),
+        "plugin_id": plugin_id,
+        "status": status,
+        "phase": phase,
+        "message": message,
+        "progress": float(progress),
+        "downloaded_bytes": int(downloaded_bytes),
+        "total_bytes": int(total_bytes),
+        "resume_from": int(resume_from),
+        "release_name": release_name,
+        "asset_name": asset_name,
+        "target_dir": target_dir,
+        "detected_path": detected_path,
+        "error": error,
+        "started_at": now,
+        "updated_at": now,
+        "completed_at": now if status in INSTALL_TERMINAL_STATUSES else None,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def write_install_task_state(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized["task_id"] = _normalize_task_id(task_id)
+    normalized["run_id"] = str(normalized.get("run_id") or normalized["task_id"])
+    normalized["plugin_id"] = str(normalized.get("plugin_id") or "galgame_plugin")
+    normalized["status"] = str(normalized.get("status") or "queued")
+    normalized["phase"] = str(normalized.get("phase") or normalized["status"])
+    normalized["message"] = str(normalized.get("message") or "")
+    normalized["progress"] = float(normalized.get("progress") or 0.0)
+    normalized["downloaded_bytes"] = int(normalized.get("downloaded_bytes") or 0)
+    normalized["total_bytes"] = int(normalized.get("total_bytes") or 0)
+    normalized["resume_from"] = int(normalized.get("resume_from") or 0)
+    normalized["release_name"] = str(normalized.get("release_name") or "")
+    normalized["asset_name"] = str(normalized.get("asset_name") or "")
+    normalized["target_dir"] = str(normalized.get("target_dir") or "")
+    normalized["detected_path"] = str(normalized.get("detected_path") or "")
+    normalized["error"] = str(normalized.get("error") or "")
+    started_at = normalized.get("started_at")
+    normalized["started_at"] = float(started_at) if isinstance(started_at, (int, float)) else time.time()
+    normalized["updated_at"] = time.time()
+    if normalized["status"] in INSTALL_TERMINAL_STATUSES:
+        completed_at = normalized.get("completed_at")
+        normalized["completed_at"] = (
+            float(completed_at)
+            if isinstance(completed_at, (int, float))
+            else normalized["updated_at"]
+        )
+    else:
+        normalized["completed_at"] = None
+    _atomic_write_json(install_task_state_path(task_id), normalized)
+    _atomic_write_json(
+        latest_install_task_path(),
+        {
+            "task_id": normalized["task_id"],
+            "run_id": normalized["run_id"],
+            "plugin_id": normalized["plugin_id"],
+            "updated_at": normalized["updated_at"],
+        },
+    )
+    return normalized
+
+
+def load_install_task_state(task_id: str) -> dict[str, Any] | None:
+    path = install_task_state_path(task_id)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def update_install_task_state(task_id: str, **changes: Any) -> dict[str, Any]:
+    current = load_install_task_state(task_id) or build_install_task_state(task_id=task_id)
+    current.update(changes)
+    return write_install_task_state(task_id, current)
+
+
+def load_latest_install_task_ref() -> dict[str, Any] | None:
+    path = latest_install_task_path()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_latest_install_task_state() -> dict[str, Any] | None:
+    latest = load_latest_install_task_ref()
+    if not isinstance(latest, dict):
+        return None
+    task_id = str(latest.get("task_id") or "").strip()
+    if not task_id:
+        return None
+    return load_install_task_state(task_id)
