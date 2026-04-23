@@ -264,6 +264,7 @@ class TesseractOcrBackend:
 def _default_window_scanner() -> list[DetectedGameWindow]:
     try:
         import win32gui
+        import win32process
     except ImportError:
         return []
 
@@ -304,7 +305,7 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
         lower_title = title.lower()
         if any(ex in lower_title for ex in excluded_title_substrings):
             return
-        _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
         process_name = ""
         if psutil is not None:
             try:

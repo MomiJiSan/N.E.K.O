@@ -16,19 +16,16 @@ Prerequisites:
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from ocr_reader import (
+from plugin.plugins.galgame_plugin.models import GalgameConfig
+from plugin.plugins.galgame_plugin.ocr_reader import (
     OcrCaptureProfile,
     OcrReaderManager,
     Win32CaptureBackend,
     TesseractOcrBackend,
     _default_window_scanner,
 )
-from models import GalgameConfig
 
 
 def _noop_logger():
