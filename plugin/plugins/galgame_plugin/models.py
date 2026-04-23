@@ -13,8 +13,14 @@ MODES = frozenset({MODE_SILENT, MODE_COMPANION, MODE_CHOICE_ADVISOR})
 DATA_SOURCE_NONE = "none"
 DATA_SOURCE_BRIDGE_SDK = "bridge_sdk"
 DATA_SOURCE_MEMORY_READER = "memory_reader"
+DATA_SOURCE_OCR_READER = "ocr_reader"
 DATA_SOURCES = frozenset(
-    {DATA_SOURCE_NONE, DATA_SOURCE_BRIDGE_SDK, DATA_SOURCE_MEMORY_READER}
+    {
+        DATA_SOURCE_NONE,
+        DATA_SOURCE_BRIDGE_SDK,
+        DATA_SOURCE_MEMORY_READER,
+        DATA_SOURCE_OCR_READER,
+    }
 )
 
 AGENT_STATUS_ACTIVE = "active"
@@ -42,6 +48,7 @@ STORE_EVENTS_FILE_SIZE = "events_file_size"
 STORE_LAST_SEQ = "last_seq"
 STORE_DEDUPE_WINDOW = "dedupe_window"
 STORE_LAST_ERROR = "last_error"
+STORE_OCR_CAPTURE_PROFILES = "ocr_capture_profiles"
 STORE_KEYS = (
     STORE_BOUND_GAME_ID,
     STORE_MODE,
@@ -52,6 +59,7 @@ STORE_KEYS = (
     STORE_LAST_SEQ,
     STORE_DEDUPE_WINDOW,
     STORE_LAST_ERROR,
+    STORE_OCR_CAPTURE_PROFILES,
 )
 
 DEFAULT_SAVE_CONTEXT = {
@@ -208,6 +216,18 @@ class GalgameConfig:
     memory_reader_install_timeout_seconds: float
     memory_reader_auto_detect: bool
     memory_reader_poll_interval_seconds: float
+    ocr_reader_enabled: bool
+    ocr_reader_tesseract_path: str
+    ocr_reader_install_manifest_url: str
+    ocr_reader_install_target_dir: str
+    ocr_reader_install_timeout_seconds: float
+    ocr_reader_poll_interval_seconds: float
+    ocr_reader_no_text_takeover_after_seconds: float
+    ocr_reader_languages: str
+    ocr_reader_left_inset_ratio: float
+    ocr_reader_right_inset_ratio: float
+    ocr_reader_top_ratio: float
+    ocr_reader_bottom_inset_ratio: float
 
 
 @dataclass(slots=True)

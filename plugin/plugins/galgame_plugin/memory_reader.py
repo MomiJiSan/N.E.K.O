@@ -34,6 +34,14 @@ MEMORY_READER_ROUTE_ID = ""
 MEMORY_READER_DEFAULT_ENGINE = "unknown"
 MEMORY_READER_MAX_HOOK_CACHE = 256
 TEXTRACTOR_EXECUTABLE = "TextractorCLI.exe"
+_EXCLUDED_PROCESS_NAMES = {
+    "crashpad_handler",
+}
+_EXCLUDED_PROCESS_NAME_SUBSTRINGS = (
+    "unitycrashhandler",
+    "crashhandler",
+    "crashreporter",
+)
 _MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
 _SPEAKER_QUOTE_RE = re.compile(r"^\s*([^「」:：]{1,40})[「『](.+)[」』]\s*$")
 _SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
@@ -87,6 +95,18 @@ def _engine_from_text(text: str) -> str:
     if "kirikiri" in lowered or "krkr" in lowered:
         return "kirikiri"
     return ""
+
+
+def _is_excluded_helper_process(name: str, cmdline: str) -> bool:
+    lowered_name = str(name or "").strip().lower()
+    lowered_cmdline = str(cmdline or "").strip().lower()
+    if lowered_name in _EXCLUDED_PROCESS_NAMES:
+        return True
+    if any(token in lowered_name for token in _EXCLUDED_PROCESS_NAME_SUBSTRINGS):
+        return True
+    if "unitycrashhandler" in lowered_cmdline:
+        return True
+    return False
 
 
 @dataclass(slots=True)
@@ -297,6 +317,8 @@ def _default_process_scanner() -> list[DetectedGameProcess]:
             name = str(info.get("name") or "")
             cmdline_parts = info.get("cmdline") or []
             cmdline = " ".join(str(item) for item in cmdline_parts)
+            if _is_excluded_helper_process(name, cmdline):
+                continue
             lowered_name = name.lower()
             lowered_cmdline = cmdline.lower()
             modules = _loaded_module_names(proc)
@@ -705,6 +727,7 @@ class MemoryReaderManager:
         self._restart_attempts = 0
         self._last_hook_text: dict[str, str] = {}
         self._last_heartbeat_at = 0.0
+        self._last_no_text_warning_at = 0.0
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -786,10 +809,18 @@ class MemoryReaderManager:
             self._runtime.status = "scanning"
             self._runtime.detail = "scanning_processes"
         processes = self._process_scanner()
+        if self._attached_process is None and processes:
+            preview = ", ".join(f"{item.name}({item.pid},{item.engine})" for item in processes[:5])
+            self._logger.debug("memory_reader detected candidate processes: %s", preview)
         if self._attached_process is not None:
             process_lookup = {item.pid: item for item in processes}
             attached = process_lookup.get(self._attached_process.pid)
             if attached is None:
+                self._logger.info(
+                    "memory_reader detached because process disappeared: %s(%s)",
+                    self._attached_process.name,
+                    self._attached_process.pid,
+                )
                 if self._writer.end_session(ts=utc_now_iso(now)):
                     result.should_rescan = True
                 await self._stop_textractor()
@@ -830,12 +861,19 @@ class MemoryReaderManager:
                 result.should_rescan = True
             self._attached_process = target
             self._last_heartbeat_at = now
+            self._last_no_text_warning_at = 0.0
             self._runtime.status = "starting"
             self._runtime.detail = "starting_textractor"
             await self._ensure_textractor_started(textractor_path)
             try:
                 if self._process is None:
                     raise RuntimeError("textractor process is unavailable")
+                self._logger.info(
+                    "memory_reader attaching Textractor to %s(%s) engine=%s",
+                    target.name,
+                    target.pid,
+                    target.engine,
+                )
                 await self._process.write(f"attach -P{target.pid}\n")
             except Exception as exc:
                 self._runtime = MemoryReaderRuntime(
@@ -879,9 +917,21 @@ class MemoryReaderManager:
             if any(line.pid == self._attached_process.pid for line in parsed_lines) or log_lines:
                 self._restart_attempts = 0
                 self._runtime.status = "active"
-                self._runtime.detail = "attached"
+                self._runtime.detail = "attached" if parsed_lines else "attached_no_text_yet"
+                self._logger.info(
+                    "memory_reader attach confirmed for %s(%s); parsed_lines=%s log_lines=%s",
+                    self._attached_process.name,
+                    self._attached_process.pid,
+                    len(parsed_lines),
+                    len(log_lines),
+                )
         if self._runtime.status == "attaching" and now - self._attach_started_at > 5.0:
             message = "memory_reader attach confirmation timed out"
+            self._logger.warning(
+                "memory_reader attach confirmation timed out for %s(%s)",
+                self._attached_process.name if self._attached_process else "",
+                self._attached_process.pid if self._attached_process else 0,
+            )
             result.warnings.append(message)
             if self._writer.emit_error(message, ts=utc_now_iso(now)):
                 result.should_rescan = True
@@ -902,12 +952,23 @@ class MemoryReaderManager:
         if emitted:
             result.should_rescan = True
             self._last_heartbeat_at = now
+            self._last_no_text_warning_at = 0.0
+            self._runtime.detail = "receiving_text"
         elif self._runtime.status == "active" and now - self._last_heartbeat_at >= float(
             self._config.memory_reader_poll_interval_seconds
         ):
             if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
                 result.should_rescan = True
                 self._last_heartbeat_at = now
+            if self._writer.last_seq <= 1:
+                self._runtime.detail = "attached_no_text_yet"
+                if now - self._attach_started_at >= 3.0 and now - self._last_no_text_warning_at >= 10.0:
+                    self._last_no_text_warning_at = now
+                    self._logger.warning(
+                        "memory_reader is attached to %s(%s) but no dialogue text has been captured yet",
+                        self._attached_process.name if self._attached_process else "",
+                        self._attached_process.pid if self._attached_process else 0,
+                    )
 
         self._runtime = MemoryReaderRuntime(
             enabled=True,
@@ -927,10 +988,12 @@ class MemoryReaderManager:
     async def _ensure_textractor_started(self, textractor_path: str) -> None:
         if self._process is not None and self._process.poll() is None:
             return
+        self._logger.info("memory_reader starting Textractor: %s", textractor_path)
         self._process = await self._process_factory(textractor_path)
 
     async def _handle_textractor_crash(self, now: float) -> str:
         self._restart_attempts += 1
+        self._logger.warning("memory_reader detected Textractor crash; restart_attempt=%s", self._restart_attempts)
         await self._stop_textractor()
         if self._restart_attempts > 3:
             self._runtime.status = "error"
@@ -948,6 +1011,11 @@ class MemoryReaderManager:
             return
         try:
             if attached_process is not None:
+                self._logger.info(
+                    "memory_reader stopping Textractor for %s(%s)",
+                    attached_process.name,
+                    attached_process.pid,
+                )
                 try:
                     await self._process.write(f"detach -P{attached_process.pid}\n")
                 except Exception:
@@ -959,6 +1027,7 @@ class MemoryReaderManager:
             self._attached_process = None
             self._attach_started_at = 0.0
             self._last_heartbeat_at = 0.0
+            self._last_no_text_warning_at = 0.0
             self._last_hook_text.clear()
 
     async def _drain_stdout(self) -> tuple[list[ParsedTextractorLine], list[str], list[str]]:
@@ -990,6 +1059,15 @@ class MemoryReaderManager:
                 oldest_key = next(iter(self._last_hook_text))
                 self._last_hook_text.pop(oldest_key, None)
             parsed.append(parsed_line)
+        for line in logs[:8]:
+            self._logger.debug("memory_reader Textractor log: %s", line)
+        for warning in warnings[:8]:
+            self._logger.warning("%s", warning)
+        if parsed:
+            preview = " | ".join(
+                f"{item.pid}:{item.hook_addr}:{normalize_text(item.text)[:80]}" for item in parsed[:4]
+            )
+            self._logger.debug("memory_reader parsed Textractor lines: %s", preview)
         return parsed, logs, warnings
 
     @staticmethod

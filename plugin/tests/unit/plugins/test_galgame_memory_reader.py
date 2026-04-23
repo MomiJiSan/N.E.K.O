@@ -41,6 +41,23 @@ class _Logger:
         return None
 
 
+class _CapturingLogger(_Logger):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, tuple[object, ...]]] = []
+
+    def info(self, *args, **kwargs):
+        del kwargs
+        self.messages.append(("info", args))
+
+    def warning(self, *args, **kwargs):
+        del kwargs
+        self.messages.append(("warning", args))
+
+    def debug(self, *args, **kwargs):
+        del kwargs
+        self.messages.append(("debug", args))
+
+
 class _FakeTextractorHandle:
     def __init__(self, lines: list[str] | None = None) -> None:
         self.lines = list(lines or [])
@@ -191,6 +208,61 @@ def test_default_process_scanner_orders_candidates_by_create_time_then_pid(
     ]
 
 
+def test_default_process_scanner_excludes_unity_crash_handler_and_crashpad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Proc:
+        def __init__(self, info: dict[str, object], modules: list[str]) -> None:
+            self.info = info
+            self._modules = modules
+
+        def memory_maps(self, grouped: bool = False):
+            del grouped
+            return [SimpleNamespace(path=module) for module in self._modules]
+
+    fake_psutil = SimpleNamespace(
+        process_iter=lambda fields: [
+            _Proc(
+                {
+                    "pid": 99,
+                    "name": "UnityCrashHandler64.exe",
+                    "cmdline": ["UnityCrashHandler64.exe"],
+                    "create_time": 30.0,
+                },
+                ["UnityPlayer.dll"],
+            ),
+            _Proc(
+                {
+                    "pid": 98,
+                    "name": "crashpad_handler",
+                    "cmdline": ["crashpad_handler"],
+                    "create_time": 29.0,
+                },
+                [],
+            ),
+            _Proc(
+                {
+                    "pid": 10,
+                    "name": "TheWeepingSwan.exe",
+                    "cmdline": ["TheWeepingSwan.exe"],
+                    "create_time": 20.0,
+                },
+                ["UnityPlayer.dll", "Assembly-CSharp.dll"],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.memory_reader.psutil",
+        fake_psutil,
+    )
+
+    detected = _default_process_scanner()
+
+    assert [(item.pid, item.name, item.engine) for item in detected] == [
+        (10, "TheWeepingSwan.exe", "unity"),
+    ]
+
+
 def test_memory_reader_bridge_writer_emits_stable_bridge_schema_and_choice_ids(
     tmp_path: Path,
 ) -> None:
@@ -294,6 +366,60 @@ async def test_memory_reader_manager_attaches_consumes_textractor_output_and_emi
 
     await manager.shutdown()
     assert handle.terminated is True
+
+
+@pytest.mark.asyncio
+async def test_memory_reader_manager_marks_attached_without_text_when_only_textractor_logs_exist(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    handle = _FakeTextractorHandle(
+        [
+            "Textractor: attached to target process",
+        ]
+    )
+    logger = _CapturingLogger()
+
+    async def _process_factory(path: str):
+        del path
+        return handle
+
+    manager = MemoryReaderManager(
+        logger=logger,
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            textractor_path=str(textractor_path),
+            auto_detect=True,
+            poll_interval_seconds=0.5,
+        ),
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=27452,
+                name="TheLamentingGeese.exe",
+                create_time=1709999999.0,
+                engine="unity",
+            )
+        ],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+    )
+
+    first = await manager.tick(bridge_sdk_available=False)
+
+    assert first.runtime["status"] == "active"
+    assert first.runtime["detail"] == "attached_no_text_yet"
+    game_id = first.runtime["game_id"]
+    events_path = bridge_root / game_id / "events.jsonl"
+    events = tail_events_jsonl(events_path, offset=0, line_buffer=b"").events
+    assert [event["type"] for event in events] == ["session_started"]
+    assert any(level == "debug" and args[0] == "memory_reader Textractor log: %s" for level, args in logger.messages)
+
+    await manager.shutdown()
 
 
 def test_inspect_textractor_installation_reports_custom_install_target(tmp_path: Path) -> None:

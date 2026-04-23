@@ -32,6 +32,8 @@ class GalgameSharedState:
     last_seen_data_monotonic: float = 0.0
     warmup_session_id: str = ""
     memory_reader_runtime: dict[str, Any] = field(default_factory=dict)
+    ocr_reader_runtime: dict[str, Any] = field(default_factory=dict)
+    ocr_capture_profiles: dict[str, dict[str, float]] = field(default_factory=dict)
     plugin_error: str = ""
 
 

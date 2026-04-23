@@ -11,6 +11,7 @@ from .models import (
     STORE_LAST_ERROR,
     STORE_LAST_SEQ,
     STORE_MODE,
+    STORE_OCR_CAPTURE_PROFILES,
     STORE_PUSH_NOTIFICATIONS,
     STORE_SESSION_ID,
 )
@@ -30,6 +31,54 @@ class GalgameStore:
         if not getattr(self._store, "enabled", False):
             return
         self._store._write_value(key, value)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _sanitize_ocr_capture_profiles(raw_value: Any) -> tuple[dict[str, dict[str, float]], list[str]]:
+        warnings: list[str] = []
+        if raw_value in ({}, None):
+            return {}, warnings
+        if not isinstance(raw_value, dict):
+            return {}, ["invalid ocr_capture_profiles dropped: non-object"]
+
+        normalized: dict[str, dict[str, float]] = {}
+        ratio_keys = (
+            "left_inset_ratio",
+            "right_inset_ratio",
+            "top_ratio",
+            "bottom_inset_ratio",
+        )
+        for process_name, profile in raw_value.items():
+            if not isinstance(process_name, str) or not process_name.strip():
+                warnings.append("invalid ocr_capture_profiles item dropped: bad process name")
+                continue
+            if not isinstance(profile, dict):
+                warnings.append(
+                    f"invalid ocr_capture_profiles item dropped: {process_name!r} is not an object"
+                )
+                continue
+            cleaned: dict[str, float] = {}
+            valid = True
+            for key in ratio_keys:
+                value = profile.get(key)
+                if isinstance(value, bool):
+                    valid = False
+                    break
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    valid = False
+                    break
+                if parsed < 0.0 or parsed >= 1.0:
+                    valid = False
+                    break
+                cleaned[key] = parsed
+            if not valid:
+                warnings.append(
+                    f"invalid ocr_capture_profiles item dropped: {process_name!r} has invalid ratios"
+                )
+                continue
+            normalized[process_name.strip()] = cleaned
+        return normalized, warnings
 
     def load(self) -> tuple[dict[str, Any], list[str]]:
         warnings: list[str] = []
@@ -69,6 +118,10 @@ class GalgameStore:
         last_error = dict(raw_last_error) if isinstance(raw_last_error, dict) else {}
         if raw_last_error not in ({}, last_error):
             warnings.append("invalid last_error dropped: non-object")
+        ocr_capture_profiles, profile_warnings = self._sanitize_ocr_capture_profiles(
+            self._read(STORE_OCR_CAPTURE_PROFILES, {})
+        )
+        warnings.extend(profile_warnings)
 
         restored = {
             STORE_BOUND_GAME_ID: self._read(STORE_BOUND_GAME_ID, ""),
@@ -80,6 +133,7 @@ class GalgameStore:
             STORE_LAST_SEQ: max(0, int(self._read(STORE_LAST_SEQ, 0) or 0)),
             STORE_DEDUPE_WINDOW: dedupe_window,
             STORE_LAST_ERROR: last_error,
+            STORE_OCR_CAPTURE_PROFILES: ocr_capture_profiles,
         }
         if not isinstance(restored[STORE_BOUND_GAME_ID], str):
             warnings.append("invalid bound_game_id dropped: non-string")
@@ -116,6 +170,18 @@ class GalgameStore:
         self._write(STORE_LAST_SEQ, max(0, int(last_seq)))
         self._write(STORE_DEDUPE_WINDOW, list(dedupe_window))
         self._write(STORE_LAST_ERROR, dict(last_error))
+
+    def persist_ocr_capture_profiles(
+        self,
+        profiles: dict[str, dict[str, float]],
+    ) -> None:
+        self._write(
+            STORE_OCR_CAPTURE_PROFILES,
+            {
+                str(process_name): {str(key): float(value) for key, value in profile.items()}
+                for process_name, profile in profiles.items()
+            },
+        )
 
     def clear_runtime(self) -> None:
         self.persist_runtime(

@@ -10,6 +10,7 @@ from typing import Any
 
 
 INSTALL_TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
+INSTALL_KINDS = frozenset({"textractor", "tesseract"})
 
 
 def _runtime_root() -> Path:
@@ -24,8 +25,16 @@ def _runtime_root() -> Path:
     return Path(os.path.expanduser("~/.local/state")) / "N.E.K.O" / "plugin-runtime" / "galgame_plugin"
 
 
-def _tasks_dir() -> Path:
-    path = _runtime_root() / "textractor-installs"
+def _normalize_kind(kind: str) -> str:
+    normalized = str(kind or "textractor").strip().lower()
+    if normalized not in INSTALL_KINDS:
+        raise ValueError(f"unsupported install task kind: {kind!r}")
+    return normalized
+
+
+def _tasks_dir(kind: str = "textractor") -> Path:
+    normalized_kind = _normalize_kind(kind)
+    path = _runtime_root() / f"{normalized_kind}-installs"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -37,17 +46,18 @@ def _normalize_task_id(task_id: str) -> str:
     return normalized
 
 
-def install_task_state_path(task_id: str) -> Path:
-    return _tasks_dir() / f"{_normalize_task_id(task_id)}.json"
+def install_task_state_path(task_id: str, *, kind: str = "textractor") -> Path:
+    return _tasks_dir(kind) / f"{_normalize_task_id(task_id)}.json"
 
 
-def latest_install_task_path() -> Path:
-    return _tasks_dir() / "latest.json"
+def latest_install_task_path(*, kind: str = "textractor") -> Path:
+    return _tasks_dir(kind) / "latest.json"
 
 
 def build_install_task_state(
     *,
     task_id: str,
+    kind: str = "textractor",
     run_id: str | None = None,
     plugin_id: str = "galgame_plugin",
     status: str = "queued",
@@ -67,6 +77,7 @@ def build_install_task_state(
     now = time.time()
     payload: dict[str, Any] = {
         "task_id": _normalize_task_id(task_id),
+        "kind": _normalize_kind(kind),
         "run_id": str(run_id or task_id or ""),
         "plugin_id": plugin_id,
         "status": status,
@@ -100,9 +111,15 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
-def write_install_task_state(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def write_install_task_state(
+    task_id: str,
+    payload: dict[str, Any],
+    *,
+    kind: str = "textractor",
+) -> dict[str, Any]:
     normalized = dict(payload)
     normalized["task_id"] = _normalize_task_id(task_id)
+    normalized["kind"] = _normalize_kind(str(normalized.get("kind") or kind))
     normalized["run_id"] = str(normalized.get("run_id") or normalized["task_id"])
     normalized["plugin_id"] = str(normalized.get("plugin_id") or "galgame_plugin")
     normalized["status"] = str(normalized.get("status") or "queued")
@@ -129,11 +146,15 @@ def write_install_task_state(task_id: str, payload: dict[str, Any]) -> dict[str,
         )
     else:
         normalized["completed_at"] = None
-    _atomic_write_json(install_task_state_path(task_id), normalized)
     _atomic_write_json(
-        latest_install_task_path(),
+        install_task_state_path(task_id, kind=normalized["kind"]),
+        normalized,
+    )
+    _atomic_write_json(
+        latest_install_task_path(kind=normalized["kind"]),
         {
             "task_id": normalized["task_id"],
+            "kind": normalized["kind"],
             "run_id": normalized["run_id"],
             "plugin_id": normalized["plugin_id"],
             "updated_at": normalized["updated_at"],
@@ -142,8 +163,8 @@ def write_install_task_state(task_id: str, payload: dict[str, Any]) -> dict[str,
     return normalized
 
 
-def load_install_task_state(task_id: str) -> dict[str, Any] | None:
-    path = install_task_state_path(task_id)
+def load_install_task_state(task_id: str, *, kind: str = "textractor") -> dict[str, Any] | None:
+    path = install_task_state_path(task_id, kind=kind)
     if not path.is_file():
         return None
     try:
@@ -153,14 +174,24 @@ def load_install_task_state(task_id: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def update_install_task_state(task_id: str, **changes: Any) -> dict[str, Any]:
-    current = load_install_task_state(task_id) or build_install_task_state(task_id=task_id)
+def update_install_task_state(
+    task_id: str,
+    *,
+    kind: str = "textractor",
+    **changes: Any,
+) -> dict[str, Any]:
+    normalized_kind = _normalize_kind(kind)
+    current = load_install_task_state(task_id, kind=normalized_kind) or build_install_task_state(
+        task_id=task_id,
+        kind=normalized_kind,
+    )
     current.update(changes)
-    return write_install_task_state(task_id, current)
+    current["kind"] = str(current.get("kind") or normalized_kind)
+    return write_install_task_state(task_id, current, kind=normalized_kind)
 
 
-def load_latest_install_task_ref() -> dict[str, Any] | None:
-    path = latest_install_task_path()
+def load_latest_install_task_ref(*, kind: str = "textractor") -> dict[str, Any] | None:
+    path = latest_install_task_path(kind=kind)
     if not path.is_file():
         return None
     try:
@@ -170,11 +201,11 @@ def load_latest_install_task_ref() -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def load_latest_install_task_state() -> dict[str, Any] | None:
-    latest = load_latest_install_task_ref()
+def load_latest_install_task_state(*, kind: str = "textractor") -> dict[str, Any] | None:
+    latest = load_latest_install_task_ref(kind=kind)
     if not isinstance(latest, dict):
         return None
     task_id = str(latest.get("task_id") or "").strip()
     if not task_id:
         return None
-    return load_install_task_state(task_id)
+    return load_install_task_state(task_id, kind=str(latest.get("kind") or kind))
