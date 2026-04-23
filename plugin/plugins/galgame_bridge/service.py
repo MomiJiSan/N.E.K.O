@@ -697,7 +697,10 @@ def _memory_reader_input_diagnostic(context: dict[str, Any]) -> str:
     reasons = list(context.get("degraded_reasons") or [])
     if not reasons:
         return ""
-    return "memory_reader_input: source data is degraded (" + ",".join(reasons) + ")"
+    return (
+        "memory_reader_input: input comes from memory_reader, semantic granularity is "
+        "weaker than bridge_sdk (" + ",".join(reasons) + ")"
+    )
 
 
 def apply_input_degraded_result(

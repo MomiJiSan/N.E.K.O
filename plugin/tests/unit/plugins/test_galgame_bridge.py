@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,9 @@ from plugin.plugins.galgame_bridge.service import (
     build_summarize_context,
 )
 from plugin.sdk.plugin import Ok
+
+
+_BRIDGE_FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures" / "galgame_bridge"
 
 
 class _Logger:
@@ -231,6 +235,23 @@ def _make_plugin_dirs(tmp_path: Path) -> tuple[Path, Path]:
     bridge_root = tmp_path / "bridge_root"
     bridge_root.mkdir()
     return plugin_dir, bridge_root
+
+
+def _copy_bridge_fixture_scenario(bridge_root: Path, scenario: str) -> Path:
+    scenario_root = _BRIDGE_FIXTURE_ROOT / scenario
+    if not scenario_root.is_dir():
+        raise AssertionError(f"missing bridge fixture scenario: {scenario}")
+    copied_game_dir: Path | None = None
+    for child in scenario_root.iterdir():
+        target = bridge_root / child.name
+        if child.is_dir():
+            shutil.copytree(child, target)
+            copied_game_dir = target
+        else:
+            shutil.copy2(child, target)
+    if copied_game_dir is None:
+        raise AssertionError(f"bridge fixture scenario is empty: {scenario}")
+    return copied_game_dir
 
 
 def _make_effective_config(bridge_root: Path, **overrides: object) -> dict[str, object]:
@@ -758,6 +779,124 @@ async def test_save_loaded_and_repeated_line_do_not_duplicate_stable_history(tmp
     assert len(history.value["events"]) == 4
     assert len(history.value["stable_lines"]) == 1
     assert history.value["stable_lines"][0]["line_id"] == "script/ch1.rpy:120"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_bridge_fixture_manual_load_round_exposes_bridge_sdk_status_snapshot_and_history(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    _copy_bridge_fixture_scenario(bridge_root, "manual_load")
+
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    await plugin._poll_bridge(force=True)
+
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+    history = await plugin.galgame_get_history(limit=20, include_events=True)
+
+    assert isinstance(status, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_BRIDGE_SDK
+    assert status.value["summary"].startswith("已通过 Bridge SDK 连接")
+    assert status.value["memory_reader_runtime"]["detail"] == "disabled_by_config"
+
+    assert isinstance(snapshot, Ok)
+    assert snapshot.value["snapshot"]["scene_id"] == "after_school"
+    assert snapshot.value["snapshot"]["line_id"] == "script.rpy:28"
+    assert snapshot.value["snapshot"]["is_menu_open"] is True
+    assert snapshot.value["snapshot"]["save_context"]["kind"] == "manual"
+    assert len(snapshot.value["snapshot"]["choices"]) == 2
+
+    assert isinstance(history, Ok)
+    assert history.value["events"][-2]["type"] == "save_loaded"
+    assert history.value["events"][-2]["payload"]["reason"] == "load"
+    assert history.value["events"][-1]["type"] == "choices_shown"
+    assert history.value["events"][-1]["payload"]["line_id"] == "script.rpy:28"
+    assert history.value["stable_lines"][-1]["line_id"] == "script.rpy:45"
+    assert len(history.value["stable_lines"]) == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_bridge_fixture_rollback_round_preserves_history_and_supports_phase2_llm_entries(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    _copy_bridge_fixture_scenario(bridge_root, "rollback")
+
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            llm={"target_entry_ref": "fake_llm:run"},
+        ),
+    )
+
+    async def _handler(**kwargs):
+        params = kwargs.get("params") or {}
+        operation = params.get("operation")
+        if operation == "explain_line":
+            return {"explanation": "这是回滚后的菜单锚点。", "evidence": []}
+        if operation == "summarize_scene":
+            return {
+                "summary": "场景重新回到了 after_school 的选项前。",
+                "key_points": [{"type": "decision", "text": "rollback 已完成。"}],
+            }
+        if operation == "suggest_choice":
+            context = params.get("context") or {}
+            visible_choices = context.get("visible_choices") or []
+            return {
+                "choices": [
+                    {
+                        "choice_id": visible_choices[0]["choice_id"],
+                        "text": visible_choices[0]["text"],
+                        "rank": 1,
+                        "reason": "继续验证 rollback 后的菜单消费。",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected operation: {operation}")
+
+    ctx.entry_handler = _handler
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    await plugin._poll_bridge(force=True)
+
+    snapshot = await plugin.galgame_get_snapshot()
+    history = await plugin.galgame_get_history(limit=20, include_events=True)
+    explain = await plugin.galgame_explain_line()
+    summarize = await plugin.galgame_summarize_scene()
+    suggest = await plugin.galgame_suggest_choice()
+
+    assert isinstance(snapshot, Ok)
+    assert snapshot.value["snapshot"]["scene_id"] == "after_school"
+    assert snapshot.value["snapshot"]["save_context"]["kind"] == "rollback"
+    assert snapshot.value["snapshot"]["is_menu_open"] is True
+
+    assert isinstance(history, Ok)
+    assert history.value["events"][-3]["type"] == "save_loaded"
+    assert history.value["events"][-3]["payload"]["reason"] == "rollback"
+    repeated_lines = [
+        item for item in history.value["stable_lines"] if item["line_id"] == "script.rpy:28"
+    ]
+    assert len(repeated_lines) == 1
+
+    assert isinstance(explain, Ok)
+    assert explain.value["degraded"] is False
+    assert explain.value["line_id"] == "script.rpy:28"
+    assert explain.value["explanation"] == "这是回滚后的菜单锚点。"
+
+    assert isinstance(summarize, Ok)
+    assert summarize.value["degraded"] is False
+    assert summarize.value["scene_id"] == "after_school"
+    assert summarize.value["summary"] == "场景重新回到了 after_school 的选项前。"
+
+    assert isinstance(suggest, Ok)
+    assert suggest.value["degraded"] is False
+    assert suggest.value["choices"][0]["choice_id"] == "script.rpy:28#choice0"
 
 
 @pytest.mark.asyncio
@@ -1379,16 +1518,19 @@ async def test_phase2_entries_mark_memory_reader_input_as_degraded_even_when_llm
     assert isinstance(explain, Ok)
     assert explain.value["degraded"] is True
     assert "memory_reader_input" in explain.value["diagnostic"]
+    assert "weaker than bridge_sdk" in explain.value["diagnostic"]
     assert explain.value["explanation"] == "这是对台词的解释。"
 
     assert isinstance(summarize, Ok)
     assert summarize.value["degraded"] is True
     assert "memory_reader_input" in summarize.value["diagnostic"]
+    assert "weaker than bridge_sdk" in summarize.value["diagnostic"]
     assert summarize.value["summary"] == "这是对场景的总结。"
 
     assert isinstance(suggest, Ok)
     assert suggest.value["degraded"] is True
     assert "memory_reader_input" in suggest.value["diagnostic"]
+    assert "weaker than bridge_sdk" in suggest.value["diagnostic"]
     assert suggest.value["choices"][0]["choice_id"] == "mem:line-1#choice0"
 
 

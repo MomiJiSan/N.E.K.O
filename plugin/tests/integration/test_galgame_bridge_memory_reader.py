@@ -174,6 +174,29 @@ def _session(
     }
 
 
+def _memory_reader_session(
+    *,
+    game_id: str,
+    session_id: str,
+    last_seq: int,
+    state: dict[str, object],
+) -> dict[str, object]:
+    payload = _session(
+        game_id=game_id,
+        session_id=session_id,
+        last_seq=last_seq,
+        state=state,
+    )
+    payload["bridge_sdk_version"] = "memory-reader-0.1.0"
+    payload["engine"] = "unknown"
+    payload["metadata"] = {
+        "source": "memory_reader",
+        "game_process_name": "NekoRenpyMemoryDemo.exe",
+        "game_pid": 4242,
+    }
+    return payload
+
+
 def _write_session(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -219,6 +242,58 @@ def _make_effective_config(bridge_root: Path, textractor_path: Path) -> dict[str
             "poll_interval_seconds": 1,
         },
     }
+
+
+class _FakePhase2Gateway:
+    async def explain_line(self, context: dict[str, object]):
+        return {
+            "degraded": False,
+            "explanation": "这是 memory_reader MVP 下的台词解释。",
+            "evidence": list(context.get("evidence") or []),
+            "diagnostic": "",
+        }
+
+    async def summarize_scene(self, context: dict[str, object]):
+        snapshot = context.get("current_snapshot") or {}
+        return {
+            "degraded": False,
+            "summary": "这是 memory_reader MVP 下的场景总结。",
+            "key_points": [
+                {
+                    "type": "plot",
+                    "text": "当前上下文来自 memory_reader。",
+                    "line_id": str(snapshot.get("line_id") or ""),
+                    "speaker": str(snapshot.get("speaker") or ""),
+                    "scene_id": str(context.get("scene_id") or ""),
+                    "route_id": str(context.get("route_id") or ""),
+                }
+            ],
+            "diagnostic": "",
+        }
+
+    async def suggest_choice(self, context: dict[str, object]):
+        visible_choices = list(context.get("visible_choices") or [])
+        first = visible_choices[0]
+        return {
+            "degraded": False,
+            "choices": [
+                {
+                    "choice_id": str(first.get("choice_id") or ""),
+                    "text": str(first.get("text") or ""),
+                    "rank": 1,
+                    "reason": "先选更接近当前主线的选项。",
+                }
+            ],
+            "diagnostic": "",
+        }
+
+    async def agent_reply(self, context: dict[str, object]):
+        prompt = str(context.get("prompt") or "")
+        return {
+            "degraded": False,
+            "reply": f"Game LLM 已收到：{prompt}",
+            "diagnostic": "",
+        }
 
 
 @pytest.mark.asyncio
@@ -295,5 +370,154 @@ async def test_memory_reader_bridge_tick_fallback_and_bridge_sdk_takeover(tmp_pa
     assert bridge_sdk_status.value["active_session_id"] == "sdk-sess"
     assert bridge_sdk_status.value["memory_reader_runtime"]["detail"] == "bridge_sdk_available"
     assert handle.terminated is True
+
+    await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_memory_reader_phase2_entries_and_agent_commands_stay_callable_in_mvp(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root, textractor_path))
+    plugin = GalgameBridgePlugin(ctx)
+    startup = await plugin.startup()
+    assert isinstance(startup, Ok)
+
+    game_id = "mem:417f0b11d197"
+    session_id = "mem-phase2-session"
+    game_dir = bridge_root / game_id
+    game_dir.mkdir(parents=True, exist_ok=True)
+    _write_session(
+        game_dir / "session.json",
+        _memory_reader_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state={
+                **_session_state(
+                    speaker="雪乃",
+                    text="放学后要去哪里？",
+                    scene_id="mem:unknown_scene",
+                    line_id="mem:line-1",
+                    ts="2026-04-23T02:00:00Z",
+                ),
+                "choices": [
+                    {
+                        "choice_id": "mem:line-1#choice0",
+                        "text": "和雪乃一起回家",
+                        "index": 0,
+                        "enabled": True,
+                    },
+                    {
+                        "choice_id": "mem:line-1#choice1",
+                        "text": "先去图书馆",
+                        "index": 1,
+                        "enabled": True,
+                    },
+                ],
+                "is_menu_open": True,
+            },
+        ),
+    )
+    (game_dir / "events.jsonl").write_text("", encoding="utf-8")
+
+    class _MemoryReaderStub:
+        def update_config(self, config) -> None:
+            del config
+
+        async def tick(self, **kwargs):
+            del kwargs
+            return type(
+                "_Tick",
+                (),
+                {
+                    "warnings": [],
+                    "should_rescan": False,
+                    "runtime": {
+                        "enabled": True,
+                        "status": "active",
+                        "detail": "fixture_active",
+                        "process_name": "NekoRenpyMemoryDemo.exe",
+                        "pid": 4242,
+                        "engine": "renpy",
+                        "game_id": game_id,
+                        "session_id": session_id,
+                        "last_seq": 2,
+                        "last_event_ts": "2026-04-23T02:00:00Z",
+                    },
+                },
+            )()
+
+        async def shutdown(self) -> None:
+            return None
+
+    plugin._memory_reader_manager = _MemoryReaderStub()
+    await plugin._poll_bridge(force=True)
+
+    fake_gateway = _FakePhase2Gateway()
+    plugin._llm_gateway = fake_gateway
+    assert plugin._game_agent is not None
+    plugin._game_agent._llm_gateway = fake_gateway
+
+    status = await plugin.galgame_get_status()
+    explain = await plugin.galgame_explain_line()
+    summarize = await plugin.galgame_summarize_scene()
+    suggest = await plugin.galgame_suggest_choice()
+    query_status = await plugin.galgame_agent_command(action="query_status")
+    query_context = await plugin.galgame_agent_command(
+        action="query_context",
+        context_query="当前场景在讲什么？",
+    )
+    send_message = await plugin.galgame_agent_command(
+        action="send_message",
+        message="先别推进，告诉我现在菜单里有什么。",
+    )
+    standby = await plugin.galgame_agent_command(action="set_standby", standby=True)
+    standby_query = await plugin.galgame_agent_command(
+        action="query_context",
+        context_query="待机后还能说明当前状态吗？",
+    )
+
+    assert isinstance(status, Ok)
+    assert status.value["active_data_source"] == "memory_reader"
+    assert status.value["memory_reader_runtime"]["process_name"] == "NekoRenpyMemoryDemo.exe"
+
+    assert isinstance(explain, Ok)
+    assert explain.value["degraded"] is True
+    assert "memory_reader_input" in explain.value["diagnostic"]
+    assert "weaker than bridge_sdk" in explain.value["diagnostic"]
+    assert explain.value["explanation"] == "这是 memory_reader MVP 下的台词解释。"
+
+    assert isinstance(summarize, Ok)
+    assert summarize.value["degraded"] is True
+    assert "memory_reader_input" in summarize.value["diagnostic"]
+    assert summarize.value["summary"] == "这是 memory_reader MVP 下的场景总结。"
+
+    assert isinstance(suggest, Ok)
+    assert suggest.value["degraded"] is True
+    assert "memory_reader_input" in suggest.value["diagnostic"]
+    assert suggest.value["choices"][0]["choice_id"] == "mem:line-1#choice0"
+
+    assert isinstance(query_status, Ok)
+    assert query_status.value["action"] == "query_status"
+    assert isinstance(query_status.value["recent_pushes"], list)
+
+    assert isinstance(query_context, Ok)
+    assert query_context.value["action"] == "query_context"
+    assert "当前场景在讲什么" in query_context.value["result"]
+
+    assert isinstance(send_message, Ok)
+    assert send_message.value["action"] == "send_message"
+    assert "菜单里有什么" in send_message.value["result"]
+
+    assert isinstance(standby, Ok)
+    assert standby.value["status"] == "standby"
+
+    assert isinstance(standby_query, Ok)
+    assert standby_query.value["status"] == "standby"
+    assert "待机后还能说明当前状态吗" in standby_query.value["result"]
 
     await plugin.shutdown()

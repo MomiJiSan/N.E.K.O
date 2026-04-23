@@ -1,0 +1,23 @@
+[plugin]
+id = "galgame_llm_target"
+name = "Galgame LLM Target"
+description = "Real single-entry LLM backend for galgame_bridge Phase 2 operations."
+short_description = "LLM target entry for explain, summarize, suggest, and agent_reply."
+keywords = ["galgame", "llm", "bridge", "visual novel", "agent"]
+version = "0.1.0"
+type = "plugin"
+entry = "plugin.plugins.galgame_llm_target:GalgameLLMTargetPlugin"
+
+[plugin.author]
+name = "N.E.K.O Team"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+[plugin.store]
+enabled = false
