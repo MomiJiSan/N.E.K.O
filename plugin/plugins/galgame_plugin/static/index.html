@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">N.E.K.O Phase 2</p>
         <h1>Galgame Plugin</h1>
-        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。这里会展示主桥接状态、OCR 主 fallback 运行时、Tesseract 安装流、截图校准，以及 Game LLM Agent 的后台状态。</p>
+        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容 fallback，这里会展示桥接状态、OCR 运行时、RapidOCR/Tesseract 安装流、截图校准，以及 Game LLM Agent 的后台状态。</p>
       </div>
       <div class="hero-actions">
         <button id="refreshBtn" class="primary">刷新全部</button>
@@ -63,11 +63,34 @@
       </div>
 
       <div class="install-stack">
+        <div id="rapidocrPrompt" class="install-banner install-banner-rapidocr" hidden>
+          <div class="install-copy">
+            <p id="rapidocrPromptKicker" class="list-kicker">OCR 主后端</p>
+            <h3 id="rapidocrPromptTitle">正在检测 RapidOCR</h3>
+            <p id="rapidocrPromptBody">插件隔离的 RapidOCR 运行时检测结果会显示在这里。</p>
+            <p id="rapidocrPathText" class="result-note"></p>
+            <div id="rapidocrInstallState" class="install-task-card" hidden>
+              <div class="install-task-head">
+                <p id="rapidocrInstallStatusText" class="install-task-status">等待安装任务</p>
+                <p id="rapidocrInstallPercent" class="install-task-percent">0%</p>
+              </div>
+              <div class="install-task-bar">
+                <div id="rapidocrInstallBar" class="install-task-bar-fill"></div>
+              </div>
+              <p id="rapidocrInstallMessage" class="result-note"></p>
+              <p id="rapidocrInstallDetail" class="result-note"></p>
+            </div>
+          </div>
+          <div class="install-actions">
+            <button id="rapidocrInstallBtn" class="primary">一键安装 RapidOCR</button>
+          </div>
+        </div>
+
         <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
           <div class="install-copy">
-            <p id="tesseractPromptKicker" class="list-kicker">OCR 主 fallback</p>
+            <p id="tesseractPromptKicker" class="list-kicker">OCR 兼容 fallback</p>
             <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
-            <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的检测结果会显示在这里。</p>
+            <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的兼容 fallback 检测结果会显示在这里。</p>
             <p id="tesseractPathText" class="result-note"></p>
             <div id="tesseractInstallState" class="install-task-card" hidden>
               <div class="install-task-head">
@@ -133,11 +156,11 @@
           </label>
           <label class="field">
             <span>top_ratio</span>
-            <input id="ocrProfileTopInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.30">
+            <input id="ocrProfileTopInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.62">
           </label>
           <label class="field">
             <span>bottom_inset_ratio</span>
-            <input id="ocrProfileBottomInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.30">
+            <input id="ocrProfileBottomInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.08">
           </label>
           <div class="capture-profile-actions">
             <button id="ocrProfileSaveBtn" class="secondary">保存校准</button>
@@ -150,85 +173,85 @@
     </section>
 
     <section class="dashboard-grid">
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>状态</h2>
         </div>
-        <dl id="statusGrid" class="data-grid"></dl>
+        <dl id="statusGrid" class="data-grid scroll-region"></dl>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>OCR 运行时</h2>
         </div>
-        <dl id="ocrRuntimeGrid" class="data-grid"></dl>
+        <dl id="ocrRuntimeGrid" class="data-grid scroll-region"></dl>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>当前快照</h2>
         </div>
-        <dl id="snapshotGrid" class="data-grid"></dl>
+        <dl id="snapshotGrid" class="data-grid scroll-region"></dl>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>Agent 状态</h2>
         </div>
         <dl id="agentStatusGrid" class="data-grid"></dl>
         <div class="reply-box">
           <h3>Agent 最近响应</h3>
-          <p id="agentReplyText">暂无交互</p>
+          <p id="agentReplyText" class="reply-text-scroll">暂无交互</p>
         </div>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>当前台词解释</h2>
         </div>
-        <div id="explainPanel" class="result-panel empty-state">暂无数据</div>
+        <div id="explainPanel" class="result-panel scroll-region empty-state">暂无数据</div>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>场景总结</h2>
         </div>
-        <div id="summaryPanel" class="result-panel empty-state">暂无数据</div>
+        <div id="summaryPanel" class="result-panel scroll-region empty-state">暂无数据</div>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll">
         <div class="panel-title-row">
           <h2>当前选项建议</h2>
         </div>
-        <div id="suggestPanel" class="result-panel empty-state">暂无数据</div>
+        <div id="suggestPanel" class="result-panel scroll-region empty-state">暂无数据</div>
       </article>
 
-      <article class="panel panel-full">
+      <article class="panel panel-full panel-scroll panel-scroll-wide">
         <div class="panel-title-row">
           <h2>Agent 推送记录</h2>
         </div>
-        <div id="pushesList" class="stack-list empty-state">暂无数据</div>
+        <div id="pushesList" class="stack-list scroll-region empty-state">暂无数据</div>
       </article>
 
-      <article class="panel panel-full">
+      <article class="panel panel-full panel-scroll panel-scroll-wide">
         <div class="panel-title-row">
           <h2>最近稳定台词</h2>
         </div>
-        <div id="linesList" class="stack-list empty-state">暂无数据</div>
+        <div id="linesList" class="stack-list scroll-region empty-state">暂无数据</div>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll panel-scroll-wide">
         <div class="panel-title-row">
           <h2>最近选项</h2>
         </div>
-        <div id="choicesList" class="stack-list empty-state">暂无数据</div>
+        <div id="choicesList" class="stack-list scroll-region empty-state">暂无数据</div>
       </article>
 
-      <article class="panel">
+      <article class="panel panel-scroll panel-scroll-wide">
         <div class="panel-title-row">
           <h2>最近事件</h2>
         </div>
-        <div id="eventsList" class="stack-list empty-state">暂无数据</div>
+        <div id="eventsList" class="stack-list scroll-region empty-state">暂无数据</div>
       </article>
     </section>
   </div>

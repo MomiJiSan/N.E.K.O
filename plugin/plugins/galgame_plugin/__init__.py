@@ -61,6 +61,7 @@ from .service import (
     rebuild_histories_from_events,
     scan_session_candidates,
 )
+from .rapidocr_support import install_rapidocr
 from .state import GalgameSharedState, build_initial_state
 from .store import GalgameStore
 from .tesseract_support import install_tesseract
@@ -77,6 +78,7 @@ class GalgamePlugin(NekoPluginBase):
         self._state_lock = threading.Lock()
         self._textractor_install_lock = threading.Lock()
         self._tesseract_install_lock = threading.Lock()
+        self._rapidocr_install_lock = threading.Lock()
         self._cfg = None
         self._state = build_initial_state(mode=MODE_COMPANION, push_notifications=True)
         self._persist = GalgameStore(self.store, self.logger)
@@ -214,6 +216,24 @@ class GalgamePlugin(NekoPluginBase):
                 "memory_reader_runtime": {},
                 "ocr_reader_enabled": False,
                 "ocr_reader_runtime": {},
+                "rapidocr_enabled": False,
+                "rapidocr": {
+                    "install_supported": False,
+                    "installed": False,
+                    "can_install": False,
+                    "detected_path": "",
+                    "target_dir": "",
+                    "runtime_dir": "",
+                    "site_packages_dir": "",
+                    "model_cache_dir": "",
+                    "selected_model": "",
+                    "engine_type": "",
+                    "lang_type": "",
+                    "model_type": "",
+                    "ocr_version": "",
+                    "detail": "config_not_loaded",
+                    "runtime_error": "",
+                },
                 "tesseract": {
                     "install_supported": False,
                     "installed": False,
@@ -753,6 +773,53 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError(f"Tesseract install failed: {exc}"))
         finally:
             self._tesseract_install_lock.release()
+
+    @plugin_entry(
+        id="galgame_install_rapidocr",
+        name="安装 RapidOCR",
+        description="检测并下载安装插件隔离的 RapidOCR 运行时，随后刷新 galgame_plugin 的 OCR 状态。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+            },
+        },
+        timeout=300.0,
+        llm_result_fields=["summary"],
+    )
+    async def galgame_install_rapidocr(self, force: bool = False, **_):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
+        if not self._rapidocr_install_lock.acquire(blocking=False):
+            return Err(SdkError("RapidOCR install is already in progress"))
+        current_run_id = self._resolve_current_run_id()
+        progress_callback = self._resolve_install_progress_callback(current_run_id)
+        try:
+            install_result = await install_rapidocr(
+                logger=self.logger,
+                install_target_dir_raw=self._cfg.rapidocr_install_target_dir,
+                manifest_url=self._cfg.rapidocr_install_manifest_url,
+                timeout_seconds=self._cfg.rapidocr_install_timeout_seconds,
+                engine_type=self._cfg.rapidocr_engine_type,
+                lang_type=self._cfg.rapidocr_lang_type,
+                model_type=self._cfg.rapidocr_model_type,
+                ocr_version=self._cfg.rapidocr_ocr_version,
+                force=bool(force),
+                task_id=current_run_id or None,
+                progress_callback=progress_callback,
+            )
+            await self._poll_bridge(force=True)
+            return Ok(
+                {
+                    "summary": str(install_result.get("summary") or "RapidOCR 安装完成"),
+                    "install_result": install_result,
+                    "status": self._current_status_payload(),
+                }
+            )
+        except Exception as exc:
+            return Err(SdkError(f"RapidOCR install failed: {exc}"))
+        finally:
+            self._rapidocr_install_lock.release()
 
     @plugin_entry(
         id="galgame_get_snapshot",

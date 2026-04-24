@@ -23,6 +23,11 @@ DATA_SOURCES = frozenset(
     }
 )
 
+DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO = 0.05
+DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO = 0.05
+DEFAULT_OCR_CAPTURE_TOP_RATIO = 0.62
+DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO = 0.08
+
 AGENT_STATUS_ACTIVE = "active"
 AGENT_STATUS_STANDBY = "standby"
 AGENT_STATUS_ERROR = "error"
@@ -218,6 +223,7 @@ class GalgameConfig:
     memory_reader_hook_codes: list[str]
     memory_reader_poll_interval_seconds: float
     ocr_reader_enabled: bool
+    ocr_reader_backend_selection: str
     ocr_reader_tesseract_path: str
     ocr_reader_install_manifest_url: str
     ocr_reader_install_target_dir: str
@@ -229,6 +235,14 @@ class GalgameConfig:
     ocr_reader_right_inset_ratio: float
     ocr_reader_top_ratio: float
     ocr_reader_bottom_inset_ratio: float
+    rapidocr_enabled: bool
+    rapidocr_install_manifest_url: str
+    rapidocr_install_target_dir: str
+    rapidocr_install_timeout_seconds: float
+    rapidocr_engine_type: str
+    rapidocr_lang_type: str
+    rapidocr_model_type: str
+    rapidocr_ocr_version: str
 
 
 @dataclass(slots=True)

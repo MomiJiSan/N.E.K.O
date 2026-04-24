@@ -631,6 +631,41 @@ def test_build_config_explicit_memory_reader_enabled_overrides_platform_default(
     assert cfg.memory_reader_enabled is False
 
 
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("platform_value", "expected_enabled"),
+    [
+        ("win32", True),
+        ("darwin", False),
+        ("linux", False),
+    ],
+)
+def test_build_config_uses_platform_default_ocr_reader_enablement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform_value: str,
+    expected_enabled: bool,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", platform_value)
+    cfg = build_config({"galgame": {"bridge_root": str(tmp_path / "bridge")}})
+    assert cfg.ocr_reader_enabled is expected_enabled
+
+
+@pytest.mark.plugin_unit
+def test_build_config_explicit_ocr_reader_enabled_overrides_platform_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(galgame_service.sys, "platform", "win32")
+    cfg = build_config(
+        {
+            "galgame": {"bridge_root": str(tmp_path / "bridge")},
+            "ocr_reader": {"enabled": False},
+        }
+    )
+    assert cfg.ocr_reader_enabled is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_memory_reader_auto_discovers_textractor_from_path(
@@ -1735,6 +1770,101 @@ async def test_install_tesseract_entry_returns_install_result_and_refreshed_stat
     assert result.value["status"]["tesseract"]["detected_path"] == str(
         install_root / "tesseract.exe"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_install_rapidocr_entry_returns_install_result_and_refreshed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "RapidOCRInstalled"
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+            rapidocr={
+                "enabled": True,
+                "install_target_dir": str(install_root),
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    async def _fake_install_rapidocr(**kwargs):
+        del kwargs
+        runtime_dir = install_root / "runtime"
+        site_packages_dir = runtime_dir / "site-packages"
+        model_cache_dir = install_root / "models"
+        package_dir = site_packages_dir / "rapidocr_onnxruntime"
+        package_dir.mkdir(parents=True, exist_ok=True)
+        model_cache_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "installed": True,
+            "already_installed": False,
+            "detected_path": str(package_dir),
+            "target_dir": str(install_root),
+            "runtime_dir": str(runtime_dir),
+            "site_packages_dir": str(site_packages_dir),
+            "model_cache_dir": str(model_cache_dir),
+            "selected_model": "PP-OCRv5/ch/mobile",
+            "engine_type": "onnxruntime",
+            "lang_type": "ch",
+            "model_type": "mobile",
+            "ocr_version": "PP-OCRv5",
+            "install_supported": True,
+            "can_install": False,
+            "detail": "installed",
+            "summary": "RapidOCR 安装完成",
+            "release_name": "RapidOCR ONNXRuntime",
+            "asset_name": "rapidocr_onnxruntime, onnxruntime",
+            "runtime_error": "",
+        }
+
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.install_rapidocr",
+        _fake_install_rapidocr,
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.service.inspect_rapidocr_installation",
+        lambda **kwargs: {
+            "install_supported": True,
+            "installed": True,
+            "can_install": False,
+            "detected_path": str(install_root / "runtime" / "site-packages" / "rapidocr_onnxruntime"),
+            "target_dir": str(install_root),
+            "runtime_dir": str(install_root / "runtime"),
+            "site_packages_dir": str(install_root / "runtime" / "site-packages"),
+            "model_cache_dir": str(install_root / "models"),
+            "selected_model": "PP-OCRv5/ch/mobile",
+            "engine_type": "onnxruntime",
+            "lang_type": "ch",
+            "model_type": "mobile",
+            "ocr_version": "PP-OCRv5",
+            "detail": "installed",
+            "runtime_error": "",
+        },
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader.inspect_rapidocr_installation",
+        lambda **kwargs: {
+            "installed": True,
+            "detail": "installed",
+            "detected_path": str(install_root / "runtime" / "site-packages" / "rapidocr_onnxruntime"),
+            "selected_model": "PP-OCRv5/ch/mobile",
+        },
+    )
+
+    result = await plugin.galgame_install_rapidocr()
+
+    assert isinstance(result, Ok)
+    assert result.value["summary"] == "RapidOCR 安装完成"
+    assert result.value["install_result"]["installed"] is True
+    assert result.value["status"]["rapidocr"]["installed"] is True
+    assert result.value["status"]["rapidocr"]["selected_model"] == "PP-OCRv5/ch/mobile"
 
 
 @pytest.mark.asyncio

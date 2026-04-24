@@ -71,7 +71,11 @@ hook_codes = ["/HQ14+3C@GameAssembly.dll#0x33A440"]
 poll_interval_seconds = 1
 
 [ocr_reader]
-enabled = false
+# Leave `enabled` unset to use platform defaults.
+# Windows: enabled by default as the current primary fallback when Bridge SDK has no usable session.
+# macOS/Linux: disabled by default.
+enabled = true
+backend_selection = "auto"
 tesseract_path = ""
 install_manifest_url = ""
 install_target_dir = ""
@@ -81,5 +85,15 @@ no_text_takeover_after_seconds = 30
 languages = "chi_sim+jpn+eng"
 left_inset_ratio = 0.05
 right_inset_ratio = 0.05
-top_ratio = 0.3
-bottom_inset_ratio = 0.3
+top_ratio = 0.62
+bottom_inset_ratio = 0.08
+
+[rapidocr]
+enabled = true
+install_manifest_url = ""
+install_target_dir = ""
+install_timeout_seconds = 180
+engine_type = "onnxruntime"
+lang_type = "ch"
+model_type = "mobile"
+ocr_version = "PP-OCRv5"

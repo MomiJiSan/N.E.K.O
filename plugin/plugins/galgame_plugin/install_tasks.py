@@ -10,7 +10,7 @@ from typing import Any
 
 
 INSTALL_TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
-INSTALL_KINDS = frozenset({"textractor", "tesseract"})
+INSTALL_KINDS = frozenset({"textractor", "tesseract", "rapidocr"})
 
 
 def _runtime_root() -> Path:

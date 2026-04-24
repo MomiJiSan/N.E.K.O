@@ -1,11 +1,25 @@
 const PLUGIN_ID = 'galgame_plugin';
 const RUNS_URL = '/runs';
 const UI_API_BASE = `/plugin/${PLUGIN_ID}/ui-api`;
+const RAPIDOCR_INSTALL_URL = `${UI_API_BASE}/rapidocr/install`;
 const TESSERACT_INSTALL_URL = `${UI_API_BASE}/tesseract/install`;
 const TEXTRACTOR_INSTALL_URL = `${UI_API_BASE}/textractor/install`;
 const INSTALL_TERMINAL_STATUSES = new Set(['completed', 'failed', 'canceled']);
 
 const INSTALL_UI = {
+  rapidocr: {
+    kind: 'rapidocr',
+    label: 'RapidOCR',
+    url: RAPIDOCR_INSTALL_URL,
+    storageKey: `${PLUGIN_ID}:rapidocr_install_task_id`,
+    domPrefix: 'rapidocr',
+    actionText: '一键安装 RapidOCR',
+    retryText: '重试安装 RapidOCR',
+    runningText: '后台安装中...',
+    queuedFlash: '已创建后台安装任务，接下来会安装插件隔离的 RapidOCR 运行时，并通过 SSE 推送实时进度。',
+    successFlash: 'RapidOCR 安装完成',
+    failureFlash: 'RapidOCR 安装失败',
+  },
   tesseract: {
     kind: 'tesseract',
     label: 'Tesseract',
@@ -46,6 +60,7 @@ function createInstallRuntimeState() {
 }
 
 const installRuntime = {
+  rapidocr: createInstallRuntimeState(),
   tesseract: createInstallRuntimeState(),
   textractor: createInstallRuntimeState(),
 };
@@ -53,12 +68,25 @@ const installRuntime = {
 const DEFAULT_CAPTURE_PROFILE = {
   left_inset_ratio: 0.05,
   right_inset_ratio: 0.05,
-  top_ratio: 0.30,
-  bottom_inset_ratio: 0.30,
+  top_ratio: 0.62,
+  bottom_inset_ratio: 0.08,
 };
+
+const AUTO_REFRESH_INTERVAL_MS = 3000;
 
 let latestAgentReply = '暂无交互';
 let latestStatus = null;
+let refreshInFlight = null;
+let autoRefreshTimer = null;
+
+const latestInsights = {
+  explainKey: '',
+  explainPayload: null,
+  summaryKey: '',
+  summaryPayload: null,
+  suggestKey: '',
+  suggestPayload: null,
+};
 
 function getInstallConfig(kind) {
   const config = INSTALL_UI[kind];
@@ -174,6 +202,37 @@ function setFlash(message, type = 'info') {
   node.className = `flash-message ${type}`;
 }
 
+function buildExplainFallback(lineId = '', diagnostic = 'missing line_id') {
+  return {
+    degraded: true,
+    line_id: lineId,
+    speaker: '',
+    text: '',
+    explanation: '',
+    evidence: [],
+    diagnostic,
+  };
+}
+
+function buildSummaryFallback(sceneId = '', diagnostic = 'missing scene_id') {
+  return {
+    degraded: true,
+    scene_id: sceneId,
+    summary: '',
+    key_points: [],
+    diagnostic,
+  };
+}
+
+function buildSuggestFallback(sceneId = '', diagnostic = 'no visible choices') {
+  return {
+    degraded: true,
+    scene_id: sceneId,
+    choices: [],
+    diagnostic,
+  };
+}
+
 function renderGrid(nodeId, rows) {
   const container = document.getElementById(nodeId);
   container.innerHTML = rows.map((row) => `
@@ -187,11 +246,11 @@ function renderGrid(nodeId, rows) {
 function renderStackList(nodeId, items, formatter) {
   const node = document.getElementById(nodeId);
   if (!items.length) {
-    node.className = 'stack-list empty-state';
+    node.className = 'stack-list scroll-region empty-state';
     node.textContent = '暂无数据';
     return;
   }
-  node.className = 'stack-list';
+  node.className = 'stack-list scroll-region';
   node.innerHTML = items.map(formatter).join('');
 }
 
@@ -383,7 +442,7 @@ function applyInstallTaskState(kind, state, { allowRefresh = true } = {}) {
   }
 
   if (allowRefresh) {
-    refreshAll().catch((error) => {
+    refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
       setFlash(error instanceof Error ? error.message : String(error), 'error');
     });
   }
@@ -507,6 +566,10 @@ async function restoreTextractorInstallState() {
   await restoreInstallState('textractor');
 }
 
+async function restoreRapidOcrInstallState() {
+  await restoreInstallState('rapidocr');
+}
+
 async function restoreTesseractInstallState() {
   await restoreInstallState('tesseract');
 }
@@ -520,6 +583,7 @@ function renderStatus(status) {
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
+  const rapidocr = status.rapidocr || {};
   const textractor = status.textractor || {};
   const tesseract = status.tesseract || {};
 
@@ -545,6 +609,11 @@ function renderStatus(status) {
     { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
     { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
     { label: 'ocr_reader_target', value: ocrTarget || '' },
+    { label: 'ocr_backend_kind', value: ocrRuntime.backend_kind || '' },
+    { label: 'ocr_backend_detail', value: ocrRuntime.backend_detail || '' },
+    { label: 'rapidocr_enabled', value: String(Boolean(status.rapidocr_enabled)) },
+    { label: 'rapidocr_installed', value: String(Boolean(rapidocr.installed)) },
+    { label: 'rapidocr_detail', value: rapidocr.detail || '' },
     { label: 'memory_reader_enabled', value: String(Boolean(status.memory_reader_enabled)) },
     { label: 'memory_reader_status', value: memoryReaderRuntime.status || '' },
     { label: 'memory_reader_detail', value: memoryReaderRuntime.detail || '' },
@@ -558,6 +627,7 @@ function renderStatus(status) {
   ]);
 
   renderOcrRuntime(status);
+  renderRapidOcr(status);
   renderTesseract(status);
   renderTextractor(status);
   renderOcrProfile(status);
@@ -576,10 +646,113 @@ function renderOcrRuntime(status) {
     { label: 'last_seq', value: String(runtime.last_seq || 0) },
     { label: 'last_event_ts', value: runtime.last_event_ts || '' },
     { label: 'capture_profile', value: formatCaptureProfile(runtime.capture_profile) || '(default)' },
+    { label: 'backend_kind', value: runtime.backend_kind || '' },
+    { label: 'backend_detail', value: runtime.backend_detail || '' },
+    { label: 'backend_path', value: runtime.backend_path || '' },
+    { label: 'backend_model', value: runtime.backend_model || '' },
     { label: 'tesseract_path', value: runtime.tesseract_path || '' },
     { label: 'languages', value: runtime.languages || '' },
     { label: 'takeover_reason', value: runtime.takeover_reason || '' },
   ]);
+}
+
+function renderRapidOcr(status) {
+  const rapidocr = status.rapidocr || {};
+  const runtime = status.ocr_reader_runtime || {};
+  const banner = document.getElementById('rapidocrPrompt');
+  const kicker = document.getElementById('rapidocrPromptKicker');
+  const title = document.getElementById('rapidocrPromptTitle');
+  const body = document.getElementById('rapidocrPromptBody');
+  const path = document.getElementById('rapidocrPathText');
+  const button = document.getElementById('rapidocrInstallBtn');
+  const installState = getInstallState('rapidocr').state;
+  const installable = Boolean(rapidocr.install_supported) && Boolean(rapidocr.can_install);
+  const installed = Boolean(rapidocr.installed);
+  const usingRapidOcr = runtime.backend_kind === 'rapidocr';
+  const usingFallback = runtime.backend_kind === 'tesseract';
+
+  banner.hidden = false;
+  banner.className = 'install-banner install-banner-rapidocr';
+  button.hidden = !installable;
+  button.disabled = getInstallState('rapidocr').inProgress;
+  button.textContent = getInstallState('rapidocr').inProgress
+    ? getInstallConfig('rapidocr').runningText
+    : getInstallConfig('rapidocr').actionText;
+
+  if (!rapidocr.install_supported) {
+    banner.classList.add('neutral');
+    kicker.textContent = 'OCR Primary Backend';
+    title.textContent = '当前平台暂不支持自动安装 RapidOCR';
+    body.textContent = 'RapidOCR 主后端目前只支持 Windows 本地运行时安装。';
+    path.textContent = '';
+    button.hidden = true;
+    renderInstallTaskState('rapidocr');
+    return;
+  }
+
+  if (installed) {
+    banner.classList.add(usingRapidOcr ? 'success' : 'neutral');
+    kicker.textContent = usingRapidOcr ? 'OCR Primary Active' : 'OCR Primary Ready';
+    title.textContent = usingRapidOcr
+      ? 'RapidOCR 已接管当前 OCR Reader'
+      : 'RapidOCR 已就绪，等待作为 OCR 主后端工作';
+    body.textContent = usingRapidOcr
+      ? `当前主后端: ${runtime.backend_kind || 'rapidocr'}，模型 ${runtime.backend_model || rapidocr.selected_model || ''}。`
+      : usingFallback
+        ? `RapidOCR 已安装，但本帧 OCR 回退到了 Tesseract。原因: ${runtime.backend_detail || rapidocr.detail || 'unknown'}.`
+        : 'RapidOCR 已安装完成。无 SDK 且无有效 memory text 时，它会优先于 Tesseract 作为 OCR Reader 的主后端。';
+    path.textContent = rapidocr.detected_path
+      ? `检测路径: ${rapidocr.detected_path}${rapidocr.model_cache_dir ? ` | 模型目录: ${rapidocr.model_cache_dir}` : ''}`
+      : '';
+    button.hidden = true;
+  } else if (rapidocr.detail === 'missing_models') {
+    banner.classList.add('warning');
+    kicker.textContent = 'OCR Primary Missing Models';
+    title.textContent = 'RapidOCR 运行时存在，但模型状态不完整';
+    body.textContent = 'RapidOCR 包已存在，但缺少安装完成状态或模型缓存标记。重新安装会执行预热校验并修复状态。';
+    path.textContent = rapidocr.target_dir ? `目标目录: ${rapidocr.target_dir}` : '';
+  } else if (rapidocr.detail === 'broken_runtime') {
+    banner.classList.add('warning');
+    kicker.textContent = 'OCR Primary Broken';
+    title.textContent = 'RapidOCR 运行时已损坏或导入失败';
+    body.textContent = '建议重新执行一键安装。安装流程会重新落地插件隔离运行时，并在完成后做一次空白图推理自检。';
+    path.textContent = rapidocr.detected_path
+      ? `检测路径: ${rapidocr.detected_path}`
+      : '';
+  } else {
+    banner.classList.add('warning');
+    kicker.textContent = 'OCR Primary Missing';
+    title.textContent = 'RapidOCR 尚未就绪';
+    body.textContent = 'RapidOCR 现在是 OCR Reader 的内部主后端。安装完成后会优先于 Tesseract 参与 OCR，Tesseract 仅保留为兼容 fallback。';
+    path.textContent = rapidocr.target_dir
+      ? `预期安装位置: ${rapidocr.target_dir}`
+      : '';
+  }
+
+  if (installState && !isInstallTaskTerminal(installState)) {
+    banner.className = 'install-banner install-banner-rapidocr neutral';
+    kicker.textContent = 'RapidOCR Install';
+    title.textContent = 'RapidOCR 正在后台安装';
+    body.textContent = '页面会通过 SSE 接收实时安装进度。安装完成后会自动刷新插件状态，并优先切回 RapidOCR 主后端。';
+    button.hidden = false;
+    button.disabled = true;
+    button.textContent = getInstallConfig('rapidocr').runningText;
+  } else if (installState && installState.status === 'failed' && installable) {
+    banner.className = 'install-banner install-banner-rapidocr neutral';
+    kicker.textContent = 'RapidOCR Install';
+    title.textContent = 'RapidOCR 安装失败，可直接重试';
+    body.textContent = installState.error || installState.message || '后台安装任务失败，你可以再次点击按钮重试。';
+    button.hidden = false;
+    button.disabled = false;
+    button.textContent = getInstallConfig('rapidocr').retryText;
+  } else if (installState && installState.status === 'completed' && !installed) {
+    banner.className = 'install-banner install-banner-rapidocr neutral';
+    kicker.textContent = 'RapidOCR Install';
+    title.textContent = 'RapidOCR 安装已完成，正在刷新 OCR 状态';
+    body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
+  }
+
+  renderInstallTaskState('rapidocr');
 }
 
 function renderTesseract(status) {
@@ -606,9 +779,9 @@ function renderTesseract(status) {
 
   if (!tesseract.install_supported) {
     banner.classList.add('neutral');
-    kicker.textContent = 'OCR 主 fallback';
+    kicker.textContent = 'OCR Compatibility Fallback';
     title.textContent = '当前平台暂不支持自动安装 Tesseract';
-    body.textContent = 'OCR Reader 目前固定为 Windows-only，本地 Tesseract 也只在 Windows 上提供自动安装入口。';
+    body.textContent = 'Tesseract 目前只保留为 OCR Reader 的兼容 fallback，本地自动安装也只在 Windows 上提供。';
     path.textContent = '';
     button.hidden = true;
     renderInstallTaskState('tesseract');
@@ -617,32 +790,30 @@ function renderTesseract(status) {
 
   if (installed) {
     banner.classList.add('success');
-    kicker.textContent = 'OCR Ready';
-    title.textContent = runtime.status === 'active'
-      ? 'Tesseract 已就绪，OCR 正在接管'
-      : 'Tesseract 已就绪，等待 OCR 接管';
-    body.textContent = runtime.detail === 'bridge_sdk_available'
-      ? '当前 Bridge SDK 可用，OCR Reader 保持热备，不会抢占主桥接。'
-      : runtime.detail === 'memory_reader_active'
-        ? '当前 Memory Reader 仍有有效文本，OCR Reader 保持热备，等待更合适的接管时机。'
-        : '本地 Tesseract 与默认语言包 chi_sim+jpn+eng 已齐全。无 SDK 且无有效内存文本时，OCR Reader 会作为当前正式主 fallback 接管。';
+    kicker.textContent = 'OCR Compatibility Fallback';
+    title.textContent = runtime.backend_kind === 'tesseract'
+      ? 'Tesseract 正在作为兼容 fallback 工作'
+      : 'Tesseract 已就绪，等待必要时回退';
+    body.textContent = runtime.backend_kind === 'tesseract'
+      ? `当前 OCR Reader 使用 Tesseract。原因: ${runtime.backend_detail || runtime.detail || 'compatibility fallback'}.`
+      : '本地 Tesseract 与默认语言包 chi_sim+jpn+eng 已齐全。它会在 RapidOCR 缺失、损坏或运行时异常时接管 OCR。';
     path.textContent = tesseract.detected_path
       ? `检测路径: ${tesseract.detected_path}`
       : '';
     button.hidden = true;
   } else if (tesseract.detail === 'missing_languages') {
     banner.classList.add('warning');
-    kicker.textContent = 'OCR Missing Languages';
-    title.textContent = '已检测到 Tesseract，但语言包不完整';
-    body.textContent = `当前缺少 ${(missingLanguages || []).join(', ') || '语言包'}，OCR 主 fallback 暂不可用。安装流程会按默认语言 chi_sim+jpn+eng 补齐运行所需文件。`;
+    kicker.textContent = 'Fallback Missing Languages';
+    title.textContent = '已检测到 Tesseract，但兼容 fallback 语言包不完整';
+    body.textContent = `当前缺少 ${(missingLanguages || []).join(', ') || '语言包'}。安装流程会按默认语言 chi_sim+jpn+eng 补齐兼容 fallback 所需文件。`;
     path.textContent = tesseract.tessdata_dir
       ? `tessdata 目录: ${tesseract.tessdata_dir}`
       : '';
   } else {
     banner.classList.add('warning');
-    kicker.textContent = 'OCR Missing';
-    title.textContent = '未检测到 Tesseract，OCR 主 fallback 尚未就绪';
-    body.textContent = '当前无 SDK 场景下的正式主 fallback 是 OCR Reader。安装本地 Tesseract 后，插件才会进入窗口截图 + OCR 接管链路。';
+    kicker.textContent = 'Fallback Missing';
+    title.textContent = '未检测到 Tesseract，兼容 fallback 尚未就绪';
+    body.textContent = '这不会阻止 RapidOCR 作为主后端工作，但当 RapidOCR 缺失或运行异常时，将无法自动回退到本地 Tesseract。';
     path.textContent = tesseract.expected_executable_path
       ? `预期安装位置: ${tesseract.expected_executable_path}`
       : '';
@@ -849,7 +1020,7 @@ function renderAgentStatus(payload) {
 
 function renderExplain(payload) {
   const node = document.getElementById('explainPanel');
-  node.className = 'result-panel';
+  node.className = 'result-panel scroll-region';
   node.innerHTML = `
     <p class="list-kicker">${escapeHtml(payload.line_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
     <h3>${escapeHtml(payload.speaker || '旁白')}</h3>
@@ -861,7 +1032,7 @@ function renderExplain(payload) {
 
 function renderSummary(payload) {
   const node = document.getElementById('summaryPanel');
-  node.className = 'result-panel';
+  node.className = 'result-panel scroll-region';
   const points = payload.key_points || [];
   node.innerHTML = `
     <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
@@ -875,7 +1046,7 @@ function renderSummary(payload) {
 
 function renderSuggest(payload) {
   const node = document.getElementById('suggestPanel');
-  node.className = 'result-panel';
+  node.className = 'result-panel scroll-region';
   const choices = payload.choices || [];
   node.innerHTML = `
     <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
@@ -891,65 +1062,122 @@ function renderSuggest(payload) {
   `;
 }
 
-async function refreshAll() {
-  setFlash('', 'info');
-  try {
-    const [status, snapshot, history, agentStatus] = await Promise.all([
-      callPlugin('galgame_get_status'),
-      callPlugin('galgame_get_snapshot'),
-      callPlugin('galgame_get_history', { limit: 20, include_events: true }),
-      safeCall(
-        'galgame_agent_command',
-        { action: 'query_status' },
-        { action: 'query_status', result: '', status: 'standby', recent_pushes: [] },
-      ),
-    ]);
-    renderStatus(status);
-    renderSnapshot(snapshot);
-    renderHistory(history);
-    renderAgentStatus(agentStatus);
+async function refreshInsights(snapshot, { force = false } = {}) {
+  const state = snapshot.snapshot || {};
+  const currentLineId = state.line_id || '';
+  const currentSceneId = state.scene_id || '';
+  const choices = Array.isArray(state.choices) ? state.choices : [];
+  const hasChoices = Boolean(state.is_menu_open) && choices.length > 0;
+  const explainKey = currentLineId || 'missing-line';
+  const summaryKey = currentSceneId || 'missing-scene';
+  const suggestKey = hasChoices
+    ? `${currentSceneId}::${choices.map((item) => `${item.choice_id || ''}:${item.text || ''}`).join('|')}`
+    : `${currentSceneId}::no-choices`;
 
-    const currentLineId = snapshot.snapshot?.line_id || '';
-    const currentSceneId = snapshot.snapshot?.scene_id || '';
-    const hasChoices = Boolean(snapshot.snapshot?.is_menu_open)
-      && Array.isArray(snapshot.snapshot?.choices)
-      && snapshot.snapshot.choices.length > 0;
-    const [explain, summary, suggest] = await Promise.all([
-      currentLineId
-        ? safeCall(
-          'galgame_explain_line',
-          { line_id: currentLineId },
-          { line_id: currentLineId, speaker: '', text: '', explanation: '', evidence: [] },
-        )
-        : Promise.resolve({
-          degraded: true,
-          line_id: '',
-          speaker: '',
-          text: '',
-          explanation: '',
-          evidence: [],
-          diagnostic: 'missing line_id',
-        }),
-      safeCall(
+  const explainPromise = currentLineId
+    ? (force || latestInsights.explainKey !== explainKey || !latestInsights.explainPayload)
+      ? safeCall(
+        'galgame_explain_line',
+        { line_id: currentLineId },
+        buildExplainFallback(currentLineId),
+      )
+      : Promise.resolve(latestInsights.explainPayload)
+    : Promise.resolve(buildExplainFallback('', 'missing line_id'));
+
+  const summaryPromise = currentSceneId
+    ? (force || latestInsights.summaryKey !== summaryKey || !latestInsights.summaryPayload)
+      ? safeCall(
         'galgame_summarize_scene',
-        currentSceneId ? { scene_id: currentSceneId } : {},
-        { scene_id: currentSceneId, summary: '', key_points: [] },
-      ),
-      hasChoices
-        ? safeCall('galgame_suggest_choice', {}, { scene_id: currentSceneId, choices: [] })
-        : Promise.resolve({
-          degraded: true,
-          scene_id: currentSceneId,
-          choices: [],
-          diagnostic: 'no visible choices',
-        }),
-    ]);
+        { scene_id: currentSceneId },
+        buildSummaryFallback(currentSceneId),
+      )
+      : Promise.resolve(latestInsights.summaryPayload)
+    : Promise.resolve(buildSummaryFallback('', 'missing scene_id'));
 
-    renderExplain(explain);
-    renderSummary(summary);
-    renderSuggest(suggest);
-  } catch (error) {
-    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  const suggestPromise = hasChoices
+    ? (force || latestInsights.suggestKey !== suggestKey || !latestInsights.suggestPayload)
+      ? safeCall(
+        'galgame_suggest_choice',
+        {},
+        buildSuggestFallback(currentSceneId),
+      )
+      : Promise.resolve(latestInsights.suggestPayload)
+    : Promise.resolve(buildSuggestFallback(currentSceneId, 'no visible choices'));
+
+  const [explain, summary, suggest] = await Promise.all([
+    explainPromise,
+    summaryPromise,
+    suggestPromise,
+  ]);
+
+  latestInsights.explainKey = explainKey;
+  latestInsights.explainPayload = explain;
+  latestInsights.summaryKey = summaryKey;
+  latestInsights.summaryPayload = summary;
+  latestInsights.suggestKey = suggestKey;
+  latestInsights.suggestPayload = suggest;
+
+  renderExplain(explain);
+  renderSummary(summary);
+  renderSuggest(suggest);
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer !== null) {
+    window.clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  autoRefreshTimer = window.setInterval(() => {
+    if (document.hidden) {
+      return;
+    }
+    refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
+  }, AUTO_REFRESH_INTERVAL_MS);
+}
+
+async function refreshAll(options = {}) {
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
+
+  const { preserveFlash = false, silent = false, forceInsights = false } = options;
+  refreshInFlight = (async () => {
+    if (!preserveFlash && !silent) {
+      setFlash('', 'info');
+    }
+    try {
+      const [status, snapshot, history, agentStatus] = await Promise.all([
+        callPlugin('galgame_get_status'),
+        callPlugin('galgame_get_snapshot'),
+        callPlugin('galgame_get_history', { limit: 20, include_events: true }),
+        safeCall(
+          'galgame_agent_command',
+          { action: 'query_status' },
+          { action: 'query_status', result: '', status: 'standby', recent_pushes: [] },
+        ),
+      ]);
+      renderStatus(status);
+      renderSnapshot(snapshot);
+      renderHistory(history);
+      renderAgentStatus(agentStatus);
+      await refreshInsights(snapshot, { force: forceInsights });
+    } catch (error) {
+      if (silent) {
+        console.warn('[galgame_plugin ui] refresh failed', error);
+        return;
+      }
+      setFlash(error instanceof Error ? error.message : String(error), 'error');
+    }
+  })();
+
+  try {
+    await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
   }
 }
 
@@ -1006,6 +1234,10 @@ async function installTextractor(force = false) {
   await startInstall('textractor', force);
 }
 
+async function installRapidOcr(force = false) {
+  await startInstall('rapidocr', force);
+}
+
 async function installTesseract(force = false) {
   await startInstall('tesseract', force);
 }
@@ -1019,7 +1251,7 @@ async function saveMode() {
       push_notifications: pushNotifications,
     });
     setFlash('模式已保存', 'success');
-    await refreshAll();
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -1030,7 +1262,7 @@ async function bindGame() {
   try {
     await callPlugin('galgame_bind_game', { game_id: gameId });
     setFlash(gameId ? `已绑定 ${gameId}` : '已恢复自动选择', 'success');
-    await refreshAll();
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -1044,7 +1276,7 @@ async function setStandby(standby) {
     });
     latestAgentReply = payload.result || latestAgentReply;
     setFlash(standby ? '已切换到待机' : '已恢复活跃', 'success');
-    await refreshAll();
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -1066,7 +1298,7 @@ async function askAgent(action) {
     );
     latestAgentReply = payload.result || 'Agent 未返回文本';
     setFlash('Agent 已响应', 'success');
-    await refreshAll();
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -1103,7 +1335,7 @@ async function saveOcrCaptureProfile() {
       clear: false,
     });
     setFlash(payload.summary || 'OCR 截图校准已保存', 'success');
-    await refreshAll();
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -1117,18 +1349,20 @@ async function clearOcrCaptureProfile() {
       clear: true,
     });
     setFlash(payload.summary || 'OCR 截图校准已清空', 'success');
-    await refreshAll();
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
 }
 
 async function initialize() {
-  await refreshAll();
+  await refreshAll({ forceInsights: true });
   await Promise.all([
+    restoreRapidOcrInstallState(),
     restoreTesseractInstallState(),
     restoreTextractorInstallState(),
   ]);
+  startAutoRefresh();
 }
 
 document.getElementById('refreshBtn').addEventListener('click', refreshAll);
@@ -1142,9 +1376,20 @@ document.getElementById('standbyOnBtn').addEventListener('click', () => setStand
 document.getElementById('standbyOffBtn').addEventListener('click', () => setStandby(false));
 document.getElementById('queryContextBtn').addEventListener('click', () => askAgent('query_context'));
 document.getElementById('sendMessageBtn').addEventListener('click', () => askAgent('send_message'));
+document.getElementById('rapidocrInstallBtn').addEventListener('click', () => installRapidOcr(false));
 document.getElementById('tesseractInstallBtn').addEventListener('click', () => installTesseract(false));
 document.getElementById('textractorInstallBtn').addEventListener('click', () => installTextractor(false));
 document.getElementById('ocrProfileSaveBtn').addEventListener('click', saveOcrCaptureProfile);
 document.getElementById('ocrProfileClearBtn').addEventListener('click', clearOcrCaptureProfile);
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
+  }
+});
+
+window.addEventListener('focus', () => {
+  refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
+});
 
 initialize();

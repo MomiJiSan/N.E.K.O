@@ -18,7 +18,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from plugin.plugins.galgame_plugin.models import GalgameConfig
+from plugin.plugins.galgame_plugin.models import (
+    DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_TOP_RATIO,
+    GalgameConfig,
+)
 from plugin.plugins.galgame_plugin.ocr_reader import (
     OcrCaptureProfile,
     OcrReaderManager,
@@ -61,10 +67,10 @@ async def main() -> None:
         return
 
     profile = OcrCaptureProfile(
-        left_inset_ratio=0.05,
-        right_inset_ratio=0.05,
-        top_ratio=0.3,
-        bottom_inset_ratio=0.3,
+        left_inset_ratio=DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
+        right_inset_ratio=DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
+        top_ratio=DEFAULT_OCR_CAPTURE_TOP_RATIO,
+        bottom_inset_ratio=DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
     )
 
     print("\nCapturing frame...")
@@ -81,11 +87,11 @@ async def main() -> None:
     print(f"  Saved cropped frame to: {debug_path.resolve()}")
 
     # Check Tesseract
-        ocr = TesseractOcrBackend(
-            tesseract_path="",
-            install_target_dir_raw="",
-            languages="chi_sim+jpn+eng",
-        )
+    ocr = TesseractOcrBackend(
+        tesseract_path="",
+        install_target_dir_raw="",
+        languages="chi_sim+jpn+eng",
+    )
     if not ocr.is_available():
         print("\nERROR: Tesseract OCR is not available.")
         print("  - Make sure tesseract.exe is installed")
@@ -133,6 +139,7 @@ async def main() -> None:
         memory_reader_hook_codes=[],
         memory_reader_poll_interval_seconds=1.0,
         ocr_reader_enabled=True,
+        ocr_reader_backend_selection="auto",
         ocr_reader_tesseract_path="",
         ocr_reader_install_manifest_url="",
         ocr_reader_install_target_dir="",
@@ -140,10 +147,18 @@ async def main() -> None:
         ocr_reader_poll_interval_seconds=2.0,
         ocr_reader_no_text_takeover_after_seconds=30.0,
         ocr_reader_languages="chi_sim+jpn+eng",
-        ocr_reader_left_inset_ratio=0.05,
-        ocr_reader_right_inset_ratio=0.05,
-        ocr_reader_top_ratio=0.3,
-        ocr_reader_bottom_inset_ratio=0.3,
+        ocr_reader_left_inset_ratio=DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
+        ocr_reader_right_inset_ratio=DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
+        ocr_reader_top_ratio=DEFAULT_OCR_CAPTURE_TOP_RATIO,
+        ocr_reader_bottom_inset_ratio=DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
+        rapidocr_enabled=True,
+        rapidocr_install_manifest_url="",
+        rapidocr_install_target_dir="",
+        rapidocr_install_timeout_seconds=180.0,
+        rapidocr_engine_type="onnxruntime",
+        rapidocr_lang_type="ch",
+        rapidocr_model_type="mobile",
+        rapidocr_ocr_version="PP-OCRv5",
     )
     mgr = OcrReaderManager(logger=_noop_logger(), config=config)
     tick = await mgr.tick(bridge_sdk_available=False, memory_reader_runtime={})

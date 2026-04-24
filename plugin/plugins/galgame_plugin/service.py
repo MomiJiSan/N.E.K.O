@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import (
+    DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_TOP_RATIO,
     DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_OCR_READER,
@@ -28,6 +32,13 @@ from .models import (
     sanitize_snapshot_state,
 )
 from .reader import expand_bridge_root, normalize_text, read_session_json
+from .rapidocr_support import (
+    DEFAULT_RAPIDOCR_ENGINE_TYPE,
+    DEFAULT_RAPIDOCR_LANG_TYPE,
+    DEFAULT_RAPIDOCR_MODEL_TYPE,
+    DEFAULT_RAPIDOCR_OCR_VERSION,
+    inspect_rapidocr_installation,
+)
 from .tesseract_support import inspect_tesseract_installation
 from .textractor_support import (
     DEFAULT_TEXTRACTOR_RELEASE_API_URL,
@@ -61,6 +72,13 @@ def _coerce_bool(value: object, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
+def _coerce_ocr_backend_selection(value: object, default: str = "auto") -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized in {"auto", "rapidocr", "tesseract"}:
+        return normalized
+    return default
+
+
 def _default_bridge_root_raw() -> str:
     if sys.platform.startswith("win"):
         return "%LOCALAPPDATA%/N.E.K.O/galgame-bridge"
@@ -76,6 +94,10 @@ def _default_memory_reader_enabled() -> bool:
     return sys.platform.startswith("win")
 
 
+def _default_ocr_reader_enabled() -> bool:
+    return sys.platform.startswith("win")
+
+
 def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
     galgame = raw_config.get("galgame")
     llm = raw_config.get("llm")
@@ -86,6 +108,8 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
     memory_reader_obj = memory_reader if isinstance(memory_reader, dict) else {}
     ocr_reader = raw_config.get("ocr_reader")
     ocr_reader_obj = ocr_reader if isinstance(ocr_reader, dict) else {}
+    rapidocr = raw_config.get("rapidocr")
+    rapidocr_obj = rapidocr if isinstance(rapidocr, dict) else {}
 
     default_mode_obj = galgame_obj.get("default_mode")
     default_mode = (
@@ -161,7 +185,12 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             memory_reader_obj.get("poll_interval_seconds"), 1.0, minimum=0.1
         ),
         ocr_reader_enabled=_coerce_bool(
-            ocr_reader_obj.get("enabled"), False,
+            ocr_reader_obj.get("enabled"),
+            _default_ocr_reader_enabled(),
+        ),
+        ocr_reader_backend_selection=_coerce_ocr_backend_selection(
+            ocr_reader_obj.get("backend_selection"),
+            "auto",
         ),
         ocr_reader_tesseract_path=str(ocr_reader_obj.get("tesseract_path") or ""),
         ocr_reader_install_manifest_url=str(
@@ -181,17 +210,54 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ),
         ocr_reader_languages=str(ocr_reader_obj.get("languages") or "chi_sim+jpn+eng"),
         ocr_reader_left_inset_ratio=_coerce_float(
-            ocr_reader_obj.get("left_inset_ratio"), 0.05, minimum=0.0
+            ocr_reader_obj.get("left_inset_ratio"),
+            DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
+            minimum=0.0,
         ),
         ocr_reader_right_inset_ratio=_coerce_float(
-            ocr_reader_obj.get("right_inset_ratio"), 0.05, minimum=0.0
+            ocr_reader_obj.get("right_inset_ratio"),
+            DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
+            minimum=0.0,
         ),
         ocr_reader_top_ratio=_coerce_float(
-            ocr_reader_obj.get("top_ratio"), 0.3, minimum=0.0
+            ocr_reader_obj.get("top_ratio"),
+            DEFAULT_OCR_CAPTURE_TOP_RATIO,
+            minimum=0.0,
         ),
         ocr_reader_bottom_inset_ratio=_coerce_float(
-            ocr_reader_obj.get("bottom_inset_ratio"), 0.3, minimum=0.0
+            ocr_reader_obj.get("bottom_inset_ratio"),
+            DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
+            minimum=0.0,
         ),
+        rapidocr_enabled=_coerce_bool(
+            rapidocr_obj.get("enabled"),
+            _default_ocr_reader_enabled(),
+        ),
+        rapidocr_install_manifest_url=str(
+            rapidocr_obj.get("install_manifest_url") or ""
+        ).strip(),
+        rapidocr_install_target_dir=str(
+            rapidocr_obj.get("install_target_dir") or ""
+        ).strip(),
+        rapidocr_install_timeout_seconds=_coerce_float(
+            rapidocr_obj.get("install_timeout_seconds"), 180.0, minimum=1.0
+        ),
+        rapidocr_engine_type=str(
+            rapidocr_obj.get("engine_type") or DEFAULT_RAPIDOCR_ENGINE_TYPE
+        ).strip()
+        or DEFAULT_RAPIDOCR_ENGINE_TYPE,
+        rapidocr_lang_type=str(
+            rapidocr_obj.get("lang_type") or DEFAULT_RAPIDOCR_LANG_TYPE
+        ).strip()
+        or DEFAULT_RAPIDOCR_LANG_TYPE,
+        rapidocr_model_type=str(
+            rapidocr_obj.get("model_type") or DEFAULT_RAPIDOCR_MODEL_TYPE
+        ).strip()
+        or DEFAULT_RAPIDOCR_MODEL_TYPE,
+        rapidocr_ocr_version=str(
+            rapidocr_obj.get("ocr_version") or DEFAULT_RAPIDOCR_OCR_VERSION
+        ).strip()
+        or DEFAULT_RAPIDOCR_OCR_VERSION,
     )
 
 
@@ -635,6 +701,13 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         configured_path=config.memory_reader_textractor_path,
         install_target_dir_raw=config.memory_reader_install_target_dir,
     )
+    rapidocr = inspect_rapidocr_installation(
+        install_target_dir_raw=config.rapidocr_install_target_dir,
+        engine_type=config.rapidocr_engine_type,
+        lang_type=config.rapidocr_lang_type,
+        model_type=config.rapidocr_model_type,
+        ocr_version=config.rapidocr_ocr_version,
+    )
     tesseract = inspect_tesseract_installation(
         configured_path=config.ocr_reader_tesseract_path,
         install_target_dir_raw=config.ocr_reader_install_target_dir,
@@ -665,6 +738,8 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "phase": "phase_1",
         "memory_reader_enabled": config.memory_reader_enabled,
         "ocr_reader_enabled": config.ocr_reader_enabled,
+        "rapidocr_enabled": config.rapidocr_enabled,
+        "rapidocr": rapidocr,
         "textractor": textractor,
         "tesseract": tesseract,
     }

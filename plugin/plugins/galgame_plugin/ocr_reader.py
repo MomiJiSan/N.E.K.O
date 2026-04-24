@@ -12,7 +12,18 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
-from .models import DATA_SOURCE_OCR_READER, GalgameConfig
+from .models import (
+    DATA_SOURCE_OCR_READER,
+    DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
+    DEFAULT_OCR_CAPTURE_TOP_RATIO,
+    GalgameConfig,
+)
+from .rapidocr_support import (
+    inspect_rapidocr_installation,
+    load_rapidocr_runtime,
+)
 from .reader import normalize_text
 from .tesseract_support import inspect_tesseract_installation, resolve_tesseract_path
 
@@ -29,6 +40,9 @@ OCR_READER_ROUTE_ID = ""
 OCR_READER_DEFAULT_ENGINE = "unknown"
 
 _MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_KANA_CHAR_RE = re.compile(r"[\u3040-\u30ff]")
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -57,10 +71,10 @@ def _coerce_choice_lines(lines: list[str]) -> list[str]:
 
 @dataclass(slots=True)
 class OcrCaptureProfile:
-    left_inset_ratio: float = 0.05
-    right_inset_ratio: float = 0.05
-    top_ratio: float = 0.3
-    bottom_inset_ratio: float = 0.3
+    left_inset_ratio: float = DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO
+    right_inset_ratio: float = DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO
+    top_ratio: float = DEFAULT_OCR_CAPTURE_TOP_RATIO
+    bottom_inset_ratio: float = DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -73,11 +87,182 @@ class OcrCaptureProfile:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> OcrCaptureProfile:
         return cls(
-            left_inset_ratio=float(value.get("left_inset_ratio", 0.05)),
-            right_inset_ratio=float(value.get("right_inset_ratio", 0.05)),
-            top_ratio=float(value.get("top_ratio", 0.3)),
-            bottom_inset_ratio=float(value.get("bottom_inset_ratio", 0.3)),
+            left_inset_ratio=float(
+                value.get("left_inset_ratio", DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO)
+            ),
+            right_inset_ratio=float(
+                value.get("right_inset_ratio", DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO)
+            ),
+            top_ratio=float(value.get("top_ratio", DEFAULT_OCR_CAPTURE_TOP_RATIO)),
+            bottom_inset_ratio=float(
+                value.get("bottom_inset_ratio", DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO)
+            ),
         )
+
+
+def _score_ocr_text(text: str) -> tuple[float, int, int]:
+    normalized = normalize_text(text)
+    if not normalized:
+        return (-1.0, 0, 0)
+    cjk_count = len(_CJK_CHAR_RE.findall(normalized))
+    kana_count = len(_KANA_CHAR_RE.findall(normalized))
+    ascii_tokens = _ASCII_TOKEN_RE.findall(normalized)
+    isolated_ascii_tokens = sum(1 for token in ascii_tokens if len(token) == 1)
+    multi_char_ascii_tokens = sum(1 for token in ascii_tokens if len(token) > 1)
+    significant_chars = sum(1 for ch in normalized if not ch.isspace())
+    score = (
+        (cjk_count * 5.0)
+        + (kana_count * 4.0)
+        + (multi_char_ascii_tokens * 1.5)
+        + (significant_chars * 0.2)
+        - (isolated_ascii_tokens * 2.0)
+    )
+    return (score, cjk_count + kana_count, significant_chars)
+
+
+def _significant_char_count(text: str) -> int:
+    return sum(1 for ch in str(text or "") if not ch.isspace())
+
+
+def _prepare_ocr_image(image: Any) -> Any:
+    from PIL import Image, ImageFilter, ImageOps
+
+    resampling = getattr(Image, "Resampling", Image)
+    prepared = image.convert("L")
+    prepared = ImageOps.autocontrast(prepared)
+    prepared = prepared.resize(
+        (max(prepared.width * 2, 1), max(prepared.height * 2, 1)),
+        resampling.LANCZOS,
+    )
+    prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
+    prepared = prepared.filter(ImageFilter.SHARPEN)
+    return prepared
+
+
+def _rapidocr_points(box: Any) -> list[tuple[float, float]]:
+    if hasattr(box, "tolist"):
+        box = box.tolist()
+    if not isinstance(box, (list, tuple)):
+        return []
+    points: list[tuple[float, float]] = []
+    for point in box:
+        if hasattr(point, "tolist"):
+            point = point.tolist()
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            points.append((float(point[0]), float(point[1])))
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
+def _should_insert_ascii_space(previous_text: str, next_text: str) -> bool:
+    if not previous_text or not next_text:
+        return False
+    left = previous_text[-1]
+    right = next_text[0]
+    return left.isascii() and right.isascii() and left.isalnum() and right.isalnum()
+
+
+def _join_ocr_segments(parts: list[str]) -> str:
+    rendered = ""
+    for part in parts:
+        normalized = normalize_text(str(part or "")).replace("\n", " ").strip()
+        if not normalized:
+            continue
+        if not rendered:
+            rendered = normalized
+            continue
+        if _should_insert_ascii_space(rendered, normalized):
+            rendered += " "
+        rendered += normalized
+    return rendered
+
+
+@dataclass(slots=True)
+class _RapidOcrToken:
+    text: str
+    score: float
+    left: float
+    top: float
+    bottom: float
+    height: float
+
+
+def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
+    payload = raw_output[0] if isinstance(raw_output, tuple) and raw_output else raw_output
+    if not isinstance(payload, list):
+        return []
+    tokens: list[_RapidOcrToken] = []
+    for item in payload:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        box, text, score = item[0], item[1], item[2]
+        normalized = normalize_text(str(text or "")).strip()
+        if not normalized:
+            continue
+        try:
+            score_value = float(score)
+        except (TypeError, ValueError):
+            score_value = 0.0
+        if score_value < 0.45:
+            continue
+        points = _rapidocr_points(box)
+        if not points:
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        top = min(ys)
+        bottom = max(ys)
+        tokens.append(
+            _RapidOcrToken(
+                text=normalized,
+                score=score_value,
+                left=min(xs),
+                top=top,
+                bottom=bottom,
+                height=max(bottom - top, 1.0),
+            )
+        )
+    return tokens
+
+
+def _rapidocr_text_from_output(raw_output: Any) -> str:
+    tokens = _rapidocr_tokens_from_output(raw_output)
+    if not tokens:
+        return ""
+    tokens.sort(key=lambda token: (token.top, token.left))
+    lines: list[list[_RapidOcrToken]] = []
+    for token in tokens:
+        token_center = (token.top + token.bottom) / 2.0
+        placed = False
+        for line in lines:
+            line_top = min(item.top for item in line)
+            line_bottom = max(item.bottom for item in line)
+            line_center = (line_top + line_bottom) / 2.0
+            threshold = max((line_bottom - line_top) * 0.6, token.height * 0.6, 12.0)
+            if abs(token_center - line_center) <= threshold:
+                line.append(token)
+                placed = True
+                break
+        if not placed:
+            lines.append([token])
+    rendered_lines: list[str] = []
+    scores: list[float] = []
+    lines.sort(key=lambda line: (min(item.top for item in line), min(item.left for item in line)))
+    for line in lines:
+        line.sort(key=lambda item: item.left)
+        scores.extend(item.score for item in line)
+        rendered_lines.append(_join_ocr_segments([item.text for item in line]))
+    text = "\n".join(line for line in rendered_lines if line)
+    normalized = normalize_text(text)
+    if not normalized:
+        return ""
+    average_score = (sum(scores) / len(scores)) if scores else 0.0
+    if _significant_char_count(normalized) < 4 and average_score < 0.55:
+        return ""
+    return text
 
 
 @dataclass(slots=True)
@@ -104,6 +289,10 @@ class OcrReaderRuntime:
     tesseract_path: str = ""
     languages: str = ""
     takeover_reason: str = ""
+    backend_kind: str = ""
+    backend_detail: str = ""
+    backend_path: str = ""
+    backend_model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +310,10 @@ class OcrReaderRuntime:
             "tesseract_path": self.tesseract_path,
             "languages": self.languages,
             "takeover_reason": self.takeover_reason,
+            "backend_kind": self.backend_kind,
+            "backend_detail": self.backend_detail,
+            "backend_path": self.backend_path,
+            "backend_model": self.backend_model,
         }
 
 
@@ -129,6 +322,33 @@ class OcrReaderTickResult:
     warnings: list[str] = field(default_factory=list)
     should_rescan: bool = False
     runtime: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class OcrBackendDescriptor:
+    kind: str = ""
+    backend: OcrBackend | None = None
+    path: str = ""
+    model: str = ""
+    detail: str = ""
+    available: bool = False
+
+
+@dataclass(slots=True)
+class SelectedOcrBackendPlan:
+    selection: str = "auto"
+    primary: OcrBackendDescriptor = field(default_factory=OcrBackendDescriptor)
+    fallback: OcrBackendDescriptor = field(default_factory=OcrBackendDescriptor)
+    rapidocr_inspection: dict[str, Any] = field(default_factory=dict)
+    tesseract_inspection: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class OcrExtractionResult:
+    text: str = ""
+    backend: OcrBackendDescriptor = field(default_factory=OcrBackendDescriptor)
+    backend_detail: str = ""
+    warnings: list[str] = field(default_factory=list)
 
 
 class CaptureBackend(Protocol):
@@ -262,6 +482,7 @@ class TesseractOcrBackend:
 
     def extract_text(self, image: Any) -> str:
         import pytesseract
+
         path = resolve_tesseract_path(
             self._tesseract_path,
             install_target_dir_raw=self._install_target_dir_raw,
@@ -269,10 +490,63 @@ class TesseractOcrBackend:
         if path:
             pytesseract.pytesseract.tesseract_cmd = path
         lang = self._languages
-        # PSM 6 = Assume a single uniform block of text (good for VN dialogue boxes)
-        config = "--psm 6"
-        text = pytesseract.image_to_string(image, lang=lang, config=config)
-        return text.strip()
+        # PSM 6 assumes a single dialogue block, which matches VN subtitle boxes.
+        config = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+        prepared = _prepare_ocr_image(image)
+
+        best_text = ""
+        best_score = (-1.0, 0, 0)
+        for candidate in (image, prepared):
+            text = pytesseract.image_to_string(candidate, lang=lang, config=config).strip()
+            score = _score_ocr_text(text)
+            if score > best_score:
+                best_text = text
+                best_score = score
+        return best_text
+
+
+class RapidOcrBackend:
+    def __init__(
+        self,
+        *,
+        install_target_dir_raw: str,
+        engine_type: str,
+        lang_type: str,
+        model_type: str,
+        ocr_version: str,
+    ) -> None:
+        self._install_target_dir_raw = install_target_dir_raw
+        self._engine_type = engine_type
+        self._lang_type = lang_type
+        self._model_type = model_type
+        self._ocr_version = ocr_version
+        self._runtime = None
+
+    def is_available(self) -> bool:
+        inspection = inspect_rapidocr_installation(
+            install_target_dir_raw=self._install_target_dir_raw,
+            engine_type=self._engine_type,
+            lang_type=self._lang_type,
+            model_type=self._model_type,
+            ocr_version=self._ocr_version,
+        )
+        return bool(inspection.get("installed"))
+
+    def extract_text(self, image: Any) -> str:
+        import numpy as np
+
+        if self._runtime is None:
+            self._runtime, _metadata = load_rapidocr_runtime(
+                install_target_dir_raw=self._install_target_dir_raw,
+                engine_type=self._engine_type,
+                lang_type=self._lang_type,
+                model_type=self._model_type,
+                ocr_version=self._ocr_version,
+                force_reload=False,
+            )
+        prepared = _prepare_ocr_image(image).convert("RGB")
+        output = self._runtime(np.asarray(prepared))
+        return _rapidocr_text_from_output(output)
 
 
 def _default_window_scanner() -> list[DetectedGameWindow]:
@@ -750,12 +1024,6 @@ class OcrReaderManager:
                 bridge_root=config.bridge_root,
                 time_fn=self._time_fn,
             )
-        if not self._custom_ocr_backend:
-            self._ocr_backend = TesseractOcrBackend(
-                tesseract_path=config.ocr_reader_tesseract_path,
-                install_target_dir_raw=config.ocr_reader_install_target_dir,
-                languages=config.ocr_reader_languages,
-            )
 
     def update_capture_profiles(self, profiles: dict[str, dict[str, float]]) -> None:
         self._capture_profiles = {}
@@ -763,7 +1031,11 @@ class OcrReaderManager:
             try:
                 self._capture_profiles[str(process_name)] = OcrCaptureProfile.from_dict(profile_dict)
             except Exception as exc:
-                self._logger.warning("ocr_reader failed to parse capture profile for %s: %s", process_name, exc)
+                self._logger.warning(
+                    "ocr_reader failed to parse capture profile for %s: %s",
+                    process_name,
+                    exc,
+                )
 
     def runtime(self) -> dict[str, Any]:
         return self._runtime.to_dict()
@@ -789,82 +1061,45 @@ class OcrReaderManager:
             return result
 
         if not self._platform_fn():
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+            self._runtime = self._build_runtime(
                 status="idle",
                 detail="unsupported_platform",
+                plan=SelectedOcrBackendPlan(),
             )
             await self._end_session_if_needed(now)
             result.warnings.append("ocr_reader is Windows-only")
             result.runtime = self._runtime.to_dict()
             return result
 
-        tesseract_path = resolve_tesseract_path(
-            self._config.ocr_reader_tesseract_path,
-            install_target_dir_raw=self._config.ocr_reader_install_target_dir,
-        )
-        if not tesseract_path:
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+        backend_plan = self._resolve_backend_plan()
+        if not backend_plan.primary.available:
+            self._runtime = self._build_runtime(
                 status="idle",
-                detail="missing_tesseract",
+                detail=self._backend_unavailable_detail(backend_plan),
+                plan=backend_plan,
             )
             await self._end_session_if_needed(now)
-            result.warnings.append("ocr_reader Tesseract is missing or not configured")
-            result.runtime = self._runtime.to_dict()
-            return result
-
-        inspection = inspect_tesseract_installation(
-            configured_path=self._config.ocr_reader_tesseract_path,
-            install_target_dir_raw=self._config.ocr_reader_install_target_dir,
-            languages=self._config.ocr_reader_languages,
-        )
-        if inspection.get("detail") == "missing_languages":
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
-                status="idle",
-                detail="missing_languages",
-                tesseract_path=tesseract_path,
-                languages=self._config.ocr_reader_languages,
-            )
-            await self._end_session_if_needed(now)
-            missing = inspection.get("missing_languages", [])
-            result.warnings.append(f"ocr_reader Tesseract is missing languages: {missing}")
+            result.warnings.extend(self._backend_unavailable_warnings(backend_plan))
             result.runtime = self._runtime.to_dict()
             return result
 
         if bridge_sdk_available:
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+            self._runtime = self._build_runtime(
                 status="idle",
                 detail="bridge_sdk_available",
-                tesseract_path=tesseract_path,
-                languages=self._config.ocr_reader_languages,
-                game_id=self._runtime.game_id,
-                session_id=self._runtime.session_id,
-                last_seq=self._runtime.last_seq,
-                last_event_ts=self._runtime.last_event_ts,
+                plan=backend_plan,
             )
             await self._end_session_if_needed(now)
             result.runtime = self._runtime.to_dict()
             return result
 
-        memory_reader_has_text = bool(
-            memory_reader_runtime.get("last_seq", 0) > 1
-            or memory_reader_runtime.get("detail") == "receiving_text"
-        )
+        memory_reader_has_text = str(memory_reader_runtime.get("detail") or "") == "receiving_text"
         if memory_reader_has_text:
             self._last_memory_reader_text_at = now
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+            self._runtime = self._build_runtime(
                 status="idle",
                 detail="memory_reader_active",
-                tesseract_path=tesseract_path,
-                languages=self._config.ocr_reader_languages,
-                game_id=self._runtime.game_id,
-                session_id=self._runtime.session_id,
-                last_seq=self._runtime.last_seq,
-                last_event_ts=self._runtime.last_event_ts,
+                plan=backend_plan,
             )
             result.runtime = self._runtime.to_dict()
             return result
@@ -873,32 +1108,20 @@ class OcrReaderManager:
             elapsed = now - self._last_memory_reader_text_at
             threshold = float(self._config.ocr_reader_no_text_takeover_after_seconds)
             if elapsed < threshold:
-                self._runtime = OcrReaderRuntime(
-                    enabled=True,
+                self._runtime = self._build_runtime(
                     status="idle",
                     detail="waiting_for_takeover_window",
-                    tesseract_path=tesseract_path,
-                    languages=self._config.ocr_reader_languages,
-                    game_id=self._runtime.game_id,
-                    session_id=self._runtime.session_id,
-                    last_seq=self._runtime.last_seq,
-                    last_event_ts=self._runtime.last_event_ts,
+                    plan=backend_plan,
                 )
                 result.runtime = self._runtime.to_dict()
                 return result
 
         if not self._capture_backend.is_available():
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+            self._runtime = self._build_runtime(
                 status="candidate",
                 detail="capture_backend_unavailable",
-                tesseract_path=tesseract_path,
-                languages=self._config.ocr_reader_languages,
+                plan=backend_plan,
                 takeover_reason="capture_backend_not_available",
-                game_id=self._runtime.game_id,
-                session_id=self._runtime.session_id,
-                last_seq=self._runtime.last_seq,
-                last_event_ts=self._runtime.last_event_ts,
             )
             await self._end_session_if_needed(now)
             result.warnings.append("ocr_reader capture backend is not available")
@@ -907,31 +1130,26 @@ class OcrReaderManager:
 
         windows = await asyncio.to_thread(self._window_scanner)
         if not windows:
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+            self._runtime = self._build_runtime(
                 status="idle",
                 detail="waiting_for_capture_target",
-                tesseract_path=tesseract_path,
-                languages=self._config.ocr_reader_languages,
-                game_id=self._runtime.game_id,
-                session_id=self._runtime.session_id,
-                last_seq=self._runtime.last_seq,
-                last_event_ts=self._runtime.last_event_ts,
+                plan=backend_plan,
             )
             await self._end_session_if_needed(now)
             result.runtime = self._runtime.to_dict()
             return result
 
-        target = self._select_target_window(windows)
-        profile = self._capture_profiles.get(target.process_name, OcrCaptureProfile(
-            left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
-            right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
-            top_ratio=self._config.ocr_reader_top_ratio,
-            bottom_inset_ratio=self._config.ocr_reader_bottom_inset_ratio,
-        ))
+        target = self._select_target_window(
+            windows,
+            memory_reader_runtime=memory_reader_runtime,
+        )
+        profile = self._capture_profile_for_target(target)
 
         if self._attached_window is None or self._attached_window.pid != target.pid:
-            if not self._writer.session_id or self._writer.game_id != _ocr_game_id_from_process(target.process_name or target.title):
+            if (
+                not self._writer.session_id
+                or self._writer.game_id != _ocr_game_id_from_process(target.process_name or target.title)
+            ):
                 self._writer.start_session(target)
                 result.should_rescan = True
             self._attached_window = target
@@ -939,20 +1157,16 @@ class OcrReaderManager:
             self._last_raw_ocr_text = ""
             self._ocr_repeat_count = 0
             self._stable_ocr_text = ""
-            self._runtime = OcrReaderRuntime(
-                enabled=True,
+            self._runtime = self._build_runtime(
                 status="starting",
                 detail="starting_capture",
-                process_name=target.process_name,
-                pid=target.pid,
-                window_title=target.title,
+                plan=backend_plan,
+                target=target,
+                capture_profile=profile.to_dict(),
                 game_id=self._writer.game_id,
                 session_id=self._writer.session_id,
                 last_seq=self._writer.last_seq,
                 last_event_ts=self._writer.last_event_ts,
-                capture_profile=profile.to_dict(),
-                tesseract_path=tesseract_path,
-                languages=self._config.ocr_reader_languages,
             )
             result.runtime = self._runtime.to_dict()
             return result
@@ -961,13 +1175,19 @@ class OcrReaderManager:
             self._attached_window = target
 
         emitted = False
+        active_backend = backend_plan.primary
+        backend_detail_override = ""
         try:
-            raw_text = await asyncio.to_thread(
+            extraction = await asyncio.to_thread(
                 self._capture_and_extract_text,
                 target,
                 profile,
+                backend_plan,
             )
-            emitted = self._consume_ocr_text(raw_text, now=now)
+            active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
+            backend_detail_override = extraction.backend_detail
+            result.warnings.extend(extraction.warnings)
+            emitted = self._consume_ocr_text(extraction.text, now=now)
         except Exception as exc:
             self._logger.warning("ocr_reader capture/OCR failed: %s", exc)
             result.warnings.append(f"ocr_reader capture failed: {exc}")
@@ -980,7 +1200,9 @@ class OcrReaderManager:
             self._last_heartbeat_at = now
             status = "active"
             detail = "receiving_text"
-        elif self._writer.session_id and now - self._last_heartbeat_at >= float(self._config.ocr_reader_poll_interval_seconds):
+        elif self._writer.session_id and now - self._last_heartbeat_at >= float(
+            self._config.ocr_reader_poll_interval_seconds
+        ):
             if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
                 result.should_rescan = True
                 self._last_heartbeat_at = now
@@ -989,35 +1211,263 @@ class OcrReaderManager:
             if detail == "starting_capture":
                 detail = "attached_no_text_yet"
 
-        self._runtime = OcrReaderRuntime(
-            enabled=True,
+        self._runtime = self._build_runtime(
             status=status,
             detail=detail,
-            process_name=target.process_name,
-            pid=target.pid,
-            window_title=target.title,
+            plan=backend_plan,
+            active_backend=active_backend,
+            backend_detail_override=backend_detail_override,
+            target=target,
+            capture_profile=profile.to_dict(),
             game_id=self._writer.game_id,
             session_id=self._writer.session_id,
             last_seq=self._writer.last_seq,
             last_event_ts=self._writer.last_event_ts,
-            capture_profile=profile.to_dict(),
-            tesseract_path=tesseract_path,
-            languages=self._config.ocr_reader_languages,
         )
         result.runtime = self._runtime.to_dict()
         return result
+
+    def _configured_backend_selection(self) -> str:
+        selection = str(self._config.ocr_reader_backend_selection or "auto").strip().lower()
+        if selection in {"auto", "rapidocr", "tesseract"}:
+            return selection
+        return "auto"
+
+    def _capture_profile_for_target(self, target: DetectedGameWindow) -> OcrCaptureProfile:
+        return self._capture_profiles.get(
+            target.process_name,
+            OcrCaptureProfile(
+                left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
+                right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
+                top_ratio=self._config.ocr_reader_top_ratio,
+                bottom_inset_ratio=self._config.ocr_reader_bottom_inset_ratio,
+            ),
+        )
+
+    def _resolved_tesseract_path(self) -> str:
+        return resolve_tesseract_path(
+            self._config.ocr_reader_tesseract_path,
+            install_target_dir_raw=self._config.ocr_reader_install_target_dir,
+        )
+
+    def _tesseract_descriptor(self, inspection: dict[str, Any]) -> OcrBackendDescriptor:
+        installed = bool(inspection.get("installed"))
+        detail = "selected_primary" if installed else self._tesseract_unavailable_detail(inspection)
+        return OcrBackendDescriptor(
+            kind="tesseract",
+            backend=TesseractOcrBackend(
+                tesseract_path=self._config.ocr_reader_tesseract_path,
+                install_target_dir_raw=self._config.ocr_reader_install_target_dir,
+                languages=self._config.ocr_reader_languages,
+            ),
+            path=str(inspection.get("detected_path") or self._resolved_tesseract_path()),
+            model=self._config.ocr_reader_languages,
+            detail=detail,
+            available=installed,
+        )
+
+    def _rapidocr_descriptor(self, inspection: dict[str, Any], *, enabled: bool) -> OcrBackendDescriptor:
+        detail = str(inspection.get("detail") or "missing")
+        if not enabled:
+            detail = "disabled_by_config"
+        return OcrBackendDescriptor(
+            kind="rapidocr",
+            backend=RapidOcrBackend(
+                install_target_dir_raw=self._config.rapidocr_install_target_dir,
+                engine_type=self._config.rapidocr_engine_type,
+                lang_type=self._config.rapidocr_lang_type,
+                model_type=self._config.rapidocr_model_type,
+                ocr_version=self._config.rapidocr_ocr_version,
+            ),
+            path=str(inspection.get("detected_path") or ""),
+            model=str(
+                inspection.get("selected_model")
+                or f"{self._config.rapidocr_ocr_version}/{self._config.rapidocr_lang_type}/{self._config.rapidocr_model_type}"
+            ),
+            detail="selected_primary" if enabled and bool(inspection.get("installed")) else detail,
+            available=enabled and bool(inspection.get("installed")),
+        )
+
+    def _resolve_backend_plan(self) -> SelectedOcrBackendPlan:
+        selection = self._configured_backend_selection()
+        tesseract_inspection = inspect_tesseract_installation(
+            configured_path=self._config.ocr_reader_tesseract_path,
+            install_target_dir_raw=self._config.ocr_reader_install_target_dir,
+            languages=self._config.ocr_reader_languages,
+        )
+        rapidocr_inspection = inspect_rapidocr_installation(
+            install_target_dir_raw=self._config.rapidocr_install_target_dir,
+            engine_type=self._config.rapidocr_engine_type,
+            lang_type=self._config.rapidocr_lang_type,
+            model_type=self._config.rapidocr_model_type,
+            ocr_version=self._config.rapidocr_ocr_version,
+        )
+        tesseract = self._tesseract_descriptor(tesseract_inspection)
+        rapidocr = self._rapidocr_descriptor(
+            rapidocr_inspection,
+            enabled=bool(self._config.rapidocr_enabled),
+        )
+        plan = SelectedOcrBackendPlan(
+            selection=selection,
+            rapidocr_inspection=rapidocr_inspection,
+            tesseract_inspection=tesseract_inspection,
+        )
+
+        if selection == "rapidocr":
+            plan.primary = rapidocr
+            return plan
+        if selection == "tesseract":
+            plan.primary = tesseract
+            return plan
+        if rapidocr.available:
+            rapidocr.detail = "selected_primary"
+            plan.primary = rapidocr
+            if tesseract.available:
+                tesseract.detail = "compatibility_fallback"
+                plan.fallback = tesseract
+            return plan
+        if tesseract.available:
+            tesseract.detail = f"auto_fallback_from_rapidocr:{rapidocr.detail}"
+            plan.primary = tesseract
+            return plan
+        plan.primary = tesseract
+        return plan
+
+    @staticmethod
+    def _tesseract_unavailable_detail(inspection: dict[str, Any]) -> str:
+        if str(inspection.get("detail") or "") == "missing_languages":
+            return "missing_languages"
+        return "missing_tesseract"
+
+    def _backend_unavailable_detail(self, plan: SelectedOcrBackendPlan) -> str:
+        if plan.selection == "rapidocr":
+            return plan.primary.detail or "missing"
+        if plan.selection == "tesseract":
+            return self._tesseract_unavailable_detail(plan.tesseract_inspection)
+        if str(plan.tesseract_inspection.get("detail") or "") == "missing_languages":
+            return "missing_languages"
+        return "missing_tesseract"
+
+    def _backend_unavailable_warnings(self, plan: SelectedOcrBackendPlan) -> list[str]:
+        warnings: list[str] = []
+        if plan.selection == "rapidocr":
+            warnings.append(f"ocr_reader RapidOCR is unavailable: {plan.primary.detail or 'missing'}")
+            return warnings
+        if str(plan.tesseract_inspection.get("detail") or "") == "missing_languages":
+            missing = plan.tesseract_inspection.get("missing_languages", [])
+            warnings.append(f"ocr_reader Tesseract is missing languages: {missing}")
+        else:
+            warnings.append("ocr_reader Tesseract is missing or not configured")
+        rapid_detail = str(plan.rapidocr_inspection.get("detail") or "")
+        if rapid_detail and rapid_detail != "installed":
+            warnings.append(f"ocr_reader RapidOCR status: {rapid_detail}")
+        return warnings
+
+    def _build_runtime(
+        self,
+        *,
+        status: str,
+        detail: str,
+        plan: SelectedOcrBackendPlan,
+        active_backend: OcrBackendDescriptor | None = None,
+        backend_detail_override: str = "",
+        target: DetectedGameWindow | None = None,
+        capture_profile: dict[str, float] | None = None,
+        takeover_reason: str = "",
+        game_id: str = "",
+        session_id: str = "",
+        last_seq: int | None = None,
+        last_event_ts: str = "",
+    ) -> OcrReaderRuntime:
+        backend = active_backend if active_backend and active_backend.kind else plan.primary
+        attached_target = target or self._attached_window
+        resolved_last_seq = (
+            int(last_seq)
+            if last_seq is not None
+            else int(self._writer.last_seq or self._runtime.last_seq)
+        )
+        return OcrReaderRuntime(
+            enabled=True,
+            status=status,
+            detail=detail,
+            process_name=str((attached_target.process_name if attached_target is not None else self._runtime.process_name) or ""),
+            pid=int((attached_target.pid if attached_target is not None else self._runtime.pid) or 0),
+            window_title=str((attached_target.title if attached_target is not None else self._runtime.window_title) or ""),
+            game_id=str(game_id or self._writer.game_id or self._runtime.game_id),
+            session_id=str(session_id or self._writer.session_id or self._runtime.session_id),
+            last_seq=resolved_last_seq,
+            last_event_ts=str(last_event_ts or self._writer.last_event_ts or self._runtime.last_event_ts),
+            capture_profile=dict(capture_profile or self._runtime.capture_profile),
+            tesseract_path=self._resolved_tesseract_path(),
+            languages=self._config.ocr_reader_languages,
+            takeover_reason=takeover_reason or self._runtime.takeover_reason,
+            backend_kind=str(backend.kind or ""),
+            backend_detail=str(backend_detail_override or backend.detail or ""),
+            backend_path=str(backend.path or ""),
+            backend_model=str(backend.model or ""),
+        )
 
     def _capture_and_extract_text(
         self,
         target: DetectedGameWindow,
         profile: OcrCaptureProfile,
-    ) -> str:
+        plan: SelectedOcrBackendPlan,
+    ) -> OcrExtractionResult:
         frame = self._capture_backend.capture_frame(target, profile)
-        return self._ocr_backend.extract_text(frame)
+        if self._custom_ocr_backend:
+            return OcrExtractionResult(
+                text=self._ocr_backend.extract_text(frame),
+                backend=plan.primary,
+                backend_detail=plan.primary.detail,
+            )
+        descriptors = [plan.primary]
+        if plan.fallback.available:
+            descriptors.append(plan.fallback)
+        warnings: list[str] = []
+        last_error: Exception | None = None
+        for index, descriptor in enumerate(descriptors):
+            if descriptor.backend is None:
+                continue
+            try:
+                return OcrExtractionResult(
+                    text=descriptor.backend.extract_text(frame),
+                    backend=descriptor,
+                    backend_detail=(
+                        "fallback_after_runtime_error"
+                        if index > 0
+                        else (descriptor.detail or "selected_primary")
+                    ),
+                    warnings=warnings,
+                )
+            except Exception as exc:
+                last_error = exc
+                warning = f"ocr_reader {descriptor.kind} failed: {exc}"
+                warnings.append(warning)
+                self._logger.warning("ocr_reader backend %s failed: %s", descriptor.kind, exc)
+        if last_error is not None:
+            raise last_error
+        return OcrExtractionResult(backend=plan.primary, warnings=warnings)
 
-    def _select_target_window(self, windows: list[DetectedGameWindow]) -> DetectedGameWindow:
+    def _select_target_window(
+        self,
+        windows: list[DetectedGameWindow],
+        *,
+        memory_reader_runtime: dict[str, Any] | None = None,
+    ) -> DetectedGameWindow:
         if not windows:
             raise RuntimeError("no OCR capture target is available")
+        preferred_pid = int((memory_reader_runtime or {}).get("pid") or 0)
+        preferred_process_name = str(
+            (memory_reader_runtime or {}).get("process_name") or ""
+        ).strip().lower()
+        if preferred_pid > 0:
+            for candidate in windows:
+                if candidate.pid == preferred_pid:
+                    return candidate
+        if preferred_process_name:
+            for candidate in windows:
+                if str(candidate.process_name or "").strip().lower() == preferred_process_name:
+                    return candidate
         if self._attached_window is not None:
             for candidate in windows:
                 if candidate.hwnd == self._attached_window.hwnd:
