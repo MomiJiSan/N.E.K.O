@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Any
@@ -34,6 +35,7 @@ from .models import (
     STORE_LAST_SEQ,
     STORE_MODE,
     STORE_OCR_CAPTURE_PROFILES,
+    STORE_OCR_WINDOW_TARGET,
     STORE_PUSH_NOTIFICATIONS,
     STORE_SESSION_ID,
     json_copy,
@@ -67,6 +69,16 @@ from .store import GalgameStore
 from .tesseract_support import install_tesseract
 from .textractor_support import install_textractor
 from .ui_api import build_open_ui_payload
+
+
+def _format_install_entry_error(label: str, exc: Exception) -> str:
+    message = str(exc or "").strip()
+    prefix = f"{label} 安装失败"
+    if not message:
+        return prefix
+    if message.startswith(prefix):
+        return message
+    return f"{prefix}：{message}"
 
 
 @neko_plugin
@@ -118,6 +130,7 @@ class GalgamePlugin(NekoPluginBase):
                 "memory_reader_runtime": json_copy(state.memory_reader_runtime),
                 "ocr_reader_runtime": json_copy(state.ocr_reader_runtime),
                 "ocr_capture_profiles": dict(state.ocr_capture_profiles),
+                "ocr_window_target": json_copy(state.ocr_window_target),
                 "plugin_error": state.plugin_error,
             }
 
@@ -150,6 +163,7 @@ class GalgamePlugin(NekoPluginBase):
             state.memory_reader_runtime = json_copy(payload["memory_reader_runtime"])
             state.ocr_reader_runtime = json_copy(payload["ocr_reader_runtime"])
             state.ocr_capture_profiles = dict(payload["ocr_capture_profiles"])
+            state.ocr_window_target = json_copy(payload["ocr_window_target"])
             state.plugin_error = str(payload["plugin_error"])
 
     def _record_error(self, error: dict[str, Any]) -> None:
@@ -190,6 +204,7 @@ class GalgamePlugin(NekoPluginBase):
             self._state.memory_reader_runtime = {}
             self._state.ocr_reader_runtime = {}
             self._state.ocr_capture_profiles = restored.get(STORE_OCR_CAPTURE_PROFILES, {})
+            self._state.ocr_window_target = json_copy(restored.get(STORE_OCR_WINDOW_TARGET, {}))
             if warnings and not self._state.last_error:
                 self._state.last_error = make_error(
                     "; ".join(warnings),
@@ -324,6 +339,7 @@ class GalgamePlugin(NekoPluginBase):
             config=self._cfg,
         )
         self._ocr_reader_manager.update_capture_profiles(self._state.ocr_capture_profiles)
+        self._ocr_reader_manager.update_window_target(self._state.ocr_window_target)
 
         self.register_static_ui("static")
         self.set_list_actions(
@@ -725,7 +741,7 @@ class GalgamePlugin(NekoPluginBase):
                 }
             )
         except Exception as exc:
-            return Err(SdkError(f"Textractor install failed: {exc}"))
+            return Err(SdkError(_format_install_entry_error("Textractor", exc)))
         finally:
             self._textractor_install_lock.release()
 
@@ -770,7 +786,7 @@ class GalgamePlugin(NekoPluginBase):
                 }
             )
         except Exception as exc:
-            return Err(SdkError(f"Tesseract install failed: {exc}"))
+            return Err(SdkError(_format_install_entry_error("Tesseract", exc)))
         finally:
             self._tesseract_install_lock.release()
 
@@ -817,7 +833,7 @@ class GalgamePlugin(NekoPluginBase):
                 }
             )
         except Exception as exc:
-            return Err(SdkError(f"RapidOCR install failed: {exc}"))
+            return Err(SdkError(_format_install_entry_error("RapidOCR", exc)))
         finally:
             self._rapidocr_install_lock.release()
 
@@ -1029,6 +1045,100 @@ class GalgamePlugin(NekoPluginBase):
             {
                 "process_name": normalized_process_name,
                 "capture_profile": capture_profile,
+                "cleared": bool(clear),
+                "summary": summary,
+                "status": self._current_status_payload(),
+            }
+        )
+
+    @plugin_entry(
+        id="galgame_list_ocr_windows",
+        name="列出 OCR 候选窗口",
+        description="返回当前 OCR Reader 的可选窗口，可选包含只读排除列表。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "include_excluded": {"type": "boolean", "default": False},
+            },
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_list_ocr_windows(self, include_excluded: bool = False, **_):
+        if self._ocr_reader_manager is None:
+            return Err(SdkError("ocr_reader manager is not initialized"))
+        try:
+            payload = await asyncio.to_thread(
+                self._ocr_reader_manager.list_windows_snapshot,
+                include_excluded=bool(include_excluded),
+            )
+        except Exception as exc:
+            return Err(SdkError(f"list OCR windows failed: {exc}"))
+        payload["summary"] = (
+            f"eligible={int(payload.get('candidate_count') or 0)} "
+            f"excluded={int(payload.get('excluded_candidate_count') or 0)} "
+            f"mode={payload.get('target_selection_mode') or 'auto'}"
+        )
+        return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_set_ocr_window_target",
+        name="设置 OCR 目标窗口",
+        description="锁定或清除 OCR Reader 的手动目标窗口。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "window_key": {"type": "string", "default": ""},
+                "clear": {"type": "boolean", "default": False},
+            },
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_set_ocr_window_target(
+        self,
+        window_key: str = "",
+        clear: bool = False,
+        **_,
+    ):
+        if self._ocr_reader_manager is None:
+            return Err(SdkError("ocr_reader manager is not initialized"))
+
+        if clear:
+            target_payload = {
+                "mode": "auto",
+                "window_key": "",
+                "process_name": "",
+                "normalized_title": "",
+                "pid": 0,
+                "last_known_hwnd": 0,
+                "selected_at": "",
+            }
+            summary = "OCR window target restored to auto"
+        else:
+            try:
+                target_payload = await asyncio.to_thread(
+                    self._ocr_reader_manager.resolve_manual_window_target,
+                    window_key,
+                )
+            except ValueError as exc:
+                return Err(SdkError(str(exc)))
+            except Exception as exc:
+                return Err(SdkError(f"resolve OCR window target failed: {exc}"))
+            summary = (
+                f"OCR window target locked to {target_payload.get('process_name') or '(unknown)'}"
+            )
+
+        try:
+            self._persist.persist_ocr_window_target(target_payload)
+        except Exception as exc:
+            return Err(SdkError(f"persist OCR window target failed: {exc}"))
+
+        with self._state_lock:
+            self._state.ocr_window_target = json_copy(target_payload)
+        self._ocr_reader_manager.update_window_target(target_payload)
+        await self._poll_bridge(force=True)
+        return Ok(
+            {
+                "window_target": json_copy(target_payload),
                 "cleared": bool(clear),
                 "summary": summary,
                 "status": self._current_status_payload(),

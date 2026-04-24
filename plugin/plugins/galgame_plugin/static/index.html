@@ -3,16 +3,16 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Galgame Plugin</title>
-  <link rel="stylesheet" href="./style.css">
+  <title>Galgame 插件管理</title>
+  <link rel="stylesheet" href="./style.css?v=20260424-zh-ui-2">
 </head>
 <body>
   <div class="page-shell">
     <header class="hero">
       <div>
-        <p class="eyebrow">N.E.K.O Phase 2</p>
-        <h1>Galgame Plugin</h1>
-        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容 fallback，这里会展示桥接状态、OCR 运行时、RapidOCR/Tesseract 安装流、截图校准，以及 Game LLM Agent 的后台状态。</p>
+        <p class="eyebrow">N.E.K.O 二期</p>
+        <h1>Galgame 插件管理</h1>
+        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容兜底，这里会展示桥接状态、OCR 运行时、RapidOCR/Tesseract 安装流、截图校准，以及游戏 Agent 的后台状态。</p>
       </div>
       <div class="hero-actions">
         <button id="refreshBtn" class="primary">刷新全部</button>
@@ -28,14 +28,14 @@
         <label class="field">
           <span>模式</span>
           <select id="modeSelect">
-            <option value="silent">silent</option>
-            <option value="companion">companion</option>
-            <option value="choice_advisor">choice_advisor</option>
+            <option value="silent">静默</option>
+            <option value="companion">伴读</option>
+            <option value="choice_advisor">选项顾问</option>
           </select>
         </label>
         <label class="field checkbox-field">
           <input id="pushToggle" type="checkbox">
-          <span>push_notifications</span>
+          <span>推送通知</span>
         </label>
         <button id="saveModeBtn" class="secondary">保存模式</button>
         <div class="inline-actions">
@@ -46,7 +46,7 @@
 
       <div class="control-grid bind-grid">
         <label class="field grow">
-          <span>手动绑定 game_id</span>
+          <span>手动绑定游戏 ID</span>
           <input id="bindInput" type="text" placeholder="例如 nekoforge.my-renpy-demo">
         </label>
         <button id="bindBtn" class="secondary">绑定</button>
@@ -55,7 +55,7 @@
 
       <div class="control-grid agent-grid">
         <label class="field grow">
-          <span>给 Agent 的文本</span>
+          <span>给游戏 Agent 的文本</span>
           <input id="agentPromptInput" type="text" placeholder="例如：现在在讲什么？">
         </label>
         <button id="queryContextBtn" class="secondary">查询上下文</button>
@@ -88,9 +88,9 @@
 
         <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
           <div class="install-copy">
-            <p id="tesseractPromptKicker" class="list-kicker">OCR 兼容 fallback</p>
+            <p id="tesseractPromptKicker" class="list-kicker">OCR 兼容兜底</p>
             <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
-            <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的兼容 fallback 检测结果会显示在这里。</p>
+            <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的兼容兜底检测结果会显示在这里。</p>
             <p id="tesseractPathText" class="result-note"></p>
             <div id="tesseractInstallState" class="install-task-card" hidden>
               <div class="install-task-head">
@@ -113,7 +113,7 @@
           <div class="install-copy">
             <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
             <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
-            <p id="textractorPromptBody">Textractor 仍保留为 Memory Reader 的实验性 fallback，不再是当前首发主线。</p>
+            <p id="textractorPromptBody">Textractor 仍保留为 Memory Reader 的实验性兜底，不再是当前首发主线。</p>
             <p id="textractorPathText" class="result-note"></p>
             <div id="textractorInstallState" class="install-task-card" hidden>
               <div class="install-task-head">
@@ -133,33 +133,53 @@
         </div>
       </div>
 
+      <div class="window-target-panel">
+        <div class="panel-title-row compact">
+          <div>
+            <h3>OCR 目标窗口</h3>
+            <p class="section-copy">默认自动排除 N.E.K.O 自身界面；这里只允许锁定可用游戏窗口。</p>
+          </div>
+          <div class="capture-profile-actions">
+            <button id="ocrWindowRefreshBtn" class="secondary">刷新窗口</button>
+            <button id="ocrWindowAutoBtn" class="ghost">恢复自动</button>
+          </div>
+        </div>
+        <p id="ocrWindowTargetModeText" class="result-note"></p>
+        <p id="ocrWindowRuntimeHint" class="panel-subcopy">等待 OCR 窗口候选列表。</p>
+        <div id="ocrWindowList" class="stack-list scroll-region empty-state">暂无候选窗口</div>
+        <details class="excluded-window-panel">
+          <summary>查看排除窗口与原因</summary>
+          <div id="ocrExcludedWindowList" class="stack-list scroll-region empty-state">暂无排除窗口</div>
+        </details>
+      </div>
+
       <div class="capture-profile-panel">
         <div class="panel-title-row compact">
           <div>
             <h3>OCR 截图校准</h3>
-            <p class="section-copy">按进程名保存窗口裁剪比例。当前没有独立手动选窗器，本轮通过更严格的窗口筛选和 per-process capture profile 提高可用性。</p>
+            <p class="section-copy">按进程名保存窗口裁剪比例。现在可以先在上方锁定目标游戏窗口，再结合按进程截图配置收紧 OCR 截图区域。</p>
           </div>
         </div>
         <p id="ocrProfileRuntimeHint" class="panel-subcopy">等待 OCR 目标进程信息。</p>
         <div class="capture-profile-grid">
           <label class="field">
-            <span>process_name</span>
+            <span>进程名</span>
             <input id="ocrProfileProcessInput" type="text" placeholder="例如 game.exe">
           </label>
           <label class="field">
-            <span>left_inset_ratio</span>
+            <span>左侧裁剪比例</span>
             <input id="ocrProfileLeftInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
           </label>
           <label class="field">
-            <span>right_inset_ratio</span>
+            <span>右侧裁剪比例</span>
             <input id="ocrProfileRightInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
           </label>
           <label class="field">
-            <span>top_ratio</span>
+            <span>顶部起始比例</span>
             <input id="ocrProfileTopInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.62">
           </label>
           <label class="field">
-            <span>bottom_inset_ratio</span>
+            <span>底部裁剪比例</span>
             <input id="ocrProfileBottomInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.08">
           </label>
           <div class="capture-profile-actions">
@@ -196,11 +216,11 @@
 
       <article class="panel panel-scroll">
         <div class="panel-title-row">
-          <h2>Agent 状态</h2>
+          <h2>游戏 Agent 状态</h2>
         </div>
-        <dl id="agentStatusGrid" class="data-grid"></dl>
+        <dl id="agentStatusGrid" class="data-grid scroll-region"></dl>
         <div class="reply-box">
-          <h3>Agent 最近响应</h3>
+          <h3>游戏 Agent 最近响应</h3>
           <p id="agentReplyText" class="reply-text-scroll">暂无交互</p>
         </div>
       </article>
@@ -228,7 +248,7 @@
 
       <article class="panel panel-full panel-scroll panel-scroll-wide">
         <div class="panel-title-row">
-          <h2>Agent 推送记录</h2>
+          <h2>游戏 Agent 推送记录</h2>
         </div>
         <div id="pushesList" class="stack-list scroll-region empty-state">暂无数据</div>
       </article>
@@ -256,6 +276,6 @@
     </section>
   </div>
 
-  <script src="./main.js"></script>
+  <script src="./main.js?v=20260424-zh-ui-2"></script>
 </body>
 </html>

@@ -241,6 +241,12 @@ def _make_effective_config(bridge_root: Path, textractor_path: Path) -> dict[str
             "auto_detect": True,
             "poll_interval_seconds": 1,
         },
+        "ocr_reader": {
+            "enabled": False,
+        },
+        "rapidocr": {
+            "enabled": False,
+        },
     }
 
 
@@ -503,6 +509,8 @@ async def test_memory_reader_phase2_entries_and_agent_commands_stay_callable_in_
 
     assert isinstance(query_status, Ok)
     assert query_status.value["action"] == "query_status"
+    assert query_status.value["input_source"] == "memory_reader"
+    assert "push_policy" in query_status.value
     assert isinstance(query_status.value["recent_pushes"], list)
 
     assert isinstance(query_context, Ok)

@@ -396,3 +396,34 @@ class LLMGateway:
             "reply": reply,
             "diagnostic": diagnostic,
         }
+
+    @staticmethod
+    def _build_agent_reply_fallback(
+        context: dict[str, Any],
+        *,
+        diagnostic: str,
+    ) -> dict[str, Any]:
+        scene_id = str(context.get("scene_id") or "")
+        route_id = str(context.get("route_id") or "")
+        latest_line = str(context.get("latest_line") or "")
+        recent_lines = context.get("recent_lines")
+        selected_choices = context.get("recent_choices")
+        summary = build_local_scene_summary(
+            scene_id=scene_id,
+            route_id=route_id,
+            lines=list(recent_lines) if isinstance(recent_lines, list) else [],
+            selected_choices=list(selected_choices) if isinstance(selected_choices, list) else [],
+            snapshot=context.get("current_snapshot", {}),
+        )
+        if latest_line:
+            reply = f"{summary} Current line: {latest_line}"
+        else:
+            reply = summary
+        prompt = str(context.get("prompt") or "").strip()
+        if prompt:
+            reply = f"Received request \"{prompt}\". {reply}"
+        return {
+            "degraded": True,
+            "reply": reply,
+            "diagnostic": diagnostic,
+        }

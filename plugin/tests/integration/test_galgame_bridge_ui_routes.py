@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from httpx import ASGITransport, AsyncClient
 from plugin._types.models import RunCreateResponse
 from plugin.core.state import state
 from plugin.plugins.galgame_plugin import install_tasks as install_task_module
+from plugin.runs.manager import RunError, RunRecord
 from plugin.server.infrastructure.exceptions import register_exception_handlers
+from plugin.server.domain.errors import ServerDomainError
 from plugin.server.routes import plugin_ui as plugin_ui_route_module
 
 
@@ -124,6 +127,8 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
     assert "galgame_get_history" in response.text
     assert "galgame_agent_command" in response.text
     assert "galgame_set_ocr_capture_profile" in response.text
+    assert "galgame_list_ocr_windows" in response.text
+    assert "galgame_set_ocr_window_target" in response.text
     assert "active_data_source" in response.text
     assert "memory_reader_runtime" in response.text
     assert "ocr_reader_runtime" in response.text
@@ -392,6 +397,103 @@ async def test_galgame_plugin_rapidocr_install_latest_route_returns_latest_state
     assert payload["task_id"] == "run-rapidocr-latest"
     assert payload["kind"] == "rapidocr"
     assert payload["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_rapidocr_install_status_route_persists_terminal_run_state(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_task_module.update_install_task_state(
+        "run-rapidocr-terminal",
+        kind="rapidocr",
+        run_id="run-rapidocr-terminal",
+        status="queued",
+        phase="queued",
+        message="RapidOCR install queued",
+        progress=0.0,
+    )
+
+    now = time.time()
+
+    def _fake_get_run(run_id: str) -> RunRecord:
+        assert run_id == "run-rapidocr-terminal"
+        return RunRecord(
+            run_id=run_id,
+            plugin_id="galgame_plugin",
+            entry_id="galgame_install_rapidocr",
+            status="failed",
+            created_at=now - 5,
+            updated_at=now,
+            started_at=now - 4,
+            finished_at=now,
+            stage="failed",
+            message="RapidOCR install failed during startup",
+            error=RunError(code="INSTALL_FAILED", message="RapidOCR install failed during startup"),
+            metrics={"asset_name": "rapidocr_onnxruntime"},
+        )
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "get_run", _fake_get_run)
+
+    response = await plugin_ui_async_client.get(
+        "/plugin/galgame_plugin/ui-api/rapidocr/install/run-rapidocr-terminal"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["phase"] == "failed"
+    assert payload["error"] == "RapidOCR install failed during startup"
+    saved = install_task_module.load_install_task_state("run-rapidocr-terminal", kind="rapidocr")
+    assert saved is not None
+    assert saved["status"] == "failed"
+    assert saved["error"] == "RapidOCR install failed during startup"
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_rapidocr_install_latest_route_marks_missing_run_as_failed(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_task_module.update_install_task_state(
+        "run-rapidocr-stale",
+        kind="rapidocr",
+        run_id="run-rapidocr-stale",
+        status="running",
+        phase="installing",
+        message="Installing rapidocr_onnxruntime",
+        progress=0.4,
+        target_dir="C:/Temp/RapidOCR",
+    )
+
+    def _missing_run(_run_id: str) -> RunRecord:
+        raise ServerDomainError(
+            code="RUN_NOT_FOUND",
+            message="run not found",
+            status_code=404,
+            details={"run_id": "run-rapidocr-stale"},
+        )
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "get_run", _missing_run)
+
+    response = await plugin_ui_async_client.get(
+        "/plugin/galgame_plugin/ui-api/rapidocr/install/latest"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["task_id"] == "run-rapidocr-stale"
+    assert payload["status"] == "failed"
+    assert "后台运行记录已经不存在" in payload["error"]
+    saved = install_task_module.load_install_task_state("run-rapidocr-stale", kind="rapidocr")
+    assert saved is not None
+    assert saved["status"] == "failed"
+    assert saved["target_dir"] == "C:/Temp/RapidOCR"
+    assert "后台运行记录已经不存在" in saved["error"]
 
 
 @pytest.mark.asyncio

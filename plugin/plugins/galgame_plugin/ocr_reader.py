@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from uuid import uuid4
@@ -43,6 +43,72 @@ _MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _KANA_CHAR_RE = re.compile(r"[\u3040-\u30ff]")
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_WINDOW_SPACE_RE = re.compile(r"\s+")
+_SELF_WINDOW_TITLE_SUBSTRINGS = (
+    "n.e.k.o",
+    "plugin manager",
+    "插件管理",
+    "galgame plugin",
+    "phase 2",
+)
+_SELF_WINDOW_PATH_SUBSTRINGS = (
+    "n.e.k.o",
+    "galgame_plugin",
+)
+_OVERLAY_WINDOW_TITLE_SUBSTRINGS = (
+    "nvidia overlay",
+    "overlay",
+    "launcher",
+    "task manager",
+    "visual studio code",
+    "obs",
+    "program manager",
+    "settings",
+    "microsoft text input application",
+)
+_OVERLAY_PROCESS_NAME_SUBSTRINGS = (
+    "nvidia",
+    "overlay",
+    "launcher",
+    "gamebar",
+    "obs",
+    "code",
+    "steamwebhelper",
+)
+_HELPER_CLASS_NAMES = {
+    "Shell_TrayWnd",
+    "Windows.UI.Core.CoreWindow",
+    "ApplicationFrameWindow",
+    "Windows.UI.Composition.DesktopWindowContentBridge",
+}
+_SELF_UI_GUARD_SUBSTRINGS = (
+    "rapidocr",
+    "tesseract",
+    "ocr compatibility fallback",
+    "install queued task",
+    "plugin manager",
+    "galgame plugin",
+    "n.e.k.o",
+)
+_AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
+_AIHONG_TITLE_SUBSTRINGS = ("哀鸿", "aihong")
+_AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET = {
+    "left_inset_ratio": 0.05,
+    "right_inset_ratio": 0.24,
+    "top_ratio": 0.73,
+    "bottom_inset_ratio": 0.10,
+}
+_AIHONG_MENU_CAPTURE_PROFILE_PRESET = {
+    "left_inset_ratio": 0.08,
+    "right_inset_ratio": 0.08,
+    "top_ratio": 0.58,
+    "bottom_inset_ratio": 0.16,
+}
+_AIHONG_DIALOGUE_STAGE = "dialogue_stage"
+_AIHONG_MENU_STAGE = "menu_stage"
+_AIHONG_MENU_MAX_LINES = 6
+_AIHONG_MENU_MAX_SIGNIFICANT_CHARS = 24
+_DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -54,7 +120,37 @@ def _ocr_game_id_from_process(name: str) -> str:
     return f"{OCR_READER_GAME_ID_PREFIX}{digest}"
 
 
-def _coerce_choice_lines(lines: list[str]) -> list[str]:
+def _normalize_window_title(value: str) -> str:
+    normalized = _WINDOW_SPACE_RE.sub(" ", str(value or "").strip().lower())
+    return normalized
+
+
+def _build_window_key(*, process_name: str, pid: int, hwnd: int, title: str) -> str:
+    payload = f"{process_name.strip().lower()}|{max(0, int(pid))}|{max(0, int(hwnd))}|{_normalize_window_title(title)}"
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return f"ocrwin:{digest}"
+
+
+def _looks_like_self_window_title(title: str) -> bool:
+    normalized = _normalize_window_title(title)
+    return any(token in normalized for token in _SELF_WINDOW_TITLE_SUBSTRINGS)
+
+
+def _looks_like_self_window_path(exe_path: str) -> bool:
+    lowered = str(exe_path or "").strip().lower()
+    if not lowered:
+        return False
+    return any(token in lowered for token in _SELF_WINDOW_PATH_SUBSTRINGS)
+
+
+def _looks_like_self_ui_text(text: str) -> bool:
+    normalized = normalize_text(text).strip().lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in _SELF_UI_GUARD_SUBSTRINGS)
+
+
+def _coerce_prefixed_choice_lines(lines: list[str]) -> list[str]:
     if len(lines) < 2:
         return []
     choices: list[str] = []
@@ -67,6 +163,42 @@ def _coerce_choice_lines(lines: list[str]) -> list[str]:
             return []
         choices.append(text)
     return choices
+
+
+def _looks_like_dialogue_line(text: str) -> bool:
+    normalized = normalize_text(text).strip()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _DIALOGUE_LINE_MARKERS)
+
+
+def _coerce_plain_choice_lines(lines: list[str]) -> list[str]:
+    if not 2 <= len(lines) <= _AIHONG_MENU_MAX_LINES:
+        return []
+    choices: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        text = normalize_text(str(line or "")).replace("\n", " ").strip()
+        if not text or _looks_like_dialogue_line(text):
+            return []
+        if _significant_char_count(text) > _AIHONG_MENU_MAX_SIGNIFICANT_CHARS:
+            return []
+        if text in seen:
+            continue
+        seen.add(text)
+        choices.append(text)
+    if not 2 <= len(choices) <= _AIHONG_MENU_MAX_LINES:
+        return []
+    return choices
+
+
+def _coerce_choice_lines(lines: list[str], *, allow_plain_text: bool = False) -> list[str]:
+    choices = _coerce_prefixed_choice_lines(lines)
+    if choices:
+        return choices
+    if allow_plain_text:
+        return _coerce_plain_choice_lines(lines)
+    return []
 
 
 @dataclass(slots=True)
@@ -271,6 +403,199 @@ class DetectedGameWindow:
     title: str = ""
     process_name: str = ""
     pid: int = 0
+    class_name: str = ""
+    exe_path: str = ""
+    area: int = 0
+    is_foreground: bool = False
+    eligible: bool = True
+    exclude_reason: str = ""
+    category: str = "eligible_game_window"
+    score: float = 0.0
+
+    @property
+    def normalized_title(self) -> str:
+        return _normalize_window_title(self.title)
+
+    @property
+    def window_key(self) -> str:
+        return _build_window_key(
+            process_name=self.process_name,
+            pid=self.pid,
+            hwnd=self.hwnd,
+            title=self.title,
+        )
+
+    def to_dict(self, *, is_attached: bool = False, is_manual_target: bool = False) -> dict[str, Any]:
+        return {
+            "window_key": self.window_key,
+            "title": self.title,
+            "process_name": self.process_name,
+            "pid": self.pid,
+            "hwnd": self.hwnd,
+            "eligible": self.eligible,
+            "exclude_reason": self.exclude_reason,
+            "is_foreground": self.is_foreground,
+            "is_attached": is_attached,
+            "is_manual_target": is_manual_target,
+            "class_name": self.class_name,
+            "exe_path": self.exe_path,
+            "category": self.category,
+        }
+
+
+def _matches_aihong_target(target: DetectedGameWindow | None) -> bool:
+    if target is None:
+        return False
+    process_name = str(target.process_name or "").strip().lower()
+    if process_name in _AIHONG_PROCESS_NAMES:
+        return True
+    normalized_title = target.normalized_title
+    return any(token in normalized_title for token in _AIHONG_TITLE_SUBSTRINGS)
+
+
+def _builtin_capture_profile_for_target(target: DetectedGameWindow) -> OcrCaptureProfile | None:
+    return _builtin_capture_profile_for_target_stage(target, stage=_AIHONG_DIALOGUE_STAGE)
+
+
+def _builtin_capture_profile_for_target_stage(
+    target: DetectedGameWindow,
+    *,
+    stage: str,
+) -> OcrCaptureProfile | None:
+    if not _matches_aihong_target(target):
+        return None
+    if stage == _AIHONG_MENU_STAGE:
+        return OcrCaptureProfile.from_dict(_AIHONG_MENU_CAPTURE_PROFILE_PRESET)
+    return OcrCaptureProfile.from_dict(_AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET)
+
+
+@dataclass(slots=True)
+class _StableOcrTextState:
+    last_raw_text: str = ""
+    repeat_count: int = 0
+    stable_text: str = ""
+
+    def reset(self) -> None:
+        self.last_raw_text = ""
+        self.repeat_count = 0
+        self.stable_text = ""
+
+
+@dataclass(slots=True)
+class _MenuConsumeResult:
+    emitted_kind: str = ""
+    has_menu_candidate: bool = False
+
+
+def _canonical_choice_candidate_text(choices: list[str]) -> str:
+    normalized = [normalize_text(str(choice or "")).strip() for choice in choices]
+    return "\n".join(item for item in normalized if item)
+
+
+def _stripped_ocr_lines(raw_text: str) -> list[str]:
+    return [line.strip() for line in str(raw_text or "").splitlines() if line.strip()]
+
+
+def _uses_manual_capture_profile(
+    profiles: dict[str, OcrCaptureProfile],
+    target: DetectedGameWindow,
+) -> bool:
+    process_name = str(target.process_name or "").strip().lower()
+    if not process_name:
+        return False
+    return any(str(name or "").strip().lower() == process_name for name in profiles)
+
+
+def _lookup_capture_profile(
+    profiles: dict[str, OcrCaptureProfile],
+    target: DetectedGameWindow,
+) -> OcrCaptureProfile | None:
+    process_name = str(target.process_name or "").strip()
+    if not process_name:
+        return None
+    profile = profiles.get(process_name)
+    if profile is not None:
+        return profile
+    lowered = process_name.lower()
+    for configured_name, configured_profile in profiles.items():
+        if str(configured_name or "").strip().lower() == lowered:
+            return configured_profile
+    return None
+
+
+@dataclass(slots=True)
+class OcrWindowTarget:
+    mode: str = "auto"
+    window_key: str = ""
+    process_name: str = ""
+    normalized_title: str = ""
+    pid: int = 0
+    last_known_hwnd: int = 0
+    selected_at: str = ""
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any] | None) -> OcrWindowTarget:
+        raw = value if isinstance(value, dict) else {}
+        mode = str(raw.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "manual"}:
+            mode = "auto"
+        try:
+            pid = int(raw.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        try:
+            last_known_hwnd = int(raw.get("last_known_hwnd") or 0)
+        except (TypeError, ValueError):
+            last_known_hwnd = 0
+        return cls(
+            mode=mode,
+            window_key=str(raw.get("window_key") or "").strip(),
+            process_name=str(raw.get("process_name") or "").strip(),
+            normalized_title=str(raw.get("normalized_title") or "").strip().lower(),
+            pid=max(0, pid),
+            last_known_hwnd=max(0, last_known_hwnd),
+            selected_at=str(raw.get("selected_at") or "").strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "window_key": self.window_key,
+            "process_name": self.process_name,
+            "normalized_title": self.normalized_title,
+            "pid": self.pid,
+            "last_known_hwnd": self.last_known_hwnd,
+            "selected_at": self.selected_at,
+        }
+
+    def is_manual(self) -> bool:
+        return self.mode == "manual"
+
+    def matches_exact(self, candidate: DetectedGameWindow) -> bool:
+        return bool(self.window_key) and self.window_key == candidate.window_key
+
+    def matches_hwnd(self, candidate: DetectedGameWindow) -> bool:
+        return bool(self.last_known_hwnd) and self.last_known_hwnd == candidate.hwnd
+
+    def matches_signature(self, candidate: DetectedGameWindow) -> bool:
+        if self.pid > 0 and candidate.pid != self.pid:
+            return False
+        if self.process_name and self.process_name.strip().lower() != candidate.process_name.strip().lower():
+            return False
+        if self.normalized_title and self.normalized_title != candidate.normalized_title:
+            return False
+        return bool(self.process_name or self.normalized_title or self.pid)
+
+    def resolved_for(self, candidate: DetectedGameWindow) -> OcrWindowTarget:
+        return OcrWindowTarget(
+            mode="manual",
+            window_key=candidate.window_key,
+            process_name=candidate.process_name,
+            normalized_title=candidate.normalized_title,
+            pid=candidate.pid,
+            last_known_hwnd=candidate.hwnd,
+            selected_at=self.selected_at,
+        )
 
 
 @dataclass(slots=True)
@@ -293,6 +618,15 @@ class OcrReaderRuntime:
     backend_detail: str = ""
     backend_path: str = ""
     backend_model: str = ""
+    target_selection_mode: str = "auto"
+    target_selection_detail: str = ""
+    effective_window_key: str = ""
+    effective_window_title: str = ""
+    effective_process_name: str = ""
+    manual_target: dict[str, Any] = field(default_factory=dict)
+    candidate_count: int = 0
+    excluded_candidate_count: int = 0
+    last_exclude_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -314,7 +648,28 @@ class OcrReaderRuntime:
             "backend_detail": self.backend_detail,
             "backend_path": self.backend_path,
             "backend_model": self.backend_model,
+            "target_selection_mode": self.target_selection_mode,
+            "target_selection_detail": self.target_selection_detail,
+            "effective_window_key": self.effective_window_key,
+            "effective_window_title": self.effective_window_title,
+            "effective_process_name": self.effective_process_name,
+            "manual_target": dict(self.manual_target),
+            "candidate_count": self.candidate_count,
+            "excluded_candidate_count": self.excluded_candidate_count,
+            "last_exclude_reason": self.last_exclude_reason,
         }
+
+
+@dataclass(slots=True)
+class WindowSelectionResult:
+    target: DetectedGameWindow | None = None
+    selection_mode: str = "auto"
+    selection_detail: str = ""
+    manual_target: OcrWindowTarget = field(default_factory=OcrWindowTarget)
+    selected_by_manual: bool = False
+    candidate_count: int = 0
+    excluded_candidate_count: int = 0
+    last_exclude_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -556,33 +911,8 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
     except ImportError:
         return []
 
-    results: list[tuple[int, DetectedGameWindow]] = []
-
-    excluded_classes = {
-        "Shell_TrayWnd",
-        "Windows.UI.Core.CoreWindow",
-        "ApplicationFrameWindow",
-        "Windows.UI.Composition.DesktopWindowContentBridge",
-    }
-    excluded_title_substrings = {
-        "program manager",
-        "settings",
-        "microsoft text input application",
-        "nvidia overlay",
-        "launcher",
-        "task manager",
-        "visual studio code",
-        "obs",
-    }
-    excluded_process_name_substrings = (
-        "nvidia",
-        "overlay",
-        "launcher",
-        "gamebar",
-        "obs",
-        "code",
-        "steamwebhelper",
-    )
+    results: list[DetectedGameWindow] = []
+    foreground_hwnd = _foreground_window_handle()
 
     def callback(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
@@ -592,36 +922,37 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
         rect = win32gui.GetWindowRect(hwnd)
         width = rect[2] - rect[0]
         height = rect[3] - rect[1]
-        if width < 400 or height < 300:
-            return
         title = win32gui.GetWindowText(hwnd)
         if not title or len(title) < 2:
             return
         class_name = win32gui.GetClassName(hwnd)
-        if class_name in excluded_classes:
-            return
-        lower_title = title.lower()
-        if any(ex in lower_title for ex in excluded_title_substrings):
-            return
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         process_name = ""
+        exe_path = ""
         if psutil is not None:
             try:
                 proc = psutil.Process(pid)
                 process_name = proc.name()
+                exe_path = proc.exe()
             except Exception:
                 pass
-        lowered_process_name = process_name.lower()
-        if lowered_process_name and any(
-            token in lowered_process_name for token in excluded_process_name_substrings
-        ):
-            return
         area = width * height
-        results.append((area, DetectedGameWindow(hwnd=hwnd, title=title, process_name=process_name, pid=pid)))
+        candidate = DetectedGameWindow(
+            hwnd=hwnd,
+            title=title,
+            process_name=process_name,
+            pid=pid,
+            class_name=class_name,
+            exe_path=exe_path,
+            area=max(0, area),
+            is_foreground=hwnd == foreground_hwnd,
+            score=float(max(area, 0)),
+        )
+        results.append(_classify_window_candidate(candidate))
 
     win32gui.EnumWindows(callback, None)
-    results.sort(key=lambda item: -item[0])
-    return [item[1] for item in results]
+    results.sort(key=_window_sort_key, reverse=True)
+    return results
 
 
 def _is_windows_platform() -> bool:
@@ -633,6 +964,64 @@ def _foreground_window_handle() -> int:
         return int(ctypes.windll.user32.GetForegroundWindow())
     except Exception:
         return 0
+
+
+def _classify_window_candidate(candidate: DetectedGameWindow) -> DetectedGameWindow:
+    normalized_title = candidate.normalized_title
+    lowered_process_name = str(candidate.process_name or "").strip().lower()
+    lowered_class_name = str(candidate.class_name or "").strip().lower()
+
+    if candidate.area and candidate.area < (400 * 300):
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_small_or_hidden_window"
+        candidate.category = "excluded_small_or_hidden_window"
+        return candidate
+
+    if _looks_like_self_window_title(candidate.title) or _looks_like_self_window_path(candidate.exe_path):
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_self_window"
+        candidate.category = "excluded_self_window"
+        return candidate
+
+    if candidate.class_name in _HELPER_CLASS_NAMES:
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_helper_window"
+        candidate.category = "excluded_helper_window"
+        return candidate
+
+    if any(token in normalized_title for token in _OVERLAY_WINDOW_TITLE_SUBSTRINGS):
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_overlay_window"
+        candidate.category = "excluded_overlay_window"
+        return candidate
+
+    if lowered_process_name and any(
+        token in lowered_process_name for token in _OVERLAY_PROCESS_NAME_SUBSTRINGS
+    ):
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_overlay_window"
+        candidate.category = "excluded_overlay_window"
+        return candidate
+
+    if lowered_class_name.startswith("chrome_widgetwin") and _looks_like_self_window_title(candidate.title):
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_self_window"
+        candidate.category = "excluded_self_window"
+        return candidate
+
+    candidate.eligible = True
+    candidate.exclude_reason = ""
+    candidate.category = "eligible_game_window"
+    return candidate
+
+
+def _window_sort_key(candidate: DetectedGameWindow) -> tuple[int, int, float, str]:
+    return (
+        1 if candidate.eligible else 0,
+        1 if candidate.is_foreground else 0,
+        float(candidate.score or 0.0),
+        candidate.normalized_title,
+    )
 
 
 class OcrReaderBridgeWriter:
@@ -1012,9 +1401,16 @@ class OcrReaderManager:
         self._last_memory_reader_text_at = 0.0
         self._last_heartbeat_at = 0.0
         self._attached_window: DetectedGameWindow | None = None
-        self._last_raw_ocr_text = ""
-        self._ocr_repeat_count = 0
-        self._stable_ocr_text = ""
+        self._default_ocr_state = _StableOcrTextState()
+        self._aihong_menu_ocr_state = _StableOcrTextState()
+        self._aihong_stage = _AIHONG_DIALOGUE_STAGE
+        self._aihong_dialogue_idle_polls = 0
+        self._aihong_menu_missing_polls = 0
+        self._manual_target = OcrWindowTarget()
+        self._last_detected_windows: list[DetectedGameWindow] = []
+        self._last_eligible_windows: list[DetectedGameWindow] = []
+        self._last_excluded_windows: list[DetectedGameWindow] = []
+        self._last_selection = WindowSelectionResult(manual_target=self._manual_target)
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -1037,8 +1433,196 @@ class OcrReaderManager:
                     exc,
                 )
 
+    def update_window_target(self, target: dict[str, Any] | None) -> None:
+        self._manual_target = OcrWindowTarget.from_dict(target)
+        self._last_selection = WindowSelectionResult(
+            selection_mode="manual" if self._manual_target.is_manual() else "auto",
+            selection_detail="manual_target_active"
+            if self._manual_target.is_manual()
+            else "auto_candidate_scan",
+            manual_target=self._manual_target,
+            candidate_count=len(self._last_eligible_windows),
+            excluded_candidate_count=len(self._last_excluded_windows),
+            last_exclude_reason=(
+                str(self._last_excluded_windows[0].exclude_reason or "")
+                if self._last_excluded_windows
+                else ""
+            ),
+        )
+
+    def current_window_target(self) -> dict[str, Any]:
+        return self._manual_target.to_dict()
+
+    def list_windows_snapshot(self, *, include_excluded: bool = False) -> dict[str, Any]:
+        eligible_windows, excluded_windows = self._scan_window_inventory()
+        payload = {
+            "target_selection_mode": self._manual_target.mode,
+            "manual_target": self._manual_target.to_dict(),
+            "candidate_count": len(eligible_windows),
+            "excluded_candidate_count": len(excluded_windows),
+            "windows": [
+                candidate.to_dict(
+                    is_attached=self._matches_attached_window(candidate),
+                    is_manual_target=self._manual_target.is_manual()
+                    and (
+                        self._manual_target.matches_exact(candidate)
+                        or self._manual_target.matches_signature(candidate)
+                    ),
+                )
+                for candidate in eligible_windows
+            ],
+        }
+        if include_excluded:
+            payload["excluded_windows"] = [
+                candidate.to_dict(
+                    is_attached=self._matches_attached_window(candidate),
+                    is_manual_target=False,
+                )
+                for candidate in excluded_windows
+            ]
+        return payload
+
+    def resolve_manual_window_target(self, window_key: str) -> dict[str, Any]:
+        normalized_key = str(window_key or "").strip()
+        if not normalized_key:
+            raise ValueError("window_key is required")
+        eligible_windows, excluded_windows = self._scan_window_inventory()
+        for candidate in eligible_windows:
+            if candidate.window_key == normalized_key:
+                return OcrWindowTarget(
+                    mode="manual",
+                    window_key=candidate.window_key,
+                    process_name=candidate.process_name,
+                    normalized_title=candidate.normalized_title,
+                    pid=candidate.pid,
+                    last_known_hwnd=candidate.hwnd,
+                    selected_at=utc_now_iso(self._time_fn()),
+                ).to_dict()
+        for candidate in excluded_windows:
+            if candidate.window_key == normalized_key:
+                raise ValueError("window_key points to an excluded OCR window")
+        raise ValueError("window_key not found among eligible OCR windows")
+
     def runtime(self) -> dict[str, Any]:
         return self._runtime.to_dict()
+
+    def _reset_default_ocr_state(self) -> None:
+        self._default_ocr_state.reset()
+
+    def _reset_aihong_menu_state(self) -> None:
+        self._aihong_menu_ocr_state.reset()
+        self._aihong_stage = _AIHONG_DIALOGUE_STAGE
+        self._aihong_dialogue_idle_polls = 0
+        self._aihong_menu_missing_polls = 0
+
+    def _has_manual_capture_profile(self, target: DetectedGameWindow) -> bool:
+        return _uses_manual_capture_profile(self._capture_profiles, target)
+
+    def _should_use_aihong_two_stage(self, target: DetectedGameWindow) -> bool:
+        return _matches_aihong_target(target) and not self._has_manual_capture_profile(target)
+
+    @staticmethod
+    def _stabilize_text_key(text: str, *, state: _StableOcrTextState) -> bool:
+        cleaned = normalize_text(text)
+        if not cleaned:
+            return False
+        if cleaned == state.last_raw_text:
+            state.repeat_count += 1
+        else:
+            state.repeat_count = 1
+            state.last_raw_text = cleaned
+        if state.repeat_count < 2:
+            return False
+        if cleaned == state.stable_text:
+            return False
+        state.stable_text = cleaned
+        return True
+
+    def _emit_line_from_ocr_text(
+        self,
+        raw_text: str,
+        *,
+        now: float,
+        state: _StableOcrTextState | None = None,
+    ) -> bool:
+        tracker = state or self._default_ocr_state
+        if not self._stabilize_text_key(raw_text, state=tracker):
+            return False
+        return self._writer.emit_line(raw_text, ts=utc_now_iso(now))
+
+    def _emit_choices_from_candidates(
+        self,
+        choices: list[str],
+        *,
+        now: float,
+        state: _StableOcrTextState | None = None,
+    ) -> bool:
+        tracker = state or self._default_ocr_state
+        if not self._stabilize_text_key(_canonical_choice_candidate_text(choices), state=tracker):
+            return False
+        return self._writer.emit_choices(choices, ts=utc_now_iso(now))
+
+    def _consume_aihong_menu_stage_text(self, raw_text: str, *, now: float) -> _MenuConsumeResult:
+        lines = _stripped_ocr_lines(raw_text)
+        choices = _coerce_choice_lines(lines, allow_plain_text=True)
+        if choices:
+            return _MenuConsumeResult(
+                emitted_kind="choices"
+                if self._emit_choices_from_candidates(
+                    choices,
+                    now=now,
+                    state=self._aihong_menu_ocr_state,
+                )
+                else "",
+                has_menu_candidate=True,
+            )
+        return _MenuConsumeResult(
+            emitted_kind="line" if self._emit_line_from_ocr_text(raw_text, now=now) else "",
+            has_menu_candidate=False,
+        )
+
+    def _matches_attached_window(self, candidate: DetectedGameWindow) -> bool:
+        if self._attached_window is None:
+            return False
+        if candidate.hwnd and self._attached_window.hwnd and candidate.hwnd == self._attached_window.hwnd:
+            return True
+        return bool(candidate.pid and self._attached_window.pid and candidate.pid == self._attached_window.pid)
+
+    def _prepare_window_inventory(
+        self,
+        windows: list[DetectedGameWindow],
+    ) -> tuple[list[DetectedGameWindow], list[DetectedGameWindow]]:
+        foreground_hwnd = _foreground_window_handle()
+        prepared: list[DetectedGameWindow] = []
+        for window in windows:
+            candidate = replace(window)
+            candidate.process_name = str(candidate.process_name or "").strip()
+            candidate.title = str(candidate.title or "")
+            candidate.class_name = str(candidate.class_name or "")
+            candidate.exe_path = str(candidate.exe_path or "")
+            candidate.pid = max(0, int(candidate.pid or 0))
+            candidate.hwnd = max(0, int(candidate.hwnd or 0))
+            candidate.area = max(0, int(candidate.area or 0))
+            candidate.is_foreground = candidate.hwnd == foreground_hwnd if candidate.hwnd else bool(candidate.is_foreground)
+            candidate.score = float(max(candidate.area, 1))
+            candidate = _classify_window_candidate(candidate)
+            prepared.append(candidate)
+        prepared.sort(key=_window_sort_key, reverse=True)
+        eligible_windows = [candidate for candidate in prepared if candidate.eligible]
+        excluded_windows = [candidate for candidate in prepared if not candidate.eligible]
+        self._last_detected_windows = list(prepared)
+        self._last_eligible_windows = list(eligible_windows)
+        self._last_excluded_windows = list(excluded_windows)
+        return eligible_windows, excluded_windows
+
+    def _scan_window_inventory(self) -> tuple[list[DetectedGameWindow], list[DetectedGameWindow]]:
+        if not self._platform_fn():
+            self._last_detected_windows = []
+            self._last_eligible_windows = []
+            self._last_excluded_windows = []
+            return [], []
+        scanned = list(self._window_scanner() or [])
+        return self._prepare_window_inventory(scanned)
 
     async def shutdown(self) -> None:
         if self._writer.session_id:
@@ -1128,22 +1712,31 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        windows = await asyncio.to_thread(self._window_scanner)
-        if not windows:
+        scanned_windows = await asyncio.to_thread(self._window_scanner)
+        eligible_windows, excluded_windows = self._prepare_window_inventory(scanned_windows)
+        selection = self._select_target_window(
+            eligible_windows,
+            excluded_windows=excluded_windows,
+            memory_reader_runtime=memory_reader_runtime,
+        )
+        self._last_selection = selection
+        target = selection.target
+        if target is None:
             self._runtime = self._build_runtime(
                 status="idle",
-                detail="waiting_for_capture_target",
+                detail="waiting_for_valid_window",
                 plan=backend_plan,
+                selection=selection,
             )
             await self._end_session_if_needed(now)
             result.runtime = self._runtime.to_dict()
             return result
 
-        target = self._select_target_window(
-            windows,
-            memory_reader_runtime=memory_reader_runtime,
-        )
-        profile = self._capture_profile_for_target(target)
+        aihong_two_stage_enabled = self._should_use_aihong_two_stage(target)
+        if not aihong_two_stage_enabled:
+            self._reset_aihong_menu_state()
+        profile_stage = self._aihong_stage if aihong_two_stage_enabled else _AIHONG_DIALOGUE_STAGE
+        profile = self._capture_profile_for_target(target, stage=profile_stage)
 
         if self._attached_window is None or self._attached_window.pid != target.pid:
             if (
@@ -1154,15 +1747,15 @@ class OcrReaderManager:
                 result.should_rescan = True
             self._attached_window = target
             self._last_heartbeat_at = now
-            self._last_raw_ocr_text = ""
-            self._ocr_repeat_count = 0
-            self._stable_ocr_text = ""
+            self._reset_default_ocr_state()
+            self._reset_aihong_menu_state()
             self._runtime = self._build_runtime(
                 status="starting",
                 detail="starting_capture",
                 plan=backend_plan,
                 target=target,
                 capture_profile=profile.to_dict(),
+                selection=selection,
                 game_id=self._writer.game_id,
                 session_id=self._writer.session_id,
                 last_seq=self._writer.last_seq,
@@ -1175,8 +1768,10 @@ class OcrReaderManager:
             self._attached_window = target
 
         emitted = False
+        guard_blocked = False
         active_backend = backend_plan.primary
         backend_detail_override = ""
+        runtime_profile = profile
         try:
             extraction = await asyncio.to_thread(
                 self._capture_and_extract_text,
@@ -1187,7 +1782,90 @@ class OcrReaderManager:
             active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
             backend_detail_override = extraction.backend_detail
             result.warnings.extend(extraction.warnings)
-            emitted = self._consume_ocr_text(extraction.text, now=now)
+            if extraction.text and not selection.selected_by_manual and _looks_like_self_ui_text(extraction.text):
+                guard_blocked = True
+                result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
+            else:
+                if aihong_two_stage_enabled:
+                    if self._aihong_stage == _AIHONG_MENU_STAGE:
+                        menu_result = self._consume_aihong_menu_stage_text(extraction.text, now=now)
+                        emitted = bool(menu_result.emitted_kind)
+                        if menu_result.emitted_kind == "line":
+                            self._aihong_stage = _AIHONG_DIALOGUE_STAGE
+                            self._aihong_dialogue_idle_polls = 0
+                            self._aihong_menu_missing_polls = 0
+                            self._aihong_menu_ocr_state.reset()
+                        elif menu_result.has_menu_candidate:
+                            self._aihong_menu_missing_polls = 0
+                        else:
+                            self._aihong_menu_missing_polls += 1
+                            if self._aihong_menu_missing_polls >= 2:
+                                self._reset_aihong_menu_state()
+                    else:
+                        dialogue_emitted = bool(
+                            self._consume_ocr_text(
+                                extraction.text,
+                                now=now,
+                                state=self._default_ocr_state,
+                                allow_choices=False,
+                            )
+                        )
+                        emitted = dialogue_emitted
+                        if dialogue_emitted:
+                            self._aihong_dialogue_idle_polls = 0
+                            self._aihong_menu_missing_polls = 0
+                            self._aihong_menu_ocr_state.reset()
+                        else:
+                            self._aihong_dialogue_idle_polls += 1
+                            if self._aihong_dialogue_idle_polls >= 2:
+                                menu_profile = self._capture_profile_for_target(
+                                    target,
+                                    stage=_AIHONG_MENU_STAGE,
+                                )
+                                menu_extraction = await asyncio.to_thread(
+                                    self._capture_and_extract_text,
+                                    target,
+                                    menu_profile,
+                                    backend_plan,
+                                )
+                                active_backend = (
+                                    menu_extraction.backend
+                                    if menu_extraction.backend.kind
+                                    else active_backend
+                                )
+                                backend_detail_override = (
+                                    menu_extraction.backend_detail or backend_detail_override
+                                )
+                                result.warnings.extend(menu_extraction.warnings)
+                                if (
+                                    menu_extraction.text
+                                    and not selection.selected_by_manual
+                                    and _looks_like_self_ui_text(menu_extraction.text)
+                                ):
+                                    result.warnings.append(
+                                        "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
+                                    )
+                                else:
+                                    menu_result = self._consume_aihong_menu_stage_text(
+                                        menu_extraction.text,
+                                        now=now,
+                                    )
+                                    if menu_result.has_menu_candidate:
+                                        self._aihong_stage = _AIHONG_MENU_STAGE
+                                        self._aihong_menu_missing_polls = 0
+                                        runtime_profile = menu_profile
+                                    if menu_result.emitted_kind == "line":
+                                        emitted = True
+                                        self._aihong_stage = _AIHONG_DIALOGUE_STAGE
+                                        self._aihong_dialogue_idle_polls = 0
+                                        self._aihong_menu_missing_polls = 0
+                                        self._aihong_menu_ocr_state.reset()
+                                        runtime_profile = menu_profile
+                                    elif menu_result.emitted_kind == "choices":
+                                        emitted = True
+                                        runtime_profile = menu_profile
+                else:
+                    emitted = bool(self._consume_ocr_text(extraction.text, now=now))
         except Exception as exc:
             self._logger.warning("ocr_reader capture/OCR failed: %s", exc)
             result.warnings.append(f"ocr_reader capture failed: {exc}")
@@ -1200,6 +1878,10 @@ class OcrReaderManager:
             self._last_heartbeat_at = now
             status = "active"
             detail = "receiving_text"
+        elif guard_blocked:
+            if status == "starting":
+                status = "active"
+            detail = "self_ui_guard_blocked"
         elif self._writer.session_id and now - self._last_heartbeat_at >= float(
             self._config.ocr_reader_poll_interval_seconds
         ):
@@ -1218,7 +1900,8 @@ class OcrReaderManager:
             active_backend=active_backend,
             backend_detail_override=backend_detail_override,
             target=target,
-            capture_profile=profile.to_dict(),
+            capture_profile=runtime_profile.to_dict(),
+            selection=selection,
             game_id=self._writer.game_id,
             session_id=self._writer.session_id,
             last_seq=self._writer.last_seq,
@@ -1233,15 +1916,25 @@ class OcrReaderManager:
             return selection
         return "auto"
 
-    def _capture_profile_for_target(self, target: DetectedGameWindow) -> OcrCaptureProfile:
-        return self._capture_profiles.get(
-            target.process_name,
-            OcrCaptureProfile(
-                left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
-                right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
-                top_ratio=self._config.ocr_reader_top_ratio,
-                bottom_inset_ratio=self._config.ocr_reader_bottom_inset_ratio,
-            ),
+    def _capture_profile_for_target(
+        self,
+        target: DetectedGameWindow,
+        *,
+        stage: str = _AIHONG_DIALOGUE_STAGE,
+    ) -> OcrCaptureProfile:
+        configured_profile = _lookup_capture_profile(self._capture_profiles, target)
+        if configured_profile is not None:
+            return configured_profile
+
+        builtin_profile = _builtin_capture_profile_for_target_stage(target, stage=stage)
+        if builtin_profile is not None:
+            return builtin_profile
+
+        return OcrCaptureProfile(
+            left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
+            right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
+            top_ratio=self._config.ocr_reader_top_ratio,
+            bottom_inset_ratio=self._config.ocr_reader_bottom_inset_ratio,
         )
 
     def _resolved_tesseract_path(self) -> str:
@@ -1373,6 +2066,7 @@ class OcrReaderManager:
         backend_detail_override: str = "",
         target: DetectedGameWindow | None = None,
         capture_profile: dict[str, float] | None = None,
+        selection: WindowSelectionResult | None = None,
         takeover_reason: str = "",
         game_id: str = "",
         session_id: str = "",
@@ -1381,6 +2075,13 @@ class OcrReaderManager:
     ) -> OcrReaderRuntime:
         backend = active_backend if active_backend and active_backend.kind else plan.primary
         attached_target = target or self._attached_window
+        selection_state = selection or self._last_selection
+        effective_target = selection_state.target or attached_target
+        manual_target = (
+            selection_state.manual_target.to_dict()
+            if isinstance(selection_state.manual_target, OcrWindowTarget)
+            else self._manual_target.to_dict()
+        )
         resolved_last_seq = (
             int(last_seq)
             if last_seq is not None
@@ -1405,6 +2106,15 @@ class OcrReaderManager:
             backend_detail=str(backend_detail_override or backend.detail or ""),
             backend_path=str(backend.path or ""),
             backend_model=str(backend.model or ""),
+            target_selection_mode=str(selection_state.selection_mode or self._manual_target.mode or "auto"),
+            target_selection_detail=str(selection_state.selection_detail or self._runtime.target_selection_detail),
+            effective_window_key=str(effective_target.window_key if effective_target is not None else ""),
+            effective_window_title=str(effective_target.title if effective_target is not None else ""),
+            effective_process_name=str(effective_target.process_name if effective_target is not None else ""),
+            manual_target=manual_target,
+            candidate_count=max(0, int(selection_state.candidate_count or 0)),
+            excluded_candidate_count=max(0, int(selection_state.excluded_candidate_count or 0)),
+            last_exclude_reason=str(selection_state.last_exclude_reason or self._runtime.last_exclude_reason),
         )
 
     def _capture_and_extract_text(
@@ -1452,10 +2162,45 @@ class OcrReaderManager:
         self,
         windows: list[DetectedGameWindow],
         *,
+        excluded_windows: list[DetectedGameWindow] | None = None,
         memory_reader_runtime: dict[str, Any] | None = None,
-    ) -> DetectedGameWindow:
+    ) -> WindowSelectionResult:
+        excluded = list(excluded_windows or [])
+        selection = WindowSelectionResult(
+            selection_mode="manual" if self._manual_target.is_manual() else "auto",
+            selection_detail="manual_target_active"
+            if self._manual_target.is_manual()
+            else "auto_candidate_scan",
+            manual_target=self._manual_target,
+            candidate_count=len(windows),
+            excluded_candidate_count=len(excluded),
+            last_exclude_reason=str(excluded[0].exclude_reason or "") if excluded else "",
+        )
         if not windows:
-            raise RuntimeError("no OCR capture target is available")
+            selection.selection_detail = (
+                "manual_target_unavailable_fallback_to_auto"
+                if self._manual_target.is_manual()
+                else "no_eligible_window"
+            )
+            return selection
+
+        if self._manual_target.is_manual():
+            for candidate in windows:
+                if self._manual_target.matches_exact(candidate) or self._manual_target.matches_hwnd(candidate):
+                    selection.target = candidate
+                    selection.selection_detail = "manual_target_exact"
+                    selection.manual_target = self._manual_target.resolved_for(candidate)
+                    selection.selected_by_manual = True
+                    return selection
+            for candidate in windows:
+                if self._manual_target.matches_signature(candidate):
+                    selection.target = candidate
+                    selection.selection_detail = "manual_target_rebound"
+                    selection.manual_target = self._manual_target.resolved_for(candidate)
+                    selection.selected_by_manual = True
+                    return selection
+            selection.selection_detail = "manual_target_unavailable_fallback_to_auto"
+
         preferred_pid = int((memory_reader_runtime or {}).get("pid") or 0)
         preferred_process_name = str(
             (memory_reader_runtime or {}).get("process_name") or ""
@@ -1463,56 +2208,64 @@ class OcrReaderManager:
         if preferred_pid > 0:
             for candidate in windows:
                 if candidate.pid == preferred_pid:
-                    return candidate
+                    selection.target = candidate
+                    if selection.selection_mode == "auto":
+                        selection.selection_detail = "memory_reader_pid"
+                    return selection
         if preferred_process_name:
             for candidate in windows:
                 if str(candidate.process_name or "").strip().lower() == preferred_process_name:
-                    return candidate
+                    selection.target = candidate
+                    if selection.selection_mode == "auto":
+                        selection.selection_detail = "memory_reader_process"
+                    return selection
         if self._attached_window is not None:
             for candidate in windows:
                 if candidate.hwnd == self._attached_window.hwnd:
-                    return candidate
+                    selection.target = candidate
+                    if selection.selection_mode == "auto":
+                        selection.selection_detail = "attached_hwnd"
+                    return selection
             if self._attached_window.pid:
                 for candidate in windows:
                     if candidate.pid == self._attached_window.pid:
-                        return candidate
+                        selection.target = candidate
+                        if selection.selection_mode == "auto":
+                            selection.selection_detail = "attached_pid"
+                        return selection
         foreground_hwnd = _foreground_window_handle()
         if foreground_hwnd:
             for candidate in windows:
                 if candidate.hwnd == foreground_hwnd:
-                    return candidate
-        return windows[0]
+                    selection.target = candidate
+                    if selection.selection_mode == "auto":
+                        selection.selection_detail = "foreground_window"
+                    return selection
+        selection.target = windows[0]
+        if selection.selection_mode == "auto":
+            selection.selection_detail = "scored_candidate"
+        return selection
 
-    def _consume_ocr_text(self, raw_text: str, *, now: float) -> bool:
-        cleaned = normalize_text(raw_text)
-        if not cleaned:
-            return False
-
-        if cleaned == self._last_raw_ocr_text:
-            self._ocr_repeat_count += 1
-        else:
-            self._ocr_repeat_count = 1
-            self._last_raw_ocr_text = cleaned
-
-        if self._ocr_repeat_count < 2:
-            return False
-
-        if cleaned == self._stable_ocr_text:
-            return False
-
-        self._stable_ocr_text = cleaned
-
-        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-        choices = _coerce_choice_lines(lines)
-        if choices:
-            return self._writer.emit_choices(choices, ts=utc_now_iso(now))
-
-        return self._writer.emit_line(raw_text, ts=utc_now_iso(now))
+    def _consume_ocr_text(
+        self,
+        raw_text: str,
+        *,
+        now: float,
+        state: _StableOcrTextState | None = None,
+        allow_choices: bool = True,
+        allow_plain_text_choices: bool = False,
+    ) -> bool:
+        tracker = state or self._default_ocr_state
+        lines = _stripped_ocr_lines(raw_text)
+        if allow_choices:
+            choices = _coerce_choice_lines(lines, allow_plain_text=allow_plain_text_choices)
+            if choices:
+                return self._emit_choices_from_candidates(choices, now=now, state=tracker)
+        return self._emit_line_from_ocr_text(raw_text, now=now, state=tracker)
 
     async def _end_session_if_needed(self, now: float) -> None:
         if self._writer.session_id:
             self._writer.end_session(ts=utc_now_iso(now))
             self._attached_window = None
-            self._last_raw_ocr_text = ""
-            self._ocr_repeat_count = 0
-            self._stable_ocr_text = ""
+            self._reset_default_ocr_state()
+            self._reset_aihong_menu_state()

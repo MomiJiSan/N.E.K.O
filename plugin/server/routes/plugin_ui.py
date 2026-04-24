@@ -20,6 +20,7 @@
 import asyncio
 import json
 import mimetypes
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -44,6 +45,9 @@ router = APIRouter(tags=["plugin-ui"])
 logger = get_logger("server.routes.plugin_ui")
 plugin_ui_query_service = PluginUiQueryService()
 run_service = RunService()
+
+_STALE_INSTALL_STATUS = "failed"
+_STALE_INSTALL_PHASE = "failed"
 
 
 class InstallStartPayload(BaseModel):
@@ -120,6 +124,10 @@ def _install_state_from_run(run_record, *, kind: str) -> dict[str, object]:
     phase = str(getattr(run_record, "stage", "") or status)
     message = str(getattr(run_record, "message", "") or "")
     progress = getattr(run_record, "progress", None)
+    run_error = getattr(run_record, "error", None)
+    error_message = ""
+    if run_error is not None:
+        error_message = str(getattr(run_error, "message", "") or "")
     payload = build_install_task_state(
         task_id=str(getattr(run_record, "task_id", None) or getattr(run_record, "run_id")),
         run_id=str(getattr(run_record, "run_id")),
@@ -133,6 +141,9 @@ def _install_state_from_run(run_record, *, kind: str) -> dict[str, object]:
         resume_from=int(metrics.get("resume_from") or 0),
         release_name=str(metrics.get("release_name") or ""),
         asset_name=str(metrics.get("asset_name") or ""),
+        target_dir=str(metrics.get("target_dir") or ""),
+        detected_path=str(metrics.get("detected_path") or ""),
+        error=error_message,
     )
     payload["started_at"] = getattr(run_record, "started_at", None) or payload["started_at"]
     payload["updated_at"] = getattr(run_record, "updated_at", None) or payload["updated_at"]
@@ -140,21 +151,86 @@ def _install_state_from_run(run_record, *, kind: str) -> dict[str, object]:
     return payload
 
 
+def _persist_install_payload(task_id: str, *, kind: str, payload: dict[str, object]) -> dict[str, object]:
+    return update_install_task_state(
+        task_id,
+        kind=kind,
+        run_id=str(payload.get("run_id") or task_id),
+        status=str(payload.get("status") or "queued"),
+        phase=str(payload.get("phase") or payload.get("status") or "queued"),
+        message=str(payload.get("message") or ""),
+        progress=float(payload.get("progress") or 0.0),
+        downloaded_bytes=int(payload.get("downloaded_bytes") or 0),
+        total_bytes=int(payload.get("total_bytes") or 0),
+        resume_from=int(payload.get("resume_from") or 0),
+        release_name=str(payload.get("release_name") or ""),
+        asset_name=str(payload.get("asset_name") or ""),
+        target_dir=str(payload.get("target_dir") or ""),
+        detected_path=str(payload.get("detected_path") or ""),
+        error=str(payload.get("error") or ""),
+    )
+
+
+def _mark_stale_install_task(
+    task_id: str,
+    *,
+    kind: str,
+    label: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    previous_phase = str(payload.get("phase") or payload.get("status") or "queued")
+    error_message = (
+        f"{label} 安装任务在完成前被中断，对应的后台运行记录已经不存在。"
+        f"上一次阶段：{previous_phase}。请直接重新发起安装。"
+    )
+    logger.warning(
+        "marking stale {} install task as failed: task_id={}, previous_phase={}",
+        kind,
+        task_id,
+        previous_phase,
+    )
+    stale_payload = dict(payload)
+    stale_payload.update(
+        {
+            "task_id": task_id,
+            "run_id": str(payload.get("run_id") or task_id),
+            "kind": kind,
+            "status": _STALE_INSTALL_STATUS,
+            "phase": _STALE_INSTALL_PHASE,
+            "message": error_message,
+            "error": error_message,
+            "completed_at": time.time(),
+        }
+    )
+    return _persist_install_payload(task_id, kind=kind, payload=stale_payload)
+
+
 def _resolve_install_task_payload(task_id: str, *, kind: str, label: str) -> dict[str, object]:
     state_payload = load_install_task_state(task_id, kind=kind)
+    run_missing = False
     try:
         run_record = run_service.get_run(task_id)
-    except ServerDomainError:
-        run_record = None
+    except ServerDomainError as error:
+        if error.code == "RUN_NOT_FOUND":
+            run_record = None
+            run_missing = True
+        else:
+            raise_http_from_domain(error, logger=logger)
 
     if state_payload is None and run_record is None:
         raise HTTPException(status_code=404, detail=f"{label} install task '{task_id}' not found")
 
     if state_payload is None and run_record is not None:
-        return _install_state_from_run(run_record, kind=kind)
+        run_payload = _install_state_from_run(run_record, kind=kind)
+        if str(run_payload.get("status") or "") in INSTALL_TERMINAL_STATUSES:
+            return _persist_install_payload(task_id, kind=kind, payload=run_payload)
+        return run_payload
 
     payload = dict(state_payload or {})
     if run_record is None:
+        state_status = str(payload.get("status") or "")
+        if run_missing and state_status not in INSTALL_TERMINAL_STATUSES:
+            return _mark_stale_install_task(task_id, kind=kind, label=label, payload=payload)
         return payload
 
     run_payload = _install_state_from_run(run_record, kind=kind)
@@ -170,9 +246,14 @@ def _resolve_install_task_payload(task_id: str, *, kind: str, label: str) -> dic
         payload["phase"] = str(run_payload.get("phase") or run_status)
         payload["message"] = str(run_payload.get("message") or payload.get("message") or "")
         payload["progress"] = float(run_payload.get("progress") or payload.get("progress") or 0.0)
+        payload["error"] = str(run_payload.get("error") or payload.get("error") or "")
+        payload["release_name"] = str(run_payload.get("release_name") or payload.get("release_name") or "")
+        payload["asset_name"] = str(run_payload.get("asset_name") or payload.get("asset_name") or "")
+        payload["target_dir"] = str(run_payload.get("target_dir") or payload.get("target_dir") or "")
+        payload["detected_path"] = str(run_payload.get("detected_path") or payload.get("detected_path") or "")
         payload["updated_at"] = run_payload.get("updated_at")
         payload["completed_at"] = run_payload.get("completed_at")
-        return payload
+        return _persist_install_payload(task_id, kind=kind, payload=payload)
 
     payload["status"] = run_status or state_status
     if run_payload.get("phase"):

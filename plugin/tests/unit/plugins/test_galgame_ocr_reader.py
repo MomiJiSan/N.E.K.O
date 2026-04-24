@@ -188,14 +188,20 @@ async def test_ocr_reader_manager_reports_missing_tesseract(
     bridge_root.mkdir()
     manager = OcrReaderManager(
         logger=_Logger(),
-        config=_make_config(bridge_root, enabled=True),
+        config=_make_config(bridge_root, enabled=True, rapidocr_enabled=False),
         platform_fn=lambda: True,
         capture_backend=_FakeCaptureBackend(),
         ocr_backend=_FakeOcrBackend(),
     )
     monkeypatch.setattr(
-        "plugin.plugins.galgame_plugin.ocr_reader.resolve_tesseract_path",
-        lambda configured_path, *, install_target_dir_raw="": "",
+        "plugin.plugins.galgame_plugin.ocr_reader.inspect_tesseract_installation",
+        lambda **kwargs: {
+            "installed": False,
+            "detail": "missing_tesseract",
+            "detected_path": "",
+            "required_languages": ["chi_sim", "jpn", "eng"],
+            "missing_languages": ["chi_sim", "jpn", "eng"],
+        },
     )
 
     result = await manager.tick(
@@ -221,6 +227,7 @@ async def test_ocr_reader_manager_reports_missing_languages(tmp_path: Path) -> N
             bridge_root,
             enabled=True,
             install_target_dir=str(install_root),
+            rapidocr_enabled=False,
         ),
         platform_fn=lambda: True,
         capture_backend=_FakeCaptureBackend(),
@@ -396,6 +403,293 @@ async def test_ocr_reader_manager_prefers_memory_reader_game_window_over_foregro
     assert result.runtime["detail"] == "starting_capture"
     assert result.runtime["process_name"] == "TheLamentingGeese.exe"
     assert result.runtime["pid"] == 28828
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_applies_builtin_aihong_capture_profile(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=28828,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["capture_profile"]["left_inset_ratio"] == pytest.approx(0.05)
+    assert result.runtime["capture_profile"]["right_inset_ratio"] == pytest.approx(0.24)
+    assert result.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.73)
+    assert result.runtime["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.10)
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_prefers_manual_capture_profile_over_builtin_aihong_profile(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=28828,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager.update_capture_profiles(
+        {
+            "TheLamentingGeese.exe": {
+                "left_inset_ratio": 0.11,
+                "right_inset_ratio": 0.09,
+                "top_ratio": 0.41,
+                "bottom_inset_ratio": 0.19,
+            }
+        }
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["capture_profile"]["left_inset_ratio"] == pytest.approx(0.11)
+    assert result.runtime["capture_profile"]["right_inset_ratio"] == pytest.approx(0.09)
+    assert result.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.41)
+    assert result.runtime["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.19)
+
+
+@pytest.mark.asyncio
+async def test_aihong_menu_stage_accepts_plain_text_choices_after_dialogue_idle_polls(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 3000.0}
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: clock["now"],
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=28828,
+            )
+        ],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "往南跑\n躲进巷子里",
+                "往南跑\n躲进巷子里",
+            ]
+        ),
+        writer=writer,
+    )
+
+    for _ in range(7):
+        latest = await manager.tick(
+            bridge_sdk_available=False,
+            memory_reader_runtime={},
+        )
+        clock["now"] += 1.0
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.58)
+    assert events[-1]["type"] == "choices_shown"
+    payload = events[-1]["payload"]
+    assert [item["text"] for item in payload["choices"]] == ["往南跑", "躲进巷子里"]
+    assert session is not None
+    assert session["state"]["is_menu_open"] is True
+    assert capture_backend.capture_calls[0][1]["top_ratio"] == pytest.approx(0.73)
+    assert capture_backend.capture_calls[0][1]["right_inset_ratio"] == pytest.approx(0.24)
+    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.58)
+    assert capture_backend.capture_calls[-1][1]["bottom_inset_ratio"] == pytest.approx(0.16)
+
+
+@pytest.mark.asyncio
+async def test_aihong_menu_probe_rejects_dialogue_like_multiline_text(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 4000.0}
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: clock["now"],
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=28828,
+            )
+        ],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "旁白：城门将破。\n将军：跟我来。",
+                "将军：那纸上所书，必是紧要军令。",
+                "旁白：城门将破。\n将军：跟我来。",
+            ]
+        ),
+        writer=writer,
+    )
+
+    for _ in range(6):
+        latest = await manager.tick(
+            bridge_sdk_available=False,
+            memory_reader_runtime={},
+        )
+        clock["now"] += 1.0
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert all(event["type"] != "choices_shown" for event in events)
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.73)
+    assert session is not None
+    assert session["state"]["is_menu_open"] is False
+    assert capture_backend.capture_calls[4][1]["top_ratio"] == pytest.approx(0.58)
+    assert capture_backend.capture_calls[6][1]["top_ratio"] == pytest.approx(0.58)
+
+
+@pytest.mark.asyncio
+async def test_aihong_menu_stage_returns_to_dialogue_profile_after_stable_line(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 5000.0}
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: clock["now"],
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=28828,
+            )
+        ],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "将军：那纸上所书，必是紧要军令。",
+                "往南跑\n躲进巷子里",
+                "往南跑\n躲进巷子里",
+                "将军：跟我来。",
+                "将军：跟我来。",
+                "将军：跟我来。",
+            ]
+        ),
+        writer=writer,
+    )
+
+    for _ in range(9):
+        latest = await manager.tick(
+            bridge_sdk_available=False,
+            memory_reader_runtime={},
+        )
+        clock["now"] += 1.0
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert events[-1]["type"] == "line_changed"
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.73)
+    assert session is not None
+    assert session["state"]["text"] == "跟我来。"
+    assert session["state"]["is_menu_open"] is False
+    assert capture_backend.capture_calls[-2][1]["top_ratio"] == pytest.approx(0.58)
+    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.73)
 
 
 @pytest.mark.asyncio
@@ -708,3 +1002,156 @@ async def test_ocr_reader_manager_forced_rapidocr_mode_does_not_fallback_to_tess
 
     assert second.runtime["backend_kind"] == "rapidocr"
     assert second.runtime["detail"] == "starting_capture"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_excludes_neko_self_window_and_waits_for_valid_target(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=202,
+                title="Galgame Plugin - N.E.K.O Plugin Manager - Chrome",
+                process_name="chrome.exe",
+                pid=1500,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "waiting_for_valid_window"
+    assert result.runtime["candidate_count"] == 0
+    assert result.runtime["excluded_candidate_count"] == 1
+    assert result.runtime["last_exclude_reason"] == "excluded_self_window"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_prefers_manual_target_and_rebinds_by_signature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    manual_window = DetectedGameWindow(
+        hwnd=777,
+        title="Aiyoku no Eustia",
+        process_name="Aiyoku.exe",
+        pid=4455,
+    )
+    rebound_window = DetectedGameWindow(
+        hwnd=778,
+        title=manual_window.title,
+        process_name=manual_window.process_name,
+        pid=manual_window.pid,
+    )
+    other_window = DetectedGameWindow(
+        hwnd=100,
+        title="Other Game",
+        process_name="Other.exe",
+        pid=1,
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader._foreground_window_handle",
+        lambda: other_window.hwnd,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [other_window, rebound_window],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager.update_window_target(
+        {
+            "mode": "manual",
+            "window_key": manual_window.window_key,
+            "process_name": manual_window.process_name,
+            "normalized_title": manual_window.normalized_title,
+            "pid": manual_window.pid,
+            "last_known_hwnd": manual_window.hwnd,
+            "selected_at": "2026-04-24T10:00:00Z",
+        }
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["status"] == "starting"
+    assert result.runtime["process_name"] == "Aiyoku.exe"
+    assert result.runtime["target_selection_mode"] == "manual"
+    assert result.runtime["target_selection_detail"] == "manual_target_rebound"
+    assert result.runtime["manual_target"]["last_known_hwnd"] == 778
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_blocks_text_that_looks_like_neko_plugin_ui(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="Real Game Window",
+                process_name="DemoGame.exe",
+                pid=4242,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "RapidOCR install queued task",
+                "RapidOCR install queued task",
+            ]
+        ),
+        writer=writer,
+    )
+
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    second = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert second.runtime["detail"] == "self_ui_guard_blocked"
+    assert session is not None
+    assert session["state"]["text"] == ""

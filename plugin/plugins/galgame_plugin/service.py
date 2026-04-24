@@ -907,19 +907,20 @@ def _build_input_degraded_context(
     return input_source, bool(reasons), reasons
 
 
-def _memory_reader_input_diagnostic(context: dict[str, Any]) -> str:
+def _input_degraded_diagnostic(context: dict[str, Any]) -> str:
     reasons = list(context.get("degraded_reasons") or [])
     if not reasons:
         return ""
     input_source = str(context.get("input_source") or "")
-    if input_source == DATA_SOURCE_OCR_READER:
-        return (
-            "ocr_reader_input: input comes from ocr_reader, semantic granularity is "
-            "weaker than bridge_sdk (" + ",".join(reasons) + ")"
-        )
+    source_label = (
+        DATA_SOURCE_OCR_READER
+        if input_source == DATA_SOURCE_OCR_READER
+        else DATA_SOURCE_MEMORY_READER
+    )
     return (
-        "memory_reader_input: input comes from memory_reader, semantic granularity is "
-        "weaker than bridge_sdk (" + ",".join(reasons) + ")"
+        f"{source_label}_input: input comes from {source_label}, semantic granularity is "
+        "weaker than bridge_sdk but the workflow remains usable "
+        f"({','.join(reasons)})"
     )
 
 
@@ -928,11 +929,18 @@ def apply_input_degraded_result(
     *,
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    if not bool(context.get("input_degraded")):
-        return payload
     next_payload = dict(payload)
+    semantic_degraded = bool(context.get("input_degraded"))
+    next_payload["input_source"] = str(context.get("input_source") or DATA_SOURCE_BRIDGE_SDK)
+    next_payload["semantic_degraded"] = semantic_degraded
+    next_payload["semantic_granularity"] = (
+        "weaker_than_bridge_sdk" if semantic_degraded else "bridge_sdk_level"
+    )
+    next_payload["fallback_used"] = bool(payload.get("degraded"))
+    if not semantic_degraded:
+        return next_payload
     next_payload["degraded"] = True
-    detail = _memory_reader_input_diagnostic(context)
+    detail = _input_degraded_diagnostic(context)
     diagnostic = str(next_payload.get("diagnostic") or "")
     if diagnostic:
         if detail and detail not in diagnostic:

@@ -302,6 +302,14 @@ button[disabled] {
   background: rgba(255, 255, 255, 0.6);
 }
 
+.window-target-panel {
+  margin-top: 14px;
+  padding: 18px 20px;
+  border: 1px solid rgba(31, 42, 51, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
 .capture-profile-grid {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -315,6 +323,61 @@ button[disabled] {
   gap: 10px;
   align-items: center;
   justify-content: flex-end;
+}
+
+.window-candidate-list {
+  max-height: 280px;
+}
+
+.window-candidate-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.window-candidate-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.07);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.status-chip.active {
+  background: rgba(14, 138, 124, 0.12);
+  color: var(--brand-strong);
+}
+
+.status-chip.warning {
+  background: rgba(178, 106, 28, 0.12);
+  color: var(--warning);
+}
+
+.excluded-window-panel {
+  margin-top: 14px;
+  border-top: 1px dashed var(--line);
+  padding-top: 14px;
+}
+
+.excluded-window-panel summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.excluded-window-panel[open] summary {
+  margin-bottom: 12px;
 }
 
 .flash-message {
@@ -366,6 +429,10 @@ button[disabled] {
   overflow: auto;
   overscroll-behavior: contain;
   padding-right: 6px;
+}
+
+.panel-scroll > .scroll-region {
+  flex: 1 1 auto;
 }
 
 .scroll-region::-webkit-scrollbar,
@@ -433,6 +500,7 @@ button[disabled] {
 }
 
 .reply-box {
+  flex: 0 0 auto;
   margin-top: 18px;
   padding-top: 16px;
   border-top: 1px dashed var(--line);

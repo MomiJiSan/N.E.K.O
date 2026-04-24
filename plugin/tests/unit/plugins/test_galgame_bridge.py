@@ -27,6 +27,8 @@ from plugin.plugins.galgame_plugin.models import (
     DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_OCR_READER,
+    STORE_OCR_CAPTURE_PROFILES,
+    STORE_OCR_WINDOW_TARGET,
 )
 from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
@@ -45,7 +47,7 @@ from plugin.plugins.galgame_plugin.service import (
     build_suggest_context,
     build_summarize_context,
 )
-from plugin.sdk.plugin import Ok
+from plugin.sdk.plugin import Err, Ok
 
 
 _PLUGIN_FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures" / "galgame_plugin"
@@ -491,6 +493,29 @@ def _memory_reader_session(
         "source": "memory_reader",
         "game_process_name": "RenPy Demo.exe",
         "game_pid": 4242,
+    }
+    return payload
+
+
+def _ocr_reader_session(
+    *,
+    game_id: str,
+    session_id: str,
+    state: dict[str, object],
+    last_seq: int,
+) -> dict[str, object]:
+    payload = _session(
+        game_id=game_id,
+        session_id=session_id,
+        last_seq=last_seq,
+        state=state,
+    )
+    payload["bridge_sdk_version"] = "ocr-reader-0.1.0"
+    payload["engine"] = "unknown"
+    payload["metadata"] = {
+        "source": DATA_SOURCE_OCR_READER,
+        "process_name": "RenPy Demo.exe",
+        "pid": 5252,
     }
     return payload
 
@@ -1196,6 +1221,8 @@ async def test_bridge_fixture_rollback_round_preserves_history_and_supports_phas
         _make_effective_config(
             bridge_root,
             llm={"target_entry_ref": "fake_llm:run"},
+            ocr_reader={"enabled": False},
+            rapidocr={"enabled": False},
         ),
     )
 
@@ -1869,6 +1896,45 @@ async def test_install_rapidocr_entry_returns_install_result_and_refreshed_statu
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_install_rapidocr_entry_returns_chinese_error_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "RapidOCRInstalled"
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+            rapidocr={
+                "enabled": True,
+                "install_target_dir": str(install_root),
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    async def _fake_install_rapidocr(**kwargs):
+        del kwargs
+        raise RuntimeError(
+            "RapidOCR 安装失败：插件在安装 OCR 运行时依赖时执行 pip 命令失败。"
+        )
+
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.install_rapidocr",
+        _fake_install_rapidocr,
+    )
+
+    result = await plugin.galgame_install_rapidocr()
+
+    assert isinstance(result, Err)
+    assert str(result.error) == "RapidOCR 安装失败：插件在安装 OCR 运行时依赖时执行 pip 命令失败。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_set_ocr_capture_profile_updates_state_and_store(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(
@@ -1906,6 +1972,72 @@ async def test_set_ocr_capture_profile_updates_state_and_store(tmp_path: Path) -
     assert cleared.value["cleared"] is True
     with plugin._state_lock:
         assert "DemoGame.exe" not in plugin._state.ocr_capture_profiles
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_list_and_set_ocr_window_target_updates_state_and_store(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": False},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    eligible_window = DetectedGameWindow(
+        hwnd=101,
+        title="Aiyoku no Eustia",
+        process_name="Aiyoku.exe",
+        pid=4242,
+    )
+    excluded_window = DetectedGameWindow(
+        hwnd=202,
+        title="Galgame Plugin - N.E.K.O Plugin Manager",
+        process_name="chrome.exe",
+        pid=1500,
+    )
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [eligible_window, excluded_window],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    listed = await plugin.galgame_list_ocr_windows(include_excluded=True)
+
+    assert isinstance(listed, Ok)
+    assert listed.value["candidate_count"] == 1
+    assert listed.value["excluded_candidate_count"] == 1
+    assert listed.value["windows"][0]["window_key"] == eligible_window.window_key
+    assert listed.value["excluded_windows"][0]["exclude_reason"] == "excluded_self_window"
+
+    saved = await plugin.galgame_set_ocr_window_target(window_key=eligible_window.window_key)
+
+    assert isinstance(saved, Ok)
+    assert saved.value["window_target"]["mode"] == "manual"
+    assert saved.value["window_target"]["window_key"] == eligible_window.window_key
+    with plugin._state_lock:
+        assert plugin._state.ocr_window_target["window_key"] == eligible_window.window_key
+    restored, _warnings = plugin._persist.load()
+    assert restored[STORE_OCR_WINDOW_TARGET]["window_key"] == eligible_window.window_key
+
+    rejected = await plugin.galgame_set_ocr_window_target(window_key=excluded_window.window_key)
+
+    assert isinstance(rejected, Err)
+    assert "excluded OCR window" in str(rejected.error)
+
+    cleared = await plugin.galgame_set_ocr_window_target(clear=True)
+
+    assert isinstance(cleared, Ok)
+    assert cleared.value["window_target"]["mode"] == "auto"
+    with plugin._state_lock:
+        assert plugin._state.ocr_window_target["mode"] == "auto"
 
 
 @pytest.mark.asyncio
@@ -2359,6 +2491,8 @@ async def test_phase2_entries_mark_memory_reader_input_as_degraded_even_when_llm
         _make_effective_config(
             bridge_root,
             llm={"target_entry_ref": "fake_llm:run"},
+            ocr_reader={"enabled": False},
+            rapidocr={"enabled": False},
         ),
     )
 
@@ -2427,19 +2561,183 @@ async def test_phase2_entries_mark_memory_reader_input_as_degraded_even_when_llm
     assert explain.value["degraded"] is True
     assert "memory_reader_input" in explain.value["diagnostic"]
     assert "weaker than bridge_sdk" in explain.value["diagnostic"]
+    assert explain.value["input_source"] == DATA_SOURCE_MEMORY_READER
+    assert explain.value["semantic_degraded"] is True
+    assert explain.value["fallback_used"] is False
     assert explain.value["explanation"] == "这是对台词的解释。"
 
     assert isinstance(summarize, Ok)
     assert summarize.value["degraded"] is True
     assert "memory_reader_input" in summarize.value["diagnostic"]
     assert "weaker than bridge_sdk" in summarize.value["diagnostic"]
+    assert summarize.value["input_source"] == DATA_SOURCE_MEMORY_READER
+    assert summarize.value["semantic_degraded"] is True
+    assert summarize.value["fallback_used"] is False
     assert summarize.value["summary"] == "这是对场景的总结。"
 
     assert isinstance(suggest, Ok)
     assert suggest.value["degraded"] is True
     assert "memory_reader_input" in suggest.value["diagnostic"]
     assert "weaker than bridge_sdk" in suggest.value["diagnostic"]
+    assert suggest.value["input_source"] == DATA_SOURCE_MEMORY_READER
+    assert suggest.value["semantic_degraded"] is True
+    assert suggest.value["fallback_used"] is False
     assert suggest.value["choices"][0]["choice_id"] == "mem:line-1#choice0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_succeeds(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "ocr-demo"
+    session_id = "ocr-session"
+    _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_ocr_reader_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(
+                speaker="é›ªä¹ƒ",
+                text="è¿™æ˜¯ OCR è¯»å–æ¥çš„å°è¯ã€‚",
+                scene_id="ocr:scene-a",
+                line_id="ocr:line-1",
+                choices=[
+                    {"choice_id": "ocr:line-1#choice0", "text": "åŽ»æ•™å®¤", "index": 0, "enabled": True},
+                    {"choice_id": "ocr:line-1#choice1", "text": "åŽ»å¤©å°", "index": 1, "enabled": True},
+                ],
+                is_menu_open=True,
+                ts="2026-04-21T08:31:00Z",
+            ),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "é›ªä¹ƒ",
+                    "text": "è¿™æ˜¯ OCR è¯»å–æ¥çš„å°è¯ã€‚",
+                    "line_id": "ocr:line-1",
+                    "scene_id": "ocr:scene-a",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:31:00Z",
+            ),
+            _event(
+                seq=2,
+                event_type="choices_shown",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "line_id": "ocr:line-1",
+                    "scene_id": "ocr:scene-a",
+                    "route_id": "",
+                    "choices": [
+                        {"choice_id": "ocr:line-1#choice0", "text": "åŽ»æ•™å®¤", "index": 0, "enabled": True},
+                        {"choice_id": "ocr:line-1#choice1", "text": "åŽ»å¤©å°", "index": 1, "enabled": True},
+                    ],
+                },
+                ts="2026-04-21T08:31:01Z",
+            ),
+        ],
+    )
+
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            llm={"target_entry_ref": "fake_llm:run"},
+        ),
+    )
+
+    async def _handler(**kwargs):
+        params = kwargs.get("params") or {}
+        operation = params.get("operation")
+        if operation == "explain_line":
+            return {"explanation": "è¿™æ˜¯å¯¹ OCR å°è¯çš„è§£é‡Šã€‚", "evidence": []}
+        if operation == "summarize_scene":
+            return {
+                "summary": "è¿™æ˜¯å¯¹ OCR åœºæ™¯çš„æ€»ç»“ã€‚",
+                "key_points": [{"type": "plot", "text": "OCR ä¸»çº¿å¯ç”¨ã€‚"}],
+            }
+        if operation == "suggest_choice":
+            context = params.get("context") or {}
+            visible_choices = context.get("visible_choices") or []
+            return {
+                "choices": [
+                    {
+                        "choice_id": visible_choices[0]["choice_id"],
+                        "text": visible_choices[0]["text"],
+                        "rank": 1,
+                        "reason": "OCR ä¸‹ä¼˜å…ˆç»§ç»­ä¸»çº¿ã€‚",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected operation: {operation}")
+
+    ctx.entry_handler = _handler
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._ocr_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        tick=lambda **kwargs: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                warnings=[],
+                should_rescan=False,
+                runtime={
+                    "enabled": True,
+                    "status": "active",
+                    "detail": "fixture_active",
+                    "process_name": "RenPy Demo.exe",
+                    "pid": 5252,
+                    "game_id": game_id,
+                    "session_id": session_id,
+                    "last_seq": 2,
+                    "last_event_ts": "2026-04-21T08:31:01Z",
+                },
+            ),
+        ),
+        shutdown=lambda: asyncio.sleep(0, result=None),
+    )
+    await plugin._poll_bridge(force=True)
+
+    status = await plugin.galgame_get_status()
+    explain = await plugin.galgame_explain_line()
+    summarize = await plugin.galgame_summarize_scene()
+    suggest = await plugin.galgame_suggest_choice()
+
+    assert isinstance(status, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
+
+    assert isinstance(explain, Ok)
+    assert explain.value["degraded"] is True
+    assert explain.value["input_source"] == DATA_SOURCE_OCR_READER
+    assert explain.value["semantic_degraded"] is True
+    assert explain.value["fallback_used"] is False
+    assert "ocr_reader_input" in explain.value["diagnostic"]
+    assert explain.value["explanation"] == "è¿™æ˜¯å¯¹ OCR å°è¯çš„è§£é‡Šã€‚"
+
+    assert isinstance(summarize, Ok)
+    assert summarize.value["degraded"] is True
+    assert summarize.value["input_source"] == DATA_SOURCE_OCR_READER
+    assert summarize.value["semantic_degraded"] is True
+    assert summarize.value["fallback_used"] is False
+    assert "ocr_reader_input" in summarize.value["diagnostic"]
+    assert summarize.value["summary"] == "è¿™æ˜¯å¯¹ OCR åœºæ™¯çš„æ€»ç»“ã€‚"
+
+    assert isinstance(suggest, Ok)
+    assert suggest.value["degraded"] is True
+    assert suggest.value["input_source"] == DATA_SOURCE_OCR_READER
+    assert suggest.value["semantic_degraded"] is True
+    assert suggest.value["fallback_used"] is False
+    assert "ocr_reader_input" in suggest.value["diagnostic"]
+    assert suggest.value["choices"][0]["choice_id"] == "ocr:line-1#choice0"
 
 
 @pytest.mark.asyncio
@@ -2532,6 +2830,43 @@ async def test_llm_gateway_degrades_on_invalid_result(tmp_path: Path) -> None:
     )
     assert payload["degraded"] is True
     assert "invalid_result" in payload["diagnostic"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_gateway_agent_reply_fallback_is_readable_and_structured(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(bridge_root, llm={"target_entry_ref": "fake_llm:run"}),
+    )
+    ctx.entry_handler = {"reply": ""}
+    plugin = GalgameBridgePlugin(ctx)
+    gateway = LLMGateway(plugin, _Logger(), type("Cfg", (), {
+        "llm_max_in_flight": 2,
+        "llm_request_cache_ttl_seconds": 0,
+        "llm_call_timeout_seconds": 15,
+        "llm_target_entry_ref": "fake_llm:run",
+    })())
+
+    payload = await gateway.agent_reply(
+        {
+            "prompt": "summarize the current scene",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "latest_line": "Yukino: Let's keep going.",
+            "recent_lines": [],
+            "recent_choices": [],
+            "current_snapshot": _session_state(scene_id="scene-a", line_id="line-1"),
+        }
+    )
+
+    assert payload["degraded"] is True
+    assert "invalid_result" in payload["diagnostic"]
+    assert "Received request" in payload["reply"]
+    assert "Current line:" in payload["reply"]
 
 
 @pytest.mark.asyncio
@@ -2678,6 +3013,38 @@ async def test_game_llm_agent_uses_rank1_choice_and_records_push_history(tmp_pat
     assert len(ctx.pushed_messages) == 1
     assert status["recent_pushes"][0]["kind"] == "choice_reason"
     assert "推荐理由" in status["recent_pushes"][0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_query_status_returns_structured_fields(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(mode="choice_advisor")
+    shared["active_data_source"] = DATA_SOURCE_OCR_READER
+
+    status = await agent.query_status(shared)
+
+    assert status["action"] == "query_status"
+    assert status["status"] == "active"
+    assert status["activity"] == "idle"
+    assert status["reason"] == "background_loop_ready"
+    assert status["input_source"] == DATA_SOURCE_OCR_READER
+    assert status["push_policy"] == "selective_scene_and_choice"
+    assert status["scene_stage"] == "dialogue"
+    assert status["actionable"] is True
+    assert status["standby_requested"] is False
+    assert status["memory_counts"]["scene_memory"] == 0
+    assert isinstance(status["recent_pushes"], list)
 
 
 @pytest.mark.asyncio
@@ -3331,6 +3698,7 @@ async def test_game_llm_agent_recovers_after_temporary_host_unavailable(
 
     assert first_status["status"] == "error"
     assert "computer_use unavailable" in first_status["result"]
+    assert first_status["reason"] == "hard_error"
     assert fake_host.started == []
 
     fake_host.ready = True
@@ -3339,5 +3707,6 @@ async def test_game_llm_agent_recovers_after_temporary_host_unavailable(
     recovered_status = await agent.query_status(shared)
 
     assert recovered_status["status"] == "active"
+    assert recovered_status["reason"] in {"actuating_advance_running_host", "background_loop_ready"}
     assert fake_host.started
     assert agent._actuation is not None

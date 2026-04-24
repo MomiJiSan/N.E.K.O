@@ -9,6 +9,7 @@ from .models import (
     AGENT_STATUS_ACTIVE,
     AGENT_STATUS_ERROR,
     AGENT_STATUS_STANDBY,
+    DATA_SOURCE_BRIDGE_SDK,
     json_copy,
     sanitize_snapshot_state,
 )
@@ -985,6 +986,309 @@ class GameLLMAgent:
         if self._pending_strategy is not None:
             return "retry_pending"
         return "idle"
+
+    async def query_status(self, shared: dict[str, Any]) -> dict[str, Any]:
+        async with self._op_lock:
+            interrupted = await self._interrupt_for_status_query()
+            await self._observe(shared)
+            self._update_scene_state(shared, time.monotonic())
+            status = self._compute_status(shared)
+            self._last_status = status
+            return {
+                "action": "query_status",
+                **self._build_status_payload(
+                    shared,
+                    status=status,
+                    interrupted=interrupted,
+                ),
+            }
+
+    async def query_context(self, shared: dict[str, Any], *, context_query: str) -> dict[str, Any]:
+        async with self._op_lock:
+            await self._interrupt_current()
+            await self._observe(shared)
+            payload = await self._llm_gateway.agent_reply(
+                self._build_agent_reply_context(shared, prompt=context_query)
+            )
+            status = self._compute_status(shared)
+            self._last_status = status
+            return {
+                "action": "query_context",
+                "result": str(payload.get("reply") or ""),
+                "status": status,
+                "degraded": bool(payload.get("degraded")),
+                "diagnostic": str(payload.get("diagnostic") or ""),
+                "input_source": self._current_input_source(shared),
+            }
+
+    async def send_message(self, shared: dict[str, Any], *, message: str) -> dict[str, Any]:
+        async with self._op_lock:
+            await self._interrupt_current()
+            await self._observe(shared)
+            payload = await self._llm_gateway.agent_reply(
+                self._build_agent_reply_context(shared, prompt=message)
+            )
+            status = self._compute_status(shared)
+            self._last_status = status
+            return {
+                "action": "send_message",
+                "result": str(payload.get("reply") or ""),
+                "status": status,
+                "degraded": bool(payload.get("degraded")),
+                "diagnostic": str(payload.get("diagnostic") or ""),
+                "input_source": self._current_input_source(shared),
+            }
+
+    async def _observe(self, shared: dict[str, Any]) -> None:
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        session_id = str(shared.get("active_session_id") or "")
+        if session_id != self._observed_session_id:
+            self._scene_memory.clear()
+            self._choice_memory.clear()
+            self._recent_pushes.clear()
+            self._failure_memory.clear()
+            self._suggestion_reasons.clear()
+            self._clear_hard_error()
+            self._observed_choice_marker = ""
+            self._observed_scene_id = str(snapshot.get("scene_id") or "")
+            self._observed_session_id = session_id
+            self._planning_candidates = []
+            self._pending_strategy = None
+            self._scene_state = self._build_empty_scene_state()
+            return
+
+        current_scene_id = str(snapshot.get("scene_id") or "")
+        current_route_id = str(snapshot.get("route_id") or "")
+        if current_scene_id and current_scene_id != self._observed_scene_id:
+            context = build_summarize_context(shared, scene_id=current_scene_id)
+            summary = build_local_scene_summary(
+                scene_id=current_scene_id,
+                route_id=current_route_id,
+                lines=context["recent_lines"],
+                selected_choices=context["recent_choices"],
+                snapshot=snapshot,
+            )
+            self._append_bounded(
+                self._scene_memory,
+                {
+                    "scene_id": current_scene_id,
+                    "route_id": current_route_id,
+                    "summary": summary,
+                    "ts": str(snapshot.get("ts") or ""),
+                },
+                limit=32,
+            )
+            if self._observed_scene_id and self._should_push_scene(shared):
+                self._push_agent_message(
+                    shared,
+                    kind="scene_summary",
+                    content=summary,
+                    scene_id=current_scene_id,
+                    route_id=current_route_id,
+                )
+            self._observed_scene_id = current_scene_id
+
+        selected = latest_selected_choice(shared.get("history_choices", []))
+        if selected is not None:
+            marker = (
+                f"{str(selected.get('ts') or '')}:"
+                f"{str(selected.get('choice_id') or '')}:"
+                f"{str(selected.get('scene_id') or '')}"
+            )
+            if marker and marker != self._observed_choice_marker:
+                choice_id = str(selected.get("choice_id") or "")
+                choice_text = str(selected.get("text") or "")
+                self._append_bounded(
+                    self._choice_memory,
+                    {
+                        "choice_id": choice_id,
+                        "text": choice_text,
+                        "scene_id": str(selected.get("scene_id") or ""),
+                        "route_id": str(selected.get("route_id") or ""),
+                        "ts": str(selected.get("ts") or ""),
+                    },
+                    limit=64,
+                )
+                reason = self._suggestion_reasons.pop(choice_id, "")
+                self._suggestion_reasons.clear()
+                if self._should_push_choice(shared) and reason:
+                    self._push_agent_message(
+                        shared,
+                        kind="choice_reason",
+                        content=(
+                            f"\u5df2\u9009\u62e9\u300c{choice_text}\u300d\u3002"
+                            f"\u63a8\u8350\u7406\u7531\uff1a{reason}"
+                        ),
+                        scene_id=str(selected.get("scene_id") or ""),
+                        route_id=str(selected.get("route_id") or ""),
+                    )
+                self._observed_choice_marker = marker
+
+    def _push_agent_message(
+        self,
+        shared: dict[str, Any],
+        *,
+        kind: str,
+        content: str,
+        scene_id: str,
+        route_id: str,
+    ) -> None:
+        if not content:
+            return
+        ts = str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        self._plugin.push_message(
+            source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
+            message_type="proactive_notification",
+            description=f"Galgame Agent | {kind}",
+            priority=6,
+            content=content,
+            metadata={
+                "kind": kind,
+                "scene_id": scene_id,
+                "route_id": route_id,
+                "ts": ts,
+            },
+        )
+        self._append_bounded(
+            self._recent_pushes,
+            {
+                "ts": ts,
+                "kind": kind,
+                "content": content,
+                "scene_id": scene_id,
+                "route_id": route_id,
+            },
+            limit=20,
+        )
+
+    def _build_agent_reply_context(self, shared: dict[str, Any], *, prompt: str) -> dict[str, Any]:
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        latest_line = ""
+        if snapshot.get("text"):
+            speaker = str(snapshot.get("speaker") or "Narration")
+            latest_line = (
+                f"{speaker}: "
+                f"{str(snapshot.get('text') or '')}"
+            )
+        return {
+            "prompt": prompt,
+            "game_id": str(shared.get("active_game_id") or ""),
+            "session_id": str(shared.get("active_session_id") or ""),
+            "scene_id": str(snapshot.get("scene_id") or ""),
+            "route_id": str(snapshot.get("route_id") or ""),
+            "current_snapshot": snapshot,
+            "latest_line": latest_line,
+            "recent_lines": json_copy(list(shared.get("history_lines", []))[-8:]),
+            "recent_choices": json_copy(list(shared.get("history_choices", []))[-8:]),
+            "scene_memory": json_copy(self._scene_memory[-8:]),
+            "choice_memory": json_copy(self._choice_memory[-8:]),
+            "failure_memory": json_copy(self._failure_memory[-8:]),
+            "scene_strategy": json_copy(self._scene_state),
+            "status": self._compute_status(shared),
+            "mode": str(shared.get("mode") or ""),
+            "input_source": self._current_input_source(shared),
+            "push_policy": self._current_push_policy(shared),
+            "standby_requested": self._explicit_standby,
+        }
+
+    def _build_status_payload(
+        self,
+        shared: dict[str, Any],
+        *,
+        status: str,
+        interrupted: bool,
+    ) -> dict[str, Any]:
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        recent_pushes = json_copy(self._recent_pushes[-20:])
+        return {
+            "result": self._build_status_result(
+                shared,
+                status=status,
+                interrupted=interrupted,
+            ),
+            "status": status,
+            "activity": self._current_activity_label(),
+            "reason": self._current_status_reason(shared),
+            "error": self._hard_error,
+            "session_id": str(shared.get("active_session_id") or ""),
+            "scene_id": str(snapshot.get("scene_id") or ""),
+            "route_id": str(snapshot.get("route_id") or ""),
+            "line_id": str(snapshot.get("line_id") or ""),
+            "scene_stage": str(self._scene_state.get("stage") or "unknown"),
+            "input_source": self._current_input_source(shared),
+            "mode": str(shared.get("mode") or ""),
+            "push_notifications": bool(shared.get("push_notifications")),
+            "push_policy": self._current_push_policy(shared),
+            "actionable": self._is_actionable(shared),
+            "standby_requested": self._explicit_standby,
+            "interrupted": interrupted,
+            "memory_counts": {
+                "scene_memory": len(self._scene_memory),
+                "choice_memory": len(self._choice_memory),
+                "failure_memory": len(self._failure_memory),
+                "recent_pushes": len(self._recent_pushes),
+            },
+            "recent_pushes": recent_pushes,
+            "last_push": json_copy(recent_pushes[-1]) if recent_pushes else None,
+        }
+
+    def _build_status_result(
+        self,
+        shared: dict[str, Any],
+        *,
+        status: str,
+        interrupted: bool,
+    ) -> str:
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        parts = [
+            f"status={status}",
+            f"session={str(shared.get('active_session_id') or '') or 'none'}",
+            f"scene={str(snapshot.get('scene_id') or '') or 'none'}",
+            f"route={str(snapshot.get('route_id') or '') or 'none'}",
+            f"line={str(snapshot.get('line_id') or '') or 'none'}",
+            f"stage={str(self._scene_state.get('stage') or 'unknown')}",
+            f"activity={self._current_activity_label()}",
+            f"input_source={self._current_input_source(shared)}",
+            f"push_policy={self._current_push_policy(shared)}",
+            f"reason={self._current_status_reason(shared)}",
+        ]
+        if interrupted:
+            parts.append("interrupted=yes")
+        if self._hard_error:
+            parts.append(f"error={self._hard_error}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _current_input_source(shared: dict[str, Any]) -> str:
+        return str(shared.get("active_data_source") or DATA_SOURCE_BRIDGE_SDK)
+
+    def _current_status_reason(self, shared: dict[str, Any]) -> str:
+        if self._hard_error:
+            return "hard_error"
+        if self._explicit_standby:
+            return "explicit_standby"
+        if not self._is_actionable(shared):
+            return "bridge_inactive"
+        if self._planning_task is not None:
+            return "planning_choice"
+        if self._actuation is not None:
+            return (
+                f"actuating_{str(self._actuation.get('kind') or 'unknown')}_"
+                f"{str(self._actuation.get('state') or 'running')}"
+            )
+        if self._pending_strategy is not None:
+            return "retry_pending"
+        return "background_loop_ready"
+
+    def _current_push_policy(self, shared: dict[str, Any]) -> str:
+        if not bool(shared.get("push_notifications")):
+            return "disabled"
+        mode = str(shared.get("mode") or "")
+        if mode_allows_choice_push(mode):
+            return "selective_scene_and_choice"
+        if mode_allows_agent_push(mode):
+            return "selective_scene_only"
+        return "disabled"
 
     @staticmethod
     def _append_bounded(items: list[dict[str, Any]], item: dict[str, Any], *, limit: int) -> None:

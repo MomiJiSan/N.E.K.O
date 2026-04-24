@@ -102,6 +102,108 @@ def _default_install_manifest(
     }
 
 
+def _localized_rapidocr_install_error(
+    exc: Exception,
+    *,
+    phase: str,
+    target_dir: Path,
+    package_specs: list[str] | None = None,
+) -> str:
+    packages = ", ".join(package_specs or []) or f"{DEFAULT_RAPIDOCR_PIP_SPEC}, {DEFAULT_ONNXRUNTIME_PIP_SPEC}"
+    target_dir_text = str(target_dir) if target_dir else "未解析"
+
+    stderr_text = ""
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr_text = str(getattr(exc, "stderr", "") or getattr(exc, "output", "") or "").strip()
+    combined_message = " ".join(
+        part for part in [stderr_text, str(exc or "").strip()] if part
+    ).strip()
+
+    if "No module named pip" in combined_message:
+        return (
+            "RapidOCR 安装失败：插件当前使用的 Python 运行时缺少 pip 模块，"
+            "因此无法下载 OCR 依赖。请先修复该 Python 环境的 pip，"
+            "或升级到包含 pip 的 N.E.K.O 运行环境后重试。"
+        )
+    if "No module named ensurepip" in combined_message:
+        return (
+            "RapidOCR 安装失败：插件 Python 环境同时缺少 pip 和 ensurepip，"
+            "无法自动补齐安装工具。请重建或替换 N.E.K.O 的 Python 运行环境后重试。"
+        )
+    if "ensurepip" in combined_message and "PermissionError" in combined_message:
+        return (
+            "RapidOCR 安装失败：插件在自动补齐 pip 时被文件权限拦截，"
+            "通常是临时目录或 Python 运行环境目录不可写。"
+            "请用管理员权限修复该 Python 环境，或重新安装/重建 N.E.K.O 运行环境后重试。"
+        )
+
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return (
+            "RapidOCR 安装超时：在限定时间内未能完成运行时依赖安装或模型预热。"
+            f"安装目录：{target_dir_text}。请检查网络连接和磁盘读写权限后重试。"
+        )
+
+    if isinstance(exc, subprocess.CalledProcessError):
+        return (
+            "RapidOCR 安装失败：插件在安装 OCR 运行时依赖时执行 pip 命令失败。"
+            f"目标目录：{target_dir_text}；依赖：{packages}。"
+            "常见原因包括无法访问 PyPI、代理或防火墙拦截、安装目录没有写权限，"
+            "或者当前 Python 环境中的 pip 不可用。请先检查网络和权限后重试。"
+        )
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = getattr(getattr(exc, "response", None), "status_code", "unknown")
+        return (
+            "RapidOCR 安装失败：获取安装清单时服务器返回了异常状态。"
+            f"HTTP 状态码：{status_code}。请稍后重试，或检查安装源地址是否可访问。"
+        )
+
+    if isinstance(exc, httpx.RequestError):
+        return (
+            "RapidOCR 安装失败：获取安装清单时网络请求没有成功完成。"
+            "请检查当前网络、代理设置或防火墙策略后重试。"
+        )
+
+    if isinstance(exc, PermissionError):
+        return (
+            "RapidOCR 安装失败：没有权限写入插件隔离安装目录。"
+            f"目标目录：{target_dir_text}。请确认目录权限或更换安装位置后重试。"
+        )
+
+    message = str(exc or "").strip()
+    if "RapidOCR install is only supported on Windows" in message:
+        return "RapidOCR 安装失败：当前仅支持在 Windows 上执行自动安装。"
+    if "missing RapidOCR install target directory" in message:
+        return "RapidOCR 安装失败：没有解析到有效的安装目录，请检查插件配置。"
+    if message.startswith("RapidOCR installation is incomplete"):
+        return (
+            "RapidOCR 安装未完成：运行时依赖已经下载，但初始化校验没有通过。"
+            "请重试；如果仍然失败，请查看插件日志中的原始错误详情。"
+        )
+    if "missing RapidOCR site-packages directory" in message:
+        return (
+            "RapidOCR 安装失败：依赖安装目录不完整，无法加载插件隔离的 site-packages。"
+            "请重试安装。"
+        )
+    if "RapidOCR runtime class not found" in message:
+        return (
+            "RapidOCR 安装失败：运行时包已下载，但没有找到可用的 RapidOCR 主类。"
+            "这通常表示安装包不完整或版本异常，请重试安装。"
+        )
+
+    if phase == "metadata":
+        return (
+            "RapidOCR 安装失败：准备安装信息时发生异常。"
+            "请检查网络或安装清单配置后重试。"
+        )
+    if phase == "verifying":
+        return (
+            "RapidOCR 安装失败：运行时预热或模型校验没有通过。"
+            "请重试；如果持续失败，请查看插件日志中的原始错误详情。"
+        )
+    return "RapidOCR 安装失败：安装运行时依赖时发生未知异常，请查看插件日志后重试。"
+
+
 async def _load_install_manifest(
     *,
     manifest_url: str,
@@ -398,12 +500,60 @@ def _warmup_rapidocr(
     return metadata
 
 
+def _rapidocr_temp_env(*, temp_root: Path) -> dict[str, str]:
+    temp_root.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    temp_value = str(temp_root)
+    env["TMP"] = temp_value
+    env["TEMP"] = temp_value
+    env["TMPDIR"] = temp_value
+    return env
+
+
+def _run_subprocess(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=True,
+        timeout=timeout_seconds,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def _ensure_pip_available(*, timeout_seconds: float, temp_root: Path) -> None:
+    env = _rapidocr_temp_env(temp_root=temp_root)
+    try:
+        _run_subprocess([sys.executable, "-m", "pip", "--version"], timeout_seconds=timeout_seconds, env=env)
+        return
+    except subprocess.CalledProcessError as exc:
+        message = " ".join(
+            part for part in [str(getattr(exc, "stderr", "") or "").strip(), str(exc).strip()] if part
+        )
+        if "No module named pip" not in message:
+            raise
+
+    _run_subprocess([sys.executable, "-m", "ensurepip", "--upgrade"], timeout_seconds=timeout_seconds, env=env)
+    _run_subprocess([sys.executable, "-m", "pip", "--version"], timeout_seconds=timeout_seconds, env=env)
+
+
 def _run_pip_install(
     *,
     site_packages_dir: Path,
     packages: list[str],
     timeout_seconds: float,
 ) -> None:
+    temp_root = site_packages_dir.parent / "tmp"
+    env = _rapidocr_temp_env(temp_root=temp_root)
+    _ensure_pip_available(timeout_seconds=timeout_seconds, temp_root=temp_root)
     command = [
         sys.executable,
         "-m",
@@ -416,12 +566,7 @@ def _run_pip_install(
         str(site_packages_dir),
         *packages,
     ]
-    subprocess.run(
-        command,
-        check=True,
-        timeout=timeout_seconds,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    _run_subprocess(command, timeout_seconds=timeout_seconds, env=env)
 
 
 async def install_rapidocr(
@@ -523,6 +668,8 @@ async def install_rapidocr(
 
     owned_client = False
     client: httpx.AsyncClient | None = None
+    current_phase = "metadata"
+    package_specs: list[str] = []
     if client_factory is None:
         client = httpx.AsyncClient(
             timeout=timeout_seconds,
@@ -577,6 +724,7 @@ async def install_rapidocr(
             update_install_task_state(task_id, kind="rapidocr", **installing_progress)
         await _emit_progress(progress_callback, installing_progress)
 
+        current_phase = "installing"
         await asyncio.to_thread(
             _run_pip_install,
             site_packages_dir=site_packages_dir,
@@ -602,6 +750,7 @@ async def install_rapidocr(
             update_install_task_state(task_id, kind="rapidocr", **verifying_progress)
         await _emit_progress(progress_callback, verifying_progress)
 
+        current_phase = "verifying"
         runtime_meta = await asyncio.to_thread(
             _warmup_rapidocr,
             install_target_dir_raw=install_target_dir_raw,
@@ -662,7 +811,21 @@ async def install_rapidocr(
         await _emit_progress(progress_callback, completed_progress)
         return result
     except Exception as exc:
-        error_message = str(exc)
+        if logger is not None:
+            logger.exception("RapidOCR install failed during {}: {}", current_phase, exc)
+            if isinstance(exc, subprocess.CalledProcessError):
+                stdout_text = str(getattr(exc, "stdout", "") or "").strip()
+                stderr_text = str(getattr(exc, "stderr", "") or "").strip()
+                if stdout_text:
+                    logger.error("RapidOCR pip stdout during {}:\n{}", current_phase, stdout_text)
+                if stderr_text:
+                    logger.error("RapidOCR pip stderr during {}:\n{}", current_phase, stderr_text)
+        error_message = _localized_rapidocr_install_error(
+            exc,
+            phase=current_phase,
+            target_dir=target_dir,
+            package_specs=package_specs,
+        )
         if task_id:
             update_install_task_state(
                 task_id,
@@ -691,7 +854,7 @@ async def install_rapidocr(
                 "error": error_message,
             },
         )
-        raise
+        raise RuntimeError(error_message) from exc
     finally:
         if owned_client and client is not None:
             await client.aclose()

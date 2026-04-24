@@ -12,6 +12,7 @@ from .models import (
     STORE_LAST_SEQ,
     STORE_MODE,
     STORE_OCR_CAPTURE_PROFILES,
+    STORE_OCR_WINDOW_TARGET,
     STORE_PUSH_NOTIFICATIONS,
     STORE_SESSION_ID,
 )
@@ -80,6 +81,58 @@ class GalgameStore:
             normalized[process_name.strip()] = cleaned
         return normalized, warnings
 
+    @staticmethod
+    def _sanitize_ocr_window_target(raw_value: Any) -> tuple[dict[str, Any], list[str]]:
+        warnings: list[str] = []
+        if raw_value in ({}, None):
+            return {}, warnings
+        if not isinstance(raw_value, dict):
+            return {}, ["invalid ocr_window_target dropped: non-object"]
+
+        mode = str(raw_value.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "manual"}:
+            warnings.append("invalid ocr_window_target mode dropped: fallback to auto")
+            mode = "auto"
+
+        normalized_title = str(raw_value.get("normalized_title") or "").strip().lower()
+        process_name = str(raw_value.get("process_name") or "").strip()
+        window_key = str(raw_value.get("window_key") or "").strip()
+        selected_at = str(raw_value.get("selected_at") or "").strip()
+
+        try:
+            pid = int(raw_value.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+            warnings.append("invalid ocr_window_target pid dropped: fallback to 0")
+        try:
+            last_known_hwnd = int(raw_value.get("last_known_hwnd") or 0)
+        except (TypeError, ValueError):
+            last_known_hwnd = 0
+            warnings.append("invalid ocr_window_target hwnd dropped: fallback to 0")
+
+        normalized = {
+            "mode": mode,
+            "window_key": window_key,
+            "process_name": process_name,
+            "normalized_title": normalized_title,
+            "pid": max(0, pid),
+            "last_known_hwnd": max(0, last_known_hwnd),
+            "selected_at": selected_at,
+        }
+
+        if mode == "manual" and not any(
+            [
+                normalized["window_key"],
+                normalized["process_name"],
+                normalized["normalized_title"],
+                normalized["pid"],
+                normalized["last_known_hwnd"],
+            ]
+        ):
+            warnings.append("invalid ocr_window_target dropped: empty manual target")
+            return {}, warnings
+        return normalized, warnings
+
     def load(self) -> tuple[dict[str, Any], list[str]]:
         warnings: list[str] = []
         raw_mode = self._read(STORE_MODE, "")
@@ -122,6 +175,10 @@ class GalgameStore:
             self._read(STORE_OCR_CAPTURE_PROFILES, {})
         )
         warnings.extend(profile_warnings)
+        ocr_window_target, target_warnings = self._sanitize_ocr_window_target(
+            self._read(STORE_OCR_WINDOW_TARGET, {})
+        )
+        warnings.extend(target_warnings)
 
         restored = {
             STORE_BOUND_GAME_ID: self._read(STORE_BOUND_GAME_ID, ""),
@@ -134,6 +191,7 @@ class GalgameStore:
             STORE_DEDUPE_WINDOW: dedupe_window,
             STORE_LAST_ERROR: last_error,
             STORE_OCR_CAPTURE_PROFILES: ocr_capture_profiles,
+            STORE_OCR_WINDOW_TARGET: ocr_window_target,
         }
         if not isinstance(restored[STORE_BOUND_GAME_ID], str):
             warnings.append("invalid bound_game_id dropped: non-string")
@@ -180,6 +238,21 @@ class GalgameStore:
             {
                 str(process_name): {str(key): float(value) for key, value in profile.items()}
                 for process_name, profile in profiles.items()
+            },
+        )
+
+    def persist_ocr_window_target(self, target: dict[str, Any]) -> None:
+        payload = dict(target or {})
+        self._write(
+            STORE_OCR_WINDOW_TARGET,
+            {
+                "mode": str(payload.get("mode") or "auto"),
+                "window_key": str(payload.get("window_key") or ""),
+                "process_name": str(payload.get("process_name") or ""),
+                "normalized_title": str(payload.get("normalized_title") or ""),
+                "pid": max(0, int(payload.get("pid") or 0)),
+                "last_known_hwnd": max(0, int(payload.get("last_known_hwnd") or 0)),
+                "selected_at": str(payload.get("selected_at") or ""),
             },
         )
 

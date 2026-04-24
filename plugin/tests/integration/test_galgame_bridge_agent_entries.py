@@ -340,6 +340,8 @@ async def test_galgame_plugin_tick_recovers_after_temporary_host_unavailable(
 
         assert isinstance(first_status, Ok)
         assert first_status.value["status"] == "error"
+        assert first_status.value["input_source"] == "bridge_sdk"
+        assert "activity" in first_status.value
 
         fake_host.ready = True
         plugin._game_agent._next_actuation_at = 0.0
@@ -348,6 +350,8 @@ async def test_galgame_plugin_tick_recovers_after_temporary_host_unavailable(
 
         assert isinstance(recovered_status, Ok)
         assert recovered_status.value["status"] == "active"
+        assert recovered_status.value["input_source"] == "bridge_sdk"
+        assert "push_policy" in recovered_status.value
         assert fake_host.started
     finally:
         await plugin.shutdown()
