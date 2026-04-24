@@ -1655,7 +1655,7 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        backend_plan = self._resolve_backend_plan()
+        backend_plan = await asyncio.to_thread(self._resolve_backend_plan)
         if not backend_plan.primary.available:
             self._runtime = self._build_runtime(
                 status="idle",

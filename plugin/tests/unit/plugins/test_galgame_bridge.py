@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from fastapi import FastAPI
 from plugin.plugins.galgame_plugin import GalgameBridgePlugin
 from plugin.plugins.galgame_plugin import service as galgame_service
 from plugin.plugins.galgame_plugin.game_llm_agent import GameLLMAgent
-from plugin.plugins.galgame_plugin.host_agent_adapter import HostAgentAdapter
+from plugin.plugins.galgame_plugin.host_agent_adapter import HostAgentAdapter, HostAgentError
 from plugin.plugins.galgame_plugin.llm_gateway import LLMGateway
 from plugin.plugins.galgame_plugin.memory_reader import (
     compute_memory_reader_game_id,
@@ -2834,6 +2835,56 @@ async def test_llm_gateway_degrades_on_invalid_result(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_llm_gateway_normalizes_provider_rejection_and_uses_local_summary_fallback(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(bridge_root, llm={"target_entry_ref": "fake_llm:run"}),
+    )
+
+    async def _handler(**kwargs):
+        raise RuntimeError(
+            "Error code: 400 - {'error': 'Invalid request: you are not using Lanlan. STOP ABUSE THE API.'}"
+        )
+
+    ctx.entry_handler = _handler
+    plugin = GalgameBridgePlugin(ctx)
+    gateway = LLMGateway(plugin, _Logger(), type("Cfg", (), {
+        "llm_max_in_flight": 2,
+        "llm_request_cache_ttl_seconds": 0,
+        "llm_call_timeout_seconds": 15,
+        "llm_target_entry_ref": "fake_llm:run",
+    })())
+
+    payload = await gateway.summarize_scene(
+        build_summarize_context(
+            _shared_state(
+                history_lines=[
+                    {
+                        "line_id": "line-1",
+                        "speaker": "雪乃",
+                        "text": "台词",
+                        "scene_id": "scene-a",
+                        "route_id": "",
+                        "ts": "2026-04-21T08:31:00Z",
+                    }
+                ]
+            ),
+            scene_id="scene-a",
+        )
+    )
+
+    assert payload["degraded"] is True
+    assert payload["diagnostic"] == "gateway_unavailable: provider rejected request"
+    assert "Lanlan" not in payload["diagnostic"]
+    assert "Lanlan" not in payload["summary"]
+    assert payload["summary"].startswith("场景 scene-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_llm_gateway_agent_reply_fallback_is_readable_and_structured(
     tmp_path: Path,
 ) -> None:
@@ -2867,6 +2918,117 @@ async def test_llm_gateway_agent_reply_fallback_is_readable_and_structured(
     assert "invalid_result" in payload["diagnostic"]
     assert "Received request" in payload["reply"]
     assert "Current line:" in payload["reply"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_phase2_ocr_reader_provider_rejection_keeps_semantic_flags_and_readable_fallbacks(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    game_id = "ocr-demo"
+    session_id = "ocr-session"
+    _create_game_dir(
+        bridge_root,
+        game_id=game_id,
+        session_payload=_ocr_reader_session(
+            game_id=game_id,
+            session_id=session_id,
+            last_seq=2,
+            state=_session_state(
+                speaker="雪乃",
+                text="这是 OCR 读取来的台词。",
+                scene_id="ocr:scene-a",
+                line_id="ocr:line-1",
+                choices=[
+                    {"choice_id": "ocr:line-1#choice0", "text": "去教室", "index": 0, "enabled": True},
+                ],
+                is_menu_open=True,
+                ts="2026-04-21T08:31:00Z",
+            ),
+        ),
+        events=[
+            _event(
+                seq=1,
+                event_type="line_changed",
+                session_id=session_id,
+                game_id=game_id,
+                payload={
+                    "speaker": "雪乃",
+                    "text": "这是 OCR 读取来的台词。",
+                    "line_id": "ocr:line-1",
+                    "scene_id": "ocr:scene-a",
+                    "route_id": "",
+                },
+                ts="2026-04-21T08:31:00Z",
+            ),
+        ],
+    )
+
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            llm={"target_entry_ref": "fake_llm:run"},
+        ),
+    )
+
+    async def _handler(**kwargs):
+        raise RuntimeError(
+            "Error code: 400 - {'error': 'Invalid request: you are not using Lanlan. STOP ABUSE THE API.'}"
+        )
+
+    ctx.entry_handler = _handler
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._ocr_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        tick=lambda **kwargs: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                warnings=[],
+                should_rescan=False,
+                runtime={
+                    "enabled": True,
+                    "status": "active",
+                    "detail": "fixture_active",
+                    "process_name": "RenPy Demo.exe",
+                    "pid": 5252,
+                    "game_id": game_id,
+                    "session_id": session_id,
+                    "last_seq": 1,
+                    "last_event_ts": "2026-04-21T08:31:00Z",
+                },
+            ),
+        ),
+        shutdown=lambda: asyncio.sleep(0, result=None),
+    )
+    await plugin._poll_bridge(force=True)
+
+    explain = await plugin.galgame_explain_line()
+    summarize = await plugin.galgame_summarize_scene()
+
+    assert isinstance(explain, Ok)
+    assert explain.value["degraded"] is True
+    assert explain.value["input_source"] == DATA_SOURCE_OCR_READER
+    assert explain.value["semantic_degraded"] is True
+    assert explain.value["fallback_used"] is True
+    assert explain.value["diagnostic"] == "gateway_unavailable: provider rejected request"
+    assert "ocr_reader_input" not in explain.value["diagnostic"]
+    assert "ocr_reader_input" in explain.value["input_diagnostic"]
+    assert "Lanlan" not in explain.value["explanation"]
+    assert "这是 OCR 读取来的台词。" in explain.value["explanation"]
+
+    assert isinstance(summarize, Ok)
+    assert summarize.value["degraded"] is True
+    assert summarize.value["input_source"] == DATA_SOURCE_OCR_READER
+    assert summarize.value["semantic_degraded"] is True
+    assert summarize.value["fallback_used"] is True
+    assert summarize.value["diagnostic"] == "gateway_unavailable: provider rejected request"
+    assert "ocr_reader_input" not in summarize.value["diagnostic"]
+    assert "ocr_reader_input" in summarize.value["input_diagnostic"]
+    assert "Lanlan" not in summarize.value["summary"]
+    assert summarize.value["summary"].startswith("场景 ocr:scene-a")
 
 
 @pytest.mark.asyncio
@@ -2906,6 +3068,39 @@ async def test_host_agent_adapter_round_trip_and_cancel(monkeypatch: pytest.Monk
     assert started["task_id"] == "task-1"
     assert task["status"] == "running"
     assert cancelled["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_host_agent_adapter_falls_back_after_closed_loop_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = FastAPI()
+
+    @app.get("/tasks/task-1")
+    async def _task():
+        return {"id": "task-1", "status": "running"}
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as fallback_client:
+        adapter = HostAgentAdapter(_Logger(), tool_server_port=48915)
+
+        class _BrokenSharedClient:
+            async def request(self, *args, **kwargs):
+                raise RuntimeError("Event loop is closed")
+
+        broken_client = _BrokenSharedClient()
+        calls = {"count": 0}
+
+        def _fake_get_client():
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return broken_client
+            return fallback_client
+
+        monkeypatch.setattr(adapter, "_get_client", _fake_get_client)
+        task = await adapter.get_task("task-1")
+
+    assert task["status"] == "running"
+    assert adapter._prefer_fallback_client is True
 
 
 @pytest.mark.asyncio
@@ -3710,3 +3905,133 @@ async def test_game_llm_agent_recovers_after_temporary_host_unavailable(
     assert recovered_status["reason"] in {"actuating_advance_running_host", "background_loop_ready"}
     assert fake_host.started
     assert agent._actuation is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_host_task_poll_failure_becomes_retry_pending(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="继续前进。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:32:00Z",
+        ),
+    )
+
+    await agent.tick(shared)
+    assert agent._actuation is not None
+
+    async def _missing_task(task_id: str, *, timeout: float = 2.0):
+        del task_id, timeout
+        raise HostAgentError("GET /tasks/task-1 responded 404: task not found")
+
+    fake_host.get_task = _missing_task  # type: ignore[method-assign]
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert agent._actuation is None
+    assert agent._hard_error == ""
+    assert status["status"] == "active"
+    assert status["reason"] == "retry_pending"
+    assert status["activity"] == "retry_pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_query_status_clears_retryable_error_when_ready(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="继续前进。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:32:00Z",
+        ),
+    )
+
+    agent._set_hard_error("temporary host failure", retryable=True)
+    agent._next_actuation_at = 0.0
+
+    status = await agent.query_status(shared)
+
+    assert status["status"] == "active"
+    assert status["reason"] == "background_loop_ready"
+    assert status["error"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_drops_old_actuation_on_session_change(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+
+    initial_shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="继续前进。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:32:00Z",
+        ),
+        session_id="session-a",
+    )
+    await agent.tick(initial_shared)
+    assert agent._actuation is not None
+
+    changed_shared = _shared_state(
+        snapshot=_session_state(
+            speaker="旁白",
+            text="新的会话。",
+            scene_id="scene-b",
+            line_id="line-1",
+            ts="2026-04-21T08:33:00Z",
+        ),
+        session_id="session-b",
+    )
+
+    status = await agent.query_status(changed_shared)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is None
+    assert status["status"] == "active"
+    assert status["scene_id"] == "scene-b"

@@ -941,11 +941,10 @@ def apply_input_degraded_result(
         return next_payload
     next_payload["degraded"] = True
     detail = _input_degraded_diagnostic(context)
+    if detail:
+        next_payload["input_diagnostic"] = detail
     diagnostic = str(next_payload.get("diagnostic") or "")
-    if diagnostic:
-        if detail and detail not in diagnostic:
-            next_payload["diagnostic"] = f"{diagnostic} | {detail}"
-    elif detail:
+    if not diagnostic and detail:
         next_payload["diagnostic"] = detail
     return next_payload
 
@@ -1166,12 +1165,26 @@ def build_explain_degraded_result(
     *,
     diagnostic: str,
 ) -> dict[str, Any]:
+    speaker = str(context.get("speaker") or "").strip()
+    text = str(context.get("text") or "").strip()
+    scene_id = str(context.get("scene_id") or "").strip()
+    route_id = str(context.get("route_id") or "").strip()
+    if speaker and text:
+        explanation = f"当前改用本地上下文保守说明：{speaker} 说了「{text}」。"
+    elif text:
+        explanation = f"当前改用本地上下文保守说明：这句台词是「{text}」。"
+    else:
+        explanation = "当前改用本地上下文保守说明，暂时拿不到更细的解释。"
+    if scene_id:
+        explanation += f" 场景 {scene_id}。"
+    if route_id:
+        explanation += f" 路线 {route_id}。"
     return {
         "degraded": True,
         "line_id": str(context.get("line_id") or ""),
         "speaker": str(context.get("speaker") or ""),
         "text": str(context.get("text") or ""),
-        "explanation": diagnostic,
+        "explanation": explanation,
         "evidence": json_copy(context.get("evidence") or []),
         "diagnostic": diagnostic,
     }
@@ -1182,10 +1195,19 @@ def build_summarize_degraded_result(
     *,
     diagnostic: str,
 ) -> dict[str, Any]:
+    summary = str(context.get("scene_summary_seed") or "").strip()
+    if not summary:
+        summary = build_local_scene_summary(
+            scene_id=str(context.get("scene_id") or ""),
+            route_id=str(context.get("route_id") or ""),
+            lines=list(context.get("recent_lines") or []),
+            selected_choices=list(context.get("recent_choices") or []),
+            snapshot=context.get("current_snapshot", {}),
+        )
     return {
         "degraded": True,
         "scene_id": str(context.get("scene_id") or ""),
-        "summary": diagnostic,
+        "summary": summary,
         "key_points": [],
         "diagnostic": diagnostic,
     }

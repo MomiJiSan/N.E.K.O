@@ -273,6 +273,14 @@ class GalgamePlugin(NekoPluginBase):
             }
         return build_status_payload(self._state, config=self._cfg)
 
+    async def _build_status_payload_async(self) -> dict[str, Any]:
+        if self._cfg is None:
+            return self._current_status_payload()
+        with self._state_lock:
+            state = json_copy(self._state)
+            config = self._cfg
+        return await asyncio.to_thread(build_status_payload, state, config=config)
+
     def _resolve_current_run_id(self) -> str:
         return str(getattr(self.ctx, "run_id", "") or "").strip()
 
@@ -354,7 +362,7 @@ class GalgamePlugin(NekoPluginBase):
         )
 
         await self._poll_bridge(force=True)
-        return Ok({"status": "ready", "result": self._current_status_payload()})
+        return Ok({"status": "ready", "result": await self._build_status_payload_async()})
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_):
@@ -421,8 +429,9 @@ class GalgamePlugin(NekoPluginBase):
         ocr_reader_runtime = json_copy(local.get("ocr_reader_runtime") or {})
 
         try:
-            raw_available_game_ids, raw_candidates, scan_warnings = scan_session_candidates(
-                self._cfg.bridge_root
+            raw_available_game_ids, raw_candidates, scan_warnings = await asyncio.to_thread(
+                scan_session_candidates,
+                self._cfg.bridge_root,
             )
             warnings.extend(scan_warnings)
         except Exception as exc:
@@ -463,7 +472,7 @@ class GalgamePlugin(NekoPluginBase):
                         raw_available_game_ids,
                         raw_candidates,
                         rescan_warnings,
-                    ) = scan_session_candidates(self._cfg.bridge_root)
+                    ) = await asyncio.to_thread(scan_session_candidates, self._cfg.bridge_root)
                     warnings.extend(rescan_warnings)
             except Exception as exc:
                 warnings.append(f"memory_reader tick failed: {exc}")
@@ -482,7 +491,7 @@ class GalgamePlugin(NekoPluginBase):
                         raw_available_game_ids,
                         raw_candidates,
                         rescan_warnings,
-                    ) = scan_session_candidates(self._cfg.bridge_root)
+                    ) = await asyncio.to_thread(scan_session_candidates, self._cfg.bridge_root)
                     warnings.extend(rescan_warnings)
             except Exception as exc:
                 warnings.append(f"ocr_reader tick failed: {exc}")
@@ -535,7 +544,8 @@ class GalgamePlugin(NekoPluginBase):
 
             if warmup_needed:
                 end_offset = int(local["events_byte_offset"]) if restore_cursor else None
-                warmup_events = warmup_replay_events(
+                warmup_events = await asyncio.to_thread(
+                    warmup_replay_events,
                     candidate.events_path,
                     bytes_limit=self._cfg.warmup_replay_bytes_limit,
                     events_limit=self._cfg.warmup_replay_events_limit,
@@ -558,7 +568,9 @@ class GalgamePlugin(NekoPluginBase):
                     game_id=candidate.game_id,
                 )
                 try:
-                    file_size = candidate.events_path.stat().st_size
+                    file_size = await asyncio.to_thread(
+                        lambda: candidate.events_path.stat().st_size
+                    )
                 except OSError:
                     file_size = 0
                 if restore_cursor and int(local["events_byte_offset"]) <= file_size:
@@ -581,7 +593,8 @@ class GalgamePlugin(NekoPluginBase):
 
             read_offset = 0 if local["stream_reset_pending"] else int(local["events_byte_offset"])
             read_buffer = b"" if local["stream_reset_pending"] else bytes(local["line_buffer"])
-            tail = tail_events_jsonl(
+            tail = await asyncio.to_thread(
+                tail_events_jsonl,
                 candidate.events_path,
                 offset=read_offset,
                 line_buffer=read_buffer,
@@ -697,9 +710,7 @@ class GalgamePlugin(NekoPluginBase):
     async def galgame_get_status(self, **_):
         if self._cfg is None:
             return Err(SdkError("galgame_plugin is not configured"))
-        with self._state_lock:
-            payload = build_status_payload(self._state, config=self._cfg)
-        return Ok(payload)
+        return Ok(await self._build_status_payload_async())
 
     @plugin_entry(
         id="galgame_install_textractor",
@@ -737,7 +748,7 @@ class GalgamePlugin(NekoPluginBase):
                 {
                     "summary": str(install_result.get("summary") or "Textractor 安装完成"),
                     "install_result": install_result,
-                    "status": self._current_status_payload(),
+                    "status": await self._build_status_payload_async(),
                 }
             )
         except Exception as exc:
@@ -782,7 +793,7 @@ class GalgamePlugin(NekoPluginBase):
                 {
                     "summary": str(install_result.get("summary") or "Tesseract 安装完成"),
                     "install_result": install_result,
-                    "status": self._current_status_payload(),
+                    "status": await self._build_status_payload_async(),
                 }
             )
         except Exception as exc:
@@ -829,7 +840,7 @@ class GalgamePlugin(NekoPluginBase):
                 {
                     "summary": str(install_result.get("summary") or "RapidOCR 安装完成"),
                     "install_result": install_result,
-                    "status": self._current_status_payload(),
+                    "status": await self._build_status_payload_async(),
                 }
             )
         except Exception as exc:
@@ -1047,7 +1058,7 @@ class GalgamePlugin(NekoPluginBase):
                 "capture_profile": capture_profile,
                 "cleared": bool(clear),
                 "summary": summary,
-                "status": self._current_status_payload(),
+                "status": await self._build_status_payload_async(),
             }
         )
 
@@ -1141,7 +1152,7 @@ class GalgamePlugin(NekoPluginBase):
                 "window_target": json_copy(target_payload),
                 "cleared": bool(clear),
                 "summary": summary,
-                "status": self._current_status_payload(),
+                "status": await self._build_status_payload_async(),
             }
         )
 

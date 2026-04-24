@@ -105,7 +105,19 @@ class GameLLMAgent:
 
     async def shutdown(self) -> None:
         async with self._op_lock:
-            await self._interrupt_current()
+            await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
+            self._clear_hard_error()
+            self._scene_memory.clear()
+            self._choice_memory.clear()
+            self._recent_pushes.clear()
+            self._failure_memory.clear()
+            self._suggestion_reasons.clear()
+            self._observed_session_id = ""
+            self._observed_scene_id = ""
+            self._observed_choice_marker = ""
+            self._next_actuation_at = 0.0
+            self._scene_state = self._build_empty_scene_state()
+            self._last_status = AGENT_STATUS_STANDBY
 
     async def tick(self, shared: dict[str, Any]) -> None:
         async with self._op_lock:
@@ -154,25 +166,6 @@ class GameLLMAgent:
                 await self._start_actuation_from_strategy(shared, strategy=strategy, now=now)
             self._last_status = self._compute_status(shared)
 
-    async def query_status(self, shared: dict[str, Any]) -> dict[str, Any]:
-        async with self._op_lock:
-            interrupted = await self._interrupt_for_status_query()
-            await self._observe(shared)
-            self._update_scene_state(shared, time.monotonic())
-            status = self._compute_status(shared)
-            result = self._build_status_result(
-                shared,
-                status=status,
-                interrupted=interrupted,
-            )
-            self._last_status = status
-            return {
-                "action": "query_status",
-                "result": result,
-                "status": status,
-                "recent_pushes": json_copy(self._recent_pushes[-20:]),
-            }
-
     async def _interrupt_for_status_query(self) -> bool:
         if self._planning_task is None:
             return False
@@ -180,40 +173,12 @@ class GameLLMAgent:
         await asyncio.gather(self._planning_task, return_exceptions=True)
         self._planning_task = None
         self._planning_candidates = []
+        self._planning_choice_signature = ()
+        self._planning_started_at = 0.0
         # Status queries should preempt LLM planning, but they should not tear down
         # an already running host actuation or a retry that is about to resume.
         self._next_actuation_at = time.monotonic() + 0.2
         return True
-
-    async def query_context(self, shared: dict[str, Any], *, context_query: str) -> dict[str, Any]:
-        async with self._op_lock:
-            await self._interrupt_current()
-            await self._observe(shared)
-            payload = await self._llm_gateway.agent_reply(
-                self._build_agent_reply_context(shared, prompt=context_query)
-            )
-            status = self._compute_status(shared)
-            self._last_status = status
-            return {
-                "action": "query_context",
-                "result": str(payload.get("reply") or ""),
-                "status": status,
-            }
-
-    async def send_message(self, shared: dict[str, Any], *, message: str) -> dict[str, Any]:
-        async with self._op_lock:
-            await self._interrupt_current()
-            await self._observe(shared)
-            payload = await self._llm_gateway.agent_reply(
-                self._build_agent_reply_context(shared, prompt=message)
-            )
-            status = self._compute_status(shared)
-            self._last_status = status
-            return {
-                "action": "send_message",
-                "result": str(payload.get("reply") or ""),
-                "status": status,
-            }
 
     async def set_standby(self, shared: dict[str, Any], *, standby: bool) -> dict[str, Any]:
         async with self._op_lock:
@@ -227,6 +192,32 @@ class GameLLMAgent:
                 "result": "agent entered standby" if standby else "agent resumed",
                 "status": status,
             }
+
+    async def _reset_runtime_state(
+        self,
+        *,
+        cancel_host_task: bool,
+        clear_retry: bool,
+    ) -> None:
+        if self._planning_task is not None:
+            self._planning_task.cancel()
+            await asyncio.gather(self._planning_task, return_exceptions=True)
+            self._planning_task = None
+        self._planning_candidates = []
+        self._planning_choice_signature = ()
+        self._planning_started_at = 0.0
+
+        if self._actuation is not None:
+            task_id = str(self._actuation.get("task_id") or "")
+            if cancel_host_task and task_id and str(self._actuation.get("state") or "") == "running_host":
+                try:
+                    await self._host_adapter.cancel_task(task_id)
+                except Exception:
+                    pass
+            self._actuation = None
+
+        if clear_retry:
+            self._pending_strategy = None
 
     def _compute_status(self, shared: dict[str, Any]) -> str:
         if self._explicit_standby:
@@ -249,88 +240,6 @@ class GameLLMAgent:
         snapshot = shared.get("latest_snapshot")
         return isinstance(snapshot, dict) and bool(snapshot)
 
-    async def _observe(self, shared: dict[str, Any]) -> None:
-        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
-        session_id = str(shared.get("active_session_id") or "")
-        if session_id != self._observed_session_id:
-            self._scene_memory.clear()
-            self._choice_memory.clear()
-            self._recent_pushes.clear()
-            self._failure_memory.clear()
-            self._suggestion_reasons.clear()
-            self._clear_hard_error()
-            self._observed_choice_marker = ""
-            self._observed_scene_id = str(snapshot.get("scene_id") or "")
-            self._observed_session_id = session_id
-            self._planning_candidates = []
-            self._pending_strategy = None
-            self._scene_state = self._build_empty_scene_state()
-            return
-
-        current_scene_id = str(snapshot.get("scene_id") or "")
-        current_route_id = str(snapshot.get("route_id") or "")
-        if current_scene_id and current_scene_id != self._observed_scene_id:
-            context = build_summarize_context(shared, scene_id=current_scene_id)
-            summary = build_local_scene_summary(
-                scene_id=current_scene_id,
-                route_id=current_route_id,
-                lines=context["recent_lines"],
-                selected_choices=context["recent_choices"],
-                snapshot=snapshot,
-            )
-            self._append_bounded(
-                self._scene_memory,
-                {
-                    "scene_id": current_scene_id,
-                    "route_id": current_route_id,
-                    "summary": summary,
-                    "ts": str(snapshot.get("ts") or ""),
-                },
-                limit=32,
-            )
-            if self._observed_scene_id and self._should_push_scene(shared):
-                self._push_agent_message(
-                    shared,
-                    kind="scene_summary",
-                    content=summary,
-                    scene_id=current_scene_id,
-                    route_id=current_route_id,
-                )
-            self._observed_scene_id = current_scene_id
-
-        selected = latest_selected_choice(shared.get("history_choices", []))
-        if selected is not None:
-            marker = (
-                f"{str(selected.get('ts') or '')}:"
-                f"{str(selected.get('choice_id') or '')}:"
-                f"{str(selected.get('scene_id') or '')}"
-            )
-            if marker and marker != self._observed_choice_marker:
-                choice_id = str(selected.get("choice_id") or "")
-                choice_text = str(selected.get("text") or "")
-                self._append_bounded(
-                    self._choice_memory,
-                    {
-                        "choice_id": choice_id,
-                        "text": choice_text,
-                        "scene_id": str(selected.get("scene_id") or ""),
-                        "route_id": str(selected.get("route_id") or ""),
-                        "ts": str(selected.get("ts") or ""),
-                    },
-                    limit=64,
-                )
-                reason = self._suggestion_reasons.pop(choice_id, "")
-                self._suggestion_reasons.clear()
-                if self._should_push_choice(shared) and reason:
-                    self._push_agent_message(
-                        shared,
-                        kind="choice_reason",
-                        content=f"已选择「{choice_text}」。推荐理由：{reason}",
-                        scene_id=str(selected.get("scene_id") or ""),
-                        route_id=str(selected.get("route_id") or ""),
-                    )
-                self._observed_choice_marker = marker
-
     def _should_push_scene(self, shared: dict[str, Any]) -> bool:
         return bool(shared.get("push_notifications")) and mode_allows_agent_push(
             str(shared.get("mode") or "")
@@ -341,58 +250,8 @@ class GameLLMAgent:
             str(shared.get("mode") or "")
         )
 
-    def _push_agent_message(
-        self,
-        shared: dict[str, Any],
-        *,
-        kind: str,
-        content: str,
-        scene_id: str,
-        route_id: str,
-    ) -> None:
-        if not content:
-            return
-        ts = str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        self._plugin.push_message(
-            source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
-            message_type="proactive_notification",
-            description=f"Galgame Agent · {kind}",
-            priority=6,
-            content=content,
-            metadata={
-                "kind": kind,
-                "scene_id": scene_id,
-                "route_id": route_id,
-                "ts": ts,
-            },
-        )
-        self._append_bounded(
-            self._recent_pushes,
-            {
-                "ts": ts,
-                "kind": kind,
-                "content": content,
-                "scene_id": scene_id,
-                "route_id": route_id,
-            },
-            limit=20,
-        )
-
     async def _interrupt_current(self) -> None:
-        if self._planning_task is not None:
-            self._planning_task.cancel()
-            await asyncio.gather(self._planning_task, return_exceptions=True)
-            self._planning_task = None
-            self._planning_candidates = []
-        if self._actuation is not None:
-            task_id = str(self._actuation.get("task_id") or "")
-            if task_id and str(self._actuation.get("state") or "") == "running_host":
-                try:
-                    await self._host_adapter.cancel_task(task_id)
-                except Exception:
-                    pass
-            self._actuation = None
-        self._pending_strategy = None
+        await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
         self._next_actuation_at = time.monotonic() + 0.2
 
     async def _progress_planning(self, shared: dict[str, Any], now: float) -> None:
@@ -533,9 +392,12 @@ class GameLLMAgent:
             try:
                 task = await self._host_adapter.get_task(str(actuation.get("task_id") or ""))
             except HostAgentError as exc:
-                self._set_hard_error(str(exc), retryable=True)
-                self._actuation = None
-                self._next_actuation_at = now + 1.0
+                self._handle_recoverable_host_poll_failure(
+                    shared,
+                    actuation=actuation,
+                    reason=str(exc),
+                    now=now,
+                )
                 return
 
             status = str(task.get("status") or "")
@@ -903,6 +765,31 @@ class GameLLMAgent:
             limit=16,
         )
 
+    def _handle_recoverable_host_poll_failure(
+        self,
+        shared: dict[str, Any],
+        *,
+        actuation: dict[str, Any],
+        reason: str,
+        now: float,
+    ) -> None:
+        self._logger.warning(
+            "galgame host task poll failed for {}: {}",
+            str(actuation.get("task_id") or ""),
+            reason,
+        )
+        self._record_failure(
+            kind=str(actuation.get("kind") or ""),
+            strategy_id=str(actuation.get("strategy_id") or ""),
+            reason=reason,
+            scene_id=str((shared.get("latest_snapshot") or {}).get("scene_id") or ""),
+        )
+        self._actuation = None
+        retry = self._build_retry_strategy(shared, actuation=actuation, failure_reason=reason)
+        self._clear_hard_error()
+        self._pending_strategy = retry
+        self._next_actuation_at = now + 1.0
+
     def _set_hard_error(self, message: str, *, retryable: bool) -> None:
         self._hard_error = message
         self._hard_error_retryable = retryable
@@ -927,55 +814,6 @@ class GameLLMAgent:
             oldest_key = next(iter(self._suggestion_reasons))
             self._suggestion_reasons.pop(oldest_key, None)
 
-    def _build_agent_reply_context(self, shared: dict[str, Any], *, prompt: str) -> dict[str, Any]:
-        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
-        latest_line = ""
-        if snapshot.get("text"):
-            latest_line = f"{str(snapshot.get('speaker') or '旁白')}：{str(snapshot.get('text') or '')}"
-        return {
-            "prompt": prompt,
-            "game_id": str(shared.get("active_game_id") or ""),
-            "session_id": str(shared.get("active_session_id") or ""),
-            "scene_id": str(snapshot.get("scene_id") or ""),
-            "route_id": str(snapshot.get("route_id") or ""),
-            "current_snapshot": snapshot,
-            "latest_line": latest_line,
-            "recent_lines": json_copy(list(shared.get("history_lines", []))[-8:]),
-            "recent_choices": json_copy(list(shared.get("history_choices", []))[-8:]),
-            "scene_memory": json_copy(self._scene_memory[-8:]),
-            "choice_memory": json_copy(self._choice_memory[-8:]),
-            "failure_memory": json_copy(self._failure_memory[-8:]),
-            "scene_strategy": json_copy(self._scene_state),
-            "status": self._compute_status(shared),
-        }
-
-    def _build_status_result(
-        self,
-        shared: dict[str, Any],
-        *,
-        status: str,
-        interrupted: bool,
-    ) -> str:
-        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
-        parts = [
-            f"status={status}",
-            f"session={str(shared.get('active_session_id') or '') or 'none'}",
-            f"scene={str(snapshot.get('scene_id') or '') or 'none'}",
-            f"route={str(snapshot.get('route_id') or '') or 'none'}",
-            f"line={str(snapshot.get('line_id') or '') or 'none'}",
-            f"stage={str(self._scene_state.get('stage') or 'unknown')}",
-            f"activity={self._current_activity_label()}",
-        ]
-        if interrupted:
-            parts.append("interrupted=yes")
-        if self._hard_error:
-            parts.append(f"error={self._hard_error}")
-        elif self._explicit_standby:
-            parts.append("reason=explicit_standby")
-        elif not self._is_actionable(shared):
-            parts.append("reason=bridge_inactive")
-        return " ".join(parts)
-
     def _current_activity_label(self) -> str:
         if self._planning_task is not None:
             return "planning"
@@ -991,7 +829,9 @@ class GameLLMAgent:
         async with self._op_lock:
             interrupted = await self._interrupt_for_status_query()
             await self._observe(shared)
-            self._update_scene_state(shared, time.monotonic())
+            now = time.monotonic()
+            self._update_scene_state(shared, now)
+            self._recover_retryable_error_if_ready(now)
             status = self._compute_status(shared)
             self._last_status = status
             return {
@@ -1007,6 +847,7 @@ class GameLLMAgent:
         async with self._op_lock:
             await self._interrupt_current()
             await self._observe(shared)
+            self._recover_retryable_error_if_ready(time.monotonic())
             payload = await self._llm_gateway.agent_reply(
                 self._build_agent_reply_context(shared, prompt=context_query)
             )
@@ -1025,6 +866,7 @@ class GameLLMAgent:
         async with self._op_lock:
             await self._interrupt_current()
             await self._observe(shared)
+            self._recover_retryable_error_if_ready(time.monotonic())
             payload = await self._llm_gateway.agent_reply(
                 self._build_agent_reply_context(shared, prompt=message)
             )
@@ -1043,6 +885,7 @@ class GameLLMAgent:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
         session_id = str(shared.get("active_session_id") or "")
         if session_id != self._observed_session_id:
+            await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
             self._scene_memory.clear()
             self._choice_memory.clear()
             self._recent_pushes.clear()
@@ -1052,8 +895,7 @@ class GameLLMAgent:
             self._observed_choice_marker = ""
             self._observed_scene_id = str(snapshot.get("scene_id") or "")
             self._observed_session_id = session_id
-            self._planning_candidates = []
-            self._pending_strategy = None
+            self._next_actuation_at = 0.0
             self._scene_state = self._build_empty_scene_state()
             return
 

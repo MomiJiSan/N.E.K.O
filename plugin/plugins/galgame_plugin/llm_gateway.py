@@ -184,7 +184,7 @@ class LLMGateway:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return degraded(f"internal_error: {exc}")
+            return degraded(self._normalize_plugin_error(exc))
 
         if isinstance(response, Err):
             return degraded(self._normalize_plugin_error(response.error))
@@ -217,7 +217,7 @@ class LLMGateway:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return degraded(f"internal_error: {exc}")
+            return degraded(self._normalize_plugin_error(exc))
 
         if not isinstance(response, dict):
             return degraded("invalid_result: internal llm backend returned non-object payload")
@@ -229,10 +229,44 @@ class LLMGateway:
 
     @staticmethod
     def _normalize_plugin_error(error: object) -> str:
-        message = str(error or "plugin call failed")
+        message = str(error or "plugin call failed").strip() or "plugin call failed"
         lowered = message.lower()
         if "timeout" in lowered:
             return f"timeout: {message}"
+        if any(token in lowered for token in ("rate limit", "too many requests", "429")):
+            return "busy: provider rate limited"
+        if any(
+            token in lowered
+            for token in (
+                "not using lanlan",
+                "stop abuse the api",
+                "invalid request",
+                "bad request",
+                "unauthorized",
+                "authentication",
+                "forbidden",
+                "api key",
+                "access denied",
+                "permission denied",
+            )
+        ):
+            return "gateway_unavailable: provider rejected request"
+        if any(
+            token in lowered
+            for token in (
+                "service unavailable",
+                "temporarily unavailable",
+                "connection refused",
+                "connection reset",
+                "connection aborted",
+                "host unreachable",
+                "name resolution",
+                "dns",
+                "network",
+                "overloaded",
+            )
+        ):
+            return "gateway_unavailable: provider unavailable"
         if "not found" in lowered or "invalid entry" in lowered:
             return f"gateway_unavailable: {message}"
         return f"internal_error: {message}"
@@ -365,36 +399,6 @@ class LLMGateway:
             "degraded": False,
             "reply": reply,
             "diagnostic": "",
-        }
-
-    @staticmethod
-    def _build_agent_reply_fallback(
-        context: dict[str, Any],
-        *,
-        diagnostic: str,
-    ) -> dict[str, Any]:
-        scene_id = str(context.get("scene_id") or "")
-        route_id = str(context.get("route_id") or "")
-        latest_line = str(context.get("latest_line") or "")
-        recent_lines = context.get("recent_lines")
-        selected_choices = context.get("recent_choices")
-        summary = build_local_scene_summary(
-            scene_id=scene_id,
-            route_id=route_id,
-            lines=list(recent_lines) if isinstance(recent_lines, list) else [],
-            selected_choices=list(selected_choices) if isinstance(selected_choices, list) else [],
-            snapshot=context.get("current_snapshot", {}),
-        )
-        if latest_line:
-            reply = f"{summary} 当前台词：{latest_line}"
-        else:
-            reply = summary
-        if str(context.get("prompt") or "").strip():
-            reply = f"收到请求「{str(context.get('prompt') or '').strip()}」。{reply}"
-        return {
-            "degraded": True,
-            "reply": reply,
-            "diagnostic": diagnostic,
         }
 
     @staticmethod

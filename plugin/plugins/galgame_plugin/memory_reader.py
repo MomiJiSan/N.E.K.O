@@ -800,7 +800,8 @@ class MemoryReaderManager:
             result.warnings.append("memory_reader is Windows-only")
             result.runtime = self._runtime.to_dict()
             return result
-        textractor_path = resolve_textractor_path(
+        textractor_path = await asyncio.to_thread(
+            resolve_textractor_path,
             self._config.memory_reader_textractor_path,
             install_target_dir_raw=self._config.memory_reader_install_target_dir,
         )
@@ -849,7 +850,7 @@ class MemoryReaderManager:
         if self._attached_process is None:
             self._runtime.status = "scanning"
             self._runtime.detail = "scanning_processes"
-        processes = self._process_scanner()
+        processes = await asyncio.to_thread(self._process_scanner)
         if self._attached_process is None and processes:
             preview = ", ".join(f"{item.name}({item.pid},{item.engine})" for item in processes[:5])
             self._logger.debug("memory_reader detected candidate processes: %s", preview)

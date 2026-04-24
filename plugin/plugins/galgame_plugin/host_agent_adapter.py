@@ -27,13 +27,14 @@ class HostAgentAdapter:
         self._logger = logger
         self._tool_server_port = int(tool_server_port or _TOOL_SERVER_PORT)
         self._fallback_client: httpx.AsyncClient | None = None
+        self._prefer_fallback_client = False
 
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self._tool_server_port}"
 
     def _get_client(self) -> httpx.AsyncClient:
-        if _get_internal_http_client is not None:
+        if not self._prefer_fallback_client and _get_internal_http_client is not None:
             return _get_internal_http_client()
         if self._fallback_client is None or self._fallback_client.is_closed:
             self._fallback_client = httpx.AsyncClient(
@@ -57,17 +58,42 @@ class HostAgentAdapter:
         payload: dict[str, Any] | None = None,
         timeout: float,
     ) -> dict[str, Any]:
-        client = self._get_client()
         url = f"{self.base_url}{path}"
-        try:
-            response = await client.request(
-                method=method,
-                url=url,
-                json=payload,
-                timeout=timeout,
-            )
-        except Exception as exc:
-            raise HostAgentError(f"{method} {path} failed: {exc}") from exc
+        last_exc: Exception | None = None
+        attempts = 2 if not self._prefer_fallback_client and _get_internal_http_client is not None else 1
+        for attempt in range(attempts):
+            client = self._get_client()
+            try:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    json=payload,
+                    timeout=timeout,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    attempt == 0
+                    and not self._prefer_fallback_client
+                    and _get_internal_http_client is not None
+                    and self._is_closed_loop_error(exc)
+                ):
+                    # The shared internal AsyncClient can survive a plugin restart while
+                    # still being bound to the previous closed loop. Fall back to a
+                    # plugin-local client and retry once on the current loop.
+                    self._prefer_fallback_client = True
+                    self._logger.warning(
+                        "HostAgentAdapter switching to fallback AsyncClient after closed-loop error on {} {}: {}",
+                        method,
+                        path,
+                        exc,
+                    )
+                    continue
+                raise HostAgentError(f"{method} {path} failed: {exc}") from exc
+        else:
+            assert last_exc is not None
+            raise HostAgentError(f"{method} {path} failed: {last_exc}") from last_exc
 
         try:
             data = response.json()
@@ -86,6 +112,10 @@ class HostAgentAdapter:
                 f"{method} {path} returned invalid payload type: {type(data)!r}"
             )
         return data
+
+    @staticmethod
+    def _is_closed_loop_error(exc: Exception) -> bool:
+        return "Event loop is closed" in str(exc or "")
 
     async def get_computer_use_availability(self, *, timeout: float = 1.5) -> dict[str, Any]:
         return await self._request_json(
