@@ -1074,12 +1074,16 @@ function renderOcrWindowListToNode(node, windows) {
       ].filter(Boolean).join('');
       return `
         <article class="list-card compact">
-          <p class="list-kicker">${escapeHtml(item.process_name || '未知进程')} · pid ${escapeHtml(item.pid || 0)}</p>
-          <h3>${escapeHtml(item.title || '未命名窗口')}</h3>
+          <div class="window-candidate-header">
+            <div class="window-candidate-summary">
+              <p class="list-kicker">${escapeHtml(item.process_name || '未知进程')} · pid ${escapeHtml(item.pid || 0)}</p>
+              <h3>${escapeHtml(item.title || '未命名窗口')}</h3>
+            </div>
+            <button class="secondary" data-window-key="${escapeHtml(item.window_key || '')}">锁定此窗口</button>
+          </div>
           <p class="result-note mono">${escapeHtml(item.window_key || '')}</p>
           <div class="window-candidate-actions">
             <div class="window-candidate-meta">${chips}</div>
-            <button class="secondary" data-window-key="${escapeHtml(item.window_key || '')}">锁定此窗口</button>
           </div>
         </article>
       `;
@@ -1222,7 +1226,11 @@ function renderRapidOcr(status) {
     body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
   }
 
-  renderInstallTaskState('rapidocr');
+  if (installed && (!installState || isInstallTaskTerminal(installState))) {
+    getInstallNodes('rapidocr').card.hidden = true;
+  } else {
+    renderInstallTaskState('rapidocr');
+  }
 }
 
 function renderTesseract(status) {
@@ -1312,7 +1320,11 @@ function renderTesseract(status) {
     body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
   }
 
-  renderInstallTaskState('tesseract');
+  if (installed && (!installState || isInstallTaskTerminal(installState))) {
+    getInstallNodes('tesseract').card.hidden = true;
+  } else {
+    renderInstallTaskState('tesseract');
+  }
 }
 
 function renderTextractor(status) {
@@ -1396,7 +1408,11 @@ function renderTextractor(status) {
     body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
   }
 
-  renderInstallTaskState('textractor');
+  if (installed && (!installState || isInstallTaskTerminal(installState))) {
+    getInstallNodes('textractor').card.hidden = true;
+  } else {
+    renderInstallTaskState('textractor');
+  }
 }
 
 function renderOcrProfile(status) {
@@ -1945,12 +1961,15 @@ async function refreshOcrWindowTargets({ includeExcluded = true, silent = false 
   }
 }
 
-function openOcrWindowModal() {
+async function openOcrWindowModal() {
   const modal = document.getElementById('ocrWindowModal');
   const modalList = document.getElementById('ocrWindowList');
+  modal.hidden = false;
+  modalList.className = 'stack-list scroll-region empty-state window-candidate-list';
+  modalList.textContent = '正在加载可用游戏窗口...';
+  await refreshOcrWindowTargets({ includeExcluded: true, silent: false });
   const snapshot = latestOcrWindowSnapshot || {};
   renderOcrWindowListToNode(modalList, snapshot.windows || []);
-  modal.hidden = false;
 }
 
 function closeOcrWindowModal() {
@@ -2020,7 +2039,11 @@ document.getElementById('ocrWindowRefreshBtn').addEventListener('click', () => {
   });
 });
 document.getElementById('ocrWindowAutoBtn').addEventListener('click', clearOcrWindowTarget);
-document.getElementById('ocrWindowSelectBtn').addEventListener('click', openOcrWindowModal);
+document.getElementById('ocrWindowSelectBtn').addEventListener('click', () => {
+  openOcrWindowModal().catch((error) => {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  });
+});
 document.getElementById('ocrWindowModalClose').addEventListener('click', closeOcrWindowModal);
 document.querySelector('#ocrWindowModal .modal-overlay').addEventListener('click', closeOcrWindowModal);
 document.addEventListener('keydown', (e) => {

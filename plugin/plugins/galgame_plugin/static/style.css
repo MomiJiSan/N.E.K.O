@@ -363,13 +363,36 @@ button[disabled] {
   max-height: 280px;
 }
 
+.window-candidate-header {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.window-candidate-summary {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.window-candidate-summary h3 {
+  font-size: 16px;
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.window-candidate-header button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .window-candidate-actions {
   display: flex;
   gap: 8px;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   flex-wrap: wrap;
-  margin-top: 12px;
+  margin-top: 10px;
 }
 
 .window-candidate-meta {
@@ -674,8 +697,23 @@ button[disabled] {
   gap: 10px;
 }
 
+.modal-body .list-card.compact {
+  padding: 14px 16px;
+}
+
 .modal-body .empty-state {
   min-height: 120px;
+}
+
+@media (max-width: 720px) {
+  .window-candidate-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .window-candidate-header button {
+    width: 100%;
+  }
 }
 
 .mono {

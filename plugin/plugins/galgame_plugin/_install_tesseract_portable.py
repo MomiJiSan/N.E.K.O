@@ -9,9 +9,12 @@ from pathlib import Path
 
 import httpx
 
-INSTALLER_URL = "https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+INSTALLER_URL = (
+    "https://ghproxy.com/https://github.com/UB-Mannheim/tesseract/"
+    "releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+)
 INSTALLER_NAME = "tesseract-ocr-w64-setup-5.4.0.20240606.exe"
-TESSDATA_BASE_URL = "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main"
+TESSDATA_BASE_URL = "https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main"
 LANGUAGES = ["chi_sim", "eng"]
 TARGET_DIR = Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR"))
 

@@ -200,7 +200,7 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             ocr_reader_obj.get("install_target_dir") or ""
         ).strip(),
         ocr_reader_install_timeout_seconds=_coerce_float(
-            ocr_reader_obj.get("install_timeout_seconds"), 60.0, minimum=1.0
+            ocr_reader_obj.get("install_timeout_seconds"), 300.0, minimum=1.0
         ),
         ocr_reader_poll_interval_seconds=_coerce_float(
             ocr_reader_obj.get("poll_interval_seconds"), 2.0, minimum=0.1

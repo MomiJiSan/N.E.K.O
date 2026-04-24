@@ -17,10 +17,10 @@ from .memory_reader import is_windows_platform
 
 TESSERACT_EXECUTABLE = "tesseract.exe"
 DEFAULT_TESSERACT_LANGUAGES = "chi_sim+jpn+eng"
-DEFAULT_TESSDATA_BASE_URL = "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main"
+DEFAULT_TESSDATA_BASE_URL = "https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main"
 DEFAULT_TESSERACT_INSTALLER_URL = (
-    "https://digi.bib.uni-mannheim.de/tesseract/"
-    "tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+    "https://ghproxy.com/https://github.com/UB-Mannheim/tesseract/"
+    "releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
 )
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
