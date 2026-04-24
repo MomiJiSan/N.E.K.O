@@ -726,6 +726,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "last_error": json_copy(state.last_error),
         "memory_reader_runtime": json_copy(state.memory_reader_runtime),
         "ocr_reader_runtime": json_copy(state.ocr_reader_runtime),
+        "ocr_capture_profiles": json_copy(state.ocr_capture_profiles),
         "summary": summarize_status(
             connection_state=state.current_connection_state,
             mode=state.mode,

@@ -71,6 +71,26 @@ const DEFAULT_CAPTURE_PROFILE = {
   top_ratio: 0.62,
   bottom_inset_ratio: 0.08,
 };
+const AIHONG_PROCESS_NAMES = new Set(['thelamentinggeese.exe']);
+const OCR_PROFILE_STAGE_LABELS_ZH = {
+  default: '通用区域',
+  dialogue_stage: '对白区',
+  menu_stage: '菜单区',
+};
+const AIHONG_CAPTURE_PRESETS = {
+  dialogue_stage: {
+    left_inset_ratio: 0.05,
+    right_inset_ratio: 0.24,
+    top_ratio: 0.73,
+    bottom_inset_ratio: 0.10,
+  },
+  menu_stage: {
+    left_inset_ratio: 0.20,
+    right_inset_ratio: 0.20,
+    top_ratio: 0.40,
+    bottom_inset_ratio: 0.34,
+  },
+};
 
 const AUTO_REFRESH_INTERVAL_MS = 3000;
 const FIELD_LABELS_ZH = {
@@ -110,6 +130,7 @@ const FIELD_LABELS_ZH = {
   game_id: '游戏 ID',
   session_id: '会话 ID',
   last_event_ts: '最近事件时间',
+  capture_stage: '截图阶段',
   capture_profile: '截图配置',
   backend_kind: '后端类型',
   backend_detail: '后端详情',
@@ -144,6 +165,24 @@ const FIELD_LABELS_ZH = {
   actionable: '可操作',
   standby_requested: '已请求待机',
   memory_counts: '记忆计数',
+};
+
+const CONNECTION_STATE_LABELS_ZH = {
+  active: '运行中',
+  idle: '空闲',
+  stale: '已过期',
+};
+
+const MODE_LABELS_ZH = {
+  silent: '静默模式',
+  companion: '陪伴模式',
+  choice_advisor: '选项顾问模式',
+};
+
+const DATA_SOURCE_LABELS_ZH = {
+  bridge_sdk: 'Bridge SDK',
+  ocr_reader: 'OCR 读取',
+  memory_reader: '内存读取',
 };
 
 let latestAgentReply = '暂无交互';
@@ -465,6 +504,72 @@ function formatCaptureProfile(profile) {
   return rows.map(([label, value]) => `${label}=${Number(value).toFixed(2)}`).join(' | ');
 }
 
+function normalizeProcessName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isRatioProfileValue(value) {
+  return Boolean(value)
+    && typeof value === 'object'
+    && ['left_inset_ratio', 'right_inset_ratio', 'top_ratio', 'bottom_inset_ratio']
+      .every((key) => typeof value[key] === 'number' && Number.isFinite(value[key]));
+}
+
+function isAihongProcessName(value) {
+  return AIHONG_PROCESS_NAMES.has(normalizeProcessName(value));
+}
+
+function findStoredCaptureProfileEntry(status, processName) {
+  const profiles = status?.ocr_capture_profiles || {};
+  const direct = profiles[processName];
+  if (direct) {
+    return direct;
+  }
+  const normalizedProcessName = normalizeProcessName(processName);
+  return Object.entries(profiles).find(([name]) => normalizeProcessName(name) === normalizedProcessName)?.[1] || null;
+}
+
+function resolveStoredCaptureProfile(entry, stage) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  if (isRatioProfileValue(entry)) {
+    return stage === 'default' ? entry : null;
+  }
+  const stageEntry = entry[stage];
+  if (isRatioProfileValue(stageEntry)) {
+    return stageEntry;
+  }
+  const defaultEntry = entry.default;
+  if (isRatioProfileValue(defaultEntry)) {
+    return defaultEntry;
+  }
+  return null;
+}
+
+function resolveEditableCaptureProfile(status, processName, stage) {
+  const runtime = status?.ocr_reader_runtime || {};
+  const storedProfile = resolveStoredCaptureProfile(
+    findStoredCaptureProfileEntry(status, processName),
+    stage,
+  );
+  if (storedProfile) {
+    return storedProfile;
+  }
+  if (
+    normalizeProcessName(processName)
+      && normalizeProcessName(processName) === normalizeProcessName(runtime.process_name)
+      && runtime.capture_profile
+      && (stage === 'default' || runtime.capture_stage === stage || !runtime.capture_stage)
+  ) {
+    return runtime.capture_profile;
+  }
+  if (isAihongProcessName(processName) && AIHONG_CAPTURE_PRESETS[stage]) {
+    return AIHONG_CAPTURE_PRESETS[stage];
+  }
+  return DEFAULT_CAPTURE_PROFILE;
+}
+
 function setInputValueIfIdle(node, value) {
   if (!node) {
     return;
@@ -707,7 +812,7 @@ async function restoreTesseractInstallState() {
 
 function renderStatus(status) {
   latestStatus = status;
-  document.getElementById('summaryText').textContent = status.summary || '无摘要';
+  document.getElementById('summaryText').textContent = buildStatusSummaryText(status);
   document.getElementById('modeSelect').value = status.mode || 'companion';
   document.getElementById('pushToggle').checked = Boolean(status.push_notifications);
   document.getElementById('bindInput').value = status.bound_game_id || '';
@@ -765,6 +870,71 @@ function renderStatus(status) {
   renderOcrProfile(status);
 }
 
+function formatConnectionStateZh(value) {
+  const normalized = String(value || '').trim();
+  return CONNECTION_STATE_LABELS_ZH[normalized] || normalized || '未知';
+}
+
+function formatModeZh(value) {
+  const normalized = String(value || '').trim();
+  return MODE_LABELS_ZH[normalized] || normalized || '未知模式';
+}
+
+function formatDataSourceZh(value) {
+  const normalized = String(value || '').trim();
+  return DATA_SOURCE_LABELS_ZH[normalized] || normalized || '未知来源';
+}
+
+function buildStatusSummaryText(status) {
+  if (!status || typeof status !== 'object') {
+    return '无摘要';
+  }
+
+  const source = String(status.active_data_source || '').trim();
+  const sessionId = String(status.active_session_id || '').trim();
+  const boundGameId = String(status.bound_game_id || '').trim();
+  const connectionState = formatConnectionStateZh(status.connection_state);
+  const mode = formatModeZh(status.mode);
+  const lastSeq = String(status.last_seq || 0);
+  const warningMessage = typeof status.last_error?.message === 'string'
+    ? status.last_error.message.trim()
+    : '';
+
+  let prefix = '';
+  if (source === 'ocr_reader' && sessionId) {
+    prefix = '已通过 OCR 读取连接（降级模式）';
+  } else if (source === 'memory_reader' && sessionId) {
+    prefix = '已通过内存读取连接（降级模式）';
+  } else if (source === 'bridge_sdk' && sessionId) {
+    prefix = '已通过 Bridge SDK 连接';
+  } else if (status.connection_state === 'stale') {
+    prefix = '当前桥接快照已过期';
+  } else if (status.connection_state === 'active') {
+    prefix = '当前桥接链路运行中';
+  } else {
+    prefix = `当前数据源：${formatDataSourceZh(source)}`;
+  }
+
+  const parts = [
+    `状态：${connectionState}`,
+    `模式：${mode}`,
+  ];
+
+  if (boundGameId) {
+    parts.push(`绑定：${boundGameId}`);
+  }
+  if (sessionId) {
+    parts.push(`会话：${sessionId}`);
+  }
+  parts.push(`最新序号：${lastSeq}`);
+
+  if (warningMessage) {
+    parts.push(`告警：${warningMessage}`);
+  }
+
+  return `${prefix}｜${parts.join('｜')}`;
+}
+
 function renderOcrRuntime(status) {
   const runtime = status.ocr_reader_runtime || {};
   renderGrid('ocrRuntimeGrid', [
@@ -777,6 +947,7 @@ function renderOcrRuntime(status) {
     { label: 'session_id', value: runtime.session_id || '' },
     { label: 'last_seq', value: String(runtime.last_seq || 0) },
     { label: 'last_event_ts', value: runtime.last_event_ts || '' },
+    { label: 'capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[runtime.capture_stage] || runtime.capture_stage || '通用区域' },
     { label: 'capture_profile', value: formatCaptureProfile(runtime.capture_profile) || '(default)' },
     { label: 'backend_kind', value: runtime.backend_kind || '' },
     { label: 'backend_detail', value: runtime.backend_detail || '' },
@@ -849,14 +1020,47 @@ function renderOcrWindowTargetStatus(status) {
   autoButton.disabled = mode !== 'manual';
 }
 
-function renderOcrWindowTargetSnapshot(snapshot, status = latestStatus) {
-  latestOcrWindowSnapshot = snapshot;
+function renderLockedWindow(status) {
   const runtime = (status || {}).ocr_reader_runtime || {};
-  const node = document.getElementById('ocrWindowList');
-  const excludedNode = document.getElementById('ocrExcludedWindowList');
-  const windows = snapshot.windows || [];
-  const excludedWindows = snapshot.excluded_windows || [];
+  const snapshot = latestOcrWindowSnapshot || {};
+  const card = document.getElementById('ocrLockedWindowCard');
+  const mode = runtime.target_selection_mode || snapshot.target_selection_mode || 'auto';
+  const manualTarget = runtime.manual_target || snapshot.manual_target || {};
+  const effectiveTitle = runtime.effective_window_title || runtime.window_title || '';
+  const effectiveProcess = runtime.effective_process_name || runtime.process_name || '';
 
+  if (mode === 'manual' && (manualTarget.process_name || effectiveProcess)) {
+    const processName = manualTarget.process_name || effectiveProcess;
+    const title = manualTarget.title || effectiveTitle;
+    const pid = manualTarget.pid || runtime.pid || '';
+    const windowKey = manualTarget.window_key || '';
+    card.innerHTML = `
+      <div class="locked-window-info">
+        <p class="list-kicker">${escapeHtml(processName)}${pid ? ` · PID ${escapeHtml(pid)}` : ''}</p>
+        <h3>${escapeHtml(title || '未命名窗口')}</h3>
+        <p class="result-note mono">${escapeHtml(windowKey)}</p>
+        <div class="window-candidate-meta" style="margin-top:8px;">
+          <span class="status-chip active">手动锁定</span>
+        </div>
+      </div>
+    `;
+  } else if (effectiveProcess) {
+    card.innerHTML = `
+      <div class="locked-window-info">
+        <p class="list-kicker">${escapeHtml(effectiveProcess)}${runtime.pid ? ` · PID ${escapeHtml(runtime.pid)}` : ''}</p>
+        <h3>${escapeHtml(effectiveTitle || '未命名窗口')}</h3>
+        <p class="result-note mono">${escapeHtml(runtime.effective_window_key || '')}</p>
+        <div class="window-candidate-meta" style="margin-top:8px;">
+          <span class="status-chip">自动选择</span>
+        </div>
+      </div>
+    `;
+  } else {
+    card.innerHTML = '<div class="locked-window-empty">暂无锁定的窗口，请点击下方按钮选择。</div>';
+  }
+}
+
+function renderOcrWindowListToNode(node, windows) {
   if (!windows.length) {
     node.className = 'stack-list scroll-region empty-state window-candidate-list';
     node.textContent = '暂无可用游戏窗口';
@@ -889,6 +1093,20 @@ function renderOcrWindowTargetSnapshot(snapshot, status = latestStatus) {
       });
     });
   }
+}
+
+function renderOcrWindowTargetSnapshot(snapshot, status = latestStatus) {
+  latestOcrWindowSnapshot = snapshot;
+  const runtime = (status || {}).ocr_reader_runtime || {};
+  const excludedNode = document.getElementById('ocrExcludedWindowList');
+  const windows = snapshot.windows || [];
+  const excludedWindows = snapshot.excluded_windows || [];
+
+  const modal = document.getElementById('ocrWindowModal');
+  if (modal && !modal.hidden) {
+    const modalList = document.getElementById('ocrWindowList');
+    renderOcrWindowListToNode(modalList, windows);
+  }
 
   if (!excludedWindows.length) {
     excludedNode.className = 'stack-list scroll-region empty-state window-candidate-list';
@@ -905,6 +1123,7 @@ function renderOcrWindowTargetSnapshot(snapshot, status = latestStatus) {
   }
 
   renderOcrWindowTargetStatus(status || { ocr_reader_runtime: runtime });
+  renderLockedWindow(status || { ocr_reader_runtime: runtime });
 }
 
 function renderRapidOcr(status) {
@@ -1183,22 +1402,35 @@ function renderTextractor(status) {
 function renderOcrProfile(status) {
   const runtime = status.ocr_reader_runtime || {};
   const processInput = document.getElementById('ocrProfileProcessInput');
+  const stageSelect = document.getElementById('ocrProfileStageSelect');
   const leftInput = document.getElementById('ocrProfileLeftInput');
   const rightInput = document.getElementById('ocrProfileRightInput');
   const topInput = document.getElementById('ocrProfileTopInput');
   const bottomInput = document.getElementById('ocrProfileBottomInput');
   const hint = document.getElementById('ocrProfileRuntimeHint');
-  const profileValues = profileValueForInputs(runtime.capture_profile);
+  const currentProcessName = processInput.value.trim() || runtime.process_name || '';
+  const currentStage = stageSelect.value || 'default';
+  const profileValues = profileValueForInputs(
+    resolveEditableCaptureProfile(status, currentProcessName, currentStage),
+  );
 
   if (runtime.process_name) {
     hint.textContent = [
       `当前 OCR 目标: ${runtime.process_name} (${runtime.pid || 0})`,
       runtime.window_title ? `窗口: ${runtime.window_title}` : '',
+      runtime.capture_stage
+        ? `运行阶段: ${OCR_PROFILE_STAGE_LABELS_ZH[runtime.capture_stage] || runtime.capture_stage}`
+        : '',
       runtime.detail ? `状态: ${runtime.detail}` : '',
       runtime.takeover_reason ? `接管原因: ${runtime.takeover_reason}` : '',
+      isAihongProcessName(currentProcessName || runtime.process_name)
+        ? '哀鸿支持按对白区 / 菜单区分别保存'
+        : '',
     ].filter(Boolean).join(' | ');
   } else {
-    hint.textContent = '当前还没有附着的 OCR 目标进程。你也可以先手动填写 process_name，把截图校准预先存起来。';
+    hint.textContent = isAihongProcessName(currentProcessName)
+      ? '当前还没有附着的 OCR 目标进程。你可以先手动填写 TheLamentingGeese.exe，并分别预存哀鸿的对白区 / 菜单区截图范围。'
+      : '当前还没有附着的 OCR 目标进程。你也可以先手动填写 process_name，把截图校准预先存起来。';
   }
 
   if (!processInput.value || document.activeElement !== processInput) {
@@ -1661,12 +1893,14 @@ function readProfileNumber(id, label) {
 async function saveOcrCaptureProfile() {
   try {
     const processName = document.getElementById('ocrProfileProcessInput').value.trim();
+    const stage = document.getElementById('ocrProfileStageSelect').value || 'default';
     const leftInsetRatio = readProfileNumber('ocrProfileLeftInput', 'left_inset_ratio');
     const rightInsetRatio = readProfileNumber('ocrProfileRightInput', 'right_inset_ratio');
     const topRatio = readProfileNumber('ocrProfileTopInput', 'top_ratio');
     const bottomInsetRatio = readProfileNumber('ocrProfileBottomInput', 'bottom_inset_ratio');
     const payload = await callPlugin('galgame_set_ocr_capture_profile', {
       process_name: processName,
+      stage,
       left_inset_ratio: leftInsetRatio,
       right_inset_ratio: rightInsetRatio,
       top_ratio: topRatio,
@@ -1683,8 +1917,10 @@ async function saveOcrCaptureProfile() {
 async function clearOcrCaptureProfile() {
   try {
     const processName = document.getElementById('ocrProfileProcessInput').value.trim();
+    const stage = document.getElementById('ocrProfileStageSelect').value || 'default';
     const payload = await callPlugin('galgame_set_ocr_capture_profile', {
       process_name: processName,
+      stage,
       clear: true,
     });
     setFlash(payload.summary || 'OCR 截图校准已清空', 'success');
@@ -1709,6 +1945,19 @@ async function refreshOcrWindowTargets({ includeExcluded = true, silent = false 
   }
 }
 
+function openOcrWindowModal() {
+  const modal = document.getElementById('ocrWindowModal');
+  const modalList = document.getElementById('ocrWindowList');
+  const snapshot = latestOcrWindowSnapshot || {};
+  renderOcrWindowListToNode(modalList, snapshot.windows || []);
+  modal.hidden = false;
+}
+
+function closeOcrWindowModal() {
+  const modal = document.getElementById('ocrWindowModal');
+  modal.hidden = true;
+}
+
 async function setOcrWindowTarget(windowKey) {
   try {
     const payload = await callPlugin('galgame_set_ocr_window_target', {
@@ -1716,6 +1965,7 @@ async function setOcrWindowTarget(windowKey) {
       clear: false,
     });
     setFlash(payload.summary || 'OCR 目标窗口已锁定', 'success');
+    closeOcrWindowModal();
     await refreshAll({ preserveFlash: true, forceInsights: true });
     await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
   } catch (error) {
@@ -1770,8 +2020,26 @@ document.getElementById('ocrWindowRefreshBtn').addEventListener('click', () => {
   });
 });
 document.getElementById('ocrWindowAutoBtn').addEventListener('click', clearOcrWindowTarget);
+document.getElementById('ocrWindowSelectBtn').addEventListener('click', openOcrWindowModal);
+document.getElementById('ocrWindowModalClose').addEventListener('click', closeOcrWindowModal);
+document.querySelector('#ocrWindowModal .modal-overlay').addEventListener('click', closeOcrWindowModal);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeOcrWindowModal();
+  }
+});
 document.getElementById('ocrProfileSaveBtn').addEventListener('click', saveOcrCaptureProfile);
 document.getElementById('ocrProfileClearBtn').addEventListener('click', clearOcrCaptureProfile);
+document.getElementById('ocrProfileStageSelect').addEventListener('change', () => {
+  if (latestStatus) {
+    renderOcrProfile(latestStatus);
+  }
+});
+document.getElementById('ocrProfileProcessInput').addEventListener('blur', () => {
+  if (latestStatus) {
+    renderOcrProfile(latestStatus);
+  }
+});
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {

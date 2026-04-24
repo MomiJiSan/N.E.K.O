@@ -4,6 +4,8 @@ from typing import Any
 
 from .models import (
     MODES,
+    OCR_CAPTURE_PROFILE_RATIO_KEYS,
+    OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
     STORE_BOUND_GAME_ID,
     STORE_DEDUPE_WINDOW,
     STORE_EVENTS_BYTE_OFFSET,
@@ -34,20 +36,32 @@ class GalgameStore:
         self._store._write_value(key, value)  # type: ignore[attr-defined]
 
     @staticmethod
-    def _sanitize_ocr_capture_profiles(raw_value: Any) -> tuple[dict[str, dict[str, float]], list[str]]:
+    def _sanitize_ratio_profile(raw_value: Any) -> dict[str, float] | None:
+        if not isinstance(raw_value, dict):
+            return None
+        cleaned: dict[str, float] = {}
+        for key in OCR_CAPTURE_PROFILE_RATIO_KEYS:
+            value = raw_value.get(key)
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            if parsed < 0.0 or parsed >= 1.0:
+                return None
+            cleaned[key] = parsed
+        return cleaned
+
+    @classmethod
+    def _sanitize_ocr_capture_profiles(cls, raw_value: Any) -> tuple[dict[str, dict[str, Any]], list[str]]:
         warnings: list[str] = []
         if raw_value in ({}, None):
             return {}, warnings
         if not isinstance(raw_value, dict):
             return {}, ["invalid ocr_capture_profiles dropped: non-object"]
 
-        normalized: dict[str, dict[str, float]] = {}
-        ratio_keys = (
-            "left_inset_ratio",
-            "right_inset_ratio",
-            "top_ratio",
-            "bottom_inset_ratio",
-        )
+        normalized: dict[str, dict[str, Any]] = {}
         for process_name, profile in raw_value.items():
             if not isinstance(process_name, str) or not process_name.strip():
                 warnings.append("invalid ocr_capture_profiles item dropped: bad process name")
@@ -57,28 +71,35 @@ class GalgameStore:
                     f"invalid ocr_capture_profiles item dropped: {process_name!r} is not an object"
                 )
                 continue
-            cleaned: dict[str, float] = {}
-            valid = True
-            for key in ratio_keys:
-                value = profile.get(key)
-                if isinstance(value, bool):
-                    valid = False
-                    break
-                try:
-                    parsed = float(value)
-                except (TypeError, ValueError):
-                    valid = False
-                    break
-                if parsed < 0.0 or parsed >= 1.0:
-                    valid = False
-                    break
-                cleaned[key] = parsed
-            if not valid:
+            cleaned = cls._sanitize_ratio_profile(profile)
+            if cleaned is not None:
+                normalized[process_name.strip()] = cleaned
+                continue
+
+            stage_profiles: dict[str, dict[str, float]] = {}
+            for stage_name, stage_profile in profile.items():
+                normalized_stage_name = str(stage_name or "").strip()
+                if not normalized_stage_name:
+                    warnings.append(
+                        f"invalid ocr_capture_profiles stage dropped: {process_name!r} has empty stage name"
+                    )
+                    continue
+                cleaned_stage = cls._sanitize_ratio_profile(stage_profile)
+                if cleaned_stage is None:
+                    warnings.append(
+                        f"invalid ocr_capture_profiles stage dropped: {process_name!r}/{normalized_stage_name!r} has invalid ratios"
+                    )
+                    continue
+                stage_profiles[normalized_stage_name] = cleaned_stage
+            if not stage_profiles:
                 warnings.append(
                     f"invalid ocr_capture_profiles item dropped: {process_name!r} has invalid ratios"
                 )
                 continue
-            normalized[process_name.strip()] = cleaned
+            if len(stage_profiles) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_profiles:
+                normalized[process_name.strip()] = stage_profiles[OCR_CAPTURE_PROFILE_STAGE_DEFAULT]
+            else:
+                normalized[process_name.strip()] = stage_profiles
         return normalized, warnings
 
     @staticmethod
@@ -231,14 +252,30 @@ class GalgameStore:
 
     def persist_ocr_capture_profiles(
         self,
-        profiles: dict[str, dict[str, float]],
+        profiles: dict[str, dict[str, Any]],
     ) -> None:
+        payload: dict[str, dict[str, Any]] = {}
+        for process_name, profile in profiles.items():
+            cleaned = self._sanitize_ratio_profile(profile)
+            if cleaned is not None:
+                payload[str(process_name)] = cleaned
+                continue
+            if not isinstance(profile, dict):
+                continue
+            stage_payload: dict[str, dict[str, float]] = {}
+            for stage_name, stage_profile in profile.items():
+                cleaned_stage = self._sanitize_ratio_profile(stage_profile)
+                if cleaned_stage is None:
+                    continue
+                stage_payload[str(stage_name)] = cleaned_stage
+            if stage_payload:
+                if len(stage_payload) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_payload:
+                    payload[str(process_name)] = stage_payload[OCR_CAPTURE_PROFILE_STAGE_DEFAULT]
+                else:
+                    payload[str(process_name)] = stage_payload
         self._write(
             STORE_OCR_CAPTURE_PROFILES,
-            {
-                str(process_name): {str(key): float(value) for key, value in profile.items()}
-                for process_name, profile in profiles.items()
-            },
+            payload,
         )
 
     def persist_ocr_window_target(self, target: dict[str, Any]) -> None:

@@ -25,6 +25,9 @@ from .models import (
     DATA_SOURCE_NONE,
     MODE_COMPANION,
     MODES,
+    OCR_CAPTURE_PROFILE_RATIO_KEYS,
+    OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_STAGES,
     STATE_ACTIVE,
     STATE_ERROR,
     STORE_BOUND_GAME_ID,
@@ -81,6 +84,36 @@ def _format_install_entry_error(label: str, exc: Exception) -> str:
     return f"{prefix}：{message}"
 
 
+def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
+    normalized = str(stage or OCR_CAPTURE_PROFILE_STAGE_DEFAULT).strip().lower()
+    if normalized not in OCR_CAPTURE_PROFILE_STAGES:
+        raise ValueError(f"invalid OCR capture profile stage: {stage!r}")
+    return normalized
+
+
+def _is_ratio_profile_payload(value: object) -> bool:
+    return isinstance(value, dict) and all(key in value for key in OCR_CAPTURE_PROFILE_RATIO_KEYS)
+
+
+def _capture_profile_entry_to_stage_map(value: object) -> dict[str, dict[str, float]]:
+    if _is_ratio_profile_payload(value):
+        return {OCR_CAPTURE_PROFILE_STAGE_DEFAULT: json_copy(value)}
+    raw = value if isinstance(value, dict) else {}
+    stage_map: dict[str, dict[str, float]] = {}
+    for stage_name, profile in raw.items():
+        normalized_stage_name = str(stage_name or "").strip().lower()
+        if not normalized_stage_name or not _is_ratio_profile_payload(profile):
+            continue
+        stage_map[normalized_stage_name] = json_copy(profile)
+    return stage_map
+
+
+def _stage_map_to_capture_profile_entry(stage_map: dict[str, dict[str, float]]) -> dict[str, Any]:
+    if len(stage_map) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_map:
+        return json_copy(stage_map[OCR_CAPTURE_PROFILE_STAGE_DEFAULT])
+    return {stage_name: json_copy(profile) for stage_name, profile in stage_map.items()}
+
+
 @neko_plugin
 class GalgamePlugin(NekoPluginBase):
     def __init__(self, ctx):
@@ -129,7 +162,7 @@ class GalgamePlugin(NekoPluginBase):
                 "warmup_session_id": state.warmup_session_id,
                 "memory_reader_runtime": json_copy(state.memory_reader_runtime),
                 "ocr_reader_runtime": json_copy(state.ocr_reader_runtime),
-                "ocr_capture_profiles": dict(state.ocr_capture_profiles),
+                "ocr_capture_profiles": json_copy(state.ocr_capture_profiles),
                 "ocr_window_target": json_copy(state.ocr_window_target),
                 "plugin_error": state.plugin_error,
             }
@@ -162,7 +195,7 @@ class GalgamePlugin(NekoPluginBase):
             state.warmup_session_id = str(payload["warmup_session_id"])
             state.memory_reader_runtime = json_copy(payload["memory_reader_runtime"])
             state.ocr_reader_runtime = json_copy(payload["ocr_reader_runtime"])
-            state.ocr_capture_profiles = dict(payload["ocr_capture_profiles"])
+            state.ocr_capture_profiles = json_copy(payload["ocr_capture_profiles"])
             state.ocr_window_target = json_copy(payload["ocr_window_target"])
             state.plugin_error = str(payload["plugin_error"])
 
@@ -203,7 +236,9 @@ class GalgamePlugin(NekoPluginBase):
             self._state.active_data_source = DATA_SOURCE_NONE
             self._state.memory_reader_runtime = {}
             self._state.ocr_reader_runtime = {}
-            self._state.ocr_capture_profiles = restored.get(STORE_OCR_CAPTURE_PROFILES, {})
+            self._state.ocr_capture_profiles = json_copy(
+                restored.get(STORE_OCR_CAPTURE_PROFILES, {})
+            )
             self._state.ocr_window_target = json_copy(restored.get(STORE_OCR_WINDOW_TARGET, {}))
             if warnings and not self._state.last_error:
                 self._state.last_error = make_error(
@@ -231,6 +266,7 @@ class GalgamePlugin(NekoPluginBase):
                 "memory_reader_runtime": {},
                 "ocr_reader_enabled": False,
                 "ocr_reader_runtime": {},
+                "ocr_capture_profiles": {},
                 "rapidocr_enabled": False,
                 "rapidocr": {
                     "install_supported": False,
@@ -972,6 +1008,11 @@ class GalgamePlugin(NekoPluginBase):
             "type": "object",
             "properties": {
                 "process_name": {"type": "string", "default": ""},
+                "stage": {
+                    "type": "string",
+                    "enum": sorted(OCR_CAPTURE_PROFILE_STAGES),
+                    "default": OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+                },
                 "left_inset_ratio": {"type": "number", "default": 0.05},
                 "right_inset_ratio": {"type": "number", "default": 0.05},
                 "top_ratio": {"type": "number", "default": 0.3},
@@ -984,6 +1025,7 @@ class GalgamePlugin(NekoPluginBase):
     async def galgame_set_ocr_capture_profile(
         self,
         process_name: str = "",
+        stage: str = OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
         left_inset_ratio: float = 0.05,
         right_inset_ratio: float = 0.05,
         top_ratio: float = 0.3,
@@ -1003,17 +1045,29 @@ class GalgamePlugin(NekoPluginBase):
             return parsed
 
         with self._state_lock:
-            profiles = dict(self._state.ocr_capture_profiles)
+            profiles = json_copy(self._state.ocr_capture_profiles)
             runtime_process_name = str(
                 (self._state.ocr_reader_runtime or {}).get("process_name") or ""
             ).strip()
         normalized_process_name = str(process_name or "").strip() or runtime_process_name
         if not normalized_process_name:
             return Err(SdkError("process_name is required"))
+        try:
+            normalized_stage = _normalize_ocr_capture_profile_stage(stage)
+        except ValueError as exc:
+            return Err(SdkError(str(exc)))
 
         if clear:
-            profiles.pop(normalized_process_name, None)
-            summary = f"OCR capture profile cleared for {normalized_process_name}"
+            stage_map = _capture_profile_entry_to_stage_map(profiles.get(normalized_process_name))
+            if normalized_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT and not stage_map:
+                profiles.pop(normalized_process_name, None)
+            else:
+                stage_map.pop(normalized_stage, None)
+                if stage_map:
+                    profiles[normalized_process_name] = _stage_map_to_capture_profile_entry(stage_map)
+                else:
+                    profiles.pop(normalized_process_name, None)
+            summary = f"OCR 截图校准已清空：{normalized_process_name} / {normalized_stage}"
             capture_profile: dict[str, float] = {}
         else:
             try:
@@ -1038,9 +1092,22 @@ class GalgamePlugin(NekoPluginBase):
                 + normalized_profile["bottom_inset_ratio"]
             ) >= 1.0:
                 return Err(SdkError("top_ratio + bottom_inset_ratio must be < 1.0"))
-            profiles[normalized_process_name] = normalized_profile
+            if normalized_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+                existing_stage_map = _capture_profile_entry_to_stage_map(
+                    profiles.get(normalized_process_name)
+                )
+                existing_stage_map[OCR_CAPTURE_PROFILE_STAGE_DEFAULT] = normalized_profile
+                profiles[normalized_process_name] = _stage_map_to_capture_profile_entry(
+                    existing_stage_map
+                )
+            else:
+                stage_map = _capture_profile_entry_to_stage_map(
+                    profiles.get(normalized_process_name)
+                )
+                stage_map[normalized_stage] = normalized_profile
+                profiles[normalized_process_name] = _stage_map_to_capture_profile_entry(stage_map)
             capture_profile = dict(normalized_profile)
-            summary = f"OCR capture profile saved for {normalized_process_name}"
+            summary = f"OCR 截图校准已保存：{normalized_process_name} / {normalized_stage}"
 
         try:
             self._persist.persist_ocr_capture_profiles(profiles)
@@ -1048,13 +1115,14 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError(f"persist OCR capture profile failed: {exc}"))
 
         with self._state_lock:
-            self._state.ocr_capture_profiles = dict(profiles)
+            self._state.ocr_capture_profiles = json_copy(profiles)
         if self._ocr_reader_manager is not None:
             self._ocr_reader_manager.update_capture_profiles(profiles)
         await self._poll_bridge(force=True)
         return Ok(
             {
                 "process_name": normalized_process_name,
+                "stage": normalized_stage,
                 "capture_profile": capture_profile,
                 "cleared": bool(clear),
                 "summary": summary,

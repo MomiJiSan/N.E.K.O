@@ -10,6 +10,7 @@ from .models import (
     AGENT_STATUS_ERROR,
     AGENT_STATUS_STANDBY,
     DATA_SOURCE_BRIDGE_SDK,
+    DATA_SOURCE_OCR_READER,
     json_copy,
     sanitize_snapshot_state,
 )
@@ -26,6 +27,18 @@ from .service import (
 
 
 class GameLLMAgent:
+    _BRIDGE_PROGRESS_EVENT_TYPES = frozenset(
+        {
+            "session_started",
+            "line_changed",
+            "choices_shown",
+            "choice_selected",
+            "scene_changed",
+            "save_loaded",
+        }
+    )
+    _DEFAULT_BRIDGE_WAIT_TIMEOUT = 5.0
+    _OCR_BRIDGE_WAIT_TIMEOUT = 12.0
     _DIALOGUE_ADVANCE_VARIANTS = (
         {
             "id": "advance_enter",
@@ -103,6 +116,7 @@ class GameLLMAgent:
         self._observed_choice_marker = ""
         self._scene_state = self._build_empty_scene_state()
         self._last_status = AGENT_STATUS_STANDBY
+        self._last_trace_message = ""
 
     def _ensure_loop_affinity(self) -> None:
         loop = asyncio.get_running_loop()
@@ -152,6 +166,7 @@ class GameLLMAgent:
             self._next_actuation_at = 0.0
             self._scene_state = self._build_empty_scene_state()
             self._last_status = AGENT_STATUS_STANDBY
+            self._last_trace_message = ""
 
     async def tick(self, shared: dict[str, Any]) -> None:
         self._ensure_loop_affinity()
@@ -160,6 +175,9 @@ class GameLLMAgent:
             now = time.monotonic()
             self._update_scene_state(shared, now)
             self._recover_retryable_error_if_ready(now)
+            snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+            visible_choices = list(snapshot.get("choices", []))
+            status = self._compute_status(shared)
 
             if self._actuation is not None:
                 await self._progress_actuation(shared, now)
@@ -171,24 +189,49 @@ class GameLLMAgent:
                 self._last_status = self._compute_status(shared)
                 return
 
-            if self._compute_status(shared) != AGENT_STATUS_ACTIVE:
-                self._last_status = self._compute_status(shared)
+            if status != AGENT_STATUS_ACTIVE:
+                self._trace_runtime(
+                    "tick skipped: "
+                    f"status={status} stage={self._scene_state['stage']} "
+                    f"choices={len(visible_choices)} reason={self._current_status_reason(shared)}"
+                )
+                self._last_status = status
                 return
 
             if now < self._next_actuation_at:
-                self._last_status = self._compute_status(shared)
+                self._trace_runtime(
+                    "tick delayed: "
+                    f"stage={self._scene_state['stage']} choices={len(visible_choices)} "
+                    f"retry_in={max(0.0, self._next_actuation_at - now):.2f}s"
+                )
+                self._last_status = status
                 return
 
             strategy = self._take_pending_strategy()
             if strategy is not None:
+                self._trace_runtime(
+                    "tick resuming pending strategy: "
+                    f"kind={str(strategy.get('kind') or '')} "
+                    f"strategy_id={str(strategy.get('strategy_id') or '')}"
+                )
                 await self._start_actuation_from_strategy(shared, strategy=strategy, now=now)
                 self._last_status = self._compute_status(shared)
                 return
 
-            snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
-            visible_choices = list(snapshot.get("choices", []))
             if self._scene_state["stage"] == "choice_menu" and visible_choices:
+                if not self._has_confirmed_ocr_choice_menu(shared, snapshot):
+                    self._trace_runtime(
+                        "tick holding choice planning: waiting for confirmed OCR menu event"
+                    )
+                    self._last_status = status
+                    return
                 context = build_suggest_context(shared)
+                self._trace_runtime(
+                    "tick starting choice planning: "
+                    f"scene={str(snapshot.get('scene_id') or '') or 'none'} "
+                    f"line={str(snapshot.get('line_id') or '') or 'none'} "
+                    f"choices={len(context['visible_choices'])}"
+                )
                 self._planning_choice_signature = build_choice_signature(context["visible_choices"])
                 self._planning_candidates = []
                 self._planning_started_at = now
@@ -198,12 +241,25 @@ class GameLLMAgent:
 
             strategy = self._build_scene_strategy(shared, now=now)
             if strategy is not None:
+                self._trace_runtime(
+                    "tick starting scene strategy: "
+                    f"kind={str(strategy.get('kind') or '')} "
+                    f"strategy_id={str(strategy.get('strategy_id') or '')} "
+                    f"stage={self._scene_state['stage']}"
+                )
                 await self._start_actuation_from_strategy(shared, strategy=strategy, now=now)
+            else:
+                self._trace_runtime(
+                    "tick idle: "
+                    f"stage={self._scene_state['stage']} choices={len(visible_choices)} "
+                    f"reason={self._current_status_reason(shared)}"
+                )
             self._last_status = self._compute_status(shared)
 
     async def _interrupt_for_status_query(self) -> bool:
         if self._planning_task is None:
             return False
+        self._trace_runtime("query_status interrupted in-flight choice planning")
         self._planning_task.cancel()
         await asyncio.gather(self._planning_task, return_exceptions=True)
         self._planning_task = None
@@ -301,6 +357,7 @@ class GameLLMAgent:
         try:
             suggestion = task.result()
         except asyncio.CancelledError:
+            self._trace_runtime("choice planning cancelled before result")
             self._next_actuation_at = now + 0.2
             return
         except Exception as exc:
@@ -309,11 +366,18 @@ class GameLLMAgent:
 
         current_choices = list((shared.get("latest_snapshot") or {}).get("choices") or [])
         if build_choice_signature(current_choices) != self._planning_choice_signature:
+            self._trace_runtime("choice planning dropped: visible choices changed before result")
             self._next_actuation_at = now + 0.2
             return
 
         candidates = self._build_choice_candidates(current_choices, suggestion)
         self._planning_candidates = json_copy(candidates)
+        self._trace_runtime(
+            "choice planning finished: "
+            f"degraded={bool(suggestion.get('degraded'))} "
+            f"diagnostic={str(suggestion.get('diagnostic') or '') or 'none'} "
+            f"candidates={len(candidates)}"
+        )
         if not candidates:
             self._next_actuation_at = now + 0.2
             return
@@ -370,12 +434,14 @@ class GameLLMAgent:
         try:
             availability = await self._host_adapter.get_computer_use_availability()
         except HostAgentError as exc:
+            self._trace_runtime(f"actuation blocked by availability error: {exc}")
             self._set_hard_error(str(exc), retryable=True)
             self._next_actuation_at = now + 1.0
             return
         if not bool(availability.get("ready")):
             reasons = availability.get("reasons")
             detail = reasons[0] if isinstance(reasons, list) and reasons else "computer_use unavailable"
+            self._trace_runtime(f"actuation blocked: computer_use not ready ({detail})")
             self._set_hard_error(str(detail), retryable=True)
             self._next_actuation_at = now + 1.0
             return
@@ -383,12 +449,14 @@ class GameLLMAgent:
         try:
             started = await self._host_adapter.run_computer_use_instruction(instruction)
         except HostAgentError as exc:
+            self._trace_runtime(f"actuation start failed: {exc}")
             self._set_hard_error(str(exc), retryable=True)
             self._next_actuation_at = now + 1.0
             return
 
         task_id = str(started.get("task_id") or "")
         if not task_id:
+            self._trace_runtime(f"actuation start failed: invalid task response {started}")
             self._set_hard_error(f"invalid task response: {started}", retryable=False)
             self._next_actuation_at = now + 1.0
             return
@@ -396,7 +464,13 @@ class GameLLMAgent:
         if choice_id and suggestion_reason:
             self._remember_suggestion_reason(choice_id, suggestion_reason)
 
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        input_source = self._current_input_source(shared)
         self._clear_hard_error()
+        self._trace_runtime(
+            "actuation started: "
+            f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
+        )
         self._actuation = {
             "kind": kind,
             "task_id": task_id,
@@ -404,14 +478,22 @@ class GameLLMAgent:
             "strategy_family": strategy_family,
             "strategy_id": strategy_id,
             "instruction_variant": instruction_variant,
+            "input_source": input_source,
             "started_at": now,
             "bridge_wait_started_at": 0.0,
+            "bridge_wait_timeout": (
+                self._OCR_BRIDGE_WAIT_TIMEOUT
+                if input_source == DATA_SOURCE_OCR_READER
+                else self._DEFAULT_BRIDGE_WAIT_TIMEOUT
+            ),
             "baseline_last_seq": int(shared.get("last_seq") or 0),
-            "baseline_signature": build_snapshot_signature(shared.get("latest_snapshot", {})),
+            "baseline_signature": build_snapshot_signature(snapshot),
+            "baseline_snapshot_ts": str(snapshot.get("ts") or ""),
             "baseline_stage": str(self._scene_state.get("stage") or ""),
-            "baseline_scene_id": str((shared.get("latest_snapshot") or {}).get("scene_id") or ""),
+            "baseline_scene_id": str(snapshot.get("scene_id") or ""),
+            "baseline_session_id": str(shared.get("active_session_id") or ""),
             "baseline_choice_signature": build_choice_signature(
-                list((shared.get("latest_snapshot") or {}).get("choices") or [])
+                list(snapshot.get("choices", []))
             ),
             "choice_id": choice_id,
             "candidate_choices": json_copy(candidate_choices or []),
@@ -440,11 +522,23 @@ class GameLLMAgent:
             if status in {"queued", "running"}:
                 return
             if status == "completed":
+                self._trace_runtime(
+                    "actuation host completed, awaiting bridge update: "
+                    f"task_id={str(actuation.get('task_id') or '')}"
+                )
                 actuation["state"] = "awaiting_bridge"
                 actuation["bridge_wait_started_at"] = now
+                actuation["bridge_wait_timeout"] = self._bridge_wait_timeout(
+                    shared, actuation=actuation
+                )
                 return
 
             reason = str(task.get("error") or f"actuation task ended with status={status}")
+            self._trace_runtime(
+                "actuation host ended unsuccessfully: "
+                f"task_id={str(actuation.get('task_id') or '')} "
+                f"status={status} reason={reason}"
+            )
             retry = self._build_retry_strategy(shared, actuation=actuation, failure_reason=reason)
             self._record_failure(
                 kind=str(actuation.get("kind") or ""),
@@ -462,20 +556,27 @@ class GameLLMAgent:
             self._next_actuation_at = now + 1.0
             return
 
-        current_signature = build_snapshot_signature(shared.get("latest_snapshot", {}))
-        baseline_signature = actuation.get("baseline_signature")
-        if (
-            current_signature != baseline_signature
-            and int(shared.get("last_seq") or 0) >= int(actuation.get("baseline_last_seq") or 0)
-        ):
+        progress_reason = self._detect_bridge_progress(shared, actuation=actuation)
+        if progress_reason is not None:
+            self._trace_runtime(
+                "actuation observed bridge progress: "
+                f"task_id={str(actuation.get('task_id') or '')} via={progress_reason}"
+            )
             self._clear_hard_error()
             self._actuation = None
             self._pending_strategy = None
             self._next_actuation_at = now + 0.2
             return
 
-        if now - float(actuation.get("bridge_wait_started_at") or now) > 5.0:
+        wait_timeout = self._bridge_wait_timeout(shared, actuation=actuation)
+        actuation["bridge_wait_timeout"] = wait_timeout
+        if now - float(actuation.get("bridge_wait_started_at") or now) > wait_timeout:
             reason = "bridge state did not change after actuation"
+            self._trace_runtime(
+                "actuation timed out waiting for bridge update: "
+                f"task_id={str(actuation.get('task_id') or '')} "
+                f"timeout={wait_timeout:.1f}s input_source={self._current_input_source(shared)}"
+            )
             retry = self._build_retry_strategy(shared, actuation=actuation, failure_reason=reason)
             self._record_failure(
                 kind=str(actuation.get("kind") or ""),
@@ -491,6 +592,92 @@ class GameLLMAgent:
                 return
             self._set_hard_error(reason, retryable=False)
             self._next_actuation_at = now + 1.0
+
+    def _detect_bridge_progress(
+        self,
+        shared: dict[str, Any],
+        *,
+        actuation: dict[str, Any],
+    ) -> str | None:
+        baseline_session_id = str(actuation.get("baseline_session_id") or "")
+        current_session_id = str(shared.get("active_session_id") or "")
+        if current_session_id and baseline_session_id and current_session_id != baseline_session_id:
+            return "session_changed"
+
+        current_snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        current_last_seq = int(shared.get("last_seq") or 0)
+        baseline_last_seq = int(actuation.get("baseline_last_seq") or 0)
+
+        if (
+            build_snapshot_signature(current_snapshot) != actuation.get("baseline_signature")
+            and current_last_seq >= baseline_last_seq
+        ):
+            return "snapshot_signature"
+
+        baseline_snapshot_ts = str(actuation.get("baseline_snapshot_ts") or "")
+        current_snapshot_ts = str(current_snapshot.get("ts") or "")
+        if current_last_seq > baseline_last_seq and current_snapshot_ts != baseline_snapshot_ts:
+            return "snapshot_ts"
+
+        history_events = shared.get("history_events")
+        if not isinstance(history_events, list):
+            return None
+
+        for event in reversed(history_events):
+            if not isinstance(event, dict):
+                continue
+            seq = int(event.get("seq") or 0)
+            if seq <= baseline_last_seq:
+                break
+            event_type = str(event.get("type") or "")
+            if event_type in self._BRIDGE_PROGRESS_EVENT_TYPES:
+                return f"history:{event_type}"
+        return None
+
+    def _bridge_wait_timeout(self, shared: dict[str, Any], *, actuation: dict[str, Any]) -> float:
+        input_source = str(
+            shared.get("active_data_source")
+            or actuation.get("input_source")
+            or DATA_SOURCE_BRIDGE_SDK
+        )
+        if input_source == DATA_SOURCE_OCR_READER:
+            return self._OCR_BRIDGE_WAIT_TIMEOUT
+        return self._DEFAULT_BRIDGE_WAIT_TIMEOUT
+
+    def _has_confirmed_ocr_choice_menu(
+        self,
+        shared: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return True
+        choices = list(snapshot.get("choices", []))
+        if not bool(snapshot.get("is_menu_open")) or not choices:
+            return False
+        history_events = shared.get("history_events")
+        if not isinstance(history_events, list):
+            return False
+        current_choice_signature = build_choice_signature(choices)
+        current_line_id = str(snapshot.get("line_id") or "")
+        current_scene_id = str(snapshot.get("scene_id") or "")
+        for event in reversed(history_events):
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("type") or "") != "choices_shown":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if build_choice_signature(list(payload.get("choices") or [])) != current_choice_signature:
+                continue
+            event_line_id = str(payload.get("line_id") or "")
+            if current_line_id and event_line_id and event_line_id != current_line_id:
+                continue
+            event_scene_id = str(payload.get("scene_id") or "")
+            if current_scene_id and event_scene_id and event_scene_id != current_scene_id:
+                continue
+            return True
+        return False
 
     def _build_scene_strategy(self, shared: dict[str, Any], *, now: float) -> dict[str, Any] | None:
         stage = str(self._scene_state.get("stage") or "unknown")
@@ -1111,6 +1298,17 @@ class GameLLMAgent:
             },
             "recent_pushes": recent_pushes,
             "last_push": json_copy(recent_pushes[-1]) if recent_pushes else None,
+            "debug": {
+                "last_trace": self._last_trace_message,
+                "runtime_loop_id": id(self._runtime_loop) if self._runtime_loop is not None else 0,
+                "current_loop_id": id(asyncio.get_running_loop()),
+                "planning_active": self._planning_task is not None,
+                "actuation": json_copy(self._actuation) if self._actuation is not None else None,
+                "pending_strategy": json_copy(self._pending_strategy)
+                if self._pending_strategy is not None
+                else None,
+                "scene_state": json_copy(self._scene_state),
+            },
         }
 
     def _build_status_result(
@@ -1176,3 +1374,11 @@ class GameLLMAgent:
         items.append(dict(item))
         if len(items) > limit:
             del items[:-limit]
+
+    def _trace_runtime(self, message: str) -> None:
+        if not message:
+            return
+        if message == self._last_trace_message:
+            return
+        self._last_trace_message = message
+        self._logger.info("galgame_agent {}", message)

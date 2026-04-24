@@ -22,7 +22,7 @@
 
     <section class="panel panel-controls">
       <div class="panel-title-row">
-        <h2>控制</h2>
+        <h2>插件管理</h2>
       </div>
       <div class="control-grid">
         <label class="field">
@@ -30,7 +30,7 @@
           <select id="modeSelect">
             <option value="silent">静默</option>
             <option value="companion">伴读</option>
-            <option value="choice_advisor">选项顾问</option>
+            <option value="choice_advisor">主动陪伴</option>
           </select>
         </label>
         <label class="field checkbox-field">
@@ -146,18 +146,39 @@
         </div>
         <p id="ocrWindowTargetModeText" class="result-note"></p>
         <p id="ocrWindowRuntimeHint" class="panel-subcopy">等待 OCR 窗口候选列表。</p>
-        <div id="ocrWindowList" class="stack-list scroll-region empty-state">暂无候选窗口</div>
+
+        <div id="ocrLockedWindowCard" class="locked-window-card">
+          <div class="locked-window-empty">暂无锁定的窗口，请点击下方按钮选择。</div>
+        </div>
+
+        <div class="window-target-actions">
+          <button id="ocrWindowSelectBtn" class="primary">选择识别窗口</button>
+        </div>
+
         <details class="excluded-window-panel">
           <summary>查看排除窗口与原因</summary>
           <div id="ocrExcludedWindowList" class="stack-list scroll-region empty-state">暂无排除窗口</div>
         </details>
       </div>
 
+      <div id="ocrWindowModal" class="modal" hidden>
+        <div class="modal-overlay"></div>
+        <div class="modal-content">
+          <div class="modal-header">
+            <h3>选择识别窗口</h3>
+            <button id="ocrWindowModalClose" class="ghost modal-close" aria-label="关闭">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div id="ocrWindowList" class="stack-list scroll-region empty-state">暂无候选窗口</div>
+          </div>
+        </div>
+      </div>
+
       <div class="capture-profile-panel">
         <div class="panel-title-row compact">
           <div>
             <h3>OCR 截图校准</h3>
-            <p class="section-copy">按进程名保存窗口裁剪比例。现在可以先在上方锁定目标游戏窗口，再结合按进程截图配置收紧 OCR 截图区域。</p>
+            <p class="section-copy">按进程名保存窗口裁剪比例。普通游戏保存“通用区域”即可；哀鸿可以分别保存“对白区 / 菜单区”，避免专用双阶段 OCR 范围被互相覆盖。</p>
           </div>
         </div>
         <p id="ocrProfileRuntimeHint" class="panel-subcopy">等待 OCR 目标进程信息。</p>
@@ -165,6 +186,14 @@
           <label class="field">
             <span>进程名</span>
             <input id="ocrProfileProcessInput" type="text" placeholder="例如 game.exe">
+          </label>
+          <label class="field">
+            <span>配置阶段</span>
+            <select id="ocrProfileStageSelect">
+              <option value="default">通用区域</option>
+              <option value="dialogue_stage">对白区</option>
+              <option value="menu_stage">菜单区</option>
+            </select>
           </label>
           <label class="field">
             <span>左侧裁剪比例</span>

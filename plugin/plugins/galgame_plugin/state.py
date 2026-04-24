@@ -33,7 +33,7 @@ class GalgameSharedState:
     warmup_session_id: str = ""
     memory_reader_runtime: dict[str, Any] = field(default_factory=dict)
     ocr_reader_runtime: dict[str, Any] = field(default_factory=dict)
-    ocr_capture_profiles: dict[str, dict[str, float]] = field(default_factory=dict)
+    ocr_capture_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
     ocr_window_target: dict[str, Any] = field(default_factory=dict)
     plugin_error: str = ""
 

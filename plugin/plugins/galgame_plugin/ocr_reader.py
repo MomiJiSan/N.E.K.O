@@ -19,6 +19,10 @@ from .models import (
     DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
     DEFAULT_OCR_CAPTURE_TOP_RATIO,
     GalgameConfig,
+    OCR_CAPTURE_PROFILE_RATIO_KEYS,
+    OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    OCR_CAPTURE_PROFILE_STAGE_MENU,
 )
 from .rapidocr_support import (
     inspect_rapidocr_installation,
@@ -99,15 +103,36 @@ _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET = {
     "bottom_inset_ratio": 0.10,
 }
 _AIHONG_MENU_CAPTURE_PROFILE_PRESET = {
-    "left_inset_ratio": 0.08,
-    "right_inset_ratio": 0.08,
-    "top_ratio": 0.58,
-    "bottom_inset_ratio": 0.16,
+    "left_inset_ratio": 0.20,
+    "right_inset_ratio": 0.20,
+    "top_ratio": 0.40,
+    "bottom_inset_ratio": 0.34,
 }
-_AIHONG_DIALOGUE_STAGE = "dialogue_stage"
-_AIHONG_MENU_STAGE = "menu_stage"
-_AIHONG_MENU_MAX_LINES = 6
-_AIHONG_MENU_MAX_SIGNIFICANT_CHARS = 24
+_AIHONG_DIALOGUE_STAGE = OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+_AIHONG_MENU_STAGE = OCR_CAPTURE_PROFILE_STAGE_MENU
+_AIHONG_MENU_MAX_LINES = 4
+_AIHONG_MENU_MIN_SIGNIFICANT_CHARS = 2
+_AIHONG_MENU_MAX_SIGNIFICANT_CHARS = 10
+_AIHONG_MENU_DIALOGUE_MARKERS = (
+    ",",
+    ".",
+    ":",
+    ";",
+    "?",
+    "!",
+    "[",
+    "]",
+    "，",
+    "。",
+    "：",
+    "；",
+    "？",
+    "！",
+    "「",
+    "」",
+    "【",
+    "】",
+)
 _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
 
 
@@ -199,6 +224,29 @@ def _coerce_choice_lines(lines: list[str], *, allow_plain_text: bool = False) ->
     if allow_plain_text:
         return _coerce_plain_choice_lines(lines)
     return []
+
+
+def _looks_like_aihong_dialogue_text(text: str) -> bool:
+    normalized = normalize_text(text).strip()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _AIHONG_MENU_DIALOGUE_MARKERS)
+
+
+def _coerce_aihong_menu_choices(lines: list[str]) -> list[str]:
+    choices = _coerce_choice_lines(lines, allow_plain_text=True)
+    if not 2 <= len(choices) <= _AIHONG_MENU_MAX_LINES:
+        return []
+    normalized_choices: list[str] = []
+    for choice in choices:
+        text = normalize_text(str(choice or "")).replace("\n", " ").strip()
+        if not text or _looks_like_aihong_dialogue_text(text):
+            return []
+        significant_chars = _significant_char_count(text)
+        if not _AIHONG_MENU_MIN_SIGNIFICANT_CHARS <= significant_chars <= _AIHONG_MENU_MAX_SIGNIFICANT_CHARS:
+            return []
+        normalized_choices.append(text)
+    return normalized_choices
 
 
 @dataclass(slots=True)
@@ -497,7 +545,7 @@ def _stripped_ocr_lines(raw_text: str) -> list[str]:
 
 
 def _uses_manual_capture_profile(
-    profiles: dict[str, OcrCaptureProfile],
+    profiles: dict[str, dict[str, OcrCaptureProfile]],
     target: DetectedGameWindow,
 ) -> bool:
     process_name = str(target.process_name or "").strip().lower()
@@ -507,20 +555,67 @@ def _uses_manual_capture_profile(
 
 
 def _lookup_capture_profile(
-    profiles: dict[str, OcrCaptureProfile],
+    profiles: dict[str, dict[str, OcrCaptureProfile]],
     target: DetectedGameWindow,
+    *,
+    stage: str,
 ) -> OcrCaptureProfile | None:
     process_name = str(target.process_name or "").strip()
     if not process_name:
         return None
-    profile = profiles.get(process_name)
-    if profile is not None:
-        return profile
+    profile_map = profiles.get(process_name)
+    if profile_map is not None:
+        profile = profile_map.get(stage) or profile_map.get(OCR_CAPTURE_PROFILE_STAGE_DEFAULT)
+        if profile is not None:
+            return profile
     lowered = process_name.lower()
-    for configured_name, configured_profile in profiles.items():
+    for configured_name, configured_profile_map in profiles.items():
         if str(configured_name or "").strip().lower() == lowered:
-            return configured_profile
+            return configured_profile_map.get(stage) or configured_profile_map.get(
+                OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            )
     return None
+
+
+def _parse_configured_capture_profiles(
+    profiles: dict[str, dict[str, Any]],
+    logger,
+) -> dict[str, dict[str, OcrCaptureProfile]]:
+    parsed_profiles: dict[str, dict[str, OcrCaptureProfile]] = {}
+    for process_name, profile_value in profiles.items():
+        normalized_process_name = str(process_name or "").strip()
+        if not normalized_process_name or not isinstance(profile_value, dict):
+            continue
+        stage_profiles: dict[str, OcrCaptureProfile] = {}
+        if all(key in profile_value for key in OCR_CAPTURE_PROFILE_RATIO_KEYS):
+            try:
+                stage_profiles[OCR_CAPTURE_PROFILE_STAGE_DEFAULT] = OcrCaptureProfile.from_dict(
+                    profile_value
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ocr_reader failed to parse capture profile for %s: %s",
+                    normalized_process_name,
+                    exc,
+                )
+                continue
+        else:
+            for stage_name, stage_profile in profile_value.items():
+                normalized_stage_name = str(stage_name or "").strip()
+                if not normalized_stage_name or not isinstance(stage_profile, dict):
+                    continue
+                try:
+                    stage_profiles[normalized_stage_name] = OcrCaptureProfile.from_dict(stage_profile)
+                except Exception as exc:
+                    logger.warning(
+                        "ocr_reader failed to parse capture profile for %s/%s: %s",
+                        normalized_process_name,
+                        normalized_stage_name,
+                        exc,
+                    )
+        if stage_profiles:
+            parsed_profiles[normalized_process_name] = stage_profiles
+    return parsed_profiles
 
 
 @dataclass(slots=True)
@@ -610,6 +705,7 @@ class OcrReaderRuntime:
     session_id: str = ""
     last_seq: int = 0
     last_event_ts: str = ""
+    capture_stage: str = ""
     capture_profile: dict[str, float] = field(default_factory=dict)
     tesseract_path: str = ""
     languages: str = ""
@@ -640,6 +736,7 @@ class OcrReaderRuntime:
             "session_id": self.session_id,
             "last_seq": self.last_seq,
             "last_event_ts": self.last_event_ts,
+            "capture_stage": self.capture_stage,
             "capture_profile": dict(self.capture_profile),
             "tesseract_path": self.tesseract_path,
             "languages": self.languages,
@@ -1397,7 +1494,7 @@ class OcrReaderManager:
             time_fn=self._time_fn,
         )
         self._runtime = OcrReaderRuntime(enabled=config.ocr_reader_enabled)
-        self._capture_profiles: dict[str, OcrCaptureProfile] = {}
+        self._capture_profiles: dict[str, dict[str, OcrCaptureProfile]] = {}
         self._last_memory_reader_text_at = 0.0
         self._last_heartbeat_at = 0.0
         self._attached_window: DetectedGameWindow | None = None
@@ -1421,17 +1518,8 @@ class OcrReaderManager:
                 time_fn=self._time_fn,
             )
 
-    def update_capture_profiles(self, profiles: dict[str, dict[str, float]]) -> None:
-        self._capture_profiles = {}
-        for process_name, profile_dict in profiles.items():
-            try:
-                self._capture_profiles[str(process_name)] = OcrCaptureProfile.from_dict(profile_dict)
-            except Exception as exc:
-                self._logger.warning(
-                    "ocr_reader failed to parse capture profile for %s: %s",
-                    process_name,
-                    exc,
-                )
+    def update_capture_profiles(self, profiles: dict[str, dict[str, Any]]) -> None:
+        self._capture_profiles = _parse_configured_capture_profiles(profiles, self._logger)
 
     def update_window_target(self, target: dict[str, Any] | None) -> None:
         self._manual_target = OcrWindowTarget.from_dict(target)
@@ -1519,7 +1607,7 @@ class OcrReaderManager:
         return _uses_manual_capture_profile(self._capture_profiles, target)
 
     def _should_use_aihong_two_stage(self, target: DetectedGameWindow) -> bool:
-        return _matches_aihong_target(target) and not self._has_manual_capture_profile(target)
+        return _matches_aihong_target(target)
 
     @staticmethod
     def _stabilize_text_key(text: str, *, state: _StableOcrTextState) -> bool:
@@ -1564,7 +1652,7 @@ class OcrReaderManager:
 
     def _consume_aihong_menu_stage_text(self, raw_text: str, *, now: float) -> _MenuConsumeResult:
         lines = _stripped_ocr_lines(raw_text)
-        choices = _coerce_choice_lines(lines, allow_plain_text=True)
+        choices = _coerce_aihong_menu_choices(lines)
         if choices:
             return _MenuConsumeResult(
                 emitted_kind="choices"
@@ -1749,12 +1837,24 @@ class OcrReaderManager:
             self._last_heartbeat_at = now
             self._reset_default_ocr_state()
             self._reset_aihong_menu_state()
+            startup_profile_stage = (
+                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            )
+            startup_profile = self._capture_profile_for_target(
+                target,
+                stage=(
+                    self._aihong_stage
+                    if aihong_two_stage_enabled
+                    else _AIHONG_DIALOGUE_STAGE
+                ),
+            )
             self._runtime = self._build_runtime(
                 status="starting",
                 detail="starting_capture",
                 plan=backend_plan,
                 target=target,
-                capture_profile=profile.to_dict(),
+                capture_stage=startup_profile_stage,
+                capture_profile=startup_profile.to_dict(),
                 selection=selection,
                 game_id=self._writer.game_id,
                 session_id=self._writer.session_id,
@@ -1851,7 +1951,6 @@ class OcrReaderManager:
                                         now=now,
                                     )
                                     if menu_result.has_menu_candidate:
-                                        self._aihong_stage = _AIHONG_MENU_STAGE
                                         self._aihong_menu_missing_polls = 0
                                         runtime_profile = menu_profile
                                     if menu_result.emitted_kind == "line":
@@ -1863,6 +1962,8 @@ class OcrReaderManager:
                                         runtime_profile = menu_profile
                                     elif menu_result.emitted_kind == "choices":
                                         emitted = True
+                                        self._aihong_stage = _AIHONG_MENU_STAGE
+                                        self._aihong_menu_missing_polls = 0
                                         runtime_profile = menu_profile
                 else:
                     emitted = bool(self._consume_ocr_text(extraction.text, now=now))
@@ -1900,6 +2001,9 @@ class OcrReaderManager:
             active_backend=active_backend,
             backend_detail_override=backend_detail_override,
             target=target,
+            capture_stage=(
+                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            ),
             capture_profile=runtime_profile.to_dict(),
             selection=selection,
             game_id=self._writer.game_id,
@@ -1922,7 +2026,11 @@ class OcrReaderManager:
         *,
         stage: str = _AIHONG_DIALOGUE_STAGE,
     ) -> OcrCaptureProfile:
-        configured_profile = _lookup_capture_profile(self._capture_profiles, target)
+        configured_profile = _lookup_capture_profile(
+            self._capture_profiles,
+            target,
+            stage=stage,
+        )
         if configured_profile is not None:
             return configured_profile
 
@@ -2065,6 +2173,7 @@ class OcrReaderManager:
         active_backend: OcrBackendDescriptor | None = None,
         backend_detail_override: str = "",
         target: DetectedGameWindow | None = None,
+        capture_stage: str = "",
         capture_profile: dict[str, float] | None = None,
         selection: WindowSelectionResult | None = None,
         takeover_reason: str = "",
@@ -2098,6 +2207,7 @@ class OcrReaderManager:
             session_id=str(session_id or self._writer.session_id or self._runtime.session_id),
             last_seq=resolved_last_seq,
             last_event_ts=str(last_event_ts or self._writer.last_event_ts or self._runtime.last_event_ts),
+            capture_stage=str(capture_stage or self._runtime.capture_stage),
             capture_profile=dict(capture_profile or self._runtime.capture_profile),
             tesseract_path=self._resolved_tesseract_path(),
             languages=self._config.ocr_reader_languages,

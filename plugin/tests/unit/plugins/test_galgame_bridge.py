@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
@@ -28,6 +29,8 @@ from plugin.plugins.galgame_plugin.models import (
     DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_OCR_READER,
+    OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    OCR_CAPTURE_PROFILE_STAGE_MENU,
     STORE_OCR_CAPTURE_PROFILES,
     STORE_OCR_WINDOW_TARGET,
 )
@@ -335,8 +338,10 @@ def _shared_state(
     snapshot: dict[str, object] | None = None,
     history_lines: list[dict[str, object]] | None = None,
     history_choices: list[dict[str, object]] | None = None,
+    history_events: list[dict[str, object]] | None = None,
+    active_data_source: str | None = None,
 ) -> dict[str, object]:
-    return {
+    shared = {
         "mode": mode,
         "push_notifications": push_notifications,
         "current_connection_state": connection_state,
@@ -351,9 +356,13 @@ def _shared_state(
             line_id="line-1",
             ts="2026-04-21T08:30:02Z",
         ),
+        "history_events": list(history_events or []),
         "history_lines": list(history_lines or []),
         "history_choices": list(history_choices or []),
     }
+    if active_data_source is not None:
+        shared["active_data_source"] = active_data_source
+    return shared
 
 
 class _FakeHostAdapter:
@@ -524,6 +533,22 @@ def _ocr_reader_session(
         "pid": 5252,
     }
     return payload
+
+
+def _prepare_fake_tesseract_install(install_root: Path) -> None:
+    install_root.mkdir(parents=True, exist_ok=True)
+    (install_root / "tesseract.exe").write_text("", encoding="utf-8")
+    tessdata_dir = install_root / "tessdata"
+    tessdata_dir.mkdir(parents=True, exist_ok=True)
+    for language in ("chi_sim", "jpn", "eng"):
+        (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+
+
+def _read_bridge_events(events_path: Path) -> list[dict[str, Any]]:
+    result = tail_events_jsonl(events_path, offset=0, line_buffer=b"")
+    assert result.errors == []
+    assert result.line_buffer == b""
+    return result.events
 
 
 @pytest.mark.plugin_unit
@@ -1963,6 +1988,7 @@ async def test_set_ocr_capture_profile_updates_state_and_store(tmp_path: Path) -
 
     assert isinstance(saved, Ok)
     assert saved.value["process_name"] == "DemoGame.exe"
+    assert saved.value["stage"] == "default"
     assert saved.value["capture_profile"]["top_ratio"] == pytest.approx(0.34)
     with plugin._state_lock:
         assert plugin._state.ocr_capture_profiles["DemoGame.exe"]["left_inset_ratio"] == pytest.approx(0.08)
@@ -1978,6 +2004,117 @@ async def test_set_ocr_capture_profile_updates_state_and_store(tmp_path: Path) -
     assert cleared.value["cleared"] is True
     with plugin._state_lock:
         assert "DemoGame.exe" not in plugin._state.ocr_capture_profiles
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_aihong_stage_specific_capture_profiles_preserve_two_stage_resolution(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="TheLamentingGeese.exe",
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        left_inset_ratio=0.11,
+        right_inset_ratio=0.12,
+        top_ratio=0.61,
+        bottom_inset_ratio=0.14,
+    )
+
+    assert isinstance(saved, Ok)
+    assert saved.value["stage"] == OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+    with plugin._state_lock:
+        stored = plugin._state.ocr_capture_profiles["TheLamentingGeese.exe"]
+        assert stored[OCR_CAPTURE_PROFILE_STAGE_DIALOGUE]["top_ratio"] == pytest.approx(0.61)
+
+    assert plugin._ocr_reader_manager is not None
+    target = DetectedGameWindow(
+        hwnd=301,
+        title="哀鸿",
+        process_name="TheLamentingGeese.exe",
+        pid=6001,
+    )
+
+    dialogue_profile = plugin._ocr_reader_manager._capture_profile_for_target(
+        target,
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    )
+    menu_profile = plugin._ocr_reader_manager._capture_profile_for_target(
+        target,
+        stage=OCR_CAPTURE_PROFILE_STAGE_MENU,
+    )
+
+    assert plugin._ocr_reader_manager._should_use_aihong_two_stage(target) is True
+    assert dialogue_profile.top_ratio == pytest.approx(0.61)
+    assert menu_profile.top_ratio == pytest.approx(0.40)
+    assert menu_profile.bottom_inset_ratio == pytest.approx(0.34)
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_aihong_stage_specific_capture_profiles_can_save_and_clear_per_stage(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    dialogue_saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="TheLamentingGeese.exe",
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        left_inset_ratio=0.09,
+        right_inset_ratio=0.10,
+        top_ratio=0.62,
+        bottom_inset_ratio=0.15,
+    )
+    menu_saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="TheLamentingGeese.exe",
+        stage=OCR_CAPTURE_PROFILE_STAGE_MENU,
+        left_inset_ratio=0.18,
+        right_inset_ratio=0.19,
+        top_ratio=0.38,
+        bottom_inset_ratio=0.31,
+    )
+
+    assert isinstance(dialogue_saved, Ok)
+    assert isinstance(menu_saved, Ok)
+    with plugin._state_lock:
+        stored = plugin._state.ocr_capture_profiles["TheLamentingGeese.exe"]
+        assert stored[OCR_CAPTURE_PROFILE_STAGE_DIALOGUE]["left_inset_ratio"] == pytest.approx(0.09)
+        assert stored[OCR_CAPTURE_PROFILE_STAGE_MENU]["top_ratio"] == pytest.approx(0.38)
+    restored, _warnings = plugin._persist.load()
+    restored_entry = restored[STORE_OCR_CAPTURE_PROFILES]["TheLamentingGeese.exe"]
+    assert restored_entry[OCR_CAPTURE_PROFILE_STAGE_DIALOGUE]["bottom_inset_ratio"] == pytest.approx(0.15)
+    assert restored_entry[OCR_CAPTURE_PROFILE_STAGE_MENU]["right_inset_ratio"] == pytest.approx(0.19)
+
+    cleared = await plugin.galgame_set_ocr_capture_profile(
+        process_name="TheLamentingGeese.exe",
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        clear=True,
+    )
+
+    assert isinstance(cleared, Ok)
+    with plugin._state_lock:
+        stored = plugin._state.ocr_capture_profiles["TheLamentingGeese.exe"]
+        assert OCR_CAPTURE_PROFILE_STAGE_DIALOGUE not in stored
+        assert OCR_CAPTURE_PROFILE_STAGE_MENU in stored
 
 
 @pytest.mark.asyncio
@@ -2053,12 +2190,7 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
 ) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     install_root = tmp_path / "Tesseract"
-    install_root.mkdir(parents=True, exist_ok=True)
-    (install_root / "tesseract.exe").write_text("", encoding="utf-8")
-    tessdata_dir = install_root / "tessdata"
-    tessdata_dir.mkdir(parents=True, exist_ok=True)
-    for language in ("chi_sim", "jpn", "eng"):
-        (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+    _prepare_fake_tesseract_install(install_root)
 
     cfg = _make_effective_config(
         bridge_root,
@@ -2125,12 +2257,7 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
 async def test_bridge_sdk_session_preempts_ocr_reader_candidate(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     install_root = tmp_path / "Tesseract"
-    install_root.mkdir(parents=True, exist_ok=True)
-    (install_root / "tesseract.exe").write_text("", encoding="utf-8")
-    tessdata_dir = install_root / "tessdata"
-    tessdata_dir.mkdir(parents=True, exist_ok=True)
-    for language in ("chi_sim", "jpn", "eng"):
-        (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+    _prepare_fake_tesseract_install(install_root)
 
     ctx = _Ctx(
         plugin_dir,
@@ -2204,6 +2331,136 @@ async def test_bridge_sdk_session_preempts_ocr_reader_candidate(tmp_path: Path) 
     assert isinstance(snapshot, Ok)
     assert status.value["active_data_source"] == DATA_SOURCE_BRIDGE_SDK
     assert snapshot.value["snapshot"]["text"] == "来自 Bridge SDK 的台词。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_aihong_menu_stage_rejects_short_dialogue_false_positive(tmp_path: Path) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 999.0,
+        },
+    )
+    clock = {"now": 1712000000.0}
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(cfg),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=301,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=6001,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "王生：前文台词。",
+                "王生：前文台词。",
+                "",
+                "",
+                "王生\n别喝了。",
+                "",
+                "王生\n别喝了。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    for _ in range(6):
+        await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        clock["now"] += 1.0
+
+    game_dir = bridge_root / str(manager._writer.game_id)
+    session = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+
+    assert session.error == ""
+    assert session.session is not None
+    assert all(event["type"] != "choices_shown" for event in events)
+    assert session.session["state"]["is_menu_open"] is False
+    assert session.session["state"]["choices"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_aihong_menu_stage_requires_two_stable_short_menu_reads_before_choices_event(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 999.0,
+        },
+    )
+    clock = {"now": 1712100000.0}
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(cfg),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=302,
+                title="哀鸿",
+                process_name="TheLamentingGeese.exe",
+                pid=6002,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "王生：前文台词。",
+                "王生：前文台词。",
+                "",
+                "",
+                "去东院\n去西院",
+                "",
+                "去东院\n去西院",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    for _ in range(5):
+        await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        clock["now"] += 1.0
+
+    game_dir = bridge_root / str(manager._writer.game_id)
+    events_before_confirm = _read_bridge_events(game_dir / "events.jsonl")
+    assert all(event["type"] != "choices_shown" for event in events_before_confirm)
+
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+
+    session = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+
+    assert session.error == ""
+    assert session.session is not None
+    assert [event["type"] for event in events][-1] == "choices_shown"
+    assert session.session["state"]["is_menu_open"] is True
+    assert [item["text"] for item in session.session["state"]["choices"]] == ["去东院", "去西院"]
 
 
 @pytest.mark.asyncio
@@ -3062,7 +3319,7 @@ async def test_host_agent_adapter_round_trip_and_cancel(monkeypatch: pytest.Monk
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         adapter = HostAgentAdapter(_Logger(), tool_server_port=48915)
-        monkeypatch.setattr(adapter, "_get_client", lambda: client)
+        monkeypatch.setattr(adapter, "_build_client", lambda: client)
 
         availability = await adapter.get_computer_use_availability()
         started = await adapter.run_computer_use_instruction("advance once")
@@ -3077,7 +3334,7 @@ async def test_host_agent_adapter_round_trip_and_cancel(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
-async def test_host_agent_adapter_falls_back_after_closed_loop_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_host_agent_adapter_rebuilds_client_after_closed_loop_error(monkeypatch: pytest.MonkeyPatch) -> None:
     app = FastAPI()
 
     @app.get("/tasks/task-1")
@@ -3089,23 +3346,58 @@ async def test_host_agent_adapter_falls_back_after_closed_loop_error(monkeypatch
         adapter = HostAgentAdapter(_Logger(), tool_server_port=48915)
 
         class _BrokenSharedClient:
+            is_closed = False
+
             async def request(self, *args, **kwargs):
                 raise RuntimeError("Event loop is closed")
 
-        broken_client = _BrokenSharedClient()
-        calls = {"count": 0}
+            async def aclose(self):
+                self.is_closed = True
 
-        def _fake_get_client():
-            calls["count"] += 1
-            if calls["count"] == 1:
-                return broken_client
-            return fallback_client
-
-        monkeypatch.setattr(adapter, "_get_client", _fake_get_client)
+        built_clients = [_BrokenSharedClient(), fallback_client]
+        monkeypatch.setattr(adapter, "_build_client", lambda: built_clients.pop(0))
         task = await adapter.get_task("task-1")
 
     assert task["status"] == "running"
-    assert adapter._prefer_fallback_client is True
+    assert adapter._client is fallback_client
+
+
+@pytest.mark.plugin_unit
+def test_host_agent_adapter_rebuilds_client_after_loop_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = HostAgentAdapter(_Logger(), tool_server_port=48915)
+    built_clients = []
+
+    class _LoopAwareAdapterClient:
+        def __init__(self, index: int) -> None:
+            self.index = index
+            self.is_closed = False
+
+        async def request(self, method: str, url: str, **kwargs):
+            del kwargs
+            return httpx.Response(
+                200,
+                json={"ready": True, "client_index": self.index},
+                request=httpx.Request(method, url),
+            )
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    def _build_client():
+        client = _LoopAwareAdapterClient(len(built_clients) + 1)
+        built_clients.append(client)
+        return client
+
+    monkeypatch.setattr(adapter, "_build_client", _build_client)
+
+    first = _run_in_new_loop(adapter.get_computer_use_availability())
+    second = _run_in_new_loop(adapter.get_computer_use_availability())
+
+    assert first["client_index"] == 1
+    assert second["client_index"] == 2
+    assert len(built_clients) == 2
+    assert built_clients[0].is_closed is True
+    assert built_clients[1].is_closed is False
 
 
 @pytest.mark.asyncio
@@ -3286,6 +3578,74 @@ async def test_game_llm_agent_falls_back_to_first_choice_when_suggest_is_degrade
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_ocr_choice_planning_waits_for_confirmed_choices_event(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    visible_choices = [
+        {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+        {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+    ]
+    snapshot = _session_state(
+        speaker="雪乃",
+        text="你要走哪边？",
+        scene_id="scene-a",
+        line_id="line-1",
+        choices=visible_choices,
+        is_menu_open=True,
+        ts="2026-04-21T08:31:00Z",
+    )
+    shared_unconfirmed = _shared_state(
+        snapshot=snapshot,
+        active_data_source=DATA_SOURCE_OCR_READER,
+        history_events=[],
+    )
+
+    await agent.tick(shared_unconfirmed)
+    await asyncio.sleep(0)
+
+    assert fake_gateway.suggest_calls == []
+    assert fake_host.started == []
+
+    shared_confirmed = _shared_state(
+        snapshot=snapshot,
+        active_data_source=DATA_SOURCE_OCR_READER,
+        last_seq=3,
+        history_events=[
+            {
+                "seq": 3,
+                "ts": "2026-04-21T08:31:01Z",
+                "type": "choices_shown",
+                "session_id": "sess-a",
+                "game_id": "demo.alpha",
+                "payload": {
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                    "choices": visible_choices,
+                },
+            }
+        ],
+    )
+
+    await agent.tick(shared_confirmed)
+    await asyncio.sleep(0)
+
+    assert len(fake_gateway.suggest_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_send_message_interrupts_pending_planning(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
@@ -3365,6 +3725,122 @@ async def test_game_llm_agent_retries_dialogue_with_alternate_advance_strategy(
     assert len(fake_host.started) == 2
     assert "click the usual continue area exactly once" in fake_host.started[-1]
     assert agent._failure_memory[-1]["strategy_id"] == "advance_enter"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_awaiting_bridge_accepts_meaningful_history_progress_without_signature_delta(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="剧情还在原地。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+    )
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    shared_after = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="剧情还在原地。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_events=[
+            {
+                "seq": 3,
+                "ts": "2026-04-21T08:31:06Z",
+                "type": "line_changed",
+                "line_id": "line-1",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "payload": {
+                    "speaker": "雪乃",
+                    "text": "剧情还在原地。",
+                    "scene_id": "scene-a",
+                    "line_id": "line-1",
+                    "route_id": "",
+                },
+            }
+        ],
+        last_seq=3,
+    )
+
+    await agent.tick(shared_after)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_ocr_awaiting_bridge_waits_longer_before_retry(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 6.0
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+    assert agent._pending_strategy is None
+
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 13.0
+    await agent.tick(shared)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is not None
+    assert agent._pending_strategy["strategy_id"] == "advance_click"
 
 
 @pytest.mark.asyncio

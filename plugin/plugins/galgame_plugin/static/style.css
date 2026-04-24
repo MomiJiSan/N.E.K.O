@@ -325,6 +325,40 @@ button[disabled] {
   justify-content: flex-end;
 }
 
+.locked-window-card {
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.locked-window-card .locked-window-empty {
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+  padding: 12px 0;
+}
+
+.locked-window-card .locked-window-info {
+  display: grid;
+  gap: 6px;
+}
+
+.locked-window-card .locked-window-info .list-kicker {
+  margin-bottom: 4px;
+}
+
+.locked-window-card .locked-window-info h3 {
+  font-size: 16px;
+}
+
+.window-target-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 14px;
+}
+
 .window-candidate-list {
   max-height: 280px;
 }
@@ -570,6 +604,78 @@ button[disabled] {
   border: 1px dashed var(--line);
   border-radius: 18px;
   color: var(--muted);
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal[hidden] {
+  display: none;
+}
+
+.modal-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(31, 42, 51, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+.modal-content {
+  position: relative;
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(720px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius);
+  background: var(--paper);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+.modal-header h3 {
+  font-size: 18px;
+}
+
+.modal-close {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  line-height: 1;
+  border-radius: 999px;
+}
+
+.modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 22px;
+}
+
+.modal-body .stack-list {
+  gap: 10px;
+}
+
+.modal-body .empty-state {
+  min-height: 120px;
 }
 
 .mono {
