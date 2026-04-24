@@ -46,8 +46,30 @@ plugin_ui_query_service = PluginUiQueryService()
 run_service = RunService()
 
 
-class TextractorInstallStartPayload(BaseModel):
+class InstallStartPayload(BaseModel):
     force: bool = False
+
+
+def _get_install_kind_spec(kind: str) -> dict[str, str]:
+    normalized = str(kind or "").strip().lower()
+    mapping = {
+        "textractor": {
+            "kind": "textractor",
+            "entry_id": "galgame_install_textractor",
+            "label": "Textractor",
+            "queued_message": "Textractor install queued",
+        },
+        "tesseract": {
+            "kind": "tesseract",
+            "entry_id": "galgame_install_tesseract",
+            "label": "Tesseract",
+            "queued_message": "Tesseract install queued",
+        },
+    }
+    spec = mapping.get(normalized)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unsupported galgame install kind: {kind!r}")
+    return spec
 
 async def _get_plugin_static_dir(plugin_id: str) -> Path | None:
     """获取插件的静态文件目录
@@ -86,7 +108,7 @@ def _run_to_install_status(run_status: str) -> str:
     return mapping.get(run_status, "queued")
 
 
-def _install_state_from_run(run_record) -> dict[str, object]:
+def _install_state_from_run(run_record, *, kind: str) -> dict[str, object]:
     metrics = dict(getattr(run_record, "metrics", {}) or {})
     status = _run_to_install_status(str(getattr(run_record, "status", "") or "queued"))
     phase = str(getattr(run_record, "stage", "") or status)
@@ -95,6 +117,7 @@ def _install_state_from_run(run_record) -> dict[str, object]:
     payload = build_install_task_state(
         task_id=str(getattr(run_record, "task_id", None) or getattr(run_record, "run_id")),
         run_id=str(getattr(run_record, "run_id")),
+        kind=kind,
         status=status,
         phase=phase,
         message=message,
@@ -111,24 +134,24 @@ def _install_state_from_run(run_record) -> dict[str, object]:
     return payload
 
 
-def _resolve_install_task_payload(task_id: str) -> dict[str, object]:
-    state_payload = load_install_task_state(task_id)
+def _resolve_install_task_payload(task_id: str, *, kind: str, label: str) -> dict[str, object]:
+    state_payload = load_install_task_state(task_id, kind=kind)
     try:
         run_record = run_service.get_run(task_id)
     except ServerDomainError:
         run_record = None
 
     if state_payload is None and run_record is None:
-        raise HTTPException(status_code=404, detail=f"Textractor install task '{task_id}' not found")
+        raise HTTPException(status_code=404, detail=f"{label} install task '{task_id}' not found")
 
     if state_payload is None and run_record is not None:
-        return _install_state_from_run(run_record)
+        return _install_state_from_run(run_record, kind=kind)
 
     payload = dict(state_payload or {})
     if run_record is None:
         return payload
 
-    run_payload = _install_state_from_run(run_record)
+    run_payload = _install_state_from_run(run_record, kind=kind)
     payload["run_id"] = str(payload.get("run_id") or run_payload.get("run_id") or task_id)
     payload["task_id"] = str(payload.get("task_id") or task_id)
 
@@ -161,6 +184,106 @@ def _resolve_install_task_payload(task_id: str) -> dict[str, object]:
         payload["resume_from"] = int(metrics.get("resume_from") or 0)
     payload["updated_at"] = getattr(run_record, "updated_at", None) or payload.get("updated_at")
     return payload
+
+
+async def _start_install_task(
+    *,
+    plugin_id: str,
+    kind: str,
+    payload: InstallStartPayload,
+    request: Request,
+) -> JSONResponse:
+    _ensure_galgame_plugin(plugin_id)
+    spec = _get_install_kind_spec(kind)
+    try:
+        client_host = request.client.host if request.client is not None else None
+        created = await run_service.create_run(
+            RunCreateRequest(
+                plugin_id=plugin_id,
+                entry_id=spec["entry_id"],
+                args={"force": bool(payload.force)},
+            ),
+            client_host=client_host,
+        )
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+    state_payload = update_install_task_state(
+        created.run_id,
+        kind=spec["kind"],
+        run_id=created.run_id,
+        status="queued",
+        phase="queued",
+        message=spec["queued_message"],
+        progress=0.0,
+    )
+    return JSONResponse(
+        {
+            "task_id": created.run_id,
+            "run_id": created.run_id,
+            "status": created.status,
+            "state": state_payload,
+        }
+    )
+
+
+def _latest_install_task_payload(*, plugin_id: str, kind: str) -> JSONResponse:
+    _ensure_galgame_plugin(plugin_id)
+    spec = _get_install_kind_spec(kind)
+    payload = load_latest_install_task_state(kind=spec["kind"])
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"No {spec['label']} install task found")
+    task_id = str(payload.get("task_id") or "").strip()
+    return JSONResponse(
+        _resolve_install_task_payload(task_id, kind=spec["kind"], label=spec["label"])
+    )
+
+
+def _get_install_task_payload(*, plugin_id: str, kind: str, task_id: str) -> JSONResponse:
+    _ensure_galgame_plugin(plugin_id)
+    spec = _get_install_kind_spec(kind)
+    return JSONResponse(
+        _resolve_install_task_payload(task_id, kind=spec["kind"], label=spec["label"])
+    )
+
+
+def _install_stream_response(*, plugin_id: str, kind: str, task_id: str, request: Request) -> StreamingResponse:
+    _ensure_galgame_plugin(plugin_id)
+    spec = _get_install_kind_spec(kind)
+
+    async def _event_stream():
+        last_payload = ""
+        idle_cycles = 0
+        while True:
+            if await request.is_disconnected():
+                break
+            payload = _resolve_install_task_payload(
+                task_id,
+                kind=spec["kind"],
+                label=spec["label"],
+            )
+            serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if serialized != last_payload:
+                last_payload = serialized
+                idle_cycles = 0
+                yield f"data: {serialized}\n\n"
+                if str(payload.get("status") or "") in INSTALL_TERMINAL_STATUSES:
+                    break
+            else:
+                idle_cycles += 1
+                if idle_cycles % 20 == 0:
+                    yield ": keep-alive\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _get_mime_type(file_path: Path) -> str:
@@ -307,55 +430,49 @@ async def plugin_ui_info(plugin_id: str):
 @router.post("/plugin/{plugin_id}/ui-api/textractor/install")
 async def galgame_plugin_start_textractor_install(
     plugin_id: str,
-    payload: TextractorInstallStartPayload,
+    payload: InstallStartPayload,
     request: Request,
 ):
-    _ensure_galgame_plugin(plugin_id)
-    try:
-        client_host = request.client.host if request.client is not None else None
-        created = await run_service.create_run(
-            RunCreateRequest(
-                plugin_id=plugin_id,
-                entry_id="galgame_install_textractor",
-                args={"force": bool(payload.force)},
-            ),
-            client_host=client_host,
-        )
-    except ServerDomainError as error:
-        raise_http_from_domain(error, logger=logger)
-
-    state_payload = update_install_task_state(
-        created.run_id,
-        run_id=created.run_id,
-        status="queued",
-        phase="queued",
-        message="Textractor install queued",
-        progress=0.0,
+    return await _start_install_task(
+        plugin_id=plugin_id,
+        kind="textractor",
+        payload=payload,
+        request=request,
     )
-    return JSONResponse(
-        {
-            "task_id": created.run_id,
-            "run_id": created.run_id,
-            "status": created.status,
-            "state": state_payload,
-        }
+
+
+@router.post("/plugin/{plugin_id}/ui-api/tesseract/install")
+async def galgame_plugin_start_tesseract_install(
+    plugin_id: str,
+    payload: InstallStartPayload,
+    request: Request,
+):
+    return await _start_install_task(
+        plugin_id=plugin_id,
+        kind="tesseract",
+        payload=payload,
+        request=request,
     )
 
 
 @router.get("/plugin/{plugin_id}/ui-api/textractor/install/latest")
 async def galgame_plugin_latest_textractor_install(plugin_id: str):
-    _ensure_galgame_plugin(plugin_id)
-    payload = load_latest_install_task_state()
-    if payload is None:
-        raise HTTPException(status_code=404, detail="No Textractor install task found")
-    task_id = str(payload.get("task_id") or "").strip()
-    return JSONResponse(_resolve_install_task_payload(task_id))
+    return _latest_install_task_payload(plugin_id=plugin_id, kind="textractor")
+
+
+@router.get("/plugin/{plugin_id}/ui-api/tesseract/install/latest")
+async def galgame_plugin_latest_tesseract_install(plugin_id: str):
+    return _latest_install_task_payload(plugin_id=plugin_id, kind="tesseract")
 
 
 @router.get("/plugin/{plugin_id}/ui-api/textractor/install/{task_id}")
 async def galgame_plugin_get_textractor_install(plugin_id: str, task_id: str):
-    _ensure_galgame_plugin(plugin_id)
-    return JSONResponse(_resolve_install_task_payload(task_id))
+    return _get_install_task_payload(plugin_id=plugin_id, kind="textractor", task_id=task_id)
+
+
+@router.get("/plugin/{plugin_id}/ui-api/tesseract/install/{task_id}")
+async def galgame_plugin_get_tesseract_install(plugin_id: str, task_id: str):
+    return _get_install_task_payload(plugin_id=plugin_id, kind="tesseract", task_id=task_id)
 
 
 @router.get("/plugin/{plugin_id}/ui-api/textractor/install/{task_id}/stream")
@@ -364,34 +481,23 @@ async def galgame_plugin_stream_textractor_install(
     task_id: str,
     request: Request,
 ):
-    _ensure_galgame_plugin(plugin_id)
+    return _install_stream_response(
+        plugin_id=plugin_id,
+        kind="textractor",
+        task_id=task_id,
+        request=request,
+    )
 
-    async def _event_stream():
-        last_payload = ""
-        idle_cycles = 0
-        while True:
-            if await request.is_disconnected():
-                break
-            payload = _resolve_install_task_payload(task_id)
-            serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            if serialized != last_payload:
-                last_payload = serialized
-                idle_cycles = 0
-                yield f"data: {serialized}\n\n"
-                if str(payload.get("status") or "") in INSTALL_TERMINAL_STATUSES:
-                    break
-            else:
-                idle_cycles += 1
-                if idle_cycles % 20 == 0:
-                    yield ": keep-alive\n\n"
-            await asyncio.sleep(0.5)
 
-    return StreamingResponse(
-        _event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+@router.get("/plugin/{plugin_id}/ui-api/tesseract/install/{task_id}/stream")
+async def galgame_plugin_stream_tesseract_install(
+    plugin_id: str,
+    task_id: str,
+    request: Request,
+):
+    return _install_stream_response(
+        plugin_id=plugin_id,
+        kind="tesseract",
+        task_id=task_id,
+        request=request,
     )

@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">N.E.K.O Phase 2</p>
         <h1>Galgame Plugin</h1>
-        <p class="hero-copy">在 Phase 1 稳定桥接之上，展示当前连接状态、快照、解释/总结/选项建议，以及 Game LLM Agent 的运行状态与推送记录。</p>
+        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。这里会展示主桥接状态、OCR 主 fallback 运行时、Tesseract 安装流、截图校准，以及 Game LLM Agent 的后台状态。</p>
       </div>
       <div class="hero-actions">
         <button id="refreshBtn" class="primary">刷新全部</button>
@@ -43,6 +43,7 @@
           <button id="standbyOffBtn" class="ghost">恢复活跃</button>
         </div>
       </div>
+
       <div class="control-grid bind-grid">
         <label class="field grow">
           <span>手动绑定 game_id</span>
@@ -51,6 +52,7 @@
         <button id="bindBtn" class="secondary">绑定</button>
         <button id="clearBindBtn" class="ghost">恢复自动</button>
       </div>
+
       <div class="control-grid agent-grid">
         <label class="field grow">
           <span>给 Agent 的文本</span>
@@ -59,28 +61,91 @@
         <button id="queryContextBtn" class="secondary">查询上下文</button>
         <button id="sendMessageBtn" class="secondary">发送消息</button>
       </div>
-      <div id="textractorPrompt" class="textractor-banner" hidden>
-        <div class="textractor-copy">
-          <p id="textractorPromptKicker" class="list-kicker">Textractor</p>
-          <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
-          <p id="textractorPromptBody">用于 Windows 读内存兜底的 TextractorCLI.exe 检测结果会显示在这里。</p>
-          <p id="textractorPathText" class="result-note"></p>
-          <div id="textractorInstallState" class="install-task-card" hidden>
-            <div class="install-task-head">
-              <p id="textractorInstallStatusText" class="install-task-status">等待安装任务</p>
-              <p id="textractorInstallPercent" class="install-task-percent">0%</p>
+
+      <div class="install-stack">
+        <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
+          <div class="install-copy">
+            <p id="tesseractPromptKicker" class="list-kicker">OCR 主 fallback</p>
+            <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
+            <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的检测结果会显示在这里。</p>
+            <p id="tesseractPathText" class="result-note"></p>
+            <div id="tesseractInstallState" class="install-task-card" hidden>
+              <div class="install-task-head">
+                <p id="tesseractInstallStatusText" class="install-task-status">等待安装任务</p>
+                <p id="tesseractInstallPercent" class="install-task-percent">0%</p>
+              </div>
+              <div class="install-task-bar">
+                <div id="tesseractInstallBar" class="install-task-bar-fill"></div>
+              </div>
+              <p id="tesseractInstallMessage" class="result-note"></p>
+              <p id="tesseractInstallDetail" class="result-note"></p>
             </div>
-            <div class="install-task-bar">
-              <div id="textractorInstallBar" class="install-task-bar-fill"></div>
-            </div>
-            <p id="textractorInstallMessage" class="result-note"></p>
-            <p id="textractorInstallDetail" class="result-note"></p>
+          </div>
+          <div class="install-actions">
+            <button id="tesseractInstallBtn" class="primary">一键安装 Tesseract</button>
           </div>
         </div>
-        <div class="textractor-actions">
-          <button id="textractorInstallBtn" class="primary">一键安装 Textractor</button>
+
+        <div id="textractorPrompt" class="install-banner install-banner-textractor" hidden>
+          <div class="install-copy">
+            <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
+            <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
+            <p id="textractorPromptBody">Textractor 仍保留为 Memory Reader 的实验性 fallback，不再是当前首发主线。</p>
+            <p id="textractorPathText" class="result-note"></p>
+            <div id="textractorInstallState" class="install-task-card" hidden>
+              <div class="install-task-head">
+                <p id="textractorInstallStatusText" class="install-task-status">等待安装任务</p>
+                <p id="textractorInstallPercent" class="install-task-percent">0%</p>
+              </div>
+              <div class="install-task-bar">
+                <div id="textractorInstallBar" class="install-task-bar-fill"></div>
+              </div>
+              <p id="textractorInstallMessage" class="result-note"></p>
+              <p id="textractorInstallDetail" class="result-note"></p>
+            </div>
+          </div>
+          <div class="install-actions">
+            <button id="textractorInstallBtn" class="secondary">一键安装 Textractor</button>
+          </div>
         </div>
       </div>
+
+      <div class="capture-profile-panel">
+        <div class="panel-title-row compact">
+          <div>
+            <h3>OCR 截图校准</h3>
+            <p class="section-copy">按进程名保存窗口裁剪比例。当前没有独立手动选窗器，本轮通过更严格的窗口筛选和 per-process capture profile 提高可用性。</p>
+          </div>
+        </div>
+        <p id="ocrProfileRuntimeHint" class="panel-subcopy">等待 OCR 目标进程信息。</p>
+        <div class="capture-profile-grid">
+          <label class="field">
+            <span>process_name</span>
+            <input id="ocrProfileProcessInput" type="text" placeholder="例如 game.exe">
+          </label>
+          <label class="field">
+            <span>left_inset_ratio</span>
+            <input id="ocrProfileLeftInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
+          </label>
+          <label class="field">
+            <span>right_inset_ratio</span>
+            <input id="ocrProfileRightInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
+          </label>
+          <label class="field">
+            <span>top_ratio</span>
+            <input id="ocrProfileTopInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.30">
+          </label>
+          <label class="field">
+            <span>bottom_inset_ratio</span>
+            <input id="ocrProfileBottomInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.30">
+          </label>
+          <div class="capture-profile-actions">
+            <button id="ocrProfileSaveBtn" class="secondary">保存校准</button>
+            <button id="ocrProfileClearBtn" class="ghost">清空校准</button>
+          </div>
+        </div>
+      </div>
+
       <div id="flashMessage" class="flash-message" hidden></div>
     </section>
 
@@ -90,6 +155,13 @@
           <h2>状态</h2>
         </div>
         <dl id="statusGrid" class="data-grid"></dl>
+      </article>
+
+      <article class="panel">
+        <div class="panel-title-row">
+          <h2>OCR 运行时</h2>
+        </div>
+        <dl id="ocrRuntimeGrid" class="data-grid"></dl>
       </article>
 
       <article class="panel">

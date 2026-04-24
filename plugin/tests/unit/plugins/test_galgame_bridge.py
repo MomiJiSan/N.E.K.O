@@ -23,7 +23,16 @@ from plugin.plugins.galgame_plugin.memory_reader import (
     MemoryReaderBridgeWriter,
     MemoryReaderManager,
 )
-from plugin.plugins.galgame_plugin.models import DATA_SOURCE_BRIDGE_SDK, DATA_SOURCE_MEMORY_READER
+from plugin.plugins.galgame_plugin.models import (
+    DATA_SOURCE_BRIDGE_SDK,
+    DATA_SOURCE_MEMORY_READER,
+    DATA_SOURCE_OCR_READER,
+)
+from plugin.plugins.galgame_plugin.ocr_reader import (
+    DetectedGameWindow,
+    OcrReaderBridgeWriter,
+    OcrReaderManager,
+)
 from plugin.plugins.galgame_plugin.reader import (
     expand_bridge_root,
     read_session_json,
@@ -430,6 +439,37 @@ class _FakeTextractorHandle:
     async def wait(self, timeout: float) -> int | None:
         del timeout
         return self.returncode
+
+
+class _FakeCaptureBackend:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}:{target.pid}"
+
+    def capture_frame(self, target: DetectedGameWindow, profile) -> str:
+        del profile
+        return f"frame:{target.hwnd}"
+
+
+class _FakeOcrBackend:
+    def __init__(self, texts: list[str] | None = None) -> None:
+        self._texts = list(texts or [])
+
+    def is_available(self) -> bool:
+        return True
+
+    def extract_text(self, image: str) -> str:
+        del image
+        if not self._texts:
+            return ""
+        if len(self._texts) == 1:
+            return self._texts[0]
+        return self._texts.pop(0)
 
 
 def _memory_reader_session(
@@ -1633,6 +1673,269 @@ async def test_install_textractor_entry_returns_install_result_and_refreshed_sta
     assert result.value["status"]["textractor"]["detected_path"] == str(
         install_root / "TextractorCLI.exe"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_install_tesseract_entry_returns_install_result_and_refreshed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "TesseractInstalled"
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={
+                "enabled": True,
+                "install_target_dir": str(install_root),
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    async def _fake_install_tesseract(**kwargs):
+        del kwargs
+        install_root.mkdir(parents=True, exist_ok=True)
+        (install_root / "tesseract.exe").write_text("", encoding="utf-8")
+        tessdata_dir = install_root / "tessdata"
+        tessdata_dir.mkdir(parents=True, exist_ok=True)
+        for language in ("chi_sim", "jpn", "eng"):
+            (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+        return {
+            "installed": True,
+            "already_installed": False,
+            "detected_path": str(install_root / "tesseract.exe"),
+            "target_dir": str(install_root),
+            "expected_executable_path": str(install_root / "tesseract.exe"),
+            "tessdata_dir": str(tessdata_dir),
+            "required_languages": ["chi_sim", "jpn", "eng"],
+            "missing_languages": [],
+            "install_supported": True,
+            "can_install": False,
+            "detail": "installed",
+            "summary": "Tesseract 安装完成",
+            "release_name": "Tesseract OCR",
+            "asset_name": "tesseract-ocr-w64-setup.exe",
+        }
+
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.install_tesseract",
+        _fake_install_tesseract,
+    )
+
+    result = await plugin.galgame_install_tesseract()
+
+    assert isinstance(result, Ok)
+    assert result.value["summary"] == "Tesseract 安装完成"
+    assert result.value["install_result"]["installed"] is True
+    assert result.value["status"]["tesseract"]["installed"] is True
+    assert result.value["status"]["tesseract"]["detected_path"] == str(
+        install_root / "tesseract.exe"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_ocr_capture_profile_updates_state_and_store(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="DemoGame.exe",
+        left_inset_ratio=0.08,
+        right_inset_ratio=0.06,
+        top_ratio=0.34,
+        bottom_inset_ratio=0.22,
+    )
+
+    assert isinstance(saved, Ok)
+    assert saved.value["process_name"] == "DemoGame.exe"
+    assert saved.value["capture_profile"]["top_ratio"] == pytest.approx(0.34)
+    with plugin._state_lock:
+        assert plugin._state.ocr_capture_profiles["DemoGame.exe"]["left_inset_ratio"] == pytest.approx(0.08)
+    restored, _warnings = plugin._persist.load()
+    assert restored[STORE_OCR_CAPTURE_PROFILES]["DemoGame.exe"]["bottom_inset_ratio"] == pytest.approx(0.22)
+
+    cleared = await plugin.galgame_set_ocr_capture_profile(
+        process_name="DemoGame.exe",
+        clear=True,
+    )
+
+    assert isinstance(cleared, Ok)
+    assert cleared.value["cleared"] is True
+    with plugin._state_lock:
+        assert "DemoGame.exe" not in plugin._state.ocr_capture_profiles
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_are_missing(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    install_root.mkdir(parents=True, exist_ok=True)
+    (install_root / "tesseract.exe").write_text("", encoding="utf-8")
+    tessdata_dir = install_root / "tessdata"
+    tessdata_dir.mkdir(parents=True, exist_ok=True)
+    for language in ("chi_sim", "jpn", "eng"):
+        (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "enabled": True,
+            "textractor_path": "",
+        },
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 999.0,
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    clock = {"now": 1710000000.0}
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=101,
+                title="OCR Demo Window",
+                process_name="DemoGame.exe",
+                pid=4242,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "雪乃：来自 OCR 的台词。",
+                "雪乃：来自 OCR 的台词。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    clock["now"] += 1.0
+    await plugin._poll_bridge(force=True)
+    clock["now"] += 1.0
+    await plugin._poll_bridge(force=True)
+
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
+    assert status.value["summary"].startswith("已通过 OCR 读取连接（降级模式）")
+    assert snapshot.value["snapshot"]["scene_id"] == "ocr:unknown_scene"
+    assert snapshot.value["snapshot"]["line_id"].startswith("ocr:")
+    assert snapshot.value["snapshot"]["text"] == "来自 OCR 的台词。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_bridge_sdk_session_preempts_ocr_reader_candidate(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    install_root.mkdir(parents=True, exist_ok=True)
+    (install_root / "tesseract.exe").write_text("", encoding="utf-8")
+    tessdata_dir = install_root / "tessdata"
+    tessdata_dir.mkdir(parents=True, exist_ok=True)
+    for language in ("chi_sim", "jpn", "eng"):
+        (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={
+                "enabled": True,
+                "install_target_dir": str(install_root),
+                "poll_interval_seconds": 999.0,
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    clock = {"now": 1711000000.0}
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=202,
+                title="OCR Demo Window",
+                process_name="DemoGame.exe",
+                pid=4343,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "雪乃：OCR 台词。",
+                "雪乃：OCR 台词。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    clock["now"] += 1.0
+    await plugin._poll_bridge(force=True)
+    clock["now"] += 1.0
+    await plugin._poll_bridge(force=True)
+
+    _create_game_dir(
+        bridge_root,
+        game_id="demo.sdk",
+        session_payload=_session(
+            game_id="demo.sdk",
+            session_id="sdk-session-1",
+            last_seq=3,
+            state=_session_state(
+                speaker="桥接",
+                text="来自 Bridge SDK 的台词。",
+                scene_id="scene-sdk",
+                line_id="line-sdk",
+                ts="2026-04-21T08:31:00Z",
+            ),
+        ),
+        events=[],
+    )
+
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_BRIDGE_SDK
+    assert snapshot.value["snapshot"]["text"] == "来自 Bridge SDK 的台词。"
 
 
 @pytest.mark.asyncio

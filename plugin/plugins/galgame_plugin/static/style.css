@@ -7,6 +7,8 @@
   --brand: #0e8a7c;
   --brand-strong: #0a5f5e;
   --accent: #d25f45;
+  --warning: #b26a1c;
+  --warning-bg: rgba(178, 106, 28, 0.1);
   --shadow: 0 18px 48px rgba(23, 37, 43, 0.12);
   --radius: 22px;
   --radius-sm: 14px;
@@ -28,7 +30,7 @@ body {
 }
 
 .page-shell {
-  width: min(1200px, calc(100vw - 32px));
+  width: min(1240px, calc(100vw - 32px));
   margin: 24px auto 40px;
 }
 
@@ -73,7 +75,7 @@ h1 {
 }
 
 .hero-copy {
-  max-width: 560px;
+  max-width: 640px;
   margin-top: 12px;
   color: var(--muted);
 }
@@ -87,7 +89,7 @@ h1 {
 }
 
 .summary-pill {
-  max-width: 320px;
+  max-width: 360px;
   padding: 10px 14px;
   border-radius: 999px;
   background: rgba(14, 138, 124, 0.11);
@@ -108,6 +110,18 @@ h1 {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 16px;
+  gap: 12px;
+}
+
+.panel-title-row.compact {
+  margin-bottom: 10px;
+}
+
+.section-copy,
+.panel-subcopy {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .control-grid {
@@ -193,15 +207,19 @@ button.ghost {
   color: var(--ink);
 }
 
-.flash-message {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
+button[disabled] {
+  cursor: not-allowed;
+  opacity: 0.65;
+  transform: none;
 }
 
-.textractor-banner {
+.install-stack {
+  display: grid;
+  gap: 14px;
   margin-top: 14px;
+}
+
+.install-banner {
   display: flex;
   justify-content: space-between;
   gap: 18px;
@@ -211,19 +229,30 @@ button.ghost {
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.84), rgba(210, 95, 69, 0.08));
 }
 
-.textractor-banner.success {
+.install-banner.success {
   border-color: rgba(14, 138, 124, 0.2);
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.84), rgba(14, 138, 124, 0.08));
 }
 
-.textractor-banner.neutral {
+.install-banner.warning {
+  border-color: rgba(178, 106, 28, 0.2);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.84), rgba(178, 106, 28, 0.08));
+}
+
+.install-banner.neutral {
   border-color: var(--line);
   background: rgba(255, 255, 255, 0.72);
 }
 
-.textractor-copy {
+.install-copy {
   display: grid;
   gap: 8px;
+  min-width: 0;
+}
+
+.install-actions {
+  display: flex;
+  align-items: center;
 }
 
 .install-task-card {
@@ -265,15 +294,34 @@ button.ghost {
   transition: width 160ms ease;
 }
 
-.textractor-actions {
-  display: flex;
-  align-items: center;
+.capture-profile-panel {
+  margin-top: 14px;
+  padding: 18px 20px;
+  border: 1px solid rgba(31, 42, 51, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.6);
 }
 
-button[disabled] {
-  cursor: not-allowed;
-  opacity: 0.65;
-  transform: none;
+.capture-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+  margin-top: 12px;
+}
+
+.capture-profile-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.flash-message {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
 }
 
 .flash-message.success {
@@ -345,6 +393,7 @@ button[disabled] {
 .result-note {
   color: var(--muted);
   font-size: 13px;
+  line-height: 1.5;
 }
 
 .reply-box {
@@ -411,6 +460,16 @@ button[disabled] {
   color: var(--muted);
 }
 
+.mono {
+  font-family: "IBM Plex Mono", "Cascadia Code", "SFMono-Regular", monospace;
+}
+
+@media (max-width: 1100px) {
+  .capture-profile-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 900px) {
   .hero {
     flex-direction: column;
@@ -422,7 +481,9 @@ button[disabled] {
 
   .control-grid,
   .bind-grid,
-  .dashboard-grid {
+  .agent-grid,
+  .dashboard-grid,
+  .capture-profile-grid {
     grid-template-columns: 1fr;
   }
 
@@ -431,11 +492,12 @@ button[disabled] {
     gap: 6px;
   }
 
-  .textractor-banner {
+  .install-banner {
     flex-direction: column;
   }
 
-  .textractor-actions {
+  .install-actions,
+  .capture-profile-actions {
     justify-content: stretch;
   }
 }

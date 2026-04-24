@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import hashlib
 import json
@@ -234,24 +235,37 @@ class Win32CaptureBackend:
 
 
 class TesseractOcrBackend:
-    def __init__(self, *, tesseract_path: str = "", languages: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        tesseract_path: str = "",
+        install_target_dir_raw: str = "",
+        languages: str = "",
+    ) -> None:
         self._tesseract_path = tesseract_path
+        self._install_target_dir_raw = install_target_dir_raw
         self._languages = languages
 
     def is_available(self) -> bool:
-        path = resolve_tesseract_path(self._tesseract_path)
+        path = resolve_tesseract_path(
+            self._tesseract_path,
+            install_target_dir_raw=self._install_target_dir_raw,
+        )
         if not path:
             return False
         inspection = inspect_tesseract_installation(
             configured_path=self._tesseract_path,
-            install_target_dir_raw="",
+            install_target_dir_raw=self._install_target_dir_raw,
             languages=self._languages,
         )
         return bool(inspection.get("installed"))
 
     def extract_text(self, image: Any) -> str:
         import pytesseract
-        path = resolve_tesseract_path(self._tesseract_path)
+        path = resolve_tesseract_path(
+            self._tesseract_path,
+            install_target_dir_raw=self._install_target_dir_raw,
+        )
         if path:
             pytesseract.pytesseract.tesseract_cmd = path
         lang = self._languages
@@ -281,10 +295,20 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
         "settings",
         "microsoft text input application",
         "nvidia overlay",
+        "launcher",
         "task manager",
         "visual studio code",
         "obs",
     }
+    excluded_process_name_substrings = (
+        "nvidia",
+        "overlay",
+        "launcher",
+        "gamebar",
+        "obs",
+        "code",
+        "steamwebhelper",
+    )
 
     def callback(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
@@ -313,6 +337,11 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
                 process_name = proc.name()
             except Exception:
                 pass
+        lowered_process_name = process_name.lower()
+        if lowered_process_name and any(
+            token in lowered_process_name for token in excluded_process_name_substrings
+        ):
+            return
         area = width * height
         results.append((area, DetectedGameWindow(hwnd=hwnd, title=title, process_name=process_name, pid=pid)))
 
@@ -323,6 +352,13 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
 
 def _is_windows_platform() -> bool:
     return os.name == "nt"
+
+
+def _foreground_window_handle() -> int:
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return 0
 
 
 class OcrReaderBridgeWriter:
@@ -692,6 +728,7 @@ class OcrReaderManager:
         self._window_scanner = window_scanner or _default_window_scanner
         self._capture_backend = capture_backend or Win32CaptureBackend(logger=logger)
         self._ocr_backend = ocr_backend
+        self._custom_ocr_backend = ocr_backend is not None
         self._writer = writer or OcrReaderBridgeWriter(
             bridge_root=config.bridge_root,
             time_fn=self._time_fn,
@@ -713,9 +750,10 @@ class OcrReaderManager:
                 bridge_root=config.bridge_root,
                 time_fn=self._time_fn,
             )
-        if self._ocr_backend is None:
+        if not self._custom_ocr_backend:
             self._ocr_backend = TesseractOcrBackend(
                 tesseract_path=config.ocr_reader_tesseract_path,
+                install_target_dir_raw=config.ocr_reader_install_target_dir,
                 languages=config.ocr_reader_languages,
             )
 
@@ -761,7 +799,10 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        tesseract_path = resolve_tesseract_path(self._config.ocr_reader_tesseract_path)
+        tesseract_path = resolve_tesseract_path(
+            self._config.ocr_reader_tesseract_path,
+            install_target_dir_raw=self._config.ocr_reader_install_target_dir,
+        )
         if not tesseract_path:
             self._runtime = OcrReaderRuntime(
                 enabled=True,
@@ -864,7 +905,7 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        windows = self._window_scanner()
+        windows = await asyncio.to_thread(self._window_scanner)
         if not windows:
             self._runtime = OcrReaderRuntime(
                 enabled=True,
@@ -881,7 +922,7 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        target = windows[0]
+        target = self._select_target_window(windows)
         profile = self._capture_profiles.get(target.process_name, OcrCaptureProfile(
             left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
             right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
@@ -921,8 +962,11 @@ class OcrReaderManager:
 
         emitted = False
         try:
-            frame = self._capture_backend.capture_frame(target, profile)
-            raw_text = self._ocr_backend.extract_text(frame)
+            raw_text = await asyncio.to_thread(
+                self._capture_and_extract_text,
+                target,
+                profile,
+            )
             emitted = self._consume_ocr_text(raw_text, now=now)
         except Exception as exc:
             self._logger.warning("ocr_reader capture/OCR failed: %s", exc)
@@ -962,6 +1006,32 @@ class OcrReaderManager:
         )
         result.runtime = self._runtime.to_dict()
         return result
+
+    def _capture_and_extract_text(
+        self,
+        target: DetectedGameWindow,
+        profile: OcrCaptureProfile,
+    ) -> str:
+        frame = self._capture_backend.capture_frame(target, profile)
+        return self._ocr_backend.extract_text(frame)
+
+    def _select_target_window(self, windows: list[DetectedGameWindow]) -> DetectedGameWindow:
+        if not windows:
+            raise RuntimeError("no OCR capture target is available")
+        if self._attached_window is not None:
+            for candidate in windows:
+                if candidate.hwnd == self._attached_window.hwnd:
+                    return candidate
+            if self._attached_window.pid:
+                for candidate in windows:
+                    if candidate.pid == self._attached_window.pid:
+                        return candidate
+        foreground_hwnd = _foreground_window_handle()
+        if foreground_hwnd:
+            for candidate in windows:
+                if candidate.hwnd == foreground_hwnd:
+                    return candidate
+        return windows[0]
 
     def _consume_ocr_text(self, raw_text: str, *, now: float) -> bool:
         cleaned = normalize_text(raw_text)

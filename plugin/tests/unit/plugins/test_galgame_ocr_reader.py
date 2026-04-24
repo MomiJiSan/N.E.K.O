@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from plugin.plugins.galgame_plugin.ocr_reader import (
+    DetectedGameWindow,
+    OcrReaderBridgeWriter,
+    OcrReaderManager,
+)
+from plugin.plugins.galgame_plugin.reader import read_session_json, tail_events_jsonl
+from plugin.plugins.galgame_plugin.service import build_config
+from plugin.plugins.galgame_plugin.tesseract_support import (
+    DEFAULT_TESSERACT_LANGUAGES,
+    inspect_tesseract_installation,
+)
+
+
+pytestmark = pytest.mark.plugin_unit
+
+
+class _Logger:
+    def info(self, *args, **kwargs):
+        return None
+
+    def warning(self, *args, **kwargs):
+        return None
+
+    def error(self, *args, **kwargs):
+        return None
+
+    def debug(self, *args, **kwargs):
+        return None
+
+    def exception(self, *args, **kwargs):
+        return None
+
+
+class _FakeCaptureBackend:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.capture_calls: list[tuple[int, dict[str, float]]] = []
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}:{target.pid}"
+
+    def capture_frame(self, target: DetectedGameWindow, profile) -> str:
+        self.capture_calls.append((target.hwnd, profile.to_dict()))
+        return f"frame:{target.hwnd}:{len(self.capture_calls)}"
+
+
+class _FakeOcrBackend:
+    def __init__(self, texts: list[str] | None = None) -> None:
+        self._texts = list(texts or [])
+        self.calls = 0
+
+    def is_available(self) -> bool:
+        return True
+
+    def extract_text(self, image: str) -> str:
+        del image
+        self.calls += 1
+        if not self._texts:
+            return ""
+        if len(self._texts) == 1:
+            return self._texts[0]
+        return self._texts.pop(0)
+
+
+def _make_config(
+    bridge_root: Path,
+    *,
+    enabled: bool = True,
+    tesseract_path: str = "",
+    install_target_dir: str = "",
+    poll_interval_seconds: float = 999.0,
+    no_text_takeover_after_seconds: float = 30.0,
+    languages: str = DEFAULT_TESSERACT_LANGUAGES,
+) -> object:
+    return build_config(
+        {
+            "galgame": {
+                "bridge_root": str(bridge_root),
+            },
+            "ocr_reader": {
+                "enabled": enabled,
+                "tesseract_path": tesseract_path,
+                "install_target_dir": install_target_dir,
+                "poll_interval_seconds": poll_interval_seconds,
+                "no_text_takeover_after_seconds": no_text_takeover_after_seconds,
+                "languages": languages,
+            },
+        }
+    )
+
+
+def _install_fake_tesseract(root: Path, *, languages: str = DEFAULT_TESSERACT_LANGUAGES) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    executable = root / "tesseract.exe"
+    executable.write_text("", encoding="utf-8")
+    tessdata_dir = root / "tessdata"
+    tessdata_dir.mkdir(parents=True, exist_ok=True)
+    for language in [item.strip() for item in languages.split("+") if item.strip()]:
+        (tessdata_dir / f"{language}.traineddata").write_text("", encoding="utf-8")
+    return executable
+
+
+def _read_events(events_path: Path) -> list[dict[str, object]]:
+    result = tail_events_jsonl(events_path, offset=0, line_buffer=b"")
+    return result.events
+
+
+def _window() -> list[DetectedGameWindow]:
+    return [
+        DetectedGameWindow(
+            hwnd=101,
+            title="Demo Window",
+            process_name="DemoGame.exe",
+            pid=4242,
+        )
+    ]
+
+
+def test_build_config_defaults_ocr_languages_to_chi_sim_jpn_eng(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    cfg = build_config({"galgame": {"bridge_root": str(bridge_root)}})
+
+    assert cfg.ocr_reader_languages == "chi_sim+jpn+eng"
+
+
+def test_inspect_tesseract_installation_reports_custom_install_target(tmp_path: Path) -> None:
+    install_root = tmp_path / "CustomTesseract"
+    executable = _install_fake_tesseract(install_root)
+
+    status = inspect_tesseract_installation(
+        configured_path="",
+        install_target_dir_raw=str(install_root),
+        languages=DEFAULT_TESSERACT_LANGUAGES,
+    )
+
+    assert status["installed"] is True
+    assert status["detected_path"] == str(executable)
+    assert status["target_dir"] == str(install_root)
+    assert status["required_languages"] == ["chi_sim", "jpn", "eng"]
+    assert status["missing_languages"] == []
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_reports_missing_tesseract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root, enabled=True),
+        platform_fn=lambda: True,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader.resolve_tesseract_path",
+        lambda configured_path, *, install_target_dir_raw="": "",
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "missing_tesseract"
+    assert "Tesseract is missing" in result.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_reports_missing_languages(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "TesseractMissingLangs"
+    install_root.mkdir(parents=True, exist_ok=True)
+    (install_root / "tesseract.exe").write_text("", encoding="utf-8")
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "missing_languages"
+    assert result.runtime["tesseract_path"] == str(install_root / "tesseract.exe")
+    assert result.runtime["languages"] == DEFAULT_TESSERACT_LANGUAGES
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_yields_bridge_sdk_and_memory_reader_statuses(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    executable = _install_fake_tesseract(install_root)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    bridge_result = await manager.tick(
+        bridge_sdk_available=True,
+        memory_reader_runtime={},
+    )
+    memory_result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={"detail": "receiving_text", "last_seq": 3},
+    )
+
+    assert bridge_result.runtime["detail"] == "bridge_sdk_available"
+    assert bridge_result.runtime["tesseract_path"] == str(executable)
+    assert memory_result.runtime["detail"] == "memory_reader_active"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_waits_before_taking_over_after_memory_reader_text(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 1000.0}
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            no_text_takeover_after_seconds=30.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={"last_seq": 2},
+    )
+    clock["now"] += 5.0
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "waiting_for_takeover_window"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 1000.0}
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: clock["now"],
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["雪乃：你好。", "雪乃：你好。"]),
+        writer=writer,
+    )
+
+    first = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+    clock["now"] += 1.0
+    second = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+    clock["now"] += 1.0
+    third = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    session_path = bridge_root / writer.game_id / "session.json"
+    session = read_session_json(session_path).session
+
+    assert first.runtime["status"] == "starting"
+    assert first.runtime["detail"] == "starting_capture"
+    assert second.runtime["status"] == "starting"
+    assert third.runtime["status"] == "active"
+    assert third.runtime["detail"] == "receiving_text"
+    assert third.runtime["game_id"].startswith("ocr-")
+    assert session is not None
+    assert session["metadata"]["source"] == "ocr_reader"
+    assert session["bridge_sdk_version"].startswith("ocr-reader-")
+    assert session["state"]["scene_id"] == "ocr:unknown_scene"
+    assert str(session["state"]["line_id"]).startswith("ocr:")
+    assert session["state"]["text"] == "你好。"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_emits_choices_after_stable_menu_detection(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 2000.0}
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: clock["now"],
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "雪乃：选一个吧。",
+                "雪乃：选一个吧。",
+                "1. 去左边\n2. 去右边",
+                "1. 去左边\n2. 去右边",
+            ]
+        ),
+        writer=writer,
+    )
+
+    for _ in range(5):
+        await manager.tick(
+            bridge_sdk_available=False,
+            memory_reader_runtime={},
+        )
+        clock["now"] += 1.0
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert events[-1]["type"] == "choices_shown"
+    payload = events[-1]["payload"]
+    assert len(payload["choices"]) == 2
+    assert payload["choices"][0]["choice_id"].startswith(f"{payload['line_id']}#choice0")
+    assert session is not None
+    assert session["state"]["is_menu_open"] is True
+    assert session["state"]["choices"][1]["text"] == "去右边"

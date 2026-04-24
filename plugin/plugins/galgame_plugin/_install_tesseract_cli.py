@@ -8,7 +8,11 @@ import asyncio
 import sys
 from pathlib import Path
 
-from plugin.plugins.galgame_plugin.tesseract_support import install_tesseract, inspect_tesseract_installation
+from plugin.plugins.galgame_plugin.tesseract_support import (
+    DEFAULT_TESSERACT_LANGUAGES,
+    install_tesseract,
+    inspect_tesseract_installation,
+)
 
 
 class SimpleLogger:
@@ -30,7 +34,7 @@ async def main() -> None:
     status = inspect_tesseract_installation(
         configured_path="",
         install_target_dir_raw="",
-        languages="chi_sim+eng",
+        languages=DEFAULT_TESSERACT_LANGUAGES,
     )
     print(f"Status: {status['detail']}")
     print(f"Detected path: {status['detected_path'] or '(none)'}")
@@ -48,7 +52,7 @@ async def main() -> None:
             install_target_dir_raw="",
             manifest_url="",
             timeout_seconds=300,
-            languages="chi_sim+eng",
+            languages=DEFAULT_TESSERACT_LANGUAGES,
             force=False,
             progress_callback=progress,
         )

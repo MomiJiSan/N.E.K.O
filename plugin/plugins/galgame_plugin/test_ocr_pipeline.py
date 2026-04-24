@@ -1,7 +1,7 @@
 """Standalone validation script for the OCR capture + recognition pipeline.
 
 Usage (from repo root with venv activated):
-    python plugin/plugins/galgame_plugin/test_ocr_pipeline.py
+    python -m plugin.plugins.galgame_plugin.test_ocr_pipeline
 
 This will:
 1. Scan for visible game-sized windows
@@ -81,10 +81,11 @@ async def main() -> None:
     print(f"  Saved cropped frame to: {debug_path.resolve()}")
 
     # Check Tesseract
-    ocr = TesseractOcrBackend(
-        tesseract_path="",
-        languages="chi_sim+eng",
-    )
+        ocr = TesseractOcrBackend(
+            tesseract_path="",
+            install_target_dir_raw="",
+            languages="chi_sim+jpn+eng",
+        )
     if not ocr.is_available():
         print("\nERROR: Tesseract OCR is not available.")
         print("  - Make sure tesseract.exe is installed")
@@ -138,7 +139,7 @@ async def main() -> None:
         ocr_reader_install_timeout_seconds=60.0,
         ocr_reader_poll_interval_seconds=2.0,
         ocr_reader_no_text_takeover_after_seconds=30.0,
-        ocr_reader_languages="chi_sim+eng",
+        ocr_reader_languages="chi_sim+jpn+eng",
         ocr_reader_left_inset_ratio=0.05,
         ocr_reader_right_inset_ratio=0.05,
         ocr_reader_top_ratio=0.3,

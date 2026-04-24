@@ -179,7 +179,7 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ocr_reader_no_text_takeover_after_seconds=_coerce_float(
             ocr_reader_obj.get("no_text_takeover_after_seconds"), 30.0, minimum=0.0
         ),
-        ocr_reader_languages=str(ocr_reader_obj.get("languages") or "chi_sim+eng"),
+        ocr_reader_languages=str(ocr_reader_obj.get("languages") or "chi_sim+jpn+eng"),
         ocr_reader_left_inset_ratio=_coerce_float(
             ocr_reader_obj.get("left_inset_ratio"), 0.05, minimum=0.0
         ),

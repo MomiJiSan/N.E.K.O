@@ -63,6 +63,7 @@ from .service import (
 )
 from .state import GalgameSharedState, build_initial_state
 from .store import GalgameStore
+from .tesseract_support import install_tesseract
 from .textractor_support import install_textractor
 from .ui_api import build_open_ui_payload
 
@@ -75,6 +76,7 @@ class GalgamePlugin(NekoPluginBase):
         self.logger = self.file_logger
         self._state_lock = threading.Lock()
         self._textractor_install_lock = threading.Lock()
+        self._tesseract_install_lock = threading.Lock()
         self._cfg = None
         self._state = build_initial_state(mode=MODE_COMPANION, push_notifications=True)
         self._persist = GalgameStore(self.store, self.logger)
@@ -212,6 +214,18 @@ class GalgamePlugin(NekoPluginBase):
                 "memory_reader_runtime": {},
                 "ocr_reader_enabled": False,
                 "ocr_reader_runtime": {},
+                "tesseract": {
+                    "install_supported": False,
+                    "installed": False,
+                    "can_install": False,
+                    "detected_path": "",
+                    "target_dir": "",
+                    "expected_executable_path": "",
+                    "tessdata_dir": "",
+                    "required_languages": [],
+                    "missing_languages": [],
+                    "detail": "config_not_loaded",
+                },
                 "textractor": {
                     "install_supported": False,
                     "installed": False,
@@ -223,6 +237,31 @@ class GalgamePlugin(NekoPluginBase):
                 },
             }
         return build_status_payload(self._state, config=self._cfg)
+
+    def _resolve_current_run_id(self) -> str:
+        return str(getattr(self.ctx, "run_id", "") or "").strip()
+
+    def _resolve_install_progress_callback(self, current_run_id: str):
+        async def _progress_update(event: dict[str, Any]) -> None:
+            if not current_run_id:
+                return
+            await self.run_update(
+                run_id=current_run_id,
+                status="running",
+                progress=float(event.get("progress") or 0.0),
+                stage=str(event.get("phase") or ""),
+                message=str(event.get("message") or ""),
+                metrics={
+                    "phase": str(event.get("phase") or ""),
+                    "downloaded_bytes": int(event.get("downloaded_bytes") or 0),
+                    "total_bytes": int(event.get("total_bytes") or 0),
+                    "resume_from": int(event.get("resume_from") or 0),
+                    "asset_name": str(event.get("asset_name") or ""),
+                    "release_name": str(event.get("release_name") or ""),
+                },
+            )
+
+        return _progress_update
 
     async def _load_config(self) -> None:
         raw = await self.config.dump(timeout=5.0)
@@ -644,26 +683,8 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError("galgame_plugin is not configured"))
         if not self._textractor_install_lock.acquire(blocking=False):
             return Err(SdkError("Textractor install is already in progress"))
-        current_run_id = str(getattr(self.ctx, "run_id", "") or "").strip()
-
-        async def _progress_update(event: dict[str, Any]) -> None:
-            if not current_run_id:
-                return
-            await self.run_update(
-                run_id=current_run_id,
-                status="running",
-                progress=float(event.get("progress") or 0.0),
-                stage=str(event.get("phase") or ""),
-                message=str(event.get("message") or ""),
-                metrics={
-                    "phase": str(event.get("phase") or ""),
-                    "downloaded_bytes": int(event.get("downloaded_bytes") or 0),
-                    "total_bytes": int(event.get("total_bytes") or 0),
-                    "resume_from": int(event.get("resume_from") or 0),
-                    "asset_name": str(event.get("asset_name") or ""),
-                    "release_name": str(event.get("release_name") or ""),
-                },
-            )
+        current_run_id = self._resolve_current_run_id()
+        progress_callback = self._resolve_install_progress_callback(current_run_id)
         try:
             install_result = await install_textractor(
                 logger=self.logger,
@@ -673,7 +694,7 @@ class GalgamePlugin(NekoPluginBase):
                 timeout_seconds=self._cfg.memory_reader_install_timeout_seconds,
                 force=bool(force),
                 task_id=current_run_id or None,
-                progress_callback=_progress_update,
+                progress_callback=progress_callback,
             )
             await self._poll_bridge(force=True)
             return Ok(
@@ -687,6 +708,51 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError(f"Textractor install failed: {exc}"))
         finally:
             self._textractor_install_lock.release()
+
+    @plugin_entry(
+        id="galgame_install_tesseract",
+        name="安装 Tesseract",
+        description="检测并下载安装本地 Tesseract OCR，随后刷新 galgame_plugin 的 OCR 状态。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+            },
+        },
+        timeout=300.0,
+        llm_result_fields=["summary"],
+    )
+    async def galgame_install_tesseract(self, force: bool = False, **_):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
+        if not self._tesseract_install_lock.acquire(blocking=False):
+            return Err(SdkError("Tesseract install is already in progress"))
+        current_run_id = self._resolve_current_run_id()
+        progress_callback = self._resolve_install_progress_callback(current_run_id)
+        try:
+            install_result = await install_tesseract(
+                logger=self.logger,
+                configured_path=self._cfg.ocr_reader_tesseract_path,
+                install_target_dir_raw=self._cfg.ocr_reader_install_target_dir,
+                manifest_url=self._cfg.ocr_reader_install_manifest_url,
+                timeout_seconds=self._cfg.ocr_reader_install_timeout_seconds,
+                languages=self._cfg.ocr_reader_languages,
+                force=bool(force),
+                task_id=current_run_id or None,
+                progress_callback=progress_callback,
+            )
+            await self._poll_bridge(force=True)
+            return Ok(
+                {
+                    "summary": str(install_result.get("summary") or "Tesseract 安装完成"),
+                    "install_result": install_result,
+                    "status": self._current_status_payload(),
+                }
+            )
+        except Exception as exc:
+            return Err(SdkError(f"Tesseract install failed: {exc}"))
+        finally:
+            self._tesseract_install_lock.release()
 
     @plugin_entry(
         id="galgame_get_snapshot",
@@ -803,6 +869,104 @@ class GalgamePlugin(NekoPluginBase):
                 "summary": f"bound_game_id={self._state.bound_game_id or '(auto)'} active_session_id={self._state.active_session_id}",
             }
         return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_set_ocr_capture_profile",
+        name="设置 OCR 截图校准",
+        description="按进程名保存或清除 OCR Reader 的截图裁剪配置。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "process_name": {"type": "string", "default": ""},
+                "left_inset_ratio": {"type": "number", "default": 0.05},
+                "right_inset_ratio": {"type": "number", "default": 0.05},
+                "top_ratio": {"type": "number", "default": 0.3},
+                "bottom_inset_ratio": {"type": "number", "default": 0.3},
+                "clear": {"type": "boolean", "default": False},
+            },
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_set_ocr_capture_profile(
+        self,
+        process_name: str = "",
+        left_inset_ratio: float = 0.05,
+        right_inset_ratio: float = 0.05,
+        top_ratio: float = 0.3,
+        bottom_inset_ratio: float = 0.3,
+        clear: bool = False,
+        **_,
+    ):
+        def _parse_ratio(name: str, value: float) -> float:
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a number")
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a number") from exc
+            if parsed < 0.0 or parsed >= 1.0:
+                raise ValueError(f"{name} must be >= 0.0 and < 1.0")
+            return parsed
+
+        with self._state_lock:
+            profiles = dict(self._state.ocr_capture_profiles)
+            runtime_process_name = str(
+                (self._state.ocr_reader_runtime or {}).get("process_name") or ""
+            ).strip()
+        normalized_process_name = str(process_name or "").strip() or runtime_process_name
+        if not normalized_process_name:
+            return Err(SdkError("process_name is required"))
+
+        if clear:
+            profiles.pop(normalized_process_name, None)
+            summary = f"OCR capture profile cleared for {normalized_process_name}"
+            capture_profile: dict[str, float] = {}
+        else:
+            try:
+                normalized_profile = {
+                    "left_inset_ratio": _parse_ratio("left_inset_ratio", left_inset_ratio),
+                    "right_inset_ratio": _parse_ratio("right_inset_ratio", right_inset_ratio),
+                    "top_ratio": _parse_ratio("top_ratio", top_ratio),
+                    "bottom_inset_ratio": _parse_ratio(
+                        "bottom_inset_ratio",
+                        bottom_inset_ratio,
+                    ),
+                }
+            except ValueError as exc:
+                return Err(SdkError(str(exc)))
+            if (
+                normalized_profile["left_inset_ratio"]
+                + normalized_profile["right_inset_ratio"]
+            ) >= 1.0:
+                return Err(SdkError("left_inset_ratio + right_inset_ratio must be < 1.0"))
+            if (
+                normalized_profile["top_ratio"]
+                + normalized_profile["bottom_inset_ratio"]
+            ) >= 1.0:
+                return Err(SdkError("top_ratio + bottom_inset_ratio must be < 1.0"))
+            profiles[normalized_process_name] = normalized_profile
+            capture_profile = dict(normalized_profile)
+            summary = f"OCR capture profile saved for {normalized_process_name}"
+
+        try:
+            self._persist.persist_ocr_capture_profiles(profiles)
+        except Exception as exc:
+            return Err(SdkError(f"persist OCR capture profile failed: {exc}"))
+
+        with self._state_lock:
+            self._state.ocr_capture_profiles = dict(profiles)
+        if self._ocr_reader_manager is not None:
+            self._ocr_reader_manager.update_capture_profiles(profiles)
+        await self._poll_bridge(force=True)
+        return Ok(
+            {
+                "process_name": normalized_process_name,
+                "capture_profile": capture_profile,
+                "cleared": bool(clear),
+                "summary": summary,
+                "status": self._current_status_payload(),
+            }
+        )
 
     @plugin_entry(
         id="galgame_open_ui",
