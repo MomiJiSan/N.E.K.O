@@ -93,6 +93,10 @@
         <el-tab-pane :label="$t('plugins.logs')" name="logs">
           <LogViewer :plugin-id="pluginId" />
         </el-tab-pane>
+
+        <el-tab-pane :label="$t('plugins.tutorial')" name="tutorial">
+          <PluginTutorial :plugin-id="pluginId" />
+        </el-tab-pane>
       </el-tabs>
     </el-card>
 
@@ -113,6 +117,7 @@ import PluginConfigEditor from '@/components/plugin/PluginConfigEditor.vue'
 import LogViewer from '@/components/logs/LogViewer.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
 import PluginUIFrame from '@/components/plugin/PluginUIFrame.vue'
+import PluginTutorial from '@/components/plugin/PluginTutorial.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -121,7 +126,7 @@ const pluginStore = usePluginStore()
 const pluginId = computed(() => route.params.id as string)
 const activeTab = ref('info')
 const loading = ref(true)
-const allowedTabs = new Set(['info', 'entries', 'ui', 'metrics', 'config', 'logs'])
+const allowedTabs = new Set(['info', 'entries', 'ui', 'metrics', 'config', 'logs', 'tutorial'])
 
 const plugin = computed(() => {
   return pluginStore.pluginsWithStatus.find(p => p.id === pluginId.value)
