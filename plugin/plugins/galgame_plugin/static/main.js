@@ -147,6 +147,7 @@ const FIELD_LABELS_ZH = {
 };
 
 let latestAgentReply = '暂无交互';
+let latestAgentStatus = null;
 let latestStatus = null;
 let latestOcrWindowSnapshot = null;
 let refreshInFlight = null;
@@ -1321,6 +1322,7 @@ function formatInsightMeta(payload) {
 }
 
 function renderAgentStatus(payload) {
+  latestAgentStatus = payload || latestAgentStatus;
   document.getElementById('agentReplyText').textContent = latestAgentReply;
   const memoryCounts = payload.memory_counts || {};
   renderGrid('agentStatusGrid', [
@@ -1483,16 +1485,20 @@ async function refreshAll(options = {}) {
       setFlash('', 'info');
     }
     try {
-      const [status, snapshot, history, agentStatus] = await Promise.all([
+      const [status, snapshot, history] = await Promise.all([
         callPlugin('galgame_get_status'),
         callPlugin('galgame_get_snapshot'),
         callPlugin('galgame_get_history', { limit: 20, include_events: true }),
-        safeCall(
+      ]);
+      let agentStatus = latestAgentStatus
+        || { action: 'query_status', result: '', status: 'standby', recent_pushes: [] };
+      if (!silent || !latestAgentStatus) {
+        agentStatus = await safeCall(
           'galgame_agent_command',
           { action: 'query_status' },
           { action: 'query_status', result: '', status: 'standby', recent_pushes: [] },
-        ),
-      ]);
+        );
+      }
       renderStatus(status);
       renderSnapshot(snapshot);
       renderHistory(history);

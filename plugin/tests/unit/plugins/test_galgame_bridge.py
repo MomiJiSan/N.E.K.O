@@ -415,6 +415,11 @@ class _FakeLLMGateway:
         return dict(self.reply_payload)
 
 
+def _run_in_new_loop(awaitable):
+    with asyncio.Runner() as runner:
+        return runner.run(awaitable)
+
+
 class _FakeTextractorHandle:
     def __init__(self, lines: list[str] | None = None) -> None:
         self.lines = list(lines or [])
@@ -4035,3 +4040,111 @@ async def test_game_llm_agent_drops_old_actuation_on_session_change(
     assert agent._pending_strategy is None
     assert status["status"] == "active"
     assert status["scene_id"] == "scene-b"
+
+
+@pytest.mark.plugin_unit
+def test_game_llm_agent_send_message_survives_loop_switch_with_pending_planning(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        suggest_payload={"degraded": False, "choices": [], "diagnostic": ""},
+        reply_payload={"degraded": False, "reply": "已经切到消息回复。", "diagnostic": ""},
+        delay=0.2,
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="你要走哪边？",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[
+                {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+                {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+            ],
+            is_menu_open=True,
+        ),
+    )
+
+    _run_in_new_loop(agent.tick(shared))
+    response = _run_in_new_loop(agent.send_message(shared, message="先停一下，汇报当前状态"))
+    status = _run_in_new_loop(agent.query_status(shared))
+
+    assert response["result"] == "已经切到消息回复。"
+    assert status["status"] == "active"
+    assert fake_host.started == []
+    assert agent._planning_task is None
+
+
+@pytest.mark.plugin_unit
+def test_game_llm_agent_standby_and_query_survive_loop_switch_with_inflight_actuation(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        reply_payload={"degraded": False, "reply": "待机已生效，查询仍可用。", "diagnostic": ""}
+    )
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state()
+
+    _run_in_new_loop(agent.tick(shared))
+    standby = _run_in_new_loop(agent.set_standby(shared, standby=True))
+    context = _run_in_new_loop(agent.query_context(shared, context_query="现在还能查询吗？"))
+
+    assert fake_host.started
+    assert standby["status"] == "standby"
+    assert fake_host.cancelled == ["task-1"]
+    assert context["status"] == "standby"
+    assert context["result"] == "待机已生效，查询仍可用。"
+
+
+@pytest.mark.plugin_unit
+def test_llm_gateway_agent_reply_survives_loop_switch() -> None:
+    class _Backend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def invoke(self, *, operation: str, context: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((operation, str(context.get("prompt") or "")))
+            return {"reply": f"reply:{context.get('prompt', '')}"}
+
+        async def shutdown(self) -> None:
+            return None
+
+    backend = _Backend()
+    gateway = LLMGateway(
+        plugin=SimpleNamespace(plugins=None),
+        logger=_Logger(),
+        config=SimpleNamespace(
+            llm_max_in_flight=2,
+            llm_request_cache_ttl_seconds=0.0,
+            llm_target_entry_ref="",
+            llm_call_timeout_seconds=1.0,
+        ),
+        backend=backend,
+    )
+
+    first = _run_in_new_loop(gateway.agent_reply({"prompt": "alpha"}))
+    second = _run_in_new_loop(gateway.agent_reply({"prompt": "beta"}))
+    _run_in_new_loop(gateway.shutdown())
+
+    assert first["reply"] == "reply:alpha"
+    assert second["reply"] == "reply:beta"
+    assert backend.calls == [("agent_reply", "alpha"), ("agent_reply", "beta")]

@@ -81,7 +81,8 @@ class GameLLMAgent:
         self._logger = logger
         self._llm_gateway = llm_gateway
         self._host_adapter = host_adapter
-        self._op_lock = asyncio.Lock()
+        self._runtime_loop: asyncio.AbstractEventLoop | None = None
+        self._op_lock: asyncio.Lock | None = None
         self._explicit_standby = False
         self._hard_error = ""
         self._hard_error_retryable = False
@@ -103,7 +104,40 @@ class GameLLMAgent:
         self._scene_state = self._build_empty_scene_state()
         self._last_status = AGENT_STATUS_STANDBY
 
+    def _ensure_loop_affinity(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._runtime_loop is loop and self._op_lock is not None:
+            return
+        if self._runtime_loop is not None and self._runtime_loop is not loop:
+            self._clear_loop_bound_state()
+        self._runtime_loop = loop
+        self._op_lock = asyncio.Lock()
+
+    def _clear_loop_bound_state(self) -> None:
+        if self._planning_task is not None:
+            self._cancel_foreign_task(self._planning_task)
+            self._planning_task = None
+        self._planning_candidates = []
+        self._planning_choice_signature = ()
+        self._planning_started_at = 0.0
+
+    @staticmethod
+    def _cancel_foreign_task(task: asyncio.Task[Any]) -> None:
+        try:
+            task_loop = task.get_loop()
+        except Exception:
+            return
+        if task.done():
+            return
+        try:
+            if task_loop.is_closed():
+                return
+            task_loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            return
+
     async def shutdown(self) -> None:
+        self._ensure_loop_affinity()
         async with self._op_lock:
             await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
             self._clear_hard_error()
@@ -120,6 +154,7 @@ class GameLLMAgent:
             self._last_status = AGENT_STATUS_STANDBY
 
     async def tick(self, shared: dict[str, Any]) -> None:
+        self._ensure_loop_affinity()
         async with self._op_lock:
             await self._observe(shared)
             now = time.monotonic()
@@ -181,6 +216,7 @@ class GameLLMAgent:
         return True
 
     async def set_standby(self, shared: dict[str, Any], *, standby: bool) -> dict[str, Any]:
+        self._ensure_loop_affinity()
         async with self._op_lock:
             self._explicit_standby = bool(standby)
             if self._explicit_standby:
@@ -826,6 +862,7 @@ class GameLLMAgent:
         return "idle"
 
     async def query_status(self, shared: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_loop_affinity()
         async with self._op_lock:
             interrupted = await self._interrupt_for_status_query()
             await self._observe(shared)
@@ -844,6 +881,7 @@ class GameLLMAgent:
             }
 
     async def query_context(self, shared: dict[str, Any], *, context_query: str) -> dict[str, Any]:
+        self._ensure_loop_affinity()
         async with self._op_lock:
             await self._interrupt_current()
             await self._observe(shared)
@@ -863,6 +901,7 @@ class GameLLMAgent:
             }
 
     async def send_message(self, shared: dict[str, Any], *, message: str) -> dict[str, Any]:
+        self._ensure_loop_affinity()
         async with self._op_lock:
             await self._interrupt_current()
             await self._observe(shared)

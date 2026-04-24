@@ -25,7 +25,8 @@ class LLMGateway:
         self._logger = logger
         self._config = config
         self._backend = backend or GalgameLLMBackend(logger)
-        self._lock = asyncio.Lock()
+        self._runtime_loop: asyncio.AbstractEventLoop | None = None
+        self._lock: asyncio.Lock | None = None
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._active_calls = 0
@@ -33,7 +34,38 @@ class LLMGateway:
     def update_config(self, config) -> None:
         self._config = config
 
+    def _ensure_loop_affinity(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._runtime_loop is loop and self._lock is not None:
+            return
+        if self._runtime_loop is not None and self._runtime_loop is not loop:
+            self._clear_loop_bound_state()
+        self._runtime_loop = loop
+        self._lock = asyncio.Lock()
+
+    def _clear_loop_bound_state(self) -> None:
+        for task in self._inflight.values():
+            self._cancel_foreign_task(task)
+        self._inflight.clear()
+        self._active_calls = 0
+
+    @staticmethod
+    def _cancel_foreign_task(task: asyncio.Task[dict[str, Any]]) -> None:
+        try:
+            task_loop = task.get_loop()
+        except Exception:
+            return
+        if task.done():
+            return
+        try:
+            if task_loop.is_closed():
+                return
+            task_loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            return
+
     async def shutdown(self) -> None:
+        self._ensure_loop_affinity()
         async with self._lock:
             tasks = list(self._inflight.values())
             self._inflight.clear()
@@ -97,6 +129,7 @@ class LLMGateway:
         validate: Callable[[dict[str, Any]], dict[str, Any]],
         degraded: Callable[[str], dict[str, Any]],
     ) -> dict[str, Any]:
+        self._ensure_loop_affinity()
         fingerprint = f"{operation}:{repr(context)}"
         now = time.monotonic()
         wait_task: asyncio.Task[dict[str, Any]] | None = None
