@@ -235,6 +235,7 @@ class GalgamePlugin(NekoPluginBase):
         self.file_logger = self.enable_file_logging(log_level="INFO")
         self.logger = self.file_logger
         self._state_lock = threading.Lock()
+        self._poll_bridge_lock = asyncio.Lock()
         self._textractor_install_lock = threading.Lock()
         self._tesseract_install_lock = threading.Lock()
         self._rapidocr_install_lock = threading.Lock()
@@ -246,6 +247,11 @@ class GalgamePlugin(NekoPluginBase):
         self._game_agent: GameLLMAgent | None = None
         self._memory_reader_manager: MemoryReaderManager | None = None
         self._ocr_reader_manager: OcrReaderManager | None = None
+        self._bridge_poll_task: asyncio.Task[None] | None = None
+        self._bridge_poll_started_at = 0.0
+        self._bridge_poll_finished_at = 0.0
+        self._last_bridge_poll_duration_seconds = 0.0
+        self._last_agent_tick_at = 0.0
 
     def _snapshot_state(self) -> dict[str, Any]:
         with self._state_lock:
@@ -447,8 +453,10 @@ class GalgamePlugin(NekoPluginBase):
             state = self._state
             state.bound_game_id = str(payload["bound_game_id"])
             state.available_game_ids = list(payload["available_game_ids"])
-            state.mode = str(payload["mode"])
-            state.push_notifications = bool(payload["push_notifications"])
+            # Preferences can be changed through plugin entries while a bridge poll is in
+            # flight. Keep the live values instead of restoring the poll's stale snapshot.
+            state.mode = state.mode if state.mode in MODES else str(payload["mode"])
+            state.push_notifications = bool(state.push_notifications)
             state.active_game_id = str(payload["active_game_id"])
             state.active_session_id = str(payload["active_session_id"])
             state.active_session_meta = json_copy(payload["active_session_meta"])
@@ -477,6 +485,72 @@ class GalgamePlugin(NekoPluginBase):
     def _record_error(self, error: dict[str, Any]) -> None:
         with self._state_lock:
             self._state.last_error = json_copy(error)
+
+    def _bridge_poll_debug_payload(self) -> dict[str, Any]:
+        now = time.monotonic()
+        poll_running = self._bridge_poll_task is not None and not self._bridge_poll_task.done()
+        inflight_seconds = (
+            max(0.0, now - self._bridge_poll_started_at)
+            if poll_running and self._bridge_poll_started_at > 0.0
+            else 0.0
+        )
+        return {
+            "bridge_poll_running": poll_running,
+            "bridge_poll_inflight_seconds": inflight_seconds,
+            "last_bridge_poll_duration_seconds": self._last_bridge_poll_duration_seconds,
+            "last_agent_tick_at": self._last_agent_tick_at,
+        }
+
+    def _add_bridge_poll_debug_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(payload)
+        enriched.update(self._bridge_poll_debug_payload())
+        return enriched
+
+    def _start_background_bridge_poll(self) -> bool:
+        if self._cfg is None:
+            return False
+        if self._bridge_poll_task is not None:
+            if not self._bridge_poll_task.done():
+                return False
+            self._bridge_poll_task = None
+        self._bridge_poll_started_at = time.monotonic()
+        self._bridge_poll_task = asyncio.create_task(self._run_background_bridge_poll())
+        return True
+
+    async def _run_background_bridge_poll(self) -> None:
+        task = asyncio.current_task()
+        started_at = self._bridge_poll_started_at or time.monotonic()
+        self._bridge_poll_started_at = started_at
+        try:
+            await self._poll_bridge(force=False)
+        except Exception as exc:
+            self._record_error(
+                make_error(
+                    f"bridge background poll failed: {exc}",
+                    source="bridge_reader",
+                    kind="error",
+                )
+            )
+        finally:
+            finished_at = time.monotonic()
+            self._bridge_poll_finished_at = finished_at
+            self._last_bridge_poll_duration_seconds = max(0.0, finished_at - started_at)
+            if self._bridge_poll_task is task:
+                self._bridge_poll_task = None
+
+    async def _cancel_background_bridge_poll(self) -> None:
+        task = self._bridge_poll_task
+        if task is None:
+            return
+        self._bridge_poll_task = None
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
     def _persist_preferences(self, *, bound_game_id: str, mode: str, push_notifications: bool) -> None:
         self._persist.persist_preferences(
@@ -524,7 +598,7 @@ class GalgamePlugin(NekoPluginBase):
 
     def _current_status_payload(self) -> dict[str, Any]:
         if self._cfg is None:
-            return {
+            return self._add_bridge_poll_debug_payload({
                 "connection_state": "error",
                 "mode": MODE_COMPANION,
                 "push_notifications": True,
@@ -581,8 +655,8 @@ class GalgamePlugin(NekoPluginBase):
                     "expected_executable_path": "",
                     "detail": "config_not_loaded",
                 },
-            }
-        return build_status_payload(self._state, config=self._cfg)
+            })
+        return self._add_bridge_poll_debug_payload(build_status_payload(self._state, config=self._cfg))
 
     async def _build_status_payload_async(self) -> dict[str, Any]:
         if self._cfg is None:
@@ -590,7 +664,8 @@ class GalgamePlugin(NekoPluginBase):
         with self._state_lock:
             state = json_copy(self._state)
             config = self._cfg
-        return await asyncio.to_thread(build_status_payload, state, config=config)
+        payload = await asyncio.to_thread(build_status_payload, state, config=config)
+        return self._add_bridge_poll_debug_payload(payload)
 
     def _resolve_current_run_id(self) -> str:
         return str(getattr(self.ctx, "run_id", "") or "").strip()
@@ -677,6 +752,7 @@ class GalgamePlugin(NekoPluginBase):
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_):
+        await self._cancel_background_bridge_poll()
         if self._memory_reader_manager is not None:
             try:
                 await self._memory_reader_manager.shutdown()
@@ -710,8 +786,8 @@ class GalgamePlugin(NekoPluginBase):
 
     @timer_interval(id="bridge_tick", seconds=1, auto_start=True)
     async def bridge_tick(self, **_):
-        await self._poll_bridge(force=False)
         if self._game_agent is not None:
+            self._last_agent_tick_at = time.monotonic()
             try:
                 await self._game_agent.tick(self._snapshot_state())
             except Exception as exc:
@@ -722,9 +798,17 @@ class GalgamePlugin(NekoPluginBase):
                         kind="error",
                     )
                 )
+        self._start_background_bridge_poll()
         return Ok({"status": "tick"})
 
     async def _poll_bridge(self, *, force: bool) -> None:
+        if self._cfg is None:
+            return
+
+        async with self._poll_bridge_lock:
+            await self._poll_bridge_locked(force=force)
+
+    async def _poll_bridge_locked(self, *, force: bool) -> None:
         if self._cfg is None:
             return
 

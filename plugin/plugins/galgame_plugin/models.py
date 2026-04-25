@@ -169,12 +169,54 @@ def sanitize_save_context(value: object) -> dict[str, str]:
 
 def sanitize_choice(value: object) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
-    return {
+    choice = {
         "choice_id": _string(raw.get("choice_id")),
         "text": _string(raw.get("text")),
         "index": _int(raw.get("index"), 0),
         "enabled": _bool(raw.get("enabled"), True),
     }
+    bounds = raw.get("bounds")
+    if isinstance(bounds, dict):
+        sanitized_bounds: dict[str, float] = {}
+        for key in ("left", "top", "right", "bottom"):
+            try:
+                sanitized_bounds[key] = float(bounds.get(key))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                sanitized_bounds = {}
+                break
+        if sanitized_bounds and sanitized_bounds["right"] > sanitized_bounds["left"] and sanitized_bounds["bottom"] > sanitized_bounds["top"]:
+            choice["bounds"] = sanitized_bounds
+    bounds_coordinate_space = _string(raw.get("bounds_coordinate_space")).strip()
+    if bounds_coordinate_space:
+        choice["bounds_coordinate_space"] = bounds_coordinate_space
+    source_size = raw.get("source_size")
+    if isinstance(source_size, dict):
+        try:
+            width = float(source_size.get("width"))  # type: ignore[arg-type]
+            height = float(source_size.get("height"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            width = 0.0
+            height = 0.0
+        if width > 0.0 and height > 0.0:
+            choice["source_size"] = {"width": width, "height": height}
+    for rect_key in ("capture_rect", "window_rect"):
+        rect = raw.get(rect_key)
+        if not isinstance(rect, dict):
+            continue
+        sanitized_rect: dict[str, float] = {}
+        for key in ("left", "top", "right", "bottom"):
+            try:
+                sanitized_rect[key] = float(rect.get(key))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                sanitized_rect = {}
+                break
+        if (
+            sanitized_rect
+            and sanitized_rect["right"] > sanitized_rect["left"]
+            and sanitized_rect["bottom"] > sanitized_rect["top"]
+        ):
+            choice[rect_key] = sanitized_rect
+    return choice
 
 
 def sanitize_metadata(value: object) -> dict[str, Any]:

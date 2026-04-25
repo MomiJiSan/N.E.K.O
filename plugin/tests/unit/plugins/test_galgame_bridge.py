@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
 
 from plugin.plugins.galgame_plugin import GalgameBridgePlugin
+from plugin.plugins.galgame_plugin import local_input_actuator as local_input
 from plugin.plugins.galgame_plugin import service as galgame_service
 from plugin.plugins.galgame_plugin.game_llm_agent import GameLLMAgent
 from plugin.plugins.galgame_plugin.host_agent_adapter import HostAgentAdapter, HostAgentError
@@ -44,6 +45,9 @@ from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
     OcrReaderBridgeWriter,
     OcrReaderManager,
+    _coerce_aihong_menu_choices,
+    _looks_like_aihong_menu_status_only_text,
+    _looks_like_noise_ocr_text,
 )
 from plugin.plugins.galgame_plugin.reader import (
     expand_bridge_root,
@@ -1046,6 +1050,174 @@ async def test_startup_binds_latest_session_and_exposes_ui(tmp_path: Path) -> No
     assert isinstance(open_ui, Ok)
     assert open_ui.value["available"] is True
     assert open_ui.value["path"] == "/plugin/galgame_plugin/ui/"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_bridge_tick_runs_agent_before_slow_background_poll(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    plugin._cfg = build_config(_make_effective_config(bridge_root))
+    events: list[str] = []
+    poll_started = asyncio.Event()
+    poll_continue = asyncio.Event()
+
+    class _TickAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def tick(self, shared: dict[str, Any]) -> None:
+            del shared
+            self.calls += 1
+            events.append("agent_tick")
+
+        async def shutdown(self) -> None:
+            return None
+
+    async def _slow_poll(*, force: bool) -> None:
+        assert force is False
+        events.append("poll_start")
+        poll_started.set()
+        await poll_continue.wait()
+        events.append("poll_done")
+
+    agent = _TickAgent()
+    plugin._game_agent = agent  # type: ignore[assignment]
+    plugin._poll_bridge = _slow_poll  # type: ignore[method-assign]
+
+    started_at = time.monotonic()
+    await plugin.bridge_tick()
+    elapsed = time.monotonic() - started_at
+    await asyncio.wait_for(poll_started.wait(), timeout=0.5)
+    task = plugin._bridge_poll_task
+
+    assert elapsed < 0.5
+    assert agent.calls == 1
+    assert events[:2] == ["agent_tick", "poll_start"]
+    assert task is not None
+    assert not task.done()
+
+    status = await plugin._build_status_payload_async()
+    assert status["bridge_poll_running"] is True
+    assert status["bridge_poll_inflight_seconds"] >= 0.0
+    assert status["last_agent_tick_at"] > 0.0
+
+    poll_continue.set()
+    await asyncio.wait_for(task, timeout=0.5)
+
+    assert plugin._bridge_poll_task is None
+    assert plugin._last_bridge_poll_duration_seconds >= 0.0
+    assert events[-1] == "poll_done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_bridge_tick_does_not_start_concurrent_background_polls(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    plugin._cfg = build_config(_make_effective_config(bridge_root))
+    poll_started = asyncio.Event()
+    poll_continue = asyncio.Event()
+    poll_starts = 0
+
+    class _TickAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def tick(self, shared: dict[str, Any]) -> None:
+            del shared
+            self.calls += 1
+
+        async def shutdown(self) -> None:
+            return None
+
+    async def _slow_poll(*, force: bool) -> None:
+        nonlocal poll_starts
+        assert force is False
+        poll_starts += 1
+        poll_started.set()
+        await poll_continue.wait()
+
+    agent = _TickAgent()
+    plugin._game_agent = agent  # type: ignore[assignment]
+    plugin._poll_bridge = _slow_poll  # type: ignore[method-assign]
+
+    await plugin.bridge_tick()
+    await asyncio.wait_for(poll_started.wait(), timeout=0.5)
+    task = plugin._bridge_poll_task
+    await plugin.bridge_tick()
+
+    assert agent.calls == 2
+    assert poll_starts == 1
+    assert plugin._bridge_poll_task is task
+
+    poll_continue.set()
+    assert task is not None
+    await asyncio.wait_for(task, timeout=0.5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_background_bridge_poll_exception_records_error(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    plugin._cfg = build_config(_make_effective_config(bridge_root))
+
+    async def _failing_poll(*, force: bool) -> None:
+        assert force is False
+        raise RuntimeError("ocr exploded")
+
+    plugin._poll_bridge = _failing_poll  # type: ignore[method-assign]
+
+    await plugin.bridge_tick()
+    task = plugin._bridge_poll_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=0.5)
+
+    with plugin._state_lock:
+        last_error = dict(plugin._state.last_error)
+
+    assert plugin._bridge_poll_task is None
+    assert last_error["source"] == "bridge_reader"
+    assert "bridge background poll failed: ocr exploded" in last_error["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_shutdown_cancels_background_bridge_poll(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    plugin._cfg = build_config(_make_effective_config(bridge_root))
+    poll_started = asyncio.Event()
+    cancelled = False
+
+    async def _slow_poll(*, force: bool) -> None:
+        nonlocal cancelled
+        assert force is False
+        poll_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    plugin._poll_bridge = _slow_poll  # type: ignore[method-assign]
+
+    await plugin.bridge_tick()
+    await asyncio.wait_for(poll_started.wait(), timeout=0.5)
+    task = plugin._bridge_poll_task
+    assert task is not None
+
+    result = await plugin.shutdown()
+
+    assert isinstance(result, Ok)
+    assert cancelled is True
+    assert task.done()
+    assert plugin._bridge_poll_task is None
 
 
 @pytest.mark.asyncio
@@ -3291,6 +3463,299 @@ async def test_aihong_menu_stage_requires_two_stable_short_menu_reads_before_cho
     assert [item["text"] for item in session.session["state"]["choices"]] == ["去东院", "去西院"]
 
 
+@pytest.mark.plugin_unit
+def test_aihong_menu_choice_parser_ignores_money_status_lines() -> None:
+    choices = _coerce_aihong_menu_choices(
+        [
+            "爽快给他钱手",
+            "不给钱手",
+            "银两剩余",
+            "5两P入",
+        ]
+    )
+
+    assert choices == ["爽快给他钱", "不给钱"]
+
+
+@pytest.mark.plugin_unit
+def test_aihong_menu_status_only_text_is_not_dialogue() -> None:
+    assert _looks_like_aihong_menu_status_only_text("银两剩余\n5两P入") is True
+
+
+@pytest.mark.plugin_unit
+def test_short_non_cjk_ocr_noise_is_not_dialogue() -> None:
+    assert _looks_like_noise_ocr_text("?") is True
+    assert _looks_like_noise_ocr_text("K") is True
+    assert _looks_like_noise_ocr_text("呼一一呼！之") is False
+
+
+@pytest.mark.plugin_unit
+def test_virtual_mouse_dialogue_target_maps_client_relative_point() -> None:
+    target = local_input._resolve_virtual_mouse_dialogue_target(
+        {"instruction_variant": 0},
+        (883, 133, 1907, 901),
+    )
+
+    assert target["success"] is True
+    assert target["target_id"] == "dialogue_continue_primary"
+    assert target["screen_x"] == 1118
+    assert target["screen_y"] == 709
+    assert target["client_rect"] == {"left": 883, "top": 133, "right": 1907, "bottom": 901}
+
+
+@pytest.mark.plugin_unit
+def test_virtual_mouse_dialogue_target_honors_explicit_target_id() -> None:
+    target = local_input._resolve_virtual_mouse_dialogue_target(
+        {
+            "instruction_variant": 0,
+            "virtual_mouse_target_id": "dialogue_text_mid",
+        },
+        (0, 0, 1000, 800),
+    )
+
+    assert target["success"] is True
+    assert target["target_id"] == "dialogue_text_mid"
+    assert target["candidate_index"] == 2
+    assert target["screen_x"] == 300
+    assert target["screen_y"] == 608
+
+
+@pytest.mark.plugin_unit
+def test_virtual_mouse_dialogue_target_skips_forbidden_zone() -> None:
+    target = local_input._resolve_virtual_mouse_dialogue_target(
+        {"instruction_variant": 0},
+        (0, 0, 1000, 800),
+        candidates=(
+            {"target_id": "bad_toolbar", "relative_x": 0.60, "relative_y": 0.80},
+            {"target_id": "safe_text", "relative_x": 0.20, "relative_y": 0.75},
+        ),
+    )
+
+    assert target["success"] is True
+    assert target["target_id"] == "safe_text"
+    assert target["screen_x"] == 200
+    assert target["screen_y"] == 600
+    assert target["skipped_candidates"][0]["forbidden_zone"] == "bottom_toolbar"
+
+
+@pytest.mark.plugin_unit
+def test_input_safety_policy_blocks_deny_markers() -> None:
+    reason = local_input._input_safety_policy_block_reason(
+        target={"pid": 1234, "process_name": "EasyAntiCheat.exe", "window_title": ""},
+        hwnd=99,
+        window_title="",
+    )
+
+    assert reason.startswith("blocked_by_input_safety_policy")
+    assert "deny marker" in reason
+
+
+@pytest.mark.plugin_unit
+def test_local_input_safety_policy_does_not_emit_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clicks: list[tuple[object, ...]] = []
+    taps: list[tuple[object, ...]] = []
+    monkeypatch.setattr(local_input.sys, "platform", "win32")
+    monkeypatch.setattr(local_input, "_find_window_for_pid", lambda pid: (99, (0, 0, 1000, 800)))
+    monkeypatch.setattr(local_input, "_window_text", lambda hwnd: "")
+    monkeypatch.setattr(local_input, "_click", lambda *args: clicks.append(args))
+    monkeypatch.setattr(local_input, "_tap_key", lambda *args, **kwargs: taps.append(args))
+
+    result = local_input.perform_local_input_actuation(
+        {"ocr_reader_runtime": {"pid": 1234, "process_name": "EasyAntiCheat.exe"}},
+        {"kind": "advance", "strategy_id": "advance_click", "instruction_variant": 0},
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "blocked_by_input_safety_policy"
+    assert result["safety_policy"]["blocked"] is True
+    assert clicks == []
+    assert taps == []
+
+
+@pytest.mark.plugin_unit
+def test_local_input_advance_click_blocks_visible_choices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clicks: list[tuple[object, ...]] = []
+    monkeypatch.setattr(local_input.sys, "platform", "win32")
+    monkeypatch.setattr(local_input, "_find_window_for_pid", lambda pid: (99, (0, 0, 1000, 800)))
+    monkeypatch.setattr(local_input, "_window_text", lambda hwnd: "TheLamentingGeese")
+    monkeypatch.setattr(local_input, "_is_current_process_elevated", lambda: False)
+    monkeypatch.setattr(local_input, "_is_process_elevated", lambda pid: False)
+    monkeypatch.setattr(local_input, "_focus_window", lambda hwnd: True)
+    monkeypatch.setattr(local_input, "_client_screen_rect", lambda hwnd: (0, 0, 1000, 800))
+    monkeypatch.setattr(local_input, "_click", lambda *args: clicks.append(args))
+
+    result = local_input.perform_local_input_actuation(
+        {
+            "ocr_reader_runtime": {"pid": 1234, "process_name": "TheLamentingGeese.exe"},
+            "latest_snapshot": {
+                "is_menu_open": True,
+                "choices": [{"choice_id": "c1", "text": "左边", "index": 0}],
+            },
+        },
+        {"kind": "advance", "strategy_id": "advance_click", "instruction_variant": 0},
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "advance_click_blocked_by_visible_choices"
+    assert result["virtual_mouse"]["blocked"] is True
+    assert clicks == []
+
+
+@pytest.mark.plugin_unit
+def test_local_input_choice_bounds_uses_capture_rect_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clicks: list[tuple[object, ...]] = []
+    taps: list[tuple[object, ...]] = []
+    monkeypatch.setattr(local_input.sys, "platform", "win32")
+    monkeypatch.setattr(
+        local_input,
+        "_find_window_for_pid",
+        lambda pid: (99, (145, 108, 1185, 915)),
+    )
+    monkeypatch.setattr(local_input, "_window_text", lambda hwnd: "TheLamentingGeese")
+    monkeypatch.setattr(local_input, "_is_current_process_elevated", lambda: False)
+    monkeypatch.setattr(local_input, "_is_process_elevated", lambda pid: False)
+    monkeypatch.setattr(local_input, "_focus_window", lambda hwnd: True)
+    monkeypatch.setattr(local_input, "_client_screen_rect", lambda hwnd: (153, 139, 1177, 907))
+    monkeypatch.setattr(local_input, "_click", lambda *args: clicks.append(args))
+    monkeypatch.setattr(local_input, "_tap_key", lambda *args, **kwargs: taps.append(args))
+
+    result = local_input.perform_local_input_actuation(
+        {
+            "ocr_reader_runtime": {
+                "pid": 42248,
+                "process_name": "TheLamentingGeese.exe",
+            },
+        },
+        {
+            "kind": "choose",
+            "strategy_id": "choose_rank_1_variant_1",
+            "candidate_index": 0,
+            "candidate_choices": [
+                {
+                    "text": "爽快给他钱",
+                    "index": 0,
+                    "bounds": {
+                        "left": 494.0,
+                        "top": 261.0,
+                        "right": 734.0,
+                        "bottom": 295.0,
+                    },
+                    "bounds_coordinate_space": "capture",
+                    "source_size": {"width": 1040.0, "height": 807.0},
+                    "capture_rect": {"left": 145, "top": 108, "right": 1185, "bottom": 915},
+                }
+            ],
+        },
+    )
+
+    assert result["success"] is True
+    assert result["method"] == "choice_bounds_click"
+    assert result["coordinate_space"] == "capture"
+    assert result["screen_points"][0] == {"x": 759, "y": 386}
+    assert clicks[0] == (99, 759, 386)
+    assert clicks[0] != (99, 767, 403)
+    assert taps[-1][1] == local_input.VK_RETURN
+
+
+@pytest.mark.plugin_unit
+def test_local_input_choice_bounds_defaults_to_window_rect_without_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clicks: list[tuple[object, ...]] = []
+    monkeypatch.setattr(local_input.sys, "platform", "win32")
+    monkeypatch.setattr(
+        local_input,
+        "_find_window_for_pid",
+        lambda pid: (99, (145, 108, 1185, 915)),
+    )
+    monkeypatch.setattr(local_input, "_window_text", lambda hwnd: "TheLamentingGeese")
+    monkeypatch.setattr(local_input, "_is_current_process_elevated", lambda: False)
+    monkeypatch.setattr(local_input, "_is_process_elevated", lambda pid: False)
+    monkeypatch.setattr(local_input, "_focus_window", lambda hwnd: True)
+    monkeypatch.setattr(local_input, "_client_screen_rect", lambda hwnd: (153, 139, 1177, 907))
+    monkeypatch.setattr(local_input, "_click", lambda *args: clicks.append(args))
+    monkeypatch.setattr(local_input, "_tap_key", lambda *args, **kwargs: None)
+
+    result = local_input.perform_local_input_actuation(
+        {
+            "ocr_reader_runtime": {
+                "pid": 42248,
+                "process_name": "TheLamentingGeese.exe",
+            },
+        },
+        {
+            "kind": "choose",
+            "strategy_id": "choose_rank_1_variant_1",
+            "candidate_index": 0,
+            "candidate_choices": [
+                {
+                    "text": "爽快给他钱",
+                    "index": 0,
+                    "bounds": {"left": 494, "top": 261, "right": 734, "bottom": 295},
+                }
+            ],
+        },
+    )
+
+    assert result["success"] is True
+    assert result["coordinate_space"] == "window"
+    assert result["screen_points"][0] == {"x": 759, "y": 386}
+    assert clicks[0] == (99, 759, 386)
+
+
+@pytest.mark.plugin_unit
+def test_ocr_writer_can_emit_choices_without_prior_line(tmp_path: Path) -> None:
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
+    writer.start_session(
+        DetectedGameWindow(
+            hwnd=404,
+            title="哀鸿",
+            process_name="TheLamentingGeese.exe",
+            pid=6104,
+        )
+    )
+
+    assert (
+        writer.emit_choices(
+            ["爽快给他钱", "不给钱"],
+            ts="2024-04-02T12:00:00Z",
+            choice_bounds=[
+                {"left": 494, "top": 261, "right": 734, "bottom": 295},
+                {"left": 485, "top": 321, "right": 742, "bottom": 363},
+            ],
+            choice_bounds_metadata={
+                "bounds_coordinate_space": "capture",
+                "source_size": {"width": 1040.0, "height": 807.0},
+                "capture_rect": {"left": 145, "top": 108, "right": 1185, "bottom": 915},
+            },
+        )
+        is True
+    )
+
+    game_dir = tmp_path / writer.game_id
+    session = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+
+    assert session.session is not None
+    assert session.session["state"]["line_id"]
+    assert session.session["state"]["is_menu_open"] is True
+    assert [item["text"] for item in session.session["state"]["choices"]] == [
+        "爽快给他钱",
+        "不给钱",
+    ]
+    first_choice = session.session["state"]["choices"][0]
+    assert first_choice["bounds_coordinate_space"] == "capture"
+    assert first_choice["source_size"] == {"width": 1040.0, "height": 807.0}
+    assert first_choice["capture_rect"] == {"left": 145, "top": 108, "right": 1185, "bottom": 915}
+    assert events[-1]["type"] == "choices_shown"
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_memory_reader_fallback_activates_when_bridge_sdk_is_missing(tmp_path: Path) -> None:
@@ -4544,7 +5009,7 @@ async def test_game_llm_agent_retries_dialogue_with_alternate_advance_strategy(
     fake_host.tasks["task-1"]["status"] = "completed"
     await agent.tick(shared)
     assert agent._actuation is not None
-    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 6.0
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 2.0
 
     await agent.tick(shared)
     agent._next_actuation_at = 0.0
@@ -4582,6 +5047,7 @@ async def test_game_llm_agent_awaiting_bridge_accepts_meaningful_history_progres
     )
 
     await agent.tick(shared)
+    assert "click the usual continue area exactly once" in fake_host.started[-1]
     fake_host.tasks["task-1"]["status"] = "completed"
     await agent.tick(shared)
 
@@ -4656,19 +5122,437 @@ async def test_game_llm_agent_ocr_awaiting_bridge_waits_longer_before_retry(
     assert agent._actuation is not None
     assert agent._actuation["state"] == "awaiting_bridge"
 
-    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 6.0
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 2.0
     await agent.tick(shared)
 
     assert agent._actuation is not None
     assert agent._actuation["state"] == "awaiting_bridge"
     assert agent._pending_strategy is None
 
-    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 13.0
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 4.0
     await agent.tick(shared)
 
     assert agent._actuation is None
     assert agent._pending_strategy is not None
     assert agent._pending_strategy["strategy_id"] == "advance_click"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_uses_local_input_fallback_when_computer_use_quota_exceeded(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, object]] = []
+
+    def _local_fallback(shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        local_calls.append({"shared": shared, "actuation": actuation})
+        return {"success": True, "reason": "", "kind": actuation.get("kind")}
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_fallback,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_BRIDGE_SDK,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "failed"
+    fake_host.tasks["task-1"]["error"] = "执行未成功"
+    fake_host.tasks["task-1"]["result"] = {
+        "success": False,
+        "result": "AGENT_QUOTA_EXCEEDED",
+    }
+
+    await agent.tick(shared)
+
+    assert len(local_calls) == 1
+    assert local_calls[0]["actuation"]["kind"] == "advance"
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+    assert agent._pending_strategy is None
+    assert "local fallback completed" in agent._last_trace_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_exposes_recent_local_input_debug(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+
+    def _local_fallback(shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        return {
+            "success": True,
+            "reason": "",
+            "kind": actuation.get("kind"),
+            "strategy_id": actuation.get("strategy_id"),
+            "pid": 1234,
+            "hwnd": 99,
+            "method": "virtual_mouse_dialogue_click",
+            "virtual_mouse": {
+                "target_id": "dialogue_continue_primary",
+                "relative_x": 0.23,
+                "relative_y": 0.75,
+                "screen_x": 1118,
+                "screen_y": 709,
+                "safety_policy": {"blocked": False},
+            },
+        }
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_fallback,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    recent = status["debug"]["recent_local_inputs"]
+    assert len(recent) == 1
+    assert recent[0]["method"] == "virtual_mouse_dialogue_click"
+    assert recent[0]["virtual_mouse"]["target_id"] == "dialogue_continue_primary"
+    assert recent[0]["virtual_mouse"]["screen_x"] == 1118
+    assert status["memory_counts"]["recent_local_inputs"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_virtual_mouse_success_prefers_same_candidate(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, object]] = []
+
+    def _local_fallback(shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        local_calls.append({"shared": shared, "actuation": actuation})
+        target_id = str(actuation.get("virtual_mouse_target_id") or "dialogue_continue_primary")
+        candidate_index = int(actuation.get("virtual_mouse_candidate_index") or 0)
+        return {
+            "success": True,
+            "reason": "",
+            "kind": actuation.get("kind"),
+            "strategy_id": actuation.get("strategy_id"),
+            "pid": 1234,
+            "hwnd": 99,
+            "method": "virtual_mouse_dialogue_click",
+            "virtual_mouse": {
+                "success": True,
+                "target_id": target_id,
+                "candidate_index": candidate_index,
+                "relative_x": 0.23,
+                "relative_y": 0.75,
+                "screen_x": 1118,
+                "screen_y": 709,
+                "safety_policy": {"blocked": False},
+            },
+        }
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_fallback,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第一句。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    await agent.tick(shared)
+    assert local_calls[-1]["actuation"]["virtual_mouse_target_id"] == "dialogue_continue_primary"
+
+    shared_after = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第二句。",
+            scene_id="scene-a",
+            line_id="line-2",
+            ts="2026-04-21T08:31:02Z",
+        ),
+        last_seq=3,
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+    await agent.tick(shared_after)
+
+    assert agent._virtual_mouse_stats["dialogue_continue_primary"]["success"] == 1
+
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared_after)
+
+    assert local_calls[-1]["actuation"]["virtual_mouse_target_id"] == "dialogue_continue_primary"
+    assert local_calls[-1]["actuation"]["virtual_mouse_candidate_index"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_virtual_mouse_failure_switches_candidate(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, object]] = []
+
+    def _local_fallback(shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        local_calls.append({"shared": shared, "actuation": actuation})
+        return {
+            "success": True,
+            "reason": "",
+            "kind": actuation.get("kind"),
+            "strategy_id": actuation.get("strategy_id"),
+            "pid": 1234,
+            "hwnd": 99,
+            "method": "virtual_mouse_dialogue_click",
+            "virtual_mouse": {
+                "success": True,
+                "target_id": str(actuation.get("virtual_mouse_target_id") or ""),
+                "candidate_index": int(actuation.get("virtual_mouse_candidate_index") or 0),
+                "relative_x": 0.23,
+                "relative_y": 0.75,
+                "screen_x": 1118,
+                "screen_y": 709,
+                "safety_policy": {"blocked": False},
+            },
+        }
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_fallback,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第一句。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    await agent.tick(shared)
+    assert local_calls[-1]["actuation"]["virtual_mouse_target_id"] == "dialogue_continue_primary"
+
+    assert agent._actuation is not None
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 4.0
+    await agent.tick(shared)
+
+    assert agent._virtual_mouse_stats["dialogue_continue_primary"]["failure"] == 1
+    assert agent._pending_strategy is not None
+    assert agent._pending_strategy["virtual_mouse_target_id"] == "dialogue_text_left"
+
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared)
+
+    assert local_calls[-1]["actuation"]["virtual_mouse_target_id"] == "dialogue_text_left"
+    assert local_calls[-1]["actuation"]["virtual_mouse_candidate_index"] == 1
+
+
+@pytest.mark.plugin_unit
+def test_game_llm_agent_virtual_mouse_consecutive_failures_skip_and_reset(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    shared = _shared_state(
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    agent._virtual_mouse_stats["dialogue_continue_primary"] = {
+        "success": 0,
+        "failure": 0,
+        "consecutive_failures": 2,
+        "last_success_at": None,
+        "last_failure_at": time.monotonic(),
+    }
+
+    strategy = agent._build_dialogue_strategy(shared, retry_index=0, reason="")
+
+    assert strategy is not None
+    assert strategy["virtual_mouse_target_id"] == "dialogue_text_left"
+
+    for target_id in (
+        "dialogue_continue_primary",
+        "dialogue_text_left",
+        "dialogue_text_mid",
+    ):
+        agent._virtual_mouse_stats[target_id] = {
+            "success": 0,
+            "failure": 0,
+            "consecutive_failures": 2,
+            "last_success_at": None,
+            "last_failure_at": time.monotonic(),
+        }
+
+    reset_strategy = agent._build_dialogue_strategy(shared, retry_index=0, reason="")
+
+    assert reset_strategy is not None
+    assert reset_strategy["virtual_mouse_target_id"] == "dialogue_continue_primary"
+    assert all(
+        int(stat["consecutive_failures"]) == 0
+        for stat in agent._virtual_mouse_stats.values()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_virtual_mouse_safety_policy_does_not_poison_stats(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+
+    def _local_fallback(shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        return {
+            "success": False,
+            "reason": "blocked_by_input_safety_policy",
+            "kind": actuation.get("kind"),
+            "strategy_id": actuation.get("strategy_id"),
+            "pid": 1234,
+            "hwnd": 99,
+            "safety_policy": {"blocked": True},
+            "virtual_mouse": {
+                "blocked": True,
+                "target_id": str(actuation.get("virtual_mouse_target_id") or ""),
+            },
+        }
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_fallback,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第一句。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert fake_host.started
+    assert agent._virtual_mouse_stats == {}
+    assert status["debug"]["virtual_mouse_stats"]["dialogue_continue_primary"]["failure"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_blocks_dialogue_advance_when_choices_are_visible(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, object]] = []
+
+    def _local_fallback(shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        local_calls.append({"shared": shared, "actuation": actuation})
+        return {"success": True, "reason": ""}
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_fallback,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[{"choice_id": "c1", "text": "左边", "index": 0, "enabled": True}],
+            is_menu_open=False,
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 1234, "process_name": "Demo.exe"},
+    )
+
+    await agent.tick(shared)
+
+    assert fake_host.started == []
+    assert local_calls == []
+    assert agent._actuation is None
+    assert "visible choices" in agent._last_trace_message
+    assert agent._virtual_mouse_stats == {}
 
 
 @pytest.mark.asyncio
@@ -4741,7 +5625,7 @@ async def test_game_llm_agent_ocr_awaiting_bridge_accepts_heartbeat_state_ts_pro
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
-async def test_game_llm_agent_ocr_awaiting_bridge_extends_timeout_when_history_is_still_advancing(
+async def test_game_llm_agent_ocr_awaiting_bridge_does_not_extend_advance_timeout_for_stale_heartbeat(
     tmp_path: Path,
 ) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
@@ -4801,14 +5685,7 @@ async def test_game_llm_agent_ocr_awaiting_bridge_extends_timeout_when_history_i
         active_data_source=DATA_SOURCE_OCR_READER,
     )
 
-    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 13.0
-    await agent.tick(shared_with_activity)
-
-    assert agent._actuation is not None
-    assert agent._actuation["state"] == "awaiting_bridge"
-    assert agent._pending_strategy is None
-
-    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 17.0
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 4.0
     await agent.tick(shared_with_activity)
 
     assert agent._actuation is None

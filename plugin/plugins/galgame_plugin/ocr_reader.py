@@ -112,16 +112,18 @@ _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET = {
     "bottom_inset_ratio": 0.10,
 }
 _AIHONG_MENU_CAPTURE_PROFILE_PRESET = {
-    "left_inset_ratio": 0.20,
-    "right_inset_ratio": 0.20,
-    "top_ratio": 0.40,
-    "bottom_inset_ratio": 0.34,
+    "left_inset_ratio": 0.0,
+    "right_inset_ratio": 0.0,
+    "top_ratio": 0.0,
+    "bottom_inset_ratio": 0.0,
 }
 _AIHONG_DIALOGUE_STAGE = OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
 _AIHONG_MENU_STAGE = OCR_CAPTURE_PROFILE_STAGE_MENU
 _AIHONG_MENU_MAX_LINES = 4
 _AIHONG_MENU_MIN_SIGNIFICANT_CHARS = 2
 _AIHONG_MENU_MAX_SIGNIFICANT_CHARS = 10
+_AIHONG_MENU_STATUS_KEYWORDS = ("银两剩余", "余额", "剩余")
+_AIHONG_MENU_AMOUNT_RE = re.compile(r"^\s*\d+\s*两\S{0,3}\s*$")
 _AIHONG_MENU_DIALOGUE_MARKERS = (
     ",",
     ".",
@@ -243,8 +245,86 @@ def _looks_like_aihong_dialogue_text(text: str) -> bool:
     return any(marker in normalized for marker in _AIHONG_MENU_DIALOGUE_MARKERS)
 
 
+def _looks_like_aihong_menu_status_line(text: str) -> bool:
+    normalized = normalize_text(str(text or "")).replace("\n", " ").strip()
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in _AIHONG_MENU_STATUS_KEYWORDS):
+        return True
+    return bool(_AIHONG_MENU_AMOUNT_RE.match(normalized))
+
+
+def _looks_like_aihong_menu_status_only_text(raw_text: str) -> bool:
+    lines = _stripped_ocr_lines(raw_text)
+    if not lines:
+        return False
+    return all(_looks_like_aihong_menu_status_line(line) for line in lines)
+
+
+def _normalize_aihong_choice_box_text(text: str) -> str:
+    normalized = normalize_text(str(text or "")).replace("\n", " ").strip()
+    if not normalized or _looks_like_aihong_menu_status_line(normalized):
+        return ""
+    if normalized.endswith("手") and _significant_char_count(normalized) > _AIHONG_MENU_MIN_SIGNIFICANT_CHARS:
+        normalized = normalized[:-1].strip()
+    return normalized
+
+
+def _aihong_choice_boxes(
+    choices: list[str],
+    boxes: list[OcrTextBox],
+) -> list[dict[str, float] | None]:
+    remaining = list(boxes)
+    matched: list[dict[str, float] | None] = []
+    for choice in choices:
+        choice_text = normalize_text(str(choice or "")).strip()
+        found_index = -1
+        for index, box in enumerate(remaining):
+            if _normalize_aihong_choice_box_text(box.text) == choice_text:
+                found_index = index
+                break
+        if found_index < 0:
+            matched.append(None)
+            continue
+        box = remaining.pop(found_index)
+        matched.append(
+            {
+                "left": float(box.left),
+                "top": float(box.top),
+                "right": float(box.right),
+                "bottom": float(box.bottom),
+            }
+        )
+    return matched
+
+
+def _extraction_choice_bounds_metadata(extraction: "OcrExtractionResult") -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if extraction.bounds_coordinate_space:
+        metadata["bounds_coordinate_space"] = extraction.bounds_coordinate_space
+    if extraction.source_size:
+        metadata["source_size"] = dict(extraction.source_size)
+    if extraction.capture_rect:
+        metadata["capture_rect"] = dict(extraction.capture_rect)
+    if extraction.window_rect:
+        metadata["window_rect"] = dict(extraction.window_rect)
+    return metadata
+
+
 def _coerce_aihong_menu_choices(lines: list[str]) -> list[str]:
-    choices = _coerce_choice_lines(lines, allow_plain_text=True)
+    status_lines = 0
+    filtered_lines: list[str] = []
+    for line in lines:
+        text = normalize_text(str(line or "")).replace("\n", " ").strip()
+        if not text:
+            continue
+        if _looks_like_aihong_menu_status_line(text):
+            status_lines += 1
+            continue
+        if text.endswith("手") and _significant_char_count(text) > _AIHONG_MENU_MIN_SIGNIFICANT_CHARS:
+            text = text[:-1].strip()
+        filtered_lines.append(text)
+    choices = _coerce_choice_lines(filtered_lines, allow_plain_text=True)
     if not 2 <= len(choices) <= _AIHONG_MENU_MAX_LINES:
         return []
     normalized_choices: list[str] = []
@@ -256,6 +336,8 @@ def _coerce_aihong_menu_choices(lines: list[str]) -> list[str]:
         if not _AIHONG_MENU_MIN_SIGNIFICANT_CHARS <= significant_chars <= _AIHONG_MENU_MAX_SIGNIFICANT_CHARS:
             return []
         normalized_choices.append(text)
+    if status_lines and len(normalized_choices) >= 2:
+        return normalized_choices
     return normalized_choices
 
 
@@ -312,6 +394,17 @@ def _score_ocr_text(text: str) -> tuple[float, int, int]:
 
 def _significant_char_count(text: str) -> int:
     return sum(1 for ch in str(text or "") if not ch.isspace())
+
+
+def _looks_like_noise_ocr_text(text: str) -> bool:
+    normalized = normalize_text(str(text or "")).strip()
+    if not normalized:
+        return True
+    significant_chars = _significant_char_count(normalized)
+    cjk_or_kana_count = len(_CJK_CHAR_RE.findall(normalized)) + len(_KANA_CHAR_RE.findall(normalized))
+    if cjk_or_kana_count <= 0 and significant_chars <= 2:
+        return True
+    return False
 
 
 def _prepare_ocr_image(image: Any) -> Any:
@@ -375,9 +468,28 @@ class _RapidOcrToken:
     text: str
     score: float
     left: float
+    right: float
     top: float
     bottom: float
     height: float
+
+
+@dataclass(slots=True)
+class OcrTextBox:
+    text: str
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    def to_dict(self) -> dict[str, float | str]:
+        return {
+            "text": self.text,
+            "left": self.left,
+            "top": self.top,
+            "right": self.right,
+            "bottom": self.bottom,
+        }
 
 
 def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
@@ -410,6 +522,7 @@ def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
                 text=normalized,
                 score=score_value,
                 left=min(xs),
+                right=max(xs),
                 top=top,
                 bottom=bottom,
                 height=max(bottom - top, 1.0),
@@ -418,10 +531,10 @@ def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
     return tokens
 
 
-def _rapidocr_text_from_output(raw_output: Any) -> str:
+def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTextBox]]:
     tokens = _rapidocr_tokens_from_output(raw_output)
     if not tokens:
-        return ""
+        return []
     tokens.sort(key=lambda token: (token.top, token.left))
     lines: list[list[_RapidOcrToken]] = []
     for token in tokens:
@@ -439,20 +552,43 @@ def _rapidocr_text_from_output(raw_output: Any) -> str:
         if not placed:
             lines.append([token])
     rendered_lines: list[str] = []
-    scores: list[float] = []
+    line_results: list[tuple[str, float, OcrTextBox]] = []
     lines.sort(key=lambda line: (min(item.top for item in line), min(item.left for item in line)))
     for line in lines:
         line.sort(key=lambda item: item.left)
-        scores.extend(item.score for item in line)
-        rendered_lines.append(_join_ocr_segments([item.text for item in line]))
+        text = _join_ocr_segments([item.text for item in line])
+        if not text:
+            continue
+        rendered_lines.append(text)
+        line_results.append(
+            (
+                text,
+                sum(item.score for item in line) / len(line),
+                OcrTextBox(
+                    text=text,
+                    left=min(item.left for item in line),
+                    top=min(item.top for item in line),
+                    right=max(item.right for item in line),
+                    bottom=max(item.bottom for item in line),
+                ),
+            )
+        )
     text = "\n".join(line for line in rendered_lines if line)
     normalized = normalize_text(text)
     if not normalized:
-        return ""
+        return []
+    scores = [score for _, score, _ in line_results]
     average_score = (sum(scores) / len(scores)) if scores else 0.0
     if _significant_char_count(normalized) < 4 and average_score < 0.55:
+        return []
+    return line_results
+
+
+def _rapidocr_text_from_output(raw_output: Any) -> str:
+    lines = _rapidocr_lines_from_output(raw_output)
+    if not lines:
         return ""
-    return text
+    return "\n".join(text for text, _score, _box in lines)
 
 
 @dataclass(slots=True)
@@ -965,6 +1101,11 @@ class OcrExtractionResult:
     backend: OcrBackendDescriptor = field(default_factory=OcrBackendDescriptor)
     backend_detail: str = ""
     warnings: list[str] = field(default_factory=list)
+    boxes: list[OcrTextBox] = field(default_factory=list)
+    bounds_coordinate_space: str = ""
+    source_size: dict[str, float] = field(default_factory=dict)
+    capture_rect: dict[str, float] = field(default_factory=dict)
+    window_rect: dict[str, float] = field(default_factory=dict)
 
 
 class CaptureBackend(Protocol):
@@ -1067,7 +1208,22 @@ class Win32CaptureBackend:
         if crop_w < 10 or crop_h < 10:
             raise RuntimeError(f"Crop region too small: {crop_w}x{crop_h}")
 
-        return image.crop((left, top, right, bottom))
+        cropped = image.crop((left, top, right, bottom))
+        cropped.info["galgame_bounds_coordinate_space"] = "capture"
+        cropped.info["galgame_source_size"] = {"width": float(crop_w), "height": float(crop_h)}
+        cropped.info["galgame_capture_rect"] = {
+            "left": float(rect[0] + left),
+            "top": float(rect[1] + top),
+            "right": float(rect[0] + right),
+            "bottom": float(rect[1] + bottom),
+        }
+        cropped.info["galgame_window_rect"] = {
+            "left": float(rect[0]),
+            "top": float(rect[1]),
+            "right": float(rect[2]),
+            "bottom": float(rect[3]),
+        }
+        return cropped
 
 
 class TesseractOcrBackend:
@@ -1163,6 +1319,37 @@ class RapidOcrBackend:
         prepared = _prepare_ocr_image(image).convert("RGB")
         output = self._runtime(np.asarray(prepared))
         return _rapidocr_text_from_output(output)
+
+    def extract_text_with_boxes(self, image: Any) -> tuple[str, list[OcrTextBox]]:
+        import numpy as np
+
+        if self._runtime is None:
+            self._runtime, _metadata = load_rapidocr_runtime(
+                install_target_dir_raw=self._install_target_dir_raw,
+                engine_type=self._engine_type,
+                lang_type=self._lang_type,
+                model_type=self._model_type,
+                ocr_version=self._ocr_version,
+                force_reload=False,
+            )
+        prepared = _prepare_ocr_image(image).convert("RGB")
+        output = self._runtime(np.asarray(prepared))
+        lines = _rapidocr_lines_from_output(output)
+        if not lines:
+            return "", []
+        scale_x = prepared.width / max(float(getattr(image, "width", prepared.width)), 1.0)
+        scale_y = prepared.height / max(float(getattr(image, "height", prepared.height)), 1.0)
+        boxes = [
+            OcrTextBox(
+                text=box.text,
+                left=box.left / scale_x,
+                top=box.top / scale_y,
+                right=box.right / scale_x,
+                bottom=box.bottom / scale_y,
+            )
+            for _text, _score, box in lines
+        ]
+        return "\n".join(text for text, _score, _box in lines), boxes
 
 
 def _default_window_scanner() -> list[DetectedGameWindow]:
@@ -1405,23 +1592,44 @@ class OcrReaderBridgeWriter:
         )
         return True
 
-    def emit_choices(self, choices: list[str], *, ts: str) -> bool:
+    def emit_choices(
+        self,
+        choices: list[str],
+        *,
+        ts: str,
+        choice_bounds: list[dict[str, float] | None] | None = None,
+        choice_bounds_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         if not choices or not self._session_id:
             return False
         line_id = str(self._state.get("line_id") or "")
         if not line_id:
-            return False
-        payload_choices = [
-            {
+            line_id = self._line_id_for_text(_canonical_choice_candidate_text(choices))
+        bounds = list(choice_bounds or [])
+        bounds_metadata = dict(choice_bounds_metadata or {})
+        payload_choices = []
+        for index, text in enumerate(choices):
+            item = {
                 "choice_id": f"{line_id}#choice{index}",
                 "text": text,
                 "index": index,
                 "enabled": True,
             }
-            for index, text in enumerate(choices)
-        ]
+            if index < len(bounds) and bounds[index]:
+                item["bounds"] = dict(bounds[index] or {})
+                for key in (
+                    "bounds_coordinate_space",
+                    "source_size",
+                    "capture_rect",
+                    "window_rect",
+                ):
+                    value = bounds_metadata.get(key)
+                    if value:
+                        item[key] = dict(value) if isinstance(value, dict) else value
+            payload_choices.append(item)
         self._state = {
             **self._state,
+            "line_id": line_id,
             "choices": payload_choices,
             "is_menu_open": True,
             "ts": ts,
@@ -2087,6 +2295,8 @@ class OcrReaderManager:
         now: float,
         state: _StableOcrTextState | None = None,
     ) -> bool:
+        if _looks_like_noise_ocr_text(raw_text):
+            return False
         tracker = state or self._default_ocr_state
         if not self._stabilize_text_key(raw_text, state=tracker):
             return False
@@ -2098,11 +2308,18 @@ class OcrReaderManager:
         *,
         now: float,
         state: _StableOcrTextState | None = None,
+        choice_bounds: list[dict[str, float] | None] | None = None,
+        choice_bounds_metadata: dict[str, Any] | None = None,
     ) -> bool:
         tracker = state or self._default_ocr_state
         if not self._stabilize_text_key(_canonical_choice_candidate_text(choices), state=tracker):
             return False
-        return self._writer.emit_choices(choices, ts=utc_now_iso(now))
+        return self._writer.emit_choices(
+            choices,
+            ts=utc_now_iso(now),
+            choice_bounds=choice_bounds,
+            choice_bounds_metadata=choice_bounds_metadata,
+        )
 
     @staticmethod
     def _should_attempt_followup_confirm(
@@ -2135,7 +2352,14 @@ class OcrReaderManager:
             backend_plan,
         )
 
-    def _consume_aihong_menu_stage_text(self, raw_text: str, *, now: float) -> _MenuConsumeResult:
+    def _consume_aihong_menu_stage_text(
+        self,
+        raw_text: str,
+        *,
+        now: float,
+        boxes: list[OcrTextBox] | None = None,
+        choice_bounds_metadata: dict[str, Any] | None = None,
+    ) -> _MenuConsumeResult:
         lines = _stripped_ocr_lines(raw_text)
         choices = _coerce_aihong_menu_choices(lines)
         if choices:
@@ -2145,10 +2369,14 @@ class OcrReaderManager:
                     choices,
                     now=now,
                     state=self._aihong_menu_ocr_state,
+                    choice_bounds=_aihong_choice_boxes(choices, list(boxes or [])),
+                    choice_bounds_metadata=choice_bounds_metadata,
                 )
                 else "",
                 has_menu_candidate=True,
             )
+        if _looks_like_aihong_menu_status_only_text(raw_text):
+            return _MenuConsumeResult(emitted_kind="", has_menu_candidate=True)
         return _MenuConsumeResult(
             emitted_kind="line" if self._emit_line_from_ocr_text(raw_text, now=now) else "",
             has_menu_candidate=False,
@@ -2379,7 +2607,12 @@ class OcrReaderManager:
             else:
                 if aihong_two_stage_enabled:
                     if self._aihong_stage == _AIHONG_MENU_STAGE:
-                        menu_result = self._consume_aihong_menu_stage_text(extraction.text, now=now)
+                        menu_result = self._consume_aihong_menu_stage_text(
+                            extraction.text,
+                            now=now,
+                            boxes=extraction.boxes,
+                            choice_bounds_metadata=_extraction_choice_bounds_metadata(extraction),
+                        )
                         emitted = bool(menu_result.emitted_kind)
                         if menu_result.emitted_kind == "line":
                             self._aihong_stage = _AIHONG_DIALOGUE_STAGE
@@ -2393,16 +2626,41 @@ class OcrReaderManager:
                             if self._aihong_menu_missing_polls >= 2:
                                 self._reset_aihong_menu_state()
                     else:
-                        dialogue_emitted = bool(
-                            self._consume_ocr_text(
-                                extraction.text,
-                                now=now,
-                                state=self._default_ocr_state,
-                                allow_choices=False,
-                            )
+                        dialogue_menu_choices = _coerce_aihong_menu_choices(
+                            _stripped_ocr_lines(extraction.text)
                         )
+                        dialogue_text_is_menu_status = _looks_like_aihong_menu_status_only_text(
+                            extraction.text
+                        )
+                        dialogue_emitted = False
+                        if dialogue_menu_choices:
+                            dialogue_emitted = bool(
+                                self._emit_choices_from_candidates(
+                                    dialogue_menu_choices,
+                                    now=now,
+                                    state=self._aihong_menu_ocr_state,
+                                    choice_bounds=_aihong_choice_boxes(
+                                        dialogue_menu_choices,
+                                        extraction.boxes,
+                                    ),
+                                    choice_bounds_metadata=_extraction_choice_bounds_metadata(
+                                        extraction
+                                    ),
+                                )
+                            )
+                        elif not dialogue_text_is_menu_status:
+                            dialogue_emitted = bool(
+                                self._consume_ocr_text(
+                                    extraction.text,
+                                    now=now,
+                                    state=self._default_ocr_state,
+                                    allow_choices=False,
+                                )
+                            )
                         if (
                             not dialogue_emitted
+                            and not dialogue_text_is_menu_status
+                            and not dialogue_menu_choices
                             and self._should_attempt_followup_confirm(
                                 extraction.text,
                                 state=self._default_ocr_state,
@@ -2446,10 +2704,23 @@ class OcrReaderManager:
                         if dialogue_emitted:
                             self._aihong_dialogue_idle_polls = 0
                             self._aihong_menu_missing_polls = 0
-                            self._aihong_menu_ocr_state.reset()
+                            if dialogue_menu_choices:
+                                self._aihong_stage = _AIHONG_MENU_STAGE
+                            else:
+                                self._aihong_menu_ocr_state.reset()
                         else:
-                            self._aihong_dialogue_idle_polls += 1
-                            if self._aihong_dialogue_idle_polls >= 2:
+                            if dialogue_text_is_menu_status or dialogue_menu_choices:
+                                self._aihong_dialogue_idle_polls = max(
+                                    self._aihong_dialogue_idle_polls,
+                                    1,
+                                )
+                            else:
+                                self._aihong_dialogue_idle_polls += 1
+                            if (
+                                dialogue_text_is_menu_status
+                                or dialogue_menu_choices
+                                or self._aihong_dialogue_idle_polls >= 2
+                            ):
                                 menu_profile_selection = self._capture_profile_selection_for_target(
                                     target,
                                     stage=_AIHONG_MENU_STAGE,
@@ -2482,6 +2753,10 @@ class OcrReaderManager:
                                     menu_result = self._consume_aihong_menu_stage_text(
                                         menu_extraction.text,
                                         now=now,
+                                        boxes=menu_extraction.boxes,
+                                        choice_bounds_metadata=_extraction_choice_bounds_metadata(
+                                            menu_extraction
+                                        ),
                                     )
                                     if menu_result.has_menu_candidate:
                                         self._aihong_menu_missing_polls = 0
@@ -2501,6 +2776,8 @@ class OcrReaderManager:
                                         self._aihong_menu_missing_polls = 0
                                         runtime_profile = menu_profile
                                         runtime_capture_profile_selection = menu_profile_selection
+                                    elif menu_result.has_menu_candidate:
+                                        self._aihong_stage = _AIHONG_MENU_STAGE
                 else:
                     emitted = bool(self._consume_ocr_text(extraction.text, now=now))
                     if (
@@ -2875,8 +3152,14 @@ class OcrReaderManager:
             if descriptor.backend is None:
                 continue
             try:
+                extract_with_boxes = getattr(descriptor.backend, "extract_text_with_boxes", None)
+                if callable(extract_with_boxes):
+                    text, boxes = extract_with_boxes(image)
+                else:
+                    text = descriptor.backend.extract_text(image)
+                    boxes = []
                 return OcrExtractionResult(
-                    text=descriptor.backend.extract_text(image),
+                    text=text,
                     backend=descriptor,
                     backend_detail=(
                         "fallback_after_runtime_error"
@@ -2884,6 +3167,7 @@ class OcrReaderManager:
                         else (descriptor.detail or "selected_primary")
                     ),
                     warnings=warnings,
+                    boxes=list(boxes),
                 )
             except Exception as exc:
                 last_error = exc
@@ -2901,7 +3185,22 @@ class OcrReaderManager:
         plan: SelectedOcrBackendPlan,
     ) -> OcrExtractionResult:
         frame = self._capture_backend.capture_frame(target, profile)
-        return self._extract_text_from_image(frame, plan=plan)
+        extraction = self._extract_text_from_image(frame, plan=plan)
+        frame_info = getattr(frame, "info", {}) if frame is not None else {}
+        if isinstance(frame_info, dict):
+            extraction.bounds_coordinate_space = str(
+                frame_info.get("galgame_bounds_coordinate_space") or ""
+            )
+            source_size = frame_info.get("galgame_source_size")
+            if isinstance(source_size, dict):
+                extraction.source_size = dict(source_size)
+            capture_rect = frame_info.get("galgame_capture_rect")
+            if isinstance(capture_rect, dict):
+                extraction.capture_rect = dict(capture_rect)
+            window_rect = frame_info.get("galgame_window_rect")
+            if isinstance(window_rect, dict):
+                extraction.window_rect = dict(window_rect)
+        return extraction
 
     def _select_target_window(
         self,

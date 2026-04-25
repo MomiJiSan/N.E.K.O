@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .host_agent_adapter import HostAgentAdapter, HostAgentError
+from .local_input_actuator import (
+    VIRTUAL_MOUSE_DIALOGUE_CANDIDATES,
+    perform_local_input_actuation,
+)
 from .models import (
     AGENT_STATUS_ACTIVE,
     AGENT_STATUS_ERROR,
@@ -39,7 +44,9 @@ class GameLLMAgent:
     )
     _DEFAULT_BRIDGE_WAIT_TIMEOUT = 5.0
     _OCR_BRIDGE_WAIT_TIMEOUT = 12.0
+    _OCR_ADVANCE_BRIDGE_WAIT_TIMEOUT = 3.0
     _OCR_BRIDGE_ACTIVITY_GRACE_SECONDS = 4.0
+    _CHOICE_PLANNING_TIMEOUT_SECONDS = 8.0
     _DIALOGUE_ADVANCE_VARIANTS = (
         {
             "id": "advance_enter",
@@ -64,6 +71,13 @@ class GameLLMAgent:
             ),
         },
     )
+    _OCR_DIALOGUE_ADVANCE_VARIANT_ORDER = (
+        "advance_click",
+        "advance_click",
+        "advance_click",
+    )
+    _VIRTUAL_MOUSE_RECENT_SUCCESS_SECONDS = 30.0
+    _VIRTUAL_MOUSE_SKIP_AFTER_CONSECUTIVE_FAILURES = 2
     _UNKNOWN_NO_TEXT_ADVANCE_VARIANTS = (
         {
             "id": "probe_space",
@@ -110,11 +124,14 @@ class GameLLMAgent:
         logger,
         llm_gateway,
         host_adapter: HostAgentAdapter,
+        local_input_actuator: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+        | None = None,
     ) -> None:
         self._plugin = plugin
         self._logger = logger
         self._llm_gateway = llm_gateway
         self._host_adapter = host_adapter
+        self._local_input_actuator = local_input_actuator or perform_local_input_actuation
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._op_lock: asyncio.Lock | None = None
         self._explicit_standby = False
@@ -131,10 +148,15 @@ class GameLLMAgent:
         self._choice_memory: list[dict[str, Any]] = []
         self._recent_pushes: list[dict[str, Any]] = []
         self._failure_memory: list[dict[str, Any]] = []
+        self._recent_local_inputs: list[dict[str, Any]] = []
+        self._virtual_mouse_stats: dict[str, dict[str, Any]] = {}
         self._suggestion_reasons: dict[str, str] = {}
         self._observed_session_id = ""
         self._observed_scene_id = ""
         self._observed_choice_marker = ""
+        self._observed_virtual_mouse_runtime_key = ""
+        self._computer_use_quota_bypass_until = 0.0
+        self._local_task_seq = 0
         self._scene_state = self._build_empty_scene_state()
         self._last_status = AGENT_STATUS_STANDBY
         self._last_trace_message = ""
@@ -180,10 +202,15 @@ class GameLLMAgent:
             self._choice_memory.clear()
             self._recent_pushes.clear()
             self._failure_memory.clear()
+            self._recent_local_inputs.clear()
+            self._virtual_mouse_stats.clear()
             self._suggestion_reasons.clear()
             self._observed_session_id = ""
             self._observed_scene_id = ""
             self._observed_choice_marker = ""
+            self._observed_virtual_mouse_runtime_key = ""
+            self._computer_use_quota_bypass_until = 0.0
+            self._local_task_seq = 0
             self._next_actuation_at = 0.0
             self._scene_state = self._build_empty_scene_state()
             self._last_status = AGENT_STATUS_STANDBY
@@ -246,6 +273,40 @@ class GameLLMAgent:
                     )
                     self._last_status = status
                     return
+                choice_signature = build_choice_signature(visible_choices)
+                if (
+                    self._planning_started_at > 0
+                    and self._planning_choice_signature == choice_signature
+                    and now - self._planning_started_at >= self._CHOICE_PLANNING_TIMEOUT_SECONDS
+                ):
+                    self._trace_runtime(
+                        "tick using choice fallback after stale planning window: "
+                        f"choices={len(visible_choices)}"
+                    )
+                    self._planning_started_at = 0.0
+                    await self._start_choice_fallback_actuation(
+                        shared,
+                        current_choices=visible_choices,
+                        now=now,
+                        diagnostic="timeout: previous choice planning did not complete",
+                    )
+                    self._last_status = self._compute_status(shared)
+                    return
+                if self._current_input_source(shared) == DATA_SOURCE_OCR_READER:
+                    self._trace_runtime(
+                        "tick using OCR visible choice fallback: "
+                        f"choices={len(visible_choices)}"
+                    )
+                    self._planning_choice_signature = choice_signature
+                    self._planning_started_at = now
+                    await self._start_choice_fallback_actuation(
+                        shared,
+                        current_choices=visible_choices,
+                        now=now,
+                        diagnostic="ocr_reader: choose first visible choice without LLM wait",
+                    )
+                    self._last_status = self._compute_status(shared)
+                    return
                 context = build_suggest_context(shared)
                 self._trace_runtime(
                     "tick starting choice planning: "
@@ -256,7 +317,7 @@ class GameLLMAgent:
                 self._planning_choice_signature = build_choice_signature(context["visible_choices"])
                 self._planning_candidates = []
                 self._planning_started_at = now
-                self._planning_task = asyncio.create_task(self._llm_gateway.suggest_choice(context))
+                await self._run_choice_planning_inline(shared, context=context, now=now)
                 self._last_status = self._compute_status(shared)
                 return
 
@@ -372,6 +433,23 @@ class GameLLMAgent:
         if task is None:
             return
         if not task.done():
+            if now - self._planning_started_at < self._CHOICE_PLANNING_TIMEOUT_SECONDS:
+                return
+            self._trace_runtime("choice planning timed out; using visible choice fallback")
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._planning_task = None
+            current_choices = list((shared.get("latest_snapshot") or {}).get("choices") or [])
+            if build_choice_signature(current_choices) != self._planning_choice_signature:
+                self._trace_runtime("choice planning timeout fallback dropped: visible choices changed")
+                self._next_actuation_at = now + 0.2
+                return
+            await self._start_choice_fallback_actuation(
+                shared,
+                current_choices=current_choices,
+                now=now,
+                diagnostic="timeout: choice planning exceeded fallback window",
+            )
             return
 
         self._planning_task = None
@@ -414,6 +492,88 @@ class GameLLMAgent:
             now=now,
         )
 
+    async def _run_choice_planning_inline(
+        self,
+        shared: dict[str, Any],
+        *,
+        context: dict[str, Any],
+        now: float,
+    ) -> None:
+        try:
+            suggestion = await asyncio.wait_for(
+                self._llm_gateway.suggest_choice(context),
+                timeout=self._CHOICE_PLANNING_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            suggestion = {
+                "degraded": True,
+                "choices": [],
+                "diagnostic": "timeout: choice planning exceeded fallback window",
+            }
+        except Exception as exc:
+            self._logger.warning("galgame inline choice planning failed: {}", exc)
+            suggestion = {"degraded": True, "choices": [], "diagnostic": str(exc)}
+
+        current_choices = list((shared.get("latest_snapshot") or {}).get("choices") or [])
+        if build_choice_signature(current_choices) != self._planning_choice_signature:
+            self._trace_runtime("choice planning dropped: visible choices changed before inline result")
+            self._next_actuation_at = now + 0.2
+            return
+
+        candidates = self._build_choice_candidates(current_choices, suggestion)
+        self._planning_candidates = json_copy(candidates)
+        self._trace_runtime(
+            "choice planning finished: "
+            f"degraded={bool(suggestion.get('degraded'))} "
+            f"diagnostic={str(suggestion.get('diagnostic') or '') or 'none'} "
+            f"candidates={len(candidates)}"
+        )
+        if not candidates:
+            self._next_actuation_at = now + 0.2
+            return
+
+        await self._start_actuation_from_strategy(
+            shared,
+            strategy=self._build_choice_strategy(
+                shared,
+                candidate_choices=candidates,
+                candidate_index=0,
+                instruction_variant=0,
+            ),
+            now=now,
+        )
+
+    async def _start_choice_fallback_actuation(
+        self,
+        shared: dict[str, Any],
+        *,
+        current_choices: list[dict[str, Any]],
+        now: float,
+        diagnostic: str,
+    ) -> None:
+        candidates = self._build_choice_candidates(
+            current_choices,
+            {"degraded": True, "choices": [], "diagnostic": diagnostic},
+        )
+        self._planning_candidates = json_copy(candidates)
+        self._trace_runtime(
+            "choice planning fallback: "
+            f"diagnostic={diagnostic or 'none'} candidates={len(candidates)}"
+        )
+        if not candidates:
+            self._next_actuation_at = now + 0.2
+            return
+        await self._start_actuation_from_strategy(
+            shared,
+            strategy=self._build_choice_strategy(
+                shared,
+                candidate_choices=candidates,
+                candidate_index=0,
+                instruction_variant=0,
+            ),
+            now=now,
+        )
+
     async def _start_actuation_from_strategy(
         self,
         shared: dict[str, Any],
@@ -421,6 +581,14 @@ class GameLLMAgent:
         strategy: dict[str, Any],
         now: float,
     ) -> None:
+        try:
+            virtual_mouse_candidate_index = int(
+                strategy.get("virtual_mouse_candidate_index")
+                if strategy.get("virtual_mouse_candidate_index") is not None
+                else -1
+            )
+        except (TypeError, ValueError):
+            virtual_mouse_candidate_index = -1
         await self._start_actuation(
             shared,
             kind=str(strategy.get("kind") or ""),
@@ -434,6 +602,8 @@ class GameLLMAgent:
             candidate_choices=list(strategy.get("candidate_choices") or []),
             candidate_index=int(strategy.get("candidate_index") or 0),
             retry_reason=str(strategy.get("retry_reason") or ""),
+            virtual_mouse_target_id=str(strategy.get("virtual_mouse_target_id") or ""),
+            virtual_mouse_candidate_index=virtual_mouse_candidate_index,
         )
 
     async def _start_actuation(
@@ -451,7 +621,100 @@ class GameLLMAgent:
         candidate_choices: list[dict[str, Any]] | None = None,
         candidate_index: int = 0,
         retry_reason: str = "",
+        virtual_mouse_target_id: str = "",
+        virtual_mouse_candidate_index: int = -1,
     ) -> None:
+        if self._should_block_dialogue_advance_for_visible_choices(shared, kind=kind):
+            self._trace_runtime("actuation blocked: visible choices are present during advance")
+            self._next_actuation_at = now + 0.2
+            return
+
+        if self._should_prefer_local_input_for_ocr(shared, kind=kind):
+            snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+            task_id = self._next_local_task_id()
+            actuation = self._build_actuation_state(
+                shared,
+                snapshot=snapshot,
+                kind=kind,
+                task_id=task_id,
+                state="local_fallback",
+                now=now,
+                choice_id=choice_id,
+                strategy_family=strategy_family,
+                strategy_id=strategy_id,
+                instruction_variant=instruction_variant,
+                candidate_choices=candidate_choices,
+                candidate_index=candidate_index,
+                retry_reason=retry_reason,
+                virtual_mouse_target_id=virtual_mouse_target_id,
+                virtual_mouse_candidate_index=virtual_mouse_candidate_index,
+            )
+            if choice_id and suggestion_reason:
+                self._remember_suggestion_reason(choice_id, suggestion_reason)
+            fallback = await self._run_local_input_fallback(shared, actuation=actuation)
+            if bool(fallback.get("success")):
+                self._clear_hard_error()
+                self._trace_runtime(
+                    "actuation local input preferred for OCR: "
+                    f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
+                )
+                actuation["local_fallback_result"] = json_copy(fallback)
+                actuation["state"] = "awaiting_bridge"
+                actuation["bridge_wait_started_at"] = now
+                actuation["bridge_wait_timeout"] = self._bridge_wait_timeout(
+                    shared, actuation=actuation
+                )
+                self._actuation = actuation
+                return
+            self._trace_runtime(
+                "actuation preferred local input failed, falling back to computer_use: "
+                f"kind={kind} strategy_id={strategy_id or 'none'} "
+                f"reason={fallback.get('reason') or fallback}"
+            )
+
+        if self._should_bypass_computer_use_for_quota(now=now, kind=kind):
+            snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+            task_id = self._next_local_task_id()
+            actuation = self._build_actuation_state(
+                shared,
+                snapshot=snapshot,
+                kind=kind,
+                task_id=task_id,
+                state="local_fallback",
+                now=now,
+                choice_id=choice_id,
+                strategy_family=strategy_family,
+                strategy_id=strategy_id,
+                instruction_variant=instruction_variant,
+                candidate_choices=candidate_choices,
+                candidate_index=candidate_index,
+                retry_reason=retry_reason,
+                virtual_mouse_target_id=virtual_mouse_target_id,
+                virtual_mouse_candidate_index=virtual_mouse_candidate_index,
+            )
+            if choice_id and suggestion_reason:
+                self._remember_suggestion_reason(choice_id, suggestion_reason)
+            fallback = await self._run_local_input_fallback(shared, actuation=actuation)
+            if bool(fallback.get("success")):
+                self._clear_hard_error()
+                self._trace_runtime(
+                    "actuation local fallback started under quota bypass: "
+                    f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
+                )
+                actuation["local_fallback_result"] = json_copy(fallback)
+                actuation["state"] = "awaiting_bridge"
+                actuation["bridge_wait_started_at"] = now
+                actuation["bridge_wait_timeout"] = self._bridge_wait_timeout(
+                    shared, actuation=actuation
+                )
+                self._actuation = actuation
+                return
+            self._trace_runtime(
+                "actuation quota bypass local fallback failed: "
+                f"kind={kind} strategy_id={strategy_id or 'none'} "
+                f"reason={fallback.get('reason') or fallback}"
+            )
+
         try:
             availability = await self._host_adapter.get_computer_use_availability()
         except HostAgentError as exc:
@@ -486,16 +749,53 @@ class GameLLMAgent:
             self._remember_suggestion_reason(choice_id, suggestion_reason)
 
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
-        input_source = self._current_input_source(shared)
         self._clear_hard_error()
         self._trace_runtime(
             "actuation started: "
             f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
         )
-        self._actuation = {
+        self._actuation = self._build_actuation_state(
+            shared,
+            snapshot=snapshot,
+            kind=kind,
+            task_id=task_id,
+            state="running_host",
+            now=now,
+            choice_id=choice_id,
+            strategy_family=strategy_family,
+            strategy_id=strategy_id,
+            instruction_variant=instruction_variant,
+            candidate_choices=candidate_choices,
+            candidate_index=candidate_index,
+            retry_reason=retry_reason,
+            virtual_mouse_target_id=virtual_mouse_target_id,
+            virtual_mouse_candidate_index=virtual_mouse_candidate_index,
+        )
+
+    def _build_actuation_state(
+        self,
+        shared: dict[str, Any],
+        *,
+        snapshot: dict[str, Any],
+        kind: str,
+        task_id: str,
+        state: str,
+        now: float,
+        choice_id: str = "",
+        strategy_family: str = "",
+        strategy_id: str = "",
+        instruction_variant: int = 0,
+        candidate_choices: list[dict[str, Any]] | None = None,
+        candidate_index: int = 0,
+        retry_reason: str = "",
+        virtual_mouse_target_id: str = "",
+        virtual_mouse_candidate_index: int = -1,
+    ) -> dict[str, Any]:
+        input_source = self._current_input_source(shared)
+        return {
             "kind": kind,
             "task_id": task_id,
-            "state": "running_host",
+            "state": state,
             "strategy_family": strategy_family,
             "strategy_id": strategy_id,
             "instruction_variant": instruction_variant,
@@ -521,7 +821,230 @@ class GameLLMAgent:
             "candidate_choices": json_copy(candidate_choices or []),
             "candidate_index": candidate_index,
             "retry_reason": retry_reason,
+            "virtual_mouse_target_id": virtual_mouse_target_id,
+            "virtual_mouse_candidate_index": virtual_mouse_candidate_index,
         }
+
+    def _next_local_task_id(self) -> str:
+        self._local_task_seq += 1
+        return f"local-{self._local_task_seq}"
+
+    def _should_bypass_computer_use_for_quota(self, *, now: float, kind: str) -> bool:
+        if kind not in {"advance", "probe", "recover", "choose"}:
+            return False
+        return now < self._computer_use_quota_bypass_until
+
+    @staticmethod
+    def _actuation_input_source_is_ocr(actuation: dict[str, Any]) -> bool:
+        return str(actuation.get("input_source") or "") == DATA_SOURCE_OCR_READER
+
+    def _should_prefer_local_input_for_ocr(self, shared: dict[str, Any], *, kind: str) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return False
+        if kind not in {"advance", "probe", "choose"}:
+            return False
+        runtime = shared.get("ocr_reader_runtime")
+        return isinstance(runtime, dict) and int(runtime.get("pid") or 0) > 0
+
+    @staticmethod
+    def _should_block_dialogue_advance_for_visible_choices(
+        shared: dict[str, Any],
+        *,
+        kind: str,
+    ) -> bool:
+        if kind != "advance":
+            return False
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        return bool(snapshot.get("is_menu_open")) or bool(list(snapshot.get("choices", [])))
+
+    @staticmethod
+    def _virtual_mouse_candidate_ids() -> tuple[str, ...]:
+        return tuple(
+            str(candidate.get("target_id") or "")
+            for candidate in VIRTUAL_MOUSE_DIALOGUE_CANDIDATES
+            if str(candidate.get("target_id") or "")
+        )
+
+    @staticmethod
+    def _coerce_stat_time(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _virtual_mouse_runtime_key(self, shared: dict[str, Any]) -> str:
+        runtime = shared.get("ocr_reader_runtime")
+        if not isinstance(runtime, dict):
+            runtime = shared.get("memory_reader_runtime")
+        if not isinstance(runtime, dict):
+            return ""
+        pid = int(runtime.get("pid") or 0)
+        process_name = str(
+            runtime.get("effective_process_name") or runtime.get("process_name") or ""
+        ).strip()
+        window_title = str(
+            runtime.get("effective_window_title") or runtime.get("window_title") or ""
+        ).strip()
+        if pid <= 0 and not process_name and not window_title:
+            return ""
+        return f"{pid}:{process_name}:{window_title}"
+
+    def _virtual_mouse_stat(self, target_id: str) -> dict[str, Any]:
+        stat = self._virtual_mouse_stats.get(target_id)
+        if not isinstance(stat, dict):
+            stat = {
+                "success": 0,
+                "failure": 0,
+                "consecutive_failures": 0,
+                "last_success_at": None,
+                "last_failure_at": None,
+            }
+            self._virtual_mouse_stats[target_id] = stat
+        return stat
+
+    def _virtual_mouse_score(self, target_id: str, *, now: float) -> int:
+        stat = self._virtual_mouse_stats.get(target_id) or {}
+        success = int(stat.get("success") or 0)
+        failure = int(stat.get("failure") or 0)
+        consecutive_failures = int(stat.get("consecutive_failures") or 0)
+        last_success_at = self._coerce_stat_time(stat.get("last_success_at"))
+        last_failure_at = self._coerce_stat_time(stat.get("last_failure_at"))
+        recent_success_bonus = 0
+        if (
+            last_success_at > 0
+            and now - last_success_at <= self._VIRTUAL_MOUSE_RECENT_SUCCESS_SECONDS
+            and last_success_at >= last_failure_at
+        ):
+            recent_success_bonus = 2
+        return success * 3 - failure * 2 - consecutive_failures * 3 + recent_success_bonus
+
+    def _select_virtual_mouse_dialogue_candidate(
+        self,
+        *,
+        now: float,
+        mutate: bool,
+    ) -> dict[str, Any] | None:
+        candidates = [
+            (index, target_id)
+            for index, target_id in enumerate(self._virtual_mouse_candidate_ids())
+            if target_id
+        ]
+        if not candidates:
+            return None
+
+        excluded = {
+            target_id
+            for _, target_id in candidates
+            if int(
+                (self._virtual_mouse_stats.get(target_id) or {}).get("consecutive_failures")
+                or 0
+            )
+            >= self._VIRTUAL_MOUSE_SKIP_AFTER_CONSECUTIVE_FAILURES
+        }
+        available = [(index, target_id) for index, target_id in candidates if target_id not in excluded]
+        all_excluded_reset = False
+        if not available:
+            all_excluded_reset = True
+            if mutate:
+                for _, target_id in candidates:
+                    if target_id in self._virtual_mouse_stats:
+                        self._virtual_mouse_stats[target_id]["consecutive_failures"] = 0
+                excluded = set()
+            available = candidates
+
+        scored = [
+            {
+                "target_id": target_id,
+                "candidate_index": index,
+                "score": self._virtual_mouse_score(target_id, now=now),
+                "temporarily_excluded_target_ids": sorted(excluded),
+                "all_candidates_temporarily_excluded_reset": all_excluded_reset,
+            }
+            for index, target_id in available
+        ]
+        scored.sort(key=lambda item: (-int(item["score"]), int(item["candidate_index"])))
+        return scored[0]
+
+    def _virtual_mouse_stats_debug(self, *, now: float) -> dict[str, dict[str, Any]]:
+        stats: dict[str, dict[str, Any]] = {}
+        for target_id in self._virtual_mouse_candidate_ids():
+            stat = self._virtual_mouse_stats.get(target_id) or {}
+            stats[target_id] = {
+                "success": int(stat.get("success") or 0),
+                "failure": int(stat.get("failure") or 0),
+                "consecutive_failures": int(stat.get("consecutive_failures") or 0),
+                "last_success_at": stat.get("last_success_at"),
+                "last_failure_at": stat.get("last_failure_at"),
+                "score": self._virtual_mouse_score(target_id, now=now),
+            }
+        return stats
+
+    def _virtual_mouse_result_for_learning(
+        self,
+        actuation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if str(actuation.get("kind") or "") != "advance":
+            return None
+        if str(actuation.get("strategy_id") or "") != "advance_click":
+            return None
+        if str(actuation.get("strategy_family") or "") != "dialogue":
+            return None
+        if not self._actuation_input_source_is_ocr(actuation):
+            return None
+        result = actuation.get("local_fallback_result")
+        if not isinstance(result, dict):
+            return None
+        if not bool(result.get("success")):
+            return None
+        if str(result.get("method") or "") != "virtual_mouse_dialogue_click":
+            return None
+        virtual_mouse = result.get("virtual_mouse")
+        if not isinstance(virtual_mouse, dict):
+            return None
+        if bool(virtual_mouse.get("blocked")):
+            return None
+        if virtual_mouse.get("success") is False:
+            return None
+        safety_policy = virtual_mouse.get("safety_policy")
+        if not isinstance(safety_policy, dict):
+            safety_policy = result.get("safety_policy")
+        if isinstance(safety_policy, dict) and bool(safety_policy.get("blocked")):
+            return None
+        target_id = str(
+            virtual_mouse.get("target_id") or actuation.get("virtual_mouse_target_id") or ""
+        )
+        if target_id not in self._virtual_mouse_candidate_ids():
+            return None
+        try:
+            candidate_index = int(
+                virtual_mouse.get("candidate_index")
+                if virtual_mouse.get("candidate_index") is not None
+                else actuation.get("virtual_mouse_candidate_index")
+            )
+        except (TypeError, ValueError):
+            candidate_index = -1
+        return {"target_id": target_id, "candidate_index": candidate_index}
+
+    def _record_virtual_mouse_outcome(
+        self,
+        actuation: dict[str, Any],
+        *,
+        success: bool,
+        now: float,
+    ) -> bool:
+        target = self._virtual_mouse_result_for_learning(actuation)
+        if target is None:
+            return False
+        stat = self._virtual_mouse_stat(str(target["target_id"]))
+        if success:
+            stat["success"] = int(stat.get("success") or 0) + 1
+            stat["consecutive_failures"] = 0
+            stat["last_success_at"] = now
+        else:
+            stat["failure"] = int(stat.get("failure") or 0) + 1
+            stat["consecutive_failures"] = int(stat.get("consecutive_failures") or 0) + 1
+            stat["last_failure_at"] = now
+        return True
 
     async def _progress_actuation(self, shared: dict[str, Any], now: float) -> None:
         actuation = self._actuation
@@ -556,6 +1079,24 @@ class GameLLMAgent:
                 return
 
             reason = str(task.get("error") or f"actuation task ended with status={status}")
+            if self._should_try_local_input_fallback(task, actuation=actuation, reason=reason):
+                self._computer_use_quota_bypass_until = now + 300.0
+                fallback = await self._run_local_input_fallback(shared, actuation=actuation)
+                if bool(fallback.get("success")):
+                    self._trace_runtime(
+                        "actuation local fallback completed, awaiting bridge update: "
+                        f"task_id={str(actuation.get('task_id') or '')} "
+                        f"kind={str(actuation.get('kind') or '')} "
+                        f"strategy_id={str(actuation.get('strategy_id') or '')}"
+                    )
+                    actuation["local_fallback_result"] = json_copy(fallback)
+                    actuation["state"] = "awaiting_bridge"
+                    actuation["bridge_wait_started_at"] = now
+                    actuation["bridge_wait_timeout"] = self._bridge_wait_timeout(
+                        shared, actuation=actuation
+                    )
+                    return
+                reason = f"{reason}; local fallback failed: {fallback.get('reason') or fallback}"
             self._trace_runtime(
                 "actuation host ended unsuccessfully: "
                 f"task_id={str(actuation.get('task_id') or '')} "
@@ -584,6 +1125,7 @@ class GameLLMAgent:
                 "actuation observed bridge progress: "
                 f"task_id={str(actuation.get('task_id') or '')} via={progress_reason}"
             )
+            self._record_virtual_mouse_outcome(actuation, success=True, now=now)
             self._clear_hard_error()
             self._actuation = None
             self._pending_strategy = None
@@ -599,6 +1141,7 @@ class GameLLMAgent:
                 f"task_id={str(actuation.get('task_id') or '')} "
                 f"timeout={wait_timeout:.1f}s input_source={self._current_input_source(shared)}"
             )
+            self._record_virtual_mouse_outcome(actuation, success=False, now=now)
             retry = self._build_retry_strategy(shared, actuation=actuation, failure_reason=reason)
             self._record_failure(
                 kind=str(actuation.get("kind") or ""),
@@ -614,6 +1157,79 @@ class GameLLMAgent:
                 return
             self._set_hard_error(reason, retryable=False)
             self._next_actuation_at = now + 1.0
+
+    @staticmethod
+    def _task_failure_text(task: dict[str, Any], *, reason: str) -> str:
+        parts = [str(reason or ""), str(task.get("status") or ""), str(task.get("error") or "")]
+        result = task.get("result")
+        if result:
+            try:
+                parts.append(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            except TypeError:
+                parts.append(str(result))
+        return "\n".join(parts)
+
+    def _should_try_local_input_fallback(
+        self,
+        task: dict[str, Any],
+        *,
+        actuation: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        kind = str(actuation.get("kind") or "")
+        if kind not in {"advance", "probe", "recover", "choose"}:
+            return False
+        text = self._task_failure_text(task, reason=reason).lower()
+        return "agent_quota_exceeded" in text or "quota" in text
+
+    async def _run_local_input_fallback(
+        self,
+        shared: dict[str, Any],
+        *,
+        actuation: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            result = await asyncio.to_thread(
+                self._local_input_actuator,
+                json_copy(shared),
+                json_copy(actuation),
+            )
+            self._remember_local_input_result(result, actuation=actuation)
+            return result
+        except Exception as exc:
+            self._logger.warning("galgame local input fallback failed: {}", exc)
+            result = {"success": False, "reason": str(exc)}
+            self._remember_local_input_result(result, actuation=actuation)
+            return result
+
+    def _remember_local_input_result(
+        self,
+        result: dict[str, Any],
+        *,
+        actuation: dict[str, Any],
+        limit: int = 10,
+    ) -> None:
+        record = {
+            "ts": str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+            "task_id": str(actuation.get("task_id") or ""),
+            "kind": str(actuation.get("kind") or ""),
+            "strategy_id": str(actuation.get("strategy_id") or ""),
+            "instruction_variant": int(actuation.get("instruction_variant") or 0),
+            "virtual_mouse_target_id": str(actuation.get("virtual_mouse_target_id") or ""),
+            "virtual_mouse_candidate_index": int(
+                actuation.get("virtual_mouse_candidate_index") or -1
+            ),
+            "success": bool(result.get("success")),
+            "reason": str(result.get("reason") or ""),
+            "method": str(result.get("method") or ""),
+            "pid": int(result.get("pid") or 0),
+            "hwnd": int(result.get("hwnd") or 0),
+        }
+        if isinstance(result.get("virtual_mouse"), dict):
+            record["virtual_mouse"] = json_copy(result["virtual_mouse"])
+        if isinstance(result.get("safety_policy"), dict):
+            record["safety_policy"] = json_copy(result["safety_policy"])
+        self._append_bounded(self._recent_local_inputs, record, limit=limit)
 
     def _detect_bridge_progress(
         self,
@@ -684,6 +1300,9 @@ class GameLLMAgent:
             or DATA_SOURCE_BRIDGE_SDK
         )
         if input_source == DATA_SOURCE_OCR_READER:
+            kind = str(actuation.get("kind") or "")
+            if kind in {"advance", "probe"}:
+                return self._OCR_ADVANCE_BRIDGE_WAIT_TIMEOUT
             if self._has_recent_ocr_bridge_activity(shared, actuation=actuation):
                 return self._OCR_BRIDGE_WAIT_TIMEOUT + self._OCR_BRIDGE_ACTIVITY_GRACE_SECONDS
             return self._OCR_BRIDGE_WAIT_TIMEOUT
@@ -783,10 +1402,11 @@ class GameLLMAgent:
         retry_index: int,
         reason: str,
     ) -> dict[str, Any] | None:
-        if retry_index >= len(self._DIALOGUE_ADVANCE_VARIANTS):
+        variants = self._dialogue_advance_variants(shared)
+        if retry_index >= len(variants):
             return None
-        variant = self._DIALOGUE_ADVANCE_VARIANTS[retry_index]
-        return {
+        variant = variants[retry_index]
+        strategy = {
             "kind": "advance",
             "strategy_family": "dialogue",
             "strategy_id": str(variant["id"]),
@@ -798,6 +1418,30 @@ class GameLLMAgent:
             "choice_id": "",
             "suggestion_reason": "",
         }
+        if (
+            self._current_input_source(shared) == DATA_SOURCE_OCR_READER
+            and str(variant["id"]) == "advance_click"
+        ):
+            selected = self._select_virtual_mouse_dialogue_candidate(
+                now=time.monotonic(),
+                mutate=True,
+            )
+            if selected is not None:
+                strategy["virtual_mouse_target_id"] = str(selected["target_id"])
+                strategy["virtual_mouse_candidate_index"] = int(selected["candidate_index"])
+        return strategy
+
+    def _dialogue_advance_variants(self, shared: dict[str, Any]) -> tuple[dict[str, str], ...]:
+        variants = tuple(self._DIALOGUE_ADVANCE_VARIANTS)
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return variants
+        by_id = {str(item.get("id") or ""): item for item in variants}
+        ordered = tuple(
+            by_id[variant_id]
+            for variant_id in self._OCR_DIALOGUE_ADVANCE_VARIANT_ORDER
+            if variant_id in by_id
+        )
+        return ordered or variants
 
     def _build_recover_strategy(
         self,
@@ -947,6 +1591,12 @@ class GameLLMAgent:
             )
             if retry is not None:
                 return retry
+            if self._actuation_input_source_is_ocr(actuation):
+                return self._build_dialogue_strategy(
+                    shared,
+                    retry_index=0,
+                    reason=failure_reason,
+                )
             return self._build_recover_strategy(shared, retry_index=0, reason=failure_reason)
 
         if kind == "recover":
@@ -1244,20 +1894,28 @@ class GameLLMAgent:
     async def _observe(self, shared: dict[str, Any]) -> None:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
         session_id = str(shared.get("active_session_id") or "")
+        virtual_mouse_runtime_key = self._virtual_mouse_runtime_key(shared)
         if session_id != self._observed_session_id:
             await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
             self._scene_memory.clear()
             self._choice_memory.clear()
             self._recent_pushes.clear()
             self._failure_memory.clear()
+            self._recent_local_inputs.clear()
+            self._virtual_mouse_stats.clear()
             self._suggestion_reasons.clear()
             self._clear_hard_error()
             self._observed_choice_marker = ""
             self._observed_scene_id = str(snapshot.get("scene_id") or "")
             self._observed_session_id = session_id
+            self._observed_virtual_mouse_runtime_key = virtual_mouse_runtime_key
             self._next_actuation_at = 0.0
             self._scene_state = self._build_empty_scene_state()
             return
+        if virtual_mouse_runtime_key != self._observed_virtual_mouse_runtime_key:
+            if self._observed_virtual_mouse_runtime_key:
+                self._virtual_mouse_stats.clear()
+            self._observed_virtual_mouse_runtime_key = virtual_mouse_runtime_key
 
         current_scene_id = str(snapshot.get("scene_id") or "")
         current_route_id = str(snapshot.get("route_id") or "")
@@ -1402,6 +2060,7 @@ class GameLLMAgent:
     ) -> dict[str, Any]:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
         recent_pushes = json_copy(self._recent_pushes[-20:])
+        debug_now = time.monotonic()
         return {
             "result": self._build_status_result(
                 shared,
@@ -1429,6 +2088,7 @@ class GameLLMAgent:
                 "choice_memory": len(self._choice_memory),
                 "failure_memory": len(self._failure_memory),
                 "recent_pushes": len(self._recent_pushes),
+                "recent_local_inputs": len(self._recent_local_inputs),
             },
             "recent_pushes": recent_pushes,
             "last_push": json_copy(recent_pushes[-1]) if recent_pushes else None,
@@ -1442,6 +2102,12 @@ class GameLLMAgent:
                 if self._pending_strategy is not None
                 else None,
                 "scene_state": json_copy(self._scene_state),
+                "recent_local_inputs": json_copy(self._recent_local_inputs[-10:]),
+                "virtual_mouse_stats": self._virtual_mouse_stats_debug(now=debug_now),
+                "virtual_mouse_preferred_target": self._select_virtual_mouse_dialogue_candidate(
+                    now=debug_now,
+                    mutate=False,
+                ),
             },
         }
 
