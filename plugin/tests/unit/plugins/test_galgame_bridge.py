@@ -3756,6 +3756,136 @@ def test_ocr_writer_can_emit_choices_without_prior_line(tmp_path: Path) -> None:
     assert events[-1]["type"] == "choices_shown"
 
 
+@pytest.mark.plugin_unit
+def test_ocr_line_observed_updates_snapshot_without_stable_history(tmp_path: Path) -> None:
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
+    writer.start_session(
+        DetectedGameWindow(
+            hwnd=404,
+            title="哀鸿",
+            process_name="TheLamentingGeese.exe",
+            pid=6104,
+        )
+    )
+
+    assert writer.emit_line_observed("王生：算了，没事。", ts="2024-04-02T12:00:00Z") is True
+
+    game_dir = tmp_path / writer.game_id
+    session = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+    history_events: list[dict[str, Any]] = []
+    history_lines: list[dict[str, Any]] = []
+    history_choices: list[dict[str, Any]] = []
+    dedupe_window: list[dict[str, str]] = []
+    cfg = build_config({"galgame": {"bridge_root": str(tmp_path)}})
+    for event in events:
+        galgame_service.apply_event_to_histories(
+            history_events=history_events,
+            history_lines=history_lines,
+            history_choices=history_choices,
+            dedupe_window=dedupe_window,
+            event=event,
+            config=cfg,
+            game_id=writer.game_id,
+        )
+
+    assert session.session is not None
+    assert session.session["state"]["speaker"] == "王生"
+    assert session.session["state"]["text"] == "算了，没事。"
+    assert session.session["state"]["stability"] == "tentative"
+    assert events[-1]["type"] == "line_observed"
+    assert history_lines == []
+
+
+@pytest.mark.plugin_unit
+def test_ocr_line_second_stable_read_enters_history(tmp_path: Path) -> None:
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
+    writer.start_session(
+        DetectedGameWindow(
+            hwnd=404,
+            title="哀鸿",
+            process_name="TheLamentingGeese.exe",
+            pid=6104,
+        )
+    )
+
+    writer.emit_line_observed("王生：算了，没事。", ts="2024-04-02T12:00:00Z")
+    assert writer.emit_line("王生：算了，没事。", ts="2024-04-02T12:00:01Z") is True
+
+    game_dir = tmp_path / writer.game_id
+    session = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+    history_events: list[dict[str, Any]] = []
+    history_lines: list[dict[str, Any]] = []
+    history_choices: list[dict[str, Any]] = []
+    dedupe_window: list[dict[str, str]] = []
+    cfg = build_config({"galgame": {"bridge_root": str(tmp_path)}})
+    for event in events:
+        galgame_service.apply_event_to_histories(
+            history_events=history_events,
+            history_lines=history_lines,
+            history_choices=history_choices,
+            dedupe_window=dedupe_window,
+            event=event,
+            config=cfg,
+            game_id=writer.game_id,
+        )
+
+    assert session.session is not None
+    assert session.session["state"]["stability"] == "stable"
+    assert events[-1]["type"] == "line_changed"
+    assert len(history_lines) == 1
+    assert history_lines[0]["speaker"] == "王生"
+    assert history_lines[0]["text"] == "算了，没事。"
+
+
+@pytest.mark.plugin_unit
+def test_ocr_advance_speed_controls_line_changed_threshold(tmp_path: Path) -> None:
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
+    writer.start_session(
+        DetectedGameWindow(
+            hwnd=404,
+            title="哀鸿",
+            process_name="TheLamentingGeese.exe",
+            pid=6104,
+        )
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config({"galgame": {"bridge_root": str(tmp_path)}}),
+        writer=writer,
+    )
+
+    manager.update_advance_speed("slow")
+    assert manager._emit_line_from_ocr_text("王生：算了，没事。", now=1712100100.0) is False
+    assert manager._emit_line_from_ocr_text("王生：算了，没事。", now=1712100101.0) is False
+    assert manager._emit_line_from_ocr_text("王生：算了，没事。", now=1712100102.0) is True
+
+    slow_events = _read_bridge_events(tmp_path / writer.game_id / "events.jsonl")
+    assert [event["type"] for event in slow_events].count("line_changed") == 1
+
+    fast_root = tmp_path / "fast"
+    fast_writer = OcrReaderBridgeWriter(bridge_root=fast_root, time_fn=lambda: 1712100200.0)
+    fast_writer.start_session(
+        DetectedGameWindow(
+            hwnd=405,
+            title="哀鸿",
+            process_name="TheLamentingGeese.exe",
+            pid=6105,
+        )
+    )
+    fast_manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config({"galgame": {"bridge_root": str(fast_root)}}),
+        writer=fast_writer,
+    )
+    fast_manager.update_advance_speed("fast")
+
+    assert fast_manager._emit_line_from_ocr_text("王生：算了，没事。", now=1712100200.0) is True
+    fast_events = _read_bridge_events(fast_root / fast_writer.game_id / "events.jsonl")
+    assert [event["type"] for event in fast_events][-2:] == ["line_observed", "line_changed"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_memory_reader_fallback_activates_when_bridge_sdk_is_missing(tmp_path: Path) -> None:

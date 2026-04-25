@@ -6,15 +6,15 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <title>Galgame 插件管理</title>
-  <link rel="stylesheet" href="./style.css?v=20260425-ocr-buttons-3">
+  <title>Galgame 插件设置</title>
+  <link rel="stylesheet" href="./style.css?v=20260426-install-state-2">
 </head>
 <body>
   <div class="page-shell">
     <header class="hero">
       <div>
         <p class="eyebrow">N.E.K.O 二期</p>
-        <h1>Galgame 插件管理</h1>
+        <h1>Galgame 插件设置</h1>
         <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容兜底，这里会展示桥接状态、OCR 运行时、RapidOCR/Tesseract 安装流、截图校准，以及游戏 Agent 的后台状态。</p>
       </div>
       <div class="hero-actions">
@@ -25,7 +25,7 @@
 
     <section class="panel panel-controls">
       <div class="panel-title-row">
-        <h2>插件管理</h2>
+        <h2>插件设置</h2>
       </div>
       <div class="control-grid">
         <label class="field">
@@ -40,7 +40,15 @@
           <input id="pushToggle" type="checkbox">
           <span>推送通知</span>
         </label>
-        <button id="saveModeBtn" class="secondary">保存模式</button>
+        <label class="field">
+          <span>推进速度</span>
+          <select id="advanceSpeedSelect">
+            <option value="slow">慢</option>
+            <option value="medium">中等</option>
+            <option value="fast">快速</option>
+          </select>
+        </label>
+        <button id="saveModeBtn" class="secondary">保存设置</button>
         <div class="inline-actions">
           <button id="standbyOnBtn" class="ghost">进入待机</button>
           <button id="standbyOffBtn" class="ghost">恢复活跃</button>
@@ -323,6 +331,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260425-ocr-buttons-3"></script>
+  <script src="./main.js?v=20260426-install-state-2"></script>
 </body>
 </html>

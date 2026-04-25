@@ -10,6 +10,11 @@ MODE_COMPANION = "companion"
 MODE_CHOICE_ADVISOR = "choice_advisor"
 MODES = frozenset({MODE_SILENT, MODE_COMPANION, MODE_CHOICE_ADVISOR})
 
+ADVANCE_SPEED_SLOW = "slow"
+ADVANCE_SPEED_MEDIUM = "medium"
+ADVANCE_SPEED_FAST = "fast"
+ADVANCE_SPEEDS = frozenset({ADVANCE_SPEED_SLOW, ADVANCE_SPEED_MEDIUM, ADVANCE_SPEED_FAST})
+
 DATA_SOURCE_NONE = "none"
 DATA_SOURCE_BRIDGE_SDK = "bridge_sdk"
 DATA_SOURCE_MEMORY_READER = "memory_reader"
@@ -77,6 +82,7 @@ CONNECTION_STATES = frozenset(
 STORE_BOUND_GAME_ID = "bound_game_id"
 STORE_MODE = "mode"
 STORE_PUSH_NOTIFICATIONS = "push_notifications"
+STORE_ADVANCE_SPEED = "advance_speed"
 STORE_SESSION_ID = "session_id"
 STORE_EVENTS_BYTE_OFFSET = "events_byte_offset"
 STORE_EVENTS_FILE_SIZE = "events_file_size"
@@ -89,6 +95,7 @@ STORE_KEYS = (
     STORE_BOUND_GAME_ID,
     STORE_MODE,
     STORE_PUSH_NOTIFICATIONS,
+    STORE_ADVANCE_SPEED,
     STORE_SESSION_ID,
     STORE_EVENTS_BYTE_OFFSET,
     STORE_EVENTS_FILE_SIZE,
@@ -241,6 +248,7 @@ def sanitize_snapshot_state(value: object) -> dict[str, Any]:
         "route_id": _string(raw.get("route_id")),
         "is_menu_open": _bool(raw.get("is_menu_open"), bool(choices)),
         "save_context": sanitize_save_context(raw.get("save_context")),
+        "stability": _string(raw.get("stability")),
         "ts": _string(raw.get("ts")),
     }
 

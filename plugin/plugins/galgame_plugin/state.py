@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import DATA_SOURCE_NONE, MODE_COMPANION, STATE_IDLE
+from .models import ADVANCE_SPEED_MEDIUM, DATA_SOURCE_NONE, MODE_COMPANION, STATE_IDLE
 
 
 @dataclass(slots=True)
@@ -12,6 +12,7 @@ class GalgameSharedState:
     available_game_ids: list[str] = field(default_factory=list)
     mode: str = MODE_COMPANION
     push_notifications: bool = True
+    advance_speed: str = ADVANCE_SPEED_MEDIUM
     active_game_id: str = ""
     active_session_id: str = ""
     active_session_meta: dict[str, Any] = field(default_factory=dict)
@@ -38,5 +39,14 @@ class GalgameSharedState:
     plugin_error: str = ""
 
 
-def build_initial_state(*, mode: str, push_notifications: bool) -> GalgameSharedState:
-    return GalgameSharedState(mode=mode, push_notifications=push_notifications)
+def build_initial_state(
+    *,
+    mode: str,
+    push_notifications: bool,
+    advance_speed: str = ADVANCE_SPEED_MEDIUM,
+) -> GalgameSharedState:
+    return GalgameSharedState(
+        mode=mode,
+        push_notifications=push_notifications,
+        advance_speed=advance_speed,
+    )

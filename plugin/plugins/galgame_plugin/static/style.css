@@ -261,6 +261,11 @@ button[disabled] {
   display: none;
 }
 
+.install-task-card[hidden],
+[hidden] {
+  display: none !important;
+}
+
 .install-banner {
   display: flex;
   justify-content: space-between;

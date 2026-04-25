@@ -22,6 +22,8 @@ from .llm_gateway import LLMGateway
 from .memory_reader import MemoryReaderManager
 from .ocr_reader import OcrReaderManager
 from .models import (
+    ADVANCE_SPEEDS,
+    ADVANCE_SPEED_MEDIUM,
     DATA_SOURCE_NONE,
     MODE_COMPANION,
     MODES,
@@ -39,6 +41,7 @@ from .models import (
     STATE_ACTIVE,
     STATE_ERROR,
     STORE_BOUND_GAME_ID,
+    STORE_ADVANCE_SPEED,
     STORE_DEDUPE_WINDOW,
     STORE_EVENTS_BYTE_OFFSET,
     STORE_EVENTS_FILE_SIZE,
@@ -240,7 +243,11 @@ class GalgamePlugin(NekoPluginBase):
         self._tesseract_install_lock = threading.Lock()
         self._rapidocr_install_lock = threading.Lock()
         self._cfg = None
-        self._state = build_initial_state(mode=MODE_COMPANION, push_notifications=True)
+        self._state = build_initial_state(
+            mode=MODE_COMPANION,
+            push_notifications=True,
+            advance_speed=ADVANCE_SPEED_MEDIUM,
+        )
         self._persist = GalgameStore(self.store, self.logger)
         self._host_agent_adapter: HostAgentAdapter | None = None
         self._llm_gateway: LLMGateway | None = None
@@ -261,6 +268,7 @@ class GalgamePlugin(NekoPluginBase):
                 "available_game_ids": list(state.available_game_ids),
                 "mode": state.mode,
                 "push_notifications": state.push_notifications,
+                "advance_speed": state.advance_speed,
                 "active_game_id": state.active_game_id,
                 "active_session_id": state.active_session_id,
                 "active_session_meta": json_copy(state.active_session_meta),
@@ -457,6 +465,11 @@ class GalgamePlugin(NekoPluginBase):
             # flight. Keep the live values instead of restoring the poll's stale snapshot.
             state.mode = state.mode if state.mode in MODES else str(payload["mode"])
             state.push_notifications = bool(state.push_notifications)
+            state.advance_speed = (
+                state.advance_speed
+                if state.advance_speed in ADVANCE_SPEEDS
+                else str(payload.get("advance_speed") or ADVANCE_SPEED_MEDIUM)
+            )
             state.active_game_id = str(payload["active_game_id"])
             state.active_session_id = str(payload["active_session_id"])
             state.active_session_meta = json_copy(payload["active_session_meta"])
@@ -552,11 +565,19 @@ class GalgamePlugin(NekoPluginBase):
             except Exception:
                 pass
 
-    def _persist_preferences(self, *, bound_game_id: str, mode: str, push_notifications: bool) -> None:
+    def _persist_preferences(
+        self,
+        *,
+        bound_game_id: str,
+        mode: str,
+        push_notifications: bool,
+        advance_speed: str,
+    ) -> None:
         self._persist.persist_preferences(
             bound_game_id=bound_game_id,
             mode=mode,
             push_notifications=push_notifications,
+            advance_speed=advance_speed,
         )
 
     def _persist_runtime_state(self, payload: dict[str, Any]) -> None:
@@ -574,6 +595,7 @@ class GalgamePlugin(NekoPluginBase):
             self._state = build_initial_state(
                 mode=str(restored.get(STORE_MODE, MODE_COMPANION)),
                 push_notifications=bool(restored.get(STORE_PUSH_NOTIFICATIONS, True)),
+                advance_speed=str(restored.get(STORE_ADVANCE_SPEED, ADVANCE_SPEED_MEDIUM)),
             )
             self._state.bound_game_id = str(restored.get(STORE_BOUND_GAME_ID, ""))
             self._state.active_session_id = str(restored.get(STORE_SESSION_ID, ""))
@@ -874,6 +896,9 @@ class GalgamePlugin(NekoPluginBase):
 
         if self._ocr_reader_manager is not None:
             self._ocr_reader_manager.update_config(self._cfg)
+            self._ocr_reader_manager.update_advance_speed(
+                str(local.get("advance_speed") or ADVANCE_SPEED_MEDIUM)
+            )
             try:
                 ocr_reader_tick = await self._ocr_reader_manager.tick(
                     bridge_sdk_available=bridge_sdk_available,
@@ -1293,32 +1318,50 @@ class GalgamePlugin(NekoPluginBase):
             "properties": {
                 "mode": {"type": "string", "enum": sorted(MODES)},
                 "push_notifications": {"type": "boolean"},
+                "advance_speed": {"type": "string", "enum": sorted(ADVANCE_SPEEDS)},
             },
             "required": ["mode"],
         },
         llm_result_fields=["summary"],
     )
-    async def galgame_set_mode(self, mode: str, push_notifications: bool | None = None, **_):
+    async def galgame_set_mode(
+        self,
+        mode: str,
+        push_notifications: bool | None = None,
+        advance_speed: str | None = None,
+        **_,
+    ):
         if mode not in MODES:
             return Err(SdkError(f"invalid galgame mode: {mode!r}"))
+        if advance_speed is not None and advance_speed not in ADVANCE_SPEEDS:
+            return Err(SdkError(f"invalid advance speed: {advance_speed!r}"))
 
         with self._state_lock:
             self._state.mode = mode
             if push_notifications is not None:
                 self._state.push_notifications = bool(push_notifications)
+            if advance_speed is not None:
+                self._state.advance_speed = advance_speed
             payload = {
                 "mode": self._state.mode,
                 "push_notifications": self._state.push_notifications,
-                "summary": f"mode={self._state.mode} push_notifications={self._state.push_notifications}",
+                "advance_speed": self._state.advance_speed,
+                "summary": (
+                    f"mode={self._state.mode} "
+                    f"push_notifications={self._state.push_notifications} "
+                    f"advance_speed={self._state.advance_speed}"
+                ),
             }
             bound_game_id = self._state.bound_game_id
             persist_push = self._state.push_notifications
+            persist_advance_speed = self._state.advance_speed
 
         try:
             self._persist_preferences(
                 bound_game_id=bound_game_id,
                 mode=mode,
                 push_notifications=persist_push,
+                advance_speed=persist_advance_speed,
             )
         except Exception as exc:
             return Err(SdkError(f"persist mode failed: {exc}"))
@@ -1347,12 +1390,14 @@ class GalgamePlugin(NekoPluginBase):
             bound_game_id = self._state.bound_game_id
             mode = self._state.mode
             push_notifications = self._state.push_notifications
+            advance_speed = self._state.advance_speed
 
         try:
             self._persist_preferences(
                 bound_game_id=bound_game_id,
                 mode=mode,
                 push_notifications=push_notifications,
+                advance_speed=advance_speed,
             )
         except Exception as exc:
             return Err(SdkError(f"persist binding failed: {exc}"))

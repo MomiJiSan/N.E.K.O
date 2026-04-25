@@ -13,6 +13,10 @@ from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from .models import (
+    ADVANCE_SPEED_FAST,
+    ADVANCE_SPEED_MEDIUM,
+    ADVANCE_SPEED_SLOW,
+    ADVANCE_SPEEDS,
     DATA_SOURCE_OCR_READER,
     DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
     DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,
@@ -1554,6 +1558,7 @@ class OcrReaderBridgeWriter:
                 "text": self._state["text"],
                 "choices": self._state["choices"],
                 "save_context": self._state["save_context"],
+                "stability": self._state.get("stability", ""),
             },
             ts=started_at,
         )
@@ -1576,6 +1581,7 @@ class OcrReaderBridgeWriter:
             "route_id": OCR_READER_ROUTE_ID,
             "is_menu_open": False,
             "save_context": self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""}),
+            "stability": "stable",
             "ts": ts,
         }
         self._append_event(
@@ -1587,6 +1593,48 @@ class OcrReaderBridgeWriter:
                 "line_id_source": "text_hash",
                 "scene_id": self._state["scene_id"],
                 "route_id": self._state["route_id"],
+                "stability": "stable",
+            },
+            ts=ts,
+        )
+        return True
+
+    def emit_line_observed(self, raw_text: str, *, ts: str) -> bool:
+        cleaned = raw_text.strip()
+        if not cleaned or not self._session_id:
+            return False
+        speaker, text = self._split_speaker_text(cleaned)
+        if not text:
+            return False
+        current_text = str(self._state.get("text") or "")
+        current_speaker = str(self._state.get("speaker") or "")
+        current_stability = str(self._state.get("stability") or "")
+        if current_text == text and current_speaker == speaker and current_stability in {"tentative", "stable"}:
+            return False
+        line_id = self._line_id_for_text(text)
+        self._state = {
+            **self._state,
+            "speaker": speaker,
+            "text": text,
+            "choices": [],
+            "scene_id": OCR_READER_UNKNOWN_SCENE,
+            "line_id": line_id,
+            "route_id": OCR_READER_ROUTE_ID,
+            "is_menu_open": False,
+            "save_context": self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""}),
+            "stability": "tentative",
+            "ts": ts,
+        }
+        self._append_event(
+            "line_observed",
+            {
+                "speaker": speaker,
+                "text": text,
+                "line_id": line_id,
+                "line_id_source": "text_hash",
+                "scene_id": self._state["scene_id"],
+                "route_id": self._state["route_id"],
+                "stability": "tentative",
             },
             ts=ts,
         )
@@ -1632,6 +1680,7 @@ class OcrReaderBridgeWriter:
             "line_id": line_id,
             "choices": payload_choices,
             "is_menu_open": True,
+            "stability": "choices",
             "ts": ts,
         }
         self._append_event(
@@ -1713,6 +1762,7 @@ class OcrReaderBridgeWriter:
             "route_id": OCR_READER_ROUTE_ID,
             "is_menu_open": False,
             "save_context": {"kind": "unknown", "slot_id": "", "display_name": ""},
+            "stability": "",
             "ts": ts,
         }
 
@@ -1751,6 +1801,7 @@ class OcrReaderBridgeWriter:
                 "route_id": str(self._state.get("route_id") or OCR_READER_ROUTE_ID),
                 "is_menu_open": bool(self._state.get("is_menu_open", False)),
                 "save_context": dict(self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""})),
+                "stability": str(self._state.get("stability") or ""),
                 "ts": str(self._state.get("ts") or self._started_at),
             },
         }
@@ -1882,6 +1933,7 @@ class OcrReaderManager:
         self._last_eligible_windows: list[DetectedGameWindow] = []
         self._last_excluded_windows: list[DetectedGameWindow] = []
         self._last_selection = WindowSelectionResult(manual_target=self._manual_target)
+        self._advance_speed = ADVANCE_SPEED_MEDIUM
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -1891,6 +1943,17 @@ class OcrReaderManager:
                 bridge_root=config.bridge_root,
                 time_fn=self._time_fn,
             )
+
+    def update_advance_speed(self, advance_speed: str) -> None:
+        normalized = str(advance_speed or "").strip().lower()
+        self._advance_speed = normalized if normalized in ADVANCE_SPEEDS else ADVANCE_SPEED_MEDIUM
+
+    def _line_changed_repeat_threshold(self) -> int:
+        if self._advance_speed == ADVANCE_SPEED_FAST:
+            return 1
+        if self._advance_speed == ADVANCE_SPEED_SLOW:
+            return 3
+        return 2
 
     def update_capture_profiles(self, profiles: dict[str, dict[str, Any]]) -> None:
         self._capture_profiles = _parse_configured_capture_profiles(profiles, self._logger)
@@ -2272,7 +2335,12 @@ class OcrReaderManager:
         return _matches_aihong_target(target)
 
     @staticmethod
-    def _stabilize_text_key(text: str, *, state: _StableOcrTextState) -> bool:
+    def _stabilize_text_key(
+        text: str,
+        *,
+        state: _StableOcrTextState,
+        repeat_threshold: int = 2,
+    ) -> bool:
         cleaned = normalize_text(text)
         if not cleaned:
             return False
@@ -2281,7 +2349,7 @@ class OcrReaderManager:
         else:
             state.repeat_count = 1
             state.last_raw_text = cleaned
-        if state.repeat_count < 2:
+        if state.repeat_count < max(1, int(repeat_threshold)):
             return False
         if cleaned == state.stable_text:
             return False
@@ -2297,8 +2365,13 @@ class OcrReaderManager:
     ) -> bool:
         if _looks_like_noise_ocr_text(raw_text):
             return False
+        self._writer.emit_line_observed(raw_text, ts=utc_now_iso(now))
         tracker = state or self._default_ocr_state
-        if not self._stabilize_text_key(raw_text, state=tracker):
+        if not self._stabilize_text_key(
+            raw_text,
+            state=tracker,
+            repeat_threshold=self._line_changed_repeat_threshold(),
+        ):
             return False
         return self._writer.emit_line(raw_text, ts=utc_now_iso(now))
 
@@ -2312,7 +2385,11 @@ class OcrReaderManager:
         choice_bounds_metadata: dict[str, Any] | None = None,
     ) -> bool:
         tracker = state or self._default_ocr_state
-        if not self._stabilize_text_key(_canonical_choice_candidate_text(choices), state=tracker):
+        if not self._stabilize_text_key(
+            _canonical_choice_candidate_text(choices),
+            state=tracker,
+            repeat_threshold=2,
+        ):
             return False
         return self._writer.emit_choices(
             choices,

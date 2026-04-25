@@ -109,6 +109,7 @@ const FIELD_LABELS_ZH = {
   active_data_source: '当前数据源',
   mode: '模式',
   push_notifications: '推送通知',
+  advance_speed: '推进速度',
   bound_game_id: '绑定游戏 ID',
   active_session_id: '当前会话 ID',
   last_seq: '最新序号',
@@ -193,6 +194,11 @@ const MODE_LABELS_ZH = {
   silent: '静默模式',
   companion: '陪伴模式',
   choice_advisor: '选项顾问模式',
+};
+const ADVANCE_SPEED_LABELS_ZH = {
+  slow: '慢',
+  medium: '中等',
+  fast: '快速',
 };
 
 const DATA_SOURCE_LABELS_ZH = {
@@ -685,11 +691,14 @@ function profileValueForInputs(runtimeProfile) {
 
 function renderInstallTaskState(kind) {
   const state = getInstallState(kind).state;
-  const { card, statusText, percentText, messageText, detailText, progressBar } = getInstallNodes(kind);
+  const { card, statusText, percentText, messageText, detailText, progressBar, button } = getInstallNodes(kind);
   const { label } = getInstallConfig(kind);
 
   if (!state) {
     card.hidden = true;
+    card.style.display = '';
+    button.hidden = false;
+    button.disabled = false;
     statusText.textContent = `等待 ${label} 安装任务`;
     percentText.textContent = '0%';
     messageText.textContent = '';
@@ -717,11 +726,56 @@ function renderInstallTaskState(kind) {
   }
 
   card.hidden = false;
+  card.style.display = '';
   statusText.textContent = `${formatInstallPhase(state.phase)} · ${state.status || ''}`;
   percentText.textContent = `${percent}%`;
   messageText.textContent = state.message || '';
   detailText.textContent = details.join(' · ');
   progressBar.style.width = `${percent}%`;
+  if (state.status === 'completed') {
+    button.hidden = true;
+    button.disabled = true;
+  } else if (state.status === 'failed') {
+    button.hidden = false;
+    button.disabled = false;
+    button.textContent = getInstallConfig(kind).retryText;
+  }
+}
+
+function renderPluginUnavailable(error) {
+  latestStatus = null;
+  const message = error instanceof Error ? error.message : String(error || '插件尚未启动');
+  document.getElementById('summaryText').textContent = '插件尚未启动';
+  renderGrid('statusGrid', [
+    { label: 'connection_state', value: 'plugin_not_started' },
+    { label: 'status', value: '插件尚未启动' },
+    { label: 'last_error', value: message },
+  ]);
+  renderGrid('ocrRuntimeGrid', [
+    { label: 'status', value: '插件尚未启动' },
+  ]);
+  renderGrid('snapshotGrid', [
+    { label: 'status', value: '插件尚未启动' },
+  ]);
+
+  for (const kind of ['rapidocr', 'tesseract', 'textractor']) {
+    const config = getInstallConfig(kind);
+    const { button, card } = getInstallNodes(kind);
+    const banner = document.getElementById(`${config.domPrefix}Prompt`);
+    const kicker = document.getElementById(`${config.domPrefix}PromptKicker`);
+    const title = document.getElementById(`${config.domPrefix}PromptTitle`);
+    const body = document.getElementById(`${config.domPrefix}PromptBody`);
+    const path = document.getElementById(`${config.domPrefix}PathText`);
+    banner.className = `install-banner install-banner-${kind} neutral`;
+    kicker.textContent = config.label;
+    title.textContent = '插件尚未启动';
+    body.textContent = '当前无法读取插件运行状态。请先启动或重载 galgame_plugin，启动完成后这里会显示安装和运行时状态。';
+    path.textContent = message;
+    card.hidden = true;
+    card.style.display = 'none';
+    button.hidden = true;
+    button.disabled = true;
+  }
 }
 
 function applyInstallTaskState(kind, state, { allowRefresh = true } = {}) {
@@ -905,6 +959,7 @@ function renderStatus(status) {
   document.getElementById('summaryText').textContent = buildStatusSummaryText(status);
   document.getElementById('modeSelect').value = status.mode || 'companion';
   document.getElementById('pushToggle').checked = Boolean(status.push_notifications);
+  document.getElementById('advanceSpeedSelect').value = status.advance_speed || 'medium';
   document.getElementById('bindInput').value = status.bound_game_id || '';
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
@@ -926,6 +981,7 @@ function renderStatus(status) {
     { label: 'active_data_source', value: status.active_data_source || '' },
     { label: 'mode', value: status.mode || '' },
     { label: 'push_notifications', value: String(Boolean(status.push_notifications)) },
+    { label: 'advance_speed', value: ADVANCE_SPEED_LABELS_ZH[status.advance_speed] || status.advance_speed || 'medium' },
     { label: 'bound_game_id', value: status.bound_game_id || '(auto)' },
     { label: 'active_session_id', value: status.active_session_id || '' },
     { label: 'last_seq', value: String(status.last_seq || 0) },
@@ -1877,6 +1933,7 @@ async function refreshAll(options = {}) {
       renderAgentStatus(agentStatus);
       await refreshInsights(snapshot, { force: forceInsights });
     } catch (error) {
+      renderPluginUnavailable(error);
       if (silent) {
         console.warn('[galgame_plugin ui] refresh failed', error);
         return;
@@ -1956,12 +2013,14 @@ async function installTesseract(force = false) {
 async function saveMode() {
   const mode = document.getElementById('modeSelect').value;
   const pushNotifications = document.getElementById('pushToggle').checked;
+  const advanceSpeed = document.getElementById('advanceSpeedSelect').value || 'medium';
   try {
     await callPlugin('galgame_set_mode', {
       mode,
       push_notifications: pushNotifications,
+      advance_speed: advanceSpeed,
     });
-    setFlash('模式已保存', 'success');
+    setFlash('设置已保存', 'success');
     await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');

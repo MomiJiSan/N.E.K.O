@@ -530,10 +530,11 @@ def apply_event_to_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> 
         next_snapshot["route_id"] = str(payload_obj.get("route_id") or "")
         next_snapshot["is_menu_open"] = bool(payload_obj.get("is_menu_open", next_snapshot["choices"]))
         next_snapshot["save_context"] = sanitize_save_context(payload_obj.get("save_context"))
+        next_snapshot["stability"] = str(payload_obj.get("stability") or "")
         next_snapshot["ts"] = event_ts
         return next_snapshot
 
-    if event_type == "line_changed":
+    if event_type in {"line_observed", "line_changed"}:
         next_snapshot["speaker"] = str(payload_obj.get("speaker") or "")
         next_snapshot["text"] = str(payload_obj.get("text") or "")
         next_snapshot["choices"] = []
@@ -541,6 +542,9 @@ def apply_event_to_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> 
         next_snapshot["line_id"] = str(payload_obj.get("line_id") or "")
         next_snapshot["route_id"] = str(payload_obj.get("route_id") or next_snapshot.get("route_id") or "")
         next_snapshot["is_menu_open"] = False
+        next_snapshot["stability"] = str(
+            payload_obj.get("stability") or ("stable" if event_type == "line_changed" else "tentative")
+        )
         next_snapshot["ts"] = event_ts
         return next_snapshot
 
@@ -555,12 +559,14 @@ def apply_event_to_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> 
         next_snapshot["scene_id"] = str(payload_obj.get("scene_id") or next_snapshot.get("scene_id") or "")
         next_snapshot["route_id"] = str(payload_obj.get("route_id") or next_snapshot.get("route_id") or "")
         next_snapshot["is_menu_open"] = bool(next_snapshot["choices"])
+        next_snapshot["stability"] = "choices" if next_snapshot["choices"] else ""
         next_snapshot["ts"] = event_ts
         return next_snapshot
 
     if event_type == "choice_selected":
         next_snapshot["choices"] = []
         next_snapshot["is_menu_open"] = False
+        next_snapshot["stability"] = ""
         next_snapshot["line_id"] = str(payload_obj.get("line_id") or next_snapshot.get("line_id") or "")
         next_snapshot["scene_id"] = str(payload_obj.get("scene_id") or next_snapshot.get("scene_id") or "")
         next_snapshot["route_id"] = str(payload_obj.get("route_id") or next_snapshot.get("route_id") or "")
@@ -717,6 +723,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "connection_state": state.current_connection_state,
         "mode": state.mode,
         "push_notifications": state.push_notifications,
+        "advance_speed": getattr(state, "advance_speed", "medium"),
         "bound_game_id": state.bound_game_id,
         "available_game_ids": list(state.available_game_ids),
         "active_session_id": state.active_session_id,

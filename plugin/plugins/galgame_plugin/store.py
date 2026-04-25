@@ -3,11 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from .models import (
+    ADVANCE_SPEEDS,
+    ADVANCE_SPEED_MEDIUM,
     MODES,
     OCR_CAPTURE_PROFILE_RATIO_KEYS,
     OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
     OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
     STORE_BOUND_GAME_ID,
+    STORE_ADVANCE_SPEED,
     STORE_DEDUPE_WINDOW,
     STORE_EVENTS_BYTE_OFFSET,
     STORE_EVENTS_FILE_SIZE,
@@ -243,6 +246,14 @@ class GalgameStore:
         mode = raw_mode if isinstance(raw_mode, str) and raw_mode in MODES else "companion"
         if raw_mode not in ("", mode):
             warnings.append(f"invalid store mode dropped: {raw_mode!r}")
+        raw_advance_speed = self._read(STORE_ADVANCE_SPEED, "")
+        advance_speed = (
+            raw_advance_speed
+            if isinstance(raw_advance_speed, str) and raw_advance_speed in ADVANCE_SPEEDS
+            else ADVANCE_SPEED_MEDIUM
+        )
+        if raw_advance_speed not in ("", advance_speed):
+            warnings.append(f"invalid advance_speed dropped: {raw_advance_speed!r}")
 
         raw_window = self._read(STORE_DEDUPE_WINDOW, [])
         dedupe_window: list[dict[str, str]] = []
@@ -288,6 +299,7 @@ class GalgameStore:
             STORE_BOUND_GAME_ID: self._read(STORE_BOUND_GAME_ID, ""),
             STORE_MODE: mode,
             STORE_PUSH_NOTIFICATIONS: bool(self._read(STORE_PUSH_NOTIFICATIONS, True)),
+            STORE_ADVANCE_SPEED: advance_speed,
             STORE_SESSION_ID: self._read(STORE_SESSION_ID, ""),
             STORE_EVENTS_BYTE_OFFSET: max(0, int(self._read(STORE_EVENTS_BYTE_OFFSET, 0) or 0)),
             STORE_EVENTS_FILE_SIZE: max(0, int(self._read(STORE_EVENTS_FILE_SIZE, 0) or 0)),
@@ -311,10 +323,15 @@ class GalgameStore:
         bound_game_id: str,
         mode: str,
         push_notifications: bool,
+        advance_speed: str = ADVANCE_SPEED_MEDIUM,
     ) -> None:
         self._write(STORE_BOUND_GAME_ID, bound_game_id)
         self._write(STORE_MODE, mode)
         self._write(STORE_PUSH_NOTIFICATIONS, push_notifications)
+        self._write(
+            STORE_ADVANCE_SPEED,
+            advance_speed if advance_speed in ADVANCE_SPEEDS else ADVANCE_SPEED_MEDIUM,
+        )
 
     def persist_runtime(
         self,
