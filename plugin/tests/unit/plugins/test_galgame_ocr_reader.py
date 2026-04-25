@@ -1063,7 +1063,7 @@ async def test_ocr_reader_manager_prefers_manual_target_and_rebinds_by_signature
         hwnd=778,
         title=manual_window.title,
         process_name=manual_window.process_name,
-        pid=manual_window.pid,
+        pid=5566,
     )
     other_window = DetectedGameWindow(
         hwnd=100,
@@ -1108,7 +1108,11 @@ async def test_ocr_reader_manager_prefers_manual_target_and_rebinds_by_signature
     assert result.runtime["process_name"] == "Aiyoku.exe"
     assert result.runtime["target_selection_mode"] == "manual"
     assert result.runtime["target_selection_detail"] == "manual_target_rebound"
+    assert result.runtime["manual_target"]["window_key"] == rebound_window.window_key
     assert result.runtime["manual_target"]["last_known_hwnd"] == 778
+    assert result.runtime["manual_target"]["pid"] == rebound_window.pid
+    assert manager.current_window_target()["window_key"] == rebound_window.window_key
+    assert manager.current_window_target()["pid"] == rebound_window.pid
 
 
 @pytest.mark.asyncio

@@ -25,9 +25,17 @@ from .models import (
     DATA_SOURCE_NONE,
     MODE_COMPANION,
     MODES,
+    build_ocr_capture_profile_bucket_key,
+    compute_ocr_window_aspect_ratio,
     OCR_CAPTURE_PROFILE_RATIO_KEYS,
+    OCR_CAPTURE_PROFILE_SAVE_SCOPES,
+    OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK,
+    OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
     OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
     OCR_CAPTURE_PROFILE_STAGES,
+    OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
+    parse_ocr_capture_profile_bucket_key,
     STATE_ACTIVE,
     STATE_ERROR,
     STORE_BOUND_GAME_ID,
@@ -91,6 +99,15 @@ def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
     return normalized
 
 
+def _normalize_ocr_capture_profile_save_scope(save_scope: str | None) -> str:
+    normalized = str(save_scope or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized not in OCR_CAPTURE_PROFILE_SAVE_SCOPES:
+        raise ValueError(f"invalid OCR capture profile save_scope: {save_scope!r}")
+    return normalized
+
+
 def _is_ratio_profile_payload(value: object) -> bool:
     return isinstance(value, dict) and all(key in value for key in OCR_CAPTURE_PROFILE_RATIO_KEYS)
 
@@ -102,16 +119,113 @@ def _capture_profile_entry_to_stage_map(value: object) -> dict[str, dict[str, fl
     stage_map: dict[str, dict[str, float]] = {}
     for stage_name, profile in raw.items():
         normalized_stage_name = str(stage_name or "").strip().lower()
+        if (
+            not normalized_stage_name
+            or normalized_stage_name == OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY
+            or not _is_ratio_profile_payload(profile)
+        ):
+            continue
+        stage_map[normalized_stage_name] = json_copy(profile)
+    return stage_map
+
+
+def _capture_profile_bucket_entry_to_stage_map(value: object) -> dict[str, dict[str, float]]:
+    raw = value if isinstance(value, dict) else {}
+    stage_map: dict[str, dict[str, float]] = {}
+    raw_stages = raw.get("stages")
+    if not isinstance(raw_stages, dict):
+        return stage_map
+    for stage_name, profile in raw_stages.items():
+        normalized_stage_name = str(stage_name or "").strip().lower()
         if not normalized_stage_name or not _is_ratio_profile_payload(profile):
             continue
         stage_map[normalized_stage_name] = json_copy(profile)
     return stage_map
 
 
-def _stage_map_to_capture_profile_entry(stage_map: dict[str, dict[str, float]]) -> dict[str, Any]:
-    if len(stage_map) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_map:
+def _capture_profile_entry_to_window_bucket_map(value: object) -> dict[str, dict[str, Any]]:
+    raw = value if isinstance(value, dict) else {}
+    raw_buckets = raw.get(OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY)
+    if not isinstance(raw_buckets, dict):
+        return {}
+    bucket_map: dict[str, dict[str, Any]] = {}
+    for bucket_key, bucket_value in raw_buckets.items():
+        normalized_bucket_key = str(bucket_key or "").strip().lower()
+        parsed_dimensions = parse_ocr_capture_profile_bucket_key(normalized_bucket_key)
+        if not normalized_bucket_key or parsed_dimensions is None or not isinstance(bucket_value, dict):
+            continue
+        try:
+            width = int(bucket_value.get("width") or parsed_dimensions[0])
+            height = int(bucket_value.get("height") or parsed_dimensions[1])
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        try:
+            aspect_ratio = float(
+                bucket_value.get("aspect_ratio") or compute_ocr_window_aspect_ratio(width, height)
+            )
+        except (TypeError, ValueError):
+            aspect_ratio = compute_ocr_window_aspect_ratio(width, height)
+        stage_map = _capture_profile_bucket_entry_to_stage_map(bucket_value)
+        if not stage_map:
+            continue
+        bucket_map[normalized_bucket_key] = {
+            "width": width,
+            "height": height,
+            "aspect_ratio": aspect_ratio,
+            "stages": stage_map,
+        }
+    return bucket_map
+
+
+def _window_bucket_map_to_capture_profile_payload(
+    bucket_map: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    payload: dict[str, dict[str, Any]] = {}
+    for bucket_key, bucket_value in bucket_map.items():
+        normalized_bucket_key = str(bucket_key or "").strip().lower()
+        if not normalized_bucket_key or not isinstance(bucket_value, dict):
+            continue
+        try:
+            width = int(bucket_value.get("width") or 0)
+            height = int(bucket_value.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        try:
+            aspect_ratio = float(
+                bucket_value.get("aspect_ratio") or compute_ocr_window_aspect_ratio(width, height)
+            )
+        except (TypeError, ValueError):
+            aspect_ratio = compute_ocr_window_aspect_ratio(width, height)
+        stage_map = _capture_profile_bucket_entry_to_stage_map(bucket_value)
+        if not stage_map:
+            continue
+        payload[normalized_bucket_key] = {
+            "width": width,
+            "height": height,
+            "aspect_ratio": aspect_ratio,
+            "stages": {
+                stage_name: json_copy(profile)
+                for stage_name, profile in stage_map.items()
+            },
+        }
+    return payload
+
+
+def _capture_profile_components_to_entry(
+    stage_map: dict[str, dict[str, float]],
+    window_bucket_map: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not window_bucket_map and len(stage_map) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_map:
         return json_copy(stage_map[OCR_CAPTURE_PROFILE_STAGE_DEFAULT])
-    return {stage_name: json_copy(profile) for stage_name, profile in stage_map.items()}
+    payload = {stage_name: json_copy(profile) for stage_name, profile in stage_map.items()}
+    bucket_payload = _window_bucket_map_to_capture_profile_payload(window_bucket_map)
+    if bucket_payload:
+        payload[OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY] = bucket_payload
+    return payload
 
 
 @neko_plugin
@@ -166,6 +280,167 @@ class GalgamePlugin(NekoPluginBase):
                 "ocr_window_target": json_copy(state.ocr_window_target),
                 "plugin_error": state.plugin_error,
             }
+
+    @staticmethod
+    def _ocr_capture_scope_label(save_scope: str) -> str:
+        if save_scope == OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET:
+            return "当前窗口分辨率"
+        return "进程通用回退"
+
+    @staticmethod
+    def _ocr_capture_stage_label(stage: str) -> str:
+        labels = {
+            OCR_CAPTURE_PROFILE_STAGE_DEFAULT: "通用区域",
+            "dialogue_stage": "对白区",
+            "menu_stage": "菜单区",
+        }
+        return labels.get(stage, stage)
+
+    @staticmethod
+    def _process_name_matches(left: str, right: str) -> bool:
+        return bool(left.strip()) and left.strip().lower() == right.strip().lower()
+
+    def _resolve_ocr_capture_profile_save_context(
+        self,
+        *,
+        process_name: str,
+        save_scope: str | None,
+        width: int = 0,
+        height: int = 0,
+    ) -> dict[str, Any]:
+        with self._state_lock:
+            runtime = json_copy(self._state.ocr_reader_runtime)
+        runtime_process_name = str(runtime.get("process_name") or "").strip()
+        runtime_width = max(0, int(runtime.get("width") or 0))
+        runtime_height = max(0, int(runtime.get("height") or 0))
+        resolved_width = max(0, int(width or runtime_width))
+        resolved_height = max(0, int(height or runtime_height))
+        normalized_scope = _normalize_ocr_capture_profile_save_scope(save_scope)
+        if not normalized_scope:
+            normalized_scope = (
+                OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET
+                if self._process_name_matches(process_name, runtime_process_name)
+                and resolved_width > 0
+                and resolved_height > 0
+                else OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK
+            )
+        bucket_key = ""
+        aspect_ratio = 0.0
+        if normalized_scope == OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET:
+            if resolved_width <= 0 or resolved_height <= 0:
+                raise ValueError("当前没有可用的 OCR 窗口尺寸，无法保存到当前窗口分辨率")
+            bucket_key = build_ocr_capture_profile_bucket_key(resolved_width, resolved_height).lower()
+            aspect_ratio = compute_ocr_window_aspect_ratio(resolved_width, resolved_height)
+        return {
+            "save_scope": normalized_scope,
+            "width": resolved_width,
+            "height": resolved_height,
+            "bucket_key": bucket_key,
+            "aspect_ratio": aspect_ratio,
+            "runtime": runtime,
+        }
+
+    async def _save_ocr_capture_profile_payload(
+        self,
+        *,
+        process_name: str,
+        stage: str,
+        capture_profile: dict[str, float] | None,
+        clear: bool,
+        save_scope: str | None,
+        width: int = 0,
+        height: int = 0,
+    ) -> dict[str, Any]:
+        normalized_process_name = str(process_name or "").strip()
+        if not normalized_process_name:
+            raise ValueError("process_name is required")
+        normalized_stage = _normalize_ocr_capture_profile_stage(stage)
+        context = self._resolve_ocr_capture_profile_save_context(
+            process_name=normalized_process_name,
+            save_scope=save_scope,
+            width=width,
+            height=height,
+        )
+        with self._state_lock:
+            profiles = json_copy(self._state.ocr_capture_profiles)
+        existing_entry = profiles.get(normalized_process_name)
+        process_stage_map = _capture_profile_entry_to_stage_map(existing_entry)
+        window_bucket_map = _capture_profile_entry_to_window_bucket_map(existing_entry)
+        normalized_profile = json_copy(capture_profile or {})
+        resolved_scope = str(context["save_scope"] or OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK)
+        bucket_key = str(context.get("bucket_key") or "")
+        if resolved_scope == OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK:
+            target_stage_map = process_stage_map
+        else:
+            bucket_entry = window_bucket_map.get(bucket_key) or {
+                "width": int(context.get("width") or 0),
+                "height": int(context.get("height") or 0),
+                "aspect_ratio": float(context.get("aspect_ratio") or 0.0),
+                "stages": {},
+            }
+            target_stage_map = _capture_profile_bucket_entry_to_stage_map(bucket_entry)
+        if clear:
+            target_stage_map.pop(normalized_stage, None)
+        else:
+            target_stage_map[normalized_stage] = normalized_profile
+        if resolved_scope == OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET:
+            if target_stage_map:
+                window_bucket_map[bucket_key] = {
+                    "width": int(context.get("width") or 0),
+                    "height": int(context.get("height") or 0),
+                    "aspect_ratio": float(context.get("aspect_ratio") or 0.0),
+                    "stages": target_stage_map,
+                }
+            else:
+                window_bucket_map.pop(bucket_key, None)
+        if not process_stage_map and not window_bucket_map:
+            profiles.pop(normalized_process_name, None)
+        else:
+            profiles[normalized_process_name] = _capture_profile_components_to_entry(
+                process_stage_map,
+                window_bucket_map,
+            )
+        self._persist.persist_ocr_capture_profiles(profiles)
+        with self._state_lock:
+            self._state.ocr_capture_profiles = json_copy(profiles)
+        if self._ocr_reader_manager is not None:
+            self._ocr_reader_manager.update_capture_profiles(profiles)
+            try:
+                refreshed_runtime = (
+                    self._ocr_reader_manager.refresh_runtime_capture_profile_selection()
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "galgame_plugin failed to refresh OCR runtime after saving capture profile: %s",
+                    exc,
+                )
+            else:
+                with self._state_lock:
+                    self._state.ocr_reader_runtime = json_copy(refreshed_runtime)
+        payload = {
+            "process_name": normalized_process_name,
+            "stage": normalized_stage,
+            "capture_profile": normalized_profile if not clear else {},
+            "cleared": bool(clear),
+            "save_scope": resolved_scope,
+            "bucket_key": bucket_key,
+            "window_width": int(context.get("width") or 0),
+            "window_height": int(context.get("height") or 0),
+        }
+        scope_label = self._ocr_capture_scope_label(resolved_scope)
+        stage_label = self._ocr_capture_stage_label(normalized_stage)
+        if clear:
+            payload["summary"] = (
+                f"OCR 截图校准已清空：{normalized_process_name} / {stage_label} / {scope_label}"
+                + (f" / {bucket_key}" if bucket_key else "")
+            )
+        else:
+            payload["summary"] = (
+                f"OCR 截图校准已保存：{normalized_process_name} / {stage_label} / {scope_label}"
+                + (f" / {bucket_key}" if bucket_key else "")
+            )
+        payload["status"] = await self._build_status_payload_async()
+        return payload
 
     def _commit_state(self, payload: dict[str, Any]) -> None:
         with self._state_lock:
@@ -529,6 +804,13 @@ class GalgamePlugin(NekoPluginBase):
                         rescan_warnings,
                     ) = await asyncio.to_thread(scan_session_candidates, self._cfg.bridge_root)
                     warnings.extend(rescan_warnings)
+                resolved_window_target = self._ocr_reader_manager.current_window_target()
+                if resolved_window_target != json_copy(local.get("ocr_window_target") or {}):
+                    local["ocr_window_target"] = json_copy(resolved_window_target)
+                    try:
+                        self._persist.persist_ocr_window_target(resolved_window_target)
+                    except Exception as exc:
+                        warnings.append(f"persist OCR window target failed: {exc}")
             except Exception as exc:
                 warnings.append(f"ocr_reader tick failed: {exc}")
 
@@ -1013,6 +1295,10 @@ class GalgamePlugin(NekoPluginBase):
                     "enum": sorted(OCR_CAPTURE_PROFILE_STAGES),
                     "default": OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
                 },
+                "save_scope": {
+                    "type": "string",
+                    "enum": sorted(OCR_CAPTURE_PROFILE_SAVE_SCOPES),
+                },
                 "left_inset_ratio": {"type": "number", "default": 0.05},
                 "right_inset_ratio": {"type": "number", "default": 0.05},
                 "top_ratio": {"type": "number", "default": 0.3},
@@ -1030,6 +1316,7 @@ class GalgamePlugin(NekoPluginBase):
         right_inset_ratio: float = 0.05,
         top_ratio: float = 0.3,
         bottom_inset_ratio: float = 0.3,
+        save_scope: str | None = None,
         clear: bool = False,
         **_,
     ):
@@ -1045,30 +1332,15 @@ class GalgamePlugin(NekoPluginBase):
             return parsed
 
         with self._state_lock:
-            profiles = json_copy(self._state.ocr_capture_profiles)
             runtime_process_name = str(
                 (self._state.ocr_reader_runtime or {}).get("process_name") or ""
             ).strip()
         normalized_process_name = str(process_name or "").strip() or runtime_process_name
         if not normalized_process_name:
             return Err(SdkError("process_name is required"))
-        try:
-            normalized_stage = _normalize_ocr_capture_profile_stage(stage)
-        except ValueError as exc:
-            return Err(SdkError(str(exc)))
 
         if clear:
-            stage_map = _capture_profile_entry_to_stage_map(profiles.get(normalized_process_name))
-            if normalized_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT and not stage_map:
-                profiles.pop(normalized_process_name, None)
-            else:
-                stage_map.pop(normalized_stage, None)
-                if stage_map:
-                    profiles[normalized_process_name] = _stage_map_to_capture_profile_entry(stage_map)
-                else:
-                    profiles.pop(normalized_process_name, None)
-            summary = f"OCR 截图校准已清空：{normalized_process_name} / {normalized_stage}"
-            capture_profile: dict[str, float] = {}
+            normalized_profile: dict[str, float] | None = None
         else:
             try:
                 normalized_profile = {
@@ -1092,43 +1364,63 @@ class GalgamePlugin(NekoPluginBase):
                 + normalized_profile["bottom_inset_ratio"]
             ) >= 1.0:
                 return Err(SdkError("top_ratio + bottom_inset_ratio must be < 1.0"))
-            if normalized_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
-                existing_stage_map = _capture_profile_entry_to_stage_map(
-                    profiles.get(normalized_process_name)
-                )
-                existing_stage_map[OCR_CAPTURE_PROFILE_STAGE_DEFAULT] = normalized_profile
-                profiles[normalized_process_name] = _stage_map_to_capture_profile_entry(
-                    existing_stage_map
-                )
-            else:
-                stage_map = _capture_profile_entry_to_stage_map(
-                    profiles.get(normalized_process_name)
-                )
-                stage_map[normalized_stage] = normalized_profile
-                profiles[normalized_process_name] = _stage_map_to_capture_profile_entry(stage_map)
-            capture_profile = dict(normalized_profile)
-            summary = f"OCR 截图校准已保存：{normalized_process_name} / {normalized_stage}"
-
         try:
-            self._persist.persist_ocr_capture_profiles(profiles)
+            payload = await self._save_ocr_capture_profile_payload(
+                process_name=normalized_process_name,
+                stage=stage,
+                capture_profile=normalized_profile,
+                clear=bool(clear),
+                save_scope=save_scope,
+            )
+        except ValueError as exc:
+            return Err(SdkError(str(exc)))
         except Exception as exc:
             return Err(SdkError(f"persist OCR capture profile failed: {exc}"))
+        return Ok(payload)
 
-        with self._state_lock:
-            self._state.ocr_capture_profiles = json_copy(profiles)
-        if self._ocr_reader_manager is not None:
-            self._ocr_reader_manager.update_capture_profiles(profiles)
-        await self._poll_bridge(force=True)
-        return Ok(
+    @plugin_entry(
+        id="galgame_auto_recalibrate_ocr_dialogue_profile",
+        name="自动重新校准 OCR 对白区",
+        description="对当前已附着 OCR 目标窗口自动重校准对白区，并保存到当前窗口分辨率。",
+        input_schema={"type": "object", "properties": {}},
+        timeout=120.0,
+        llm_result_fields=["summary", "sample_text"],
+    )
+    async def galgame_auto_recalibrate_ocr_dialogue_profile(self, **_):
+        if self._ocr_reader_manager is None:
+            return Err(SdkError("ocr_reader manager is not initialized"))
+        try:
+            recalibrated = await asyncio.to_thread(
+                self._ocr_reader_manager.auto_recalibrate_dialogue_profile
+            )
+            payload = await self._save_ocr_capture_profile_payload(
+                process_name=str(recalibrated.get("process_name") or ""),
+                stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+                capture_profile=dict(recalibrated.get("capture_profile") or {}),
+                clear=False,
+                save_scope=OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
+                width=int(recalibrated.get("window_width") or 0),
+                height=int(recalibrated.get("window_height") or 0),
+            )
+        except ValueError as exc:
+            return Err(SdkError(str(exc)))
+        except Exception as exc:
+            return Err(SdkError(f"auto recalibrate OCR dialogue profile failed: {exc}"))
+        payload.update(
             {
-                "process_name": normalized_process_name,
-                "stage": normalized_stage,
-                "capture_profile": capture_profile,
-                "cleared": bool(clear),
-                "summary": summary,
-                "status": await self._build_status_payload_async(),
+                "sample_text": str(recalibrated.get("sample_text") or ""),
+                "save_scope": OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
+                "bucket_key": str(recalibrated.get("bucket_key") or payload.get("bucket_key") or ""),
+                "window_width": int(
+                    recalibrated.get("window_width") or payload.get("window_width") or 0
+                ),
+                "window_height": int(
+                    recalibrated.get("window_height") or payload.get("window_height") or 0
+                ),
+                "summary": str(recalibrated.get("summary") or payload.get("summary") or ""),
             }
         )
+        return Ok(payload)
 
     @plugin_entry(
         id="galgame_list_ocr_windows",

@@ -43,6 +43,20 @@ OCR_CAPTURE_PROFILE_STAGES = frozenset(
         OCR_CAPTURE_PROFILE_STAGE_MENU,
     }
 )
+OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY = "__window_buckets__"
+OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET = "window_bucket"
+OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK = "process_fallback"
+OCR_CAPTURE_PROFILE_SAVE_SCOPES = frozenset(
+    {
+        OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
+        OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK,
+    }
+)
+OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT = "bucket_exact"
+OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST = "bucket_aspect_nearest"
+OCR_CAPTURE_PROFILE_MATCH_SOURCE_PROCESS_FALLBACK = "process_fallback"
+OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET = "builtin_preset"
+OCR_CAPTURE_PROFILE_MATCH_SOURCE_CONFIG_DEFAULT = "config_default"
 
 AGENT_STATUS_ACTIVE = "active"
 AGENT_STATUS_STANDBY = "standby"
@@ -94,6 +108,33 @@ DEFAULT_SAVE_CONTEXT = {
 
 def json_copy(value: Any) -> Any:
     return copy.deepcopy(value)
+
+
+def build_ocr_capture_profile_bucket_key(width: int, height: int) -> str:
+    return f"{max(0, int(width))}x{max(0, int(height))}"
+
+
+def parse_ocr_capture_profile_bucket_key(value: str) -> tuple[int, int] | None:
+    normalized = str(value or "").strip().lower()
+    if "x" not in normalized:
+        return None
+    left, right = normalized.split("x", 1)
+    try:
+        width = int(left)
+        height = int(right)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
+
+
+def compute_ocr_window_aspect_ratio(width: int, height: int, *, precision: int = 4) -> float:
+    width_value = max(0, int(width))
+    height_value = max(0, int(height))
+    if width_value <= 0 or height_value <= 0:
+        return 0.0
+    return round(width_value / height_value, precision)
 
 
 def _string(value: object, default: str = "") -> str:

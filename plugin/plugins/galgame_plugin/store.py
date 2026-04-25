@@ -6,6 +6,7 @@ from .models import (
     MODES,
     OCR_CAPTURE_PROFILE_RATIO_KEYS,
     OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
     STORE_BOUND_GAME_ID,
     STORE_DEDUPE_WINDOW,
     STORE_EVENTS_BYTE_OFFSET,
@@ -17,6 +18,9 @@ from .models import (
     STORE_OCR_WINDOW_TARGET,
     STORE_PUSH_NOTIFICATIONS,
     STORE_SESSION_ID,
+    build_ocr_capture_profile_bucket_key,
+    compute_ocr_window_aspect_ratio,
+    parse_ocr_capture_profile_bucket_key,
 )
 
 
@@ -79,6 +83,8 @@ class GalgameStore:
             stage_profiles: dict[str, dict[str, float]] = {}
             for stage_name, stage_profile in profile.items():
                 normalized_stage_name = str(stage_name or "").strip()
+                if normalized_stage_name == OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY:
+                    continue
                 if not normalized_stage_name:
                     warnings.append(
                         f"invalid ocr_capture_profiles stage dropped: {process_name!r} has empty stage name"
@@ -91,15 +97,92 @@ class GalgameStore:
                     )
                     continue
                 stage_profiles[normalized_stage_name] = cleaned_stage
-            if not stage_profiles:
+            bucket_profiles: dict[str, dict[str, Any]] = {}
+            raw_buckets = profile.get(OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY)
+            if raw_buckets not in ({}, None):
+                if not isinstance(raw_buckets, dict):
+                    warnings.append(
+                        f"invalid ocr_capture_profiles buckets dropped: {process_name!r}.__window_buckets__ is not an object"
+                    )
+                else:
+                    for bucket_key, bucket_value in raw_buckets.items():
+                        normalized_bucket_key = str(bucket_key or "").strip().lower()
+                        parsed_dimensions = parse_ocr_capture_profile_bucket_key(normalized_bucket_key)
+                        if parsed_dimensions is None:
+                            warnings.append(
+                                f"invalid ocr_capture_profiles bucket dropped: {process_name!r}/{bucket_key!r} has invalid bucket key"
+                            )
+                            continue
+                        if not isinstance(bucket_value, dict):
+                            warnings.append(
+                                f"invalid ocr_capture_profiles bucket dropped: {process_name!r}/{normalized_bucket_key!r} is not an object"
+                            )
+                            continue
+                        try:
+                            width = int(bucket_value.get("width") or parsed_dimensions[0])
+                            height = int(bucket_value.get("height") or parsed_dimensions[1])
+                        except (TypeError, ValueError):
+                            warnings.append(
+                                f"invalid ocr_capture_profiles bucket dropped: {process_name!r}/{normalized_bucket_key!r} has invalid width/height"
+                            )
+                            continue
+                        if width <= 0 or height <= 0:
+                            warnings.append(
+                                f"invalid ocr_capture_profiles bucket dropped: {process_name!r}/{normalized_bucket_key!r} has non-positive width/height"
+                            )
+                            continue
+                        try:
+                            aspect_ratio = float(
+                                bucket_value.get("aspect_ratio")
+                                or compute_ocr_window_aspect_ratio(width, height)
+                            )
+                        except (TypeError, ValueError):
+                            aspect_ratio = compute_ocr_window_aspect_ratio(width, height)
+                        raw_bucket_stages = bucket_value.get("stages")
+                        if not isinstance(raw_bucket_stages, dict):
+                            warnings.append(
+                                f"invalid ocr_capture_profiles bucket dropped: {process_name!r}/{normalized_bucket_key!r} has no valid stages"
+                            )
+                            continue
+                        bucket_stage_profiles: dict[str, dict[str, float]] = {}
+                        for stage_name, stage_profile in raw_bucket_stages.items():
+                            normalized_stage_name = str(stage_name or "").strip()
+                            if not normalized_stage_name:
+                                warnings.append(
+                                    f"invalid ocr_capture_profiles bucket stage dropped: {process_name!r}/{normalized_bucket_key!r} has empty stage name"
+                                )
+                                continue
+                            cleaned_stage = cls._sanitize_ratio_profile(stage_profile)
+                            if cleaned_stage is None:
+                                warnings.append(
+                                    f"invalid ocr_capture_profiles bucket stage dropped: {process_name!r}/{normalized_bucket_key!r}/{normalized_stage_name!r} has invalid ratios"
+                                )
+                                continue
+                            bucket_stage_profiles[normalized_stage_name] = cleaned_stage
+                        if not bucket_stage_profiles:
+                            warnings.append(
+                                f"invalid ocr_capture_profiles bucket dropped: {process_name!r}/{normalized_bucket_key!r} has no valid stages"
+                            )
+                            continue
+                        canonical_bucket_key = build_ocr_capture_profile_bucket_key(width, height).lower()
+                        bucket_profiles[canonical_bucket_key] = {
+                            "width": width,
+                            "height": height,
+                            "aspect_ratio": aspect_ratio,
+                            "stages": bucket_stage_profiles,
+                        }
+            if not stage_profiles and not bucket_profiles:
                 warnings.append(
                     f"invalid ocr_capture_profiles item dropped: {process_name!r} has invalid ratios"
                 )
                 continue
-            if len(stage_profiles) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_profiles:
+            if not bucket_profiles and len(stage_profiles) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_profiles:
                 normalized[process_name.strip()] = stage_profiles[OCR_CAPTURE_PROFILE_STAGE_DEFAULT]
             else:
-                normalized[process_name.strip()] = stage_profiles
+                payload: dict[str, Any] = dict(stage_profiles)
+                if bucket_profiles:
+                    payload[OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY] = bucket_profiles
+                normalized[process_name.strip()] = payload
         return normalized, warnings
 
     @staticmethod
@@ -254,25 +337,9 @@ class GalgameStore:
         self,
         profiles: dict[str, dict[str, Any]],
     ) -> None:
-        payload: dict[str, dict[str, Any]] = {}
-        for process_name, profile in profiles.items():
-            cleaned = self._sanitize_ratio_profile(profile)
-            if cleaned is not None:
-                payload[str(process_name)] = cleaned
-                continue
-            if not isinstance(profile, dict):
-                continue
-            stage_payload: dict[str, dict[str, float]] = {}
-            for stage_name, stage_profile in profile.items():
-                cleaned_stage = self._sanitize_ratio_profile(stage_profile)
-                if cleaned_stage is None:
-                    continue
-                stage_payload[str(stage_name)] = cleaned_stage
-            if stage_payload:
-                if len(stage_payload) == 1 and OCR_CAPTURE_PROFILE_STAGE_DEFAULT in stage_payload:
-                    payload[str(process_name)] = stage_payload[OCR_CAPTURE_PROFILE_STAGE_DEFAULT]
-                else:
-                    payload[str(process_name)] = stage_payload
+        payload, warnings = self._sanitize_ocr_capture_profiles(profiles)
+        for warning in warnings:
+            self._logger.warning(warning)
         self._write(
             STORE_OCR_CAPTURE_PROFILES,
             payload,

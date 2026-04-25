@@ -19,10 +19,19 @@ from .models import (
     DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
     DEFAULT_OCR_CAPTURE_TOP_RATIO,
     GalgameConfig,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_CONFIG_DEFAULT,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_PROCESS_FALLBACK,
     OCR_CAPTURE_PROFILE_RATIO_KEYS,
     OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
     OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
     OCR_CAPTURE_PROFILE_STAGE_MENU,
+    OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
+    build_ocr_capture_profile_bucket_key,
+    compute_ocr_window_aspect_ratio,
+    parse_ocr_capture_profile_bucket_key,
 )
 from .rapidocr_support import (
     inspect_rapidocr_installation,
@@ -134,6 +143,7 @@ _AIHONG_MENU_DIALOGUE_MARKERS = (
     "】",
 )
 _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
+_OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS = 0.18
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -453,6 +463,8 @@ class DetectedGameWindow:
     pid: int = 0
     class_name: str = ""
     exe_path: str = ""
+    width: int = 0
+    height: int = 0
     area: int = 0
     is_foreground: bool = False
     eligible: bool = True
@@ -473,6 +485,10 @@ class DetectedGameWindow:
             title=self.title,
         )
 
+    @property
+    def aspect_ratio(self) -> float:
+        return compute_ocr_window_aspect_ratio(self.width, self.height)
+
     def to_dict(self, *, is_attached: bool = False, is_manual_target: bool = False) -> dict[str, Any]:
         return {
             "window_key": self.window_key,
@@ -480,6 +496,9 @@ class DetectedGameWindow:
             "process_name": self.process_name,
             "pid": self.pid,
             "hwnd": self.hwnd,
+            "width": self.width,
+            "height": self.height,
+            "aspect_ratio": self.aspect_ratio,
             "eligible": self.eligible,
             "exclude_reason": self.exclude_reason,
             "is_foreground": self.is_foreground,
@@ -544,46 +563,124 @@ def _stripped_ocr_lines(raw_text: str) -> list[str]:
     return [line.strip() for line in str(raw_text or "").splitlines() if line.strip()]
 
 
+@dataclass(slots=True)
+class ParsedOcrCaptureBucket:
+    width: int = 0
+    height: int = 0
+    aspect_ratio: float = 0.0
+    stages: dict[str, OcrCaptureProfile] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ParsedOcrCaptureProcessConfig:
+    stages: dict[str, OcrCaptureProfile] = field(default_factory=dict)
+    window_buckets: dict[str, ParsedOcrCaptureBucket] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ResolvedOcrCaptureSelection:
+    profile: OcrCaptureProfile = field(default_factory=OcrCaptureProfile)
+    match_source: str = OCR_CAPTURE_PROFILE_MATCH_SOURCE_CONFIG_DEFAULT
+    bucket_key: str = ""
+
+
+def _resolve_stage_capture_profile(
+    stage_profiles: dict[str, OcrCaptureProfile],
+    *,
+    stage: str,
+) -> OcrCaptureProfile | None:
+    return stage_profiles.get(stage) or stage_profiles.get(OCR_CAPTURE_PROFILE_STAGE_DEFAULT)
+
+
 def _uses_manual_capture_profile(
-    profiles: dict[str, dict[str, OcrCaptureProfile]],
+    profiles: dict[str, ParsedOcrCaptureProcessConfig],
     target: DetectedGameWindow,
 ) -> bool:
     process_name = str(target.process_name or "").strip().lower()
     if not process_name:
         return False
-    return any(str(name or "").strip().lower() == process_name for name in profiles)
+    return process_name in profiles
 
 
 def _lookup_capture_profile(
-    profiles: dict[str, dict[str, OcrCaptureProfile]],
+    profiles: dict[str, ParsedOcrCaptureProcessConfig],
     target: DetectedGameWindow,
     *,
     stage: str,
-) -> OcrCaptureProfile | None:
-    process_name = str(target.process_name or "").strip()
+) -> ResolvedOcrCaptureSelection | None:
+    process_name = str(target.process_name or "").strip().lower()
     if not process_name:
         return None
-    profile_map = profiles.get(process_name)
-    if profile_map is not None:
-        profile = profile_map.get(stage) or profile_map.get(OCR_CAPTURE_PROFILE_STAGE_DEFAULT)
-        if profile is not None:
-            return profile
-    lowered = process_name.lower()
-    for configured_name, configured_profile_map in profiles.items():
-        if str(configured_name or "").strip().lower() == lowered:
-            return configured_profile_map.get(stage) or configured_profile_map.get(
-                OCR_CAPTURE_PROFILE_STAGE_DEFAULT
-            )
+    configured = profiles.get(process_name)
+    if configured is None:
+        return None
+
+    if target.width > 0 and target.height > 0:
+        exact_bucket_key = build_ocr_capture_profile_bucket_key(target.width, target.height).lower()
+        exact_bucket = configured.window_buckets.get(exact_bucket_key)
+        if exact_bucket is not None:
+            exact_profile = _resolve_stage_capture_profile(exact_bucket.stages, stage=stage)
+            if exact_profile is not None:
+                return ResolvedOcrCaptureSelection(
+                    profile=exact_profile,
+                    match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT,
+                    bucket_key=exact_bucket_key,
+                )
+
+        target_aspect_ratio = target.aspect_ratio
+        if target_aspect_ratio > 0:
+            nearest_bucket_key = ""
+            nearest_profile: OcrCaptureProfile | None = None
+            nearest_size_delta: int | None = None
+            nearest_aspect_delta: float | None = None
+            for bucket_key, bucket in configured.window_buckets.items():
+                profile = _resolve_stage_capture_profile(bucket.stages, stage=stage)
+                if profile is None:
+                    continue
+                aspect_delta = abs(float(bucket.aspect_ratio or 0.0) - target_aspect_ratio)
+                if aspect_delta > 0.03:
+                    continue
+                size_delta = abs(int(bucket.width or 0) - target.width) + abs(
+                    int(bucket.height or 0) - target.height
+                )
+                if (
+                    nearest_size_delta is None
+                    or size_delta < nearest_size_delta
+                    or (
+                        size_delta == nearest_size_delta
+                        and (
+                            nearest_aspect_delta is None
+                            or aspect_delta < nearest_aspect_delta
+                        )
+                    )
+                ):
+                    nearest_bucket_key = bucket_key
+                    nearest_profile = profile
+                    nearest_size_delta = size_delta
+                    nearest_aspect_delta = aspect_delta
+            if nearest_profile is not None:
+                return ResolvedOcrCaptureSelection(
+                    profile=nearest_profile,
+                    match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST,
+                    bucket_key=nearest_bucket_key,
+                )
+
+    fallback_profile = _resolve_stage_capture_profile(configured.stages, stage=stage)
+    if fallback_profile is not None:
+        return ResolvedOcrCaptureSelection(
+            profile=fallback_profile,
+            match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_PROCESS_FALLBACK,
+        )
     return None
 
 
 def _parse_configured_capture_profiles(
     profiles: dict[str, dict[str, Any]],
     logger,
-) -> dict[str, dict[str, OcrCaptureProfile]]:
-    parsed_profiles: dict[str, dict[str, OcrCaptureProfile]] = {}
+) -> dict[str, ParsedOcrCaptureProcessConfig]:
+    parsed_profiles: dict[str, ParsedOcrCaptureProcessConfig] = {}
     for process_name, profile_value in profiles.items():
-        normalized_process_name = str(process_name or "").strip()
+        normalized_process_name = str(process_name or "").strip().lower()
         if not normalized_process_name or not isinstance(profile_value, dict):
             continue
         stage_profiles: dict[str, OcrCaptureProfile] = {}
@@ -602,6 +699,8 @@ def _parse_configured_capture_profiles(
         else:
             for stage_name, stage_profile in profile_value.items():
                 normalized_stage_name = str(stage_name or "").strip()
+                if normalized_stage_name == OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY:
+                    continue
                 if not normalized_stage_name or not isinstance(stage_profile, dict):
                     continue
                 try:
@@ -613,8 +712,61 @@ def _parse_configured_capture_profiles(
                         normalized_stage_name,
                         exc,
                     )
-        if stage_profiles:
-            parsed_profiles[normalized_process_name] = stage_profiles
+        window_buckets: dict[str, ParsedOcrCaptureBucket] = {}
+        raw_buckets = profile_value.get(OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY)
+        if isinstance(raw_buckets, dict):
+            for bucket_key, bucket_value in raw_buckets.items():
+                normalized_bucket_key = str(bucket_key or "").strip().lower()
+                parsed_dimensions = parse_ocr_capture_profile_bucket_key(normalized_bucket_key)
+                if parsed_dimensions is None or not isinstance(bucket_value, dict):
+                    continue
+                try:
+                    width = int(bucket_value.get("width") or parsed_dimensions[0])
+                    height = int(bucket_value.get("height") or parsed_dimensions[1])
+                except (TypeError, ValueError):
+                    continue
+                if width <= 0 or height <= 0:
+                    continue
+                try:
+                    aspect_ratio = float(
+                        bucket_value.get("aspect_ratio")
+                        or compute_ocr_window_aspect_ratio(width, height)
+                    )
+                except (TypeError, ValueError):
+                    aspect_ratio = compute_ocr_window_aspect_ratio(width, height)
+                raw_stages = bucket_value.get("stages")
+                if not isinstance(raw_stages, dict):
+                    continue
+                bucket_stages: dict[str, OcrCaptureProfile] = {}
+                for stage_name, stage_profile in raw_stages.items():
+                    normalized_stage_name = str(stage_name or "").strip()
+                    if not normalized_stage_name or not isinstance(stage_profile, dict):
+                        continue
+                    try:
+                        bucket_stages[normalized_stage_name] = OcrCaptureProfile.from_dict(
+                            stage_profile
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ocr_reader failed to parse capture profile for %s/%s/%s: %s",
+                            normalized_process_name,
+                            normalized_bucket_key,
+                            normalized_stage_name,
+                            exc,
+                        )
+                if bucket_stages:
+                    canonical_bucket_key = build_ocr_capture_profile_bucket_key(width, height).lower()
+                    window_buckets[canonical_bucket_key] = ParsedOcrCaptureBucket(
+                        width=width,
+                        height=height,
+                        aspect_ratio=aspect_ratio,
+                        stages=bucket_stages,
+                    )
+        if stage_profiles or window_buckets:
+            parsed_profiles[normalized_process_name] = ParsedOcrCaptureProcessConfig(
+                stages=stage_profiles,
+                window_buckets=window_buckets,
+            )
     return parsed_profiles
 
 
@@ -673,12 +825,14 @@ class OcrWindowTarget:
         return bool(self.last_known_hwnd) and self.last_known_hwnd == candidate.hwnd
 
     def matches_signature(self, candidate: DetectedGameWindow) -> bool:
-        if self.pid > 0 and candidate.pid != self.pid:
+        has_process_name = bool(self.process_name)
+        has_title = bool(self.normalized_title)
+        if has_process_name and self.process_name.strip().lower() != candidate.process_name.strip().lower():
             return False
-        if self.process_name and self.process_name.strip().lower() != candidate.process_name.strip().lower():
+        if has_title and self.normalized_title != candidate.normalized_title:
             return False
-        if self.normalized_title and self.normalized_title != candidate.normalized_title:
-            return False
+        if not has_process_name and not has_title and self.pid > 0:
+            return candidate.pid == self.pid
         return bool(self.process_name or self.normalized_title or self.pid)
 
     def resolved_for(self, candidate: DetectedGameWindow) -> OcrWindowTarget:
@@ -701,12 +855,17 @@ class OcrReaderRuntime:
     process_name: str = ""
     pid: int = 0
     window_title: str = ""
+    width: int = 0
+    height: int = 0
+    aspect_ratio: float = 0.0
     game_id: str = ""
     session_id: str = ""
     last_seq: int = 0
     last_event_ts: str = ""
     capture_stage: str = ""
     capture_profile: dict[str, float] = field(default_factory=dict)
+    capture_profile_match_source: str = ""
+    capture_profile_bucket_key: str = ""
     tesseract_path: str = ""
     languages: str = ""
     takeover_reason: str = ""
@@ -732,12 +891,17 @@ class OcrReaderRuntime:
             "process_name": self.process_name,
             "pid": self.pid,
             "window_title": self.window_title,
+            "width": self.width,
+            "height": self.height,
+            "aspect_ratio": self.aspect_ratio,
             "game_id": self.game_id,
             "session_id": self.session_id,
             "last_seq": self.last_seq,
             "last_event_ts": self.last_event_ts,
             "capture_stage": self.capture_stage,
             "capture_profile": dict(self.capture_profile),
+            "capture_profile_match_source": self.capture_profile_match_source,
+            "capture_profile_bucket_key": self.capture_profile_bucket_key,
             "tesseract_path": self.tesseract_path,
             "languages": self.languages,
             "takeover_reason": self.takeover_reason,
@@ -1041,6 +1205,8 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
             pid=pid,
             class_name=class_name,
             exe_path=exe_path,
+            width=max(0, width),
+            height=max(0, height),
             area=max(0, area),
             is_foreground=hwnd == foreground_hwnd,
             score=float(max(area, 0)),
@@ -1494,7 +1660,7 @@ class OcrReaderManager:
             time_fn=self._time_fn,
         )
         self._runtime = OcrReaderRuntime(enabled=config.ocr_reader_enabled)
-        self._capture_profiles: dict[str, dict[str, OcrCaptureProfile]] = {}
+        self._capture_profiles: dict[str, ParsedOcrCaptureProcessConfig] = {}
         self._last_memory_reader_text_at = 0.0
         self._last_heartbeat_at = 0.0
         self._attached_window: DetectedGameWindow | None = None
@@ -1594,6 +1760,294 @@ class OcrReaderManager:
     def runtime(self) -> dict[str, Any]:
         return self._runtime.to_dict()
 
+    def refresh_runtime_capture_profile_selection(self) -> dict[str, Any]:
+        target = self._attached_window
+        if target is None:
+            return self._runtime.to_dict()
+
+        if target.width <= 0 and self._runtime.width > 0:
+            target.width = int(self._runtime.width)
+        if target.height <= 0 and self._runtime.height > 0:
+            target.height = int(self._runtime.height)
+        resolved_aspect_ratio = float(target.aspect_ratio or self._runtime.aspect_ratio)
+        if resolved_aspect_ratio <= 0.0 and target.width > 0 and target.height > 0:
+            resolved_aspect_ratio = compute_ocr_window_aspect_ratio(target.width, target.height)
+
+        capture_stage = str(self._runtime.capture_stage or "").strip().lower()
+        if not capture_stage or capture_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+            capture_stage = (
+                self._aihong_stage
+                if self._should_use_aihong_two_stage(target)
+                else OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+            )
+        capture_profile_selection = self._capture_profile_selection_for_target(
+            target,
+            stage=capture_stage,
+        )
+        self._runtime.process_name = str(target.process_name or self._runtime.process_name)
+        self._runtime.pid = int(target.pid or self._runtime.pid)
+        self._runtime.window_title = str(target.title or self._runtime.window_title)
+        self._runtime.width = int(target.width or self._runtime.width)
+        self._runtime.height = int(target.height or self._runtime.height)
+        self._runtime.aspect_ratio = resolved_aspect_ratio
+        self._runtime.capture_stage = capture_stage
+        self._runtime.capture_profile = capture_profile_selection.profile.to_dict()
+        self._runtime.capture_profile_match_source = capture_profile_selection.match_source
+        self._runtime.capture_profile_bucket_key = capture_profile_selection.bucket_key
+        self._runtime.effective_window_key = str(target.window_key or self._runtime.effective_window_key)
+        self._runtime.effective_window_title = str(target.title or self._runtime.effective_window_title)
+        self._runtime.effective_process_name = str(
+            target.process_name or self._runtime.effective_process_name
+        )
+        return self._runtime.to_dict()
+
+    @staticmethod
+    def _scan_ratio_values(
+        current_value: float,
+        *,
+        delta_start: float,
+        delta_end: float,
+        step: float,
+    ) -> list[float]:
+        values: list[float] = []
+        seen: set[int] = set()
+        basis = 100
+        start = int(round((current_value + delta_start) * basis))
+        end = int(round((current_value + delta_end) * basis))
+        step_value = max(1, int(round(step * basis)))
+        for raw in range(start, end + 1, step_value):
+            normalized = max(0.0, min(raw / basis, 0.98))
+            key = int(round(normalized * basis))
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(round(normalized, 2))
+        return values
+
+    @staticmethod
+    def _crop_box_for_profile_size(
+        *,
+        width: int,
+        height: int,
+        profile: OcrCaptureProfile,
+    ) -> tuple[int, int, int, int]:
+        left = int(width * profile.left_inset_ratio)
+        right = int(width * (1.0 - profile.right_inset_ratio))
+        top = int(height * profile.top_ratio)
+        bottom = int(height * (1.0 - profile.bottom_inset_ratio))
+        left = max(0, min(left, width))
+        right = max(left, min(right, width))
+        top = max(0, min(top, height))
+        bottom = max(top, min(bottom, height))
+        return (left, top, right, bottom)
+
+    def auto_recalibrate_dialogue_profile(self) -> dict[str, Any]:
+        if not self._config.ocr_reader_enabled:
+            raise ValueError("ocr_reader 未启用，无法自动重校准对白区")
+        if not self._platform_fn():
+            raise ValueError("当前平台不是 Windows，无法自动重校准对白区")
+        if not self._capture_backend.is_available():
+            raise ValueError("当前截图后端不可用，无法自动重校准对白区")
+        target = self._attached_window
+        if target is None:
+            raise ValueError("当前没有已附着的 OCR 目标窗口，无法自动重校准对白区")
+        process_name = str(target.process_name or "").strip()
+        if not process_name:
+            raise ValueError("当前 OCR 目标缺少进程名，无法自动重校准对白区")
+
+        full_window_profile = OcrCaptureProfile(
+            left_inset_ratio=0.0,
+            right_inset_ratio=0.0,
+            top_ratio=0.0,
+            bottom_inset_ratio=0.0,
+        )
+        full_image = self._capture_backend.capture_frame(target, full_window_profile)
+        image_size = getattr(full_image, "size", None)
+        if (
+            not isinstance(image_size, tuple)
+            or len(image_size) < 2
+            or int(image_size[0]) <= 0
+            or int(image_size[1]) <= 0
+            or not hasattr(full_image, "crop")
+        ):
+            raise ValueError("当前截图后端不支持自动重校准所需的整窗截图")
+
+        image_width = int(image_size[0])
+        image_height = int(image_size[1])
+        if target.width <= 0:
+            target.width = image_width
+        if target.height <= 0:
+            target.height = image_height
+
+        base_selection = self._capture_profile_selection_for_target(
+            target,
+            stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        )
+        base_profile = base_selection.profile
+        left, _top_unused, right, _bottom_unused = self._crop_box_for_profile_size(
+            width=image_width,
+            height=image_height,
+            profile=OcrCaptureProfile(
+                left_inset_ratio=base_profile.left_inset_ratio,
+                right_inset_ratio=base_profile.right_inset_ratio,
+                top_ratio=0.0,
+                bottom_inset_ratio=0.0,
+            ),
+        )
+        if right - left < 10:
+            raise ValueError("当前对白区横向裁剪过窄，无法自动重校准")
+
+        top_values = self._scan_ratio_values(
+            base_profile.top_ratio,
+            delta_start=-0.14,
+            delta_end=0.08,
+            step=0.02,
+        )
+        bottom_values = self._scan_ratio_values(
+            base_profile.bottom_inset_ratio,
+            delta_start=-0.04,
+            delta_end=0.08,
+            step=0.02,
+        )
+        backend_plan = None if self._custom_ocr_backend else self._resolve_backend_plan()
+        if backend_plan is not None and not backend_plan.primary.available:
+            raise ValueError("当前 OCR backend 不可用，无法自动重校准对白区")
+
+        best_candidate: dict[str, Any] | None = None
+        current_distance_basis = (
+            round(base_profile.top_ratio, 2),
+            round(base_profile.bottom_inset_ratio, 2),
+        )
+        min_height = max(24, int(image_height * 0.08))
+        max_height = max(min_height, int(image_height * 0.45))
+        visited_pairs: set[tuple[float, float]] = set()
+
+        def _consider_candidate(top_ratio: float, bottom_inset_ratio: float) -> None:
+            nonlocal best_candidate
+            key = (round(top_ratio, 2), round(bottom_inset_ratio, 2))
+            if key in visited_pairs:
+                return
+            visited_pairs.add(key)
+            if top_ratio + bottom_inset_ratio >= 1.0:
+                return
+            candidate_profile = OcrCaptureProfile(
+                left_inset_ratio=base_profile.left_inset_ratio,
+                right_inset_ratio=base_profile.right_inset_ratio,
+                top_ratio=top_ratio,
+                bottom_inset_ratio=bottom_inset_ratio,
+            )
+            left_px, top_px, right_px, bottom_px = self._crop_box_for_profile_size(
+                width=image_width,
+                height=image_height,
+                profile=candidate_profile,
+            )
+            crop_height = bottom_px - top_px
+            if crop_height < min_height or crop_height > max_height:
+                return
+            if right_px - left_px < 10:
+                return
+            extracted = self._extract_text_from_image(
+                full_image.crop((left_px, top_px, right_px, bottom_px)),
+                plan=backend_plan,
+            )
+            sample_text = str(extracted.text or "").strip()
+            if not sample_text or _looks_like_self_ui_text(sample_text):
+                return
+            score, cjk_count, significant_chars = _score_ocr_text(sample_text)
+            if significant_chars < 8 or cjk_count <= 0:
+                return
+            distance = abs(round(top_ratio, 2) - current_distance_basis[0]) + abs(
+                round(bottom_inset_ratio, 2) - current_distance_basis[1]
+            )
+            candidate = {
+                "profile": candidate_profile,
+                "sample_text": sample_text,
+                "score": score,
+                "cjk_count": cjk_count,
+                "significant_chars": significant_chars,
+                "distance": distance,
+            }
+            if best_candidate is None:
+                best_candidate = candidate
+                return
+            if (
+                (candidate["score"], candidate["cjk_count"], candidate["significant_chars"])
+                > (
+                    best_candidate["score"],
+                    best_candidate["cjk_count"],
+                    best_candidate["significant_chars"],
+                )
+                or (
+                    (
+                        candidate["score"],
+                        candidate["cjk_count"],
+                        candidate["significant_chars"],
+                    )
+                    == (
+                        best_candidate["score"],
+                        best_candidate["cjk_count"],
+                        best_candidate["significant_chars"],
+                    )
+                    and candidate["distance"] < best_candidate["distance"]
+                )
+            ):
+                best_candidate = candidate
+
+        preferred_bottom_values: list[float] = []
+        for delta in (0.0, 0.02, -0.02, 0.04):
+            candidate_value = round(base_profile.bottom_inset_ratio + delta, 2)
+            if candidate_value in bottom_values and candidate_value not in preferred_bottom_values:
+                preferred_bottom_values.append(candidate_value)
+        if not preferred_bottom_values:
+            preferred_bottom_values = list(bottom_values)
+
+        for top_ratio in top_values:
+            for bottom_inset_ratio in preferred_bottom_values:
+                _consider_candidate(top_ratio, bottom_inset_ratio)
+
+        if best_candidate is not None:
+            refine_top_values: list[float] = []
+            best_top_ratio = round(float(best_candidate["profile"].top_ratio), 2)
+            for delta in (-0.02, 0.0, 0.02):
+                candidate_value = round(best_top_ratio + delta, 2)
+                if candidate_value in top_values and candidate_value not in refine_top_values:
+                    refine_top_values.append(candidate_value)
+            for top_ratio in refine_top_values:
+                for bottom_inset_ratio in bottom_values:
+                    _consider_candidate(top_ratio, bottom_inset_ratio)
+        else:
+            for top_ratio in top_values:
+                for bottom_inset_ratio in bottom_values:
+                    _consider_candidate(top_ratio, bottom_inset_ratio)
+
+        if best_candidate is None:
+            raise ValueError("自动重校准失败：请先停在稳定对白界面再重试")
+
+        window_width = max(0, int(target.width or image_width))
+        window_height = max(0, int(target.height or image_height))
+        bucket_key = (
+            build_ocr_capture_profile_bucket_key(window_width, window_height).lower()
+            if window_width > 0 and window_height > 0
+            else ""
+        )
+        capture_profile = best_candidate["profile"].to_dict()
+        sample_text = str(best_candidate["sample_text"] or "")
+        return {
+            "process_name": process_name,
+            "stage": OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+            "save_scope": "window_bucket",
+            "bucket_key": bucket_key,
+            "window_width": window_width,
+            "window_height": window_height,
+            "capture_profile": capture_profile,
+            "sample_text": sample_text,
+            "summary": (
+                f"已自动重校准对白区：{process_name}"
+                + (f" / {bucket_key}" if bucket_key else "")
+                + f" / 示例文本：{sample_text[:24]}"
+            ),
+        }
+
     def _reset_default_ocr_state(self) -> None:
         self._default_ocr_state.reset()
 
@@ -1649,6 +2103,37 @@ class OcrReaderManager:
         if not self._stabilize_text_key(_canonical_choice_candidate_text(choices), state=tracker):
             return False
         return self._writer.emit_choices(choices, ts=utc_now_iso(now))
+
+    @staticmethod
+    def _should_attempt_followup_confirm(
+        raw_text: str,
+        *,
+        state: _StableOcrTextState,
+    ) -> bool:
+        cleaned = normalize_text(raw_text).strip()
+        if not cleaned:
+            return False
+        return (
+            bool(state.stable_text)
+            and
+            state.repeat_count == 1
+            and state.last_raw_text == cleaned
+            and state.stable_text != cleaned
+        )
+
+    async def _capture_followup_text(
+        self,
+        target: DetectedGameWindow,
+        profile: OcrCaptureProfile,
+        backend_plan: SelectedOcrBackendPlan,
+    ) -> OcrExtractionResult:
+        await asyncio.sleep(_OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS)
+        return await asyncio.to_thread(
+            self._capture_and_extract_text,
+            target,
+            profile,
+            backend_plan,
+        )
 
     def _consume_aihong_menu_stage_text(self, raw_text: str, *, now: float) -> _MenuConsumeResult:
         lines = _stripped_ocr_lines(raw_text)
@@ -1824,7 +2309,11 @@ class OcrReaderManager:
         if not aihong_two_stage_enabled:
             self._reset_aihong_menu_state()
         profile_stage = self._aihong_stage if aihong_two_stage_enabled else _AIHONG_DIALOGUE_STAGE
-        profile = self._capture_profile_for_target(target, stage=profile_stage)
+        capture_profile_selection = self._capture_profile_selection_for_target(
+            target,
+            stage=profile_stage,
+        )
+        profile = capture_profile_selection.profile
 
         if self._attached_window is None or self._attached_window.pid != target.pid:
             if (
@@ -1840,7 +2329,7 @@ class OcrReaderManager:
             startup_profile_stage = (
                 self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
             )
-            startup_profile = self._capture_profile_for_target(
+            startup_profile_selection = self._capture_profile_selection_for_target(
                 target,
                 stage=(
                     self._aihong_stage
@@ -1854,7 +2343,8 @@ class OcrReaderManager:
                 plan=backend_plan,
                 target=target,
                 capture_stage=startup_profile_stage,
-                capture_profile=startup_profile.to_dict(),
+                capture_profile=startup_profile_selection.profile.to_dict(),
+                capture_profile_selection=startup_profile_selection,
                 selection=selection,
                 game_id=self._writer.game_id,
                 session_id=self._writer.session_id,
@@ -1872,6 +2362,7 @@ class OcrReaderManager:
         active_backend = backend_plan.primary
         backend_detail_override = ""
         runtime_profile = profile
+        runtime_capture_profile_selection = capture_profile_selection
         try:
             extraction = await asyncio.to_thread(
                 self._capture_and_extract_text,
@@ -1910,6 +2401,47 @@ class OcrReaderManager:
                                 allow_choices=False,
                             )
                         )
+                        if (
+                            not dialogue_emitted
+                            and self._should_attempt_followup_confirm(
+                                extraction.text,
+                                state=self._default_ocr_state,
+                            )
+                        ):
+                            followup_extraction = await self._capture_followup_text(
+                                target,
+                                profile,
+                                backend_plan,
+                            )
+                            active_backend = (
+                                followup_extraction.backend
+                                if followup_extraction.backend.kind
+                                else active_backend
+                            )
+                            backend_detail_override = (
+                                followup_extraction.backend_detail or backend_detail_override
+                            )
+                            result.warnings.extend(followup_extraction.warnings)
+                            if (
+                                followup_extraction.text
+                                and not selection.selected_by_manual
+                                and _looks_like_self_ui_text(followup_extraction.text)
+                            ):
+                                result.warnings.append(
+                                    "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
+                                )
+                            else:
+                                followup_now = self._time_fn()
+                                dialogue_emitted = bool(
+                                    self._consume_ocr_text(
+                                        followup_extraction.text,
+                                        now=followup_now,
+                                        state=self._default_ocr_state,
+                                        allow_choices=False,
+                                    )
+                                )
+                                if dialogue_emitted:
+                                    now = followup_now
                         emitted = dialogue_emitted
                         if dialogue_emitted:
                             self._aihong_dialogue_idle_polls = 0
@@ -1918,10 +2450,11 @@ class OcrReaderManager:
                         else:
                             self._aihong_dialogue_idle_polls += 1
                             if self._aihong_dialogue_idle_polls >= 2:
-                                menu_profile = self._capture_profile_for_target(
+                                menu_profile_selection = self._capture_profile_selection_for_target(
                                     target,
                                     stage=_AIHONG_MENU_STAGE,
                                 )
+                                menu_profile = menu_profile_selection.profile
                                 menu_extraction = await asyncio.to_thread(
                                     self._capture_and_extract_text,
                                     target,
@@ -1953,6 +2486,7 @@ class OcrReaderManager:
                                     if menu_result.has_menu_candidate:
                                         self._aihong_menu_missing_polls = 0
                                         runtime_profile = menu_profile
+                                        runtime_capture_profile_selection = menu_profile_selection
                                     if menu_result.emitted_kind == "line":
                                         emitted = True
                                         self._aihong_stage = _AIHONG_DIALOGUE_STAGE
@@ -1960,13 +2494,51 @@ class OcrReaderManager:
                                         self._aihong_menu_missing_polls = 0
                                         self._aihong_menu_ocr_state.reset()
                                         runtime_profile = menu_profile
+                                        runtime_capture_profile_selection = menu_profile_selection
                                     elif menu_result.emitted_kind == "choices":
                                         emitted = True
                                         self._aihong_stage = _AIHONG_MENU_STAGE
                                         self._aihong_menu_missing_polls = 0
                                         runtime_profile = menu_profile
+                                        runtime_capture_profile_selection = menu_profile_selection
                 else:
                     emitted = bool(self._consume_ocr_text(extraction.text, now=now))
+                    if (
+                        not emitted
+                        and self._should_attempt_followup_confirm(
+                            extraction.text,
+                            state=self._default_ocr_state,
+                        )
+                    ):
+                        followup_extraction = await self._capture_followup_text(
+                            target,
+                            profile,
+                            backend_plan,
+                        )
+                        active_backend = (
+                            followup_extraction.backend
+                            if followup_extraction.backend.kind
+                            else active_backend
+                        )
+                        backend_detail_override = (
+                            followup_extraction.backend_detail or backend_detail_override
+                        )
+                        result.warnings.extend(followup_extraction.warnings)
+                        if (
+                            followup_extraction.text
+                            and not selection.selected_by_manual
+                            and _looks_like_self_ui_text(followup_extraction.text)
+                        ):
+                            result.warnings.append(
+                                "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
+                            )
+                        else:
+                            followup_now = self._time_fn()
+                            emitted = bool(
+                                self._consume_ocr_text(followup_extraction.text, now=followup_now)
+                            )
+                            if emitted:
+                                now = followup_now
         except Exception as exc:
             self._logger.warning("ocr_reader capture/OCR failed: %s", exc)
             result.warnings.append(f"ocr_reader capture failed: {exc}")
@@ -2005,6 +2577,7 @@ class OcrReaderManager:
                 self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
             ),
             capture_profile=runtime_profile.to_dict(),
+            capture_profile_selection=runtime_capture_profile_selection,
             selection=selection,
             game_id=self._writer.game_id,
             session_id=self._writer.session_id,
@@ -2020,12 +2593,12 @@ class OcrReaderManager:
             return selection
         return "auto"
 
-    def _capture_profile_for_target(
+    def _capture_profile_selection_for_target(
         self,
         target: DetectedGameWindow,
         *,
         stage: str = _AIHONG_DIALOGUE_STAGE,
-    ) -> OcrCaptureProfile:
+    ) -> ResolvedOcrCaptureSelection:
         configured_profile = _lookup_capture_profile(
             self._capture_profiles,
             target,
@@ -2036,14 +2609,28 @@ class OcrReaderManager:
 
         builtin_profile = _builtin_capture_profile_for_target_stage(target, stage=stage)
         if builtin_profile is not None:
-            return builtin_profile
+            return ResolvedOcrCaptureSelection(
+                profile=builtin_profile,
+                match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET,
+            )
 
-        return OcrCaptureProfile(
-            left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
-            right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
-            top_ratio=self._config.ocr_reader_top_ratio,
-            bottom_inset_ratio=self._config.ocr_reader_bottom_inset_ratio,
+        return ResolvedOcrCaptureSelection(
+            profile=OcrCaptureProfile(
+                left_inset_ratio=self._config.ocr_reader_left_inset_ratio,
+                right_inset_ratio=self._config.ocr_reader_right_inset_ratio,
+                top_ratio=self._config.ocr_reader_top_ratio,
+                bottom_inset_ratio=self._config.ocr_reader_bottom_inset_ratio,
+            ),
+            match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_CONFIG_DEFAULT,
         )
+
+    def _capture_profile_for_target(
+        self,
+        target: DetectedGameWindow,
+        *,
+        stage: str = _AIHONG_DIALOGUE_STAGE,
+    ) -> OcrCaptureProfile:
+        return self._capture_profile_selection_for_target(target, stage=stage).profile
 
     def _resolved_tesseract_path(self) -> str:
         return resolve_tesseract_path(
@@ -2175,6 +2762,7 @@ class OcrReaderManager:
         target: DetectedGameWindow | None = None,
         capture_stage: str = "",
         capture_profile: dict[str, float] | None = None,
+        capture_profile_selection: ResolvedOcrCaptureSelection | None = None,
         selection: WindowSelectionResult | None = None,
         takeover_reason: str = "",
         game_id: str = "",
@@ -2203,12 +2791,38 @@ class OcrReaderManager:
             process_name=str((attached_target.process_name if attached_target is not None else self._runtime.process_name) or ""),
             pid=int((attached_target.pid if attached_target is not None else self._runtime.pid) or 0),
             window_title=str((attached_target.title if attached_target is not None else self._runtime.window_title) or ""),
+            width=int((attached_target.width if attached_target is not None else self._runtime.width) or 0),
+            height=int((attached_target.height if attached_target is not None else self._runtime.height) or 0),
+            aspect_ratio=float(
+                (
+                    attached_target.aspect_ratio
+                    if attached_target is not None
+                    else self._runtime.aspect_ratio
+                )
+                or 0.0
+            ),
             game_id=str(game_id or self._writer.game_id or self._runtime.game_id),
             session_id=str(session_id or self._writer.session_id or self._runtime.session_id),
             last_seq=resolved_last_seq,
             last_event_ts=str(last_event_ts or self._writer.last_event_ts or self._runtime.last_event_ts),
             capture_stage=str(capture_stage or self._runtime.capture_stage),
             capture_profile=dict(capture_profile or self._runtime.capture_profile),
+            capture_profile_match_source=str(
+                (
+                    capture_profile_selection.match_source
+                    if capture_profile_selection is not None
+                    else self._runtime.capture_profile_match_source
+                )
+                or ""
+            ),
+            capture_profile_bucket_key=str(
+                (
+                    capture_profile_selection.bucket_key
+                    if capture_profile_selection is not None
+                    else self._runtime.capture_profile_bucket_key
+                )
+                or ""
+            ),
             tesseract_path=self._resolved_tesseract_path(),
             languages=self._config.ocr_reader_languages,
             takeover_reason=takeover_reason or self._runtime.takeover_reason,
@@ -2227,22 +2841,34 @@ class OcrReaderManager:
             last_exclude_reason=str(selection_state.last_exclude_reason or self._runtime.last_exclude_reason),
         )
 
-    def _capture_and_extract_text(
+    def _extract_text_from_image(
         self,
-        target: DetectedGameWindow,
-        profile: OcrCaptureProfile,
-        plan: SelectedOcrBackendPlan,
+        image: Any,
+        *,
+        plan: SelectedOcrBackendPlan | None = None,
     ) -> OcrExtractionResult:
-        frame = self._capture_backend.capture_frame(target, profile)
+        if plan is not None:
+            resolved_plan = plan
+        elif self._custom_ocr_backend:
+            resolved_plan = SelectedOcrBackendPlan(
+                primary=OcrBackendDescriptor(
+                    kind=str(self._runtime.backend_kind or "custom"),
+                    backend=self._ocr_backend,
+                    detail=str(self._runtime.backend_detail or "custom_backend"),
+                    available=True,
+                )
+            )
+        else:
+            resolved_plan = self._resolve_backend_plan()
         if self._custom_ocr_backend:
             return OcrExtractionResult(
-                text=self._ocr_backend.extract_text(frame),
-                backend=plan.primary,
-                backend_detail=plan.primary.detail,
+                text=self._ocr_backend.extract_text(image),
+                backend=resolved_plan.primary,
+                backend_detail=resolved_plan.primary.detail or "custom_backend",
             )
-        descriptors = [plan.primary]
-        if plan.fallback.available:
-            descriptors.append(plan.fallback)
+        descriptors = [resolved_plan.primary]
+        if resolved_plan.fallback.available:
+            descriptors.append(resolved_plan.fallback)
         warnings: list[str] = []
         last_error: Exception | None = None
         for index, descriptor in enumerate(descriptors):
@@ -2250,7 +2876,7 @@ class OcrReaderManager:
                 continue
             try:
                 return OcrExtractionResult(
-                    text=descriptor.backend.extract_text(frame),
+                    text=descriptor.backend.extract_text(image),
                     backend=descriptor,
                     backend_detail=(
                         "fallback_after_runtime_error"
@@ -2266,7 +2892,16 @@ class OcrReaderManager:
                 self._logger.warning("ocr_reader backend %s failed: %s", descriptor.kind, exc)
         if last_error is not None:
             raise last_error
-        return OcrExtractionResult(backend=plan.primary, warnings=warnings)
+        return OcrExtractionResult(backend=resolved_plan.primary, warnings=warnings)
+
+    def _capture_and_extract_text(
+        self,
+        target: DetectedGameWindow,
+        profile: OcrCaptureProfile,
+        plan: SelectedOcrBackendPlan,
+    ) -> OcrExtractionResult:
+        frame = self._capture_backend.capture_frame(target, profile)
+        return self._extract_text_from_image(frame, plan=plan)
 
     def _select_target_window(
         self,
@@ -2297,16 +2932,20 @@ class OcrReaderManager:
         if self._manual_target.is_manual():
             for candidate in windows:
                 if self._manual_target.matches_exact(candidate) or self._manual_target.matches_hwnd(candidate):
+                    resolved_target = self._manual_target.resolved_for(candidate)
+                    self._manual_target = resolved_target
                     selection.target = candidate
                     selection.selection_detail = "manual_target_exact"
-                    selection.manual_target = self._manual_target.resolved_for(candidate)
+                    selection.manual_target = resolved_target
                     selection.selected_by_manual = True
                     return selection
             for candidate in windows:
                 if self._manual_target.matches_signature(candidate):
+                    resolved_target = self._manual_target.resolved_for(candidate)
+                    self._manual_target = resolved_target
                     selection.target = candidate
                     selection.selection_detail = "manual_target_rebound"
-                    selection.manual_target = self._manual_target.resolved_for(candidate)
+                    selection.manual_target = resolved_target
                     selection.selected_by_manual = True
                     return selection
             selection.selection_detail = "manual_target_unavailable_fallback_to_auto"

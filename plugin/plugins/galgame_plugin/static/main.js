@@ -77,6 +77,17 @@ const OCR_PROFILE_STAGE_LABELS_ZH = {
   dialogue_stage: '对白区',
   menu_stage: '菜单区',
 };
+const OCR_CAPTURE_SAVE_SCOPE_LABELS_ZH = {
+  window_bucket: '当前窗口分辨率',
+  process_fallback: '进程通用回退',
+};
+const OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH = {
+  bucket_exact: '当前窗口精确命中',
+  bucket_aspect_nearest: '相近宽高比回退',
+  process_fallback: '进程通用回退',
+  builtin_preset: '内建预设',
+  config_default: '插件默认配置',
+};
 const AIHONG_CAPTURE_PRESETS = {
   dialogue_stage: {
     left_inset_ratio: 0.05,
@@ -127,11 +138,16 @@ const FIELD_LABELS_ZH = {
   process_name: '进程名',
   pid: '进程 ID',
   window_title: '窗口标题',
+  width: '窗口宽度',
+  height: '窗口高度',
+  aspect_ratio: '窗口宽高比',
   game_id: '游戏 ID',
   session_id: '会话 ID',
   last_event_ts: '最近事件时间',
   capture_stage: '截图阶段',
   capture_profile: '截图配置',
+  capture_profile_match_source: '截图配置来源',
+  capture_profile_bucket_key: '截图配置桶',
   backend_kind: '后端类型',
   backend_detail: '后端详情',
   backend_path: '后端路径',
@@ -191,6 +207,7 @@ let latestStatus = null;
 let latestOcrWindowSnapshot = null;
 let refreshInFlight = null;
 let autoRefreshTimer = null;
+let activeInstallTab = 'rapidocr';
 
 const latestInsights = {
   explainKey: '',
@@ -508,6 +525,24 @@ function normalizeProcessName(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function normalizeCaptureProfileSaveScope(value) {
+  const normalized = String(value || '').trim();
+  return normalized === 'window_bucket' ? 'window_bucket' : 'process_fallback';
+}
+
+function normalizeCaptureProfileBucketKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function buildCaptureProfileBucketKey(width, height) {
+  const normalizedWidth = Math.max(0, Number(width || 0));
+  const normalizedHeight = Math.max(0, Number(height || 0));
+  if (!normalizedWidth || !normalizedHeight) {
+    return '';
+  }
+  return `${Math.round(normalizedWidth)}x${Math.round(normalizedHeight)}`;
+}
+
 function isRatioProfileValue(value) {
   return Boolean(value)
     && typeof value === 'object'
@@ -529,12 +564,12 @@ function findStoredCaptureProfileEntry(status, processName) {
   return Object.entries(profiles).find(([name]) => normalizeProcessName(name) === normalizedProcessName)?.[1] || null;
 }
 
-function resolveStoredCaptureProfile(entry, stage) {
+function resolveStoredFallbackCaptureProfile(entry, stage) {
   if (!entry || typeof entry !== 'object') {
     return null;
   }
   if (isRatioProfileValue(entry)) {
-    return stage === 'default' ? entry : null;
+    return entry;
   }
   const stageEntry = entry[stage];
   if (isRatioProfileValue(stageEntry)) {
@@ -547,22 +582,77 @@ function resolveStoredCaptureProfile(entry, stage) {
   return null;
 }
 
-function resolveEditableCaptureProfile(status, processName, stage) {
-  const runtime = status?.ocr_reader_runtime || {};
-  const storedProfile = resolveStoredCaptureProfile(
-    findStoredCaptureProfileEntry(status, processName),
-    stage,
-  );
-  if (storedProfile) {
-    return storedProfile;
+function resolveStoredBucketCaptureProfile(entry, stage, bucketKey) {
+  if (!entry || typeof entry !== 'object' || !bucketKey) {
+    return null;
   }
-  if (
-    normalizeProcessName(processName)
-      && normalizeProcessName(processName) === normalizeProcessName(runtime.process_name)
+  const buckets = entry.__window_buckets__;
+  if (!buckets || typeof buckets !== 'object') {
+    return null;
+  }
+  const normalizedBucketKey = normalizeCaptureProfileBucketKey(bucketKey);
+  const directBucket = buckets[normalizedBucketKey];
+  const bucketEntry = directBucket
+    || Object.entries(buckets).find(([key]) => normalizeCaptureProfileBucketKey(key) === normalizedBucketKey)?.[1]
+    || null;
+  if (!bucketEntry || typeof bucketEntry !== 'object') {
+    return null;
+  }
+  const bucketStages = bucketEntry.stages;
+  if (!bucketStages || typeof bucketStages !== 'object') {
+    return null;
+  }
+  const stageEntry = bucketStages[stage];
+  if (isRatioProfileValue(stageEntry)) {
+    return stageEntry;
+  }
+  const defaultEntry = bucketStages.default;
+  if (isRatioProfileValue(defaultEntry)) {
+    return defaultEntry;
+  }
+  return null;
+}
+
+function resolveRuntimeDefaultSaveScope(status, processName) {
+  const runtime = status?.ocr_reader_runtime || {};
+  return normalizeProcessName(processName)
+    && normalizeProcessName(processName) === normalizeProcessName(runtime.process_name)
+    && Number(runtime.width || 0) > 0
+    && Number(runtime.height || 0) > 0
+    ? 'window_bucket'
+    : 'process_fallback';
+}
+
+function resolveEditableCaptureProfile(status, processName, stage, saveScope) {
+  const runtime = status?.ocr_reader_runtime || {};
+  const entry = findStoredCaptureProfileEntry(status, processName);
+  const normalizedScope = normalizeCaptureProfileSaveScope(saveScope);
+  const runtimeProcessMatches = normalizeProcessName(processName)
+    && normalizeProcessName(processName) === normalizeProcessName(runtime.process_name);
+  const runtimeBucketKey = normalizeCaptureProfileBucketKey(
+    runtime.capture_profile_bucket_key || buildCaptureProfileBucketKey(runtime.width, runtime.height),
+  );
+
+  if (normalizedScope === 'window_bucket') {
+    const storedBucketProfile = resolveStoredBucketCaptureProfile(entry, stage, runtimeBucketKey);
+    if (storedBucketProfile) {
+      return storedBucketProfile;
+    }
+    if (runtimeProcessMatches && runtime.capture_profile && runtimeBucketKey) {
+      return runtime.capture_profile;
+    }
+  } else {
+    const storedFallbackProfile = resolveStoredFallbackCaptureProfile(entry, stage);
+    if (storedFallbackProfile) {
+      return storedFallbackProfile;
+    }
+    if (
+      runtimeProcessMatches
       && runtime.capture_profile
-      && (stage === 'default' || runtime.capture_stage === stage || !runtime.capture_stage)
-  ) {
-    return runtime.capture_profile;
+      && !['bucket_exact', 'bucket_aspect_nearest'].includes(String(runtime.capture_profile_match_source || ''))
+    ) {
+      return runtime.capture_profile;
+    }
   }
   if (isAihongProcessName(processName) && AIHONG_CAPTURE_PRESETS[stage]) {
     return AIHONG_CAPTURE_PRESETS[stage];
@@ -943,12 +1033,20 @@ function renderOcrRuntime(status) {
     { label: 'process_name', value: runtime.process_name || '' },
     { label: 'pid', value: String(runtime.pid || 0) },
     { label: 'window_title', value: runtime.window_title || '' },
+    { label: 'width', value: String(runtime.width || 0) },
+    { label: 'height', value: String(runtime.height || 0) },
+    { label: 'aspect_ratio', value: runtime.aspect_ratio ? Number(runtime.aspect_ratio).toFixed(4) : '' },
     { label: 'game_id', value: runtime.game_id || '' },
     { label: 'session_id', value: runtime.session_id || '' },
     { label: 'last_seq', value: String(runtime.last_seq || 0) },
     { label: 'last_event_ts', value: runtime.last_event_ts || '' },
     { label: 'capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[runtime.capture_stage] || runtime.capture_stage || '通用区域' },
     { label: 'capture_profile', value: formatCaptureProfile(runtime.capture_profile) || '(default)' },
+    {
+      label: 'capture_profile_match_source',
+      value: OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH[runtime.capture_profile_match_source] || runtime.capture_profile_match_source || '',
+    },
+    { label: 'capture_profile_bucket_key', value: runtime.capture_profile_bucket_key || '' },
     { label: 'backend_kind', value: runtime.backend_kind || '' },
     { label: 'backend_detail', value: runtime.backend_detail || '' },
     { label: 'backend_path', value: runtime.backend_path || '' },
@@ -1141,11 +1239,10 @@ function renderRapidOcr(status) {
   const button = document.getElementById('rapidocrInstallBtn');
   const installState = getInstallState('rapidocr').state;
   const installable = Boolean(rapidocr.install_supported) && Boolean(rapidocr.can_install);
-  const installed = Boolean(rapidocr.installed);
+  const installed = Boolean(rapidocr.installed) || (installState && installState.status === 'completed');
   const usingRapidOcr = runtime.backend_kind === 'rapidocr';
   const usingFallback = runtime.backend_kind === 'tesseract';
 
-  banner.hidden = false;
   banner.className = 'install-banner install-banner-rapidocr';
   button.hidden = !installable;
   button.disabled = getInstallState('rapidocr').inProgress;
@@ -1171,13 +1268,14 @@ function renderRapidOcr(status) {
       ? 'RapidOCR 已接管当前 OCR Reader'
       : 'RapidOCR 已就绪，等待作为 OCR 主后端工作';
     body.textContent = usingRapidOcr
-      ? `当前主后端: ${runtime.backend_kind || 'rapidocr'}，模型 ${runtime.backend_model || rapidocr.selected_model || ''}。`
+      ? `后端: ${runtime.backend_kind || 'rapidocr'}\n模型: ${runtime.backend_model || rapidocr.selected_model || ''}`
       : usingFallback
         ? `RapidOCR 已安装，但本帧 OCR 回退到了 Tesseract。原因: ${runtime.backend_detail || rapidocr.detail || '未知'}。`
         : 'RapidOCR 已安装完成。无 SDK 且无有效内存文本时，它会优先于 Tesseract 作为 OCR Reader 的主后端。';
-    path.textContent = rapidocr.detected_path
-      ? `检测路径: ${rapidocr.detected_path}${rapidocr.model_cache_dir ? ` | 模型目录: ${rapidocr.model_cache_dir}` : ''}`
-      : '';
+    path.textContent = [
+      rapidocr.detected_path ? `检测路径: ${rapidocr.detected_path}` : '',
+      rapidocr.model_cache_dir ? `模型目录: ${rapidocr.model_cache_dir}` : '',
+    ].filter(Boolean).join('\n');
     button.hidden = true;
   } else if (rapidocr.detail === 'missing_models') {
     banner.classList.add('warning');
@@ -1226,7 +1324,7 @@ function renderRapidOcr(status) {
     body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
   }
 
-  if (installed && (!installState || isInstallTaskTerminal(installState))) {
+  if (installed) {
     getInstallNodes('rapidocr').card.hidden = true;
   } else {
     renderInstallTaskState('rapidocr');
@@ -1244,10 +1342,9 @@ function renderTesseract(status) {
   const button = document.getElementById('tesseractInstallBtn');
   const installState = getInstallState('tesseract').state;
   const installable = Boolean(tesseract.install_supported) && Boolean(tesseract.can_install);
-  const installed = Boolean(tesseract.installed);
+  const installed = Boolean(tesseract.installed) || (installState && installState.status === 'completed');
   const missingLanguages = tesseract.missing_languages || [];
 
-  banner.hidden = false;
   banner.className = 'install-banner install-banner-tesseract';
   button.hidden = !installable;
   button.disabled = getInstallState('tesseract').inProgress;
@@ -1320,7 +1417,7 @@ function renderTesseract(status) {
     body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
   }
 
-  if (installed && (!installState || isInstallTaskTerminal(installState))) {
+  if (installed) {
     getInstallNodes('tesseract').card.hidden = true;
   } else {
     renderInstallTaskState('tesseract');
@@ -1338,10 +1435,9 @@ function renderTextractor(status) {
   const button = document.getElementById('textractorInstallBtn');
   const installState = getInstallState('textractor').state;
   const installable = Boolean(textractor.install_supported) && Boolean(textractor.can_install);
-  const installed = Boolean(textractor.installed);
+  const installed = Boolean(textractor.installed) || (installState && installState.status === 'completed');
   const runtimeBlocked = runtime.detail === 'invalid_textractor_path';
 
-  banner.hidden = false;
   banner.className = 'install-banner install-banner-textractor';
   button.hidden = !installable;
   button.disabled = getInstallState('textractor').inProgress;
@@ -1368,7 +1464,7 @@ function renderTextractor(status) {
       : 'Textractor 已就绪，但仅作为实验性兜底';
     body.textContent = runtimeBlocked
       ? '当前已检测到 TextractorCLI.exe。它仍保留在链路中，但优先级固定低于 OCR Reader，不再是当前首发主验收线。'
-      : 'TextractorCLI.exe 已检测到。Memory Reader 仍然保留，但不再作为主叙事，也不会压过 OCR Reader。';
+      : 'TextractorCLI.exe 已检测到';
     path.textContent = textractor.detected_path ? `检测路径: ${textractor.detected_path}` : '';
     button.hidden = true;
   } else {
@@ -1408,7 +1504,7 @@ function renderTextractor(status) {
     body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
   }
 
-  if (installed && (!installState || isInstallTaskTerminal(installState))) {
+  if (installed) {
     getInstallNodes('textractor').card.hidden = true;
   } else {
     renderInstallTaskState('textractor');
@@ -1419,6 +1515,7 @@ function renderOcrProfile(status) {
   const runtime = status.ocr_reader_runtime || {};
   const processInput = document.getElementById('ocrProfileProcessInput');
   const stageSelect = document.getElementById('ocrProfileStageSelect');
+  const saveScopeSelect = document.getElementById('ocrProfileSaveScopeSelect');
   const leftInput = document.getElementById('ocrProfileLeftInput');
   const rightInput = document.getElementById('ocrProfileRightInput');
   const topInput = document.getElementById('ocrProfileTopInput');
@@ -1426,36 +1523,63 @@ function renderOcrProfile(status) {
   const hint = document.getElementById('ocrProfileRuntimeHint');
   const currentProcessName = processInput.value.trim() || runtime.process_name || '';
   const currentStage = stageSelect.value || 'default';
+  const defaultSaveScope = resolveRuntimeDefaultSaveScope(status, currentProcessName);
+  if (!saveScopeSelect.value || (saveScopeSelect.value === 'window_bucket' && defaultSaveScope === 'process_fallback' && !runtime.width)) {
+    saveScopeSelect.value = defaultSaveScope;
+  }
+  const currentSaveScope = normalizeCaptureProfileSaveScope(saveScopeSelect.value || defaultSaveScope);
   const profileValues = profileValueForInputs(
-    resolveEditableCaptureProfile(status, currentProcessName, currentStage),
+    resolveEditableCaptureProfile(status, currentProcessName, currentStage, currentSaveScope),
   );
+  const autoRecalibrateButton = document.getElementById('ocrProfileAutoRecalibrateBtn');
+  let autoRecalibrateReason = '';
+  if (!Boolean(runtime.enabled)) {
+    autoRecalibrateReason = 'OCR Reader 未启用';
+  } else if (runtime.detail === 'unsupported_platform') {
+    autoRecalibrateReason = '当前平台不是 Windows';
+  } else if (runtime.detail === 'capture_backend_unavailable') {
+    autoRecalibrateReason = '当前截图后端不可用';
+  } else if (!runtime.process_name || !Number(runtime.width || 0) || !Number(runtime.height || 0)) {
+    autoRecalibrateReason = '当前没有已附着的 OCR 目标窗口';
+  }
 
   if (runtime.process_name) {
     hint.textContent = [
       `当前 OCR 目标: ${runtime.process_name} (${runtime.pid || 0})`,
       runtime.window_title ? `窗口: ${runtime.window_title}` : '',
+      runtime.width && runtime.height ? `尺寸: ${runtime.width}x${runtime.height}` : '',
       runtime.capture_stage
         ? `运行阶段: ${OCR_PROFILE_STAGE_LABELS_ZH[runtime.capture_stage] || runtime.capture_stage}`
         : '',
+      runtime.capture_profile_match_source
+        ? `命中来源: ${OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH[runtime.capture_profile_match_source] || runtime.capture_profile_match_source}`
+        : '',
+      runtime.capture_profile_bucket_key ? `命中桶: ${runtime.capture_profile_bucket_key}` : '',
       runtime.detail ? `状态: ${runtime.detail}` : '',
       runtime.takeover_reason ? `接管原因: ${runtime.takeover_reason}` : '',
+      `自动重校准: ${autoRecalibrateReason || '可用'}`,
       isAihongProcessName(currentProcessName || runtime.process_name)
         ? '哀鸿支持按对白区 / 菜单区分别保存'
         : '',
     ].filter(Boolean).join(' | ');
   } else {
     hint.textContent = isAihongProcessName(currentProcessName)
-      ? '当前还没有附着的 OCR 目标进程。你可以先手动填写 TheLamentingGeese.exe，并分别预存哀鸿的对白区 / 菜单区截图范围。'
-      : '当前还没有附着的 OCR 目标进程。你也可以先手动填写 process_name，把截图校准预先存起来。';
+      ? '当前还没有附着的 OCR 目标进程。你可以先手动填写 TheLamentingGeese.exe，并分别预存哀鸿的对白区 / 菜单区截图范围。自动重校准需要先附着到真实游戏窗口。'
+      : '当前还没有附着的 OCR 目标进程。你也可以先手动填写 process_name，把截图校准预先存起来。自动重校准需要先附着到真实游戏窗口。';
   }
 
   if (!processInput.value || document.activeElement !== processInput) {
     setInputValueIfIdle(processInput, runtime.process_name || processInput.value);
   }
+  if (!saveScopeSelect.value) {
+    saveScopeSelect.value = defaultSaveScope;
+  }
   setInputValueIfIdle(leftInput, profileValues.left);
   setInputValueIfIdle(rightInput, profileValues.right);
   setInputValueIfIdle(topInput, profileValues.top);
   setInputValueIfIdle(bottomInput, profileValues.bottom);
+  autoRecalibrateButton.disabled = Boolean(autoRecalibrateReason);
+  autoRecalibrateButton.title = autoRecalibrateReason || '使用当前附着窗口自动重校准对白区';
 }
 
 function renderSnapshot(snapshot) {
@@ -1910,6 +2034,9 @@ async function saveOcrCaptureProfile() {
   try {
     const processName = document.getElementById('ocrProfileProcessInput').value.trim();
     const stage = document.getElementById('ocrProfileStageSelect').value || 'default';
+    const saveScope = normalizeCaptureProfileSaveScope(
+      document.getElementById('ocrProfileSaveScopeSelect').value,
+    );
     const leftInsetRatio = readProfileNumber('ocrProfileLeftInput', 'left_inset_ratio');
     const rightInsetRatio = readProfileNumber('ocrProfileRightInput', 'right_inset_ratio');
     const topRatio = readProfileNumber('ocrProfileTopInput', 'top_ratio');
@@ -1917,6 +2044,7 @@ async function saveOcrCaptureProfile() {
     const payload = await callPlugin('galgame_set_ocr_capture_profile', {
       process_name: processName,
       stage,
+      save_scope: saveScope,
       left_inset_ratio: leftInsetRatio,
       right_inset_ratio: rightInsetRatio,
       top_ratio: topRatio,
@@ -1934,12 +2062,30 @@ async function clearOcrCaptureProfile() {
   try {
     const processName = document.getElementById('ocrProfileProcessInput').value.trim();
     const stage = document.getElementById('ocrProfileStageSelect').value || 'default';
+    const saveScope = normalizeCaptureProfileSaveScope(
+      document.getElementById('ocrProfileSaveScopeSelect').value,
+    );
     const payload = await callPlugin('galgame_set_ocr_capture_profile', {
       process_name: processName,
       stage,
+      save_scope: saveScope,
       clear: true,
     });
     setFlash(payload.summary || 'OCR 截图校准已清空', 'success');
+    await refreshAll({ preserveFlash: true, forceInsights: true });
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+async function autoRecalibrateOcrDialogueProfile() {
+  try {
+    const payload = await callPlugin('galgame_auto_recalibrate_ocr_dialogue_profile', {});
+    const sampleText = String(payload.sample_text || '').trim();
+    const summary = payload.summary || 'OCR 对白区已自动重校准';
+    setFlash(sampleText ? `${summary} | ${sampleText}` : summary, 'success');
+    const saveScopeSelect = document.getElementById('ocrProfileSaveScopeSelect');
+    saveScopeSelect.value = 'window_bucket';
     await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
@@ -2005,6 +2151,23 @@ async function clearOcrWindowTarget() {
   }
 }
 
+function switchInstallTab(tab) {
+  activeInstallTab = tab;
+  document.querySelectorAll('.install-tab').forEach((btn) => {
+    if (btn.dataset.installTab === tab) {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+  ['rapidocr', 'tesseract', 'textractor'].forEach((kind) => {
+    const banner = document.getElementById(`${kind}Prompt`);
+    if (banner) {
+      banner.hidden = kind !== tab;
+    }
+  });
+}
+
 async function initialize() {
   await refreshAll({ forceInsights: true });
   await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
@@ -2013,6 +2176,7 @@ async function initialize() {
     restoreTesseractInstallState(),
     restoreTextractorInstallState(),
   ]);
+  switchInstallTab(activeInstallTab);
   startAutoRefresh();
 }
 
@@ -2053,7 +2217,13 @@ document.addEventListener('keydown', (e) => {
 });
 document.getElementById('ocrProfileSaveBtn').addEventListener('click', saveOcrCaptureProfile);
 document.getElementById('ocrProfileClearBtn').addEventListener('click', clearOcrCaptureProfile);
+document.getElementById('ocrProfileAutoRecalibrateBtn').addEventListener('click', autoRecalibrateOcrDialogueProfile);
 document.getElementById('ocrProfileStageSelect').addEventListener('change', () => {
+  if (latestStatus) {
+    renderOcrProfile(latestStatus);
+  }
+});
+document.getElementById('ocrProfileSaveScopeSelect').addEventListener('change', () => {
   if (latestStatus) {
     renderOcrProfile(latestStatus);
   }
@@ -2062,6 +2232,15 @@ document.getElementById('ocrProfileProcessInput').addEventListener('blur', () =>
   if (latestStatus) {
     renderOcrProfile(latestStatus);
   }
+});
+
+document.querySelectorAll('.install-tab').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.installTab;
+    if (tab) {
+      switchInstallTab(tab);
+    }
+  });
 });
 
 document.addEventListener('visibilitychange', () => {

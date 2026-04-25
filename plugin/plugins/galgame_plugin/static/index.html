@@ -3,8 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>Galgame 插件管理</title>
-  <link rel="stylesheet" href="./style.css?v=20260425-ocr-window-modal-2">
+  <link rel="stylesheet" href="./style.css?v=20260425-ocr-buttons-3">
 </head>
 <body>
   <div class="page-shell">
@@ -63,72 +66,79 @@
       </div>
 
       <div class="install-stack">
-        <div id="rapidocrPrompt" class="install-banner install-banner-rapidocr" hidden>
-          <div class="install-copy">
-            <p id="rapidocrPromptKicker" class="list-kicker">OCR 主后端</p>
-            <h3 id="rapidocrPromptTitle">正在检测 RapidOCR</h3>
-            <p id="rapidocrPromptBody">插件隔离的 RapidOCR 运行时检测结果会显示在这里。</p>
-            <p id="rapidocrPathText" class="result-note"></p>
-            <div id="rapidocrInstallState" class="install-task-card" hidden>
-              <div class="install-task-head">
-                <p id="rapidocrInstallStatusText" class="install-task-status">等待安装任务</p>
-                <p id="rapidocrInstallPercent" class="install-task-percent">0%</p>
-              </div>
-              <div class="install-task-bar">
-                <div id="rapidocrInstallBar" class="install-task-bar-fill"></div>
-              </div>
-              <p id="rapidocrInstallMessage" class="result-note"></p>
-              <p id="rapidocrInstallDetail" class="result-note"></p>
-            </div>
-          </div>
-          <div class="install-actions">
-            <button id="rapidocrInstallBtn" class="primary">一键安装 RapidOCR</button>
-          </div>
+        <div class="install-tabs">
+          <button class="install-tab active" data-install-tab="rapidocr">RapidOCR</button>
+          <button class="install-tab" data-install-tab="tesseract">Tesseract</button>
+          <button class="install-tab" data-install-tab="textractor">Textractor</button>
         </div>
-
-        <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
-          <div class="install-copy">
-            <p id="tesseractPromptKicker" class="list-kicker">OCR 兼容兜底</p>
-            <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
-            <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的兼容兜底检测结果会显示在这里。</p>
-            <p id="tesseractPathText" class="result-note"></p>
-            <div id="tesseractInstallState" class="install-task-card" hidden>
-              <div class="install-task-head">
-                <p id="tesseractInstallStatusText" class="install-task-status">等待安装任务</p>
-                <p id="tesseractInstallPercent" class="install-task-percent">0%</p>
+        <div class="install-panels">
+          <div id="rapidocrPrompt" class="install-banner install-banner-rapidocr" hidden>
+            <div class="install-copy">
+              <p id="rapidocrPromptKicker" class="list-kicker">OCR 主后端</p>
+              <h3 id="rapidocrPromptTitle">正在检测 RapidOCR</h3>
+              <p id="rapidocrPromptBody">插件隔离的 RapidOCR 运行时检测结果会显示在这里。</p>
+              <p id="rapidocrPathText" class="result-note"></p>
+              <div id="rapidocrInstallState" class="install-task-card" hidden>
+                <div class="install-task-head">
+                  <p id="rapidocrInstallStatusText" class="install-task-status">等待安装任务</p>
+                  <p id="rapidocrInstallPercent" class="install-task-percent">0%</p>
+                </div>
+                <div class="install-task-bar">
+                  <div id="rapidocrInstallBar" class="install-task-bar-fill"></div>
+                </div>
+                <p id="rapidocrInstallMessage" class="result-note"></p>
+                <p id="rapidocrInstallDetail" class="result-note"></p>
               </div>
-              <div class="install-task-bar">
-                <div id="tesseractInstallBar" class="install-task-bar-fill"></div>
-              </div>
-              <p id="tesseractInstallMessage" class="result-note"></p>
-              <p id="tesseractInstallDetail" class="result-note"></p>
+            </div>
+            <div class="install-actions">
+              <button id="rapidocrInstallBtn" class="primary">一键安装 RapidOCR</button>
             </div>
           </div>
-          <div class="install-actions">
-            <button id="tesseractInstallBtn" class="primary">一键安装 Tesseract</button>
-          </div>
-        </div>
 
-        <div id="textractorPrompt" class="install-banner install-banner-textractor" hidden>
-          <div class="install-copy">
-            <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
-            <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
-            <p id="textractorPromptBody">Textractor 仍保留为 Memory Reader 的实验性兜底，不再是当前首发主线。</p>
-            <p id="textractorPathText" class="result-note"></p>
-            <div id="textractorInstallState" class="install-task-card" hidden>
-              <div class="install-task-head">
-                <p id="textractorInstallStatusText" class="install-task-status">等待安装任务</p>
-                <p id="textractorInstallPercent" class="install-task-percent">0%</p>
+          <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
+            <div class="install-copy">
+              <p id="tesseractPromptKicker" class="list-kicker">OCR 兼容兜底</p>
+              <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
+              <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的兼容兜底检测结果会显示在这里。</p>
+              <p id="tesseractPathText" class="result-note"></p>
+              <div id="tesseractInstallState" class="install-task-card" hidden>
+                <div class="install-task-head">
+                  <p id="tesseractInstallStatusText" class="install-task-status">等待安装任务</p>
+                  <p id="tesseractInstallPercent" class="install-task-percent">0%</p>
+                </div>
+                <div class="install-task-bar">
+                  <div id="tesseractInstallBar" class="install-task-bar-fill"></div>
+                </div>
+                <p id="tesseractInstallMessage" class="result-note"></p>
+                <p id="tesseractInstallDetail" class="result-note"></p>
               </div>
-              <div class="install-task-bar">
-                <div id="textractorInstallBar" class="install-task-bar-fill"></div>
-              </div>
-              <p id="textractorInstallMessage" class="result-note"></p>
-              <p id="textractorInstallDetail" class="result-note"></p>
+            </div>
+            <div class="install-actions">
+              <button id="tesseractInstallBtn" class="primary">一键安装 Tesseract</button>
             </div>
           </div>
-          <div class="install-actions">
-            <button id="textractorInstallBtn" class="secondary">一键安装 Textractor</button>
+
+          <div id="textractorPrompt" class="install-banner install-banner-textractor" hidden>
+            <div class="install-copy">
+              <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
+              <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
+              <p id="textractorPromptBody">Textractor 仍保留为 Memory Reader 的实验性兜底，不再是当前首发主线。</p>
+              <p id="textractorPathText" class="result-note"></p>
+              <div id="textractorInstallState" class="install-task-card" hidden>
+                <div class="install-task-head">
+                  <p id="textractorInstallStatusText" class="install-task-status">等待安装任务</p>
+                  <p id="textractorInstallPercent" class="install-task-percent">0%</p>
+                </div>
+                <div class="install-task-bar">
+                  <div id="textractorInstallBar" class="install-task-bar-fill"></div>
+                </div>
+                <p id="textractorInstallMessage" class="result-note"></p>
+                <p id="textractorInstallDetail" class="result-note"></p>
+              </div>
+            </div>
+            <div class="install-actions">
+              <button id="textractorInstallBtn" class="secondary">一键安装 Textractor</button>
+            </div>
           </div>
         </div>
       </div>
@@ -196,6 +206,13 @@
             </select>
           </label>
           <label class="field">
+            <span>保存范围</span>
+            <select id="ocrProfileSaveScopeSelect">
+              <option value="window_bucket">当前窗口分辨率</option>
+              <option value="process_fallback">进程通用回退</option>
+            </select>
+          </label>
+          <label class="field">
             <span>左侧裁剪比例</span>
             <input id="ocrProfileLeftInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
           </label>
@@ -214,6 +231,7 @@
           <div class="capture-profile-actions">
             <button id="ocrProfileSaveBtn" class="secondary">保存校准</button>
             <button id="ocrProfileClearBtn" class="ghost">清空校准</button>
+            <button id="ocrProfileAutoRecalibrateBtn" class="primary">自动重新校准对白区</button>
           </div>
         </div>
       </div>
@@ -305,6 +323,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260425-ocr-window-modal-2"></script>
+  <script src="./main.js?v=20260425-ocr-buttons-3"></script>
 </body>
 </html>

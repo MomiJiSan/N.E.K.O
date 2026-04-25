@@ -39,6 +39,7 @@ class GameLLMAgent:
     )
     _DEFAULT_BRIDGE_WAIT_TIMEOUT = 5.0
     _OCR_BRIDGE_WAIT_TIMEOUT = 12.0
+    _OCR_BRIDGE_ACTIVITY_GRACE_SECONDS = 4.0
     _DIALOGUE_ADVANCE_VARIANTS = (
         {
             "id": "advance_enter",
@@ -60,6 +61,26 @@ class GameLLMAgent:
                 "Focus the visual novel window. If a dialogue line is waiting to advance and no "
                 "menu choices are open, press Space exactly once. If Space is clearly not appropriate, "
                 "click the continue area once instead, then stop."
+            ),
+        },
+    )
+    _UNKNOWN_NO_TEXT_ADVANCE_VARIANTS = (
+        {
+            "id": "probe_space",
+            "instruction": (
+                "Focus the visual novel window. If no branch choices are visible and the game appears "
+                "to be waiting on a hidden dialogue, splash, title prompt, or other normal advance "
+                "state, press Space exactly once. Do not open menus or select branch choices. Stop "
+                "immediately after the single input."
+            ),
+        },
+        {
+            "id": "probe_enter",
+            "instruction": (
+                "Focus the visual novel window. If no branch choices are visible and the game appears "
+                "to be waiting on a hidden dialogue, splash, title prompt, or other normal advance "
+                "state, press Enter exactly once. Do not open menus or select branch choices. Stop "
+                "immediately after the single input."
             ),
         },
     )
@@ -491,6 +512,7 @@ class GameLLMAgent:
             "baseline_snapshot_ts": str(snapshot.get("ts") or ""),
             "baseline_stage": str(self._scene_state.get("stage") or ""),
             "baseline_scene_id": str(snapshot.get("scene_id") or ""),
+            "baseline_line_id": str(snapshot.get("line_id") or ""),
             "baseline_session_id": str(shared.get("active_session_id") or ""),
             "baseline_choice_signature": build_choice_signature(
                 list(snapshot.get("choices", []))
@@ -619,6 +641,13 @@ class GameLLMAgent:
         if current_last_seq > baseline_last_seq and current_snapshot_ts != baseline_snapshot_ts:
             return "snapshot_ts"
 
+        input_source = str(
+            shared.get("active_data_source")
+            or actuation.get("input_source")
+            or DATA_SOURCE_BRIDGE_SDK
+        )
+        baseline_line_id = str(actuation.get("baseline_line_id") or "")
+        baseline_scene_id = str(actuation.get("baseline_scene_id") or "")
         history_events = shared.get("history_events")
         if not isinstance(history_events, list):
             return None
@@ -632,6 +661,20 @@ class GameLLMAgent:
             event_type = str(event.get("type") or "")
             if event_type in self._BRIDGE_PROGRESS_EVENT_TYPES:
                 return f"history:{event_type}"
+            if input_source != DATA_SOURCE_OCR_READER or event_type != "heartbeat":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            heartbeat_state_ts = str(payload.get("state_ts") or "")
+            if heartbeat_state_ts and heartbeat_state_ts != baseline_snapshot_ts:
+                return "history:heartbeat_state_ts"
+            heartbeat_line_id = str(payload.get("line_id") or "")
+            if heartbeat_line_id and heartbeat_line_id != baseline_line_id:
+                return "history:heartbeat_line_id"
+            heartbeat_scene_id = str(payload.get("scene_id") or "")
+            if heartbeat_scene_id and heartbeat_scene_id != baseline_scene_id:
+                return "history:heartbeat_scene_id"
         return None
 
     def _bridge_wait_timeout(self, shared: dict[str, Any], *, actuation: dict[str, Any]) -> float:
@@ -641,8 +684,32 @@ class GameLLMAgent:
             or DATA_SOURCE_BRIDGE_SDK
         )
         if input_source == DATA_SOURCE_OCR_READER:
+            if self._has_recent_ocr_bridge_activity(shared, actuation=actuation):
+                return self._OCR_BRIDGE_WAIT_TIMEOUT + self._OCR_BRIDGE_ACTIVITY_GRACE_SECONDS
             return self._OCR_BRIDGE_WAIT_TIMEOUT
         return self._DEFAULT_BRIDGE_WAIT_TIMEOUT
+
+    def _has_recent_ocr_bridge_activity(
+        self,
+        shared: dict[str, Any],
+        *,
+        actuation: dict[str, Any],
+    ) -> bool:
+        baseline_last_seq = int(actuation.get("baseline_last_seq") or 0)
+        if int(shared.get("last_seq") or 0) > baseline_last_seq:
+            return True
+        history_events = shared.get("history_events")
+        if not isinstance(history_events, list):
+            return False
+        for event in reversed(history_events):
+            if not isinstance(event, dict):
+                continue
+            seq = int(event.get("seq") or 0)
+            if seq <= baseline_last_seq:
+                break
+            if str(event.get("type") or "") in {"heartbeat", "line_changed", "choices_shown", "scene_changed"}:
+                return True
+        return False
 
     def _has_confirmed_ocr_choice_menu(
         self,
@@ -696,6 +763,12 @@ class GameLLMAgent:
         if stage == "unknown":
             if int(self._scene_state.get("stage_ticks") or 0) < 2:
                 return None
+            if self._should_probe_unknown_no_text(shared):
+                return self._build_unknown_no_text_strategy(
+                    shared,
+                    retry_index=0,
+                    reason="ocr attached but has not stabilized any text yet",
+                )
             return self._build_recover_strategy(
                 shared,
                 retry_index=0,
@@ -739,6 +812,30 @@ class GameLLMAgent:
         return {
             "kind": "recover",
             "strategy_family": "recover",
+            "strategy_id": str(variant["id"]),
+            "instruction": str(variant["instruction"]),
+            "instruction_variant": retry_index,
+            "candidate_choices": [],
+            "candidate_index": 0,
+            "retry_reason": reason,
+            "choice_id": "",
+            "suggestion_reason": "",
+        }
+
+    def _build_unknown_no_text_strategy(
+        self,
+        shared: dict[str, Any],
+        *,
+        retry_index: int,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        del shared
+        if retry_index >= len(self._UNKNOWN_NO_TEXT_ADVANCE_VARIANTS):
+            return None
+        variant = self._UNKNOWN_NO_TEXT_ADVANCE_VARIANTS[retry_index]
+        return {
+            "kind": "probe",
+            "strategy_family": "unknown_no_text",
             "strategy_id": str(variant["id"]),
             "instruction": str(variant["instruction"]),
             "instruction_variant": retry_index,
@@ -853,9 +950,32 @@ class GameLLMAgent:
             return self._build_recover_strategy(shared, retry_index=0, reason=failure_reason)
 
         if kind == "recover":
-            return self._build_recover_strategy(
+            retry = self._build_recover_strategy(
                 shared,
                 retry_index=instruction_variant + 1,
+                reason=failure_reason,
+            )
+            if retry is not None:
+                return retry
+            if self._should_probe_unknown_no_text(shared):
+                return self._build_unknown_no_text_strategy(
+                    shared,
+                    retry_index=0,
+                    reason=failure_reason,
+                )
+            return None
+
+        if kind == "probe":
+            retry = self._build_unknown_no_text_strategy(
+                shared,
+                retry_index=instruction_variant + 1,
+                reason=failure_reason,
+            )
+            if retry is not None:
+                return retry
+            return self._build_recover_strategy(
+                shared,
+                retry_index=0,
                 reason=failure_reason,
             )
 
@@ -960,6 +1080,20 @@ class GameLLMAgent:
         if now - float(self._scene_state.get("last_scene_change_at") or 0.0) < 0.6:
             return "scene_transition"
         return "unknown"
+
+    def _should_probe_unknown_no_text(self, shared: dict[str, Any]) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return False
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        if snapshot.get("text") or snapshot.get("line_id"):
+            return False
+        if bool(snapshot.get("is_menu_open")) or list(snapshot.get("choices", [])):
+            return False
+        ocr_runtime = shared.get("ocr_reader_runtime")
+        if not isinstance(ocr_runtime, dict):
+            return False
+        detail = str(ocr_runtime.get("detail") or "")
+        return detail in {"attached_no_text_yet", "starting_capture"}
 
     @staticmethod
     def _build_empty_scene_state() -> dict[str, Any]:

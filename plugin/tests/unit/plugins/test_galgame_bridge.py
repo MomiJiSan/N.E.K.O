@@ -26,13 +26,19 @@ from plugin.plugins.galgame_plugin.memory_reader import (
     MemoryReaderManager,
 )
 from plugin.plugins.galgame_plugin.models import (
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT,
+    OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK,
+    OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
     DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_OCR_READER,
     OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
     OCR_CAPTURE_PROFILE_STAGE_MENU,
+    OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
     STORE_OCR_CAPTURE_PROFILES,
     STORE_OCR_WINDOW_TARGET,
+    build_ocr_capture_profile_bucket_key,
 )
 from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
@@ -340,6 +346,8 @@ def _shared_state(
     history_choices: list[dict[str, object]] | None = None,
     history_events: list[dict[str, object]] | None = None,
     active_data_source: str | None = None,
+    ocr_reader_runtime: dict[str, object] | None = None,
+    memory_reader_runtime: dict[str, object] | None = None,
 ) -> dict[str, object]:
     shared = {
         "mode": mode,
@@ -359,6 +367,8 @@ def _shared_state(
         "history_events": list(history_events or []),
         "history_lines": list(history_lines or []),
         "history_choices": list(history_choices or []),
+        "ocr_reader_runtime": dict(ocr_reader_runtime or {}),
+        "memory_reader_runtime": dict(memory_reader_runtime or {}),
     }
     if active_data_source is not None:
         shared["active_data_source"] = active_data_source
@@ -487,6 +497,53 @@ class _FakeOcrBackend:
         if len(self._texts) == 1:
             return self._texts[0]
         return self._texts.pop(0)
+
+
+class _FakeImage:
+    def __init__(self, size: tuple[int, int], *, crop_box: tuple[int, int, int, int] | None = None) -> None:
+        self.size = size
+        self.crop_box = crop_box or (0, 0, size[0], size[1])
+
+    def crop(self, box: tuple[int, int, int, int]):
+        return _FakeImage(
+            (max(0, box[2] - box[0]), max(0, box[3] - box[1])),
+            crop_box=box,
+        )
+
+
+class _FakeImageCaptureBackend:
+    def __init__(self, *, size: tuple[int, int] = (1000, 500), available: bool = True) -> None:
+        self.available = available
+        self.size = size
+        self.calls: list[tuple[int, int, int, int]] = []
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}:{target.pid}"
+
+    def capture_frame(self, target: DetectedGameWindow, profile) -> _FakeImage:
+        del target
+        width, height = self.size
+        left = int(width * profile.left_inset_ratio)
+        right = int(width * (1.0 - profile.right_inset_ratio))
+        top = int(height * profile.top_ratio)
+        bottom = int(height * (1.0 - profile.bottom_inset_ratio))
+        box = (left, top, right, bottom)
+        self.calls.append(box)
+        return _FakeImage((max(0, right - left), max(0, bottom - top)), crop_box=box)
+
+
+class _CropAwareOcrBackend:
+    def __init__(self, resolver) -> None:
+        self._resolver = resolver
+
+    def is_available(self) -> bool:
+        return True
+
+    def extract_text(self, image: _FakeImage) -> str:
+        return str(self._resolver(image) or "")
 
 
 def _memory_reader_session(
@@ -2117,6 +2174,657 @@ async def test_aihong_stage_specific_capture_profiles_can_save_and_clear_per_sta
         assert OCR_CAPTURE_PROFILE_STAGE_MENU in stored
 
 
+@pytest.mark.plugin_unit
+def test_store_load_preserves_legacy_and_window_bucket_capture_profiles(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    bucket_key = build_ocr_capture_profile_bucket_key(1280, 720).lower()
+
+    plugin._persist._write(
+        STORE_OCR_CAPTURE_PROFILES,
+        {
+            "Legacy.exe": {
+                "left_inset_ratio": 0.08,
+                "right_inset_ratio": 0.06,
+                "top_ratio": 0.34,
+                "bottom_inset_ratio": 0.22,
+            },
+            "DemoGame.exe": {
+                "default": {
+                    "left_inset_ratio": 0.05,
+                    "right_inset_ratio": 0.05,
+                    "top_ratio": 0.62,
+                    "bottom_inset_ratio": 0.08,
+                },
+                OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY: {
+                    bucket_key: {
+                        "width": 1280,
+                        "height": 720,
+                        "aspect_ratio": 1.7778,
+                        "stages": {
+                            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE: {
+                                "left_inset_ratio": 0.09,
+                                "right_inset_ratio": 0.11,
+                                "top_ratio": 0.48,
+                                "bottom_inset_ratio": 0.13,
+                            }
+                        },
+                    }
+                },
+            },
+        },
+    )
+
+    restored, warnings = plugin._persist.load()
+
+    assert warnings == []
+    restored_profiles = restored[STORE_OCR_CAPTURE_PROFILES]
+    assert restored_profiles["Legacy.exe"]["top_ratio"] == pytest.approx(0.34)
+    assert restored_profiles["DemoGame.exe"]["default"]["top_ratio"] == pytest.approx(0.62)
+    assert (
+        restored_profiles["DemoGame.exe"][OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY][bucket_key]["stages"][
+            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+        ]["top_ratio"]
+        == pytest.approx(0.48)
+    )
+
+    plugin._persist.persist_ocr_capture_profiles(restored_profiles)
+    persisted, persist_warnings = plugin._persist.load()
+
+    assert persist_warnings == []
+    assert (
+        persisted[STORE_OCR_CAPTURE_PROFILES]["DemoGame.exe"][OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY][bucket_key][
+            "width"
+        ]
+        == 1280
+    )
+
+
+@pytest.mark.plugin_unit
+def test_ocr_capture_profile_exact_bucket_wins_over_process_fallback(tmp_path: Path) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    bucket_key = build_ocr_capture_profile_bucket_key(1280, 720).lower()
+    manager.update_capture_profiles(
+        {
+            "DemoGame.exe": {
+                "default": {
+                    "left_inset_ratio": 0.05,
+                    "right_inset_ratio": 0.05,
+                    "top_ratio": 0.62,
+                    "bottom_inset_ratio": 0.08,
+                },
+                OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY: {
+                    bucket_key: {
+                        "width": 1280,
+                        "height": 720,
+                        "aspect_ratio": 1.7778,
+                        "stages": {
+                            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE: {
+                                "left_inset_ratio": 0.07,
+                                "right_inset_ratio": 0.08,
+                                "top_ratio": 0.44,
+                                "bottom_inset_ratio": 0.12,
+                            }
+                        },
+                    }
+                },
+            }
+        }
+    )
+
+    selection = manager._capture_profile_selection_for_target(
+        DetectedGameWindow(
+            hwnd=11,
+            title="Demo",
+            process_name="DemoGame.exe",
+            pid=9001,
+            width=1280,
+            height=720,
+        ),
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    )
+
+    assert selection.match_source == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+    assert selection.bucket_key == bucket_key
+    assert selection.profile.top_ratio == pytest.approx(0.44)
+
+
+@pytest.mark.plugin_unit
+def test_ocr_capture_profile_uses_nearest_aspect_bucket_when_exact_size_missing(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    bucket_key = build_ocr_capture_profile_bucket_key(1600, 900).lower()
+    manager.update_capture_profiles(
+        {
+            "DemoGame.exe": {
+                "default": {
+                    "left_inset_ratio": 0.05,
+                    "right_inset_ratio": 0.05,
+                    "top_ratio": 0.62,
+                    "bottom_inset_ratio": 0.08,
+                },
+                OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY: {
+                    bucket_key: {
+                        "width": 1600,
+                        "height": 900,
+                        "aspect_ratio": 1.7778,
+                        "stages": {
+                            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE: {
+                                "left_inset_ratio": 0.06,
+                                "right_inset_ratio": 0.07,
+                                "top_ratio": 0.46,
+                                "bottom_inset_ratio": 0.10,
+                            }
+                        },
+                    }
+                },
+            }
+        }
+    )
+
+    selection = manager._capture_profile_selection_for_target(
+        DetectedGameWindow(
+            hwnd=12,
+            title="Demo",
+            process_name="DemoGame.exe",
+            pid=9002,
+            width=1920,
+            height=1080,
+        ),
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    )
+
+    assert selection.match_source == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST
+    assert selection.bucket_key == bucket_key
+    assert selection.profile.top_ratio == pytest.approx(0.46)
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_ocr_capture_profile_window_bucket_only_updates_current_bucket(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    bucket_key = build_ocr_capture_profile_bucket_key(1280, 720).lower()
+
+    with plugin._state_lock:
+        plugin._state.ocr_reader_runtime = {
+            "process_name": "DemoGame.exe",
+            "width": 1280,
+            "height": 720,
+        }
+
+    await plugin.galgame_set_ocr_capture_profile(
+        process_name="DemoGame.exe",
+        stage="default",
+        save_scope=OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK,
+        left_inset_ratio=0.05,
+        right_inset_ratio=0.05,
+        top_ratio=0.62,
+        bottom_inset_ratio=0.08,
+    )
+    with plugin._state_lock:
+        plugin._state.ocr_reader_runtime = {
+            "process_name": "DemoGame.exe",
+            "width": 1280,
+            "height": 720,
+        }
+    saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="DemoGame.exe",
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        save_scope=OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
+        left_inset_ratio=0.09,
+        right_inset_ratio=0.11,
+        top_ratio=0.48,
+        bottom_inset_ratio=0.12,
+    )
+
+    assert isinstance(saved, Ok)
+    with plugin._state_lock:
+        stored = plugin._state.ocr_capture_profiles["DemoGame.exe"]
+        assert stored["default"]["top_ratio"] == pytest.approx(0.62)
+        assert (
+            stored[OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY][bucket_key]["stages"][
+                OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+            ]["top_ratio"]
+            == pytest.approx(0.48)
+        )
+    restored, _warnings = plugin._persist.load()
+    assert (
+        restored[STORE_OCR_CAPTURE_PROFILES]["DemoGame.exe"][OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY][bucket_key][
+            "stages"
+        ][OCR_CAPTURE_PROFILE_STAGE_DIALOGUE]["bottom_inset_ratio"]
+        == pytest.approx(0.12)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_ocr_capture_profile_window_bucket_refreshes_runtime_without_bridge_poll(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    bucket_key = build_ocr_capture_profile_bucket_key(1280, 720).lower()
+    target = DetectedGameWindow(
+        hwnd=901,
+        title="Demo Window",
+        process_name="DemoGame.exe",
+        pid=8801,
+        width=1280,
+        height=720,
+    )
+    manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager._attached_window = target
+    manager._runtime.enabled = True
+    manager._runtime.status = "active"
+    manager._runtime.capture_stage = OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+    plugin._ocr_reader_manager = manager
+    with plugin._state_lock:
+        plugin._state.ocr_reader_runtime = {
+            "enabled": True,
+            "status": "active",
+            "process_name": "DemoGame.exe",
+            "pid": 8801,
+            "window_title": "Demo Window",
+            "width": 1280,
+            "height": 720,
+            "capture_stage": OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+            "capture_profile_match_source": "builtin_preset",
+            "capture_profile_bucket_key": "",
+        }
+
+    async def _unexpected_poll(*, force: bool = False):
+        raise AssertionError(f"unexpected bridge poll during OCR profile save: force={force}")
+
+    plugin._poll_bridge = _unexpected_poll
+
+    saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="DemoGame.exe",
+        stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        save_scope=OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
+        left_inset_ratio=0.09,
+        right_inset_ratio=0.11,
+        top_ratio=0.48,
+        bottom_inset_ratio=0.12,
+    )
+
+    assert isinstance(saved, Ok)
+    assert (
+        saved.value["status"]["ocr_reader_runtime"]["capture_profile_match_source"]
+        == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+    )
+    assert saved.value["status"]["ocr_reader_runtime"]["capture_profile_bucket_key"] == bucket_key
+    with plugin._state_lock:
+        assert (
+            plugin._state.ocr_reader_runtime["capture_profile_match_source"]
+            == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+        )
+        assert plugin._state.ocr_reader_runtime["capture_profile_bucket_key"] == bucket_key
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_ocr_capture_profile_process_fallback_only_updates_fallback(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    bucket_key = build_ocr_capture_profile_bucket_key(1280, 720).lower()
+
+    with plugin._state_lock:
+        plugin._state.ocr_reader_runtime = {
+            "process_name": "DemoGame.exe",
+            "width": 1280,
+            "height": 720,
+        }
+        plugin._state.ocr_capture_profiles = {
+            "DemoGame.exe": {
+                OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY: {
+                    bucket_key: {
+                        "width": 1280,
+                        "height": 720,
+                        "aspect_ratio": 1.7778,
+                        "stages": {
+                            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE: {
+                                "left_inset_ratio": 0.09,
+                                "right_inset_ratio": 0.11,
+                                "top_ratio": 0.48,
+                                "bottom_inset_ratio": 0.12,
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    plugin._persist.persist_ocr_capture_profiles(plugin._state.ocr_capture_profiles)
+
+    saved = await plugin.galgame_set_ocr_capture_profile(
+        process_name="DemoGame.exe",
+        stage="default",
+        save_scope=OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK,
+        left_inset_ratio=0.05,
+        right_inset_ratio=0.06,
+        top_ratio=0.60,
+        bottom_inset_ratio=0.09,
+    )
+
+    assert isinstance(saved, Ok)
+    with plugin._state_lock:
+        stored = plugin._state.ocr_capture_profiles["DemoGame.exe"]
+        assert stored["default"]["top_ratio"] == pytest.approx(0.60)
+        assert (
+            stored[OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY][bucket_key]["stages"][
+                OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+            ]["top_ratio"]
+            == pytest.approx(0.48)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_runtime_exposes_window_bucket_match_metadata(tmp_path: Path) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 999.0,
+        },
+    )
+    bucket_key = build_ocr_capture_profile_bucket_key(1280, 720).lower()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(cfg),
+        time_fn=lambda: 1713000000.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=401,
+                title="Demo Window",
+                process_name="DemoGame.exe",
+                pid=7001,
+                width=1280,
+                height=720,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["测试文本", "测试文本"]),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: 1713000000.0,
+        ),
+    )
+    manager.update_capture_profiles(
+        {
+            "DemoGame.exe": {
+                OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY: {
+                    bucket_key: {
+                        "width": 1280,
+                        "height": 720,
+                        "aspect_ratio": 1.7778,
+                        "stages": {
+                            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE: {
+                                "left_inset_ratio": 0.08,
+                                "right_inset_ratio": 0.06,
+                                "top_ratio": 0.47,
+                                "bottom_inset_ratio": 0.11,
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["width"] == 1280
+    assert result.runtime["height"] == 720
+    assert result.runtime["aspect_ratio"] == pytest.approx(1280 / 720, rel=1e-4)
+    assert result.runtime["capture_profile_match_source"] == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+    assert result.runtime["capture_profile_bucket_key"] == bucket_key
+
+
+@pytest.mark.plugin_unit
+def test_auto_recalibrate_ocr_dialogue_profile_selects_best_candidate_and_returns_bucket(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeImageCaptureBackend(size=(1000, 500)),
+        ocr_backend=_CropAwareOcrBackend(
+            lambda image: "这是自动校准命中的对白文本。"
+            if getattr(image, "crop_box", None) == (50, 250, 950, 440)
+            else "菜单"
+        ),
+    )
+    manager._attached_window = DetectedGameWindow(
+        hwnd=501,
+        title="Demo Window",
+        process_name="DemoGame.exe",
+        pid=7101,
+        width=1000,
+        height=500,
+    )
+
+    payload = manager.auto_recalibrate_dialogue_profile()
+
+    assert payload["save_scope"] == OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET
+    assert payload["bucket_key"] == "1000x500"
+    assert payload["capture_profile"]["top_ratio"] == pytest.approx(0.50)
+    assert payload["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.12)
+    assert payload["sample_text"] == "这是自动校准命中的对白文本。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_auto_recalibrate_ocr_dialogue_profile_persists_bucket_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    target = DetectedGameWindow(
+        hwnd=602,
+        title="Demo Window",
+        process_name="DemoGame.exe",
+        pid=7202,
+        width=1000,
+        height=500,
+    )
+    manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeImageCaptureBackend(size=(1000, 500)),
+        ocr_backend=_CropAwareOcrBackend(
+            lambda image: "这是自动校准命中的对白文本。"
+            if getattr(image, "crop_box", None) == (50, 250, 950, 440)
+            else "菜单"
+        ),
+    )
+    manager._attached_window = target
+    manager._runtime.enabled = True
+    manager._runtime.status = "active"
+    manager._runtime.capture_stage = OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+    plugin._ocr_reader_manager = manager
+    with plugin._state_lock:
+        plugin._state.ocr_reader_runtime = {
+            "enabled": True,
+            "status": "active",
+            "process_name": "DemoGame.exe",
+            "pid": 7202,
+            "window_title": "Demo Window",
+            "width": 1000,
+            "height": 500,
+            "capture_stage": OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        }
+
+    async def _unexpected_poll(*, force: bool = False):
+        raise AssertionError(f"unexpected bridge poll during auto recalibrate: force={force}")
+
+    plugin._poll_bridge = _unexpected_poll
+
+    result = await plugin.galgame_auto_recalibrate_ocr_dialogue_profile()
+
+    assert isinstance(result, Ok)
+    assert result.value["bucket_key"] == "1000x500"
+    assert result.value["save_scope"] == OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET
+    assert (
+        result.value["status"]["ocr_reader_runtime"]["capture_profile_match_source"]
+        == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+    )
+
+    await plugin.shutdown()
+
+    restarted = GalgameBridgePlugin(ctx)
+    await restarted.startup()
+
+    with restarted._state_lock:
+        stored = restarted._state.ocr_capture_profiles["DemoGame.exe"]
+        assert (
+            stored[OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY]["1000x500"]["stages"][
+                OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+            ]["top_ratio"]
+            == pytest.approx(0.50)
+        )
+
+    restored_manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=602,
+                title="Demo Window",
+                process_name="DemoGame.exe",
+                pid=7202,
+                width=1000,
+                height=500,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["测试文本", "测试文本"]),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: 1713000000.0,
+        ),
+    )
+    with restarted._state_lock:
+        restored_manager.update_capture_profiles(restarted._state.ocr_capture_profiles)
+
+    tick = await restored_manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert tick.runtime["capture_profile_match_source"] == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+    assert tick.runtime["capture_profile_bucket_key"] == "1000x500"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_auto_recalibrate_ocr_dialogue_profile_failure_does_not_write_store(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeImageCaptureBackend(size=(1000, 500)),
+        ocr_backend=_CropAwareOcrBackend(lambda image: "菜单"),
+    )
+    plugin._ocr_reader_manager._attached_window = DetectedGameWindow(
+        hwnd=601,
+        title="Demo Window",
+        process_name="DemoGame.exe",
+        pid=7201,
+        width=1000,
+        height=500,
+    )
+
+    result = await plugin.galgame_auto_recalibrate_ocr_dialogue_profile()
+
+    assert isinstance(result, Err)
+    assert "稳定对白界面" in str(result.error)
+    with plugin._state_lock:
+        assert plugin._state.ocr_capture_profiles == {}
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_list_and_set_ocr_window_target_updates_state_and_store(tmp_path: Path) -> None:
@@ -2181,6 +2889,64 @@ async def test_list_and_set_ocr_window_target_updates_state_and_store(tmp_path: 
     assert cleared.value["window_target"]["mode"] == "auto"
     with plugin._state_lock:
         assert plugin._state.ocr_window_target["mode"] == "auto"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_poll_bridge_persists_rebound_ocr_window_target(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={
+                "enabled": True,
+                "install_target_dir": str(install_root),
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    rebound_window = DetectedGameWindow(
+        hwnd=778,
+        title="Aiyoku no Eustia",
+        process_name="Aiyoku.exe",
+        pid=5566,
+    )
+    original_target = {
+        "mode": "manual",
+        "window_key": "ocrwin:legacy-window",
+        "process_name": rebound_window.process_name,
+        "normalized_title": rebound_window.normalized_title,
+        "pid": 4455,
+        "last_known_hwnd": 777,
+        "selected_at": "2026-04-24T10:00:00Z",
+    }
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [rebound_window],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend([""]),
+    )
+    plugin._ocr_reader_manager.update_window_target(original_target)
+    with plugin._state_lock:
+        plugin._state.ocr_window_target = dict(original_target)
+    plugin._persist.persist_ocr_window_target(original_target)
+
+    await plugin._poll_bridge(force=True)
+
+    with plugin._state_lock:
+        assert plugin._state.ocr_window_target["window_key"] == rebound_window.window_key
+        assert plugin._state.ocr_window_target["pid"] == rebound_window.pid
+        assert plugin._state.ocr_window_target["last_known_hwnd"] == rebound_window.hwnd
+    restored, _warnings = plugin._persist.load()
+    assert restored[STORE_OCR_WINDOW_TARGET]["window_key"] == rebound_window.window_key
+    assert restored[STORE_OCR_WINDOW_TARGET]["pid"] == rebound_window.pid
 
 
 @pytest.mark.asyncio
@@ -2392,6 +3158,68 @@ async def test_aihong_menu_stage_rejects_short_dialogue_false_positive(tmp_path:
     assert all(event["type"] != "choices_shown" for event in events)
     assert session.session["state"]["is_menu_open"] is False
     assert session.session["state"]["choices"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_quick_followup_confirm_emits_line_without_waiting_next_tick(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 999.0,
+        },
+    )
+    clock = {"now": 1712050000.0}
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(cfg),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=399,
+                title="测试游戏",
+                process_name="Demo.exe",
+                pid=6099,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "王生：前文台词。",
+                "王生：前文台词。",
+                "王生：别喝了。",
+                "王生：别喝了。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    game_dir = bridge_root / str(manager._writer.game_id)
+    session = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+
+    assert session.session is not None
+    assert session.session["state"]["text"] == "别喝了。"
+    assert [event["type"] for event in events].count("line_changed") >= 2
 
 
 @pytest.mark.asyncio
@@ -3845,6 +4673,151 @@ async def test_game_llm_agent_ocr_awaiting_bridge_waits_longer_before_retry(
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_ocr_awaiting_bridge_accepts_heartbeat_state_ts_progress(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    shared_after = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_events=[
+            {
+                "seq": 3,
+                "ts": "2026-04-21T08:31:05Z",
+                "type": "heartbeat",
+                "line_id": "line-1",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "payload": {
+                    "state_ts": "2026-04-21T08:31:04Z",
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                },
+            }
+        ],
+        last_seq=3,
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    await agent.tick(shared_after)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_ocr_awaiting_bridge_extends_timeout_when_history_is_still_advancing(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    shared_with_activity = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="下一句还没出来。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_events=[
+            {
+                "seq": 3,
+                "ts": "2026-04-21T08:31:05Z",
+                "type": "heartbeat",
+                "line_id": "line-1",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "payload": {
+                    "state_ts": "2026-04-21T08:31:00Z",
+                    "line_id": "line-1",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                },
+            }
+        ],
+        last_seq=3,
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 13.0
+    await agent.tick(shared_with_activity)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+    assert agent._pending_strategy is None
+
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 17.0
+    await agent.tick(shared_with_activity)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is not None
+    assert agent._pending_strategy["strategy_id"] == "advance_click"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_recovers_unknown_ui_after_stall(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
@@ -3877,6 +4850,50 @@ async def test_game_llm_agent_recovers_unknown_ui_after_stall(tmp_path: Path) ->
     assert len(fake_host.started) == 1
     assert "dismiss that overlay exactly once" in fake_host.started[-1]
     assert agent._scene_state["stage"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_uses_safe_probe_when_ocr_has_no_text_yet(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="",
+            text="",
+            scene_id="scene-a",
+            line_id="",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_lines=[],
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={
+            "enabled": True,
+            "status": "active",
+            "detail": "attached_no_text_yet",
+        },
+    )
+
+    await agent.tick(shared)
+    agent._scene_state["last_scene_change_at"] = time.monotonic() - 1.0
+
+    await agent.tick(shared)
+    await agent.tick(shared)
+
+    assert len(fake_host.started) == 1
+    assert "press Space exactly once" in fake_host.started[-1]
+    assert agent._actuation is not None
+    assert agent._actuation["kind"] == "probe"
+    assert agent._actuation["strategy_id"] == "probe_space"
 
 
 @pytest.mark.asyncio

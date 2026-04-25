@@ -219,6 +219,48 @@ button[disabled] {
   margin-top: 14px;
 }
 
+.install-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.06);
+}
+
+.install-tab {
+  flex: 1 1 auto;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  border: none;
+  transition: background 150ms ease, color 150ms ease;
+}
+
+.install-tab:hover {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.install-tab.active {
+  background: #fff;
+  color: var(--brand-strong);
+  box-shadow: 0 2px 8px rgba(31, 42, 51, 0.1);
+}
+
+.install-panels {
+  display: grid;
+}
+
+.install-panels > .install-banner {
+  grid-area: 1 / 1;
+}
+
+.install-panels > .install-banner[hidden] {
+  display: none;
+}
+
 .install-banner {
   display: flex;
   justify-content: space-between;
@@ -312,7 +354,7 @@ button[disabled] {
 
 .capture-profile-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 12px;
   align-items: end;
   margin-top: 12px;
@@ -323,6 +365,8 @@ button[disabled] {
   gap: 10px;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
 }
 
 .locked-window-card {
@@ -556,6 +600,10 @@ button[disabled] {
   line-height: 1.5;
 }
 
+.install-copy .result-note {
+  white-space: pre-wrap;
+}
+
 .reply-box {
   flex: 0 0 auto;
   margin-top: 18px;
@@ -634,8 +682,9 @@ button[disabled] {
   inset: 0;
   z-index: 1000;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
+  padding-top: 48px;
 }
 
 .modal[hidden] {
@@ -722,7 +771,7 @@ button[disabled] {
 
 @media (max-width: 1100px) {
   .capture-profile-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
