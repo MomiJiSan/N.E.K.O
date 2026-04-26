@@ -169,6 +169,9 @@ class GameLLMAgent:
         self._observed_scene_id = ""
         self._observed_choice_marker = ""
         self._observed_virtual_mouse_runtime_key = ""
+        self._ocr_no_observed_advance_count = 0
+        self._ocr_last_progress_seq = 0
+        self._ocr_capture_diagnostic = ""
         self._computer_use_quota_bypass_until = 0.0
         self._local_task_seq = 0
         self._scene_state = self._build_empty_scene_state()
@@ -223,6 +226,9 @@ class GameLLMAgent:
             self._observed_scene_id = ""
             self._observed_choice_marker = ""
             self._observed_virtual_mouse_runtime_key = ""
+            self._ocr_no_observed_advance_count = 0
+            self._ocr_last_progress_seq = 0
+            self._ocr_capture_diagnostic = ""
             self._computer_use_quota_bypass_until = 0.0
             self._local_task_seq = 0
             self._next_actuation_at = 0.0
@@ -306,21 +312,6 @@ class GameLLMAgent:
                     )
                     self._last_status = self._compute_status(shared)
                     return
-                if self._current_input_source(shared) == DATA_SOURCE_OCR_READER:
-                    self._trace_runtime(
-                        "tick using OCR visible choice fallback: "
-                        f"choices={len(visible_choices)}"
-                    )
-                    self._planning_choice_signature = choice_signature
-                    self._planning_started_at = now
-                    await self._start_choice_fallback_actuation(
-                        shared,
-                        current_choices=visible_choices,
-                        now=now,
-                        diagnostic="ocr_reader: choose first visible choice without LLM wait",
-                    )
-                    self._last_status = self._compute_status(shared)
-                    return
                 context = build_suggest_context(shared)
                 self._trace_runtime(
                     "tick starting choice planning: "
@@ -331,8 +322,25 @@ class GameLLMAgent:
                 self._planning_choice_signature = build_choice_signature(context["visible_choices"])
                 self._planning_candidates = []
                 self._planning_started_at = now
-                await self._run_choice_planning_inline(shared, context=context, now=now)
+                self._planning_task = asyncio.create_task(
+                    self._llm_gateway.suggest_choice(context)
+                )
                 self._last_status = self._compute_status(shared)
+                return
+
+            if self._should_hold_for_ocr_capture_diagnostic(shared):
+                runtime = shared.get("ocr_reader_runtime") if isinstance(shared.get("ocr_reader_runtime"), dict) else {}
+                self._ocr_capture_diagnostic = self._ocr_capture_diagnostic or (
+                    "ocr_capture_diagnostic_required: OCR 连续未读到有效对白，"
+                    "请检查截图区、目标窗口或当前画面是否为普通对白"
+                )
+                self._trace_runtime(
+                    "tick holding for OCR capture diagnostic: "
+                    f"detail={str(runtime.get('detail') or '')} "
+                    f"no_text_polls={int(runtime.get('consecutive_no_text_polls') or 0)}"
+                )
+                self._next_actuation_at = now + 1.0
+                self._last_status = status
                 return
 
             strategy = self._build_scene_strategy(shared, now=now)
@@ -885,6 +893,71 @@ class GameLLMAgent:
             return speed
         return ADVANCE_SPEED_SLOW if speed == ADVANCE_SPEED_MEDIUM else speed
 
+    @staticmethod
+    def _latest_ocr_progress_seq(shared: dict[str, Any]) -> int:
+        latest = 0
+        history_events = shared.get("history_events")
+        if isinstance(history_events, list):
+            for event in history_events:
+                if not isinstance(event, dict):
+                    continue
+                if str(event.get("type") or "") in {"line_observed", "line_changed", "choices_shown"}:
+                    latest = max(latest, int(event.get("seq") or 0))
+        return latest
+
+    def _clear_ocr_capture_diagnostic(self) -> None:
+        self._ocr_no_observed_advance_count = 0
+        self._ocr_capture_diagnostic = ""
+
+    def _record_ocr_no_observed_timeout(
+        self,
+        *,
+        actuation: dict[str, Any],
+        shared: dict[str, Any],
+    ) -> str:
+        if not self._actuation_input_source_is_ocr(actuation):
+            return ""
+        if str(actuation.get("kind") or "") not in {"advance", "probe"}:
+            return ""
+        local_result = actuation.get("local_fallback_result")
+        if not isinstance(local_result, dict) or not bool(local_result.get("success")):
+            return ""
+        if bool((sanitize_snapshot_state(shared.get("latest_snapshot", {}))).get("choices")):
+            return ""
+        runtime = shared.get("ocr_reader_runtime")
+        if isinstance(runtime, dict):
+            detail = str(runtime.get("detail") or "")
+            if detail in {"backend_unavailable", "self_ui_guard_blocked"}:
+                return ""
+        self._ocr_no_observed_advance_count += 1
+        if self._ocr_no_observed_advance_count < 3:
+            return ""
+        self._ocr_capture_diagnostic = (
+            "ocr_capture_diagnostic_required: 连续本地推进后没有 OCR observed，"
+            "请检查截图区、目标窗口或当前画面是否为普通对白"
+        )
+        return self._ocr_capture_diagnostic
+
+    def _should_hold_for_ocr_capture_diagnostic(self, shared: dict[str, Any]) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return False
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        if bool(snapshot.get("is_menu_open")) or list(snapshot.get("choices", [])):
+            return False
+        if self._ocr_capture_diagnostic:
+            return True
+        if snapshot.get("text") or snapshot.get("line_id"):
+            return False
+        runtime = shared.get("ocr_reader_runtime")
+        runtime_requires_diagnostic = bool(
+            isinstance(runtime, dict)
+            and (
+                runtime.get("ocr_capture_diagnostic_required")
+                or str(runtime.get("detail") or "") == "ocr_capture_diagnostic_required"
+            )
+        )
+        return bool(self._ocr_capture_diagnostic or runtime_requires_diagnostic)
+
     def _ocr_advance_observation_window(self, shared: dict[str, Any]) -> float:
         return float(
             self._OCR_ADVANCE_OBSERVATION_WINDOWS.get(
@@ -1216,11 +1289,19 @@ class GameLLMAgent:
                 f"timeout={wait_timeout:.1f}s input_source={self._current_input_source(shared)}"
             )
             self._record_virtual_mouse_outcome(actuation, success=False, now=now)
-            retry = self._build_retry_strategy(shared, actuation=actuation, failure_reason=reason)
+            ocr_diagnostic = self._record_ocr_no_observed_timeout(
+                actuation=actuation,
+                shared=shared,
+            )
+            retry = (
+                None
+                if ocr_diagnostic
+                else self._build_retry_strategy(shared, actuation=actuation, failure_reason=reason)
+            )
             self._record_failure(
                 kind=str(actuation.get("kind") or ""),
                 strategy_id=str(actuation.get("strategy_id") or ""),
-                reason=reason,
+                reason=ocr_diagnostic or reason,
                 scene_id=str((shared.get("latest_snapshot") or {}).get("scene_id") or ""),
             )
             self._actuation = None
@@ -1228,6 +1309,10 @@ class GameLLMAgent:
                 self._clear_hard_error()
                 self._pending_strategy = retry
                 self._next_actuation_at = now + 0.2
+                return
+            if ocr_diagnostic:
+                self._clear_hard_error()
+                self._next_actuation_at = now + 1.0
                 return
             self._set_hard_error(reason, retryable=False)
             self._next_actuation_at = now + 1.0
@@ -1819,12 +1904,16 @@ class GameLLMAgent:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
         if snapshot.get("text") or snapshot.get("line_id"):
             return False
+        if list(shared.get("history_observed_lines") or []):
+            return False
         if bool(snapshot.get("is_menu_open")) or list(snapshot.get("choices", [])):
             return False
         ocr_runtime = shared.get("ocr_reader_runtime")
         if not isinstance(ocr_runtime, dict):
             return False
         detail = str(ocr_runtime.get("detail") or "")
+        if bool(ocr_runtime.get("ocr_capture_diagnostic_required")):
+            return False
         return detail in {"attached_no_text_yet", "starting_capture"}
 
     @staticmethod
@@ -1991,6 +2080,8 @@ class GameLLMAgent:
             self._observed_scene_id = str(snapshot.get("scene_id") or "")
             self._observed_session_id = session_id
             self._observed_virtual_mouse_runtime_key = virtual_mouse_runtime_key
+            self._clear_ocr_capture_diagnostic()
+            self._ocr_last_progress_seq = self._latest_ocr_progress_seq(shared)
             self._next_actuation_at = 0.0
             self._scene_state = self._build_empty_scene_state()
             return
@@ -1998,6 +2089,11 @@ class GameLLMAgent:
             if self._observed_virtual_mouse_runtime_key:
                 self._virtual_mouse_stats.clear()
             self._observed_virtual_mouse_runtime_key = virtual_mouse_runtime_key
+
+        latest_ocr_progress_seq = self._latest_ocr_progress_seq(shared)
+        if latest_ocr_progress_seq > self._ocr_last_progress_seq:
+            self._clear_ocr_capture_diagnostic()
+            self._ocr_last_progress_seq = latest_ocr_progress_seq
 
         current_scene_id = str(snapshot.get("scene_id") or "")
         current_route_id = str(snapshot.get("route_id") or "")
@@ -2196,6 +2292,12 @@ class GameLLMAgent:
                 "recent_local_inputs": json_copy(self._recent_local_inputs[-10:]),
                 "advance_observation_window_seconds": self._ocr_advance_observation_window(shared),
                 "advance_retry_timeout_seconds": self._ocr_advance_retry_timeout(shared),
+                "ocr_no_observed_advance_count": self._ocr_no_observed_advance_count,
+                "ocr_capture_diagnostic_required": bool(
+                    self._ocr_capture_diagnostic
+                    or self._should_hold_for_ocr_capture_diagnostic(shared)
+                ),
+                "ocr_capture_diagnostic": self._ocr_capture_diagnostic,
                 "virtual_mouse_stats": self._virtual_mouse_stats_debug(now=debug_now),
                 "virtual_mouse_preferred_target": self._select_virtual_mouse_dialogue_candidate(
                     now=debug_now,
@@ -2250,6 +2352,8 @@ class GameLLMAgent:
             )
         if self._pending_strategy is not None:
             return "retry_pending"
+        if self._should_hold_for_ocr_capture_diagnostic(shared):
+            return "ocr_capture_diagnostic_required"
         return "background_loop_ready"
 
     def _current_push_policy(self, shared: dict[str, Any]) -> str:

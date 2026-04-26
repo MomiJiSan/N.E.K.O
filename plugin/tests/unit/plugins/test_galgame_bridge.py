@@ -1249,14 +1249,20 @@ async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(t
     )
     assert entry_ids == [
         "galgame_agent_command",
+        "galgame_auto_recalibrate_ocr_dialogue_profile",
         "galgame_bind_game",
         "galgame_explain_line",
         "galgame_get_history",
-        "galgame_install_textractor",
         "galgame_get_snapshot",
         "galgame_get_status",
+        "galgame_install_rapidocr",
+        "galgame_install_tesseract",
+        "galgame_install_textractor",
+        "galgame_list_ocr_windows",
         "galgame_open_ui",
         "galgame_set_mode",
+        "galgame_set_ocr_capture_profile",
+        "galgame_set_ocr_window_target",
         "galgame_suggest_choice",
         "galgame_summarize_scene",
     ]
@@ -2287,8 +2293,8 @@ async def test_aihong_stage_specific_capture_profiles_preserve_two_stage_resolut
 
     assert plugin._ocr_reader_manager._should_use_aihong_two_stage(target) is True
     assert dialogue_profile.top_ratio == pytest.approx(0.61)
-    assert menu_profile.top_ratio == pytest.approx(0.40)
-    assert menu_profile.bottom_inset_ratio == pytest.approx(0.34)
+    assert menu_profile.top_ratio == pytest.approx(0.0)
+    assert menu_profile.bottom_inset_ratio == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -2848,6 +2854,65 @@ def test_auto_recalibrate_ocr_dialogue_profile_selects_best_candidate_and_return
     assert payload["sample_text"] == "这是自动校准命中的对白文本。"
 
 
+@pytest.mark.plugin_unit
+def test_auto_recalibrate_aihong_dialogue_profile_can_escape_stale_narrow_bucket(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=502,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=7102,
+        width=1040,
+        height=807,
+    )
+    expected_box = (0, 484, 1040, 766)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeImageCaptureBackend(size=(1040, 807)),
+        ocr_backend=_CropAwareOcrBackend(
+            lambda image: "王生：算了，没事。"
+            if getattr(image, "crop_box", None) == expected_box
+            else ""
+        ),
+    )
+    manager.update_capture_profiles(
+        {
+            "TheLamentingGeese.exe": {
+                "__window_buckets__": {
+                    "1040x807": {
+                        "width": 1040,
+                        "height": 807,
+                        "aspect_ratio": 1.2887,
+                        "stages": {
+                            "dialogue_stage": {
+                                "left_inset_ratio": 0.05,
+                                "right_inset_ratio": 0.24,
+                                "top_ratio": 0.69,
+                                "bottom_inset_ratio": 0.12,
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    )
+    manager._attached_window = target
+
+    payload = manager.auto_recalibrate_dialogue_profile()
+
+    assert payload["bucket_key"] == "1040x807"
+    assert payload["capture_profile"]["left_inset_ratio"] == pytest.approx(0.0)
+    assert payload["capture_profile"]["right_inset_ratio"] == pytest.approx(0.0)
+    assert payload["capture_profile"]["top_ratio"] == pytest.approx(0.60)
+    assert payload["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.05)
+    assert payload["sample_text"] == "王生：算了，没事。"
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_auto_recalibrate_ocr_dialogue_profile_persists_bucket_and_survives_restart(
@@ -3379,10 +3444,12 @@ async def test_ocr_reader_quick_followup_confirm_emits_line_without_waiting_next
         ),
     )
 
-    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
-    clock["now"] += 1.0
-    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
-    clock["now"] += 1.0
+    for _ in range(2):
+        await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        clock["now"] += 1.0
+    for _ in range(2):
+        await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        clock["now"] += 1.0
     await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
     clock["now"] += 1.0
     await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
@@ -3452,8 +3519,9 @@ async def test_aihong_menu_stage_requires_two_stable_short_menu_reads_before_cho
     events_before_confirm = _read_bridge_events(game_dir / "events.jsonl")
     assert all(event["type"] != "choices_shown" for event in events_before_confirm)
 
-    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
-    clock["now"] += 1.0
+    for _ in range(2):
+        await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        clock["now"] += 1.0
 
     session = read_session_json(game_dir / "session.json")
     events = _read_bridge_events(game_dir / "events.jsonl")
@@ -5183,7 +5251,7 @@ async def test_game_llm_agent_retries_dialogue_with_alternate_advance_strategy(
     fake_host.tasks["task-1"]["status"] = "completed"
     await agent.tick(shared)
     assert agent._actuation is not None
-    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 2.0
+    agent._actuation["bridge_wait_started_at"] = time.monotonic() - 6.0
 
     await agent.tick(shared)
     agent._next_actuation_at = 0.0
@@ -5221,7 +5289,7 @@ async def test_game_llm_agent_awaiting_bridge_accepts_meaningful_history_progres
     )
 
     await agent.tick(shared)
-    assert "click the usual continue area exactly once" in fake_host.started[-1]
+    assert "press Enter exactly once" in fake_host.started[-1]
     fake_host.tasks["task-1"]["status"] = "completed"
     await agent.tick(shared)
 
@@ -6014,6 +6082,78 @@ async def test_game_llm_agent_uses_safe_probe_when_ocr_has_no_text_yet(tmp_path:
     assert agent._actuation is not None
     assert agent._actuation["kind"] == "probe"
     assert agent._actuation["strategy_id"] == "probe_space"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_holds_after_repeated_ocr_advance_without_observed(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, Any]] = []
+
+    def _local_input(_shared: dict[str, Any], actuation: dict[str, Any]) -> dict[str, Any]:
+        local_calls.append(dict(actuation))
+        return {
+            "success": True,
+            "method": "virtual_mouse_dialogue_click",
+            "pid": 4242,
+            "hwnd": 101,
+        }
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_input,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="王生",
+            text="旧台词还停在画面上。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_lines=[],
+        history_events=[],
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={
+            "enabled": True,
+            "status": "active",
+            "detail": "receiving_observed_text",
+            "pid": 4242,
+        },
+    )
+
+    await agent.tick(shared)
+    assert len(local_calls) == 1
+
+    for expected_count in (1, 2, 3):
+        assert agent._actuation is not None
+        agent._actuation["bridge_wait_started_at"] = time.monotonic() - 10.0
+        await agent.tick(shared)
+        assert agent._ocr_no_observed_advance_count == expected_count
+        if expected_count < 3:
+            assert agent._pending_strategy is not None
+            agent._next_actuation_at = 0.0
+            await agent.tick(shared)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is None
+    assert "ocr_capture_diagnostic_required" in agent._ocr_capture_diagnostic
+    agent._next_actuation_at = 0.0
+    await agent.tick(shared)
+    assert len(local_calls) == 3
+
+    status = await agent.query_status(shared)
+    assert status["reason"] == "ocr_capture_diagnostic_required"
+    assert status["debug"]["ocr_capture_diagnostic_required"] is True
 
 
 @pytest.mark.asyncio

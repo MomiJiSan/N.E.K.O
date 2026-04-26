@@ -9,7 +9,7 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from uuid import uuid4
 
 from .models import (
@@ -110,10 +110,10 @@ _SELF_UI_GUARD_SUBSTRINGS = (
 _AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
 _AIHONG_TITLE_SUBSTRINGS = ("哀鸿", "aihong")
 _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET = {
-    "left_inset_ratio": 0.05,
-    "right_inset_ratio": 0.24,
-    "top_ratio": 0.73,
-    "bottom_inset_ratio": 0.10,
+    "left_inset_ratio": 0.0,
+    "right_inset_ratio": 0.0,
+    "top_ratio": 0.60,
+    "bottom_inset_ratio": 0.05,
 }
 _AIHONG_MENU_CAPTURE_PROFILE_PRESET = {
     "left_inset_ratio": 0.0,
@@ -1022,6 +1022,11 @@ class OcrReaderRuntime:
     candidate_count: int = 0
     excluded_candidate_count: int = 0
     last_exclude_reason: str = ""
+    consecutive_no_text_polls: int = 0
+    last_observed_at: str = ""
+    last_capture_profile: dict[str, float] = field(default_factory=dict)
+    last_capture_stage: str = ""
+    ocr_capture_diagnostic_required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1058,6 +1063,11 @@ class OcrReaderRuntime:
             "candidate_count": self.candidate_count,
             "excluded_candidate_count": self.excluded_candidate_count,
             "last_exclude_reason": self.last_exclude_reason,
+            "consecutive_no_text_polls": self.consecutive_no_text_polls,
+            "last_observed_at": self.last_observed_at,
+            "last_capture_profile": dict(self.last_capture_profile),
+            "last_capture_stage": self.last_capture_stage,
+            "ocr_capture_diagnostic_required": self.ocr_capture_diagnostic_required,
         }
 
 
@@ -1934,6 +1944,8 @@ class OcrReaderManager:
         self._last_excluded_windows: list[DetectedGameWindow] = []
         self._last_selection = WindowSelectionResult(manual_target=self._manual_target)
         self._advance_speed = ADVANCE_SPEED_MEDIUM
+        self._consecutive_no_text_polls = 0
+        self._last_observed_at = ""
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -1955,11 +1967,22 @@ class OcrReaderManager:
             return 3
         return 2
 
+    def _mark_observed_progress(self, *, now: float) -> None:
+        self._consecutive_no_text_polls = 0
+        self._last_observed_at = utc_now_iso(now)
+
+    def _mark_no_text_poll(self) -> None:
+        self._consecutive_no_text_polls += 1
+
+    def _ocr_capture_diagnostic_required(self) -> bool:
+        return self._consecutive_no_text_polls >= 3
+
     def update_capture_profiles(self, profiles: dict[str, dict[str, Any]]) -> None:
         self._capture_profiles = _parse_configured_capture_profiles(profiles, self._logger)
 
     def update_window_target(self, target: dict[str, Any] | None) -> None:
         self._manual_target = OcrWindowTarget.from_dict(target)
+        self._consecutive_no_text_polls = 0
         self._last_selection = WindowSelectionResult(
             selection_mode="manual" if self._manual_target.is_manual() else "auto",
             selection_detail="manual_target_active"
@@ -2065,6 +2088,11 @@ class OcrReaderManager:
         self._runtime.capture_profile = capture_profile_selection.profile.to_dict()
         self._runtime.capture_profile_match_source = capture_profile_selection.match_source
         self._runtime.capture_profile_bucket_key = capture_profile_selection.bucket_key
+        self._runtime.consecutive_no_text_polls = max(0, int(self._consecutive_no_text_polls or 0))
+        self._runtime.last_observed_at = str(self._last_observed_at or self._runtime.last_observed_at)
+        self._runtime.last_capture_stage = capture_stage
+        self._runtime.last_capture_profile = capture_profile_selection.profile.to_dict()
+        self._runtime.ocr_capture_diagnostic_required = self._ocr_capture_diagnostic_required()
         self._runtime.effective_window_key = str(target.window_key or self._runtime.effective_window_key)
         self._runtime.effective_window_title = str(target.title or self._runtime.effective_window_title)
         self._runtime.effective_process_name = str(
@@ -2155,18 +2183,43 @@ class OcrReaderManager:
             stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
         )
         base_profile = base_selection.profile
-        left, _top_unused, right, _bottom_unused = self._crop_box_for_profile_size(
-            width=image_width,
-            height=image_height,
-            profile=OcrCaptureProfile(
-                left_inset_ratio=base_profile.left_inset_ratio,
-                right_inset_ratio=base_profile.right_inset_ratio,
-                top_ratio=0.0,
-                bottom_inset_ratio=0.0,
-            ),
-        )
-        if right - left < 10:
-            raise ValueError("当前对白区横向裁剪过窄，无法自动重校准")
+        is_aihong_target = _matches_aihong_target(target)
+
+        def _append_ratio_values(values: list[float], additions: Iterable[float]) -> list[float]:
+            merged = list(values)
+            seen = {int(round(value * 100)) for value in merged}
+            for raw in additions:
+                normalized = round(max(0.0, min(float(raw), 0.98)), 2)
+                key = int(round(normalized * 100))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(normalized)
+            return sorted(merged)
+
+        horizontal_pairs: list[tuple[float, float]] = []
+
+        def _add_horizontal_pair(left_ratio: float, right_ratio: float) -> None:
+            left_ratio = round(max(0.0, min(float(left_ratio), 0.45)), 2)
+            right_ratio = round(max(0.0, min(float(right_ratio), 0.45)), 2)
+            if left_ratio + right_ratio >= 0.95:
+                return
+            pair = (left_ratio, right_ratio)
+            if pair not in horizontal_pairs:
+                horizontal_pairs.append(pair)
+
+        if is_aihong_target:
+            _add_horizontal_pair(0.0, 0.0)
+            _add_horizontal_pair(0.02, 0.02)
+            _add_horizontal_pair(0.05, 0.05)
+        _add_horizontal_pair(base_profile.left_inset_ratio, base_profile.right_inset_ratio)
+        if not is_aihong_target and (
+            base_profile.left_inset_ratio > 0.0 or base_profile.right_inset_ratio > 0.0
+        ):
+            _add_horizontal_pair(
+                max(0.0, base_profile.left_inset_ratio - 0.05),
+                max(0.0, base_profile.right_inset_ratio - 0.05),
+            )
 
         top_values = self._scan_ratio_values(
             base_profile.top_ratio,
@@ -2180,6 +2233,26 @@ class OcrReaderManager:
             delta_end=0.08,
             step=0.02,
         )
+        if is_aihong_target:
+            aihong_preset = OcrCaptureProfile.from_dict(_AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET)
+            top_values = _append_ratio_values(
+                top_values,
+                self._scan_ratio_values(
+                    aihong_preset.top_ratio,
+                    delta_start=-0.08,
+                    delta_end=0.08,
+                    step=0.02,
+                ),
+            )
+            bottom_values = _append_ratio_values(
+                bottom_values,
+                self._scan_ratio_values(
+                    aihong_preset.bottom_inset_ratio,
+                    delta_start=-0.05,
+                    delta_end=0.08,
+                    step=0.01,
+                ),
+            )
         backend_plan = None if self._custom_ocr_backend else self._resolve_backend_plan()
         if backend_plan is not None and not backend_plan.primary.available:
             raise ValueError("当前 OCR backend 不可用，无法自动重校准对白区")
@@ -2191,19 +2264,29 @@ class OcrReaderManager:
         )
         min_height = max(24, int(image_height * 0.08))
         max_height = max(min_height, int(image_height * 0.45))
-        visited_pairs: set[tuple[float, float]] = set()
+        visited_pairs: set[tuple[float, float, float, float]] = set()
 
-        def _consider_candidate(top_ratio: float, bottom_inset_ratio: float) -> None:
+        def _consider_candidate(
+            top_ratio: float,
+            bottom_inset_ratio: float,
+            left_inset_ratio: float,
+            right_inset_ratio: float,
+        ) -> None:
             nonlocal best_candidate
-            key = (round(top_ratio, 2), round(bottom_inset_ratio, 2))
+            key = (
+                round(top_ratio, 2),
+                round(bottom_inset_ratio, 2),
+                round(left_inset_ratio, 2),
+                round(right_inset_ratio, 2),
+            )
             if key in visited_pairs:
                 return
             visited_pairs.add(key)
-            if top_ratio + bottom_inset_ratio >= 1.0:
+            if top_ratio + bottom_inset_ratio >= 1.0 or left_inset_ratio + right_inset_ratio >= 1.0:
                 return
             candidate_profile = OcrCaptureProfile(
-                left_inset_ratio=base_profile.left_inset_ratio,
-                right_inset_ratio=base_profile.right_inset_ratio,
+                left_inset_ratio=left_inset_ratio,
+                right_inset_ratio=right_inset_ratio,
                 top_ratio=top_ratio,
                 bottom_inset_ratio=bottom_inset_ratio,
             )
@@ -2230,6 +2313,7 @@ class OcrReaderManager:
             distance = abs(round(top_ratio, 2) - current_distance_basis[0]) + abs(
                 round(bottom_inset_ratio, 2) - current_distance_basis[1]
             )
+            width_ratio = max(0.0, 1.0 - left_inset_ratio - right_inset_ratio)
             candidate = {
                 "profile": candidate_profile,
                 "sample_text": sample_text,
@@ -2237,6 +2321,7 @@ class OcrReaderManager:
                 "cjk_count": cjk_count,
                 "significant_chars": significant_chars,
                 "distance": distance,
+                "width_ratio": width_ratio,
             }
             if best_candidate is None:
                 best_candidate = candidate
@@ -2259,7 +2344,13 @@ class OcrReaderManager:
                         best_candidate["cjk_count"],
                         best_candidate["significant_chars"],
                     )
-                    and candidate["distance"] < best_candidate["distance"]
+                    and (
+                        candidate["width_ratio"] > best_candidate["width_ratio"]
+                        or (
+                            candidate["width_ratio"] == best_candidate["width_ratio"]
+                            and candidate["distance"] < best_candidate["distance"]
+                        )
+                    )
                 )
             ):
                 best_candidate = candidate
@@ -2274,7 +2365,13 @@ class OcrReaderManager:
 
         for top_ratio in top_values:
             for bottom_inset_ratio in preferred_bottom_values:
-                _consider_candidate(top_ratio, bottom_inset_ratio)
+                for left_inset_ratio, right_inset_ratio in horizontal_pairs:
+                    _consider_candidate(
+                        top_ratio,
+                        bottom_inset_ratio,
+                        left_inset_ratio,
+                        right_inset_ratio,
+                    )
 
         if best_candidate is not None:
             refine_top_values: list[float] = []
@@ -2285,11 +2382,23 @@ class OcrReaderManager:
                     refine_top_values.append(candidate_value)
             for top_ratio in refine_top_values:
                 for bottom_inset_ratio in bottom_values:
-                    _consider_candidate(top_ratio, bottom_inset_ratio)
+                    for left_inset_ratio, right_inset_ratio in horizontal_pairs:
+                        _consider_candidate(
+                            top_ratio,
+                            bottom_inset_ratio,
+                            left_inset_ratio,
+                            right_inset_ratio,
+                        )
         else:
             for top_ratio in top_values:
                 for bottom_inset_ratio in bottom_values:
-                    _consider_candidate(top_ratio, bottom_inset_ratio)
+                    for left_inset_ratio, right_inset_ratio in horizontal_pairs:
+                        _consider_candidate(
+                            top_ratio,
+                            bottom_inset_ratio,
+                            left_inset_ratio,
+                            right_inset_ratio,
+                        )
 
         if best_candidate is None:
             raise ValueError("自动重校准失败：请先停在稳定对白界面再重试")
@@ -2321,6 +2430,7 @@ class OcrReaderManager:
 
     def _reset_default_ocr_state(self) -> None:
         self._default_ocr_state.reset()
+        self._consecutive_no_text_polls = 0
 
     def _reset_aihong_menu_state(self) -> None:
         self._aihong_menu_ocr_state.reset()
@@ -2668,13 +2778,18 @@ class OcrReaderManager:
         backend_detail_override = ""
         runtime_profile = profile
         runtime_capture_profile_selection = capture_profile_selection
+        event_seq_before_capture = int(self._writer.last_seq or 0)
+        capture_attempted = False
+        capture_completed = False
         try:
+            capture_attempted = True
             extraction = await asyncio.to_thread(
                 self._capture_and_extract_text,
                 target,
                 profile,
                 backend_plan,
             )
+            capture_completed = True
             active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
             backend_detail_override = extraction.backend_detail
             result.warnings.extend(extraction.warnings)
@@ -2899,16 +3014,43 @@ class OcrReaderManager:
 
         status = self._runtime.status
         detail = self._runtime.detail
+        observed_or_stable_emitted = int(self._writer.last_seq or 0) > event_seq_before_capture
 
         if emitted:
             result.should_rescan = True
+            self._mark_observed_progress(now=now)
             self._last_heartbeat_at = now
             status = "active"
             detail = "receiving_text"
+        elif observed_or_stable_emitted:
+            result.should_rescan = True
+            self._mark_observed_progress(now=now)
+            self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            detail = "receiving_observed_text"
         elif guard_blocked:
             if status == "starting":
                 status = "active"
             detail = "self_ui_guard_blocked"
+        elif capture_completed:
+            self._mark_no_text_poll()
+            if self._writer.session_id and now - self._last_heartbeat_at >= float(
+                self._config.ocr_reader_poll_interval_seconds
+            ):
+                if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+                    result.should_rescan = True
+                    self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            detail = (
+                "ocr_capture_diagnostic_required"
+                if self._ocr_capture_diagnostic_required()
+                else "attached_no_text_yet"
+            )
+        elif capture_attempted:
+            if status == "starting":
+                detail = "starting_capture"
         elif self._writer.session_id and now - self._last_heartbeat_at >= float(
             self._config.ocr_reader_poll_interval_seconds
         ):
@@ -3208,6 +3350,11 @@ class OcrReaderManager:
             candidate_count=max(0, int(selection_state.candidate_count or 0)),
             excluded_candidate_count=max(0, int(selection_state.excluded_candidate_count or 0)),
             last_exclude_reason=str(selection_state.last_exclude_reason or self._runtime.last_exclude_reason),
+            consecutive_no_text_polls=max(0, int(self._consecutive_no_text_polls or 0)),
+            last_observed_at=str(self._last_observed_at or self._runtime.last_observed_at),
+            last_capture_profile=dict(capture_profile or self._runtime.capture_profile),
+            last_capture_stage=str(capture_stage or self._runtime.capture_stage),
+            ocr_capture_diagnostic_required=self._ocr_capture_diagnostic_required(),
         )
 
     def _extract_text_from_image(
@@ -3246,7 +3393,17 @@ class OcrReaderManager:
             try:
                 extract_with_boxes = getattr(descriptor.backend, "extract_text_with_boxes", None)
                 if callable(extract_with_boxes):
-                    text, boxes = extract_with_boxes(image)
+                    try:
+                        text, boxes = extract_with_boxes(image)
+                    except Exception as boxes_exc:
+                        extract_text = getattr(descriptor.backend, "extract_text", None)
+                        if not callable(extract_text):
+                            raise
+                        warnings.append(
+                            f"ocr_reader {descriptor.kind} boxes unavailable: {boxes_exc}"
+                        )
+                        text = extract_text(image)
+                        boxes = []
                 else:
                     text = descriptor.backend.extract_text(image)
                     boxes = []

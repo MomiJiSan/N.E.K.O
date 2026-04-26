@@ -492,10 +492,10 @@ async def test_ocr_reader_manager_applies_builtin_aihong_capture_profile(tmp_pat
         memory_reader_runtime={},
     )
 
-    assert result.runtime["capture_profile"]["left_inset_ratio"] == pytest.approx(0.05)
-    assert result.runtime["capture_profile"]["right_inset_ratio"] == pytest.approx(0.24)
-    assert result.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.73)
-    assert result.runtime["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.10)
+    assert result.runtime["capture_profile"]["left_inset_ratio"] == pytest.approx(0.0)
+    assert result.runtime["capture_profile"]["right_inset_ratio"] == pytest.approx(0.0)
+    assert result.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.60)
+    assert result.runtime["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.05)
 
 
 @pytest.mark.asyncio
@@ -603,16 +603,16 @@ async def test_aihong_menu_stage_accepts_plain_text_choices_after_dialogue_idle_
     events = _read_events(bridge_root / writer.game_id / "events.jsonl")
     session = read_session_json(bridge_root / writer.game_id / "session.json").session
 
-    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.58)
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.0)
     assert events[-1]["type"] == "choices_shown"
     payload = events[-1]["payload"]
     assert [item["text"] for item in payload["choices"]] == ["往南跑", "躲进巷子里"]
     assert session is not None
     assert session["state"]["is_menu_open"] is True
-    assert capture_backend.capture_calls[0][1]["top_ratio"] == pytest.approx(0.73)
-    assert capture_backend.capture_calls[0][1]["right_inset_ratio"] == pytest.approx(0.24)
-    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.58)
-    assert capture_backend.capture_calls[-1][1]["bottom_inset_ratio"] == pytest.approx(0.16)
+    assert capture_backend.capture_calls[0][1]["top_ratio"] == pytest.approx(0.60)
+    assert capture_backend.capture_calls[0][1]["right_inset_ratio"] == pytest.approx(0.0)
+    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.0)
+    assert capture_backend.capture_calls[-1][1]["bottom_inset_ratio"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -673,11 +673,11 @@ async def test_aihong_menu_probe_rejects_dialogue_like_multiline_text(
     session = read_session_json(bridge_root / writer.game_id / "session.json").session
 
     assert all(event["type"] != "choices_shown" for event in events)
-    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.73)
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.60)
     assert session is not None
     assert session["state"]["is_menu_open"] is False
-    assert capture_backend.capture_calls[4][1]["top_ratio"] == pytest.approx(0.58)
-    assert capture_backend.capture_calls[6][1]["top_ratio"] == pytest.approx(0.58)
+    assert capture_backend.capture_calls[4][1]["top_ratio"] == pytest.approx(0.0)
+    assert capture_backend.capture_calls[6][1]["top_ratio"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -740,12 +740,12 @@ async def test_aihong_menu_stage_returns_to_dialogue_profile_after_stable_line(
     session = read_session_json(bridge_root / writer.game_id / "session.json").session
 
     assert events[-1]["type"] == "line_changed"
-    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.73)
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.60)
     assert session is not None
     assert session["state"]["text"] == "跟我来。"
     assert session["state"]["is_menu_open"] is False
-    assert capture_backend.capture_calls[-2][1]["top_ratio"] == pytest.approx(0.58)
-    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.73)
+    assert capture_backend.capture_calls[-2][1]["top_ratio"] == pytest.approx(0.0)
+    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.60)
 
 
 @pytest.mark.asyncio
@@ -795,7 +795,10 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
 
     assert first.runtime["status"] == "starting"
     assert first.runtime["detail"] == "starting_capture"
-    assert second.runtime["status"] == "starting"
+    assert second.runtime["status"] == "active"
+    assert second.runtime["detail"] == "receiving_observed_text"
+    assert second.runtime["consecutive_no_text_polls"] == 0
+    assert second.runtime["last_observed_at"]
     assert third.runtime["status"] == "active"
     assert third.runtime["detail"] == "receiving_text"
     assert third.runtime["game_id"].startswith("ocr-")
@@ -805,6 +808,48 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
     assert session["state"]["scene_id"] == "ocr:unknown_scene"
     assert str(session["state"]["line_id"]).startswith("ocr:")
     assert session["state"]["text"] == "你好。"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_reports_capture_diagnostic_after_repeated_no_text(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 1200.0}
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["", "", ""]),
+    )
+
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    second = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    third = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    fourth = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert second.runtime["detail"] == "attached_no_text_yet"
+    assert second.runtime["consecutive_no_text_polls"] == 1
+    assert third.runtime["consecutive_no_text_polls"] == 2
+    assert fourth.runtime["detail"] == "ocr_capture_diagnostic_required"
+    assert fourth.runtime["consecutive_no_text_polls"] == 3
+    assert fourth.runtime["ocr_capture_diagnostic_required"] is True
+    assert fourth.runtime["last_capture_stage"]
+    assert fourth.runtime["last_capture_profile"]
 
 
 @pytest.mark.asyncio

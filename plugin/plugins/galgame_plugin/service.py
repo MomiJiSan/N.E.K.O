@@ -783,6 +783,22 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         install_target_dir_raw=config.ocr_reader_install_target_dir,
         languages=config.ocr_reader_languages,
     )
+    ocr_runtime = json_copy(state.ocr_reader_runtime)
+    ocr_capture_diagnostic_required = bool(
+        isinstance(ocr_runtime, dict)
+        and (
+            ocr_runtime.get("ocr_capture_diagnostic_required")
+            or str(ocr_runtime.get("detail") or "") == "ocr_capture_diagnostic_required"
+        )
+    )
+    ocr_capture_diagnostic = ""
+    if ocr_capture_diagnostic_required and isinstance(ocr_runtime, dict):
+        ocr_capture_diagnostic = (
+            "OCR 连续未读到有效对白，请检查截图区、目标窗口或当前画面是否为普通对白。"
+            f" stage={ocr_runtime.get('capture_stage') or ''}"
+            f" profile={ocr_runtime.get('capture_profile') or {}}"
+            f" target={ocr_runtime.get('effective_process_name') or ocr_runtime.get('process_name') or ''}"
+        )
     return {
         "connection_state": state.current_connection_state,
         "mode": state.mode,
@@ -796,7 +812,9 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "last_seq": state.last_seq,
         "last_error": json_copy(state.last_error),
         "memory_reader_runtime": json_copy(state.memory_reader_runtime),
-        "ocr_reader_runtime": json_copy(state.ocr_reader_runtime),
+        "ocr_reader_runtime": ocr_runtime,
+        "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
+        "ocr_capture_diagnostic": ocr_capture_diagnostic,
         "ocr_capture_profiles": json_copy(state.ocr_capture_profiles),
         "summary": summarize_status(
             connection_state=state.current_connection_state,

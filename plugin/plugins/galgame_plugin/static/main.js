@@ -350,6 +350,67 @@ function buildExplainFallback(lineId = '', diagnostic = 'missing line_id') {
   };
 }
 
+function buildOcrMissingLineDiagnostic(status = {}) {
+  const runtime = status.ocr_reader_runtime || {};
+  const rapidocr = status.rapidocr || {};
+  const parts = [
+    status.ocr_capture_diagnostic_required
+      ? 'OCR 截图区/窗口目标可能异常'
+      : 'OCR 尚未读到可解释台词',
+  ];
+  if (status.ocr_capture_diagnostic) {
+    parts.push(status.ocr_capture_diagnostic);
+  }
+  if (runtime.status) {
+    parts.push(`status=${runtime.status}`);
+  }
+  if (runtime.detail) {
+    parts.push(`detail=${runtime.detail}`);
+  }
+  if (runtime.backend_kind) {
+    parts.push(`backend=${runtime.backend_kind}`);
+  }
+  if (runtime.backend_detail) {
+    parts.push(`backend_detail=${runtime.backend_detail}`);
+  }
+  if (rapidocr.detail && rapidocr.detail !== 'installed') {
+    parts.push(`rapidocr=${rapidocr.detail}`);
+  }
+  if (runtime.capture_stage) {
+    parts.push(`stage=${runtime.capture_stage}`);
+  }
+  if (runtime.capture_profile) {
+    parts.push(`capture=${formatCaptureProfile(runtime.capture_profile)}`);
+  }
+  if (runtime.consecutive_no_text_polls) {
+    parts.push(`no_text_polls=${runtime.consecutive_no_text_polls}`);
+  }
+  if (runtime.last_observed_at) {
+    parts.push(`last_observed_at=${runtime.last_observed_at}`);
+  }
+  return parts.join(' | ');
+}
+
+function lineKey(item = {}) {
+  return `${item.line_id || ''}::${item.text || ''}`;
+}
+
+function mergedHistoryLines(history = {}) {
+  const merged = new Map();
+  (history.observed_lines || []).forEach((item) => {
+    merged.set(lineKey(item), { ...item, stability: item.stability || 'tentative' });
+  });
+  (history.stable_lines || []).forEach((item) => {
+    merged.set(lineKey(item), { ...item, stability: item.stability || 'stable' });
+  });
+  return Array.from(merged.values());
+}
+
+function latestHistoryLine(history = {}) {
+  const lines = mergedHistoryLines(history);
+  return lines.length ? lines[lines.length - 1] : null;
+}
+
 function buildSummaryFallback(sceneId = '', diagnostic = 'missing scene_id') {
   return {
     degraded: true,
@@ -990,6 +1051,8 @@ function renderStatus(status) {
     { label: 'ocr_reader_enabled', value: String(Boolean(status.ocr_reader_enabled)) },
     { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
     { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
+    { label: 'ocr_capture_diagnostic_required', value: String(Boolean(status.ocr_capture_diagnostic_required)) },
+    { label: 'ocr_capture_diagnostic', value: status.ocr_capture_diagnostic || '' },
     { label: 'ocr_reader_target', value: ocrTarget || '' },
     { label: 'ocr_backend_kind', value: ocrRuntime.backend_kind || '' },
     { label: 'ocr_backend_detail', value: ocrRuntime.backend_detail || '' },
@@ -1077,6 +1140,9 @@ function buildStatusSummaryText(status) {
   if (warningMessage) {
     parts.push(`告警：${warningMessage}`);
   }
+  if (status.ocr_capture_diagnostic_required) {
+    parts.push('OCR诊断：截图区/窗口目标可能异常');
+  }
 
   return `${prefix}｜${parts.join('｜')}`;
 }
@@ -1103,6 +1169,11 @@ function renderOcrRuntime(status) {
       value: OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH[runtime.capture_profile_match_source] || runtime.capture_profile_match_source || '',
     },
     { label: 'capture_profile_bucket_key', value: runtime.capture_profile_bucket_key || '' },
+    { label: 'consecutive_no_text_polls', value: String(runtime.consecutive_no_text_polls || 0) },
+    { label: 'last_observed_at', value: runtime.last_observed_at || '' },
+    { label: 'last_capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[runtime.last_capture_stage] || runtime.last_capture_stage || '' },
+    { label: 'last_capture_profile', value: formatCaptureProfile(runtime.last_capture_profile) || '' },
+    { label: 'ocr_capture_diagnostic_required', value: String(Boolean(runtime.ocr_capture_diagnostic_required)) },
     { label: 'backend_kind', value: runtime.backend_kind || '' },
     { label: 'backend_detail', value: runtime.backend_detail || '' },
     { label: 'backend_path', value: runtime.backend_path || '' },
@@ -1645,6 +1716,7 @@ function renderSnapshot(snapshot) {
     { label: 'session_id', value: snapshot.session_id || '' },
     { label: 'speaker', value: state.speaker || '' },
     { label: 'text', value: state.text || '' },
+    { label: 'stability', value: state.stability || '' },
     { label: 'scene_id', value: state.scene_id || '' },
     { label: 'line_id', value: state.line_id || '' },
     { label: 'route_id', value: state.route_id || '' },
@@ -1655,9 +1727,9 @@ function renderSnapshot(snapshot) {
 }
 
 function renderHistory(history) {
-  renderStackList('linesList', history.stable_lines || [], (item) => `
+  renderStackList('linesList', mergedHistoryLines(history), (item) => `
     <article class="list-card">
-      <p class="list-kicker">${escapeHtml(item.speaker || '旁白')} · ${escapeHtml(item.scene_id || '')}</p>
+      <p class="list-kicker">${escapeHtml(item.speaker || '旁白')} · ${escapeHtml(item.scene_id || '')} · ${escapeHtml(item.stability || '')}</p>
       <h3>${escapeHtml(item.line_id || '')}</h3>
       <p>${escapeHtml(item.text || '')}</p>
     </article>
@@ -1825,10 +1897,11 @@ function renderSuggest(payload) {
   `;
 }
 
-async function refreshInsights(snapshot, { force = false } = {}) {
+async function refreshInsights(snapshot, { force = false, history = {}, status = {} } = {}) {
   const state = snapshot.snapshot || {};
-  const currentLineId = state.line_id || '';
-  const currentSceneId = state.scene_id || '';
+  const fallbackLine = latestHistoryLine(history) || {};
+  const currentLineId = state.line_id || fallbackLine.line_id || '';
+  const currentSceneId = state.scene_id || fallbackLine.scene_id || '';
   const choices = Array.isArray(state.choices) ? state.choices : [];
   const hasChoices = Boolean(state.is_menu_open) && choices.length > 0;
   const explainKey = currentLineId || 'missing-line';
@@ -1845,7 +1918,7 @@ async function refreshInsights(snapshot, { force = false } = {}) {
         buildExplainFallback(currentLineId),
       )
       : Promise.resolve(latestInsights.explainPayload)
-    : Promise.resolve(buildExplainFallback('', 'missing line_id'));
+    : Promise.resolve(buildExplainFallback('', buildOcrMissingLineDiagnostic(status)));
 
   const summaryPromise = currentSceneId
     ? (force || latestInsights.summaryKey !== summaryKey || !latestInsights.summaryPayload)
@@ -1931,7 +2004,7 @@ async function refreshAll(options = {}) {
       renderSnapshot(snapshot);
       renderHistory(history);
       renderAgentStatus(agentStatus);
-      await refreshInsights(snapshot, { force: forceInsights });
+      await refreshInsights(snapshot, { force: forceInsights, history, status });
     } catch (error) {
       renderPluginUnavailable(error);
       if (silent) {

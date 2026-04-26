@@ -898,9 +898,13 @@ class GalgamePlugin(NekoPluginBase):
 
         if self._ocr_reader_manager is not None:
             self._ocr_reader_manager.update_config(self._cfg)
-            self._ocr_reader_manager.update_advance_speed(
-                str(local.get("advance_speed") or ADVANCE_SPEED_MEDIUM)
+            update_advance_speed = getattr(
+                self._ocr_reader_manager,
+                "update_advance_speed",
+                None,
             )
+            if callable(update_advance_speed):
+                update_advance_speed(str(local.get("advance_speed") or ADVANCE_SPEED_MEDIUM))
             try:
                 ocr_reader_tick = await self._ocr_reader_manager.tick(
                     bridge_sdk_available=bridge_sdk_available,
