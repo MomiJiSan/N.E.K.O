@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import threading
 import time
 from typing import Any
@@ -21,6 +22,7 @@ from .host_agent_adapter import HostAgentAdapter
 from .llm_gateway import LLMGateway
 from .memory_reader import MemoryReaderManager
 from .ocr_reader import OcrReaderManager
+from .dxcam_support import install_dxcam
 from .models import (
     ADVANCE_SPEEDS,
     ADVANCE_SPEED_MEDIUM,
@@ -98,6 +100,29 @@ def _format_install_entry_error(label: str, exc: Exception) -> str:
     if message.startswith(prefix):
         return message
     return f"{prefix}：{message}"
+
+
+_PLUGIN_TOML_PATH = Path(__file__).with_name("plugin.toml")
+_OCR_BACKEND_SELECTIONS = {"auto", "rapidocr", "tesseract"}
+_OCR_CAPTURE_BACKEND_SELECTIONS = {"auto", "dxcam", "imagegrab", "printwindow"}
+_BACKGROUND_BRIDGE_POLL_MIN_STALE_SECONDS = 45.0
+
+
+def _replace_toml_section_value(text: str, *, section: str, key: str, value: str) -> str:
+    lines = text.splitlines()
+    in_section = False
+    section_header = f"[{section}]"
+    replacement = f'{key} = "{value}"'
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == section_header
+            continue
+        if in_section and stripped.startswith(f"{key}"):
+            prefix = line[: len(line) - len(line.lstrip())]
+            lines[index] = f"{prefix}{replacement}"
+            return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    raise ValueError(f"plugin.toml missing [{section}].{key}")
 
 
 def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
@@ -247,6 +272,7 @@ class GalgamePlugin(NekoPluginBase):
         self._textractor_install_lock = threading.Lock()
         self._tesseract_install_lock = threading.Lock()
         self._rapidocr_install_lock = threading.Lock()
+        self._dxcam_install_lock = threading.Lock()
         self._cfg = None
         self._state = build_initial_state(
             mode=MODE_COMPANION,
@@ -514,12 +540,27 @@ class GalgamePlugin(NekoPluginBase):
             if poll_running and self._bridge_poll_started_at > 0.0
             else 0.0
         )
+        with self._state_lock:
+            next_poll_at = float(self._state.next_poll_at_monotonic or 0.0)
+        next_poll_in_seconds = max(0.0, next_poll_at - now) if next_poll_at > 0.0 else 0.0
         return {
             "bridge_poll_running": poll_running,
             "bridge_poll_inflight_seconds": inflight_seconds,
             "last_bridge_poll_duration_seconds": self._last_bridge_poll_duration_seconds,
+            "next_bridge_poll_in_seconds": next_poll_in_seconds,
             "last_agent_tick_at": self._last_agent_tick_at,
         }
+
+    def _background_bridge_poll_stale_timeout_seconds(self) -> float:
+        if self._cfg is None:
+            return _BACKGROUND_BRIDGE_POLL_MIN_STALE_SECONDS
+        interval = max(
+            float(self._cfg.active_poll_interval_seconds),
+            float(self._cfg.idle_poll_interval_seconds),
+            float(self._cfg.ocr_reader_poll_interval_seconds),
+            1.0,
+        )
+        return max(_BACKGROUND_BRIDGE_POLL_MIN_STALE_SECONDS, interval * 12.0)
 
     def _add_bridge_poll_debug_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
@@ -544,6 +585,22 @@ class GalgamePlugin(NekoPluginBase):
             return False
         if self._bridge_poll_task is not None:
             if not self._bridge_poll_task.done():
+                inflight_seconds = max(
+                    0.0,
+                    time.monotonic() - float(self._bridge_poll_started_at or 0.0),
+                )
+                if inflight_seconds >= self._background_bridge_poll_stale_timeout_seconds():
+                    self._record_error(
+                        make_error(
+                            (
+                                "bridge background poll timed out; canceling stale OCR poll "
+                                f"after {inflight_seconds:.1f}s"
+                            ),
+                            source="bridge_reader",
+                            kind="warning",
+                        )
+                    )
+                    self._bridge_poll_task.cancel()
                 return False
             self._bridge_poll_task = None
         self._bridge_poll_started_at = time.monotonic()
@@ -557,6 +614,8 @@ class GalgamePlugin(NekoPluginBase):
         try:
             await self._poll_bridge(force=False)
         except Exception as exc:
+            with self._state_lock:
+                self._state.next_poll_at_monotonic = 0.0
             self._record_error(
                 make_error(
                     f"bridge background poll failed: {exc}",
@@ -599,6 +658,29 @@ class GalgamePlugin(NekoPluginBase):
             push_notifications=push_notifications,
             advance_speed=advance_speed,
         )
+
+    def _persist_ocr_backend_selection(
+        self,
+        *,
+        backend_selection: str | None,
+        capture_backend: str | None,
+    ) -> None:
+        text = _PLUGIN_TOML_PATH.read_text(encoding="utf-8")
+        if backend_selection is not None:
+            text = _replace_toml_section_value(
+                text,
+                section="ocr_reader",
+                key="backend_selection",
+                value=backend_selection,
+            )
+        if capture_backend is not None:
+            text = _replace_toml_section_value(
+                text,
+                section="ocr_reader",
+                key="capture_backend",
+                value=capture_backend,
+            )
+        _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
 
     def _persist_runtime_state(self, payload: dict[str, Any]) -> None:
         self._persist.persist_runtime(
@@ -658,6 +740,16 @@ class GalgamePlugin(NekoPluginBase):
                 "ocr_reader_enabled": False,
                 "ocr_reader_runtime": {},
                 "ocr_capture_profiles": {},
+                "dxcam": {
+                    "install_supported": False,
+                    "installed": False,
+                    "can_install": False,
+                    "detected_path": "",
+                    "package_name": "dxcam",
+                    "target_dir": "",
+                    "detail": "config_not_loaded",
+                    "runtime_error": "",
+                },
                 "rapidocr_enabled": False,
                 "rapidocr": {
                     "install_supported": False,
@@ -943,7 +1035,17 @@ class GalgamePlugin(NekoPluginBase):
 
         now_monotonic = time.monotonic()
         local = self._snapshot_state()
-        if not force and now_monotonic < float(local["next_poll_at_monotonic"]):
+        next_poll_at = float(local["next_poll_at_monotonic"])
+        max_reasonable_interval = max(
+            float(self._cfg.active_poll_interval_seconds),
+            float(self._cfg.idle_poll_interval_seconds),
+            float(self._cfg.ocr_reader_poll_interval_seconds),
+            1.0,
+        ) * 5.0
+        if not force and next_poll_at > now_monotonic + max_reasonable_interval:
+            local["next_poll_at_monotonic"] = 0.0
+            next_poll_at = 0.0
+        if not force and now_monotonic < next_poll_at:
             return
 
         warnings: list[str] = []
@@ -1396,6 +1498,47 @@ class GalgamePlugin(NekoPluginBase):
             self._rapidocr_install_lock.release()
 
     @plugin_entry(
+        id="galgame_install_dxcam",
+        name="安装 DXcam",
+        description="检测并安装 DXcam 截图依赖，随后刷新 galgame_plugin 的 OCR 截图后端状态。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+            },
+        },
+        timeout=180.0,
+        llm_result_fields=["summary"],
+    )
+    async def galgame_install_dxcam(self, force: bool = False, **_):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
+        if not self._dxcam_install_lock.acquire(blocking=False):
+            return Err(SdkError("DXcam install is already in progress"))
+        current_run_id = self._resolve_current_run_id()
+        progress_callback = self._resolve_install_progress_callback(current_run_id)
+        try:
+            install_result = await install_dxcam(
+                logger=self.logger,
+                timeout_seconds=self._cfg.ocr_reader_install_timeout_seconds,
+                force=bool(force),
+                task_id=current_run_id or None,
+                progress_callback=progress_callback,
+            )
+            await self._poll_bridge(force=True)
+            return Ok(
+                {
+                    "summary": str(install_result.get("summary") or "DXcam 安装完成"),
+                    "install_result": install_result,
+                    "status": await self._build_status_payload_async(),
+                }
+            )
+        except Exception as exc:
+            return Err(SdkError(_format_install_entry_error("DXcam", exc)))
+        finally:
+            self._dxcam_install_lock.release()
+
+    @plugin_entry(
         id="galgame_get_snapshot",
         name="获取 galgame 快照",
         description="返回当前游戏快照和 stale 状态。",
@@ -1491,6 +1634,87 @@ class GalgamePlugin(NekoPluginBase):
                 payload["agent"] = json_copy(agent_payload)
             except Exception as exc:
                 payload["agent_warning"] = f"apply_mode_change failed: {exc}"
+        return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_set_ocr_backend",
+        name="设置 OCR / 截图后端",
+        description="切换 OCR 文本识别后端和截图后端。只影响 OCR 读取，不改变 Agent 点击安全策略。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "backend_selection": {
+                    "type": "string",
+                    "enum": sorted(_OCR_BACKEND_SELECTIONS),
+                },
+                "capture_backend": {
+                    "type": "string",
+                    "enum": sorted(_OCR_CAPTURE_BACKEND_SELECTIONS),
+                },
+            },
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_set_ocr_backend(
+        self,
+        backend_selection: str | None = None,
+        capture_backend: str | None = None,
+        **_,
+    ):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
+        normalized_backend = str(backend_selection or "").strip().lower() or None
+        normalized_capture = str(capture_backend or "").strip().lower() or None
+        if normalized_backend is None and normalized_capture is None:
+            return Err(SdkError("backend_selection or capture_backend is required"))
+        if normalized_backend is not None and normalized_backend not in _OCR_BACKEND_SELECTIONS:
+            return Err(SdkError(f"invalid OCR backend: {backend_selection!r}"))
+        if normalized_capture is not None and normalized_capture not in _OCR_CAPTURE_BACKEND_SELECTIONS:
+            return Err(SdkError(f"invalid OCR capture backend: {capture_backend!r}"))
+
+        old_backend = self._cfg.ocr_reader_backend_selection
+        old_capture = self._cfg.ocr_reader_capture_backend
+        if normalized_backend is not None:
+            self._cfg.ocr_reader_backend_selection = normalized_backend
+        if normalized_capture is not None:
+            self._cfg.ocr_reader_capture_backend = normalized_capture
+        if self._ocr_reader_manager is not None:
+            try:
+                self._ocr_reader_manager.update_config(self._cfg)
+            except Exception as exc:
+                if normalized_backend is not None:
+                    self._cfg.ocr_reader_backend_selection = old_backend
+                if normalized_capture is not None:
+                    self._cfg.ocr_reader_capture_backend = old_capture
+                return Err(SdkError(f"apply OCR backend failed: {exc}"))
+
+        with self._state_lock:
+            self._state.next_poll_at_monotonic = 0.0
+
+        try:
+            self._persist_ocr_backend_selection(
+                backend_selection=normalized_backend,
+                capture_backend=normalized_capture,
+            )
+        except Exception as exc:
+            self._cfg.ocr_reader_backend_selection = old_backend
+            self._cfg.ocr_reader_capture_backend = old_capture
+            if self._ocr_reader_manager is not None:
+                try:
+                    self._ocr_reader_manager.update_config(self._cfg)
+                except Exception:
+                    pass
+            return Err(SdkError(f"persist OCR backend failed: {exc}"))
+
+        self._start_background_bridge_poll()
+        payload = {
+            "backend_selection": self._cfg.ocr_reader_backend_selection,
+            "capture_backend": self._cfg.ocr_reader_capture_backend,
+            "summary": (
+                f"OCR backend={self._cfg.ocr_reader_backend_selection} "
+                f"capture_backend={self._cfg.ocr_reader_capture_backend}"
+            ),
+        }
         return Ok(payload)
 
     @plugin_entry(

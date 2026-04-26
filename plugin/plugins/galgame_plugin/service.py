@@ -31,6 +31,7 @@ from .models import (
     sanitize_save_context,
     sanitize_snapshot_state,
 )
+from .dxcam_support import inspect_dxcam_installation
 from .reader import expand_bridge_root, normalize_text, read_session_json
 from .rapidocr_support import (
     DEFAULT_RAPIDOCR_ENGINE_TYPE,
@@ -778,6 +779,7 @@ def rebuild_histories_from_events(
 
 
 def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
+    dxcam = inspect_dxcam_installation()
     textractor = inspect_textractor_installation(
         configured_path=config.memory_reader_textractor_path,
         install_target_dir_raw=config.memory_reader_install_target_dir,
@@ -850,7 +852,10 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "phase": "phase_1",
         "memory_reader_enabled": config.memory_reader_enabled,
         "ocr_reader_enabled": config.ocr_reader_enabled,
+        "ocr_backend_selection": config.ocr_reader_backend_selection,
+        "ocr_capture_backend_selection": config.ocr_reader_capture_backend,
         "rapidocr_enabled": config.rapidocr_enabled,
+        "dxcam": dxcam,
         "rapidocr": rapidocr,
         "textractor": textractor,
         "tesseract": tesseract,

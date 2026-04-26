@@ -2,6 +2,7 @@ const PLUGIN_ID = 'galgame_plugin';
 const RUNS_URL = '/runs';
 const UI_API_BASE = `/plugin/${PLUGIN_ID}/ui-api`;
 const RAPIDOCR_INSTALL_URL = `${UI_API_BASE}/rapidocr/install`;
+const DXCAM_INSTALL_URL = `${UI_API_BASE}/dxcam/install`;
 const TESSERACT_INSTALL_URL = `${UI_API_BASE}/tesseract/install`;
 const TEXTRACTOR_INSTALL_URL = `${UI_API_BASE}/textractor/install`;
 const INSTALL_TERMINAL_STATUSES = new Set(['completed', 'failed', 'canceled']);
@@ -19,6 +20,19 @@ const INSTALL_UI = {
     queuedFlash: '已创建后台安装任务，接下来会安装插件隔离的 RapidOCR 运行时，并通过 SSE 推送实时进度。',
     successFlash: 'RapidOCR 安装完成',
     failureFlash: 'RapidOCR 安装失败',
+  },
+  dxcam: {
+    kind: 'dxcam',
+    label: 'DXcam',
+    url: DXCAM_INSTALL_URL,
+    storageKey: `${PLUGIN_ID}:dxcam_install_task_id`,
+    domPrefix: 'dxcam',
+    actionText: '一键安装 DXcam',
+    retryText: '重试安装 DXcam',
+    runningText: '后台安装中...',
+    queuedFlash: '已创建后台安装任务，接下来会安装 DXcam 截图依赖，并通过 SSE 推送实时进度。',
+    successFlash: 'DXcam 安装完成',
+    failureFlash: 'DXcam 安装失败',
   },
   tesseract: {
     kind: 'tesseract',
@@ -61,6 +75,7 @@ function createInstallRuntimeState() {
 
 const installRuntime = {
   rapidocr: createInstallRuntimeState(),
+  dxcam: createInstallRuntimeState(),
   tesseract: createInstallRuntimeState(),
   textractor: createInstallRuntimeState(),
 };
@@ -120,11 +135,15 @@ const FIELD_LABELS_ZH = {
   ocr_reader_status: 'OCR Reader 状态',
   ocr_reader_detail: 'OCR Reader 详情',
   ocr_reader_target: 'OCR Reader 目标',
+  ocr_backend_selection: 'OCR 后端选择',
+  ocr_capture_backend_selection: '截图后端选择',
   ocr_backend_kind: 'OCR 后端类型',
   ocr_backend_detail: 'OCR 后端详情',
   rapidocr_enabled: 'RapidOCR 已启用',
   rapidocr_installed: 'RapidOCR 已安装',
   rapidocr_detail: 'RapidOCR 详情',
+  dxcam_installed: 'DXcam 已安装',
+  dxcam_detail: 'DXcam 详情',
   memory_reader_enabled: 'Memory Reader 已启用',
   memory_reader_status: 'Memory Reader 状态',
   memory_reader_detail: 'Memory Reader 详情',
@@ -282,6 +301,19 @@ function getInstallNodes(kind) {
     progressBar: document.getElementById(`${prefix}InstallBar`),
     button: document.getElementById(`${prefix}InstallBtn`),
   };
+}
+
+function configureUseButton(id, { active = false, disabled = false, text = '', title = '' } = {}) {
+  const button = document.getElementById(id);
+  if (!button) {
+    return;
+  }
+  if (text) {
+    button.textContent = text;
+  }
+  button.disabled = Boolean(disabled || active);
+  button.classList.toggle('active', Boolean(active));
+  button.title = title || '';
 }
 
 async function createRun(entryId, args = {}) {
@@ -967,7 +999,7 @@ function renderPluginUnavailable(error) {
     { label: 'status', value: '插件尚未启动' },
   ]);
 
-  for (const kind of ['rapidocr', 'tesseract', 'textractor']) {
+  for (const kind of ['rapidocr', 'dxcam', 'tesseract', 'textractor']) {
     const config = getInstallConfig(kind);
     const { button, card } = getInstallNodes(kind);
     const banner = document.getElementById(`${config.domPrefix}Prompt`);
@@ -1159,6 +1191,10 @@ async function restoreRapidOcrInstallState() {
   await restoreInstallState('rapidocr');
 }
 
+async function restoreDxcamInstallState() {
+  await restoreInstallState('dxcam');
+}
+
 async function restoreTesseractInstallState() {
   await restoreInstallState('tesseract');
 }
@@ -1173,6 +1209,7 @@ function renderStatus(status) {
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
   const rapidocr = status.rapidocr || {};
+  const dxcam = status.dxcam || {};
   const textractor = status.textractor || {};
   const tesseract = status.tesseract || {};
 
@@ -1218,11 +1255,15 @@ function renderStatus(status) {
     { label: 'ocr_capture_diagnostic_required', value: String(Boolean(status.ocr_capture_diagnostic_required)) },
     { label: 'ocr_capture_diagnostic', value: status.ocr_capture_diagnostic || '' },
     { label: 'ocr_reader_target', value: ocrTarget || '' },
+    { label: 'ocr_backend_selection', value: status.ocr_backend_selection || 'auto' },
+    { label: 'ocr_capture_backend_selection', value: status.ocr_capture_backend_selection || 'auto' },
     { label: 'ocr_backend_kind', value: ocrRuntime.backend_kind || '' },
     { label: 'ocr_backend_detail', value: ocrRuntime.backend_detail || '' },
     { label: 'rapidocr_enabled', value: String(Boolean(status.rapidocr_enabled)) },
     { label: 'rapidocr_installed', value: String(Boolean(rapidocr.installed)) },
     { label: 'rapidocr_detail', value: rapidocr.detail || '' },
+    { label: 'dxcam_installed', value: String(Boolean(dxcam.installed)) },
+    { label: 'dxcam_detail', value: dxcam.detail || '' },
     { label: 'memory_reader_enabled', value: String(Boolean(status.memory_reader_enabled)) },
     { label: 'memory_reader_status', value: memoryReaderRuntime.status || '' },
     { label: 'memory_reader_detail', value: memoryReaderRuntime.detail || '' },
@@ -1240,6 +1281,7 @@ function renderStatus(status) {
   syncAgentResumeButton(status);
   syncAutoRefreshIntervalForStatus(status);
   renderRapidOcr(status);
+  renderDxcam(status);
   renderTesseract(status);
   renderTextractor(status);
   renderOcrWindowTargetStatus(status);
@@ -1673,8 +1715,20 @@ function renderRapidOcr(status) {
   const installState = getInstallState('rapidocr').state;
   const installable = Boolean(rapidocr.install_supported) && Boolean(rapidocr.can_install);
   const installed = Boolean(rapidocr.installed) || (installState && installState.status === 'completed');
+  const selectedBackend = status.ocr_backend_selection || 'auto';
   const usingRapidOcr = runtime.backend_kind === 'rapidocr';
   const usingFallback = runtime.backend_kind === 'tesseract';
+  configureUseButton('rapidocrUseBtn', {
+    active: selectedBackend === 'rapidocr',
+    disabled: !installed,
+    text: selectedBackend === 'rapidocr' ? '正在使用 RapidOCR' : '使用 RapidOCR',
+    title: installed ? '强制 OCR Reader 使用 RapidOCR' : '请先安装 RapidOCR',
+  });
+  configureUseButton('ocrBackendAutoBtn', {
+    active: selectedBackend === 'auto',
+    text: selectedBackend === 'auto' ? 'OCR 自动选择中' : 'OCR 自动',
+    title: '按 RapidOCR 优先、Tesseract 兜底自动选择 OCR 后端',
+  });
 
   banner.className = 'install-banner install-banner-rapidocr';
   button.hidden = !installable;
@@ -1764,6 +1818,109 @@ function renderRapidOcr(status) {
   }
 }
 
+function renderDxcam(status) {
+  const dxcam = status.dxcam || {};
+  const runtime = status.ocr_reader_runtime || {};
+  const banner = document.getElementById('dxcamPrompt');
+  const kicker = document.getElementById('dxcamPromptKicker');
+  const title = document.getElementById('dxcamPromptTitle');
+  const body = document.getElementById('dxcamPromptBody');
+  const path = document.getElementById('dxcamPathText');
+  const button = document.getElementById('dxcamInstallBtn');
+  const installState = getInstallState('dxcam').state;
+  const installable = Boolean(dxcam.install_supported) && Boolean(dxcam.can_install);
+  const installed = Boolean(dxcam.installed) || (installState && installState.status === 'completed');
+  const selectedCaptureBackend = status.ocr_capture_backend_selection || 'auto';
+  const usingDxcam = runtime.capture_backend_kind === 'dxcam';
+  configureUseButton('dxcamUseBtn', {
+    active: selectedCaptureBackend === 'dxcam',
+    disabled: !installed,
+    text: selectedCaptureBackend === 'dxcam' ? '正在使用 DXcam' : '使用 DXcam',
+    title: installed ? '强制截图后端使用 DXcam' : '请先安装 DXcam',
+  });
+  configureUseButton('captureBackendAutoBtn', {
+    active: selectedCaptureBackend === 'auto',
+    text: selectedCaptureBackend === 'auto' ? '截图自动选择中' : '截图自动',
+    title: '按 DXcam 优先、ImageGrab/PrintWindow 兜底自动选择截图后端',
+  });
+  configureUseButton('imagegrabUseBtn', {
+    active: selectedCaptureBackend === 'imagegrab',
+    text: selectedCaptureBackend === 'imagegrab' ? '正在使用 ImageGrab' : '使用 ImageGrab',
+    title: '使用系统截图兼容后端，游戏窗口需要可见',
+  });
+  configureUseButton('printwindowUseBtn', {
+    active: selectedCaptureBackend === 'printwindow',
+    text: selectedCaptureBackend === 'printwindow' ? '正在使用 PrintWindow' : '使用 PrintWindow',
+    title: '使用 Win32 PrintWindow 兜底，DirectX/Unity 游戏可能旧帧',
+  });
+
+  banner.className = 'install-banner install-banner-dxcam';
+  button.hidden = !installable;
+  button.disabled = getInstallState('dxcam').inProgress;
+  button.textContent = getInstallState('dxcam').inProgress
+    ? getInstallConfig('dxcam').runningText
+    : getInstallConfig('dxcam').actionText;
+
+  if (!dxcam.install_supported) {
+    banner.classList.add('neutral');
+    kicker.textContent = '截图依赖';
+    title.textContent = '当前平台暂不支持自动安装 DXcam';
+    body.textContent = 'DXcam 截图后端仅用于 Windows 桌面捕获；当前平台会继续使用兼容截图方案。';
+    path.textContent = '';
+    button.hidden = true;
+    renderInstallTaskState('dxcam');
+    return;
+  }
+
+  if (installed) {
+    banner.classList.add(usingDxcam ? 'success' : 'neutral');
+    kicker.textContent = usingDxcam ? '截图依赖已接管' : '截图依赖已就绪';
+    title.textContent = usingDxcam
+      ? 'DXcam 正在作为截图后端工作'
+      : 'DXcam 已安装，等待 OCR Reader 自动使用';
+    body.textContent = usingDxcam
+      ? '当前截图后端使用 DXcam。它仍要求游戏窗口前台可见，不做后台捕获或绕过。'
+      : `DXcam 已安装。当前截图后端: ${runtime.capture_backend_kind || '未知'}。`;
+    path.textContent = dxcam.detected_path ? `检测路径: ${dxcam.detected_path}` : '';
+    button.hidden = true;
+  } else {
+    banner.classList.add('warning');
+    kicker.textContent = '截图依赖未就绪';
+    title.textContent = '未检测到 DXcam';
+    body.textContent = '安装 DXcam 后，auto 截图后端会优先使用 GPU Desktop Duplication 截取前台游戏画面，降低插件页遮挡或 PrintWindow 旧帧问题。';
+    path.textContent = '安装位置: 当前插件 Python 环境';
+  }
+
+  if (installState && !isInstallTaskTerminal(installState)) {
+    banner.className = 'install-banner install-banner-dxcam neutral';
+    kicker.textContent = 'DXcam 安装';
+    title.textContent = 'DXcam 正在后台安装';
+    body.textContent = '页面会通过 SSE 接收实时安装进度。安装完成后会刷新 OCR 截图后端状态。';
+    button.hidden = false;
+    button.disabled = true;
+    button.textContent = getInstallConfig('dxcam').runningText;
+  } else if (installState && installState.status === 'failed' && installable) {
+    banner.className = 'install-banner install-banner-dxcam neutral';
+    kicker.textContent = 'DXcam 安装';
+    title.textContent = 'DXcam 安装失败，可直接重试';
+    body.textContent = installState.error || installState.message || '后台安装任务失败，你可以再次点击按钮重试。';
+    button.hidden = false;
+    button.disabled = false;
+    button.textContent = getInstallConfig('dxcam').retryText;
+  } else if (installState && installState.status === 'completed' && !installed) {
+    banner.className = 'install-banner install-banner-dxcam neutral';
+    kicker.textContent = 'DXcam 安装';
+    title.textContent = 'DXcam 安装已完成，正在刷新截图状态';
+    body.textContent = installState.message || '安装任务已结束，正在等待插件状态刷新。';
+  }
+
+  if (installed) {
+    getInstallNodes('dxcam').card.hidden = true;
+  } else {
+    renderInstallTaskState('dxcam');
+  }
+}
+
 function renderTesseract(status) {
   const tesseract = status.tesseract || {};
   const runtime = status.ocr_reader_runtime || {};
@@ -1777,6 +1934,13 @@ function renderTesseract(status) {
   const installable = Boolean(tesseract.install_supported) && Boolean(tesseract.can_install);
   const installed = Boolean(tesseract.installed) || (installState && installState.status === 'completed');
   const missingLanguages = tesseract.missing_languages || [];
+  const selectedBackend = status.ocr_backend_selection || 'auto';
+  configureUseButton('tesseractUseBtn', {
+    active: selectedBackend === 'tesseract',
+    disabled: !installed,
+    text: selectedBackend === 'tesseract' ? '正在使用 Tesseract' : '使用 Tesseract',
+    title: installed ? '强制 OCR Reader 使用 Tesseract' : '请先安装 Tesseract 和所需语言包',
+  });
 
   banner.className = 'install-banner install-banner-tesseract';
   button.hidden = !installable;
@@ -2043,11 +2207,12 @@ function renderHistory(history) {
     text: runtime.last_raw_ocr_text
       ? `最近 raw OCR：${runtime.last_raw_ocr_text}`
       : buildOcrMissingLineDiagnostic(latestStatus || {}),
+    is_diagnostic: true,
   }];
   renderStackList('linesList', fallbackItems, (item) => `
     <article class="list-card">
-      <p class="list-kicker">${escapeHtml(item.speaker || '旁白')} · ${escapeHtml(item.scene_id || '')} · ${escapeHtml(item.stability || '')}</p>
-      <h3>${escapeHtml(item.line_id || '')}</h3>
+      <p class="list-kicker">${escapeHtml(item.is_diagnostic ? 'OCR 诊断' : (item.speaker || '旁白'))} · ${escapeHtml(item.scene_id || '')} · ${escapeHtml(item.stability || '')}</p>
+      <h3>${escapeHtml(item.is_diagnostic ? '未写入稳定台词' : (item.line_id || ''))}</h3>
       <p>${escapeHtml(item.text || '')}</p>
     </article>
   `);
@@ -2065,23 +2230,6 @@ function renderHistory(history) {
       <p class="list-kicker">seq ${escapeHtml(item.seq || 0)} · ${escapeHtml(item.type || '')}</p>
       <h3>${escapeHtml(item.line_id || item.scene_id || '')}</h3>
       <p>${escapeHtml(JSON.stringify(item.payload || {}))}</p>
-    </article>
-  `);
-}
-
-function renderAgentStatus(payload) {
-  document.getElementById('agentReplyText').textContent = latestAgentReply;
-  renderGrid('agentStatusGrid', [
-    { label: 'status', value: payload.status || 'standby' },
-    { label: 'result', value: payload.result || '' },
-    { label: 'recent_pushes', value: String((payload.recent_pushes || []).length) },
-  ]);
-
-  renderStackList('pushesList', payload.recent_pushes || [], (item) => `
-    <article class="list-card compact">
-      <p class="list-kicker">${escapeHtml(item.kind || '')} · ${escapeHtml(item.ts || '')}</p>
-      <h3>${escapeHtml(item.scene_id || '')}</h3>
-      <p>${escapeHtml(item.content || '')}</p>
     </article>
   `);
 }
@@ -2433,10 +2581,24 @@ async function startInstall(kind, force = false) {
   const state = getInstallState(kind);
   const { button } = getInstallNodes(kind);
   state.inProgress = true;
+  state.state = {
+    kind,
+    task_id: '',
+    status: 'queued',
+    phase: 'queued',
+    message: `正在创建 ${config.label} 后台安装任务...`,
+    progress: 0.01,
+    updated_at: Date.now() / 1000,
+  };
   closeInstallStream(kind);
   clearInstallReconnectTimer(kind);
   button.disabled = true;
   button.textContent = '准备安装...';
+  if (latestStatus) {
+    renderStatus(latestStatus);
+  } else {
+    renderInstallTaskState(kind);
+  }
   setFlash(config.queuedFlash, 'info');
 
   try {
@@ -2467,13 +2629,24 @@ async function startInstall(kind, force = false) {
       applyInstallTaskState(kind, initialState, { allowRefresh: false });
     }
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     state.inProgress = false;
+    state.state = {
+      kind,
+      task_id: state.currentTaskId || '',
+      status: 'failed',
+      phase: 'failed',
+      message,
+      error: message,
+      progress: 1,
+      updated_at: Date.now() / 1000,
+    };
     if (latestStatus) {
       renderStatus(latestStatus);
     } else {
       renderInstallTaskState(kind);
     }
-    setFlash(error instanceof Error ? error.message : String(error), 'error');
+    setFlash(message, 'error');
   }
 }
 
@@ -2485,8 +2658,33 @@ async function installRapidOcr(force = false) {
   await startInstall('rapidocr', force);
 }
 
+async function installDxcam(force = false) {
+  await startInstall('dxcam', force);
+}
+
 async function installTesseract(force = false) {
   await startInstall('tesseract', force);
+}
+
+async function setOcrBackendSelection({ backendSelection = null, captureBackend = null } = {}) {
+  const args = {};
+  if (backendSelection) {
+    args.backend_selection = backendSelection;
+  }
+  if (captureBackend) {
+    args.capture_backend = captureBackend;
+  }
+  const label = backendSelection
+    ? `OCR 后端切换为 ${backendSelection}`
+    : `截图后端切换为 ${captureBackend}`;
+  try {
+    setFlash(`正在${label}...`, 'info');
+    await callPlugin('galgame_set_ocr_backend', args);
+    setFlash(`${label} 已保存`, 'success');
+    await refreshAll({ preserveFlash: true });
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
 }
 
 async function saveMode() {
@@ -2734,7 +2932,7 @@ function switchInstallTab(tab) {
       btn.classList.remove('active');
     }
   });
-  ['rapidocr', 'tesseract', 'textractor'].forEach((kind) => {
+  ['rapidocr', 'dxcam', 'tesseract', 'textractor'].forEach((kind) => {
     const banner = document.getElementById(`${kind}Prompt`);
     if (banner) {
       banner.hidden = kind !== tab;
@@ -2747,6 +2945,7 @@ async function initialize() {
   await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
   await Promise.all([
     restoreRapidOcrInstallState(),
+    restoreDxcamInstallState(),
     restoreTesseractInstallState(),
     restoreTextractorInstallState(),
   ]);
@@ -2781,8 +2980,16 @@ document.getElementById('sendMessageBtn').addEventListener('click', () => {
   withButtonPending('sendMessageBtn', '发送中...', () => askAgent('send_message')).catch(() => {});
 });
 document.getElementById('rapidocrInstallBtn').addEventListener('click', () => installRapidOcr(false));
+document.getElementById('dxcamInstallBtn').addEventListener('click', () => installDxcam(false));
 document.getElementById('tesseractInstallBtn').addEventListener('click', () => installTesseract(false));
 document.getElementById('textractorInstallBtn').addEventListener('click', () => installTextractor(false));
+document.getElementById('rapidocrUseBtn').addEventListener('click', () => setOcrBackendSelection({ backendSelection: 'rapidocr' }));
+document.getElementById('ocrBackendAutoBtn').addEventListener('click', () => setOcrBackendSelection({ backendSelection: 'auto' }));
+document.getElementById('tesseractUseBtn').addEventListener('click', () => setOcrBackendSelection({ backendSelection: 'tesseract' }));
+document.getElementById('dxcamUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'dxcam' }));
+document.getElementById('captureBackendAutoBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'auto' }));
+document.getElementById('imagegrabUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'imagegrab' }));
+document.getElementById('printwindowUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'printwindow' }));
 document.getElementById('ocrWindowRefreshBtn').addEventListener('click', () => {
   refreshOcrWindowTargets({ includeExcluded: true }).catch((error) => {
     setFlash(error instanceof Error ? error.message : String(error), 'error');

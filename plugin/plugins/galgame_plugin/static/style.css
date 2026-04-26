@@ -434,6 +434,12 @@ button[disabled] {
   box-shadow: 0 2px 8px rgba(31, 42, 51, 0.1);
 }
 
+button.active {
+  color: #fff;
+  background: var(--brand);
+  border-color: var(--brand);
+}
+
 .install-panels {
   display: grid;
 }
@@ -485,6 +491,9 @@ button[disabled] {
 .install-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .install-task-card {
@@ -744,6 +753,15 @@ button[disabled] {
 .data-grid {
   display: grid;
   gap: 10px;
+  min-width: 0;
+}
+
+#snapshotGrid.scroll-region {
+  max-height: clamp(180px, 30vh, 340px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  align-content: start;
 }
 
 .data-row {
@@ -764,28 +782,71 @@ button[disabled] {
 }
 
 .data-row dd {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   word-break: break-word;
 }
 
 .stack-list {
   display: grid;
   gap: 12px;
+  min-width: 0;
+}
+
+#linesList.scroll-region {
+  max-height: clamp(220px, 36vh, 420px);
+  align-content: start;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+#linesList .list-card {
+  max-height: clamp(180px, 30vh, 360px);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+#linesList .list-card p,
+#linesList .list-card h3 {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .result-panel {
   display: grid;
   gap: 12px;
+  min-width: 0;
+}
+
+.result-panel.scroll-region {
+  max-height: clamp(180px, 30vh, 340px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+
+.result-panel h3,
+.result-panel p,
+.result-panel .chip {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .result-main {
   font-size: 15px;
   line-height: 1.6;
+  max-width: 100%;
 }
 
 .result-note {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+  max-width: 100%;
 }
 
 .install-copy .result-note {

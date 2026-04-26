@@ -93,9 +93,11 @@ async def test_galgame_plugin_ui_index_route_serves_static_dashboard(
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
-    assert "<title>Galgame Plugin</title>" in response.text
-    assert "N.E.K.O Phase 2" in response.text
+    assert "<title>Galgame 插件设置</title>" in response.text
+    assert "N.E.K.O 二期" in response.text
     assert "RapidOCR" in response.text
+    assert "依赖安装" in response.text
+    assert "DXcam" in response.text
     assert "一键安装 Tesseract" in response.text
     assert "Textractor" in response.text
     assert "OCR 截图校准" in response.text
@@ -112,10 +114,12 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
     assert "javascript" in response.headers["content-type"]
     assert "const RUNS_URL = '/runs';" in response.text
     assert "const RAPIDOCR_INSTALL_URL = `${UI_API_BASE}/rapidocr/install`;" in response.text
+    assert "const DXCAM_INSTALL_URL = `${UI_API_BASE}/dxcam/install`;" in response.text
     assert "const TESSERACT_INSTALL_URL = `${UI_API_BASE}/tesseract/install`;" in response.text
     assert "const TEXTRACTOR_INSTALL_URL = `${UI_API_BASE}/textractor/install`;" in response.text
     assert "new EventSource(" in response.text
     assert "restoreRapidOcrInstallState" in response.text
+    assert "restoreDxcamInstallState" in response.text
     assert "restoreTextractorInstallState" in response.text
     assert "restoreTesseractInstallState" in response.text
     assert "session.json" not in response.text
@@ -133,6 +137,7 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
     assert "memory_reader_runtime" in response.text
     assert "ocr_reader_runtime" in response.text
     assert "rapidocr" in response.text
+    assert "dxcam" in response.text
     assert "tesseract" in response.text
     assert "textractor" in response.text
 
@@ -226,6 +231,36 @@ async def test_galgame_plugin_rapidocr_install_start_route_creates_run_and_seeds
     saved = install_task_module.load_install_task_state("run-rapidocr-1", kind="rapidocr")
     assert saved is not None
     assert saved["message"] == "RapidOCR install queued"
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_dxcam_install_start_route_creates_run_and_seeds_state(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+    galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_create_run(payload, *, client_host):
+        del client_host
+        assert payload.plugin_id == "galgame_plugin"
+        assert payload.entry_id == "galgame_install_dxcam"
+        assert payload.args == {"force": True}
+        return RunCreateResponse(run_id="run-dxcam-1", status="queued")
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "create_run", _fake_create_run)
+
+    response = await plugin_ui_async_client.post(
+        "/plugin/galgame_plugin/ui-api/dxcam/install",
+        json={"force": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["task_id"] == "run-dxcam-1"
+    assert payload["state"]["kind"] == "dxcam"
+    saved = install_task_module.load_install_task_state("run-dxcam-1", kind="dxcam")
+    assert saved is not None
+    assert saved["message"] == "DXcam install queued"
 
 
 @pytest.mark.asyncio

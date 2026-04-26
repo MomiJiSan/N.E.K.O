@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Galgame 插件设置</title>
-  <link rel="stylesheet" href="./style.css?v=20260426-dxcam-capture-1">
+  <link rel="stylesheet" href="./style.css?v=20260426-backend-use-buttons-1">
 </head>
 <body>
   <div class="page-shell">
@@ -15,7 +15,7 @@
       <div>
         <p class="eyebrow">N.E.K.O 二期</p>
         <h1>Galgame 插件设置</h1>
-        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容兜底，这里会展示桥接状态、OCR 运行时、RapidOCR/Tesseract 安装流、截图校准，以及游戏 Agent 的后台状态。</p>
+        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容兜底，这里会展示桥接状态、OCR 运行时、依赖安装、截图校准，以及游戏 Agent 的后台状态。</p>
       </div>
       <div class="hero-actions">
         <button id="refreshBtn" class="primary">刷新全部</button>
@@ -92,12 +92,13 @@
 
       <details class="settings-module">
         <summary>
-          <span>OCR 后端安装</span>
-          <small>RapidOCR 优先，Tesseract/Textractor 仅作兜底</small>
+          <span>依赖安装</span>
+          <small>RapidOCR / DXcam 优先，Tesseract / Textractor 仅作兜底</small>
         </summary>
         <div class="module-body install-stack">
         <div class="install-tabs">
           <button class="install-tab active" data-install-tab="rapidocr">RapidOCR</button>
+          <button class="install-tab" data-install-tab="dxcam">DXcam</button>
           <button class="install-tab" data-install-tab="tesseract">Tesseract</button>
           <button class="install-tab" data-install-tab="textractor">Textractor</button>
         </div>
@@ -121,7 +122,36 @@
               </div>
             </div>
             <div class="install-actions">
+              <button id="rapidocrUseBtn" class="secondary">使用 RapidOCR</button>
+              <button id="ocrBackendAutoBtn" class="ghost">OCR 自动</button>
               <button id="rapidocrInstallBtn" class="primary">一键安装 RapidOCR</button>
+            </div>
+          </div>
+
+          <div id="dxcamPrompt" class="install-banner install-banner-dxcam" hidden>
+            <div class="install-copy">
+              <p id="dxcamPromptKicker" class="list-kicker">截图依赖</p>
+              <h3 id="dxcamPromptTitle">正在检测 DXcam</h3>
+              <p id="dxcamPromptBody">DXcam 用于更可靠地截取前台游戏画面，降低被插件页面遮挡或旧帧影响的概率。</p>
+              <p id="dxcamPathText" class="result-note"></p>
+              <div id="dxcamInstallState" class="install-task-card" hidden>
+                <div class="install-task-head">
+                  <p id="dxcamInstallStatusText" class="install-task-status">等待安装任务</p>
+                  <p id="dxcamInstallPercent" class="install-task-percent">0%</p>
+                </div>
+                <div class="install-task-bar">
+                  <div id="dxcamInstallBar" class="install-task-bar-fill"></div>
+                </div>
+                <p id="dxcamInstallMessage" class="result-note"></p>
+                <p id="dxcamInstallDetail" class="result-note"></p>
+              </div>
+            </div>
+            <div class="install-actions">
+              <button id="dxcamUseBtn" class="secondary">使用 DXcam</button>
+              <button id="captureBackendAutoBtn" class="ghost">截图自动</button>
+              <button id="imagegrabUseBtn" class="ghost">使用 ImageGrab</button>
+              <button id="printwindowUseBtn" class="ghost">使用 PrintWindow</button>
+              <button id="dxcamInstallBtn" class="primary">一键安装 DXcam</button>
             </div>
           </div>
 
@@ -144,6 +174,7 @@
               </div>
             </div>
             <div class="install-actions">
+              <button id="tesseractUseBtn" class="secondary">使用 Tesseract</button>
               <button id="tesseractInstallBtn" class="primary">一键安装 Tesseract</button>
             </div>
           </div>
@@ -339,7 +370,7 @@
       </details>
 
       <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module" open>
-        <summary><span>最近稳定台词</span><small>stable 与 observed 合并历史</small></summary>
+        <summary><span>最近台词与 OCR 诊断</span><small>stable/observed 合并；无文本时显示阻塞点</small></summary>
         <div id="linesList" class="stack-list scroll-region empty-state">暂无数据</div>
       </details>
 
@@ -355,6 +386,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260426-dxcam-capture-1"></script>
+  <script src="./main.js?v=20260426-backend-use-buttons-1"></script>
 </body>
 </html>

@@ -63,6 +63,12 @@ def _get_install_kind_spec(kind: str) -> dict[str, str]:
             "label": "RapidOCR",
             "queued_message": "RapidOCR install queued",
         },
+        "dxcam": {
+            "kind": "dxcam",
+            "entry_id": "galgame_install_dxcam",
+            "label": "DXcam",
+            "queued_message": "DXcam install queued",
+        },
         "textractor": {
             "kind": "textractor",
             "entry_id": "galgame_install_textractor",
@@ -542,6 +548,20 @@ async def galgame_plugin_start_rapidocr_install(
     )
 
 
+@router.post("/plugin/{plugin_id}/ui-api/dxcam/install")
+async def galgame_plugin_start_dxcam_install(
+    plugin_id: str,
+    payload: InstallStartPayload,
+    request: Request,
+):
+    return await _start_install_task(
+        plugin_id=plugin_id,
+        kind="dxcam",
+        payload=payload,
+        request=request,
+    )
+
+
 @router.post("/plugin/{plugin_id}/ui-api/tesseract/install")
 async def galgame_plugin_start_tesseract_install(
     plugin_id: str,
@@ -566,6 +586,11 @@ async def galgame_plugin_latest_rapidocr_install(plugin_id: str):
     return _latest_install_task_payload(plugin_id=plugin_id, kind="rapidocr")
 
 
+@router.get("/plugin/{plugin_id}/ui-api/dxcam/install/latest")
+async def galgame_plugin_latest_dxcam_install(plugin_id: str):
+    return _latest_install_task_payload(plugin_id=plugin_id, kind="dxcam")
+
+
 @router.get("/plugin/{plugin_id}/ui-api/tesseract/install/latest")
 async def galgame_plugin_latest_tesseract_install(plugin_id: str):
     return _latest_install_task_payload(plugin_id=plugin_id, kind="tesseract")
@@ -579,6 +604,11 @@ async def galgame_plugin_get_textractor_install(plugin_id: str, task_id: str):
 @router.get("/plugin/{plugin_id}/ui-api/rapidocr/install/{task_id}")
 async def galgame_plugin_get_rapidocr_install(plugin_id: str, task_id: str):
     return _get_install_task_payload(plugin_id=plugin_id, kind="rapidocr", task_id=task_id)
+
+
+@router.get("/plugin/{plugin_id}/ui-api/dxcam/install/{task_id}")
+async def galgame_plugin_get_dxcam_install(plugin_id: str, task_id: str):
+    return _get_install_task_payload(plugin_id=plugin_id, kind="dxcam", task_id=task_id)
 
 
 @router.get("/plugin/{plugin_id}/ui-api/tesseract/install/{task_id}")
@@ -609,6 +639,20 @@ async def galgame_plugin_stream_rapidocr_install(
     return _install_stream_response(
         plugin_id=plugin_id,
         kind="rapidocr",
+        task_id=task_id,
+        request=request,
+    )
+
+
+@router.get("/plugin/{plugin_id}/ui-api/dxcam/install/{task_id}/stream")
+async def galgame_plugin_stream_dxcam_install(
+    plugin_id: str,
+    task_id: str,
+    request: Request,
+):
+    return _install_stream_response(
+        plugin_id=plugin_id,
+        kind="dxcam",
         task_id=task_id,
         request=request,
     )

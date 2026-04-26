@@ -221,8 +221,43 @@ def _window_text(hwnd: int) -> str:
         return ""
 
 
+def _root_window_handle(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    try:
+        root = int(ctypes.windll.user32.GetAncestor(int(hwnd), 2))
+        return root or int(hwnd)
+    except Exception:
+        return int(hwnd)
+
+
+def _window_process_id(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    try:
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        return int(pid.value or 0)
+    except Exception:
+        return 0
+
+
+def _foreground_matches_target_window(foreground_hwnd: int, target_hwnd: int, target_pid: int) -> bool:
+    if not foreground_hwnd or not target_hwnd:
+        return False
+    if int(foreground_hwnd) == int(target_hwnd):
+        return True
+    foreground_root = _root_window_handle(int(foreground_hwnd))
+    target_root = _root_window_handle(int(target_hwnd))
+    if foreground_root and target_root and foreground_root == target_root:
+        return True
+    foreground_pid = _window_process_id(int(foreground_hwnd)) or _window_process_id(foreground_root)
+    return bool(foreground_pid and target_pid and foreground_pid == int(target_pid))
+
+
 def _focus_window(hwnd: int) -> bool:
     user32 = ctypes.windll.user32
+    target_pid = _window_process_id(hwnd)
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
     try:
@@ -253,7 +288,11 @@ def _focus_window(hwnd: int) -> bool:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
     time.sleep(0.12)
     try:
-        return int(user32.GetForegroundWindow()) == int(hwnd)
+        return _foreground_matches_target_window(
+            int(user32.GetForegroundWindow()),
+            int(hwnd),
+            int(target_pid),
+        )
     except Exception:
         return False
 

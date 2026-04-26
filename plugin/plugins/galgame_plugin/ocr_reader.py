@@ -1234,11 +1234,22 @@ def _target_window_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]
     return (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
 
 
-def _require_foreground_capture_target(target: DetectedGameWindow, *, backend_kind: str) -> None:
-    foreground_hwnd = _foreground_window_handle()
-    if foreground_hwnd and target.hwnd and int(foreground_hwnd) == int(target.hwnd):
-        return
-    raise RuntimeError(f"{backend_kind}: target_window_not_foreground_for_capture")
+def _require_visible_capture_target(target: DetectedGameWindow, *, backend_kind: str) -> None:
+    if not target.hwnd:
+        raise RuntimeError(f"{backend_kind}: target_window_not_resolved_for_capture")
+    try:
+        import win32gui
+
+        if not win32gui.IsWindow(target.hwnd):
+            raise RuntimeError(f"{backend_kind}: target_window_invalid_for_capture")
+        if not win32gui.IsWindowVisible(target.hwnd):
+            raise RuntimeError(f"{backend_kind}: target_window_not_visible_for_capture")
+        if win32gui.IsIconic(target.hwnd):
+            raise RuntimeError(f"{backend_kind}: target_window_minimized_for_capture")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"{backend_kind}: target_window_visibility_check_failed: {exc}") from exc
 
 
 def _crop_window_image(
@@ -1306,7 +1317,7 @@ class ImageGrabCaptureBackend:
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         from PIL import ImageGrab
 
-        _require_foreground_capture_target(target, backend_kind=self.kind)
+        _require_visible_capture_target(target, backend_kind=self.kind)
         rect = _target_window_rect(target)
         image = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
         return _crop_window_image(
@@ -1434,7 +1445,7 @@ class DxcamCaptureBackend:
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         from PIL import Image
 
-        _require_foreground_capture_target(target, backend_kind=self.kind)
+        _require_visible_capture_target(target, backend_kind=self.kind)
         rect = _target_window_rect(target)
         camera = self._camera_instance()
         frame = camera.grab(region=rect)
@@ -1471,6 +1482,8 @@ class Win32CaptureBackend:
         return [dxcam, imagegrab, printwindow]
 
     def is_available(self) -> bool:
+        if self.selection != _CAPTURE_BACKEND_AUTO:
+            return bool(self._backends) and self._backends[0].is_available()
         return any(backend.is_available() for backend in self._backends)
 
     def describe_target(self, target: DetectedGameWindow) -> str:
@@ -1498,11 +1511,24 @@ class Win32CaptureBackend:
                 return frame
             except Exception as exc:
                 errors.append(f"{kind}_failed:{exc}")
-                if "target_window_not_foreground_for_capture" in str(exc):
+                if any(
+                    marker in str(exc)
+                    for marker in (
+                        "target_window_not_resolved_for_capture",
+                        "target_window_invalid_for_capture",
+                        "target_window_not_visible_for_capture",
+                        "target_window_minimized_for_capture",
+                    )
+                ):
                     raise
                 if self.selection != _CAPTURE_BACKEND_AUTO:
                     raise
                 continue
+        if self.selection != _CAPTURE_BACKEND_AUTO:
+            raise RuntimeError(
+                f"{self.selection}: capture_backend_unavailable"
+                + (f": {'; '.join(errors)}" if errors else "")
+            )
         raise RuntimeError("; ".join(errors) or "capture_backend_unavailable")
 
 
@@ -1678,6 +1704,7 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
             is_foreground=hwnd == foreground_hwnd,
             score=float(max(area, 0)),
         )
+        candidate.is_foreground = _foreground_matches_target(foreground_hwnd, candidate)[0]
         results.append(_classify_window_candidate(candidate))
 
     win32gui.EnumWindows(callback, None)
@@ -1694,6 +1721,57 @@ def _foreground_window_handle() -> int:
         return int(ctypes.windll.user32.GetForegroundWindow())
     except Exception:
         return 0
+
+
+def _root_window_handle(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    try:
+        root = int(ctypes.windll.user32.GetAncestor(int(hwnd), 2))
+        return root or int(hwnd)
+    except Exception:
+        return int(hwnd)
+
+
+def _window_process_id(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    try:
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        return int(pid.value or 0)
+    except Exception:
+        return 0
+
+
+def _window_process_name(pid: int) -> str:
+    if not pid or psutil is None:
+        return ""
+    try:
+        return str(psutil.Process(int(pid)).name() or "").strip()
+    except Exception:
+        return ""
+
+
+def _foreground_matches_target(foreground_hwnd: int, target: DetectedGameWindow | None) -> tuple[bool, str]:
+    if target is None or not foreground_hwnd:
+        return False, "no_foreground_or_target"
+    target_hwnd = int(target.hwnd or 0)
+    foreground_root_hwnd = _root_window_handle(int(foreground_hwnd))
+    target_root_hwnd = _root_window_handle(target_hwnd)
+    if target_hwnd and int(foreground_hwnd) == target_hwnd:
+        return True, "hwnd"
+    if target_root_hwnd and foreground_root_hwnd and foreground_root_hwnd == target_root_hwnd:
+        return True, "root_hwnd"
+    foreground_pid = _window_process_id(int(foreground_hwnd)) or _window_process_id(foreground_root_hwnd)
+    target_pid = int(target.pid or 0)
+    if foreground_pid and target_pid and foreground_pid == target_pid:
+        return True, "pid"
+    target_process = str(target.process_name or "").strip().lower()
+    foreground_process = _window_process_name(foreground_pid).strip().lower()
+    if foreground_process and target_process and foreground_process == target_process:
+        return True, "process"
+    return False, "background"
 
 
 def _classify_window_candidate(candidate: DetectedGameWindow) -> DetectedGameWindow:
@@ -2251,6 +2329,10 @@ class OcrReaderManager:
                     logger=self._logger,
                     selection=config.ocr_reader_capture_backend,
                 )
+                self._capture_backend_kind = str(
+                    getattr(self._capture_backend, "selection", "custom")
+                )
+                self._capture_backend_detail = ""
         if self._writer.bridge_root != config.bridge_root:
             self._writer = OcrReaderBridgeWriter(
                 bridge_root=config.bridge_root,
@@ -2394,7 +2476,10 @@ class OcrReaderManager:
         target, detail = self._foreground_refresh_target()
         target_hwnd = int(target.hwnd or 0) if target is not None else 0
         if target is not None:
-            is_foreground = bool(foreground_hwnd and target_hwnd and foreground_hwnd == target_hwnd)
+            is_foreground, foreground_match_reason = _foreground_matches_target(
+                foreground_hwnd,
+                target,
+            )
             self._runtime.target_is_foreground = is_foreground
             self._runtime.effective_window_key = str(target.window_key or self._runtime.effective_window_key)
             self._runtime.effective_window_title = str(target.title or self._runtime.effective_window_title)
@@ -2405,7 +2490,11 @@ class OcrReaderManager:
                 self._runtime.window_title = str(target.title or "")
             if not self._runtime.pid:
                 self._runtime.pid = int(target.pid or 0)
-            detail = f"{detail}:{'foreground' if is_foreground else 'background'}"
+            detail = (
+                f"{detail}:foreground_{foreground_match_reason}"
+                if is_foreground
+                else f"{detail}:background"
+            )
         elif self._runtime.effective_window_key or self._runtime.process_name:
             detail = detail or "target_unresolved"
         else:
@@ -2596,7 +2685,13 @@ class OcrReaderManager:
         self._runtime.effective_process_name = str(
             target.process_name or self._runtime.effective_process_name
         )
-        self._runtime.target_is_foreground = bool(target.is_foreground)
+        foreground_hwnd = _foreground_window_handle()
+        self._runtime.target_is_foreground = _foreground_matches_target(
+            foreground_hwnd,
+            target,
+        )[0]
+        self._runtime.foreground_hwnd = max(0, int(foreground_hwnd or 0))
+        self._runtime.target_hwnd = max(0, int(target.hwnd or 0))
         return self._runtime.to_dict()
 
     @staticmethod
@@ -3104,7 +3199,8 @@ class OcrReaderManager:
             candidate.pid = max(0, int(candidate.pid or 0))
             candidate.hwnd = max(0, int(candidate.hwnd or 0))
             candidate.area = max(0, int(candidate.area or 0))
-            candidate.is_foreground = candidate.hwnd == foreground_hwnd if candidate.hwnd else bool(candidate.is_foreground)
+            foreground_match, _ = _foreground_matches_target(foreground_hwnd, candidate)
+            candidate.is_foreground = foreground_match
             candidate.score = float(max(candidate.area, 1))
             candidate = _classify_window_candidate(candidate)
             prepared.append(candidate)

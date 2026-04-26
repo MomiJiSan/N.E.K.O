@@ -1228,6 +1228,49 @@ async def test_shutdown_cancels_background_bridge_poll(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_bridge_tick_cancels_stale_background_poll(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    plugin._cfg = build_config(_make_effective_config(bridge_root))
+    poll_started = asyncio.Event()
+    cancelled = False
+
+    async def _stuck_poll(*, force: bool) -> None:
+        nonlocal cancelled
+        assert force is False
+        poll_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    plugin._poll_bridge = _stuck_poll  # type: ignore[method-assign]
+
+    await plugin.bridge_tick()
+    await asyncio.wait_for(poll_started.wait(), timeout=0.5)
+    task = plugin._bridge_poll_task
+    assert task is not None
+
+    plugin._bridge_poll_started_at = (
+        time.monotonic() - plugin._background_bridge_poll_stale_timeout_seconds() - 1.0
+    )
+    await plugin.bridge_tick()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+    with plugin._state_lock:
+        last_error = dict(plugin._state.last_error)
+
+    assert cancelled is True
+    assert plugin._bridge_poll_task is None
+    assert last_error["source"] == "bridge_reader"
+    assert "timed out" in last_error["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     _create_game_dir(
@@ -1259,12 +1302,14 @@ async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(t
         "galgame_get_history",
         "galgame_get_snapshot",
         "galgame_get_status",
+        "galgame_install_dxcam",
         "galgame_install_rapidocr",
         "galgame_install_tesseract",
         "galgame_install_textractor",
         "galgame_list_ocr_windows",
         "galgame_open_ui",
         "galgame_set_mode",
+        "galgame_set_ocr_backend",
         "galgame_set_ocr_capture_profile",
         "galgame_set_ocr_window_target",
         "galgame_suggest_choice",
@@ -2168,6 +2213,63 @@ async def test_install_rapidocr_entry_returns_install_result_and_refreshed_statu
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_install_dxcam_entry_returns_install_result_and_refreshed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True},
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+
+    async def _fake_install_dxcam(**kwargs):
+        del kwargs
+        return {
+            "install_supported": True,
+            "installed": True,
+            "can_install": False,
+            "detected_path": "C:/Python/Lib/site-packages/dxcam/__init__.py",
+            "package_name": "dxcam",
+            "target_dir": "current_python_environment",
+            "detail": "installed",
+            "summary": "DXcam 安装完成",
+            "release_name": "DXcam",
+            "asset_name": "dxcam",
+        }
+
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.install_dxcam",
+        _fake_install_dxcam,
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.service.inspect_dxcam_installation",
+        lambda **kwargs: {
+            "install_supported": True,
+            "installed": True,
+            "can_install": False,
+            "detected_path": "C:/Python/Lib/site-packages/dxcam/__init__.py",
+            "package_name": "dxcam",
+            "target_dir": "current_python_environment",
+            "detail": "installed",
+        },
+    )
+
+    result = await plugin.galgame_install_dxcam()
+
+    assert isinstance(result, Ok)
+    assert result.value["summary"] == "DXcam 安装完成"
+    assert result.value["install_result"]["installed"] is True
+    assert result.value["status"]["dxcam"]["installed"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_install_rapidocr_entry_returns_chinese_error_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2958,7 +3060,7 @@ def test_ocr_reader_foreground_refresh_updates_target_without_capture(
     assert runtime["target_is_foreground"] is True
     assert runtime["foreground_hwnd"] == target.hwnd
     assert runtime["target_hwnd"] == target.hwnd
-    assert runtime["foreground_refresh_detail"] == "manual_target_exact:foreground"
+    assert runtime["foreground_refresh_detail"] == "manual_target_exact:foreground_hwnd"
 
     monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 999999)
     runtime = manager.refresh_foreground_state()
@@ -2967,6 +3069,15 @@ def test_ocr_reader_foreground_refresh_updates_target_without_capture(
     assert runtime["foreground_hwnd"] == 999999
     assert runtime["target_hwnd"] == target.hwnd
     assert runtime["foreground_refresh_detail"] == "manual_target_exact:background"
+
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 888888)
+    monkeypatch.setattr(galgame_ocr_reader, "_window_process_id", lambda hwnd: target.pid)
+    runtime = manager.refresh_foreground_state()
+
+    assert runtime["target_is_foreground"] is True
+    assert runtime["foreground_hwnd"] == 888888
+    assert runtime["target_hwnd"] == target.hwnd
+    assert runtime["foreground_refresh_detail"] == "manual_target_exact:foreground_pid"
 
 
 @pytest.mark.plugin_unit
@@ -3009,7 +3120,7 @@ def test_ocr_reader_foreground_refresh_rebounds_manual_target_by_signature(
 
     assert runtime["target_is_foreground"] is True
     assert runtime["target_hwnd"] == rebound.hwnd
-    assert runtime["foreground_refresh_detail"] == "manual_target_rebound:foreground"
+    assert runtime["foreground_refresh_detail"] == "manual_target_rebound:foreground_hwnd"
 
 
 @pytest.mark.asyncio
@@ -3181,6 +3292,41 @@ def test_win32_capture_backend_selection_orders_dxcam_first_for_auto() -> None:
 
     printwindow_backend = galgame_ocr_reader.Win32CaptureBackend(selection="printwindow")
     assert [item.kind for item in printwindow_backend._backends] == ["printwindow"]
+
+
+@pytest.mark.plugin_unit
+def test_ocr_window_inventory_uses_root_hwnd_foreground_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=200,
+        title="Demo",
+        process_name="DemoGame.exe",
+        pid=9001,
+        width=1280,
+        height=720,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 201)
+    monkeypatch.setattr(
+        galgame_ocr_reader,
+        "_root_window_handle",
+        lambda hwnd: 100 if hwnd in {200, 201} else hwnd,
+    )
+
+    eligible, _excluded = manager._scan_window_inventory()
+
+    assert eligible
+    assert eligible[0].is_foreground is True
 
 
 @pytest.mark.asyncio
