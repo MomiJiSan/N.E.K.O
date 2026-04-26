@@ -75,7 +75,7 @@ poll_interval_seconds = 1
 # Windows: enabled by default as the current primary fallback when Bridge SDK has no usable session.
 # macOS/Linux: disabled by default.
 enabled = true
-backend_selection = "auto"
+backend_selection = "rapidocr"
 capture_backend = "auto"
 tesseract_path = ""
 install_manifest_url = ""

@@ -814,6 +814,26 @@ button.active {
   word-break: break-word;
 }
 
+#eventsList.scroll-region {
+  max-height: clamp(220px, 36vh, 420px);
+  align-content: start;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+#eventsList .list-card {
+  max-height: clamp(160px, 28vh, 320px);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+#eventsList .list-card p,
+#eventsList .list-card h3 {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .result-panel {
   display: grid;
   gap: 12px;

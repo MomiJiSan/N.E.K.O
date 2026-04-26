@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 from pathlib import Path
 import threading
 import time
@@ -113,6 +114,30 @@ def _replace_toml_section_value(text: str, *, section: str, key: str, value: str
     in_section = False
     section_header = f"[{section}]"
     replacement = f'{key} = "{value}"'
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == section_header
+            continue
+        if in_section and stripped.startswith(f"{key}"):
+            prefix = line[: len(line) - len(line.lstrip())]
+            lines[index] = f"{prefix}{replacement}"
+            return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    raise ValueError(f"plugin.toml missing [{section}].{key}")
+
+
+def _replace_toml_section_number_value(
+    text: str,
+    *,
+    section: str,
+    key: str,
+    value: float,
+) -> str:
+    lines = text.splitlines()
+    in_section = False
+    section_header = f"[{section}]"
+    formatted = f"{float(value):.3f}".rstrip("0").rstrip(".")
+    replacement = f"{key} = {formatted}"
     for index, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
@@ -269,6 +294,7 @@ class GalgamePlugin(NekoPluginBase):
         self.logger = self.file_logger
         self._state_lock = threading.Lock()
         self._poll_bridge_lock = asyncio.Lock()
+        self._poll_bridge_thread_lock = threading.RLock()
         self._textractor_install_lock = threading.Lock()
         self._tesseract_install_lock = threading.Lock()
         self._rapidocr_install_lock = threading.Lock()
@@ -285,10 +311,15 @@ class GalgamePlugin(NekoPluginBase):
         self._game_agent: GameLLMAgent | None = None
         self._memory_reader_manager: MemoryReaderManager | None = None
         self._ocr_reader_manager: OcrReaderManager | None = None
-        self._bridge_poll_task: asyncio.Task[None] | None = None
+        self._bridge_poll_task: asyncio.Task[None] | Future[None] | None = None
+        self._bridge_poll_loop: asyncio.AbstractEventLoop | None = None
+        self._bridge_poll_thread: threading.Thread | None = None
+        self._bridge_poll_thread_stop = threading.Event()
         self._bridge_poll_started_at = 0.0
         self._bridge_poll_finished_at = 0.0
         self._last_bridge_poll_duration_seconds = 0.0
+        self._last_bridge_poll_launch_at = 0.0
+        self._bridge_poll_launch_count = 0
         self._last_agent_tick_at = 0.0
 
     def _snapshot_state(self) -> dict[str, Any]:
@@ -549,7 +580,94 @@ class GalgamePlugin(NekoPluginBase):
             "last_bridge_poll_duration_seconds": self._last_bridge_poll_duration_seconds,
             "next_bridge_poll_in_seconds": next_poll_in_seconds,
             "last_agent_tick_at": self._last_agent_tick_at,
+            "last_bridge_poll_launch_at": self._last_bridge_poll_launch_at,
+            "bridge_poll_launch_count": self._bridge_poll_launch_count,
         }
+
+    def _clear_completed_background_bridge_poll(self) -> None:
+        task = self._bridge_poll_task
+        if task is None or not task.done():
+            return
+        self._bridge_poll_task = None
+        if task.cancelled():
+            with self._state_lock:
+                self._state.next_poll_at_monotonic = 0.0
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            with self._state_lock:
+                self._state.next_poll_at_monotonic = 0.0
+        except Exception as exc:
+            with self._state_lock:
+                self._state.next_poll_at_monotonic = 0.0
+            self._record_error(
+                make_error(
+                    f"bridge background poll failed after completion: {exc}",
+                    source="bridge_reader",
+                    kind="error",
+                )
+            )
+
+    def _ensure_bridge_poll_loop(self) -> asyncio.AbstractEventLoop | None:
+        loop = self._bridge_poll_loop
+        thread = self._bridge_poll_thread
+        if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+            return loop
+
+        ready = threading.Event()
+        holder: dict[str, asyncio.AbstractEventLoop] = {}
+        self._bridge_poll_thread_stop.clear()
+
+        def _run_loop() -> None:
+            worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker_loop)
+            holder["loop"] = worker_loop
+            ready.set()
+            try:
+                worker_loop.run_forever()
+            finally:
+                pending = [task for task in asyncio.all_tasks(worker_loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    worker_loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                worker_loop.close()
+
+        thread = threading.Thread(
+            target=_run_loop,
+            name="galgame-bridge-poll",
+            daemon=True,
+        )
+        thread.start()
+        if not ready.wait(timeout=2.0):
+            self._record_error(
+                make_error(
+                    "bridge background poll loop failed to start",
+                    source="bridge_reader",
+                    kind="error",
+                )
+            )
+            return None
+        self._bridge_poll_loop = holder.get("loop")
+        self._bridge_poll_thread = thread
+        return self._bridge_poll_loop
+
+    def _stop_bridge_poll_loop(self) -> None:
+        loop = self._bridge_poll_loop
+        thread = self._bridge_poll_thread
+        self._bridge_poll_loop = None
+        self._bridge_poll_thread = None
+        self._bridge_poll_thread_stop.set()
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
 
     def _background_bridge_poll_stale_timeout_seconds(self) -> float:
         if self._cfg is None:
@@ -583,6 +701,7 @@ class GalgamePlugin(NekoPluginBase):
     def _start_background_bridge_poll(self) -> bool:
         if self._cfg is None:
             return False
+        self._clear_completed_background_bridge_poll()
         if self._bridge_poll_task is not None:
             if not self._bridge_poll_task.done():
                 inflight_seconds = max(
@@ -601,14 +720,22 @@ class GalgamePlugin(NekoPluginBase):
                         )
                     )
                     self._bridge_poll_task.cancel()
+                    with self._state_lock:
+                        self._state.next_poll_at_monotonic = 0.0
                 return False
             self._bridge_poll_task = None
         self._bridge_poll_started_at = time.monotonic()
-        self._bridge_poll_task = asyncio.create_task(self._run_background_bridge_poll())
+        self._last_bridge_poll_launch_at = self._bridge_poll_started_at
+        self._bridge_poll_launch_count += 1
+        loop = self._ensure_bridge_poll_loop()
+        if loop is None:
+            return False
+        task = asyncio.run_coroutine_threadsafe(self._run_background_bridge_poll(), loop)
+        task.add_done_callback(lambda _task: self._clear_completed_background_bridge_poll())
+        self._bridge_poll_task = task
         return True
 
     async def _run_background_bridge_poll(self) -> None:
-        task = asyncio.current_task()
         started_at = self._bridge_poll_started_at or time.monotonic()
         self._bridge_poll_started_at = started_at
         try:
@@ -627,8 +754,6 @@ class GalgamePlugin(NekoPluginBase):
             finished_at = time.monotonic()
             self._bridge_poll_finished_at = finished_at
             self._last_bridge_poll_duration_seconds = max(0.0, finished_at - started_at)
-            if self._bridge_poll_task is task:
-                self._bridge_poll_task = None
 
     async def _cancel_background_bridge_poll(self) -> None:
         task = self._bridge_poll_task
@@ -638,11 +763,12 @@ class GalgamePlugin(NekoPluginBase):
         if not task.done():
             task.cancel()
             try:
-                await task
+                await asyncio.wrap_future(task) if isinstance(task, Future) else await task
             except asyncio.CancelledError:
                 pass
             except Exception:
                 pass
+        self._stop_bridge_poll_loop()
 
     def _persist_preferences(
         self,
@@ -680,6 +806,16 @@ class GalgamePlugin(NekoPluginBase):
                 key="capture_backend",
                 value=capture_backend,
             )
+        _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
+
+    def _persist_ocr_timing(self, *, poll_interval_seconds: float) -> None:
+        text = _PLUGIN_TOML_PATH.read_text(encoding="utf-8")
+        text = _replace_toml_section_number_value(
+            text,
+            section="ocr_reader",
+            key="poll_interval_seconds",
+            value=poll_interval_seconds,
+        )
         _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
 
     def _persist_runtime_state(self, payload: dict[str, Any]) -> None:
@@ -986,6 +1122,7 @@ class GalgamePlugin(NekoPluginBase):
 
     @timer_interval(id="bridge_tick", seconds=1, auto_start=True)
     async def bridge_tick(self, **_):
+        self._clear_completed_background_bridge_poll()
         self._refresh_ocr_foreground_state()
         if self._game_agent is not None:
             self._last_agent_tick_at = time.monotonic()
@@ -1000,6 +1137,7 @@ class GalgamePlugin(NekoPluginBase):
                     )
                 )
         self._start_background_bridge_poll()
+        await asyncio.sleep(0)
         return Ok({"status": "tick"})
 
     def _refresh_ocr_foreground_state(self) -> None:
@@ -1026,8 +1164,12 @@ class GalgamePlugin(NekoPluginBase):
         if self._cfg is None:
             return
 
-        async with self._poll_bridge_lock:
+        while not self._poll_bridge_thread_lock.acquire(blocking=False):
+            await asyncio.sleep(0.05)
+        try:
             await self._poll_bridge_locked(force=force)
+        finally:
+            self._poll_bridge_thread_lock.release()
 
     async def _poll_bridge_locked(self, *, force: bool) -> None:
         if self._cfg is None:
@@ -1713,6 +1855,70 @@ class GalgamePlugin(NekoPluginBase):
             "summary": (
                 f"OCR backend={self._cfg.ocr_reader_backend_selection} "
                 f"capture_backend={self._cfg.ocr_reader_capture_backend}"
+            ),
+        }
+        return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_set_ocr_timing",
+        name="设置 OCR 识别间隔",
+        description="设置 OCR Reader 轮询间隔；DXcam 截图后端会随 OCR 轮询一起触发。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "poll_interval_seconds": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 10.0,
+                },
+            },
+            "required": ["poll_interval_seconds"],
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_set_ocr_timing(
+        self,
+        poll_interval_seconds: float,
+        **_,
+    ):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
+        try:
+            normalized_interval = float(poll_interval_seconds)
+        except (TypeError, ValueError):
+            return Err(SdkError("poll_interval_seconds must be a number"))
+        if normalized_interval < 0.5 or normalized_interval > 10.0:
+            return Err(SdkError("poll_interval_seconds must be between 0.5 and 10.0"))
+
+        old_interval = self._cfg.ocr_reader_poll_interval_seconds
+        self._cfg.ocr_reader_poll_interval_seconds = normalized_interval
+        if self._ocr_reader_manager is not None:
+            try:
+                self._ocr_reader_manager.update_config(self._cfg)
+            except Exception as exc:
+                self._cfg.ocr_reader_poll_interval_seconds = old_interval
+                return Err(SdkError(f"apply OCR timing failed: {exc}"))
+
+        with self._state_lock:
+            self._state.next_poll_at_monotonic = 0.0
+
+        try:
+            self._persist_ocr_timing(poll_interval_seconds=normalized_interval)
+        except Exception as exc:
+            self._cfg.ocr_reader_poll_interval_seconds = old_interval
+            if self._ocr_reader_manager is not None:
+                try:
+                    self._ocr_reader_manager.update_config(self._cfg)
+                except Exception:
+                    pass
+            return Err(SdkError(f"persist OCR timing failed: {exc}"))
+
+        self._start_background_bridge_poll()
+        payload = {
+            "poll_interval_seconds": self._cfg.ocr_reader_poll_interval_seconds,
+            "summary": (
+                "OCR/DXcam 识别间隔="
+                f"{self._cfg.ocr_reader_poll_interval_seconds:.1f}s"
             ),
         }
         return Ok(payload)

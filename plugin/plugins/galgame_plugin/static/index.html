@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Galgame 插件设置</title>
-  <link rel="stylesheet" href="./style.css?v=20260426-backend-use-buttons-1">
+  <link rel="stylesheet" href="./style.css?v=20260426-region-scroll-1">
 </head>
 <body>
   <div class="page-shell">
@@ -53,6 +53,10 @@
                 <option value="medium">中等</option>
                 <option value="fast">快速</option>
               </select>
+            </label>
+            <label class="field">
+              <span>OCR/DXcam 识别间隔（秒）</span>
+              <input id="ocrPollIntervalInput" type="number" min="0.5" max="10" step="0.1" placeholder="2.0">
             </label>
             <button id="saveModeBtn" class="secondary">保存设置</button>
             <div class="inline-actions">
@@ -386,6 +390,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260426-backend-use-buttons-1"></script>
+  <script src="./main.js?v=20260426-region-scroll-1"></script>
 </body>
 </html>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from typing import Any, Callable
 
@@ -32,6 +33,7 @@ from .service import (
     mode_allows_agent_actuation,
     mode_allows_agent_push,
     mode_allows_choice_push,
+    resolve_effective_current_line,
 )
 
 
@@ -62,6 +64,8 @@ class GameLLMAgent:
     }
     _OCR_BRIDGE_ACTIVITY_GRACE_SECONDS = 4.0
     _CHOICE_PLANNING_TIMEOUT_SECONDS = 8.0
+    _SCENE_SUMMARY_PUSH_LINE_INTERVAL = 8
+    _CHOICE_ADVICE_WAIT_TIMEOUT_SECONDS = 90.0
     _DIALOGUE_ADVANCE_VARIANTS = (
         {
             "id": "advance_enter",
@@ -166,6 +170,10 @@ class GameLLMAgent:
         self._outbound_messages: list[dict[str, Any]] = []
         self._message_seq = 0
         self._last_interruption: dict[str, Any] = {}
+        self._pending_choice_advice: dict[str, Any] | None = None
+        self._summary_seen_line_keys: set[str] = set()
+        self._summary_lines_since_push = 0
+        self._summary_scene_id = ""
         self._failure_memory: list[dict[str, Any]] = []
         self._recent_local_inputs: list[dict[str, Any]] = []
         self._virtual_mouse_stats: dict[str, dict[str, Any]] = {}
@@ -226,6 +234,10 @@ class GameLLMAgent:
             self._inbound_messages.clear()
             self._outbound_messages.clear()
             self._last_interruption = {}
+            self._pending_choice_advice = None
+            self._summary_seen_line_keys.clear()
+            self._summary_lines_since_push = 0
+            self._summary_scene_id = ""
             self._failure_memory.clear()
             self._recent_local_inputs.clear()
             self._virtual_mouse_stats.clear()
@@ -327,37 +339,20 @@ class GameLLMAgent:
                     self._last_status = status
                     return
                 choice_signature = build_choice_signature(visible_choices)
-                if (
-                    self._planning_started_at > 0
-                    and self._planning_choice_signature == choice_signature
-                    and now - self._planning_started_at >= self._CHOICE_PLANNING_TIMEOUT_SECONDS
-                ):
-                    self._trace_runtime(
-                        "tick using choice fallback after stale planning window: "
-                        f"choices={len(visible_choices)}"
-                    )
-                    self._planning_started_at = 0.0
-                    await self._start_choice_fallback_actuation(
-                        shared,
-                        current_choices=visible_choices,
-                        now=now,
-                        diagnostic="timeout: previous choice planning did not complete",
-                    )
-                    self._last_status = self._compute_status(shared)
-                    return
-                context = build_suggest_context(shared)
-                self._trace_runtime(
-                    "tick starting choice planning: "
-                    f"scene={str(snapshot.get('scene_id') or '') or 'none'} "
-                    f"line={str(snapshot.get('line_id') or '') or 'none'} "
-                    f"choices={len(context['visible_choices'])}"
-                )
-                self._planning_choice_signature = build_choice_signature(context["visible_choices"])
-                self._planning_candidates = []
-                self._planning_started_at = now
-                self._planning_task = asyncio.create_task(
-                    self._llm_gateway.suggest_choice(context)
-                )
+                if self._pending_choice_advice is not None:
+                    pending_signature = tuple(self._pending_choice_advice.get("choice_signature") or ())
+                    if pending_signature == choice_signature:
+                        waited = now - float(self._pending_choice_advice.get("requested_at") or now)
+                        self._trace_runtime(
+                            "tick waiting for cat choice advice: "
+                            f"choices={len(visible_choices)} waited={waited:.1f}s"
+                        )
+                        self._next_actuation_at = now + 1.0
+                        self._last_status = status
+                        return
+                    self._pending_choice_advice = None
+
+                self._request_choice_advice(shared, visible_choices, snapshot=snapshot, now=now)
                 self._last_status = self._compute_status(shared)
                 return
 
@@ -1842,6 +1837,193 @@ class GameLLMAgent:
             item.pop("rank", None)
         return candidates
 
+    def _request_choice_advice(
+        self,
+        shared: dict[str, Any],
+        current_choices: list[dict[str, Any]],
+        *,
+        snapshot: dict[str, Any],
+        now: float,
+    ) -> None:
+        candidates = self._build_choice_candidates(
+            current_choices,
+            {"degraded": True, "choices": [], "diagnostic": "waiting_for_cat_advice"},
+        )
+        choice_signature = build_choice_signature(current_choices)
+        self._planning_choice_signature = choice_signature
+        self._planning_candidates = json_copy(candidates)
+        pre_choice_save_diagnostic = (
+            "通用空存档自动保存尚未接入；执行选择前需要游戏专用存档 skill "
+            "或猫娘/用户确认可用空存档位。"
+        )
+        self._pending_choice_advice = {
+            "choice_signature": choice_signature,
+            "candidates": json_copy(candidates),
+            "requested_at": now,
+            "scene_id": str(snapshot.get("scene_id") or ""),
+            "route_id": str(snapshot.get("route_id") or ""),
+            "line_id": str(snapshot.get("line_id") or ""),
+            "save_before_choice": True,
+            "pre_choice_save_status": "not_attempted",
+            "pre_choice_save_diagnostic": pre_choice_save_diagnostic,
+        }
+        rendered_choices = [
+            f"{index}. {str(choice.get('text') or '')}"
+            for index, choice in enumerate(candidates, start=1)
+        ]
+        content = (
+            "出现选项，请猫娘给出建议后返回给游戏 LLM 执行选择。\n"
+            "选择前建议先保存到空存档位；当前通用空存档自动保存尚未接入，"
+            "请在建议中说明是否继续选择。\n"
+            + "\n".join(rendered_choices)
+        )
+        self._push_agent_message(
+            shared,
+            kind="choice_advice_request",
+            content=content,
+            scene_id=str(snapshot.get("scene_id") or ""),
+            route_id=str(snapshot.get("route_id") or ""),
+            metadata={
+                "choices": json_copy(candidates),
+                "line_id": str(snapshot.get("line_id") or ""),
+                "save_before_choice": True,
+                "pre_choice_save_status": "not_attempted",
+                "pre_choice_save_diagnostic": pre_choice_save_diagnostic,
+            },
+        )
+        self._trace_runtime(
+            "choice advice requested from cat: "
+            f"scene={str(snapshot.get('scene_id') or '') or 'none'} choices={len(candidates)}"
+        )
+        self._next_actuation_at = now + 1.0
+
+    def _resolve_choice_advice_candidate(
+        self,
+        message: str,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[int, str]:
+        normalized = str(message or "").strip()
+        if not normalized or not candidates:
+            return (-1, "")
+        lowered = normalized.lower()
+        for pattern in (r"(?:选择|选|建议|推荐|第)\s*([1-9][0-9]*)", r"\b([1-9][0-9]*)\b"):
+            match = re.search(pattern, normalized)
+            if not match:
+                continue
+            try:
+                candidate_index = int(match.group(1)) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= candidate_index < len(candidates):
+                return (candidate_index, f"cat_advice_index_{candidate_index + 1}")
+        for token, candidate_index in {
+            "一": 0,
+            "二": 1,
+            "三": 2,
+            "四": 3,
+            "五": 4,
+            "六": 5,
+            "七": 6,
+            "八": 7,
+            "九": 8,
+        }.items():
+            if token in normalized and 0 <= candidate_index < len(candidates):
+                return (candidate_index, f"cat_advice_chinese_index_{token}")
+        for index, candidate in enumerate(candidates):
+            text = str(candidate.get("text") or "").strip()
+            if text and (text in normalized or text.lower() in lowered):
+                return (index, "cat_advice_choice_text")
+        return (-1, "")
+
+    async def _apply_pending_choice_advice(
+        self,
+        shared: dict[str, Any],
+        *,
+        message: str,
+    ) -> dict[str, Any] | None:
+        pending = self._pending_choice_advice
+        if pending is None:
+            return None
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        current_choices = list(snapshot.get("choices") or [])
+        current_signature = build_choice_signature(current_choices)
+        pending_signature = tuple(pending.get("choice_signature") or ())
+        if current_signature != pending_signature:
+            self._pending_choice_advice = None
+            return {
+                "action": "send_message",
+                "result": "选项已变化，已丢弃旧的猫娘建议请求。",
+                "status": self._compute_status(shared),
+                "degraded": True,
+                "diagnostic": "choice_advice_stale: visible choices changed",
+                "input_source": self._current_input_source(shared),
+            }
+
+        candidates = list(pending.get("candidates") or [])
+        candidate_index, reason = self._resolve_choice_advice_candidate(message, candidates)
+        if candidate_index < 0:
+            return None
+
+        status = self._compute_status(shared)
+        if (
+            not self._is_actionable(shared)
+            or not self._should_actuate(shared)
+            or self._should_pause_for_target_window_focus(shared)
+            or self._should_hold_for_ocr_capture_diagnostic(shared)
+        ):
+            self._last_status = status
+            return {
+                "action": "send_message",
+                "result": "已收到猫娘选项建议，但当前模式或安全门禁不允许自动选择。",
+                "status": status,
+                "degraded": True,
+                "diagnostic": (
+                    self._target_window_focus_diagnostic(shared)
+                    or self._ocr_capture_diagnostic
+                    or "choice_advice_not_actionable: 当前不是自动推进模式或会话不可操作"
+                ),
+                "input_source": self._current_input_source(shared),
+                "pending_choice_advice": json_copy(pending),
+            }
+
+        strategy = self._build_choice_strategy(
+            shared,
+            candidate_choices=candidates,
+            candidate_index=candidate_index,
+            instruction_variant=0,
+        )
+        if strategy is None:
+            return {
+                "action": "send_message",
+                "result": "猫娘建议已收到，但无法构建选项执行策略。",
+                "status": self._compute_status(shared),
+                "degraded": True,
+                "diagnostic": "choice_advice_no_strategy",
+                "input_source": self._current_input_source(shared),
+            }
+        strategy["suggestion_reason"] = (
+            f"cat_advice:{reason}; "
+            f"pre_choice_save_status={str(pending.get('pre_choice_save_status') or '')}; "
+            f"{str(pending.get('pre_choice_save_diagnostic') or '')}"
+        )
+        self._pending_choice_advice = None
+        await self._start_actuation_from_strategy(shared, strategy=strategy, now=time.monotonic())
+        status = self._compute_status(shared)
+        self._last_status = status
+        selected = candidates[candidate_index] if candidate_index < len(candidates) else {}
+        return {
+            "action": "send_message",
+            "result": (
+                "已采纳猫娘选项建议，准备执行选择："
+                f"{str(selected.get('text') or '')}"
+            ),
+            "status": status,
+            "degraded": False,
+            "diagnostic": str(pending.get("pre_choice_save_diagnostic") or ""),
+            "input_source": self._current_input_source(shared),
+            "selected_choice": json_copy(selected),
+        }
+
     def _build_retry_strategy(
         self,
         shared: dict[str, Any],
@@ -2203,8 +2385,17 @@ class GameLLMAgent:
         scene_id: str,
         route_id: str,
         priority: int,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         created_at = self._utc_now_iso()
+        message_metadata = {
+            "kind": kind,
+            "scene_id": scene_id,
+            "route_id": route_id,
+            "ts": created_at,
+        }
+        if metadata:
+            message_metadata.update(dict(metadata))
         message = {
             "message_id": self._new_message_id(direction="outbound", kind=kind),
             "direction": "outbound",
@@ -2215,12 +2406,7 @@ class GameLLMAgent:
             "created_at": created_at,
             "delivered_at": "",
             "acked_at": "",
-            "metadata": {
-                "kind": kind,
-                "scene_id": scene_id,
-                "route_id": route_id,
-                "ts": created_at,
-            },
+            "metadata": message_metadata,
         }
         self._outbound_messages.append(message)
         if len(self._outbound_messages) > 100:
@@ -2385,6 +2571,56 @@ class GameLLMAgent:
                 )
                 raise
 
+    def _handle_low_frequency_control_message(
+        self,
+        shared: dict[str, Any],
+        *,
+        message: str,
+    ) -> dict[str, Any] | None:
+        normalized = str(message or "").strip()
+        if not normalized:
+            return None
+        if any(token in normalized for token in ("暂停剧情", "暂停推进", "先暂停", "暂停游戏")):
+            self._explicit_standby = True
+            status = self._compute_status(shared)
+            self._last_status = status
+            return {
+                "action": "send_message",
+                "result": "已按猫娘消息暂停游戏 LLM 自动推进。",
+                "status": status,
+                "degraded": False,
+                "diagnostic": "",
+                "input_source": self._current_input_source(shared),
+            }
+        if any(token in normalized for token in ("继续推动剧情", "继续推进", "继续剧情", "恢复推进")):
+            self._explicit_standby = False
+            self._next_actuation_at = 0.0
+            status = self._compute_status(shared)
+            self._last_status = status
+            return {
+                "action": "send_message",
+                "result": "已按猫娘消息恢复游戏 LLM，可在允许模式下继续推进。",
+                "status": status,
+                "degraded": False,
+                "diagnostic": "",
+                "input_source": self._current_input_source(shared),
+            }
+        if any(token in normalized for token in ("保存存档", "存档", "保存游戏")):
+            status = self._compute_status(shared)
+            self._last_status = status
+            return {
+                "action": "send_message",
+                "result": "已收到保存存档请求，但通用空存档自动保存尚未接入。",
+                "status": status,
+                "degraded": True,
+                "diagnostic": (
+                    "save_not_available: 需要游戏专用存档 skill 或用户确认空存档位，"
+                    "当前不会静默假装已保存。"
+                ),
+                "input_source": self._current_input_source(shared),
+            }
+        return None
+
     async def send_message(self, shared: dict[str, Any], *, message: str) -> dict[str, Any]:
         self._ensure_loop_affinity()
         async with self._op_lock:
@@ -2398,6 +2634,18 @@ class GameLLMAgent:
             try:
                 await self._interrupt_for_inbound_message(inbound)
                 self._recover_retryable_error_if_ready(time.monotonic())
+                control_payload = self._handle_low_frequency_control_message(shared, message=message)
+                if control_payload is not None:
+                    self._mark_message(inbound, status="completed", delivered=True)
+                    control_payload["message"] = json_copy(inbound)
+                    return control_payload
+
+                choice_payload = await self._apply_pending_choice_advice(shared, message=message)
+                if choice_payload is not None:
+                    self._mark_message(inbound, status="completed", delivered=True)
+                    choice_payload["message"] = json_copy(inbound)
+                    return choice_payload
+
                 payload = await self._llm_gateway.agent_reply(
                     self._build_agent_reply_context(shared, prompt=message)
                 )
@@ -2440,6 +2688,7 @@ class GameLLMAgent:
             self._clear_hard_error()
             self._observed_choice_marker = ""
             self._observed_scene_id = str(snapshot.get("scene_id") or "")
+            self._summary_scene_id = self._observed_scene_id
             self._observed_session_id = session_id
             self._observed_virtual_mouse_runtime_key = virtual_mouse_runtime_key
             self._clear_ocr_capture_diagnostic()
@@ -2482,11 +2731,16 @@ class GameLLMAgent:
                 self._push_agent_message(
                     shared,
                     kind="scene_summary",
-                    content=summary,
+                    content=f"剧情摘要（请猫娘评论）：{summary}",
                     scene_id=current_scene_id,
                     route_id=current_route_id,
                 )
             self._observed_scene_id = current_scene_id
+            self._summary_scene_id = current_scene_id
+            self._summary_seen_line_keys.clear()
+            self._summary_lines_since_push = 0
+
+        self._maybe_push_periodic_scene_summary(shared, snapshot=snapshot)
 
         selected = latest_selected_choice(shared.get("history_choices", []))
         if selected is not None:
@@ -2524,6 +2778,66 @@ class GameLLMAgent:
                     )
                 self._observed_choice_marker = marker
 
+    def _line_summary_key(self, line: dict[str, Any]) -> str:
+        line_id = str(line.get("line_id") or "").strip()
+        text = str(line.get("text") or "").strip()
+        speaker = str(line.get("speaker") or "").strip()
+        return line_id or f"{speaker}:{text}"
+
+    def _maybe_push_periodic_scene_summary(
+        self,
+        shared: dict[str, Any],
+        *,
+        snapshot: dict[str, Any],
+    ) -> None:
+        if not self._should_push_scene(shared):
+            return
+        scene_id = str(snapshot.get("scene_id") or "")
+        if not scene_id:
+            return
+        if scene_id != self._summary_scene_id:
+            self._summary_scene_id = scene_id
+            self._summary_seen_line_keys.clear()
+            self._summary_lines_since_push = 0
+
+        context = build_summarize_context(shared, scene_id=scene_id)
+        scene_lines = list(context.get("recent_lines") or [])
+        new_line_count = 0
+        for line in scene_lines:
+            if not isinstance(line, dict) or not str(line.get("text") or "").strip():
+                continue
+            key = self._line_summary_key(line)
+            if not key or key in self._summary_seen_line_keys:
+                continue
+            self._summary_seen_line_keys.add(key)
+            new_line_count += 1
+
+        if new_line_count <= 0:
+            return
+        self._summary_lines_since_push += new_line_count
+        if self._summary_lines_since_push < self._SCENE_SUMMARY_PUSH_LINE_INTERVAL:
+            return
+
+        summary = build_local_scene_summary(
+            scene_id=scene_id,
+            route_id=str(context.get("route_id") or snapshot.get("route_id") or ""),
+            lines=list(context.get("recent_lines") or []),
+            selected_choices=list(context.get("recent_choices") or []),
+            snapshot=snapshot,
+        )
+        self._summary_lines_since_push %= self._SCENE_SUMMARY_PUSH_LINE_INTERVAL
+        self._push_agent_message(
+            shared,
+            kind="scene_summary",
+            content=f"剧情摘要（请猫娘评论）：{summary}",
+            scene_id=scene_id,
+            route_id=str(context.get("route_id") or snapshot.get("route_id") or ""),
+            metadata={
+                "trigger": "line_count",
+                "line_interval": self._SCENE_SUMMARY_PUSH_LINE_INTERVAL,
+            },
+        )
+
     def _push_agent_message(
         self,
         shared: dict[str, Any],
@@ -2532,6 +2846,7 @@ class GameLLMAgent:
         content: str,
         scene_id: str,
         route_id: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if not content:
             return
@@ -2541,6 +2856,7 @@ class GameLLMAgent:
             scene_id=scene_id,
             route_id=route_id,
             priority=6,
+            metadata=metadata,
         )
         try:
             self._plugin.push_message(
@@ -2564,20 +2880,23 @@ class GameLLMAgent:
         observed_lines = list(shared.get("history_observed_lines") or [])[-8:]
         recent_choices = list(shared.get("history_choices") or [])[-8:]
         recent_lines = [*stable_lines, *observed_lines][-8:]
+        effective_line = resolve_effective_current_line(shared) or {}
         latest_line = ""
-        if snapshot.get("text"):
-            speaker = str(snapshot.get("speaker") or "Narration")
+        if effective_line.get("text"):
+            speaker = str(effective_line.get("speaker") or "Narration")
             latest_line = (
                 f"{speaker}: "
-                f"{str(snapshot.get('text') or '')}"
+                f"{str(effective_line.get('text') or '')}"
             )
         public_context = {
             "current_line": {
-                "speaker": str(snapshot.get("speaker") or ""),
-                "text": str(snapshot.get("text") or ""),
-                "line_id": str(snapshot.get("line_id") or ""),
-                "scene_id": str(snapshot.get("scene_id") or ""),
-                "route_id": str(snapshot.get("route_id") or ""),
+                "speaker": str(effective_line.get("speaker") or ""),
+                "text": str(effective_line.get("text") or ""),
+                "line_id": str(effective_line.get("line_id") or ""),
+                "scene_id": str(effective_line.get("scene_id") or snapshot.get("scene_id") or ""),
+                "route_id": str(effective_line.get("route_id") or snapshot.get("route_id") or ""),
+                "source": str(effective_line.get("source") or ""),
+                "stability": str(effective_line.get("stability") or ""),
             },
             "latest_line": latest_line,
             "recent_lines": json_copy(recent_lines),
@@ -2716,6 +3035,17 @@ class GameLLMAgent:
         )
         debug_now = time.monotonic()
         pause_info = self._agent_pause_info(shared, status=status)
+        pending_choice_advice = json_copy(self._pending_choice_advice or {})
+        pending_choice_requested_at = float(pending_choice_advice.get("requested_at") or 0.0)
+        pending_choice_age = (
+            max(0.0, debug_now - pending_choice_requested_at)
+            if pending_choice_requested_at > 0
+            else 0.0
+        )
+        scene_summary_lines_until_push = max(
+            0,
+            self._SCENE_SUMMARY_PUSH_LINE_INTERVAL - int(self._summary_lines_since_push or 0),
+        )
         return {
             "result": self._build_status_result(
                 shared,
@@ -2746,6 +3076,12 @@ class GameLLMAgent:
             "outbound_queue_size": len(self._outbound_messages),
             "last_interruption": json_copy(self._last_interruption),
             "last_outbound_message": last_outbound_message,
+            "pending_choice_advice": pending_choice_advice,
+            "pending_choice_advice_age_seconds": pending_choice_age,
+            "choice_advice_wait_timeout_seconds": self._CHOICE_ADVICE_WAIT_TIMEOUT_SECONDS,
+            "scene_summary_line_interval": self._SCENE_SUMMARY_PUSH_LINE_INTERVAL,
+            "scene_summary_lines_since_push": self._summary_lines_since_push,
+            "scene_summary_lines_until_push": scene_summary_lines_until_push,
             "memory_counts": {
                 "scene_memory": len(self._scene_memory),
                 "choice_memory": len(self._choice_memory),

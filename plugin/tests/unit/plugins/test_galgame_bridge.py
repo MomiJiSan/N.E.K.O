@@ -5437,24 +5437,13 @@ def test_host_agent_adapter_rebuilds_client_after_loop_switch(monkeypatch: pytes
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
-async def test_game_llm_agent_uses_rank1_choice_and_records_push_history(tmp_path: Path) -> None:
+async def test_game_llm_agent_uses_cat_choice_advice_and_records_push_history(
+    tmp_path: Path,
+) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
     plugin = GalgameBridgePlugin(ctx)
-    fake_gateway = _FakeLLMGateway(
-        suggest_payload={
-            "degraded": False,
-            "choices": [
-                {
-                    "choice_id": "choice-2",
-                    "text": "右边",
-                    "rank": 1,
-                    "reason": "更符合当前目标",
-                }
-            ],
-            "diagnostic": "",
-        }
-    )
+    fake_gateway = _FakeLLMGateway()
     fake_host = _FakeHostAdapter()
     agent = GameLLMAgent(
         plugin=plugin,
@@ -5490,7 +5479,13 @@ async def test_game_llm_agent_uses_rank1_choice_and_records_push_history(tmp_pat
 
     await agent.tick(shared)
     await asyncio.sleep(0)
-    await agent.tick(shared)
+    status = await agent.query_status(shared)
+    assert status["pending_choice_advice"]["pre_choice_save_status"] == "not_attempted"
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "choice_advice_request"
+
+    response = await agent.send_message(shared, message="建议选择 2，右边更符合当前目标")
+
+    assert response["selected_choice"]["choice_id"] == "choice-2"
     assert "右边" in fake_host.started[-1]
 
     fake_host.tasks["task-1"]["status"] = "completed"
@@ -5642,6 +5637,45 @@ async def test_game_llm_agent_companion_mode_does_not_plan_or_choose(tmp_path: P
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_cat_choice_advice_does_not_choose_in_companion_mode(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=fake_host,
+    )
+    snapshot = _session_state(
+        speaker="雪乃",
+        text="你要走哪边？",
+        scene_id="scene-a",
+        line_id="line-1",
+        choices=[
+            {"choice_id": "choice-1", "text": "左边", "index": 0, "enabled": True},
+            {"choice_id": "choice-2", "text": "右边", "index": 1, "enabled": True},
+        ],
+        is_menu_open=True,
+    )
+    await agent.tick(_shared_state(mode="choice_advisor", snapshot=snapshot))
+
+    response = await agent.send_message(
+        _shared_state(mode="companion", snapshot=snapshot),
+        message="建议选择 2",
+    )
+
+    assert response["degraded"] is True
+    assert "不允许自动选择" in response["result"]
+    assert fake_host.started == []
+    assert agent._pending_choice_advice is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_apply_mode_change_cancels_pending_retry(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
@@ -5750,13 +5784,13 @@ def test_game_llm_agent_reply_context_exposes_public_context_not_private_memory(
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
-async def test_game_llm_agent_falls_back_to_first_choice_when_suggest_is_degraded(tmp_path: Path) -> None:
+async def test_game_llm_agent_cat_choice_advice_can_select_first_visible_choice(
+    tmp_path: Path,
+) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
     plugin = GalgameBridgePlugin(ctx)
-    fake_gateway = _FakeLLMGateway(
-        suggest_payload={"degraded": True, "choices": [], "diagnostic": "busy"}
-    )
+    fake_gateway = _FakeLLMGateway()
     fake_host = _FakeHostAdapter()
     agent = GameLLMAgent(
         plugin=plugin,
@@ -5780,8 +5814,9 @@ async def test_game_llm_agent_falls_back_to_first_choice_when_suggest_is_degrade
 
     await agent.tick(shared)
     await asyncio.sleep(0)
-    await agent.tick(shared)
+    response = await agent.send_message(shared, message="建议选 1")
 
+    assert response["selected_choice"]["choice_id"] == "choice-1"
     assert "左边" in fake_host.started[-1]
 
 
@@ -5850,7 +5885,9 @@ async def test_game_llm_agent_ocr_choice_planning_waits_for_confirmed_choices_ev
     await agent.tick(shared_confirmed)
     await asyncio.sleep(0)
 
-    assert len(fake_gateway.suggest_calls) == 1
+    assert fake_gateway.suggest_calls == []
+    assert agent._pending_choice_advice is not None
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "choice_advice_request"
 
 
 @pytest.mark.asyncio
@@ -7374,6 +7411,53 @@ async def test_game_llm_agent_mode_controls_push_types(
     assert [item["metadata"]["kind"] for item in ctx.pushed_messages] == expected_kinds
     status = await agent.query_status(shared_after)
     assert [item["kind"] for item in status["recent_pushes"]] == expected_kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_pushes_scene_summary_after_eight_lines(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    lines = [
+        {
+            "line_id": f"line-{index}",
+            "speaker": "雪乃",
+            "text": f"第 {index} 句台词。",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "ts": f"2026-04-21T08:33:{index:02d}Z",
+        }
+        for index in range(1, 9)
+    ]
+    shared = _shared_state(
+        mode="companion",
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第 8 句台词。",
+            scene_id="scene-a",
+            line_id="line-8",
+            ts="2026-04-21T08:33:08Z",
+        ),
+        history_lines=lines,
+    )
+
+    await agent.tick(shared)
+    await agent.tick(shared)
+
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "scene_summary"
+    assert ctx.pushed_messages[-1]["metadata"]["trigger"] == "line_count"
+    assert "请猫娘评论" in ctx.pushed_messages[-1]["content"]
+    status = await agent.query_status(shared)
+    assert status["scene_summary_line_interval"] == 8
 
 
 @pytest.mark.asyncio

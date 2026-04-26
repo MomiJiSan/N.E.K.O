@@ -1205,6 +1205,11 @@ function renderStatus(status) {
   document.getElementById('modeSelect').value = status.mode || 'companion';
   document.getElementById('pushToggle').checked = Boolean(status.push_notifications);
   document.getElementById('advanceSpeedSelect').value = status.advance_speed || 'medium';
+  const ocrPollIntervalInput = document.getElementById('ocrPollIntervalInput');
+  if (ocrPollIntervalInput) {
+    const interval = Number(status.ocr_reader_poll_interval_seconds || 2);
+    ocrPollIntervalInput.value = Number.isFinite(interval) ? interval.toFixed(1) : '2.0';
+  }
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
@@ -1247,6 +1252,7 @@ function renderStatus(status) {
     { label: 'stream_reset_pending', value: String(Boolean(status.stream_reset_pending)) },
     { label: 'available_game_ids', value: (status.available_game_ids || []).join(', ') || '(none)' },
     { label: 'ocr_reader_enabled', value: String(Boolean(status.ocr_reader_enabled)) },
+    { label: 'ocr_poll_interval_seconds', value: String(status.ocr_reader_poll_interval_seconds || '') },
     { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
     { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
     { label: 'ocr_context_state', value: ocrRuntime.ocr_context_state || '' },
@@ -2460,6 +2466,21 @@ async function refreshInsights(snapshot, { force = false, history = {}, status =
   renderSuggest(suggest);
 }
 
+function renderInsightsPending(message = '解释、总结和选项建议正在后台刷新...') {
+  const payload = buildExplainFallback('', message);
+  renderExplain(payload);
+  renderSummary(buildSummaryFallback('', message));
+  renderSuggest(buildSuggestFallback('', message));
+}
+
+function runBackgroundTask(label, task) {
+  Promise.resolve()
+    .then(task)
+    .catch((error) => {
+      console.warn(`[galgame_plugin ui] ${label} failed`, error);
+    });
+}
+
 function stopAutoRefresh() {
   if (autoRefreshTimer !== null) {
     window.clearInterval(autoRefreshTimer);
@@ -2496,7 +2517,13 @@ async function refreshAll(options = {}) {
     return refreshInFlight;
   }
 
-  const { preserveFlash = false, silent = false, forceInsights = false } = options;
+  const {
+    preserveFlash = false,
+    silent = false,
+    forceInsights = false,
+    insightMode = 'background',
+    showInsightPending = false,
+  } = options;
   refreshInFlight = (async () => {
     if (!preserveFlash && !silent) {
       setFlash('', 'info');
@@ -2512,27 +2539,33 @@ async function refreshAll(options = {}) {
       renderSnapshot(snapshot);
       renderHistory(history);
       renderAgentStatus(agentStatus);
-      const skipBlockingInsights = silent && status.agent_user_status === 'paused_window_not_foreground';
-      const insightRefresh = refreshInsights(snapshot, { force: forceInsights, history, status });
-      if (skipBlockingInsights) {
-        insightRefresh.catch((error) => {
-          console.warn('[galgame_plugin ui] background insight refresh failed', error);
-        });
-      } else {
-        await insightRefresh;
+      if (showInsightPending && !latestInsights.explainPayload) {
+        renderInsightsPending();
       }
+      if (insightMode !== 'none') {
+        const insightRefresh = refreshInsights(snapshot, { force: forceInsights, history, status });
+        if (insightMode === 'blocking') {
+          await insightRefresh;
+        } else {
+          insightRefresh.catch((error) => {
+            console.warn('[galgame_plugin ui] background insight refresh failed', error);
+          });
+        }
+      }
+      return true;
     } catch (error) {
       renderPluginUnavailable(error);
       if (silent) {
         console.warn('[galgame_plugin ui] refresh failed', error);
-        return;
+        return false;
       }
       setFlash(error instanceof Error ? error.message : String(error), 'error');
+      return false;
     }
   })();
 
   try {
-    await refreshInFlight;
+    return await refreshInFlight;
   } finally {
     refreshInFlight = null;
   }
@@ -2691,12 +2724,21 @@ async function saveMode() {
   const mode = document.getElementById('modeSelect').value;
   const pushNotifications = document.getElementById('pushToggle').checked;
   const advanceSpeed = document.getElementById('advanceSpeedSelect').value || 'medium';
+  const ocrPollIntervalRaw = document.getElementById('ocrPollIntervalInput')?.value || '';
+  const ocrPollInterval = Number(ocrPollIntervalRaw || 2);
+  if (!Number.isFinite(ocrPollInterval) || ocrPollInterval < 0.5 || ocrPollInterval > 10) {
+    setFlash('OCR/DXcam 识别间隔必须在 0.5 到 10 秒之间。', 'error');
+    return;
+  }
   try {
     setFlash('正在保存设置...', 'info');
     await callPlugin('galgame_set_mode', {
       mode,
       push_notifications: pushNotifications,
       advance_speed: advanceSpeed,
+    });
+    await callPlugin('galgame_set_ocr_timing', {
+      poll_interval_seconds: ocrPollInterval,
     });
     setFlash('设置已保存', 'success');
     await refreshAll({ preserveFlash: true, forceInsights: true });
@@ -2941,24 +2983,35 @@ function switchInstallTab(tab) {
 }
 
 async function initialize() {
-  await refreshAll({ forceInsights: true });
-  await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
-  await Promise.all([
+  switchInstallTab(activeInstallTab);
+  renderInsightsPending('等待首轮状态刷新；解释、总结和选项建议会在后台更新。');
+  setFlash('正在加载插件状态...', 'info');
+  const loaded = await refreshAll({ forceInsights: false, showInsightPending: true });
+  if (loaded) {
+    setFlash('插件状态已加载；解释/总结、窗口列表和依赖状态正在后台更新。', 'success');
+  }
+  runBackgroundTask('refresh OCR window targets', () => (
+    refreshOcrWindowTargets({ includeExcluded: true, silent: true })
+  ));
+  runBackgroundTask('restore install states', () => Promise.all([
     restoreRapidOcrInstallState(),
     restoreDxcamInstallState(),
     restoreTesseractInstallState(),
     restoreTextractorInstallState(),
-  ]);
-  switchInstallTab(activeInstallTab);
+  ]));
   startAutoRefresh();
 }
 
 document.getElementById('refreshBtn').addEventListener('click', async () => {
   await withButtonPending('refreshBtn', '刷新中...', async () => {
     setFlash('正在刷新插件状态...', 'info');
-    await refreshAll({ forceInsights: true });
-    await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
-    setFlash('刷新完成', 'success');
+    const loaded = await refreshAll({ forceInsights: true, showInsightPending: true });
+    runBackgroundTask('refresh OCR window targets', () => (
+      refreshOcrWindowTargets({ includeExcluded: true, silent: true })
+    ));
+    if (loaded) {
+      setFlash('状态已刷新；解释/总结和窗口列表在后台更新。', 'success');
+    }
   });
 });
 document.getElementById('saveModeBtn').addEventListener('click', () => {

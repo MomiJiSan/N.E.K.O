@@ -113,6 +113,14 @@ _HELPER_CLASS_NAMES = {
     "Windows.UI.Composition.DesktopWindowContentBridge",
 }
 _SELF_UI_GUARD_SUBSTRINGS = (
+    ".agent",
+    ".codex",
+    ".codex_tmp",
+    ".codex_pytest_tmp",
+    "__pycache__",
+    "-pycache_",
+    "codex_tmp",
+    "documents\\code\\n.e.k.o",
     "rapidocr",
     "tesseract",
     "ocr compatibility fallback",
@@ -141,6 +149,11 @@ _SELF_UI_GUARD_SUBSTRINGS = (
     "当前台词解释",
     "场景总结",
     "游戏 agent",
+    "plugin.plugins.galgame_plugin",
+    "uv run python",
+    "launcher.py",
+    "powershell",
+    "ps c:",
 )
 _AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
 _AIHONG_TITLE_SUBSTRINGS = ("哀鸿", "aihong")
@@ -1079,6 +1092,9 @@ class OcrReaderRuntime:
     capture_backend_kind: str = ""
     capture_backend_detail: str = ""
     last_capture_image_hash: str = ""
+    last_capture_source_size: dict[str, float] = field(default_factory=dict)
+    last_capture_rect: dict[str, float] = field(default_factory=dict)
+    last_capture_window_rect: dict[str, float] = field(default_factory=dict)
     consecutive_same_capture_frames: int = 0
     stale_capture_backend: bool = False
     foreground_refresh_at: str = ""
@@ -1142,6 +1158,9 @@ class OcrReaderRuntime:
             "capture_backend_kind": self.capture_backend_kind,
             "capture_backend_detail": self.capture_backend_detail,
             "last_capture_image_hash": self.last_capture_image_hash,
+            "last_capture_source_size": dict(self.last_capture_source_size),
+            "last_capture_rect": dict(self.last_capture_rect),
+            "last_capture_window_rect": dict(self.last_capture_window_rect),
             "consecutive_same_capture_frames": self.consecutive_same_capture_frames,
             "stale_capture_backend": self.stale_capture_backend,
             "foreground_refresh_at": self.foreground_refresh_at,
@@ -1232,6 +1251,46 @@ def _target_window_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Invalid window dimensions: {width}x{height}")
     return (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+
+
+def _run_with_thread_dpi_awareness(fn: Callable[[], tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    user32 = getattr(ctypes, "windll", None)
+    user32 = getattr(user32, "user32", None) if user32 is not None else None
+    set_context = getattr(user32, "SetThreadDpiAwarenessContext", None) if user32 is not None else None
+    if not callable(set_context):
+        return fn()
+    old_context = None
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. This is thread-local and
+        # avoids globally changing the plugin process.
+        old_context = set_context(ctypes.c_void_p(-4))
+    except Exception:
+        old_context = None
+    try:
+        return fn()
+    finally:
+        if old_context:
+            try:
+                set_context(old_context)
+            except Exception:
+                pass
+
+
+def _target_client_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]:
+    import win32gui
+
+    def _read_rect() -> tuple[int, int, int, int]:
+        left, top, right, bottom = win32gui.GetClientRect(target.hwnd)
+        screen_left, screen_top = win32gui.ClientToScreen(target.hwnd, (left, top))
+        screen_right, screen_bottom = win32gui.ClientToScreen(target.hwnd, (right, bottom))
+        return (int(screen_left), int(screen_top), int(screen_right), int(screen_bottom))
+
+    rect = _run_with_thread_dpi_awareness(_read_rect)
+    width = int(rect[2] - rect[0])
+    height = int(rect[3] - rect[1])
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid client dimensions: {width}x{height}")
+    return rect
 
 
 def _require_visible_capture_target(target: DetectedGameWindow, *, backend_kind: str) -> None:
@@ -1446,7 +1505,7 @@ class DxcamCaptureBackend:
         from PIL import Image
 
         _require_visible_capture_target(target, backend_kind=self.kind)
-        rect = _target_window_rect(target)
+        rect = _target_client_rect(target)
         camera = self._camera_instance()
         frame = camera.grab(region=rect)
         if frame is None:
@@ -1457,7 +1516,7 @@ class DxcamCaptureBackend:
             window_rect=rect,
             profile=profile,
             backend_kind=self.kind,
-            backend_detail="selected",
+            backend_detail="selected_client_rect",
         )
 
 
@@ -1499,12 +1558,17 @@ class Win32CaptureBackend:
             try:
                 frame = backend.capture_frame(target, profile)
                 self.last_backend_kind = kind
-                self.last_backend_detail = (
+                frame_info = getattr(frame, "info", None)
+                frame_backend_detail = (
+                    str(frame_info.get("galgame_capture_backend_detail") or "")
+                    if isinstance(frame_info, dict)
+                    else ""
+                )
+                self.last_backend_detail = frame_backend_detail or (
                     "dxcam_unavailable_fallback"
                     if kind != _CAPTURE_BACKEND_DXCAM and "dxcam_unavailable" in errors
                     else "selected"
                 )
-                frame_info = getattr(frame, "info", None)
                 if isinstance(frame_info, dict):
                     frame_info["galgame_capture_backend_kind"] = kind
                     frame_info["galgame_capture_backend_detail"] = self.last_backend_detail
@@ -1942,7 +2006,7 @@ class OcrReaderBridgeWriter:
             "speaker": speaker,
             "text": text,
             "choices": [],
-            "scene_id": OCR_READER_UNKNOWN_SCENE,
+            "scene_id": self._current_scene_id(),
             "line_id": line_id,
             "route_id": OCR_READER_ROUTE_ID,
             "is_menu_open": False,
@@ -1983,7 +2047,7 @@ class OcrReaderBridgeWriter:
             "speaker": speaker,
             "text": text,
             "choices": [],
-            "scene_id": OCR_READER_UNKNOWN_SCENE,
+            "scene_id": self._current_scene_id(),
             "line_id": line_id,
             "route_id": OCR_READER_ROUTE_ID,
             "is_menu_open": False,
@@ -2044,6 +2108,7 @@ class OcrReaderBridgeWriter:
         self._state = {
             **self._state,
             "line_id": line_id,
+            "scene_id": self._current_scene_id(),
             "choices": payload_choices,
             "is_menu_open": True,
             "stability": "choices",
@@ -2123,7 +2188,7 @@ class OcrReaderBridgeWriter:
             "speaker": "",
             "text": "",
             "choices": [],
-            "scene_id": OCR_READER_UNKNOWN_SCENE,
+            "scene_id": self._current_scene_id(),
             "line_id": "",
             "route_id": OCR_READER_ROUTE_ID,
             "is_menu_open": False,
@@ -2131,6 +2196,13 @@ class OcrReaderBridgeWriter:
             "stability": "",
             "ts": ts,
         }
+
+    def _current_scene_id(self) -> str:
+        state = getattr(self, "_state", {}) or {}
+        current = str(state.get("scene_id") or "").strip()
+        if current and current != OCR_READER_UNKNOWN_SCENE:
+            return current
+        return f"ocr:{self._game_id or 'unknown'}:scene-0001"
 
     def _bridge_dir(self) -> Path:
         return self._bridge_root / self._game_id
@@ -2314,6 +2386,9 @@ class OcrReaderManager:
         self._last_observed_line: dict[str, Any] = {}
         self._last_stable_line: dict[str, Any] = {}
         self._last_capture_image_hash = ""
+        self._last_capture_source_size: dict[str, float] = {}
+        self._last_capture_rect: dict[str, float] = {}
+        self._last_capture_window_rect: dict[str, float] = {}
         self._consecutive_same_capture_frames = 0
         self._stale_capture_backend = False
         self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
@@ -2377,6 +2452,11 @@ class OcrReaderManager:
             self._stale_capture_backend = (
                 self._consecutive_same_capture_frames >= _STALE_CAPTURE_FRAME_THRESHOLD
             )
+
+    def _record_capture_geometry(self, extraction: OcrExtractionResult) -> None:
+        self._last_capture_source_size = dict(extraction.source_size or {})
+        self._last_capture_rect = dict(extraction.capture_rect or {})
+        self._last_capture_window_rect = dict(extraction.window_rect or {})
 
     def _record_capture_error(self, *, now: float, error: Exception) -> None:
         if not self._last_capture_attempt_at:
@@ -3030,6 +3110,9 @@ class OcrReaderManager:
         self._last_observed_line = {}
         self._last_stable_line = {}
         self._last_capture_image_hash = ""
+        self._last_capture_source_size = {}
+        self._last_capture_rect = {}
+        self._last_capture_window_rect = {}
         self._consecutive_same_capture_frames = 0
         self._stale_capture_backend = False
 
@@ -3172,10 +3255,11 @@ class OcrReaderManager:
             )
         if _looks_like_aihong_menu_status_only_text(raw_text):
             return _MenuConsumeResult(emitted_kind="", has_menu_candidate=True)
-        return _MenuConsumeResult(
-            emitted_kind="line" if self._emit_line_from_ocr_text(raw_text, now=now) else "",
-            has_menu_candidate=False,
-        )
+        # Menu-stage capture intentionally scans a much larger region so option
+        # OCR can find buttons anywhere on screen. Do not turn that full-screen
+        # text into a dialogue line; switch back to dialogue-stage capture and
+        # let the narrower profile read the next line.
+        return _MenuConsumeResult(emitted_kind="", has_menu_candidate=False)
 
     def _matches_attached_window(self, candidate: DetectedGameWindow) -> bool:
         if self._attached_window is None:
@@ -3407,6 +3491,7 @@ class OcrReaderManager:
                 raw_text=extraction.text,
                 image_hash=extraction.capture_image_hash,
             )
+            self._record_capture_geometry(extraction)
             self._capture_backend_kind = extraction.capture_backend_kind
             self._capture_backend_detail = extraction.capture_backend_detail
             active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
@@ -3415,6 +3500,8 @@ class OcrReaderManager:
             if extraction.text and _looks_like_self_ui_text(extraction.text):
                 guard_blocked = True
                 result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
+                self._default_ocr_state.reset()
+                self._aihong_menu_ocr_state.reset()
             else:
                 if aihong_two_stage_enabled:
                     if self._aihong_stage == _AIHONG_MENU_STAGE:
@@ -3492,6 +3579,7 @@ class OcrReaderManager:
                                 raw_text=followup_extraction.text,
                                 image_hash=followup_extraction.capture_image_hash,
                             )
+                            self._record_capture_geometry(followup_extraction)
                             self._capture_backend_kind = followup_extraction.capture_backend_kind
                             self._capture_backend_detail = followup_extraction.capture_backend_detail
                             active_backend = (
@@ -3504,6 +3592,9 @@ class OcrReaderManager:
                             )
                             result.warnings.extend(followup_extraction.warnings)
                             if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
+                                guard_blocked = True
+                                self._default_ocr_state.reset()
+                                self._aihong_menu_ocr_state.reset()
                                 result.warnings.append(
                                     "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                 )
@@ -3556,6 +3647,7 @@ class OcrReaderManager:
                                     raw_text=menu_extraction.text,
                                     image_hash=menu_extraction.capture_image_hash,
                                 )
+                                self._record_capture_geometry(menu_extraction)
                                 self._capture_backend_kind = menu_extraction.capture_backend_kind
                                 self._capture_backend_detail = menu_extraction.capture_backend_detail
                                 active_backend = (
@@ -3568,6 +3660,9 @@ class OcrReaderManager:
                                 )
                                 result.warnings.extend(menu_extraction.warnings)
                                 if menu_extraction.text and _looks_like_self_ui_text(menu_extraction.text):
+                                    guard_blocked = True
+                                    self._default_ocr_state.reset()
+                                    self._aihong_menu_ocr_state.reset()
                                     result.warnings.append(
                                         "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                     )
@@ -3619,6 +3714,7 @@ class OcrReaderManager:
                             raw_text=followup_extraction.text,
                             image_hash=followup_extraction.capture_image_hash,
                         )
+                        self._record_capture_geometry(followup_extraction)
                         self._capture_backend_kind = followup_extraction.capture_backend_kind
                         self._capture_backend_detail = followup_extraction.capture_backend_detail
                         active_backend = (
@@ -3631,6 +3727,9 @@ class OcrReaderManager:
                         )
                         result.warnings.extend(followup_extraction.warnings)
                         if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
+                            guard_blocked = True
+                            self._default_ocr_state.reset()
+                            self._aihong_menu_ocr_state.reset()
                             result.warnings.append(
                                 "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                             )
@@ -4027,6 +4126,15 @@ class OcrReaderManager:
             ),
             last_capture_image_hash=str(
                 self._last_capture_image_hash or self._runtime.last_capture_image_hash
+            ),
+            last_capture_source_size=dict(
+                self._last_capture_source_size or self._runtime.last_capture_source_size
+            ),
+            last_capture_rect=dict(
+                self._last_capture_rect or self._runtime.last_capture_rect
+            ),
+            last_capture_window_rect=dict(
+                self._last_capture_window_rect or self._runtime.last_capture_window_rect
             ),
             consecutive_same_capture_frames=max(
                 0,

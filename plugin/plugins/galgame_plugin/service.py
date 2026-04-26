@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -45,6 +46,76 @@ from .textractor_support import (
     DEFAULT_TEXTRACTOR_RELEASE_API_URL,
     inspect_textractor_installation,
 )
+
+_OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
+    ".agent",
+    ".codex",
+    ".codex_tmp",
+    ".codex_pytest_tmp",
+    "__pycache__",
+    "-pycache_",
+    "codex_tmp",
+    "documents\\code\\n.e.k.o",
+    "galgame plugin",
+    "n.e.k.o",
+    "plugin manager",
+    "plugin.plugins.galgame_plugin",
+    "uv run python",
+    "launcher.py",
+    "powershell",
+    "ps c:",
+    "插件设置",
+    "ocr 目标窗口",
+    "截图校准",
+)
+_CJK_OR_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
+_DIALOGUE_PUNCTUATION_RE = re.compile(r"[。！？!?…，,、：:]")
+_NON_DIALOGUE_CONTEXT_TOKENS = (
+    "capture_failed",
+    "context_state=",
+    "dxcam:",
+    "galgame_",
+    "gateway_unavailable",
+    "http://",
+    "https://",
+    "last_error=",
+    "ocr_context_unavailable",
+    "plugin/",
+    "plugin\\",
+    "powershell",
+    "status=",
+)
+
+
+def _looks_like_ocr_overlay_text(text: object) -> bool:
+    normalized = normalize_text(str(text or "")).strip().lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in _OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS)
+
+
+def _significant_char_count(text: object) -> int:
+    return sum(1 for ch in str(text or "") if not ch.isspace())
+
+
+def _looks_like_game_dialogue_context_line(line: dict[str, Any]) -> bool:
+    if not isinstance(line, dict) or bool(line.get("is_diagnostic")):
+        return False
+    text = normalize_text(str(line.get("text") or "")).strip()
+    if not text or _looks_like_ocr_overlay_text(text):
+        return False
+    lowered = text.lower()
+    if any(token in lowered for token in _NON_DIALOGUE_CONTEXT_TOKENS):
+        return False
+    if text.startswith("{") or text.startswith("[") or "{" in text and "}" in text:
+        return False
+    significant_chars = _significant_char_count(text)
+    if significant_chars < 2 or significant_chars > 220:
+        return False
+    has_cjk_or_kana = bool(_CJK_OR_KANA_RE.search(text))
+    has_dialogue_punctuation = bool(_DIALOGUE_PUNCTUATION_RE.search(text))
+    has_speaker = bool(str(line.get("speaker") or "").strip())
+    return has_cjk_or_kana or has_dialogue_punctuation or has_speaker
 
 
 def _coerce_float(value: object, default: float, *, minimum: float) -> float:
@@ -586,6 +657,8 @@ def apply_event_to_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> 
         return next_snapshot
 
     if event_type in {"line_observed", "line_changed"}:
+        if _looks_like_ocr_overlay_text(payload_obj.get("text")):
+            return next_snapshot
         next_snapshot["speaker"] = str(payload_obj.get("speaker") or "")
         next_snapshot["text"] = str(payload_obj.get("text") or "")
         next_snapshot["choices"] = []
@@ -662,6 +735,8 @@ def apply_event_to_histories(
     _append_limited(history_events, summarize_event(event), config.history_events_limit)
 
     if event_type == "line_observed":
+        if _looks_like_ocr_overlay_text(payload_obj.get("text")):
+            return
         if history_observed_lines is not None:
             _append_observed_line(
                 history_observed_lines,
@@ -671,6 +746,8 @@ def apply_event_to_histories(
         return
 
     if event_type == "line_changed":
+        if _looks_like_ocr_overlay_text(payload_obj.get("text")):
+            return
         fingerprint = _line_fingerprint(
             game_id,
             str(payload_obj.get("line_id") or ""),
@@ -854,6 +931,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "ocr_reader_enabled": config.ocr_reader_enabled,
         "ocr_backend_selection": config.ocr_reader_backend_selection,
         "ocr_capture_backend_selection": config.ocr_reader_capture_backend,
+        "ocr_reader_poll_interval_seconds": config.ocr_reader_poll_interval_seconds,
         "rapidocr_enabled": config.rapidocr_enabled,
         "dxcam": dxcam,
         "rapidocr": rapidocr,
@@ -864,9 +942,15 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
 
 def build_snapshot_payload(state) -> dict[str, Any]:
     stale = state.current_connection_state == STATE_STALE
+    snapshot = sanitize_snapshot_state(state.latest_snapshot)
+    if _looks_like_ocr_overlay_text(snapshot.get("text")):
+        snapshot["speaker"] = ""
+        snapshot["text"] = ""
+        snapshot["line_id"] = ""
+        snapshot["stability"] = ""
     effective_current_line = resolve_effective_current_line(
         {
-            "latest_snapshot": json_copy(state.latest_snapshot),
+            "latest_snapshot": json_copy(snapshot),
             "history_observed_lines": json_copy(state.history_observed_lines),
             "history_lines": json_copy(state.history_lines),
         }
@@ -874,23 +958,29 @@ def build_snapshot_payload(state) -> dict[str, Any]:
     return {
         "game_id": state.active_game_id,
         "session_id": state.active_session_id,
-        "snapshot": json_copy(state.latest_snapshot),
+        "snapshot": json_copy(snapshot),
         "effective_current_line": json_copy(effective_current_line or {}),
-        "snapshot_ts": str(state.latest_snapshot.get("ts") or "")
-        if isinstance(state.latest_snapshot, dict)
-        else "",
+        "snapshot_ts": str(snapshot.get("ts") or ""),
         "stale": stale,
     }
 
 
 def build_history_payload(state, *, limit: int, include_events: bool) -> dict[str, Any]:
     bounded_limit = max(1, limit)
+    stable_lines = [
+        item for item in state.history_lines
+        if not _looks_like_ocr_overlay_text((item if isinstance(item, dict) else {}).get("text"))
+    ]
+    observed_lines = [
+        item for item in state.history_observed_lines
+        if not _looks_like_ocr_overlay_text((item if isinstance(item, dict) else {}).get("text"))
+    ]
     return {
         "game_id": state.active_game_id,
         "session_id": state.active_session_id,
         "events": json_copy(state.history_events[-bounded_limit:]) if include_events else [],
-        "stable_lines": json_copy(state.history_lines[-bounded_limit:]),
-        "observed_lines": json_copy(state.history_observed_lines[-bounded_limit:]),
+        "stable_lines": json_copy(stable_lines[-bounded_limit:]),
+        "observed_lines": json_copy(observed_lines[-bounded_limit:]),
         "choices": json_copy(state.history_choices[-bounded_limit:]),
     }
 
@@ -939,6 +1029,8 @@ def build_choice_signature(choices: list[dict[str, Any]]) -> tuple[tuple[str, st
 def _current_line_entry(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     normalized = sanitize_snapshot_state(snapshot)
     if not normalized.get("line_id") or not normalized.get("text"):
+        return None
+    if _looks_like_ocr_overlay_text(normalized.get("text")):
         return None
     return {
         "line_id": str(normalized.get("line_id") or ""),
@@ -1073,6 +1165,14 @@ def _append_unique_line(
         return lines[-limit:]
     merged = list(lines) + [normalized]
     return merged[-limit:]
+
+
+def _dialogue_context_lines(lines: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    return [
+        dict(item)
+        for item in lines
+        if _looks_like_game_dialogue_context_line(item)
+    ][-limit:]
 
 
 def _is_memory_reader_identifier(value: object) -> bool:
@@ -1311,7 +1411,9 @@ def build_summarize_context(
         effective_scene_id,
         limit=20,
     )
-    scene_lines = [*stable_lines, *observed_lines][-20:]
+    stable_lines = _dialogue_context_lines(stable_lines, limit=20)
+    observed_lines = _dialogue_context_lines(observed_lines, limit=20)
+    scene_lines = _dialogue_context_lines([*stable_lines, *observed_lines], limit=20)
     selected_choices = _scene_selected_choices(
         local_state.get("history_choices", []),
         effective_scene_id,
