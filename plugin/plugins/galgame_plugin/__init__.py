@@ -1718,13 +1718,13 @@ class GalgamePlugin(NekoPluginBase):
         with self._state_lock:
             self._state.ocr_window_target = json_copy(target_payload)
         self._ocr_reader_manager.update_window_target(target_payload)
-        await self._poll_bridge(force=True)
+        background_poll_started = self._start_background_bridge_poll()
         return Ok(
             {
                 "window_target": json_copy(target_payload),
                 "cleared": bool(clear),
                 "summary": summary,
-                "status": await self._build_status_payload_async(),
+                "background_poll_started": background_poll_started,
             }
         )
 

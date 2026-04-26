@@ -1493,9 +1493,7 @@ function renderOcrWindowListToNode(node, windows) {
     node.querySelectorAll('[data-window-key]').forEach((button) => {
       button.addEventListener('click', () => {
         const key = button.getAttribute('data-window-key') || '';
-        setOcrWindowTarget(key).catch((error) => {
-          setFlash(error instanceof Error ? error.message : String(error), 'error');
-        });
+        withButtonPending(button, '锁定中...', () => setOcrWindowTarget(key)).catch(() => {});
       });
     });
   }
@@ -2505,14 +2503,19 @@ function closeOcrWindowModal() {
 
 async function setOcrWindowTarget(windowKey) {
   try {
+    setFlash('正在锁定 OCR 识别窗口...', 'info');
     const payload = await callPlugin('galgame_set_ocr_window_target', {
       window_key: windowKey,
       clear: false,
     });
-    setFlash(payload.summary || 'OCR 目标窗口已锁定', 'success');
+    const target = payload.window_target || {};
+    const targetName = target.process_name || target.normalized_title || '目标窗口';
+    setFlash(`已锁定 OCR 识别窗口：${targetName}。后台正在刷新识别状态。`, 'success');
     closeOcrWindowModal();
-    await refreshAll({ preserveFlash: true, forceInsights: true });
-    await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
+    refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
+      console.warn('[galgame_plugin ui] refresh after OCR window lock failed', error);
+    });
+    refreshOcrWindowTargets({ includeExcluded: true, silent: true }).catch(() => {});
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -2520,15 +2523,22 @@ async function setOcrWindowTarget(windowKey) {
 
 async function clearOcrWindowTarget() {
   try {
+    setFlash('正在恢复 OCR 自动选窗...', 'info');
     const payload = await callPlugin('galgame_set_ocr_window_target', {
       clear: true,
     });
-    setFlash(payload.summary || 'OCR 已恢复自动选窗', 'success');
-    await refreshAll({ preserveFlash: true, forceInsights: true });
-    await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
+    setFlash(payload.summary || 'OCR 已恢复自动选窗，后台正在刷新识别状态。', 'success');
+    refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
+      console.warn('[galgame_plugin ui] refresh after OCR auto target failed', error);
+    });
+    refreshOcrWindowTargets({ includeExcluded: true, silent: true }).catch(() => {});
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
+}
+
+async function clearOcrWindowTargetWithFeedback() {
+  await withButtonPending('ocrWindowAutoBtn', '恢复中...', clearOcrWindowTarget);
 }
 
 function switchInstallTab(tab) {
@@ -2594,7 +2604,9 @@ document.getElementById('ocrWindowRefreshBtn').addEventListener('click', () => {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   });
 });
-document.getElementById('ocrWindowAutoBtn').addEventListener('click', clearOcrWindowTarget);
+document.getElementById('ocrWindowAutoBtn').addEventListener('click', () => {
+  clearOcrWindowTargetWithFeedback().catch(() => {});
+});
 document.getElementById('ocrWindowSelectBtn').addEventListener('click', () => {
   openOcrWindowModal().catch((error) => {
     setFlash(error instanceof Error ? error.message : String(error), 'error');

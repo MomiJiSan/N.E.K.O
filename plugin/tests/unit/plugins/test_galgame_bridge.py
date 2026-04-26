@@ -3113,6 +3113,8 @@ async def test_list_and_set_ocr_window_target_updates_state_and_store(tmp_path: 
     assert isinstance(saved, Ok)
     assert saved.value["window_target"]["mode"] == "manual"
     assert saved.value["window_target"]["window_key"] == eligible_window.window_key
+    assert "background_poll_started" in saved.value
+    assert "status" not in saved.value
     with plugin._state_lock:
         assert plugin._state.ocr_window_target["window_key"] == eligible_window.window_key
     restored, _warnings = plugin._persist.load()
@@ -3127,8 +3129,11 @@ async def test_list_and_set_ocr_window_target_updates_state_and_store(tmp_path: 
 
     assert isinstance(cleared, Ok)
     assert cleared.value["window_target"]["mode"] == "auto"
+    assert "background_poll_started" in cleared.value
+    assert "status" not in cleared.value
     with plugin._state_lock:
         assert plugin._state.ocr_window_target["mode"] == "auto"
+    await plugin.shutdown()
 
 
 @pytest.mark.asyncio
