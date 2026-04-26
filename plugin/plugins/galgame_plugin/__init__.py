@@ -1226,6 +1226,12 @@ class GalgamePlugin(NekoPluginBase):
             stream_reset_pending=bool(local["stream_reset_pending"]),
             config=self._cfg,
         )
+        if (
+            self._cfg.ocr_reader_enabled
+            and str(ocr_reader_runtime.get("status") or "") in {"starting", "active"}
+            and str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
+        ):
+            interval = min(interval, float(self._cfg.ocr_reader_poll_interval_seconds))
         local["next_poll_at_monotonic"] = now_monotonic + interval
         self._commit_state(local)
 

@@ -166,6 +166,10 @@ const FIELD_LABELS_ZH = {
   foreground_refresh_detail: '前台刷新详情',
   foreground_hwnd: '当前前台 hwnd',
   target_hwnd: '目标 hwnd',
+  last_poll_started_at: '最近 OCR poll 开始',
+  last_poll_completed_at: '最近 OCR poll 完成',
+  last_poll_duration_seconds: '最近 OCR poll 耗时',
+  last_poll_emitted_event: '最近 OCR poll 产生事件',
   candidate_count: '候选窗口数',
   excluded_candidate_count: '排除窗口数',
   last_exclude_reason: '最近排除原因',
@@ -1456,6 +1460,13 @@ function renderOcrRuntime(status) {
     { label: 'foreground_refresh_detail', value: runtime.foreground_refresh_detail || '' },
     { label: 'foreground_hwnd', value: String(runtime.foreground_hwnd || 0) },
     { label: 'target_hwnd', value: String(runtime.target_hwnd || 0) },
+    { label: 'last_poll_started_at', value: runtime.last_poll_started_at || '' },
+    { label: 'last_poll_completed_at', value: runtime.last_poll_completed_at || '' },
+    {
+      label: 'last_poll_duration_seconds',
+      value: runtime.last_poll_duration_seconds ? Number(runtime.last_poll_duration_seconds).toFixed(2) : '',
+    },
+    { label: 'last_poll_emitted_event', value: String(Boolean(runtime.last_poll_emitted_event)) },
     { label: 'candidate_count', value: String(runtime.candidate_count || 0) },
     { label: 'excluded_candidate_count', value: String(runtime.excluded_candidate_count || 0) },
     { label: 'last_exclude_reason', value: runtime.last_exclude_reason || '' },
@@ -1995,7 +2006,18 @@ function renderSnapshot(snapshot) {
 }
 
 function renderHistory(history) {
-  renderStackList('linesList', mergedHistoryLines(history), (item) => `
+  const mergedLines = mergedHistoryLines(history);
+  const runtime = latestStatus?.ocr_reader_runtime || {};
+  const fallbackItems = mergedLines.length ? mergedLines : [{
+    speaker: 'OCR',
+    scene_id: runtime.ocr_context_state || runtime.detail || '',
+    stability: 'diagnostic',
+    line_id: runtime.last_poll_completed_at || runtime.last_capture_completed_at || '',
+    text: runtime.last_raw_ocr_text
+      ? `最近 raw OCR：${runtime.last_raw_ocr_text}`
+      : buildOcrMissingLineDiagnostic(latestStatus || {}),
+  }];
+  renderStackList('linesList', fallbackItems, (item) => `
     <article class="list-card">
       <p class="list-kicker">${escapeHtml(item.speaker || '旁白')} · ${escapeHtml(item.scene_id || '')} · ${escapeHtml(item.stability || '')}</p>
       <h3>${escapeHtml(item.line_id || '')}</h3>

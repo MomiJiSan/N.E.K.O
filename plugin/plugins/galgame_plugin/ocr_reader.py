@@ -1040,6 +1040,10 @@ class OcrReaderRuntime:
     foreground_refresh_detail: str = ""
     foreground_hwnd: int = 0
     target_hwnd: int = 0
+    last_poll_started_at: str = ""
+    last_poll_completed_at: str = ""
+    last_poll_duration_seconds: float = 0.0
+    last_poll_emitted_event: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1094,6 +1098,10 @@ class OcrReaderRuntime:
             "foreground_refresh_detail": self.foreground_refresh_detail,
             "foreground_hwnd": self.foreground_hwnd,
             "target_hwnd": self.target_hwnd,
+            "last_poll_started_at": self.last_poll_started_at,
+            "last_poll_completed_at": self.last_poll_completed_at,
+            "last_poll_duration_seconds": self.last_poll_duration_seconds,
+            "last_poll_emitted_event": self.last_poll_emitted_event,
         }
 
 
@@ -2839,7 +2847,9 @@ class OcrReaderManager:
         memory_reader_runtime: dict[str, Any],
     ) -> OcrReaderTickResult:
         now = self._time_fn()
+        poll_started_at = now
         result = OcrReaderTickResult(runtime=self._runtime.to_dict())
+        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
 
         if not self._config.ocr_reader_enabled:
             self._runtime = OcrReaderRuntime(enabled=False, status="disabled", detail="disabled_by_config")
@@ -3321,6 +3331,11 @@ class OcrReaderManager:
             last_seq=self._writer.last_seq,
             last_event_ts=self._writer.last_event_ts,
         )
+        poll_completed_at = self._time_fn()
+        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+        self._runtime.last_poll_completed_at = utc_now_iso(poll_completed_at)
+        self._runtime.last_poll_duration_seconds = max(0.0, poll_completed_at - poll_started_at)
+        self._runtime.last_poll_emitted_event = bool(emitted or observed_or_stable_emitted)
         result.runtime = self._runtime.to_dict()
         return result
 
