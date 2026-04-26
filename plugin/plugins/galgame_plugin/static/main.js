@@ -104,6 +104,7 @@ const AIHONG_CAPTURE_PRESETS = {
 };
 
 const AUTO_REFRESH_INTERVAL_MS = 3000;
+const FOCUS_PAUSE_REFRESH_INTERVAL_MS = 1000;
 const FIELD_LABELS_ZH = {
   connection_state: '连接状态',
   active_data_source: '当前数据源',
@@ -174,6 +175,10 @@ const FIELD_LABELS_ZH = {
   stale: '是否过期',
   result: '结果',
   agent_user_status: 'Agent 用户状态',
+  agent_pause_kind: 'Agent 暂停类型',
+  agent_pause_message: 'Agent 暂停说明',
+  agent_can_resume_by_button: '可用按钮恢复',
+  agent_can_resume_by_focus: '可由窗口聚焦恢复',
   inbound_queue_size: '入站队列',
   outbound_queue_size: '出站队列',
   last_interruption: '最近打断',
@@ -229,6 +234,7 @@ let latestStatus = null;
 let latestOcrWindowSnapshot = null;
 let refreshInFlight = null;
 let autoRefreshTimer = null;
+let autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
 let activeInstallTab = 'rapidocr';
 
 const latestInsights = {
@@ -352,6 +358,72 @@ function setFlash(message, type = 'info') {
   node.hidden = !message;
   node.textContent = message || '';
   node.className = `flash-message ${type}`;
+}
+
+function formatOcrTargetForUser(status = {}) {
+  const runtime = status.ocr_reader_runtime || {};
+  const processName = runtime.process_name || runtime.effective_process_name || '';
+  const title = runtime.window_title || runtime.effective_window_title || '';
+  const pid = Number(runtime.pid || 0);
+  const parts = [];
+  if (processName) {
+    parts.push(processName);
+  }
+  if (title) {
+    parts.push(title);
+  }
+  if (pid) {
+    parts.push(`pid ${pid}`);
+  }
+  return parts.join(' / ');
+}
+
+function syncAgentResumeButton(status = {}) {
+  const button = document.getElementById('standbyOffBtn');
+  const userStatus = status.agent_user_status || '';
+  const pauseKind = status.agent_pause_kind || '';
+  button.disabled = false;
+  if (status.agent_can_resume_by_button || userStatus === 'paused_by_user') {
+    button.textContent = '恢复活跃';
+    button.dataset.resumeAction = 'standby';
+  } else if (pauseKind === 'window_not_foreground' || userStatus === 'paused_window_not_foreground') {
+    button.textContent = '请切回游戏窗口';
+    button.dataset.resumeAction = 'focus';
+  } else if (pauseKind === 'read_only' || userStatus === 'read_only') {
+    button.textContent = '只读模式';
+    button.dataset.resumeAction = 'read_only';
+  } else {
+    button.textContent = '恢复活跃';
+    button.dataset.resumeAction = 'noop';
+  }
+}
+
+function renderAgentUserNotice(status = {}) {
+  const node = document.getElementById('agentUserNotice');
+  const title = document.getElementById('agentUserNoticeTitle');
+  const body = document.getElementById('agentUserNoticeBody');
+  const target = document.getElementById('agentUserNoticeTarget');
+  const userStatus = status.agent_user_status || '';
+  const pauseKind = status.agent_pause_kind || 'none';
+  const label = AGENT_USER_STATUS_LABELS_ZH[userStatus] || userStatus || '等待状态';
+  const targetText = formatOcrTargetForUser(status);
+
+  node.hidden = false;
+  title.textContent = label;
+  body.textContent = status.agent_pause_message
+    || (userStatus === 'running'
+      ? 'Agent 正在按当前模式运行。OCR 会在后台持续刷新。'
+      : 'Agent 状态会随游戏窗口、OCR 和模式设置自动更新。');
+  target.textContent = targetText ? `目标窗口：${targetText}` : '';
+
+  node.className = 'agent-user-notice neutral';
+  if (pauseKind === 'window_not_foreground' || userStatus === 'paused_window_not_foreground') {
+    node.classList.add('warning');
+  } else if (pauseKind === 'ocr_unavailable' || userStatus === 'ocr_unavailable' || userStatus === 'error') {
+    node.classList.add('error');
+  } else if (pauseKind === 'read_only' || pauseKind === 'user' || userStatus === 'read_only' || userStatus === 'paused_by_user') {
+    node.classList.add('read-only');
+  }
 }
 
 function buildExplainFallback(lineId = '', diagnostic = 'missing line_id') {
@@ -1101,6 +1173,10 @@ function renderStatus(status) {
       label: 'agent_user_status',
       value: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || '',
     },
+    { label: 'agent_pause_kind', value: status.agent_pause_kind || '' },
+    { label: 'agent_pause_message', value: status.agent_pause_message || '' },
+    { label: 'agent_can_resume_by_button', value: String(Boolean(status.agent_can_resume_by_button)) },
+    { label: 'agent_can_resume_by_focus', value: String(Boolean(status.agent_can_resume_by_focus)) },
     { label: 'agent_status', value: status.agent_status || '' },
     { label: 'agent_activity', value: status.agent_activity || '' },
     { label: 'agent_reason', value: status.agent_reason || '' },
@@ -1141,6 +1217,9 @@ function renderStatus(status) {
   ]);
 
   renderOcrRuntime(status);
+  renderAgentUserNotice(status);
+  syncAgentResumeButton(status);
+  syncAutoRefreshIntervalForStatus(status);
   renderRapidOcr(status);
   renderTesseract(status);
   renderTextractor(status);
@@ -2177,14 +2256,28 @@ function stopAutoRefresh() {
   }
 }
 
-function startAutoRefresh() {
+function desiredAutoRefreshInterval(status = latestStatus) {
+  return status?.agent_user_status === 'paused_window_not_foreground'
+    ? FOCUS_PAUSE_REFRESH_INTERVAL_MS
+    : AUTO_REFRESH_INTERVAL_MS;
+}
+
+function startAutoRefresh(intervalMs = AUTO_REFRESH_INTERVAL_MS) {
   stopAutoRefresh();
+  autoRefreshIntervalMs = intervalMs;
   autoRefreshTimer = window.setInterval(() => {
     if (document.hidden) {
       return;
     }
     refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
-  }, AUTO_REFRESH_INTERVAL_MS);
+  }, intervalMs);
+}
+
+function syncAutoRefreshIntervalForStatus(status = latestStatus) {
+  const desired = desiredAutoRefreshInterval(status);
+  if (autoRefreshTimer !== null && desired !== autoRefreshIntervalMs) {
+    startAutoRefresh(desired);
+  }
 }
 
 async function refreshAll(options = {}) {
@@ -2364,10 +2457,30 @@ async function setStandby(standby) {
     });
     latestAgentReply = payload.result || latestAgentReply;
     setFlash(standby ? '已切换到待机' : '已恢复活跃', 'success');
-    await refreshAll({ preserveFlash: true, forceInsights: true });
+    refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
+      console.warn('[galgame_plugin ui] refresh after standby change failed', error);
+    });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
+}
+
+async function resumeAgentFromButton() {
+  const action = document.getElementById('standbyOffBtn').dataset.resumeAction || 'noop';
+  if (action === 'focus') {
+    setFlash('当前是窗口失焦暂停。请切回游戏窗口，Agent 会自动继续；恢复活跃只解除手动待机。', 'info');
+    refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
+    return;
+  }
+  if (action === 'read_only') {
+    setFlash('当前为伴读/静默模式，不会自动点击。需要自动推进时请切到“自动推进”。', 'info');
+    return;
+  }
+  if (action === 'noop') {
+    setFlash('Agent 当前没有手动待机。', 'info');
+    return;
+  }
+  await setStandby(false);
 }
 
 async function askAgent(action) {
@@ -2588,7 +2701,7 @@ document.getElementById('standbyOnBtn').addEventListener('click', () => {
   withButtonPending('standbyOnBtn', '切换中...', () => setStandby(true)).catch(() => {});
 });
 document.getElementById('standbyOffBtn').addEventListener('click', () => {
-  withButtonPending('standbyOffBtn', '恢复中...', () => setStandby(false)).catch(() => {});
+  withButtonPending('standbyOffBtn', '处理中...', resumeAgentFromButton).catch(() => {});
 });
 document.getElementById('queryContextBtn').addEventListener('click', () => {
   withButtonPending('queryContextBtn', '查询中...', () => askAgent('query_context')).catch(() => {});

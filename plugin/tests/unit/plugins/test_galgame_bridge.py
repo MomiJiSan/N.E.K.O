@@ -6402,8 +6402,69 @@ async def test_game_llm_agent_pauses_when_ocr_target_window_is_not_foreground(
     assert status["status"] == "active"
     assert status["reason"] == "target_window_not_foreground"
     assert status["agent_user_status"] == "paused_window_not_foreground"
+    assert status["agent_pause_kind"] == "window_not_foreground"
+    assert status["agent_can_resume_by_button"] is False
+    assert status["agent_can_resume_by_focus"] is True
+    assert "切回游戏窗口后自动继续" in status["agent_pause_message"]
     assert status["debug"]["target_window_not_foreground"] is True
     assert "已暂停 Agent 自动推进" in status["debug"]["target_window_diagnostic"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_resume_button_does_not_override_foreground_pause(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+
+    async def _local_input(*_args, **_kwargs):
+        return {"ok": True}
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_input,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="杨军爷",
+            text="这酒真不赖！",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={
+            "enabled": True,
+            "status": "active",
+            "detail": "receiving_observed_text",
+            "ocr_context_state": "observed",
+            "process_name": "TheLamentingGeese.exe",
+            "window_title": "TheLamentingGeese",
+            "pid": 4242,
+            "target_is_foreground": False,
+        },
+    )
+
+    standby_result = await agent.set_standby(shared, standby=True)
+    assert standby_result["status"] == "standby"
+
+    resumed = await agent.set_standby(shared, standby=False)
+    assert resumed["status"] == "active"
+    status = await agent.query_status(shared)
+
+    assert status["agent_user_status"] == "paused_window_not_foreground"
+    assert status["agent_pause_kind"] == "window_not_foreground"
+    assert status["agent_can_resume_by_button"] is False
+    assert status["agent_can_resume_by_focus"] is True
+    assert status["reason"] == "target_window_not_foreground"
+    assert fake_host.started == []
 
 
 @pytest.mark.asyncio

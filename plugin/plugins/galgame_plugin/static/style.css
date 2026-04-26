@@ -214,6 +214,42 @@ h1 {
   font-weight: 700;
 }
 
+.agent-user-notice {
+  display: flex;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(14, 138, 124, 0.08);
+}
+
+.agent-user-notice h3 {
+  margin-top: 3px;
+  font-size: 17px;
+}
+
+.agent-user-notice-body {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.agent-user-notice.warning {
+  border-color: rgba(178, 106, 28, 0.26);
+  background: var(--warning-bg);
+}
+
+.agent-user-notice.error {
+  border-color: rgba(210, 95, 69, 0.3);
+  background: rgba(210, 95, 69, 0.1);
+}
+
+.agent-user-notice.read-only {
+  background: rgba(98, 113, 124, 0.08);
+}
+
 .field {
   display: flex;
   flex-direction: column;

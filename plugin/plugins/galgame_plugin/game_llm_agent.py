@@ -2631,6 +2631,76 @@ class GameLLMAgent:
             return "waiting_choice"
         return "running"
 
+    def _agent_pause_info(self, shared: dict[str, Any], *, status: str) -> dict[str, Any]:
+        user_status = self._agent_user_status(shared, status=status)
+        mode = str(shared.get("mode") or "")
+        target = self._target_window_label(shared)
+        if user_status == "paused_by_user":
+            return {
+                "agent_pause_kind": "user",
+                "agent_pause_message": "Agent 已手动待机。点击“恢复活跃”后才会继续自动操作。",
+                "agent_can_resume_by_button": True,
+                "agent_can_resume_by_focus": False,
+            }
+        if user_status == "paused_window_not_foreground":
+            target_note = f"当前目标：{target}。" if target else ""
+            return {
+                "agent_pause_kind": "window_not_foreground",
+                "agent_pause_message": (
+                    "已暂停：游戏窗口不在前台。切回游戏窗口后自动继续。"
+                    f"{target_note}OCR 仍在后台读取。"
+                ),
+                "agent_can_resume_by_button": False,
+                "agent_can_resume_by_focus": True,
+            }
+        if user_status == "ocr_unavailable":
+            diagnostic = self._ocr_capture_diagnostic or "OCR 截图、窗口目标或后端不可用。"
+            return {
+                "agent_pause_kind": "ocr_unavailable",
+                "agent_pause_message": f"已暂停自动推进：{diagnostic}",
+                "agent_can_resume_by_button": False,
+                "agent_can_resume_by_focus": False,
+            }
+        if user_status == "read_only":
+            mode_label = "伴读/静默模式" if mode in {"silent", "companion"} else "只读模式"
+            return {
+                "agent_pause_kind": "read_only",
+                "agent_pause_message": f"当前为{mode_label}，不会自动点击。需要自动推进时请切到自动推进模式。",
+                "agent_can_resume_by_button": False,
+                "agent_can_resume_by_focus": False,
+            }
+        return {
+            "agent_pause_kind": "none",
+            "agent_pause_message": "",
+            "agent_can_resume_by_button": False,
+            "agent_can_resume_by_focus": False,
+        }
+
+    @staticmethod
+    def _target_window_label(shared: dict[str, Any]) -> str:
+        runtime = shared.get("ocr_reader_runtime")
+        if not isinstance(runtime, dict):
+            return ""
+        process_name = str(
+            runtime.get("process_name")
+            or runtime.get("effective_process_name")
+            or ""
+        ).strip()
+        title = str(
+            runtime.get("window_title")
+            or runtime.get("effective_window_title")
+            or ""
+        ).strip()
+        pid = int(runtime.get("pid") or 0)
+        parts = []
+        if process_name:
+            parts.append(process_name)
+        if title:
+            parts.append(title)
+        if pid:
+            parts.append(f"pid {pid}")
+        return " / ".join(parts)
+
     def _build_status_payload(
         self,
         shared: dict[str, Any],
@@ -2645,6 +2715,7 @@ class GameLLMAgent:
             json_copy(self._outbound_messages[-1]) if self._outbound_messages else None
         )
         debug_now = time.monotonic()
+        pause_info = self._agent_pause_info(shared, status=status)
         return {
             "result": self._build_status_result(
                 shared,
@@ -2653,6 +2724,7 @@ class GameLLMAgent:
             ),
             "status": status,
             "agent_user_status": self._agent_user_status(shared, status=status),
+            **pause_info,
             "activity": self._current_activity_label(),
             "reason": self._current_status_reason(shared),
             "error": self._hard_error,

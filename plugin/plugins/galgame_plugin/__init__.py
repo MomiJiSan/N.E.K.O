@@ -713,6 +713,16 @@ class GalgamePlugin(NekoPluginBase):
                 payload["agent"] = json_copy(agent_payload)
                 payload["agent_status"] = str(agent_payload.get("status") or "")
                 payload["agent_user_status"] = str(agent_payload.get("agent_user_status") or "")
+                payload["agent_pause_kind"] = str(agent_payload.get("agent_pause_kind") or "")
+                payload["agent_pause_message"] = str(
+                    agent_payload.get("agent_pause_message") or ""
+                )
+                payload["agent_can_resume_by_button"] = bool(
+                    agent_payload.get("agent_can_resume_by_button")
+                )
+                payload["agent_can_resume_by_focus"] = bool(
+                    agent_payload.get("agent_can_resume_by_focus")
+                )
                 payload["agent_activity"] = str(agent_payload.get("activity") or "")
                 payload["agent_reason"] = str(agent_payload.get("reason") or "")
                 payload["agent_error"] = str(agent_payload.get("error") or "")
@@ -752,6 +762,10 @@ class GalgamePlugin(NekoPluginBase):
             except Exception as exc:
                 payload["agent_status"] = "unknown"
                 payload["agent_user_status"] = "error"
+                payload["agent_pause_kind"] = "none"
+                payload["agent_pause_message"] = ""
+                payload["agent_can_resume_by_button"] = False
+                payload["agent_can_resume_by_focus"] = False
                 payload["agent_activity"] = ""
                 payload["agent_reason"] = "agent_status_unavailable"
                 payload["agent_error"] = str(exc)
