@@ -20,6 +20,7 @@ class GalgameSharedState:
     latest_snapshot: dict[str, Any] = field(default_factory=dict)
     history_events: list[dict[str, Any]] = field(default_factory=list)
     history_lines: list[dict[str, Any]] = field(default_factory=list)
+    history_observed_lines: list[dict[str, Any]] = field(default_factory=list)
     history_choices: list[dict[str, Any]] = field(default_factory=list)
     dedupe_window: list[dict[str, str]] = field(default_factory=list)
     line_buffer: bytes = b""

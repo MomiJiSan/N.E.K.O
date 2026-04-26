@@ -481,6 +481,45 @@ def _line_fingerprint(game_id: str, line_id: str, text: str) -> dict[str, str]:
     }
 
 
+def _line_history_entry(payload_obj: dict[str, Any], *, ts: str, stability: str) -> dict[str, Any]:
+    return {
+        "line_id": str(payload_obj.get("line_id") or ""),
+        "speaker": str(payload_obj.get("speaker") or ""),
+        "text": str(payload_obj.get("text") or ""),
+        "scene_id": str(payload_obj.get("scene_id") or ""),
+        "route_id": str(payload_obj.get("route_id") or ""),
+        "stability": stability,
+        "ts": ts,
+    }
+
+
+def _append_observed_line(
+    history_observed_lines: list[dict[str, Any]],
+    item: dict[str, Any],
+    *,
+    limit: int,
+) -> None:
+    text = normalize_text(str(item.get("text") or ""))
+    if not text:
+        return
+    line_id = str(item.get("line_id") or "")
+    scene_id = str(item.get("scene_id") or "")
+    for index in range(len(history_observed_lines) - 1, -1, -1):
+        existing = history_observed_lines[index]
+        same_line = line_id and line_id == str(existing.get("line_id") or "")
+        same_text = (
+            text == normalize_text(str(existing.get("text") or ""))
+            and scene_id == str(existing.get("scene_id") or "")
+        )
+        if same_line or same_text:
+            history_observed_lines[index] = item
+            history_observed_lines.append(history_observed_lines.pop(index))
+            if len(history_observed_lines) > limit:
+                del history_observed_lines[:-limit]
+            return
+    _append_limited(history_observed_lines, item, limit)
+
+
 def _update_dedupe_window(
     dedupe_window: list[dict[str, str]],
     fingerprint: dict[str, str],
@@ -596,6 +635,7 @@ def apply_event_to_histories(
     *,
     history_events: list[dict[str, Any]],
     history_lines: list[dict[str, Any]],
+    history_observed_lines: list[dict[str, Any]] | None = None,
     history_choices: list[dict[str, Any]],
     dedupe_window: list[dict[str, str]],
     event: dict[str, Any],
@@ -608,6 +648,15 @@ def apply_event_to_histories(
     event_ts = str(event.get("ts") or "")
 
     _append_limited(history_events, summarize_event(event), config.history_events_limit)
+
+    if event_type == "line_observed":
+        if history_observed_lines is not None:
+            _append_observed_line(
+                history_observed_lines,
+                _line_history_entry(payload_obj, ts=event_ts, stability="tentative"),
+                limit=config.history_lines_limit,
+            )
+        return
 
     if event_type == "line_changed":
         fingerprint = _line_fingerprint(
@@ -622,16 +671,15 @@ def apply_event_to_histories(
             return
         _append_limited(
             history_lines,
-            {
-                "line_id": str(payload_obj.get("line_id") or ""),
-                "speaker": str(payload_obj.get("speaker") or ""),
-                "text": str(payload_obj.get("text") or ""),
-                "scene_id": str(payload_obj.get("scene_id") or ""),
-                "route_id": str(payload_obj.get("route_id") or ""),
-                "ts": event_ts,
-            },
+            _line_history_entry(payload_obj, ts=event_ts, stability="stable"),
             config.history_lines_limit,
         )
+        if history_observed_lines is not None:
+            _append_observed_line(
+                history_observed_lines,
+                _line_history_entry(payload_obj, ts=event_ts, stability="stable"),
+                limit=config.history_lines_limit,
+            )
         return
 
     if event_type == "choices_shown":
@@ -680,9 +728,17 @@ def rebuild_histories_from_events(
     dedupe_window: list[dict[str, str]],
     config: GalgameConfig,
     game_id: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, str]],
+    dict[str, Any],
+]:
     history_events: list[dict[str, Any]] = []
     history_lines: list[dict[str, Any]] = []
+    history_observed_lines: list[dict[str, Any]] = []
     history_choices: list[dict[str, Any]] = []
     working_window = [dict(item) for item in dedupe_window]
     working_snapshot = sanitize_snapshot_state(snapshot)
@@ -691,6 +747,7 @@ def rebuild_histories_from_events(
         apply_event_to_histories(
             history_events=history_events,
             history_lines=history_lines,
+            history_observed_lines=history_observed_lines,
             history_choices=history_choices,
             dedupe_window=working_window,
             event=event,
@@ -699,7 +756,14 @@ def rebuild_histories_from_events(
         )
         working_snapshot = apply_event_to_snapshot(working_snapshot, event)
 
-    return history_events, history_lines, history_choices, working_window, working_snapshot
+    return (
+        history_events,
+        history_lines,
+        history_observed_lines,
+        history_choices,
+        working_window,
+        working_snapshot,
+    )
 
 
 def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
@@ -773,6 +837,7 @@ def build_history_payload(state, *, limit: int, include_events: bool) -> dict[st
         "session_id": state.active_session_id,
         "events": json_copy(state.history_events[-bounded_limit:]) if include_events else [],
         "stable_lines": json_copy(state.history_lines[-bounded_limit:]),
+        "observed_lines": json_copy(state.history_observed_lines[-bounded_limit:]),
         "choices": json_copy(state.history_choices[-bounded_limit:]),
     }
 
@@ -964,6 +1029,9 @@ def _resolve_target_line(local_state: dict[str, Any], *, line_id: str) -> dict[s
     for item in reversed(local_state.get("history_lines", [])):
         if str(item.get("line_id") or "") == line_id:
             return dict(item)
+    for item in reversed(local_state.get("history_observed_lines", [])):
+        if str(item.get("line_id") or "") == line_id:
+            return dict(item)
     return None
 
 
@@ -1010,11 +1078,13 @@ def build_explain_context(local_state: dict[str, Any], *, line_id: str) -> dict[
 
     scene_id = str(target_line.get("scene_id") or snapshot.get("scene_id") or "")
     route_id = str(target_line.get("route_id") or snapshot.get("route_id") or "")
-    scene_lines = _append_unique_line(
-        _scene_lines(local_state.get("history_lines", []), scene_id, limit=8),
-        target_line,
+    stable_lines = _scene_lines(local_state.get("history_lines", []), scene_id, limit=8)
+    observed_lines = _scene_lines(
+        local_state.get("history_observed_lines", []),
+        scene_id,
         limit=8,
     )
+    scene_lines = _append_unique_line([*stable_lines, *observed_lines], target_line, limit=8)
     selected_choices = _scene_selected_choices(
         local_state.get("history_choices", []),
         scene_id,
@@ -1075,6 +1145,8 @@ def build_explain_context(local_state: dict[str, Any], *, line_id: str) -> dict[
         "text": str(target_line.get("text") or ""),
         "current_snapshot": snapshot,
         "recent_lines": scene_lines,
+        "stable_lines": stable_lines,
+        "observed_lines": observed_lines,
         "recent_choices": selected_choices,
         "evidence": evidence,
         "input_source": input_source,
@@ -1091,7 +1163,13 @@ def build_summarize_context(
     snapshot = sanitize_snapshot_state(local_state.get("latest_snapshot", {}))
     effective_scene_id = scene_id or str(snapshot.get("scene_id") or "")
     route_id = str(snapshot.get("route_id") or "")
-    scene_lines = _scene_lines(local_state.get("history_lines", []), effective_scene_id, limit=20)
+    stable_lines = _scene_lines(local_state.get("history_lines", []), effective_scene_id, limit=20)
+    observed_lines = _scene_lines(
+        local_state.get("history_observed_lines", []),
+        effective_scene_id,
+        limit=20,
+    )
+    scene_lines = [*stable_lines, *observed_lines][-20:]
     selected_choices = _scene_selected_choices(
         local_state.get("history_choices", []),
         effective_scene_id,
@@ -1110,6 +1188,8 @@ def build_summarize_context(
         "route_id": route_id,
         "current_snapshot": snapshot,
         "recent_lines": scene_lines,
+        "stable_lines": stable_lines,
+        "observed_lines": observed_lines,
         "recent_choices": selected_choices,
         "scene_summary_seed": build_local_scene_summary(
             scene_id=effective_scene_id,
@@ -1131,7 +1211,13 @@ def build_suggest_context(local_state: dict[str, Any]) -> dict[str, Any]:
     ]
     scene_id = str(snapshot.get("scene_id") or "")
     route_id = str(snapshot.get("route_id") or "")
-    scene_lines = _scene_lines(local_state.get("history_lines", []), scene_id, limit=8)
+    stable_lines = _scene_lines(local_state.get("history_lines", []), scene_id, limit=8)
+    observed_lines = _scene_lines(
+        local_state.get("history_observed_lines", []),
+        scene_id,
+        limit=8,
+    )
+    scene_lines = [*stable_lines, *observed_lines][-8:]
     selected_choices = _scene_selected_choices(
         local_state.get("history_choices", []),
         scene_id,
@@ -1154,6 +1240,8 @@ def build_suggest_context(local_state: dict[str, Any]) -> dict[str, Any]:
         "current_snapshot": snapshot,
         "visible_choices": visible_choices,
         "recent_lines": scene_lines,
+        "stable_lines": stable_lines,
+        "observed_lines": observed_lines,
         "recent_choices": selected_choices,
         "scene_summary": build_local_scene_summary(
             scene_id=scene_id,

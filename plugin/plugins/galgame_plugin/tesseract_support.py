@@ -75,6 +75,15 @@ def _iter_tesseract_candidates(
         _candidate_path_from_env(
             "LOCALAPPDATA",
             "Programs",
+            "N.E.K.O",
+            "Tesseract-OCR",
+            TESSERACT_EXECUTABLE,
+        )
+    )
+    _add(
+        _candidate_path_from_env(
+            "LOCALAPPDATA",
+            "Programs",
             "Tesseract-OCR",
             TESSERACT_EXECUTABLE,
         )
@@ -108,7 +117,7 @@ def resolve_tesseract_path(configured_path: str, *, install_target_dir_raw: str 
 
 def default_tesseract_install_target_raw() -> str:
     if is_windows_platform():
-        return "%LOCALAPPDATA%/Programs/Tesseract-OCR"
+        return "%LOCALAPPDATA%/Programs/N.E.K.O/Tesseract-OCR"
     return ""
 
 

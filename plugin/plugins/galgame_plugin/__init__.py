@@ -276,6 +276,7 @@ class GalgamePlugin(NekoPluginBase):
                 "latest_snapshot": json_copy(state.latest_snapshot),
                 "history_events": json_copy(state.history_events),
                 "history_lines": json_copy(state.history_lines),
+                "history_observed_lines": json_copy(state.history_observed_lines),
                 "history_choices": json_copy(state.history_choices),
                 "dedupe_window": json_copy(state.dedupe_window),
                 "line_buffer": state.line_buffer,
@@ -477,6 +478,7 @@ class GalgamePlugin(NekoPluginBase):
             state.latest_snapshot = json_copy(payload["latest_snapshot"])
             state.history_events = json_copy(payload["history_events"])
             state.history_lines = json_copy(payload["history_lines"])
+            state.history_observed_lines = json_copy(payload.get("history_observed_lines", []))
             state.history_choices = json_copy(payload["history_choices"])
             state.dedupe_window = json_copy(payload["dedupe_window"])
             state.line_buffer = payload["line_buffer"]
@@ -984,6 +986,7 @@ class GalgamePlugin(NekoPluginBase):
                 (
                     local["history_events"],
                     local["history_lines"],
+                    local["history_observed_lines"],
                     local["history_choices"],
                     local["dedupe_window"],
                     local["latest_snapshot"],
@@ -1046,6 +1049,7 @@ class GalgamePlugin(NekoPluginBase):
                 if confirm_reset:
                     local["history_events"] = []
                     local["history_lines"] = []
+                    local["history_observed_lines"] = []
                     local["history_choices"] = []
                     local["dedupe_window"] = []
                     local["line_buffer"] = b""
@@ -1063,6 +1067,7 @@ class GalgamePlugin(NekoPluginBase):
                         apply_event_to_histories(
                             history_events=local["history_events"],
                             history_lines=local["history_lines"],
+                            history_observed_lines=local["history_observed_lines"],
                             history_choices=local["history_choices"],
                             dedupe_window=local["dedupe_window"],
                             event=event,
@@ -1298,7 +1303,7 @@ class GalgamePlugin(NekoPluginBase):
                 "include_events": {"type": "boolean", "default": True},
             },
         },
-        llm_result_fields=["stable_lines", "choices"],
+        llm_result_fields=["stable_lines", "observed_lines", "choices"],
     )
     async def galgame_get_history(self, limit: int = 50, include_events: bool = True, **_):
         with self._state_lock:

@@ -11,6 +11,9 @@ from .local_input_actuator import (
     perform_local_input_actuation,
 )
 from .models import (
+    ADVANCE_SPEED_FAST,
+    ADVANCE_SPEED_MEDIUM,
+    ADVANCE_SPEED_SLOW,
     AGENT_STATUS_ACTIVE,
     AGENT_STATUS_ERROR,
     AGENT_STATUS_STANDBY,
@@ -35,6 +38,7 @@ class GameLLMAgent:
     _BRIDGE_PROGRESS_EVENT_TYPES = frozenset(
         {
             "session_started",
+            "line_observed",
             "line_changed",
             "choices_shown",
             "choice_selected",
@@ -45,6 +49,16 @@ class GameLLMAgent:
     _DEFAULT_BRIDGE_WAIT_TIMEOUT = 5.0
     _OCR_BRIDGE_WAIT_TIMEOUT = 12.0
     _OCR_ADVANCE_BRIDGE_WAIT_TIMEOUT = 3.0
+    _OCR_ADVANCE_OBSERVATION_WINDOWS = {
+        ADVANCE_SPEED_SLOW: 3.2,
+        ADVANCE_SPEED_MEDIUM: 2.4,
+        ADVANCE_SPEED_FAST: 0.8,
+    }
+    _OCR_ADVANCE_RETRY_TIMEOUTS = {
+        ADVANCE_SPEED_SLOW: 5.0,
+        ADVANCE_SPEED_MEDIUM: 3.5,
+        ADVANCE_SPEED_FAST: 2.0,
+    }
     _OCR_BRIDGE_ACTIVITY_GRACE_SECONDS = 4.0
     _CHOICE_PLANNING_TIMEOUT_SECONDS = 8.0
     _DIALOGUE_ADVANCE_VARIANTS = (
@@ -838,6 +852,66 @@ class GameLLMAgent:
     def _actuation_input_source_is_ocr(actuation: dict[str, Any]) -> bool:
         return str(actuation.get("input_source") or "") == DATA_SOURCE_OCR_READER
 
+    def _configured_advance_speed(self, shared: dict[str, Any]) -> str:
+        speed = str(shared.get("advance_speed") or ADVANCE_SPEED_MEDIUM).strip().lower()
+        if speed in {ADVANCE_SPEED_SLOW, ADVANCE_SPEED_MEDIUM, ADVANCE_SPEED_FAST}:
+            return speed
+        return ADVANCE_SPEED_MEDIUM
+
+    def _effective_advance_speed(self, shared: dict[str, Any]) -> str:
+        speed = self._configured_advance_speed(shared)
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return speed
+        if speed == ADVANCE_SPEED_FAST:
+            return speed
+        recent_advance_inputs = [
+            item
+            for item in self._recent_local_inputs
+            if str(item.get("kind") or "") == "advance"
+            and str(item.get("strategy_id") or "") == "advance_click"
+        ][-4:]
+        if len(recent_advance_inputs) < 3:
+            return speed
+        history_events = shared.get("history_events")
+        if not isinstance(history_events, list):
+            return ADVANCE_SPEED_SLOW if speed == ADVANCE_SPEED_MEDIUM else speed
+        recent_observations = [
+            event
+            for event in history_events[-12:]
+            if isinstance(event, dict)
+            and str(event.get("type") or "") in {"line_observed", "line_changed", "choices_shown"}
+        ]
+        if recent_observations:
+            return speed
+        return ADVANCE_SPEED_SLOW if speed == ADVANCE_SPEED_MEDIUM else speed
+
+    def _ocr_advance_observation_window(self, shared: dict[str, Any]) -> float:
+        return float(
+            self._OCR_ADVANCE_OBSERVATION_WINDOWS.get(
+                self._effective_advance_speed(shared),
+                self._OCR_ADVANCE_OBSERVATION_WINDOWS[ADVANCE_SPEED_MEDIUM],
+            )
+        )
+
+    def _ocr_advance_retry_timeout(self, shared: dict[str, Any]) -> float:
+        return float(
+            self._OCR_ADVANCE_RETRY_TIMEOUTS.get(
+                self._effective_advance_speed(shared),
+                self._OCR_ADVANCE_RETRY_TIMEOUTS[ADVANCE_SPEED_MEDIUM],
+            )
+        )
+
+    def _post_progress_delay(self, shared: dict[str, Any], *, actuation: dict[str, Any]) -> float:
+        if not self._actuation_input_source_is_ocr(actuation):
+            return 0.2
+        if str(actuation.get("kind") or "") != "advance":
+            return 0.2
+        if str(actuation.get("strategy_id") or "") != "advance_click":
+            return 0.2
+        if str(actuation.get("strategy_family") or "") != "dialogue":
+            return 0.2
+        return self._ocr_advance_observation_window(shared)
+
     def _should_prefer_local_input_for_ocr(self, shared: dict[str, Any], *, kind: str) -> bool:
         if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
             return False
@@ -1129,7 +1203,7 @@ class GameLLMAgent:
             self._clear_hard_error()
             self._actuation = None
             self._pending_strategy = None
-            self._next_actuation_at = now + 0.2
+            self._next_actuation_at = now + self._post_progress_delay(shared, actuation=actuation)
             return
 
         wait_timeout = self._bridge_wait_timeout(shared, actuation=actuation)
@@ -1302,6 +1376,8 @@ class GameLLMAgent:
         if input_source == DATA_SOURCE_OCR_READER:
             kind = str(actuation.get("kind") or "")
             if kind in {"advance", "probe"}:
+                if kind == "advance":
+                    return self._ocr_advance_retry_timeout(shared)
                 return self._OCR_ADVANCE_BRIDGE_WAIT_TIMEOUT
             if self._has_recent_ocr_bridge_activity(shared, actuation=actuation):
                 return self._OCR_BRIDGE_WAIT_TIMEOUT + self._OCR_BRIDGE_ACTIVITY_GRACE_SECONDS
@@ -1326,7 +1402,13 @@ class GameLLMAgent:
             seq = int(event.get("seq") or 0)
             if seq <= baseline_last_seq:
                 break
-            if str(event.get("type") or "") in {"heartbeat", "line_changed", "choices_shown", "scene_changed"}:
+            if str(event.get("type") or "") in {
+                "heartbeat",
+                "line_observed",
+                "line_changed",
+                "choices_shown",
+                "scene_changed",
+            }:
                 return True
         return False
 
@@ -2038,8 +2120,15 @@ class GameLLMAgent:
             "route_id": str(snapshot.get("route_id") or ""),
             "current_snapshot": snapshot,
             "latest_line": latest_line,
-            "recent_lines": json_copy(list(shared.get("history_lines", []))[-8:]),
-            "recent_choices": json_copy(list(shared.get("history_choices", []))[-8:]),
+            "recent_lines": json_copy(
+                [
+                    *list(shared.get("history_lines") or []),
+                    *list(shared.get("history_observed_lines") or []),
+                ][-8:]
+            ),
+            "stable_lines": json_copy(list(shared.get("history_lines") or [])[-8:]),
+            "observed_lines": json_copy(list(shared.get("history_observed_lines") or [])[-8:]),
+            "recent_choices": json_copy(list(shared.get("history_choices") or [])[-8:]),
             "scene_memory": json_copy(self._scene_memory[-8:]),
             "choice_memory": json_copy(self._choice_memory[-8:]),
             "failure_memory": json_copy(self._failure_memory[-8:]),
@@ -2077,6 +2166,8 @@ class GameLLMAgent:
             "line_id": str(snapshot.get("line_id") or ""),
             "scene_stage": str(self._scene_state.get("stage") or "unknown"),
             "input_source": self._current_input_source(shared),
+            "advance_speed": self._configured_advance_speed(shared),
+            "effective_advance_speed": self._effective_advance_speed(shared),
             "mode": str(shared.get("mode") or ""),
             "push_notifications": bool(shared.get("push_notifications")),
             "push_policy": self._current_push_policy(shared),
@@ -2103,6 +2194,8 @@ class GameLLMAgent:
                 else None,
                 "scene_state": json_copy(self._scene_state),
                 "recent_local_inputs": json_copy(self._recent_local_inputs[-10:]),
+                "advance_observation_window_seconds": self._ocr_advance_observation_window(shared),
+                "advance_retry_timeout_seconds": self._ocr_advance_retry_timeout(shared),
                 "virtual_mouse_stats": self._virtual_mouse_stats_debug(now=debug_now),
                 "virtual_mouse_preferred_target": self._select_virtual_mouse_dialogue_candidate(
                     now=debug_now,

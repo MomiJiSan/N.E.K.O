@@ -16,7 +16,7 @@ INSTALLER_URL = (
 INSTALLER_NAME = "tesseract-ocr-w64-setup-5.4.0.20240606.exe"
 TESSDATA_BASE_URL = "https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main"
 LANGUAGES = ["chi_sim", "eng"]
-TARGET_DIR = Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR"))
+TARGET_DIR = Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\N.E.K.O\Tesseract-OCR"))
 
 
 def download_file(url: str, destination: Path, timeout: float = 300.0) -> None:

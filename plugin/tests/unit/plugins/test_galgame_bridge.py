@@ -347,6 +347,7 @@ def _shared_state(
     last_seq: int = 2,
     snapshot: dict[str, object] | None = None,
     history_lines: list[dict[str, object]] | None = None,
+    history_observed_lines: list[dict[str, object]] | None = None,
     history_choices: list[dict[str, object]] | None = None,
     history_events: list[dict[str, object]] | None = None,
     active_data_source: str | None = None,
@@ -370,6 +371,7 @@ def _shared_state(
         ),
         "history_events": list(history_events or []),
         "history_lines": list(history_lines or []),
+        "history_observed_lines": list(history_observed_lines or []),
         "history_choices": list(history_choices or []),
         "ocr_reader_runtime": dict(ocr_reader_runtime or {}),
         "memory_reader_runtime": dict(memory_reader_runtime or {}),
@@ -3775,6 +3777,7 @@ def test_ocr_line_observed_updates_snapshot_without_stable_history(tmp_path: Pat
     events = _read_bridge_events(game_dir / "events.jsonl")
     history_events: list[dict[str, Any]] = []
     history_lines: list[dict[str, Any]] = []
+    history_observed_lines: list[dict[str, Any]] = []
     history_choices: list[dict[str, Any]] = []
     dedupe_window: list[dict[str, str]] = []
     cfg = build_config({"galgame": {"bridge_root": str(tmp_path)}})
@@ -3782,6 +3785,7 @@ def test_ocr_line_observed_updates_snapshot_without_stable_history(tmp_path: Pat
         galgame_service.apply_event_to_histories(
             history_events=history_events,
             history_lines=history_lines,
+            history_observed_lines=history_observed_lines,
             history_choices=history_choices,
             dedupe_window=dedupe_window,
             event=event,
@@ -3795,6 +3799,9 @@ def test_ocr_line_observed_updates_snapshot_without_stable_history(tmp_path: Pat
     assert session.session["state"]["stability"] == "tentative"
     assert events[-1]["type"] == "line_observed"
     assert history_lines == []
+    assert len(history_observed_lines) == 1
+    assert history_observed_lines[0]["stability"] == "tentative"
+    assert history_observed_lines[0]["text"] == "算了，没事。"
 
 
 @pytest.mark.plugin_unit
@@ -3817,6 +3824,7 @@ def test_ocr_line_second_stable_read_enters_history(tmp_path: Path) -> None:
     events = _read_bridge_events(game_dir / "events.jsonl")
     history_events: list[dict[str, Any]] = []
     history_lines: list[dict[str, Any]] = []
+    history_observed_lines: list[dict[str, Any]] = []
     history_choices: list[dict[str, Any]] = []
     dedupe_window: list[dict[str, str]] = []
     cfg = build_config({"galgame": {"bridge_root": str(tmp_path)}})
@@ -3824,6 +3832,7 @@ def test_ocr_line_second_stable_read_enters_history(tmp_path: Path) -> None:
         galgame_service.apply_event_to_histories(
             history_events=history_events,
             history_lines=history_lines,
+            history_observed_lines=history_observed_lines,
             history_choices=history_choices,
             dedupe_window=dedupe_window,
             event=event,
@@ -3837,6 +3846,41 @@ def test_ocr_line_second_stable_read_enters_history(tmp_path: Path) -> None:
     assert len(history_lines) == 1
     assert history_lines[0]["speaker"] == "王生"
     assert history_lines[0]["text"] == "算了，没事。"
+    assert len(history_observed_lines) == 1
+    assert history_observed_lines[0]["stability"] == "stable"
+
+
+@pytest.mark.plugin_unit
+def test_summarize_context_uses_observed_lines_when_stable_history_is_empty() -> None:
+    context = build_summarize_context(
+        _shared_state(
+            snapshot=_session_state(
+                speaker="王生",
+                text="算了，没事。",
+                scene_id="ocr:scene-a",
+                line_id="ocr:line-1",
+                ts="2024-04-02T12:00:00Z",
+            ),
+            history_lines=[],
+            history_observed_lines=[
+                {
+                    "line_id": "ocr:line-1",
+                    "speaker": "王生",
+                    "text": "算了，没事。",
+                    "scene_id": "ocr:scene-a",
+                    "route_id": "",
+                    "stability": "tentative",
+                    "ts": "2024-04-02T12:00:00Z",
+                }
+            ],
+        ),
+        scene_id="ocr:scene-a",
+    )
+
+    assert context["stable_lines"] == []
+    assert len(context["observed_lines"]) == 1
+    assert context["recent_lines"][0]["stability"] == "tentative"
+    assert "算了，没事。" in context["scene_summary_seed"]
 
 
 @pytest.mark.plugin_unit
@@ -5216,6 +5260,75 @@ async def test_game_llm_agent_awaiting_bridge_accepts_meaningful_history_progres
 
     assert agent._actuation is None
     assert agent._pending_strategy is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_ocr_line_observed_progress_delays_next_dialogue_advance(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="剧情还在原地。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    await agent.tick(shared)
+    fake_host.tasks["task-1"]["status"] = "completed"
+    await agent.tick(shared)
+
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+
+    shared_after = _shared_state(
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="剧情还在原地。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        history_events=[
+            {
+                "seq": 3,
+                "ts": "2026-04-21T08:31:03Z",
+                "type": "line_observed",
+                "payload": {
+                    "speaker": "雪乃",
+                    "text": "剧情还在原地。",
+                    "scene_id": "scene-a",
+                    "line_id": "line-1",
+                    "route_id": "",
+                    "stability": "tentative",
+                },
+            }
+        ],
+        last_seq=3,
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+    before = time.monotonic()
+
+    await agent.tick(shared_after)
+
+    assert agent._actuation is None
+    assert agent._pending_strategy is None
+    assert agent._next_actuation_at - before >= 2.0
 
 
 @pytest.mark.asyncio

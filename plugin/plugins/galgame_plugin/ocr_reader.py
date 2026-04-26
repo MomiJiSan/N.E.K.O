@@ -3072,6 +3072,11 @@ class OcrReaderManager:
             tesseract.detail = f"auto_fallback_from_rapidocr:{rapidocr.detail}"
             plan.primary = tesseract
             return plan
+        if rapidocr.available or bool(self._config.rapidocr_enabled):
+            plan.primary = rapidocr
+            if tesseract.kind:
+                plan.fallback = tesseract
+            return plan
         plan.primary = tesseract
         return plan
 
@@ -3086,14 +3091,24 @@ class OcrReaderManager:
             return plan.primary.detail or "missing"
         if plan.selection == "tesseract":
             return self._tesseract_unavailable_detail(plan.tesseract_inspection)
+        if plan.primary.kind == "rapidocr":
+            return plan.primary.detail or "missing"
         if str(plan.tesseract_inspection.get("detail") or "") == "missing_languages":
             return "missing_languages"
         return "missing_tesseract"
 
     def _backend_unavailable_warnings(self, plan: SelectedOcrBackendPlan) -> list[str]:
         warnings: list[str] = []
-        if plan.selection == "rapidocr":
+        if plan.selection == "rapidocr" or plan.primary.kind == "rapidocr":
             warnings.append(f"ocr_reader RapidOCR is unavailable: {plan.primary.detail or 'missing'}")
+            if plan.selection == "rapidocr":
+                return warnings
+            tesseract_detail = str(plan.tesseract_inspection.get("detail") or "")
+            if tesseract_detail == "missing_languages":
+                missing = plan.tesseract_inspection.get("missing_languages", [])
+                warnings.append(f"ocr_reader Tesseract fallback is missing languages: {missing}")
+            elif tesseract_detail and tesseract_detail != "installed":
+                warnings.append("ocr_reader Tesseract fallback is missing or not configured")
             return warnings
         if str(plan.tesseract_inspection.get("detail") or "") == "missing_languages":
             missing = plan.tesseract_inspection.get("missing_languages", [])

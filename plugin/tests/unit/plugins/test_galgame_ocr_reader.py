@@ -19,7 +19,9 @@ from plugin.plugins.galgame_plugin.reader import read_session_json, tail_events_
 from plugin.plugins.galgame_plugin.service import build_config
 from plugin.plugins.galgame_plugin.tesseract_support import (
     DEFAULT_TESSERACT_LANGUAGES,
+    default_tesseract_install_target_raw,
     inspect_tesseract_installation,
+    resolve_tesseract_install_target,
 )
 
 
@@ -179,6 +181,14 @@ def test_inspect_tesseract_installation_reports_custom_install_target(tmp_path: 
     assert status["missing_languages"] == []
 
 
+def test_tesseract_default_install_target_matches_neko_programs_root() -> None:
+    raw_target = default_tesseract_install_target_raw()
+
+    assert raw_target == "%LOCALAPPDATA%/Programs/N.E.K.O/Tesseract-OCR"
+    assert resolve_tesseract_install_target("").name == "Tesseract-OCR"
+    assert resolve_tesseract_install_target("").parent.name == "N.E.K.O"
+
+
 @pytest.mark.asyncio
 async def test_ocr_reader_manager_reports_missing_tesseract(
     tmp_path: Path,
@@ -212,6 +222,52 @@ async def test_ocr_reader_manager_reports_missing_tesseract(
     assert result.runtime["status"] == "idle"
     assert result.runtime["detail"] == "missing_tesseract"
     assert "Tesseract is missing" in result.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_auto_reports_rapidocr_first_when_all_backends_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root, enabled=True, rapidocr_enabled=True),
+        platform_fn=lambda: True,
+        capture_backend=_FakeCaptureBackend(),
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader.inspect_rapidocr_installation",
+        lambda **kwargs: {
+            "installed": False,
+            "detail": "broken_runtime",
+            "runtime_error": "access denied",
+            "detected_path": "C:/RapidOCR/site-packages/rapidocr_onnxruntime",
+            "selected_model": "PP-OCRv5/ch/mobile",
+        },
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader.inspect_tesseract_installation",
+        lambda **kwargs: {
+            "installed": False,
+            "detail": "missing",
+            "detected_path": "",
+            "required_languages": ["chi_sim", "jpn", "eng"],
+            "missing_languages": ["chi_sim", "jpn", "eng"],
+        },
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={},
+    )
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["backend_kind"] == "rapidocr"
+    assert result.runtime["detail"] == "broken_runtime"
+    assert "RapidOCR is unavailable: broken_runtime" in result.warnings[0]
+    assert any("Tesseract fallback" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
