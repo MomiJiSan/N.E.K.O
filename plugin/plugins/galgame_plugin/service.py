@@ -79,6 +79,13 @@ def _coerce_ocr_backend_selection(value: object, default: str = "auto") -> str:
     return default
 
 
+def _coerce_ocr_capture_backend(value: object, default: str = "auto") -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized in {"auto", "dxcam", "imagegrab", "printwindow"}:
+        return normalized
+    return default
+
+
 def _default_bridge_root_raw() -> str:
     if sys.platform.startswith("win"):
         return "%LOCALAPPDATA%/N.E.K.O/galgame-bridge"
@@ -190,6 +197,10 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ),
         ocr_reader_backend_selection=_coerce_ocr_backend_selection(
             ocr_reader_obj.get("backend_selection"),
+            "auto",
+        ),
+        ocr_reader_capture_backend=_coerce_ocr_capture_backend(
+            ocr_reader_obj.get("capture_backend"),
             "auto",
         ),
         ocr_reader_tesseract_path=str(ocr_reader_obj.get("tesseract_path") or ""),
@@ -789,7 +800,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         and (
             ocr_runtime.get("ocr_capture_diagnostic_required")
             or str(ocr_runtime.get("ocr_context_state") or "")
-            in {"poll_not_running", "capture_failed", "diagnostic_required"}
+            in {"poll_not_running", "capture_failed", "diagnostic_required", "stale_capture_backend"}
             or str(ocr_runtime.get("detail") or "") == "ocr_capture_diagnostic_required"
         )
     )
@@ -976,6 +987,20 @@ def build_ocr_context_diagnostic(local_state: dict[str, Any]) -> str:
     backend = str(runtime_obj.get("backend_kind") or "").strip()
     if backend:
         parts.append(f"backend={backend}")
+    capture_backend = str(runtime_obj.get("capture_backend_kind") or "").strip()
+    if capture_backend:
+        parts.append(f"capture_backend={capture_backend}")
+    capture_detail = str(runtime_obj.get("capture_backend_detail") or "").strip()
+    if capture_detail:
+        parts.append(f"capture_detail={capture_detail}")
+    if runtime_obj.get("stale_capture_backend"):
+        parts.append("stale_capture_backend=true")
+    same_frames = int(runtime_obj.get("consecutive_same_capture_frames") or 0)
+    if same_frames:
+        parts.append(f"same_capture_frames={same_frames}")
+    image_hash = str(runtime_obj.get("last_capture_image_hash") or "").strip()
+    if image_hash:
+        parts.append(f"capture_hash={image_hash}")
     error = str(runtime_obj.get("last_capture_error") or "").strip()
     if error:
         parts.append(f"last_capture_error={error}")

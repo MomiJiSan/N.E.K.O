@@ -3122,6 +3122,113 @@ async def test_ocr_reader_does_not_auto_capture_common_non_game_foreground_windo
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_ocr_reader_ignores_chinese_plugin_ui_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=815,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=9105,
+        width=1040,
+        height=807,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(["运行控制 模式静默 静默进入待机恢复活跃"]),
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: target.hwnd)
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert capture_backend.capture_calls == 1
+    assert manager._writer.last_seq == 0
+    assert any("N.E.K.O plugin UI" in warning for warning in result.warnings)
+
+
+@pytest.mark.plugin_unit
+def test_ocr_reader_capture_backend_config_is_sanitized(tmp_path: Path) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+
+    config = build_config(
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True, "capture_backend": "dxcam"},
+        )
+    )
+    assert config.ocr_reader_capture_backend == "dxcam"
+
+    fallback_config = build_config(
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True, "capture_backend": "unknown"},
+        )
+    )
+    assert fallback_config.ocr_reader_capture_backend == "auto"
+
+
+@pytest.mark.plugin_unit
+def test_win32_capture_backend_selection_orders_dxcam_first_for_auto() -> None:
+    backend = galgame_ocr_reader.Win32CaptureBackend(selection="auto")
+    assert [item.kind for item in backend._backends] == ["dxcam", "imagegrab", "printwindow"]
+
+    printwindow_backend = galgame_ocr_reader.Win32CaptureBackend(selection="printwindow")
+    assert [item.kind for item in printwindow_backend._backends] == ["printwindow"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_marks_stale_capture_backend_after_repeated_same_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    now = [1713000000.0]
+    target = DetectedGameWindow(
+        hwnd=816,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=9106,
+        width=1040,
+        height=807,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(
+            _make_effective_config(
+                bridge_root,
+                ocr_reader={"enabled": True, "poll_interval_seconds": 0.1},
+            )
+        ),
+        time_fn=lambda: now[0],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["", "", ""]),
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: target.hwnd)
+
+    result = None
+    for _ in range(3):
+        result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        now[0] += 1.0
+
+    assert result is not None
+    assert result.runtime["last_capture_image_hash"]
+    assert result.runtime["consecutive_same_capture_frames"] >= 3
+    assert result.runtime["stale_capture_backend"] is True
+    assert result.runtime["ocr_context_state"] == "stale_capture_backend"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_auto_recalibrate_ocr_dialogue_profile_persists_bucket_and_survives_restart(
     tmp_path: Path,
 ) -> None:

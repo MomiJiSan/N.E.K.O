@@ -140,6 +140,7 @@ async def main() -> None:
         memory_reader_poll_interval_seconds=1.0,
         ocr_reader_enabled=True,
         ocr_reader_backend_selection="auto",
+        ocr_reader_capture_backend="auto",
         ocr_reader_tesseract_path="",
         ocr_reader_install_manifest_url="",
         ocr_reader_install_target_dir="",

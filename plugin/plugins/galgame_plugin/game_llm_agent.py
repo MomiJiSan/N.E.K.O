@@ -1012,7 +1012,7 @@ class GameLLMAgent:
             return True
         runtime = shared.get("ocr_reader_runtime")
         context_state = str((runtime or {}).get("ocr_context_state") or "") if isinstance(runtime, dict) else ""
-        if context_state in {"poll_not_running", "capture_failed", "diagnostic_required"}:
+        if context_state in {"poll_not_running", "capture_failed", "diagnostic_required", "stale_capture_backend"}:
             self._ocr_capture_diagnostic = (
                 f"ocr_context_unavailable: OCR context_state={context_state}，"
                 "暂停普通推进并等待截图/OCR 恢复"
@@ -2014,7 +2014,7 @@ class GameLLMAgent:
             return False
         detail = str(ocr_runtime.get("detail") or "")
         context_state = str(ocr_runtime.get("ocr_context_state") or "")
-        if context_state in {"poll_not_running", "capture_failed", "diagnostic_required"}:
+        if context_state in {"poll_not_running", "capture_failed", "diagnostic_required", "stale_capture_backend"}:
             return False
         if bool(ocr_runtime.get("ocr_capture_diagnostic_required")):
             return False

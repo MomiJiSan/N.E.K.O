@@ -333,6 +333,7 @@ class GalgameConfig:
     memory_reader_poll_interval_seconds: float
     ocr_reader_enabled: bool
     ocr_reader_backend_selection: str
+    ocr_reader_capture_backend: str
     ocr_reader_tesseract_path: str
     ocr_reader_install_manifest_url: str
     ocr_reader_install_target_dir: str

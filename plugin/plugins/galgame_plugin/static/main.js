@@ -150,6 +150,11 @@ const FIELD_LABELS_ZH = {
   capture_profile: '截图配置',
   capture_profile_match_source: '截图配置来源',
   capture_profile_bucket_key: '截图配置桶',
+  capture_backend_kind: '截图后端',
+  capture_backend_detail: '截图后端详情',
+  last_capture_image_hash: '最近截图 Hash',
+  consecutive_same_capture_frames: '连续相同截图',
+  stale_capture_backend: '截图源未更新',
   backend_kind: '后端类型',
   backend_detail: '后端详情',
   backend_path: '后端路径',
@@ -1439,6 +1444,11 @@ function renderOcrRuntime(status) {
     { label: 'last_capture_attempt_at', value: runtime.last_capture_attempt_at || '' },
     { label: 'last_capture_completed_at', value: runtime.last_capture_completed_at || '' },
     { label: 'last_capture_error', value: runtime.last_capture_error || '' },
+    { label: 'capture_backend_kind', value: runtime.capture_backend_kind || '' },
+    { label: 'capture_backend_detail', value: runtime.capture_backend_detail || '' },
+    { label: 'last_capture_image_hash', value: runtime.last_capture_image_hash || '' },
+    { label: 'consecutive_same_capture_frames', value: String(runtime.consecutive_same_capture_frames || 0) },
+    { label: 'stale_capture_backend', value: String(Boolean(runtime.stale_capture_backend)) },
     { label: 'last_raw_ocr_text', value: runtime.last_raw_ocr_text || '' },
     { label: 'last_observed_line', value: runtime.last_observed_line?.text || '' },
     { label: 'last_stable_line', value: runtime.last_stable_line?.text || '' },
@@ -1515,9 +1525,21 @@ function renderOcrWindowTargetStatus(status) {
   const effectiveTitle = runtime.effective_window_title || runtime.window_title || '';
   const effectiveProcess = runtime.effective_process_name || runtime.process_name || '';
   const detail = formatOcrWindowSelectionDetail(runtime.target_selection_detail || '');
+  let captureHint = '';
+  if (runtime.capture_backend_kind === 'dxcam') {
+    captureHint = '使用 DXcam 截图后端';
+  } else if (runtime.capture_backend_detail === 'dxcam_unavailable_fallback') {
+    captureHint = '未安装 DXcam，正在使用兼容截图；可安装 dxcam 降低遮挡或旧帧影响';
+  } else if (runtime.capture_backend_kind) {
+    captureHint = `使用 ${runtime.capture_backend_kind} 兼容截图`;
+  }
+  if (runtime.stale_capture_backend) {
+    captureHint = '截图源没有更新，请切回游戏窗口或切换 DXcam 截图后端';
+  }
   const hintParts = [
     effectiveProcess ? `当前目标: ${effectiveProcess}${runtime.pid ? ` (${runtime.pid})` : ''}` : '',
     effectiveTitle ? `窗口: ${effectiveTitle}` : '',
+    captureHint,
     detail,
     runtime.last_exclude_reason ? `最近排除: ${formatOcrWindowReason(runtime.last_exclude_reason)}` : '',
   ].filter(Boolean);

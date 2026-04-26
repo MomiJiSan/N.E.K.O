@@ -76,6 +76,7 @@ poll_interval_seconds = 1
 # macOS/Linux: disabled by default.
 enabled = true
 backend_selection = "auto"
+capture_backend = "auto"
 tesseract_path = ""
 install_manifest_url = ""
 install_target_dir = ""

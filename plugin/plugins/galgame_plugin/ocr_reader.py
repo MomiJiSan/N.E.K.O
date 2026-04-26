@@ -120,6 +120,27 @@ _SELF_UI_GUARD_SUBSTRINGS = (
     "plugin manager",
     "galgame plugin",
     "n.e.k.o",
+    "插件设置",
+    "运行控制",
+    "模式静默",
+    "静默进入待机",
+    "进入待机",
+    "恢复活跃",
+    "推送通知",
+    "推进速度",
+    "保存设置",
+    "ocr 目标窗口",
+    "ocr目标窗口",
+    "等待 ocr 窗口候选列表",
+    "等待ocr窗口候选列表",
+    "查看排除窗口",
+    "选择识别窗口",
+    "截图校准",
+    "最近稳定台词",
+    "stable 与 observed",
+    "当前台词解释",
+    "场景总结",
+    "游戏 agent",
 )
 _AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
 _AIHONG_TITLE_SUBSTRINGS = ("哀鸿", "aihong")
@@ -164,6 +185,11 @@ _AIHONG_MENU_DIALOGUE_MARKERS = (
 )
 _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
 _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS = 0.18
+_CAPTURE_BACKEND_AUTO = "auto"
+_CAPTURE_BACKEND_DXCAM = "dxcam"
+_CAPTURE_BACKEND_IMAGEGRAB = "imagegrab"
+_CAPTURE_BACKEND_PRINTWINDOW = "printwindow"
+_STALE_CAPTURE_FRAME_THRESHOLD = 3
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -1050,6 +1076,11 @@ class OcrReaderRuntime:
     last_raw_ocr_text: str = ""
     last_observed_line: dict[str, Any] = field(default_factory=dict)
     last_stable_line: dict[str, Any] = field(default_factory=dict)
+    capture_backend_kind: str = ""
+    capture_backend_detail: str = ""
+    last_capture_image_hash: str = ""
+    consecutive_same_capture_frames: int = 0
+    stale_capture_backend: bool = False
     foreground_refresh_at: str = ""
     foreground_refresh_detail: str = ""
     foreground_hwnd: int = 0
@@ -1108,6 +1139,11 @@ class OcrReaderRuntime:
             "last_raw_ocr_text": self.last_raw_ocr_text,
             "last_observed_line": dict(self.last_observed_line),
             "last_stable_line": dict(self.last_stable_line),
+            "capture_backend_kind": self.capture_backend_kind,
+            "capture_backend_detail": self.capture_backend_detail,
+            "last_capture_image_hash": self.last_capture_image_hash,
+            "consecutive_same_capture_frames": self.consecutive_same_capture_frames,
+            "stale_capture_backend": self.stale_capture_backend,
             "foreground_refresh_at": self.foreground_refresh_at,
             "foreground_refresh_detail": self.foreground_refresh_detail,
             "foreground_hwnd": self.foreground_hwnd,
@@ -1168,6 +1204,9 @@ class OcrExtractionResult:
     source_size: dict[str, float] = field(default_factory=dict)
     capture_rect: dict[str, float] = field(default_factory=dict)
     window_rect: dict[str, float] = field(default_factory=dict)
+    capture_backend_kind: str = ""
+    capture_backend_detail: str = ""
+    capture_image_hash: str = ""
 
 
 class CaptureBackend(Protocol):
@@ -1184,7 +1223,104 @@ class OcrBackend(Protocol):
     def extract_text(self, image: Any) -> str: ...
 
 
-class Win32CaptureBackend:
+def _target_window_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]:
+    import win32gui
+
+    rect = win32gui.GetWindowRect(target.hwnd)
+    width = int(rect[2] - rect[0])
+    height = int(rect[3] - rect[1])
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid window dimensions: {width}x{height}")
+    return (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+
+
+def _require_foreground_capture_target(target: DetectedGameWindow, *, backend_kind: str) -> None:
+    foreground_hwnd = _foreground_window_handle()
+    if foreground_hwnd and target.hwnd and int(foreground_hwnd) == int(target.hwnd):
+        return
+    raise RuntimeError(f"{backend_kind}: target_window_not_foreground_for_capture")
+
+
+def _crop_window_image(
+    image: Any,
+    *,
+    window_rect: tuple[int, int, int, int],
+    profile: OcrCaptureProfile,
+    backend_kind: str,
+    backend_detail: str,
+) -> Any:
+    width = int(window_rect[2] - window_rect[0])
+    height = int(window_rect[3] - window_rect[1])
+    left = int(width * profile.left_inset_ratio)
+    right = int(width * (1.0 - profile.right_inset_ratio))
+    top = int(height * profile.top_ratio)
+    bottom = int(height * (1.0 - profile.bottom_inset_ratio))
+
+    left = max(0, min(left, width))
+    right = max(left, min(right, width))
+    top = max(0, min(top, height))
+    bottom = max(top, min(bottom, height))
+
+    crop_w = right - left
+    crop_h = bottom - top
+    if crop_w < 10 or crop_h < 10:
+        raise RuntimeError(f"Crop region too small: {crop_w}x{crop_h}")
+
+    cropped = image.crop((left, top, right, bottom))
+    cropped.info["galgame_bounds_coordinate_space"] = "capture"
+    cropped.info["galgame_source_size"] = {"width": float(crop_w), "height": float(crop_h)}
+    cropped.info["galgame_capture_rect"] = {
+        "left": float(window_rect[0] + left),
+        "top": float(window_rect[1] + top),
+        "right": float(window_rect[0] + right),
+        "bottom": float(window_rect[1] + bottom),
+    }
+    cropped.info["galgame_window_rect"] = {
+        "left": float(window_rect[0]),
+        "top": float(window_rect[1]),
+        "right": float(window_rect[2]),
+        "bottom": float(window_rect[3]),
+    }
+    cropped.info["galgame_capture_backend_kind"] = backend_kind
+    cropped.info["galgame_capture_backend_detail"] = backend_detail
+    return cropped
+
+
+class ImageGrabCaptureBackend:
+    kind = _CAPTURE_BACKEND_IMAGEGRAB
+
+    def __init__(self, *, logger=None) -> None:
+        self._logger = logger
+
+    def is_available(self) -> bool:
+        try:
+            import win32gui
+            from PIL import ImageGrab
+            return bool(win32gui and ImageGrab)
+        except ImportError:
+            return False
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}({target.pid}) {target.title}"
+
+    def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
+        from PIL import ImageGrab
+
+        _require_foreground_capture_target(target, backend_kind=self.kind)
+        rect = _target_window_rect(target)
+        image = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
+        return _crop_window_image(
+            image,
+            window_rect=rect,
+            profile=profile,
+            backend_kind=self.kind,
+            backend_detail="selected",
+        )
+
+
+class PrintWindowCaptureBackend:
+    kind = _CAPTURE_BACKEND_PRINTWINDOW
+
     def __init__(self, *, logger=None) -> None:
         self._logger = logger
 
@@ -1193,7 +1329,7 @@ class Win32CaptureBackend:
             import win32gui
             import win32ui
             import win32con
-            return True
+            return bool(win32gui and win32ui and win32con)
         except ImportError:
             return False
 
@@ -1201,81 +1337,27 @@ class Win32CaptureBackend:
         return f"{target.process_name}({target.pid}) {target.title}"
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
-        import win32gui
-        from PIL import ImageGrab
-
-        hwnd = target.hwnd
-        rect = win32gui.GetWindowRect(hwnd)
-        width = rect[2] - rect[0]
-        height = rect[3] - rect[1]
-
-        if width <= 0 or height <= 0:
-            raise RuntimeError(f"Invalid window dimensions: {width}x{height}")
-
-        image = None
-        desktop_error = None
-        try:
-            image = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
-        except Exception as exc:
-            desktop_error = exc
-
-        if image is None:
-            image = self._capture_frame_with_print_window(
-                hwnd=hwnd,
-                width=width,
-                height=height,
-                desktop_error=desktop_error,
-            )
-
-        left = int(width * profile.left_inset_ratio)
-        right = int(width * (1.0 - profile.right_inset_ratio))
-        top = int(height * profile.top_ratio)
-        bottom = int(height * (1.0 - profile.bottom_inset_ratio))
-
-        left = max(0, min(left, width))
-        right = max(left, min(right, width))
-        top = max(0, min(top, height))
-        bottom = max(top, min(bottom, height))
-
-        crop_w = right - left
-        crop_h = bottom - top
-        if crop_w < 10 or crop_h < 10:
-            raise RuntimeError(f"Crop region too small: {crop_w}x{crop_h}")
-
-        cropped = image.crop((left, top, right, bottom))
-        cropped.info["galgame_bounds_coordinate_space"] = "capture"
-        cropped.info["galgame_source_size"] = {"width": float(crop_w), "height": float(crop_h)}
-        cropped.info["galgame_capture_rect"] = {
-            "left": float(rect[0] + left),
-            "top": float(rect[1] + top),
-            "right": float(rect[0] + right),
-            "bottom": float(rect[1] + bottom),
-        }
-        cropped.info["galgame_window_rect"] = {
-            "left": float(rect[0]),
-            "top": float(rect[1]),
-            "right": float(rect[2]),
-            "bottom": float(rect[3]),
-        }
-        return cropped
+        rect = _target_window_rect(target)
+        image = self._capture_full_window(target.hwnd, rect)
+        return _crop_window_image(
+            image,
+            window_rect=rect,
+            profile=profile,
+            backend_kind=self.kind,
+            backend_detail="selected_legacy_fallback",
+        )
 
     @staticmethod
-    def _capture_frame_with_print_window(
-        *,
-        hwnd: int,
-        width: int,
-        height: int,
-        desktop_error: Exception | None = None,
-    ) -> Any:
+    def _capture_full_window(hwnd: int, rect: tuple[int, int, int, int]) -> Any:
         import win32gui
         import win32ui
         import win32con
         from PIL import Image
 
+        width = int(rect[2] - rect[0])
+        height = int(rect[3] - rect[1])
         hdc = win32gui.GetWindowDC(hwnd)
         if not hdc:
-            if desktop_error is not None:
-                raise RuntimeError(f"Failed to capture desktop and window DC: {desktop_error}")
             raise RuntimeError("Failed to get window DC")
 
         bmp = None
@@ -1315,6 +1397,113 @@ class Win32CaptureBackend:
                 win32gui.DeleteObject(bmp.GetHandle())
             win32gui.ReleaseDC(hwnd, hdc)
         return image
+
+
+class DxcamCaptureBackend:
+    kind = _CAPTURE_BACKEND_DXCAM
+
+    def __init__(self, *, logger=None) -> None:
+        self._logger = logger
+        self._camera = None
+        self._last_create_error = ""
+
+    def is_available(self) -> bool:
+        try:
+            import dxcam
+            return bool(dxcam)
+        except ImportError:
+            return False
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}({target.pid}) {target.title}"
+
+    def _camera_instance(self):
+        if self._camera is not None:
+            return self._camera
+        import dxcam
+
+        try:
+            self._camera = dxcam.create(output_color="RGB")
+        except Exception as exc:
+            self._last_create_error = str(exc)
+            raise RuntimeError(f"dxcam_create_failed: {exc}") from exc
+        if self._camera is None:
+            raise RuntimeError("dxcam_create_failed: returned None")
+        return self._camera
+
+    def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
+        from PIL import Image
+
+        _require_foreground_capture_target(target, backend_kind=self.kind)
+        rect = _target_window_rect(target)
+        camera = self._camera_instance()
+        frame = camera.grab(region=rect)
+        if frame is None:
+            raise RuntimeError("dxcam_grab_returned_none")
+        image = Image.fromarray(frame).convert("RGB")
+        return _crop_window_image(
+            image,
+            window_rect=rect,
+            profile=profile,
+            backend_kind=self.kind,
+            backend_detail="selected",
+        )
+
+
+class Win32CaptureBackend:
+    def __init__(self, *, logger=None, selection: str = _CAPTURE_BACKEND_AUTO) -> None:
+        self._logger = logger
+        self.selection = str(selection or _CAPTURE_BACKEND_AUTO).strip().lower()
+        self._backends = self._build_backends()
+        self.last_backend_kind = ""
+        self.last_backend_detail = ""
+
+    def _build_backends(self) -> list[CaptureBackend]:
+        imagegrab = ImageGrabCaptureBackend(logger=self._logger)
+        printwindow = PrintWindowCaptureBackend(logger=self._logger)
+        dxcam = DxcamCaptureBackend(logger=self._logger)
+        if self.selection == _CAPTURE_BACKEND_DXCAM:
+            return [dxcam]
+        if self.selection == _CAPTURE_BACKEND_IMAGEGRAB:
+            return [imagegrab]
+        if self.selection == _CAPTURE_BACKEND_PRINTWINDOW:
+            return [printwindow]
+        return [dxcam, imagegrab, printwindow]
+
+    def is_available(self) -> bool:
+        return any(backend.is_available() for backend in self._backends)
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}({target.pid}) {target.title}"
+
+    def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
+        errors: list[str] = []
+        for backend in self._backends:
+            kind = str(getattr(backend, "kind", backend.__class__.__name__))
+            if not backend.is_available():
+                errors.append(f"{kind}_unavailable")
+                continue
+            try:
+                frame = backend.capture_frame(target, profile)
+                self.last_backend_kind = kind
+                self.last_backend_detail = (
+                    "dxcam_unavailable_fallback"
+                    if kind != _CAPTURE_BACKEND_DXCAM and "dxcam_unavailable" in errors
+                    else "selected"
+                )
+                frame_info = getattr(frame, "info", None)
+                if isinstance(frame_info, dict):
+                    frame_info["galgame_capture_backend_kind"] = kind
+                    frame_info["galgame_capture_backend_detail"] = self.last_backend_detail
+                return frame
+            except Exception as exc:
+                errors.append(f"{kind}_failed:{exc}")
+                if "target_window_not_foreground_for_capture" in str(exc):
+                    raise
+                if self.selection != _CAPTURE_BACKEND_AUTO:
+                    raise
+                continue
+        raise RuntimeError("; ".join(errors) or "capture_backend_unavailable")
 
 
 class TesseractOcrBackend:
@@ -2010,7 +2199,11 @@ class OcrReaderManager:
         self._time_fn = time_fn or time.time
         self._platform_fn = platform_fn or _is_windows_platform
         self._window_scanner = window_scanner or _default_window_scanner
-        self._capture_backend = capture_backend or Win32CaptureBackend(logger=logger)
+        self._custom_capture_backend = capture_backend is not None
+        self._capture_backend = capture_backend or Win32CaptureBackend(
+            logger=logger,
+            selection=config.ocr_reader_capture_backend,
+        )
         self._ocr_backend = ocr_backend
         self._custom_ocr_backend = ocr_backend is not None
         self._writer = writer or OcrReaderBridgeWriter(
@@ -2042,10 +2235,22 @@ class OcrReaderManager:
         self._last_raw_ocr_text = ""
         self._last_observed_line: dict[str, Any] = {}
         self._last_stable_line: dict[str, Any] = {}
+        self._last_capture_image_hash = ""
+        self._consecutive_same_capture_frames = 0
+        self._stale_capture_backend = False
+        self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
+        self._capture_backend_detail = ""
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
         self._runtime.enabled = config.ocr_reader_enabled
+        if not self._custom_capture_backend:
+            current_selection = str(getattr(self._capture_backend, "selection", "") or "")
+            if current_selection != config.ocr_reader_capture_backend:
+                self._capture_backend = Win32CaptureBackend(
+                    logger=self._logger,
+                    selection=config.ocr_reader_capture_backend,
+                )
         if self._writer.bridge_root != config.bridge_root:
             self._writer = OcrReaderBridgeWriter(
                 bridge_root=config.bridge_root,
@@ -2077,15 +2282,40 @@ class OcrReaderManager:
         self._last_capture_attempt_at = utc_now_iso(now)
         self._last_capture_error = ""
 
-    def _record_capture_completed(self, *, now: float, raw_text: str) -> None:
+    def _record_capture_completed(self, *, now: float, raw_text: str, image_hash: str = "") -> None:
         self._last_capture_completed_at = utc_now_iso(now)
         self._last_raw_ocr_text = str(raw_text or "")
         self._last_capture_error = ""
+        if image_hash:
+            if image_hash == self._last_capture_image_hash:
+                self._consecutive_same_capture_frames += 1
+            else:
+                self._last_capture_image_hash = image_hash
+                self._consecutive_same_capture_frames = 1
+            self._stale_capture_backend = (
+                self._consecutive_same_capture_frames >= _STALE_CAPTURE_FRAME_THRESHOLD
+            )
 
     def _record_capture_error(self, *, now: float, error: Exception) -> None:
         if not self._last_capture_attempt_at:
             self._last_capture_attempt_at = utc_now_iso(now)
         self._last_capture_error = str(error)
+
+    @staticmethod
+    def _capture_image_hash(frame: Any) -> str:
+        if frame is None:
+            return ""
+        try:
+            if hasattr(frame, "tobytes") and hasattr(frame, "size"):
+                size = getattr(frame, "size", "")
+                payload = frame.tobytes()
+                return hashlib.sha1(repr(size).encode("utf-8") + payload).hexdigest()[:16]
+        except Exception:
+            return ""
+        try:
+            return hashlib.sha1(repr(frame).encode("utf-8", "ignore")).hexdigest()[:16]
+        except Exception:
+            return ""
 
     def _line_payload_from_writer(self, *, stability: str) -> dict[str, Any]:
         state = getattr(self._writer, "_state", {})
@@ -2112,6 +2342,8 @@ class OcrReaderManager:
             return "capture_pending"
         if detail == "capture_failed":
             return "capture_failed"
+        if self._stale_capture_backend:
+            return "stale_capture_backend"
         if detail == "ocr_capture_diagnostic_required" or self._ocr_capture_diagnostic_required():
             return "diagnostic_required"
         if detail in {"attached_no_text_yet", "self_ui_guard_blocked"}:
@@ -2702,6 +2934,9 @@ class OcrReaderManager:
         self._last_raw_ocr_text = ""
         self._last_observed_line = {}
         self._last_stable_line = {}
+        self._last_capture_image_hash = ""
+        self._consecutive_same_capture_frames = 0
+        self._stale_capture_backend = False
 
     def _reset_aihong_menu_state(self) -> None:
         self._aihong_menu_ocr_state.reset()
@@ -3071,7 +3306,13 @@ class OcrReaderManager:
                 backend_plan,
             )
             capture_completed = True
-            self._record_capture_completed(now=now, raw_text=extraction.text)
+            self._record_capture_completed(
+                now=now,
+                raw_text=extraction.text,
+                image_hash=extraction.capture_image_hash,
+            )
+            self._capture_backend_kind = extraction.capture_backend_kind
+            self._capture_backend_detail = extraction.capture_backend_detail
             active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
             backend_detail_override = extraction.backend_detail
             result.warnings.extend(extraction.warnings)
@@ -3153,7 +3394,10 @@ class OcrReaderManager:
                             self._record_capture_completed(
                                 now=self._time_fn(),
                                 raw_text=followup_extraction.text,
+                                image_hash=followup_extraction.capture_image_hash,
                             )
+                            self._capture_backend_kind = followup_extraction.capture_backend_kind
+                            self._capture_backend_detail = followup_extraction.capture_backend_detail
                             active_backend = (
                                 followup_extraction.backend
                                 if followup_extraction.backend.kind
@@ -3214,7 +3458,10 @@ class OcrReaderManager:
                                 self._record_capture_completed(
                                     now=self._time_fn(),
                                     raw_text=menu_extraction.text,
+                                    image_hash=menu_extraction.capture_image_hash,
                                 )
+                                self._capture_backend_kind = menu_extraction.capture_backend_kind
+                                self._capture_backend_detail = menu_extraction.capture_backend_detail
                                 active_backend = (
                                     menu_extraction.backend
                                     if menu_extraction.backend.kind
@@ -3274,7 +3521,10 @@ class OcrReaderManager:
                         self._record_capture_completed(
                             now=self._time_fn(),
                             raw_text=followup_extraction.text,
+                            image_hash=followup_extraction.capture_image_hash,
                         )
+                        self._capture_backend_kind = followup_extraction.capture_backend_kind
+                        self._capture_backend_detail = followup_extraction.capture_backend_detail
                         active_backend = (
                             followup_extraction.backend
                             if followup_extraction.backend.kind
@@ -3667,6 +3917,32 @@ class OcrReaderManager:
             last_raw_ocr_text=str(self._last_raw_ocr_text or self._runtime.last_raw_ocr_text),
             last_observed_line=dict(self._last_observed_line or self._runtime.last_observed_line),
             last_stable_line=dict(self._last_stable_line or self._runtime.last_stable_line),
+            capture_backend_kind=str(
+                self._capture_backend_kind
+                or self._runtime.capture_backend_kind
+                or getattr(self._capture_backend, "last_backend_kind", "")
+                or getattr(self._capture_backend, "selection", "")
+            ),
+            capture_backend_detail=str(
+                self._capture_backend_detail
+                or self._runtime.capture_backend_detail
+                or getattr(self._capture_backend, "last_backend_detail", "")
+                or ""
+            ),
+            last_capture_image_hash=str(
+                self._last_capture_image_hash or self._runtime.last_capture_image_hash
+            ),
+            consecutive_same_capture_frames=max(
+                0,
+                int(
+                    self._consecutive_same_capture_frames
+                    or self._runtime.consecutive_same_capture_frames
+                    or 0
+                ),
+            ),
+            stale_capture_backend=bool(
+                self._stale_capture_backend or self._runtime.stale_capture_backend
+            ),
         )
 
     def _extract_text_from_image(
@@ -3746,9 +4022,21 @@ class OcrReaderManager:
         plan: SelectedOcrBackendPlan,
     ) -> OcrExtractionResult:
         frame = self._capture_backend.capture_frame(target, profile)
+        capture_hash = self._capture_image_hash(frame)
         extraction = self._extract_text_from_image(frame, plan=plan)
+        extraction.capture_image_hash = capture_hash
         frame_info = getattr(frame, "info", {}) if frame is not None else {}
         if isinstance(frame_info, dict):
+            extraction.capture_backend_kind = str(
+                frame_info.get("galgame_capture_backend_kind")
+                or getattr(self._capture_backend, "last_backend_kind", "")
+                or getattr(self._capture_backend, "selection", "")
+            )
+            extraction.capture_backend_detail = str(
+                frame_info.get("galgame_capture_backend_detail")
+                or getattr(self._capture_backend, "last_backend_detail", "")
+                or ""
+            )
             extraction.bounds_coordinate_space = str(
                 frame_info.get("galgame_bounds_coordinate_space") or ""
             )
@@ -3761,6 +4049,15 @@ class OcrReaderManager:
             window_rect = frame_info.get("galgame_window_rect")
             if isinstance(window_rect, dict):
                 extraction.window_rect = dict(window_rect)
+        else:
+            extraction.capture_backend_kind = str(
+                getattr(self._capture_backend, "last_backend_kind", "")
+                or getattr(self._capture_backend, "selection", "")
+                or ""
+            )
+            extraction.capture_backend_detail = str(
+                getattr(self._capture_backend, "last_backend_detail", "") or ""
+            )
         return extraction
 
     def _select_target_window(
