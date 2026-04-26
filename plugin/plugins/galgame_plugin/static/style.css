@@ -117,6 +117,82 @@ h1 {
   margin-bottom: 10px;
 }
 
+.settings-module,
+.dashboard-module {
+  margin-top: 14px;
+}
+
+.settings-module {
+  border: 1px solid rgba(31, 42, 51, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.48);
+}
+
+.settings-module:first-of-type {
+  margin-top: 0;
+}
+
+.settings-module > summary,
+.dashboard-module > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.settings-module > summary {
+  padding: 15px 18px;
+}
+
+.dashboard-module > summary {
+  margin-bottom: 14px;
+}
+
+.settings-module > summary::-webkit-details-marker,
+.dashboard-module > summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-module > summary::after,
+.dashboard-module > summary::after {
+  content: "展开";
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.07);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.settings-module[open] > summary::after,
+.dashboard-module[open] > summary::after {
+  content: "收起";
+}
+
+.settings-module > summary span,
+.dashboard-module > summary span {
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.settings-module > summary small,
+.dashboard-module > summary small {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.module-body {
+  padding: 0 18px 18px;
+}
+
 .section-copy,
 .panel-subcopy {
   color: var(--muted);
@@ -326,7 +402,6 @@ button[disabled] {
 .install-stack {
   display: grid;
   gap: 14px;
-  margin-top: 14px;
 }
 
 .install-tabs {
@@ -452,7 +527,6 @@ button[disabled] {
 }
 
 .capture-profile-panel {
-  margin-top: 14px;
   padding: 18px 20px;
   border: 1px solid rgba(31, 42, 51, 0.08);
   border-radius: 18px;
@@ -460,7 +534,6 @@ button[disabled] {
 }
 
 .window-target-panel {
-  margin-top: 14px;
   padding: 18px 20px;
   border: 1px solid rgba(31, 42, 51, 0.08);
   border-radius: 18px;
@@ -870,6 +943,23 @@ button[disabled] {
 }
 
 @media (max-width: 720px) {
+  .settings-module > summary,
+  .dashboard-module > summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settings-module > summary small,
+  .dashboard-module > summary small {
+    margin-left: 0;
+    text-align: left;
+  }
+
+  .settings-module > summary::after,
+  .dashboard-module > summary::after {
+    align-self: flex-start;
+  }
+
   .window-candidate-header {
     flex-direction: column;
     align-items: stretch;

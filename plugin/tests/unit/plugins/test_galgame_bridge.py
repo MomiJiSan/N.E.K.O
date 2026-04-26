@@ -479,6 +479,7 @@ class _FakeTextractorHandle:
 class _FakeCaptureBackend:
     def __init__(self, *, available: bool = True) -> None:
         self.available = available
+        self.capture_calls = 0
 
     def is_available(self) -> bool:
         return self.available
@@ -488,6 +489,7 @@ class _FakeCaptureBackend:
 
     def capture_frame(self, target: DetectedGameWindow, profile) -> str:
         del profile
+        self.capture_calls += 1
         return f"frame:{target.hwnd}"
 
 
@@ -3008,6 +3010,114 @@ def test_ocr_reader_foreground_refresh_rebounds_manual_target_by_signature(
     assert runtime["target_is_foreground"] is True
     assert runtime["target_hwnd"] == rebound.hwnd
     assert runtime["foreground_refresh_detail"] == "manual_target_rebound:foreground"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_requires_manual_fallback_when_auto_target_is_not_confident(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=812,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=9102,
+        width=1040,
+        height=807,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(["不应读取"]),
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "waiting_for_valid_window"
+    assert result.runtime["target_selection_mode"] == "auto"
+    assert result.runtime["target_selection_detail"] == "auto_detect_needs_manual_fallback"
+    assert result.runtime["candidate_count"] == 1
+    assert capture_backend.capture_calls == 0
+    assert manager._writer.last_seq == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_auto_detects_foreground_window_before_manual_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=813,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=9103,
+        width=1040,
+        height=807,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(["王生\n算了，没事。"]),
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: target.hwnd)
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["target_selection_mode"] == "auto"
+    assert result.runtime["target_selection_detail"] == "foreground_window"
+    assert result.runtime["effective_process_name"] == "TheLamentingGeese.exe"
+    assert capture_backend.capture_calls == 1
+    assert manager._writer.last_seq >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_does_not_auto_capture_common_non_game_foreground_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    browser = DetectedGameWindow(
+        hwnd=814,
+        title="Some Web Page",
+        process_name="chrome.exe",
+        pid=9104,
+        class_name="Chrome_WidgetWin_1",
+        width=1280,
+        height=800,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [browser],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(["不应读取网页文本"]),
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: browser.hwnd)
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "waiting_for_valid_window"
+    assert result.runtime["target_selection_detail"] == "foreground_window_needs_manual_confirmation"
+    assert capture_backend.capture_calls == 0
+    assert manager._writer.last_seq == 0
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,7 @@ from .models import (
     ADVANCE_SPEEDS,
     ADVANCE_SPEED_MEDIUM,
     DATA_SOURCE_NONE,
+    DATA_SOURCE_OCR_READER,
     MODE_COMPANION,
     MODES,
     build_ocr_capture_profile_bucket_key,
@@ -1737,7 +1738,7 @@ class GalgamePlugin(NekoPluginBase):
                 "last_known_hwnd": 0,
                 "selected_at": "",
             }
-            summary = "OCR window target restored to auto"
+            summary = "OCR window target cleared; waiting for manual lock"
         else:
             try:
                 target_payload = await asyncio.to_thread(

@@ -1485,11 +1485,14 @@ function formatOcrWindowReason(reason) {
 
 function formatOcrWindowSelectionDetail(detail) {
   const mapping = {
-    auto_candidate_scan: '自动扫描可用窗口',
+    auto_candidate_scan: '正在自动检测游戏窗口',
     manual_target_active: '手动锁定已启用',
     manual_target_exact: '命中手动锁定窗口',
     manual_target_rebound: '已按签名重新绑定手动窗口',
-    manual_target_unavailable_fallback_to_auto: '手动窗口不可用，已回退到自动选择',
+    manual_target_unavailable_fallback_to_auto: '手动窗口不可用，请重新锁定窗口',
+    waiting_for_manual_window_target: '自动检测失败，请手动锁定 OCR 目标窗口',
+    auto_detect_needs_manual_fallback: '未找到可信自动目标，请手动选择游戏窗口',
+    foreground_window_needs_manual_confirmation: '当前前台窗口不像游戏，请手动选择游戏窗口',
     no_eligible_window: '当前没有可用游戏窗口',
     memory_reader_pid: '优先沿用 Memory Reader 命中的 PID',
     memory_reader_process: '优先沿用 Memory Reader 命中的进程',
@@ -1521,8 +1524,8 @@ function renderOcrWindowTargetStatus(status) {
 
   modeText.textContent = mode === 'manual'
     ? `当前模式: manual${manualTarget.process_name ? ` | 锁定 ${manualTarget.process_name}` : ''}`
-    : '当前模式: auto';
-  hint.textContent = hintParts.join(' | ') || '等待 OCR 窗口候选列表。';
+    : '当前模式: 自动检测优先';
+  hint.textContent = hintParts.join(' | ') || '插件会先尝试当前前台/已绑定游戏窗口；无法可信识别时，请手动选择游戏窗口。';
   autoButton.disabled = mode !== 'manual';
 }
 
@@ -1550,19 +1553,21 @@ function renderLockedWindow(status) {
         </div>
       </div>
     `;
-  } else if (effectiveProcess) {
+  } else if (effectiveProcess || effectiveTitle) {
+    const detail = formatOcrWindowSelectionDetail(runtime.target_selection_detail || '');
     card.innerHTML = `
       <div class="locked-window-info">
-        <p class="list-kicker">${escapeHtml(effectiveProcess)}${runtime.pid ? ` · PID ${escapeHtml(runtime.pid)}` : ''}</p>
+        <p class="list-kicker">${escapeHtml(effectiveProcess || '自动检测目标')}${runtime.pid ? ` · PID ${escapeHtml(runtime.pid)}` : ''}</p>
         <h3>${escapeHtml(effectiveTitle || '未命名窗口')}</h3>
-        <p class="result-note mono">${escapeHtml(runtime.effective_window_key || '')}</p>
+        <p class="result-note">${escapeHtml(detail || '自动检测到可信游戏窗口')}</p>
         <div class="window-candidate-meta" style="margin-top:8px;">
-          <span class="status-chip">自动选择</span>
+          <span class="status-chip active">自动检测</span>
+          ${runtime.target_is_foreground ? '<span class="status-chip active">前台窗口</span>' : '<span class="status-chip warning">非前台</span>'}
         </div>
       </div>
     `;
   } else {
-    card.innerHTML = '<div class="locked-window-empty">暂无锁定的窗口，请点击下方按钮选择。</div>';
+    card.innerHTML = '<div class="locked-window-empty">尚未确认 OCR 目标窗口。插件会优先尝试前台/已绑定游戏窗口；如果仍没有读到台词，请点击“选择识别窗口”手动锁定。</div>';
   }
 }
 
@@ -2680,13 +2685,13 @@ async function setOcrWindowTarget(windowKey) {
 
 async function clearOcrWindowTarget() {
   try {
-    setFlash('正在恢复 OCR 自动选窗...', 'info');
+    setFlash('正在清除 OCR 目标窗口...', 'info');
     const payload = await callPlugin('galgame_set_ocr_window_target', {
       clear: true,
     });
-    setFlash(payload.summary || 'OCR 已恢复自动选窗，后台正在刷新识别状态。', 'success');
+    setFlash(payload.summary || '已清除 OCR 目标窗口。插件会重新尝试自动检测；识别不到时再手动选择。', 'success');
     refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
-      console.warn('[galgame_plugin ui] refresh after OCR auto target failed', error);
+      console.warn('[galgame_plugin ui] refresh after OCR target clear failed', error);
     });
     refreshOcrWindowTargets({ includeExcluded: true, silent: true }).catch(() => {});
   } catch (error) {
@@ -2695,7 +2700,7 @@ async function clearOcrWindowTarget() {
 }
 
 async function clearOcrWindowTargetWithFeedback() {
-  await withButtonPending('ocrWindowAutoBtn', '恢复中...', clearOcrWindowTarget);
+  await withButtonPending('ocrWindowAutoBtn', '清除中...', clearOcrWindowTarget);
 }
 
 function switchInstallTab(tab) {

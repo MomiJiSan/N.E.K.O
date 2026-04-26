@@ -92,6 +92,20 @@ _OVERLAY_PROCESS_NAME_SUBSTRINGS = (
     "code",
     "steamwebhelper",
 )
+_AUTO_TARGET_DENY_PROCESS_NAMES = {
+    "applicationframehost.exe",
+    "chrome.exe",
+    "cmd.exe",
+    "code.exe",
+    "explorer.exe",
+    "firefox.exe",
+    "msedge.exe",
+    "notepad.exe",
+    "powershell.exe",
+    "windowsterminal.exe",
+    "winword.exe",
+    "wps.exe",
+}
 _HELPER_CLASS_NAMES = {
     "Shell_TrayWnd",
     "Windows.UI.Core.CoreWindow",
@@ -1188,9 +1202,7 @@ class Win32CaptureBackend:
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         import win32gui
-        import win32ui
-        import win32con
-        from PIL import Image
+        from PIL import ImageGrab
 
         hwnd = target.hwnd
         rect = win32gui.GetWindowRect(hwnd)
@@ -1200,8 +1212,70 @@ class Win32CaptureBackend:
         if width <= 0 or height <= 0:
             raise RuntimeError(f"Invalid window dimensions: {width}x{height}")
 
+        image = None
+        desktop_error = None
+        try:
+            image = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
+        except Exception as exc:
+            desktop_error = exc
+
+        if image is None:
+            image = self._capture_frame_with_print_window(
+                hwnd=hwnd,
+                width=width,
+                height=height,
+                desktop_error=desktop_error,
+            )
+
+        left = int(width * profile.left_inset_ratio)
+        right = int(width * (1.0 - profile.right_inset_ratio))
+        top = int(height * profile.top_ratio)
+        bottom = int(height * (1.0 - profile.bottom_inset_ratio))
+
+        left = max(0, min(left, width))
+        right = max(left, min(right, width))
+        top = max(0, min(top, height))
+        bottom = max(top, min(bottom, height))
+
+        crop_w = right - left
+        crop_h = bottom - top
+        if crop_w < 10 or crop_h < 10:
+            raise RuntimeError(f"Crop region too small: {crop_w}x{crop_h}")
+
+        cropped = image.crop((left, top, right, bottom))
+        cropped.info["galgame_bounds_coordinate_space"] = "capture"
+        cropped.info["galgame_source_size"] = {"width": float(crop_w), "height": float(crop_h)}
+        cropped.info["galgame_capture_rect"] = {
+            "left": float(rect[0] + left),
+            "top": float(rect[1] + top),
+            "right": float(rect[0] + right),
+            "bottom": float(rect[1] + bottom),
+        }
+        cropped.info["galgame_window_rect"] = {
+            "left": float(rect[0]),
+            "top": float(rect[1]),
+            "right": float(rect[2]),
+            "bottom": float(rect[3]),
+        }
+        return cropped
+
+    @staticmethod
+    def _capture_frame_with_print_window(
+        *,
+        hwnd: int,
+        width: int,
+        height: int,
+        desktop_error: Exception | None = None,
+    ) -> Any:
+        import win32gui
+        import win32ui
+        import win32con
+        from PIL import Image
+
         hdc = win32gui.GetWindowDC(hwnd)
         if not hdc:
+            if desktop_error is not None:
+                raise RuntimeError(f"Failed to capture desktop and window DC: {desktop_error}")
             raise RuntimeError("Failed to get window DC")
 
         bmp = None
@@ -1240,38 +1314,7 @@ class Win32CaptureBackend:
             if bmp is not None:
                 win32gui.DeleteObject(bmp.GetHandle())
             win32gui.ReleaseDC(hwnd, hdc)
-
-        left = int(width * profile.left_inset_ratio)
-        right = int(width * (1.0 - profile.right_inset_ratio))
-        top = int(height * profile.top_ratio)
-        bottom = int(height * (1.0 - profile.bottom_inset_ratio))
-
-        left = max(0, min(left, width))
-        right = max(left, min(right, width))
-        top = max(0, min(top, height))
-        bottom = max(top, min(bottom, height))
-
-        crop_w = right - left
-        crop_h = bottom - top
-        if crop_w < 10 or crop_h < 10:
-            raise RuntimeError(f"Crop region too small: {crop_w}x{crop_h}")
-
-        cropped = image.crop((left, top, right, bottom))
-        cropped.info["galgame_bounds_coordinate_space"] = "capture"
-        cropped.info["galgame_source_size"] = {"width": float(crop_w), "height": float(crop_h)}
-        cropped.info["galgame_capture_rect"] = {
-            "left": float(rect[0] + left),
-            "top": float(rect[1] + top),
-            "right": float(rect[0] + right),
-            "bottom": float(rect[1] + bottom),
-        }
-        cropped.info["galgame_window_rect"] = {
-            "left": float(rect[0]),
-            "top": float(rect[1]),
-            "right": float(rect[2]),
-            "bottom": float(rect[3]),
-        }
-        return cropped
+        return image
 
 
 class TesseractOcrBackend:
@@ -1511,6 +1554,18 @@ def _classify_window_candidate(candidate: DetectedGameWindow) -> DetectedGameWin
     candidate.exclude_reason = ""
     candidate.category = "eligible_game_window"
     return candidate
+
+
+def _is_confident_auto_window(candidate: DetectedGameWindow) -> bool:
+    if _matches_aihong_target(candidate):
+        return True
+    process_name = str(candidate.process_name or "").strip().lower()
+    class_name = str(candidate.class_name or "").strip().lower()
+    if process_name in _AUTO_TARGET_DENY_PROCESS_NAMES:
+        return False
+    if class_name.startswith("chrome_widgetwin"):
+        return False
+    return bool(candidate.hwnd and candidate.eligible)
 
 
 def _window_sort_key(candidate: DetectedGameWindow) -> tuple[int, int, float, str]:
@@ -3020,7 +3075,7 @@ class OcrReaderManager:
             active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
             backend_detail_override = extraction.backend_detail
             result.warnings.extend(extraction.warnings)
-            if extraction.text and not selection.selected_by_manual and _looks_like_self_ui_text(extraction.text):
+            if extraction.text and _looks_like_self_ui_text(extraction.text):
                 guard_blocked = True
                 result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
             else:
@@ -3108,11 +3163,7 @@ class OcrReaderManager:
                                 followup_extraction.backend_detail or backend_detail_override
                             )
                             result.warnings.extend(followup_extraction.warnings)
-                            if (
-                                followup_extraction.text
-                                and not selection.selected_by_manual
-                                and _looks_like_self_ui_text(followup_extraction.text)
-                            ):
+                            if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
                                 result.warnings.append(
                                     "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                 )
@@ -3173,11 +3224,7 @@ class OcrReaderManager:
                                     menu_extraction.backend_detail or backend_detail_override
                                 )
                                 result.warnings.extend(menu_extraction.warnings)
-                                if (
-                                    menu_extraction.text
-                                    and not selection.selected_by_manual
-                                    and _looks_like_self_ui_text(menu_extraction.text)
-                                ):
+                                if menu_extraction.text and _looks_like_self_ui_text(menu_extraction.text):
                                     result.warnings.append(
                                         "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                     )
@@ -3237,11 +3284,7 @@ class OcrReaderManager:
                             followup_extraction.backend_detail or backend_detail_override
                         )
                         result.warnings.extend(followup_extraction.warnings)
-                        if (
-                            followup_extraction.text
-                            and not selection.selected_by_manual
-                            and _looks_like_self_ui_text(followup_extraction.text)
-                        ):
+                        if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
                             result.warnings.append(
                                 "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                             )
@@ -3819,13 +3862,16 @@ class OcrReaderManager:
         if foreground_hwnd:
             for candidate in windows:
                 if candidate.hwnd == foreground_hwnd:
+                    if not _is_confident_auto_window(candidate):
+                        if selection.selection_mode == "auto":
+                            selection.selection_detail = "foreground_window_needs_manual_confirmation"
+                        return selection
                     selection.target = candidate
                     if selection.selection_mode == "auto":
                         selection.selection_detail = "foreground_window"
                     return selection
-        selection.target = windows[0]
         if selection.selection_mode == "auto":
-            selection.selection_detail = "scored_candidate"
+            selection.selection_detail = "auto_detect_needs_manual_fallback"
         return selection
 
     def _consume_ocr_text(
