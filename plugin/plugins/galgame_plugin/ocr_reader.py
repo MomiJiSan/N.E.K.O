@@ -1036,6 +1036,10 @@ class OcrReaderRuntime:
     last_raw_ocr_text: str = ""
     last_observed_line: dict[str, Any] = field(default_factory=dict)
     last_stable_line: dict[str, Any] = field(default_factory=dict)
+    foreground_refresh_at: str = ""
+    foreground_refresh_detail: str = ""
+    foreground_hwnd: int = 0
+    target_hwnd: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1086,6 +1090,10 @@ class OcrReaderRuntime:
             "last_raw_ocr_text": self.last_raw_ocr_text,
             "last_observed_line": dict(self.last_observed_line),
             "last_stable_line": dict(self.last_stable_line),
+            "foreground_refresh_at": self.foreground_refresh_at,
+            "foreground_refresh_detail": self.foreground_refresh_detail,
+            "foreground_hwnd": self.foreground_hwnd,
+            "target_hwnd": self.target_hwnd,
         }
 
 
@@ -2083,6 +2091,74 @@ class OcrReaderManager:
 
     def current_window_target(self) -> dict[str, Any]:
         return self._manual_target.to_dict()
+
+    def refresh_foreground_state(self) -> dict[str, Any]:
+        if not self._config.ocr_reader_enabled or not self._platform_fn():
+            return self._runtime.to_dict()
+        foreground_hwnd = _foreground_window_handle()
+        target, detail = self._foreground_refresh_target()
+        target_hwnd = int(target.hwnd or 0) if target is not None else 0
+        if target is not None:
+            is_foreground = bool(foreground_hwnd and target_hwnd and foreground_hwnd == target_hwnd)
+            self._runtime.target_is_foreground = is_foreground
+            self._runtime.effective_window_key = str(target.window_key or self._runtime.effective_window_key)
+            self._runtime.effective_window_title = str(target.title or self._runtime.effective_window_title)
+            self._runtime.effective_process_name = str(target.process_name or self._runtime.effective_process_name)
+            if not self._runtime.process_name:
+                self._runtime.process_name = str(target.process_name or "")
+            if not self._runtime.window_title:
+                self._runtime.window_title = str(target.title or "")
+            if not self._runtime.pid:
+                self._runtime.pid = int(target.pid or 0)
+            detail = f"{detail}:{'foreground' if is_foreground else 'background'}"
+        elif self._runtime.effective_window_key or self._runtime.process_name:
+            detail = detail or "target_unresolved"
+        else:
+            detail = "no_target"
+        self._runtime.foreground_refresh_at = utc_now_iso(self._time_fn())
+        self._runtime.foreground_refresh_detail = detail
+        self._runtime.foreground_hwnd = max(0, int(foreground_hwnd or 0))
+        self._runtime.target_hwnd = max(0, int(target_hwnd or 0))
+        return self._runtime.to_dict()
+
+    def _foreground_refresh_target(self) -> tuple[DetectedGameWindow | None, str]:
+        windows = list(self._last_detected_windows or [])
+        for target, detail in (
+            (self._manual_target, "manual_target"),
+            (self._locked_target, "locked_target"),
+        ):
+            if not isinstance(target, OcrWindowTarget):
+                continue
+            if not (
+                target.window_key
+                or target.last_known_hwnd
+                or target.pid
+                or target.process_name
+                or target.normalized_title
+            ):
+                continue
+            for candidate in windows:
+                if target.matches_exact(candidate) or target.matches_hwnd(candidate):
+                    return candidate, f"{detail}_exact"
+            for candidate in windows:
+                if target.matches_signature(candidate):
+                    return candidate, f"{detail}_rebound"
+        runtime_key = str(self._runtime.effective_window_key or "").strip()
+        runtime_process = str(self._runtime.effective_process_name or self._runtime.process_name or "").strip().lower()
+        runtime_pid = int(self._runtime.pid or 0)
+        if runtime_key:
+            for candidate in windows:
+                if candidate.window_key == runtime_key:
+                    return candidate, "runtime_effective_key"
+        if runtime_pid > 0:
+            for candidate in windows:
+                if candidate.pid == runtime_pid:
+                    return candidate, "runtime_pid"
+        if runtime_process:
+            for candidate in windows:
+                if candidate.process_name.strip().lower() == runtime_process:
+                    return candidate, "runtime_process"
+        return None, "target_unresolved"
 
     def _has_locked_target(self) -> bool:
         return bool(

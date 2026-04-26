@@ -162,6 +162,10 @@ const FIELD_LABELS_ZH = {
   effective_window_key: '生效窗口键',
   effective_window_title: '生效窗口标题',
   effective_process_name: '生效进程名',
+  foreground_refresh_at: '前台刷新时间',
+  foreground_refresh_detail: '前台刷新详情',
+  foreground_hwnd: '当前前台 hwnd',
+  target_hwnd: '目标 hwnd',
   candidate_count: '候选窗口数',
   excluded_candidate_count: '排除窗口数',
   last_exclude_reason: '最近排除原因',
@@ -411,6 +415,12 @@ function renderAgentUserNotice(status = {}) {
   node.hidden = false;
   title.textContent = label;
   body.textContent = status.agent_pause_message
+    || (userStatus === 'read_only' && status.mode === 'companion'
+      ? '游戏窗口已在前台，但伴读模式不会自动推进。需要自动推进时请切到自动推进模式。'
+      : '')
+    || (userStatus === 'running' && status.mode === 'choice_advisor'
+      ? '游戏窗口已在前台，Agent 会按自动推进模式继续。OCR 会在后台持续刷新。'
+      : '')
     || (userStatus === 'running'
       ? 'Agent 正在按当前模式运行。OCR 会在后台持续刷新。'
       : 'Agent 状态会随游戏窗口、OCR 和模式设置自动更新。');
@@ -1442,6 +1452,10 @@ function renderOcrRuntime(status) {
     { label: 'effective_window_title', value: runtime.effective_window_title || '' },
     { label: 'effective_process_name', value: runtime.effective_process_name || '' },
     { label: 'target_is_foreground', value: String(Boolean(runtime.target_is_foreground)) },
+    { label: 'foreground_refresh_at', value: runtime.foreground_refresh_at || '' },
+    { label: 'foreground_refresh_detail', value: runtime.foreground_refresh_detail || '' },
+    { label: 'foreground_hwnd', value: String(runtime.foreground_hwnd || 0) },
+    { label: 'target_hwnd', value: String(runtime.target_hwnd || 0) },
     { label: 'candidate_count', value: String(runtime.candidate_count || 0) },
     { label: 'excluded_candidate_count', value: String(runtime.excluded_candidate_count || 0) },
     { label: 'last_exclude_reason', value: runtime.last_exclude_reason || '' },
@@ -2301,7 +2315,15 @@ async function refreshAll(options = {}) {
       renderSnapshot(snapshot);
       renderHistory(history);
       renderAgentStatus(agentStatus);
-      await refreshInsights(snapshot, { force: forceInsights, history, status });
+      const skipBlockingInsights = silent && status.agent_user_status === 'paused_window_not_foreground';
+      const insightRefresh = refreshInsights(snapshot, { force: forceInsights, history, status });
+      if (skipBlockingInsights) {
+        insightRefresh.catch((error) => {
+          console.warn('[galgame_plugin ui] background insight refresh failed', error);
+        });
+      } else {
+        await insightRefresh;
+      }
     } catch (error) {
       renderPluginUnavailable(error);
       if (silent) {

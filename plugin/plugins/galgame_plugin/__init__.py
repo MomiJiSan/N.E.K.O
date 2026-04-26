@@ -702,6 +702,7 @@ class GalgamePlugin(NekoPluginBase):
     async def _build_status_payload_async(self) -> dict[str, Any]:
         if self._cfg is None:
             return self._current_status_payload()
+        self._refresh_ocr_foreground_state()
         with self._state_lock:
             state = json_copy(self._state)
             config = self._cfg
@@ -892,6 +893,7 @@ class GalgamePlugin(NekoPluginBase):
 
     @timer_interval(id="bridge_tick", seconds=1, auto_start=True)
     async def bridge_tick(self, **_):
+        self._refresh_ocr_foreground_state()
         if self._game_agent is not None:
             self._last_agent_tick_at = time.monotonic()
             try:
@@ -906,6 +908,26 @@ class GalgamePlugin(NekoPluginBase):
                 )
         self._start_background_bridge_poll()
         return Ok({"status": "tick"})
+
+    def _refresh_ocr_foreground_state(self) -> None:
+        if self._ocr_reader_manager is None:
+            return
+        refresh = getattr(self._ocr_reader_manager, "refresh_foreground_state", None)
+        if not callable(refresh):
+            return
+        try:
+            runtime = refresh()
+        except Exception as exc:
+            self._record_error(
+                make_error(
+                    f"ocr_reader foreground refresh failed: {exc}",
+                    source="ocr_reader",
+                    kind="warning",
+                )
+            )
+            return
+        with self._state_lock:
+            self._state.ocr_reader_runtime = json_copy(runtime)
 
     async def _poll_bridge(self, *, force: bool) -> None:
         if self._cfg is None:

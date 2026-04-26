@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from plugin.plugins.galgame_plugin import GalgameBridgePlugin
 from plugin.plugins.galgame_plugin import local_input_actuator as local_input
+from plugin.plugins.galgame_plugin import ocr_reader as galgame_ocr_reader
 from plugin.plugins.galgame_plugin import service as galgame_service
 from plugin.plugins.galgame_plugin.game_llm_agent import GameLLMAgent
 from plugin.plugins.galgame_plugin.host_agent_adapter import HostAgentAdapter, HostAgentError
@@ -2912,6 +2913,101 @@ def test_auto_recalibrate_aihong_dialogue_profile_can_escape_stale_narrow_bucket
     assert payload["capture_profile"]["top_ratio"] == pytest.approx(0.60)
     assert payload["capture_profile"]["bottom_inset_ratio"] == pytest.approx(0.05)
     assert payload["sample_text"] == "王生：算了，没事。"
+
+
+@pytest.mark.plugin_unit
+def test_ocr_reader_foreground_refresh_updates_target_without_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=610,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=8101,
+        width=1040,
+        height=807,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        time_fn=lambda: 1713000000.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["不会被调用"]),
+    )
+    manager.list_windows_snapshot()
+    manager.update_window_target(
+        {
+            "mode": "manual",
+            "window_key": target.window_key,
+            "process_name": target.process_name,
+            "normalized_title": target.normalized_title,
+            "pid": target.pid,
+            "last_known_hwnd": target.hwnd,
+        }
+    )
+
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: target.hwnd)
+    runtime = manager.refresh_foreground_state()
+
+    assert runtime["target_is_foreground"] is True
+    assert runtime["foreground_hwnd"] == target.hwnd
+    assert runtime["target_hwnd"] == target.hwnd
+    assert runtime["foreground_refresh_detail"] == "manual_target_exact:foreground"
+
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 999999)
+    runtime = manager.refresh_foreground_state()
+
+    assert runtime["target_is_foreground"] is False
+    assert runtime["foreground_hwnd"] == 999999
+    assert runtime["target_hwnd"] == target.hwnd
+    assert runtime["foreground_refresh_detail"] == "manual_target_exact:background"
+
+
+@pytest.mark.plugin_unit
+def test_ocr_reader_foreground_refresh_rebounds_manual_target_by_signature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    rebound = DetectedGameWindow(
+        hwnd=711,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=8102,
+        width=1040,
+        height=807,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        time_fn=lambda: 1713000000.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [rebound],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["不会被调用"]),
+    )
+    manager.list_windows_snapshot()
+    manager.update_window_target(
+        {
+            "mode": "manual",
+            "window_key": "stale-window-key",
+            "process_name": rebound.process_name,
+            "normalized_title": rebound.normalized_title,
+            "pid": 9999,
+            "last_known_hwnd": 9999,
+        }
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: rebound.hwnd)
+
+    runtime = manager.refresh_foreground_state()
+
+    assert runtime["target_is_foreground"] is True
+    assert runtime["target_hwnd"] == rebound.hwnd
+    assert runtime["foreground_refresh_detail"] == "manual_target_rebound:foreground"
 
 
 @pytest.mark.asyncio
