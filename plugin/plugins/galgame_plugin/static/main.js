@@ -173,6 +173,11 @@ const FIELD_LABELS_ZH = {
   snapshot_ts: '快照时间',
   stale: '是否过期',
   result: '结果',
+  agent_user_status: 'Agent 用户状态',
+  inbound_queue_size: '入站队列',
+  outbound_queue_size: '出站队列',
+  last_interruption: '最近打断',
+  last_outbound_message: '最近出站消息',
   recent_pushes: '最近推送数',
   activity: '活动',
   reason: '原因',
@@ -199,6 +204,17 @@ const ADVANCE_SPEED_LABELS_ZH = {
   slow: '慢',
   medium: '中等',
   fast: '快速',
+};
+
+const AGENT_USER_STATUS_LABELS_ZH = {
+  running: '运行中',
+  read_only: '只读伴读',
+  paused_by_user: '用户待机',
+  paused_window_not_foreground: '游戏窗口未前台',
+  ocr_unavailable: 'OCR 不可用',
+  waiting_choice: '等待/处理选项',
+  acting: '正在操作',
+  error: '错误',
 };
 
 const DATA_SOURCE_LABELS_ZH = {
@@ -1081,10 +1097,16 @@ function renderStatus(status) {
     { label: 'connection_state', value: status.connection_state || '' },
     { label: 'active_data_source', value: status.active_data_source || '' },
     { label: 'mode', value: status.mode || '' },
+    {
+      label: 'agent_user_status',
+      value: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || '',
+    },
     { label: 'agent_status', value: status.agent_status || '' },
     { label: 'agent_activity', value: status.agent_activity || '' },
     { label: 'agent_reason', value: status.agent_reason || '' },
     { label: 'agent_diagnostic', value: status.agent_diagnostic || '' },
+    { label: 'inbound_queue_size', value: String(status.agent_inbound_queue_size || 0) },
+    { label: 'outbound_queue_size', value: String(status.agent_outbound_queue_size || 0) },
     { label: 'push_notifications', value: String(Boolean(status.push_notifications)) },
     { label: 'advance_speed', value: ADVANCE_SPEED_LABELS_ZH[status.advance_speed] || status.advance_speed || 'medium' },
     { label: 'bound_game_id', value: status.bound_game_id || '(auto)' },
@@ -1981,6 +2003,10 @@ function renderAgentStatus(payload) {
   document.getElementById('agentReplyText').textContent = latestAgentReply;
   const memoryCounts = payload.memory_counts || {};
   renderGrid('agentStatusGrid', [
+    {
+      label: 'agent_user_status',
+      value: AGENT_USER_STATUS_LABELS_ZH[payload.agent_user_status] || payload.agent_user_status || '',
+    },
     { label: 'status', value: payload.status || 'standby' },
     { label: 'activity', value: payload.activity || 'idle' },
     { label: 'reason', value: payload.reason || '' },
@@ -1996,13 +2022,23 @@ function renderAgentStatus(payload) {
       label: 'memory_counts',
       value: `scene=${memoryCounts.scene_memory || 0} choice=${memoryCounts.choice_memory || 0} failure=${memoryCounts.failure_memory || 0}`,
     },
+    { label: 'inbound_queue_size', value: String(payload.inbound_queue_size || 0) },
+    { label: 'outbound_queue_size', value: String(payload.outbound_queue_size || 0) },
+    {
+      label: 'last_interruption',
+      value: payload.last_interruption?.interrupted_message_id || '',
+    },
+    {
+      label: 'last_outbound_message',
+      value: payload.last_outbound_message?.content || '',
+    },
     { label: 'result', value: payload.result || '' },
     { label: 'recent_pushes', value: String((payload.recent_pushes || []).length) },
   ]);
 
   renderStackList('pushesList', payload.recent_pushes || [], (item) => `
     <article class="list-card compact">
-      <p class="list-kicker">${escapeHtml(item.kind || '')} | ${escapeHtml(item.ts || '')}</p>
+      <p class="list-kicker">${escapeHtml(item.kind || '')} | ${escapeHtml(item.status || '')} | ${escapeHtml(item.ts || '')}</p>
       <h3>${escapeHtml(item.scene_id || '')}</h3>
       <p>${escapeHtml(item.content || '')}</p>
     </article>
@@ -2197,9 +2233,14 @@ function buildAgentStatusFromStatus(status = {}) {
     action: 'peek_status',
     result: status.agent_error || '',
     status: status.agent_status || 'standby',
+    agent_user_status: status.agent_user_status || '',
     activity: status.agent_activity || '',
     reason: status.agent_reason || '',
     error: status.agent_error || '',
+    inbound_queue_size: status.agent_inbound_queue_size || 0,
+    outbound_queue_size: status.agent_outbound_queue_size || 0,
+    last_interruption: status.agent_last_interruption || {},
+    last_outbound_message: status.agent_last_outbound_message || {},
     debug: {
       ocr_capture_diagnostic: status.agent_diagnostic || status.ocr_capture_diagnostic || '',
     },

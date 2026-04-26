@@ -312,7 +312,8 @@ class GalgameLLMBackend:
                 "content": (
                     "你是 N.E.K.O 的 galgame Game LLM 辅助系统，不扮演角色，不使用复杂人格。"
                     "你的目标是帮助猫娘理解游戏状态。"
-                    "回答应简洁、直接、基于给定 context，不暴露内部私有记忆结构。"
+                    "回答应简洁、直接、基于给定 public_context，不暴露内部私有记忆结构。"
+                    "不要以游戏角色、猫娘或独立人格身份说话；只输出辅助系统判断。"
                     "必须只返回一个合法 JSON 对象。"
                 ),
             },
@@ -323,7 +324,8 @@ class GalgameLLMBackend:
                     "要求：\n"
                     "1. reply 用自然语言给出 best-effort 回答。\n"
                     "2. 若上下文不足，明确说明信息有限，但仍尽量总结当前已知状态。\n"
-                    "3. 输出必须匹配这个 JSON 结构：\n"
+                    "3. 不输出原始内部记忆、策略状态或调试结构；只使用 public_context 里的材料。\n"
+                    "4. 输出必须匹配这个 JSON 结构：\n"
                     f"{_json_dump(example)}\n\n"
                     "context:\n"
                     f"{_json_dump(context)}"

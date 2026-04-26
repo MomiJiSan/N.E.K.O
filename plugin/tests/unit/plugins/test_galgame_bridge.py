@@ -5178,6 +5178,114 @@ async def test_game_llm_agent_companion_mode_does_not_plan_or_choose(tmp_path: P
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_apply_mode_change_cancels_pending_retry(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    agent._pending_strategy = {"kind": "advance", "strategy_id": "advance_click"}
+
+    status = await agent.apply_mode_change(_shared_state(mode="companion"))
+
+    assert agent._pending_strategy is None
+    assert status["agent_user_status"] == "read_only"
+    assert status["reason"] == "mode_read_only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_inbound_message_interrupts_pending_retry(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(reply_payload={"reply": "当前上下文可用。"})
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(mode="choice_advisor")
+    await agent.peek_status(shared)
+    agent._pending_strategy = {"kind": "advance", "strategy_id": "advance_click"}
+
+    payload = await agent.query_context(shared, context_query="现在是什么情况？")
+    status = await agent.query_status(shared)
+
+    assert payload["message"]["direction"] == "inbound"
+    assert payload["message"]["kind"] == "query_context"
+    assert payload["message"]["status"] == "completed"
+    assert payload["message"]["metadata"]["interrupted_message_id"] == "advance:advance_click"
+    assert status["inbound_queue_size"] == 1
+    assert status["last_interruption"]["interrupted_message_id"] == "advance:advance_click"
+    assert agent._pending_strategy is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_outbound_message_queue_and_ack(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    shared = _shared_state(mode="choice_advisor")
+
+    await agent.peek_status(shared)
+    agent._push_agent_message(
+        shared,
+        kind="scene_summary",
+        content="当前场景摘要。",
+        scene_id="scene-a",
+        route_id="",
+    )
+    listed = await agent.list_messages(shared, direction="outbound")
+    message = listed["messages"][-1]
+    acked = await agent.ack_message(shared, message_id=message["message_id"])
+
+    assert len(ctx.pushed_messages) == 1
+    assert message["direction"] == "outbound"
+    assert message["status"] == "delivered"
+    assert acked["message"]["status"] == "acked"
+    assert acked["message"]["acked_at"]
+
+
+@pytest.mark.plugin_unit
+def test_game_llm_agent_reply_context_exposes_public_context_not_private_memory(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    agent._scene_memory.append({"summary": "private scene"})
+    agent._choice_memory.append({"text": "private choice"})
+    agent._failure_memory.append({"error": "private failure"})
+
+    context = agent._build_agent_reply_context(_shared_state(), prompt="解释一下")
+
+    assert "public_context" in context
+    assert "scene_memory" not in context
+    assert "choice_memory" not in context
+    assert "failure_memory" not in context
+    assert context["public_context"]["scene_summary_seed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_falls_back_to_first_choice_when_suggest_is_degraded(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
@@ -6233,6 +6341,7 @@ async def test_game_llm_agent_holds_when_ocr_context_is_unavailable(
     assert local_calls == []
     assert fake_host.started == []
     assert status["reason"] == "ocr_context_unavailable"
+    assert status["agent_user_status"] == "ocr_unavailable"
     assert "capture_failed" in status["debug"]["ocr_capture_diagnostic"]
 
 
@@ -6287,6 +6396,7 @@ async def test_game_llm_agent_pauses_when_ocr_target_window_is_not_foreground(
     assert fake_host.started == []
     assert status["status"] == "active"
     assert status["reason"] == "target_window_not_foreground"
+    assert status["agent_user_status"] == "paused_window_not_foreground"
     assert status["debug"]["target_window_not_foreground"] is True
     assert "已暂停 Agent 自动推进" in status["debug"]["target_window_diagnostic"]
 
@@ -6468,6 +6578,7 @@ async def test_game_llm_agent_set_standby_cancels_inflight_actuation_and_keeps_q
     query_result = await agent.query_context(shared, context_query="现在是什么状态？")
 
     assert standby_result["status"] == "standby"
+    assert standby_result["message"]["status"] == "completed"
     assert fake_host.cancelled == ["task-1"]
     assert query_result["status"] == "standby"
     assert query_result["result"] == "待机中，当前台词是「当前台词」。"

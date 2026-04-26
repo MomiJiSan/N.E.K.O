@@ -76,6 +76,7 @@ from .service import (
     derive_connection_state,
     filter_memory_reader_candidates,
     filter_ocr_reader_candidates,
+    mode_allows_agent_actuation,
     next_poll_interval_for_state,
     rebuild_histories_from_events,
     scan_session_candidates,
@@ -711,9 +712,22 @@ class GalgamePlugin(NekoPluginBase):
                 agent_payload = await self._game_agent.peek_status(self._snapshot_state())
                 payload["agent"] = json_copy(agent_payload)
                 payload["agent_status"] = str(agent_payload.get("status") or "")
+                payload["agent_user_status"] = str(agent_payload.get("agent_user_status") or "")
                 payload["agent_activity"] = str(agent_payload.get("activity") or "")
                 payload["agent_reason"] = str(agent_payload.get("reason") or "")
                 payload["agent_error"] = str(agent_payload.get("error") or "")
+                payload["agent_inbound_queue_size"] = int(
+                    agent_payload.get("inbound_queue_size") or 0
+                )
+                payload["agent_outbound_queue_size"] = int(
+                    agent_payload.get("outbound_queue_size") or 0
+                )
+                payload["agent_last_interruption"] = json_copy(
+                    agent_payload.get("last_interruption") or {}
+                )
+                payload["agent_last_outbound_message"] = json_copy(
+                    agent_payload.get("last_outbound_message") or {}
+                )
                 agent_debug = agent_payload.get("debug")
                 agent_diagnostic = (
                     str(
@@ -737,6 +751,7 @@ class GalgamePlugin(NekoPluginBase):
                 )
             except Exception as exc:
                 payload["agent_status"] = "unknown"
+                payload["agent_user_status"] = "error"
                 payload["agent_activity"] = ""
                 payload["agent_reason"] = "agent_status_unavailable"
                 payload["agent_error"] = str(exc)
@@ -1427,6 +1442,12 @@ class GalgamePlugin(NekoPluginBase):
             )
         except Exception as exc:
             return Err(SdkError(f"persist mode failed: {exc}"))
+        if self._game_agent is not None and not mode_allows_agent_actuation(mode):
+            try:
+                agent_payload = await self._game_agent.apply_mode_change(self._snapshot_state())
+                payload["agent"] = json_copy(agent_payload)
+            except Exception as exc:
+                payload["agent_warning"] = f"apply_mode_change failed: {exc}"
         return Ok(payload)
 
     @plugin_entry(
@@ -1837,10 +1858,15 @@ class GalgamePlugin(NekoPluginBase):
                         "query_context",
                         "send_message",
                         "set_standby",
+                        "list_messages",
+                        "ack_message",
                     ],
                 },
                 "message": {"type": "string", "default": ""},
                 "context_query": {"type": "string", "default": ""},
+                "message_id": {"type": "string", "default": ""},
+                "direction": {"type": "string", "default": ""},
+                "limit": {"type": "integer", "default": 50},
                 "standby": {"type": "boolean"},
             },
             "required": ["action"],
@@ -1853,6 +1879,9 @@ class GalgamePlugin(NekoPluginBase):
         action: str,
         message: str = "",
         context_query: str = "",
+        message_id: str = "",
+        direction: str = "",
+        limit: int = 50,
         standby: bool | None = None,
         **_,
     ):
@@ -1883,6 +1912,23 @@ class GalgamePlugin(NekoPluginBase):
             if standby is None:
                 return Err(SdkError("standby is required for set_standby"))
             return Ok(await self._game_agent.set_standby(local, standby=bool(standby)))
+        if action == "list_messages":
+            return Ok(
+                await self._game_agent.list_messages(
+                    local,
+                    direction=direction,
+                    limit=int(limit or 50),
+                )
+            )
+        if action == "ack_message":
+            if not message_id.strip():
+                return Err(SdkError("message_id is required for ack_message"))
+            return Ok(
+                await self._game_agent.ack_message(
+                    local,
+                    message_id=message_id.strip(),
+                )
+            )
         return Err(SdkError(f"unsupported agent action: {action!r}"))
 
 

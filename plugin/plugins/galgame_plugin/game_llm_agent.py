@@ -162,6 +162,10 @@ class GameLLMAgent:
         self._scene_memory: list[dict[str, Any]] = []
         self._choice_memory: list[dict[str, Any]] = []
         self._recent_pushes: list[dict[str, Any]] = []
+        self._inbound_messages: list[dict[str, Any]] = []
+        self._outbound_messages: list[dict[str, Any]] = []
+        self._message_seq = 0
+        self._last_interruption: dict[str, Any] = {}
         self._failure_memory: list[dict[str, Any]] = []
         self._recent_local_inputs: list[dict[str, Any]] = []
         self._virtual_mouse_stats: dict[str, dict[str, Any]] = {}
@@ -219,6 +223,9 @@ class GameLLMAgent:
             self._scene_memory.clear()
             self._choice_memory.clear()
             self._recent_pushes.clear()
+            self._inbound_messages.clear()
+            self._outbound_messages.clear()
+            self._last_interruption = {}
             self._failure_memory.clear()
             self._recent_local_inputs.clear()
             self._virtual_mouse_stats.clear()
@@ -404,15 +411,24 @@ class GameLLMAgent:
     async def set_standby(self, shared: dict[str, Any], *, standby: bool) -> dict[str, Any]:
         self._ensure_loop_affinity()
         async with self._op_lock:
+            await self._observe(shared)
+            message = self._enqueue_inbound_message(
+                kind="set_standby",
+                content="standby=true" if standby else "standby=false",
+                priority=9,
+                metadata={"standby": bool(standby)},
+            )
+            self._mark_message(message, status="processing")
+            await self._interrupt_for_inbound_message(message)
             self._explicit_standby = bool(standby)
-            if self._explicit_standby:
-                await self._interrupt_current()
             status = self._compute_status(shared)
             self._last_status = status
+            self._mark_message(message, status="completed", delivered=True)
             return {
                 "action": "set_standby",
                 "result": "agent entered standby" if standby else "agent resumed",
                 "status": status,
+                "message": json_copy(message),
             }
 
     async def _reset_runtime_state(
@@ -2091,6 +2107,214 @@ class GameLLMAgent:
             return "retry_pending"
         return "idle"
 
+    def _new_message_id(self, *, direction: str, kind: str) -> str:
+        self._message_seq += 1
+        safe_direction = "".join(ch for ch in direction.lower() if ch.isalnum()) or "msg"
+        safe_kind = "".join(ch for ch in kind.lower() if ch.isalnum()) or "event"
+        return f"gamellm-{safe_direction}-{safe_kind}-{self._message_seq}"
+
+    @staticmethod
+    def _utc_now_iso() -> str:
+        return str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+
+    def _interruptible_activity_id(self) -> str:
+        if self._actuation is not None:
+            task_id = str(self._actuation.get("task_id") or "")
+            strategy_id = str(self._actuation.get("strategy_id") or "")
+            kind = str(self._actuation.get("kind") or "actuation")
+            return task_id or (f"{kind}:{strategy_id}" if strategy_id else kind)
+        if self._planning_task is not None:
+            return "planning:choice"
+        if self._pending_strategy is not None:
+            strategy_id = str(self._pending_strategy.get("strategy_id") or "")
+            kind = str(self._pending_strategy.get("kind") or "retry")
+            return f"{kind}:{strategy_id}" if strategy_id else kind
+        return ""
+
+    def _enqueue_inbound_message(
+        self,
+        *,
+        kind: str,
+        content: str,
+        priority: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        created_at = self._utc_now_iso()
+        message = {
+            "message_id": self._new_message_id(direction="inbound", kind=kind),
+            "direction": "inbound",
+            "kind": kind,
+            "content": content,
+            "status": "queued",
+            "priority": int(priority),
+            "created_at": created_at,
+            "delivered_at": "",
+            "acked_at": "",
+            "metadata": dict(metadata or {}),
+        }
+        self._inbound_messages.append(message)
+        if len(self._inbound_messages) > 100:
+            del self._inbound_messages[:-100]
+        return message
+
+    def _mark_message(
+        self,
+        message: dict[str, Any],
+        *,
+        status: str,
+        delivered: bool = False,
+        acked: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        message["status"] = status
+        now = self._utc_now_iso()
+        if delivered:
+            message["delivered_at"] = now
+        if acked:
+            message["acked_at"] = now
+        if metadata:
+            existing = message.get("metadata")
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(metadata)
+            message["metadata"] = existing
+
+    async def _interrupt_for_inbound_message(self, message: dict[str, Any]) -> None:
+        interrupted_message_id = self._interruptible_activity_id()
+        await self._interrupt_current()
+        if interrupted_message_id:
+            metadata = message.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["interrupted_message_id"] = interrupted_message_id
+            message["metadata"] = metadata
+            self._last_interruption = {
+                "message_id": str(message.get("message_id") or ""),
+                "kind": str(message.get("kind") or ""),
+                "interrupted_message_id": interrupted_message_id,
+                "ts": self._utc_now_iso(),
+            }
+
+    def _enqueue_outbound_message(
+        self,
+        *,
+        kind: str,
+        content: str,
+        scene_id: str,
+        route_id: str,
+        priority: int,
+    ) -> dict[str, Any]:
+        created_at = self._utc_now_iso()
+        message = {
+            "message_id": self._new_message_id(direction="outbound", kind=kind),
+            "direction": "outbound",
+            "kind": kind,
+            "content": content,
+            "status": "queued",
+            "priority": int(priority),
+            "created_at": created_at,
+            "delivered_at": "",
+            "acked_at": "",
+            "metadata": {
+                "kind": kind,
+                "scene_id": scene_id,
+                "route_id": route_id,
+                "ts": created_at,
+            },
+        }
+        self._outbound_messages.append(message)
+        if len(self._outbound_messages) > 100:
+            del self._outbound_messages[:-100]
+        return message
+
+    def _recent_push_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for message in self._outbound_messages[-20:]:
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            records.append(
+                {
+                    "message_id": str(message.get("message_id") or ""),
+                    "ts": str(message.get("delivered_at") or message.get("created_at") or ""),
+                    "kind": str(message.get("kind") or metadata.get("kind") or ""),
+                    "content": str(message.get("content") or ""),
+                    "scene_id": str(metadata.get("scene_id") or ""),
+                    "route_id": str(metadata.get("route_id") or ""),
+                    "status": str(message.get("status") or ""),
+                    "acked_at": str(message.get("acked_at") or ""),
+                }
+            )
+        return records
+
+    def _message_queue_snapshot(
+        self,
+        *,
+        direction: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        bounded_limit = max(1, min(int(limit or 50), 100))
+        direction = str(direction or "").strip().lower()
+        if direction == "inbound":
+            messages = self._inbound_messages
+        elif direction == "outbound":
+            messages = self._outbound_messages
+        else:
+            messages = [*self._inbound_messages, *self._outbound_messages]
+        return {
+            "messages": json_copy(messages[-bounded_limit:]),
+            "inbound_queue_size": len(self._inbound_messages),
+            "outbound_queue_size": len(self._outbound_messages),
+            "last_interruption": json_copy(self._last_interruption),
+            "last_outbound_message": json_copy(self._outbound_messages[-1])
+            if self._outbound_messages
+            else None,
+        }
+
+    async def list_messages(
+        self,
+        shared: dict[str, Any],
+        *,
+        direction: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        self._ensure_loop_affinity()
+        async with self._op_lock:
+            await self._observe(shared)
+            return {
+                "action": "list_messages",
+                **self._message_queue_snapshot(direction=direction, limit=limit),
+            }
+
+    async def ack_message(self, shared: dict[str, Any], *, message_id: str) -> dict[str, Any]:
+        self._ensure_loop_affinity()
+        async with self._op_lock:
+            await self._observe(shared)
+            target_id = str(message_id or "").strip()
+            for message in [*self._inbound_messages, *self._outbound_messages]:
+                if str(message.get("message_id") or "") == target_id:
+                    self._mark_message(message, status="acked", acked=True)
+                    return {
+                        "action": "ack_message",
+                        "message": json_copy(message),
+                        **self._message_queue_snapshot(limit=20),
+                    }
+            return {
+                "action": "ack_message",
+                "message": None,
+                "diagnostic": f"unknown message_id: {target_id}",
+                **self._message_queue_snapshot(limit=20),
+            }
+
+    async def apply_mode_change(self, shared: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_loop_affinity()
+        async with self._op_lock:
+            await self._observe(shared)
+            if not self._should_actuate(shared):
+                await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
+                self._next_actuation_at = time.monotonic() + 1.0
+            status = self._compute_status(shared)
+            self._last_status = status
+            return self._build_status_payload(shared, status=status, interrupted=False)
+
     async def query_status(self, shared: dict[str, Any]) -> dict[str, Any]:
         self._ensure_loop_affinity()
         async with self._op_lock:
@@ -2128,42 +2352,74 @@ class GameLLMAgent:
     async def query_context(self, shared: dict[str, Any], *, context_query: str) -> dict[str, Any]:
         self._ensure_loop_affinity()
         async with self._op_lock:
-            await self._interrupt_current()
             await self._observe(shared)
-            self._recover_retryable_error_if_ready(time.monotonic())
-            payload = await self._llm_gateway.agent_reply(
-                self._build_agent_reply_context(shared, prompt=context_query)
+            message = self._enqueue_inbound_message(
+                kind="query_context",
+                content=context_query,
+                priority=8,
             )
-            status = self._compute_status(shared)
-            self._last_status = status
-            return {
-                "action": "query_context",
-                "result": str(payload.get("reply") or ""),
-                "status": status,
-                "degraded": bool(payload.get("degraded")),
-                "diagnostic": str(payload.get("diagnostic") or ""),
-                "input_source": self._current_input_source(shared),
-            }
+            self._mark_message(message, status="processing")
+            try:
+                await self._interrupt_for_inbound_message(message)
+                self._recover_retryable_error_if_ready(time.monotonic())
+                payload = await self._llm_gateway.agent_reply(
+                    self._build_agent_reply_context(shared, prompt=context_query)
+                )
+                status = self._compute_status(shared)
+                self._last_status = status
+                self._mark_message(message, status="completed", delivered=True)
+                return {
+                    "action": "query_context",
+                    "result": str(payload.get("reply") or ""),
+                    "status": status,
+                    "degraded": bool(payload.get("degraded")),
+                    "diagnostic": str(payload.get("diagnostic") or ""),
+                    "input_source": self._current_input_source(shared),
+                    "message": json_copy(message),
+                }
+            except Exception as exc:
+                self._mark_message(
+                    message,
+                    status="failed",
+                    metadata={"error": str(exc)},
+                )
+                raise
 
     async def send_message(self, shared: dict[str, Any], *, message: str) -> dict[str, Any]:
         self._ensure_loop_affinity()
         async with self._op_lock:
-            await self._interrupt_current()
             await self._observe(shared)
-            self._recover_retryable_error_if_ready(time.monotonic())
-            payload = await self._llm_gateway.agent_reply(
-                self._build_agent_reply_context(shared, prompt=message)
+            inbound = self._enqueue_inbound_message(
+                kind="send_message",
+                content=message,
+                priority=8,
             )
-            status = self._compute_status(shared)
-            self._last_status = status
-            return {
-                "action": "send_message",
-                "result": str(payload.get("reply") or ""),
-                "status": status,
-                "degraded": bool(payload.get("degraded")),
-                "diagnostic": str(payload.get("diagnostic") or ""),
-                "input_source": self._current_input_source(shared),
-            }
+            self._mark_message(inbound, status="processing")
+            try:
+                await self._interrupt_for_inbound_message(inbound)
+                self._recover_retryable_error_if_ready(time.monotonic())
+                payload = await self._llm_gateway.agent_reply(
+                    self._build_agent_reply_context(shared, prompt=message)
+                )
+                status = self._compute_status(shared)
+                self._last_status = status
+                self._mark_message(inbound, status="completed", delivered=True)
+                return {
+                    "action": "send_message",
+                    "result": str(payload.get("reply") or ""),
+                    "status": status,
+                    "degraded": bool(payload.get("degraded")),
+                    "diagnostic": str(payload.get("diagnostic") or ""),
+                    "input_source": self._current_input_source(shared),
+                    "message": json_copy(inbound),
+                }
+            except Exception as exc:
+                self._mark_message(
+                    inbound,
+                    status="failed",
+                    metadata={"error": str(exc)},
+                )
+                raise
 
     async def _observe(self, shared: dict[str, Any]) -> None:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
@@ -2174,6 +2430,9 @@ class GameLLMAgent:
             self._scene_memory.clear()
             self._choice_memory.clear()
             self._recent_pushes.clear()
+            self._inbound_messages.clear()
+            self._outbound_messages.clear()
+            self._last_interruption = {}
             self._failure_memory.clear()
             self._recent_local_inputs.clear()
             self._virtual_mouse_stats.clear()
@@ -2276,34 +2535,35 @@ class GameLLMAgent:
     ) -> None:
         if not content:
             return
-        ts = str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        self._plugin.push_message(
-            source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
-            message_type="proactive_notification",
-            description=f"Galgame Agent | {kind}",
-            priority=6,
+        outbound = self._enqueue_outbound_message(
+            kind=kind,
             content=content,
-            metadata={
-                "kind": kind,
-                "scene_id": scene_id,
-                "route_id": route_id,
-                "ts": ts,
-            },
+            scene_id=scene_id,
+            route_id=route_id,
+            priority=6,
         )
-        self._append_bounded(
-            self._recent_pushes,
-            {
-                "ts": ts,
-                "kind": kind,
-                "content": content,
-                "scene_id": scene_id,
-                "route_id": route_id,
-            },
-            limit=20,
-        )
+        try:
+            self._plugin.push_message(
+                source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
+                message_type="proactive_notification",
+                description=f"Galgame Agent | {kind}",
+                priority=6,
+                content=content,
+                metadata=dict(outbound.get("metadata") or {}),
+            )
+            self._mark_message(outbound, status="delivered", delivered=True)
+        except Exception as exc:
+            self._mark_message(outbound, status="failed", metadata={"error": str(exc)})
+            self._logger.warning("galgame outbound message delivery failed: {}", exc)
+        self._recent_pushes = self._recent_push_records()
 
     def _build_agent_reply_context(self, shared: dict[str, Any], *, prompt: str) -> dict[str, Any]:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        status = self._compute_status(shared)
+        stable_lines = list(shared.get("history_lines") or [])[-8:]
+        observed_lines = list(shared.get("history_observed_lines") or [])[-8:]
+        recent_choices = list(shared.get("history_choices") or [])[-8:]
+        recent_lines = [*stable_lines, *observed_lines][-8:]
         latest_line = ""
         if snapshot.get("text"):
             speaker = str(snapshot.get("speaker") or "Narration")
@@ -2311,33 +2571,65 @@ class GameLLMAgent:
                 f"{speaker}: "
                 f"{str(snapshot.get('text') or '')}"
             )
+        public_context = {
+            "current_line": {
+                "speaker": str(snapshot.get("speaker") or ""),
+                "text": str(snapshot.get("text") or ""),
+                "line_id": str(snapshot.get("line_id") or ""),
+                "scene_id": str(snapshot.get("scene_id") or ""),
+                "route_id": str(snapshot.get("route_id") or ""),
+            },
+            "latest_line": latest_line,
+            "recent_lines": json_copy(recent_lines),
+            "stable_lines": json_copy(stable_lines),
+            "observed_lines": json_copy(observed_lines),
+            "recent_choices": json_copy(recent_choices),
+            "scene_summary_seed": build_local_scene_summary(
+                scene_id=str(snapshot.get("scene_id") or ""),
+                route_id=str(snapshot.get("route_id") or ""),
+                lines=recent_lines,
+                selected_choices=recent_choices,
+                snapshot=snapshot,
+            ),
+            "diagnostic": self._target_window_focus_diagnostic(shared)
+            or self._ocr_capture_diagnostic
+            or "",
+        }
         return {
             "prompt": prompt,
             "game_id": str(shared.get("active_game_id") or ""),
             "session_id": str(shared.get("active_session_id") or ""),
             "scene_id": str(snapshot.get("scene_id") or ""),
             "route_id": str(snapshot.get("route_id") or ""),
-            "current_snapshot": snapshot,
-            "latest_line": latest_line,
-            "recent_lines": json_copy(
-                [
-                    *list(shared.get("history_lines") or []),
-                    *list(shared.get("history_observed_lines") or []),
-                ][-8:]
-            ),
-            "stable_lines": json_copy(list(shared.get("history_lines") or [])[-8:]),
-            "observed_lines": json_copy(list(shared.get("history_observed_lines") or [])[-8:]),
-            "recent_choices": json_copy(list(shared.get("history_choices") or [])[-8:]),
-            "scene_memory": json_copy(self._scene_memory[-8:]),
-            "choice_memory": json_copy(self._choice_memory[-8:]),
-            "failure_memory": json_copy(self._failure_memory[-8:]),
-            "scene_strategy": json_copy(self._scene_state),
-            "status": self._compute_status(shared),
+            "public_context": public_context,
+            "status": status,
+            "agent_user_status": self._agent_user_status(shared, status=status),
             "mode": str(shared.get("mode") or ""),
             "input_source": self._current_input_source(shared),
             "push_policy": self._current_push_policy(shared),
             "standby_requested": self._explicit_standby,
         }
+
+    def _agent_user_status(self, shared: dict[str, Any], *, status: str) -> str:
+        if self._hard_error or status == AGENT_STATUS_ERROR:
+            return "error"
+        if self._explicit_standby:
+            return "paused_by_user"
+        if self._should_pause_for_target_window_focus(shared):
+            return "paused_window_not_foreground"
+        if self._should_hold_for_ocr_capture_diagnostic(shared):
+            return "ocr_unavailable"
+        if not self._is_actionable(shared):
+            return "read_only"
+        if not self._should_actuate(shared):
+            return "read_only"
+        if self._actuation is not None:
+            return "acting"
+        if self._planning_task is not None:
+            return "waiting_choice"
+        if str(self._scene_state.get("stage") or "") == "choice_menu":
+            return "waiting_choice"
+        return "running"
 
     def _build_status_payload(
         self,
@@ -2347,7 +2639,11 @@ class GameLLMAgent:
         interrupted: bool,
     ) -> dict[str, Any]:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        self._recent_pushes = self._recent_push_records()
         recent_pushes = json_copy(self._recent_pushes[-20:])
+        last_outbound_message = (
+            json_copy(self._outbound_messages[-1]) if self._outbound_messages else None
+        )
         debug_now = time.monotonic()
         return {
             "result": self._build_status_result(
@@ -2356,6 +2652,7 @@ class GameLLMAgent:
                 interrupted=interrupted,
             ),
             "status": status,
+            "agent_user_status": self._agent_user_status(shared, status=status),
             "activity": self._current_activity_label(),
             "reason": self._current_status_reason(shared),
             "error": self._hard_error,
@@ -2373,11 +2670,17 @@ class GameLLMAgent:
             "actionable": self._is_actionable(shared),
             "standby_requested": self._explicit_standby,
             "interrupted": interrupted,
+            "inbound_queue_size": len(self._inbound_messages),
+            "outbound_queue_size": len(self._outbound_messages),
+            "last_interruption": json_copy(self._last_interruption),
+            "last_outbound_message": last_outbound_message,
             "memory_counts": {
                 "scene_memory": len(self._scene_memory),
                 "choice_memory": len(self._choice_memory),
                 "failure_memory": len(self._failure_memory),
                 "recent_pushes": len(self._recent_pushes),
+                "inbound_messages": len(self._inbound_messages),
+                "outbound_messages": len(self._outbound_messages),
                 "recent_local_inputs": len(self._recent_local_inputs),
             },
             "recent_pushes": recent_pushes,
@@ -2432,6 +2735,7 @@ class GameLLMAgent:
             f"line={str(snapshot.get('line_id') or '') or 'none'}",
             f"stage={str(self._scene_state.get('stage') or 'unknown')}",
             f"activity={self._current_activity_label()}",
+            f"user_status={self._agent_user_status(shared, status=status)}",
             f"input_source={self._current_input_source(shared)}",
             f"push_policy={self._current_push_policy(shared)}",
             f"reason={self._current_status_reason(shared)}",

@@ -440,17 +440,25 @@ class LLMGateway:
         *,
         diagnostic: str,
     ) -> dict[str, Any]:
+        public_context = context.get("public_context")
+        public_context = public_context if isinstance(public_context, dict) else {}
         scene_id = str(context.get("scene_id") or "")
         route_id = str(context.get("route_id") or "")
-        latest_line = str(context.get("latest_line") or "")
-        recent_lines = context.get("recent_lines")
-        selected_choices = context.get("recent_choices")
+        latest_line = str(
+            public_context.get("latest_line")
+            or context.get("latest_line")
+            or ""
+        )
+        recent_lines = public_context.get("recent_lines") or context.get("recent_lines")
+        selected_choices = public_context.get("recent_choices") or context.get("recent_choices")
+        current_line = public_context.get("current_line")
+        snapshot = current_line if isinstance(current_line, dict) else context.get("current_snapshot", {})
         summary = build_local_scene_summary(
             scene_id=scene_id,
             route_id=route_id,
             lines=list(recent_lines) if isinstance(recent_lines, list) else [],
             selected_choices=list(selected_choices) if isinstance(selected_choices, list) else [],
-            snapshot=context.get("current_snapshot", {}),
+            snapshot=snapshot,
         )
         if latest_line:
             reply = f"{summary} Current line: {latest_line}"
