@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Galgame 插件设置</title>
-  <link rel="stylesheet" href="./style.css?v=20260426-ocr-diagnostics-1">
+  <link rel="stylesheet" href="./style.css?v=20260426-mode-semantics-1">
 </head>
 <body>
   <div class="page-shell">
@@ -33,7 +33,7 @@
           <select id="modeSelect">
             <option value="silent">静默</option>
             <option value="companion">伴读</option>
-            <option value="choice_advisor">主动陪伴</option>
+            <option value="choice_advisor">自动推进</option>
           </select>
         </label>
         <label class="field checkbox-field">
@@ -55,22 +55,16 @@
         </div>
       </div>
 
-      <div class="control-grid bind-grid">
-        <label class="field grow">
-          <span>手动绑定游戏 ID</span>
-          <input id="bindInput" type="text" placeholder="例如 nekoforge.my-renpy-demo">
-        </label>
-        <button id="bindBtn" class="secondary">绑定</button>
-        <button id="clearBindBtn" class="ghost">恢复自动</button>
-      </div>
-
-      <div class="control-grid agent-grid">
-        <label class="field grow">
-          <span>给游戏 Agent 的文本</span>
-          <input id="agentPromptInput" type="text" placeholder="例如：现在在讲什么？">
-        </label>
-        <button id="queryContextBtn" class="secondary">查询上下文</button>
-        <button id="sendMessageBtn" class="secondary">发送消息</button>
+      <div class="settings-subpanel game-binding-panel">
+        <div class="binding-summary">
+          <div>
+            <p class="list-kicker">游戏目标</p>
+            <h3 id="currentBoundGameId">自动选择游戏窗口</h3>
+            <p id="currentBoundGameDetail" class="binding-detail">插件会优先选择当前可用目标。</p>
+          </div>
+          <button id="clearBindBtn" class="ghost">恢复自动</button>
+        </div>
+        <div id="availableGameIds" class="binding-chip-row empty-inline">等待刷新可用游戏 ID</div>
       </div>
 
       <div class="install-stack">
@@ -278,6 +272,17 @@
           <h3>游戏 Agent 最近响应</h3>
           <p id="agentReplyText" class="reply-text-scroll">暂无交互</p>
         </div>
+        <details class="agent-debug-tools">
+          <summary>Agent 调试输入</summary>
+          <div class="control-grid agent-grid">
+            <label class="field grow">
+              <span>给游戏 Agent 的文本</span>
+              <input id="agentPromptInput" type="text" placeholder="例如：现在在讲什么？">
+            </label>
+            <button id="queryContextBtn" class="secondary">查询上下文</button>
+            <button id="sendMessageBtn" class="secondary">发送消息</button>
+          </div>
+        </details>
       </article>
 
       <article class="panel panel-scroll">
@@ -331,6 +336,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260426-ocr-loop-diagnostics-1"></script>
+  <script src="./main.js?v=20260426-mode-semantics-1"></script>
 </body>
 </html>

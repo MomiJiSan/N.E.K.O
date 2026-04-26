@@ -62,12 +62,15 @@ from .service import (
     apply_input_degraded_result,
     build_active_session_meta,
     build_config,
+    build_explain_degraded_result,
     build_explain_context,
     build_history_payload,
+    build_ocr_context_diagnostic,
     build_snapshot_payload,
     build_status_payload,
     build_suggest_context,
     build_suggest_degraded_result,
+    build_summarize_degraded_result,
     build_summarize_context,
     choose_candidate,
     derive_connection_state,
@@ -519,6 +522,19 @@ class GalgamePlugin(NekoPluginBase):
     def _add_bridge_poll_debug_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
         enriched.update(self._bridge_poll_debug_payload())
+        runtime = dict(enriched.get("ocr_reader_runtime") or {})
+        if runtime:
+            context_state = str(runtime.get("ocr_context_state") or "")
+            poll_running = bool(enriched.get("bridge_poll_running"))
+            has_capture_attempt = bool(str(runtime.get("last_capture_attempt_at") or ""))
+            if context_state == "capture_pending" and not poll_running and not has_capture_attempt:
+                runtime["ocr_context_state"] = "poll_not_running"
+                enriched["ocr_reader_runtime"] = runtime
+                enriched["ocr_capture_diagnostic_required"] = True
+                enriched["ocr_capture_diagnostic"] = (
+                    "OCR 轮询未继续执行，尚未完成首次截图；请检查插件 timer、后端重载状态或刷新运行中的插件。"
+                )
+            enriched["ocr_context_state"] = str(runtime.get("ocr_context_state") or context_state)
         return enriched
 
     def _start_background_bridge_poll(self) -> bool:
@@ -689,7 +705,44 @@ class GalgamePlugin(NekoPluginBase):
             state = json_copy(self._state)
             config = self._cfg
         payload = await asyncio.to_thread(build_status_payload, state, config=config)
-        return self._add_bridge_poll_debug_payload(payload)
+        payload = self._add_bridge_poll_debug_payload(payload)
+        if self._game_agent is not None:
+            try:
+                agent_payload = await self._game_agent.peek_status(self._snapshot_state())
+                payload["agent"] = json_copy(agent_payload)
+                payload["agent_status"] = str(agent_payload.get("status") or "")
+                payload["agent_activity"] = str(agent_payload.get("activity") or "")
+                payload["agent_reason"] = str(agent_payload.get("reason") or "")
+                payload["agent_error"] = str(agent_payload.get("error") or "")
+                agent_debug = agent_payload.get("debug")
+                agent_diagnostic = (
+                    str(
+                        (agent_debug or {}).get("target_window_diagnostic")
+                        or (agent_debug or {}).get("ocr_capture_diagnostic")
+                        or ""
+                    )
+                    if isinstance(agent_debug, dict)
+                    else ""
+                )
+                payload["agent_diagnostic"] = agent_diagnostic
+                payload["agent_diagnostic_required"] = bool(
+                    agent_diagnostic
+                    or payload["agent_reason"]
+                    in {
+                        "ocr_context_unavailable",
+                        "input_advance_unconfirmed",
+                        "target_window_not_foreground",
+                        "hard_error",
+                    }
+                )
+            except Exception as exc:
+                payload["agent_status"] = "unknown"
+                payload["agent_activity"] = ""
+                payload["agent_reason"] = "agent_status_unavailable"
+                payload["agent_error"] = str(exc)
+                payload["agent_diagnostic"] = f"agent_status_unavailable: {exc}"
+                payload["agent_diagnostic_required"] = True
+        return payload
 
     def _resolve_current_run_id(self) -> str:
         return str(getattr(self.ctx, "run_id", "") or "").strip()
@@ -1686,7 +1739,20 @@ class GalgamePlugin(NekoPluginBase):
         try:
             context = build_explain_context(local, line_id=line_id.strip())
         except ValueError as exc:
-            return Err(SdkError(str(exc)))
+            context = {
+                "line_id": "",
+                "speaker": "",
+                "text": "",
+                "scene_id": "",
+                "route_id": "",
+                "evidence": [],
+            }
+            return Ok(
+                build_explain_degraded_result(
+                    context,
+                    diagnostic=str(exc) or build_ocr_context_diagnostic(local),
+                )
+            )
         payload = apply_input_degraded_result(
             await self._llm_gateway.explain_line(context),
             context=context,
@@ -1712,6 +1778,14 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError("galgame_plugin llm_gateway is not initialized"))
         local = self._snapshot_state()
         context = build_summarize_context(local, scene_id=scene_id.strip())
+        snapshot = context.get("current_snapshot") if isinstance(context.get("current_snapshot"), dict) else {}
+        if not list(context.get("recent_lines") or []) and not str(snapshot.get("text") or ""):
+            return Ok(
+                build_summarize_degraded_result(
+                    context,
+                    diagnostic=build_ocr_context_diagnostic(local),
+                )
+            )
         payload = apply_input_degraded_result(
             await self._llm_gateway.summarize_scene(context),
             context=context,

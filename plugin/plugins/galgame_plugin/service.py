@@ -788,17 +788,27 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         isinstance(ocr_runtime, dict)
         and (
             ocr_runtime.get("ocr_capture_diagnostic_required")
+            or str(ocr_runtime.get("ocr_context_state") or "")
+            in {"poll_not_running", "capture_failed", "diagnostic_required"}
             or str(ocr_runtime.get("detail") or "") == "ocr_capture_diagnostic_required"
         )
     )
     ocr_capture_diagnostic = ""
     if ocr_capture_diagnostic_required and isinstance(ocr_runtime, dict):
-        ocr_capture_diagnostic = (
-            "OCR 连续未读到有效对白，请检查截图区、目标窗口或当前画面是否为普通对白。"
-            f" stage={ocr_runtime.get('capture_stage') or ''}"
-            f" profile={ocr_runtime.get('capture_profile') or {}}"
-            f" target={ocr_runtime.get('effective_process_name') or ocr_runtime.get('process_name') or ''}"
+        ocr_capture_diagnostic = build_ocr_context_diagnostic(
+            {
+                "ocr_reader_runtime": ocr_runtime,
+                "last_error": json_copy(state.last_error),
+            }
         )
+    local_state = {
+        "latest_snapshot": json_copy(state.latest_snapshot),
+        "history_observed_lines": json_copy(state.history_observed_lines),
+        "history_lines": json_copy(state.history_lines),
+        "ocr_reader_runtime": ocr_runtime,
+        "last_error": json_copy(state.last_error),
+    }
+    effective_current_line = resolve_effective_current_line(local_state)
     return {
         "connection_state": state.current_connection_state,
         "mode": state.mode,
@@ -813,6 +823,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "last_error": json_copy(state.last_error),
         "memory_reader_runtime": json_copy(state.memory_reader_runtime),
         "ocr_reader_runtime": ocr_runtime,
+        "effective_current_line": json_copy(effective_current_line or {}),
         "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
         "ocr_capture_diagnostic": ocr_capture_diagnostic,
         "ocr_capture_profiles": json_copy(state.ocr_capture_profiles),
@@ -837,10 +848,18 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
 
 def build_snapshot_payload(state) -> dict[str, Any]:
     stale = state.current_connection_state == STATE_STALE
+    effective_current_line = resolve_effective_current_line(
+        {
+            "latest_snapshot": json_copy(state.latest_snapshot),
+            "history_observed_lines": json_copy(state.history_observed_lines),
+            "history_lines": json_copy(state.history_lines),
+        }
+    )
     return {
         "game_id": state.active_game_id,
         "session_id": state.active_session_id,
         "snapshot": json_copy(state.latest_snapshot),
+        "effective_current_line": json_copy(effective_current_line or {}),
         "snapshot_ts": str(state.latest_snapshot.get("ts") or "")
         if isinstance(state.latest_snapshot, dict)
         else "",
@@ -911,8 +930,72 @@ def _current_line_entry(snapshot: dict[str, Any]) -> dict[str, Any] | None:
         "text": str(normalized.get("text") or ""),
         "scene_id": str(normalized.get("scene_id") or ""),
         "route_id": str(normalized.get("route_id") or ""),
+        "stability": str(normalized.get("stability") or ""),
+        "source": "snapshot",
         "ts": str(normalized.get("ts") or ""),
     }
+
+
+def resolve_effective_current_line(local_state: dict[str, Any]) -> dict[str, Any] | None:
+    snapshot_line = _current_line_entry(local_state.get("latest_snapshot", {}))
+    if snapshot_line is not None:
+        return snapshot_line
+    for source_key, source_label in (
+        ("history_observed_lines", "observed"),
+        ("history_lines", "stable"),
+    ):
+        for item in reversed(local_state.get(source_key, [])):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "")
+            line_id = str(item.get("line_id") or "")
+            if not text or not line_id:
+                continue
+            result = dict(item)
+            result["source"] = source_label
+            result["stability"] = str(
+                result.get("stability") or ("stable" if source_label == "stable" else "tentative")
+            )
+            return result
+    return None
+
+
+def build_ocr_context_diagnostic(local_state: dict[str, Any]) -> str:
+    runtime = local_state.get("ocr_reader_runtime")
+    runtime_obj = runtime if isinstance(runtime, dict) else {}
+    parts = ["ocr_context_unavailable"]
+    context_state = str(runtime_obj.get("ocr_context_state") or "").strip()
+    detail = str(runtime_obj.get("detail") or "").strip()
+    status = str(runtime_obj.get("status") or "").strip()
+    if context_state:
+        parts.append(f"context_state={context_state}")
+    if status:
+        parts.append(f"status={status}")
+    if detail:
+        parts.append(f"detail={detail}")
+    backend = str(runtime_obj.get("backend_kind") or "").strip()
+    if backend:
+        parts.append(f"backend={backend}")
+    error = str(runtime_obj.get("last_capture_error") or "").strip()
+    if error:
+        parts.append(f"last_capture_error={error}")
+    raw_text = str(runtime_obj.get("last_raw_ocr_text") or "").strip()
+    if raw_text:
+        parts.append(f"last_raw_ocr_text={raw_text[:80]}")
+    profile = runtime_obj.get("capture_profile")
+    if profile:
+        parts.append(f"profile={profile}")
+    target = str(
+        runtime_obj.get("effective_process_name")
+        or runtime_obj.get("process_name")
+        or ""
+    ).strip()
+    if target:
+        parts.append(f"target={target}")
+    last_error = local_state.get("last_error")
+    if isinstance(last_error, dict) and str(last_error.get("message") or ""):
+        parts.append(f"last_error={str(last_error.get('message') or '')}")
+    return " | ".join(parts)
 
 
 def _scene_lines(history_lines: list[dict[str, Any]], scene_id: str, *, limit: int) -> list[dict[str, Any]]:
@@ -1086,13 +1169,21 @@ def build_local_scene_summary(
 
 def build_explain_context(local_state: dict[str, Any], *, line_id: str) -> dict[str, Any]:
     snapshot = sanitize_snapshot_state(local_state.get("latest_snapshot", {}))
-    effective_line_id = line_id or str(snapshot.get("line_id") or "")
+    effective_line = resolve_effective_current_line(local_state)
+    effective_line_id = line_id or str(
+        (effective_line or {}).get("line_id") or snapshot.get("line_id") or ""
+    )
     if not effective_line_id:
-        raise ValueError("missing line_id")
+        raise ValueError(build_ocr_context_diagnostic(local_state))
 
-    target_line = _resolve_target_line(local_state, line_id=effective_line_id)
+    target_line = (
+        dict(effective_line)
+        if effective_line is not None
+        and str(effective_line.get("line_id") or "") == effective_line_id
+        else _resolve_target_line(local_state, line_id=effective_line_id)
+    )
     if target_line is None:
-        raise ValueError(f"unknown line_id: {effective_line_id}")
+        raise ValueError(f"unknown line_id: {effective_line_id}; {build_ocr_context_diagnostic(local_state)}")
 
     scene_id = str(target_line.get("scene_id") or snapshot.get("scene_id") or "")
     route_id = str(target_line.get("route_id") or snapshot.get("route_id") or "")
@@ -1179,8 +1270,11 @@ def build_summarize_context(
     scene_id: str,
 ) -> dict[str, Any]:
     snapshot = sanitize_snapshot_state(local_state.get("latest_snapshot", {}))
-    effective_scene_id = scene_id or str(snapshot.get("scene_id") or "")
-    route_id = str(snapshot.get("route_id") or "")
+    effective_line = resolve_effective_current_line(local_state)
+    effective_scene_id = scene_id or str(
+        snapshot.get("scene_id") or (effective_line or {}).get("scene_id") or ""
+    )
+    route_id = str(snapshot.get("route_id") or (effective_line or {}).get("route_id") or "")
     stable_lines = _scene_lines(local_state.get("history_lines", []), effective_scene_id, limit=20)
     observed_lines = _scene_lines(
         local_state.get("history_observed_lines", []),
@@ -1361,4 +1455,8 @@ def mode_allows_agent_push(mode: str) -> bool:
 
 
 def mode_allows_choice_push(mode: str) -> bool:
+    return mode == MODE_CHOICE_ADVISOR
+
+
+def mode_allows_agent_actuation(mode: str) -> bool:
     return mode == MODE_CHOICE_ADVISOR

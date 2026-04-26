@@ -29,6 +29,7 @@ from .service import (
     build_suggest_context,
     build_summarize_context,
     latest_selected_choice,
+    mode_allows_agent_actuation,
     mode_allows_agent_push,
     mode_allows_choice_push,
 )
@@ -247,6 +248,22 @@ class GameLLMAgent:
             visible_choices = list(snapshot.get("choices", []))
             status = self._compute_status(shared)
 
+            if status == AGENT_STATUS_ACTIVE and not self._should_actuate(shared):
+                if (
+                    self._actuation is not None
+                    or self._planning_task is not None
+                    or self._pending_strategy is not None
+                ):
+                    await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
+                self._trace_runtime(
+                    "tick read-only: "
+                    f"mode={str(shared.get('mode') or '') or 'unknown'} "
+                    f"stage={self._scene_state['stage']} choices={len(visible_choices)}"
+                )
+                self._next_actuation_at = now + 1.0
+                self._last_status = self._compute_status(shared)
+                return
+
             if self._actuation is not None:
                 await self._progress_actuation(shared, now)
                 self._last_status = self._compute_status(shared)
@@ -263,6 +280,15 @@ class GameLLMAgent:
                     f"status={status} stage={self._scene_state['stage']} "
                     f"choices={len(visible_choices)} reason={self._current_status_reason(shared)}"
                 )
+                self._last_status = status
+                return
+
+            if self._should_pause_for_target_window_focus(shared):
+                self._trace_runtime(
+                    "tick paused: target window is not foreground "
+                    f"stage={self._scene_state['stage']} choices={len(visible_choices)}"
+                )
+                self._next_actuation_at = now + 1.0
                 self._last_status = status
                 return
 
@@ -331,7 +357,7 @@ class GameLLMAgent:
             if self._should_hold_for_ocr_capture_diagnostic(shared):
                 runtime = shared.get("ocr_reader_runtime") if isinstance(shared.get("ocr_reader_runtime"), dict) else {}
                 self._ocr_capture_diagnostic = self._ocr_capture_diagnostic or (
-                    "ocr_capture_diagnostic_required: OCR 连续未读到有效对白，"
+                    "ocr_context_unavailable: OCR 连续未读到有效对白，"
                     "请检查截图区、目标窗口或当前画面是否为普通对白"
                 )
                 self._trace_runtime(
@@ -445,6 +471,9 @@ class GameLLMAgent:
         return bool(shared.get("push_notifications")) and mode_allows_choice_push(
             str(shared.get("mode") or "")
         )
+
+    def _should_actuate(self, shared: dict[str, Any]) -> bool:
+        return mode_allows_agent_actuation(str(shared.get("mode") or ""))
 
     async def _interrupt_current(self) -> None:
         await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
@@ -932,11 +961,30 @@ class GameLLMAgent:
         self._ocr_no_observed_advance_count += 1
         if self._ocr_no_observed_advance_count < 3:
             return ""
-        self._ocr_capture_diagnostic = (
-            "ocr_capture_diagnostic_required: 连续本地推进后没有 OCR observed，"
-            "请检查截图区、目标窗口或当前画面是否为普通对白"
+        snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
+        context_state = (
+            str((runtime or {}).get("ocr_context_state") or "")
+            if isinstance(runtime, dict)
+            else ""
         )
+        if context_state in {"observed", "stable"} or snapshot.get("text") or snapshot.get("line_id"):
+            self._ocr_capture_diagnostic = (
+                "input_advance_unconfirmed: 本地点击已发送，但 OCR 仍停在同一句台词；"
+                "可能是游戏窗口没有接收输入、被其他窗口遮挡/抢焦点、点击点未命中对白区，"
+                "或当前画面不是可推进对白。已暂停盲目推进，请切回/置顶游戏窗口后再继续。"
+            )
+        else:
+            self._ocr_capture_diagnostic = (
+                "ocr_context_unavailable: 连续本地推进后没有 OCR observed，"
+                "请检查截图区、目标窗口或当前画面是否为普通对白"
+            )
         return self._ocr_capture_diagnostic
+
+    def _hold_reason_from_diagnostic(self) -> str:
+        diagnostic = str(self._ocr_capture_diagnostic or "")
+        if diagnostic.startswith("input_advance_unconfirmed"):
+            return "input_advance_unconfirmed"
+        return "ocr_context_unavailable"
 
     def _should_hold_for_ocr_capture_diagnostic(self, shared: dict[str, Any]) -> bool:
         if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
@@ -946,9 +994,16 @@ class GameLLMAgent:
             return False
         if self._ocr_capture_diagnostic:
             return True
+        runtime = shared.get("ocr_reader_runtime")
+        context_state = str((runtime or {}).get("ocr_context_state") or "") if isinstance(runtime, dict) else ""
+        if context_state in {"poll_not_running", "capture_failed", "diagnostic_required"}:
+            self._ocr_capture_diagnostic = (
+                f"ocr_context_unavailable: OCR context_state={context_state}，"
+                "暂停普通推进并等待截图/OCR 恢复"
+            )
+            return True
         if snapshot.get("text") or snapshot.get("line_id"):
             return False
-        runtime = shared.get("ocr_reader_runtime")
         runtime_requires_diagnostic = bool(
             isinstance(runtime, dict)
             and (
@@ -957,6 +1012,36 @@ class GameLLMAgent:
             )
         )
         return bool(self._ocr_capture_diagnostic or runtime_requires_diagnostic)
+
+    def _should_pause_for_target_window_focus(self, shared: dict[str, Any]) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return False
+        runtime = shared.get("ocr_reader_runtime")
+        if not isinstance(runtime, dict):
+            return False
+        if "target_is_foreground" not in runtime:
+            return False
+        if not str(runtime.get("process_name") or runtime.get("effective_process_name") or ""):
+            return False
+        if str(runtime.get("status") or "") not in {"starting", "active"}:
+            return False
+        return not bool(runtime.get("target_is_foreground"))
+
+    def _target_window_focus_diagnostic(self, shared: dict[str, Any]) -> str:
+        if not self._should_pause_for_target_window_focus(shared):
+            return ""
+        runtime = shared.get("ocr_reader_runtime") if isinstance(shared.get("ocr_reader_runtime"), dict) else {}
+        process_name = str(
+            runtime.get("process_name")
+            or runtime.get("effective_process_name")
+            or "目标游戏"
+        )
+        title = str(runtime.get("window_title") or runtime.get("effective_window_title") or "")
+        target = f"{process_name} / {title}" if title else process_name
+        return (
+            f"target_window_not_foreground: 已暂停 Agent 自动推进；当前目标窗口不是前台窗口（{target}）。"
+            "为避免抢焦点或后台误输入，请切回/置顶游戏窗口后继续。"
+        )
 
     def _ocr_advance_observation_window(self, shared: dict[str, Any]) -> float:
         return float(
@@ -1912,6 +1997,9 @@ class GameLLMAgent:
         if not isinstance(ocr_runtime, dict):
             return False
         detail = str(ocr_runtime.get("detail") or "")
+        context_state = str(ocr_runtime.get("ocr_context_state") or "")
+        if context_state in {"poll_not_running", "capture_failed", "diagnostic_required"}:
+            return False
         if bool(ocr_runtime.get("ocr_capture_diagnostic_required")):
             return False
         return detail in {"attached_no_text_yet", "starting_capture"}
@@ -2021,6 +2109,21 @@ class GameLLMAgent:
                     interrupted=interrupted,
                 ),
             }
+
+    async def peek_status(self, shared: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_loop_affinity()
+        async with self._op_lock:
+            await self._observe(shared)
+            now = time.monotonic()
+            self._update_scene_state(shared, now)
+            self._recover_retryable_error_if_ready(now)
+            status = self._compute_status(shared)
+            self._last_status = status
+            return self._build_status_payload(
+                shared,
+                status=status,
+                interrupted=False,
+            )
 
     async def query_context(self, shared: dict[str, Any], *, context_query: str) -> dict[str, Any]:
         self._ensure_loop_affinity()
@@ -2298,6 +2401,13 @@ class GameLLMAgent:
                     or self._should_hold_for_ocr_capture_diagnostic(shared)
                 ),
                 "ocr_capture_diagnostic": self._ocr_capture_diagnostic,
+                "ocr_context_state": str(
+                    (shared.get("ocr_reader_runtime") or {}).get("ocr_context_state") or ""
+                )
+                if isinstance(shared.get("ocr_reader_runtime"), dict)
+                else "",
+                "target_window_not_foreground": self._should_pause_for_target_window_focus(shared),
+                "target_window_diagnostic": self._target_window_focus_diagnostic(shared),
                 "virtual_mouse_stats": self._virtual_mouse_stats_debug(now=debug_now),
                 "virtual_mouse_preferred_target": self._select_virtual_mouse_dialogue_candidate(
                     now=debug_now,
@@ -2343,6 +2453,8 @@ class GameLLMAgent:
             return "explicit_standby"
         if not self._is_actionable(shared):
             return "bridge_inactive"
+        if not self._should_actuate(shared):
+            return "mode_read_only"
         if self._planning_task is not None:
             return "planning_choice"
         if self._actuation is not None:
@@ -2350,10 +2462,12 @@ class GameLLMAgent:
                 f"actuating_{str(self._actuation.get('kind') or 'unknown')}_"
                 f"{str(self._actuation.get('state') or 'running')}"
             )
+        if self._should_pause_for_target_window_focus(shared):
+            return "target_window_not_foreground"
         if self._pending_strategy is not None:
             return "retry_pending"
         if self._should_hold_for_ocr_capture_diagnostic(shared):
-            return "ocr_capture_diagnostic_required"
+            return self._hold_reason_from_diagnostic()
         return "background_loop_ready"
 
     def _current_push_policy(self, shared: dict[str, Any]) -> str:

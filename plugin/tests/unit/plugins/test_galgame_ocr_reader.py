@@ -400,8 +400,9 @@ async def test_ocr_reader_manager_does_not_treat_memory_reader_heartbeats_as_liv
         },
     )
 
-    assert result.runtime["status"] == "starting"
-    assert result.runtime["detail"] == "starting_capture"
+    assert result.runtime["status"] == "active"
+    assert result.runtime["detail"] == "attached_no_text_yet"
+    assert result.runtime["ocr_context_state"] == "no_text"
 
 
 @pytest.mark.asyncio
@@ -455,10 +456,86 @@ async def test_ocr_reader_manager_prefers_memory_reader_game_window_over_foregro
         },
     )
 
-    assert result.runtime["status"] == "starting"
-    assert result.runtime["detail"] == "starting_capture"
+    assert result.runtime["status"] == "active"
+    assert result.runtime["detail"] == "attached_no_text_yet"
+    assert result.runtime["ocr_context_state"] == "no_text"
     assert result.runtime["process_name"] == "TheLamentingGeese.exe"
     assert result.runtime["pid"] == 28828
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_locks_auto_target_when_user_focuses_other_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    game_window = DetectedGameWindow(
+        hwnd=101,
+        title="哀鸿",
+        process_name="TheLamentingGeese.exe",
+        pid=28828,
+    )
+    rebound_game_window = DetectedGameWindow(
+        hwnd=303,
+        title=game_window.title,
+        process_name=game_window.process_name,
+        pid=38828,
+    )
+    other_window = DetectedGameWindow(
+        hwnd=202,
+        title="Other Tool",
+        process_name="Other.exe",
+        pid=1500,
+    )
+    foreground = {"hwnd": game_window.hwnd}
+    windows = {"items": [game_window, other_window]}
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader._foreground_window_handle",
+        lambda: foreground["hwnd"],
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: list(windows["items"]),
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    first = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert first.runtime["process_name"] == "TheLamentingGeese.exe"
+    assert first.runtime["target_selection_detail"] == "foreground_window"
+    assert first.runtime["target_is_foreground"] is True
+    assert first.runtime["locked_target"]["process_name"] == "TheLamentingGeese.exe"
+    assert capture_backend.capture_calls[-1][0] == game_window.hwnd
+
+    foreground["hwnd"] = other_window.hwnd
+    windows["items"] = [other_window]
+    second = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert second.runtime["status"] == "idle"
+    assert second.runtime["detail"] == "waiting_for_valid_window"
+    assert second.runtime["target_selection_detail"] == "locked_target_unavailable"
+    assert len(capture_backend.capture_calls) == 1
+
+    windows["items"] = [other_window, rebound_game_window]
+    third = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert third.runtime["status"] == "active"
+    assert third.runtime["process_name"] == "TheLamentingGeese.exe"
+    assert third.runtime["pid"] == rebound_game_window.pid
+    assert third.runtime["target_selection_detail"] == "locked_target_rebound"
+    assert third.runtime["target_is_foreground"] is False
+    assert capture_backend.capture_calls[-1][0] == rebound_game_window.hwnd
 
 
 @pytest.mark.asyncio
@@ -729,7 +806,7 @@ async def test_aihong_menu_stage_returns_to_dialogue_profile_after_stable_line(
         writer=writer,
     )
 
-    for _ in range(9):
+    for _ in range(12):
         latest = await manager.tick(
             bridge_sdk_available=False,
             memory_reader_runtime={},
@@ -744,8 +821,11 @@ async def test_aihong_menu_stage_returns_to_dialogue_profile_after_stable_line(
     assert session is not None
     assert session["state"]["text"] == "跟我来。"
     assert session["state"]["is_menu_open"] is False
-    assert capture_backend.capture_calls[-2][1]["top_ratio"] == pytest.approx(0.0)
-    assert capture_backend.capture_calls[-1][1]["top_ratio"] == pytest.approx(0.60)
+    assert any(
+        call[1]["top_ratio"] == pytest.approx(0.0)
+        for call in capture_backend.capture_calls
+    )
+    assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.60)
 
 
 @pytest.mark.asyncio
@@ -793,14 +873,20 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
     session_path = bridge_root / writer.game_id / "session.json"
     session = read_session_json(session_path).session
 
-    assert first.runtime["status"] == "starting"
-    assert first.runtime["detail"] == "starting_capture"
+    assert first.runtime["status"] == "active"
+    assert first.runtime["detail"] == "receiving_observed_text"
+    assert first.runtime["ocr_context_state"] == "observed"
+    assert first.runtime["consecutive_no_text_polls"] == 0
+    assert first.runtime["last_observed_at"]
+    assert first.runtime["last_capture_attempt_at"]
+    assert first.runtime["last_capture_completed_at"]
+    assert first.runtime["last_raw_ocr_text"] == "雪乃：你好。"
+    assert first.runtime["last_observed_line"]["text"] == "你好。"
     assert second.runtime["status"] == "active"
-    assert second.runtime["detail"] == "receiving_observed_text"
-    assert second.runtime["consecutive_no_text_polls"] == 0
-    assert second.runtime["last_observed_at"]
+    assert second.runtime["detail"] == "receiving_text"
+    assert second.runtime["ocr_context_state"] == "stable"
+    assert second.runtime["last_stable_line"]["text"] == "你好。"
     assert third.runtime["status"] == "active"
-    assert third.runtime["detail"] == "receiving_text"
     assert third.runtime["game_id"].startswith("ocr-")
     assert session is not None
     assert session["metadata"]["source"] == "ocr_reader"
@@ -843,10 +929,10 @@ async def test_ocr_reader_manager_reports_capture_diagnostic_after_repeated_no_t
     fourth = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
 
     assert second.runtime["detail"] == "attached_no_text_yet"
-    assert second.runtime["consecutive_no_text_polls"] == 1
-    assert third.runtime["consecutive_no_text_polls"] == 2
-    assert fourth.runtime["detail"] == "ocr_capture_diagnostic_required"
-    assert fourth.runtime["consecutive_no_text_polls"] == 3
+    assert second.runtime["consecutive_no_text_polls"] == 2
+    assert third.runtime["detail"] == "ocr_capture_diagnostic_required"
+    assert third.runtime["consecutive_no_text_polls"] == 3
+    assert third.runtime["ocr_context_state"] == "diagnostic_required"
     assert fourth.runtime["ocr_capture_diagnostic_required"] is True
     assert fourth.runtime["last_capture_stage"]
     assert fourth.runtime["last_capture_profile"]
@@ -963,7 +1049,8 @@ async def test_ocr_reader_manager_auto_mode_prefers_rapidocr_when_available(
     assert first.runtime["backend_kind"] == "rapidocr"
     assert second.runtime["backend_kind"] == "rapidocr"
     assert third.runtime["backend_kind"] == "rapidocr"
-    assert third.runtime["detail"] == "receiving_text"
+    assert second.runtime["detail"] == "receiving_text"
+    assert second.runtime["ocr_context_state"] == "stable"
 
 
 @pytest.mark.asyncio
@@ -1102,7 +1189,7 @@ async def test_ocr_reader_manager_forced_rapidocr_mode_does_not_fallback_to_tess
     second = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
 
     assert second.runtime["backend_kind"] == "rapidocr"
-    assert second.runtime["detail"] == "starting_capture"
+    assert second.runtime["detail"] == "capture_failed"
 
 
 @pytest.mark.asyncio
@@ -1205,7 +1292,8 @@ async def test_ocr_reader_manager_prefers_manual_target_and_rebinds_by_signature
         memory_reader_runtime={},
     )
 
-    assert result.runtime["status"] == "starting"
+    assert result.runtime["status"] == "active"
+    assert result.runtime["detail"] == "attached_no_text_yet"
     assert result.runtime["process_name"] == "Aiyoku.exe"
     assert result.runtime["target_selection_mode"] == "manual"
     assert result.runtime["target_selection_detail"] == "manual_target_rebound"

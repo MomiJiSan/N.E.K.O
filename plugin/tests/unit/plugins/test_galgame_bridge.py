@@ -60,6 +60,7 @@ from plugin.plugins.galgame_plugin.service import (
     build_explain_context,
     build_suggest_context,
     build_summarize_context,
+    resolve_effective_current_line,
 )
 from plugin.sdk.plugin import Err, Ok
 
@@ -3952,6 +3953,41 @@ def test_summarize_context_uses_observed_lines_when_stable_history_is_empty() ->
 
 
 @pytest.mark.plugin_unit
+def test_effective_current_line_and_explain_context_fall_back_to_observed() -> None:
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="",
+            text="",
+            scene_id="",
+            line_id="",
+            ts="2024-04-02T12:00:00Z",
+        ),
+        history_lines=[],
+        history_observed_lines=[
+            {
+                "line_id": "ocr:line-1",
+                "speaker": "王生",
+                "text": "算了，没事。",
+                "scene_id": "ocr:unknown_scene",
+                "route_id": "ocr:route",
+                "stability": "tentative",
+                "ts": "2024-04-02T12:00:01Z",
+            }
+        ],
+        active_data_source=DATA_SOURCE_OCR_READER,
+    )
+
+    effective = resolve_effective_current_line(shared)
+    context = build_explain_context(shared, line_id="")
+
+    assert effective is not None
+    assert effective["source"] == "observed"
+    assert context["line_id"] == "ocr:line-1"
+    assert context["text"] == "算了，没事。"
+    assert context["observed_lines"][0]["text"] == "算了，没事。"
+
+
+@pytest.mark.plugin_unit
 def test_ocr_advance_speed_controls_line_changed_threshold(tmp_path: Path) -> None:
     writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
     writer.start_session(
@@ -5076,6 +5112,72 @@ async def test_game_llm_agent_query_status_returns_structured_fields(tmp_path: P
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_companion_mode_does_not_advance_dialogue(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(mode="companion", push_notifications=False)
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert fake_host.started == []
+    assert agent._actuation is None
+    assert agent._pending_strategy is None
+    assert status["status"] == "active"
+    assert status["reason"] == "mode_read_only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_companion_mode_does_not_plan_or_choose(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+    )
+    shared = _shared_state(
+        mode="companion",
+        push_notifications=False,
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="你要走哪边？",
+            scene_id="scene-a",
+            line_id="line-1",
+            choices=[
+                {"choice_id": "choice-1", "text": "左边", "index": 0},
+                {"choice_id": "choice-2", "text": "右边", "index": 1},
+            ],
+            is_menu_open=True,
+        ),
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert fake_gateway.suggest_calls == []
+    assert fake_host.started == []
+    assert agent._planning_task is None
+    assert agent._actuation is None
+    assert status["reason"] == "mode_read_only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_falls_back_to_first_choice_when_suggest_is_degraded(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
@@ -6086,6 +6188,111 @@ async def test_game_llm_agent_uses_safe_probe_when_ocr_has_no_text_yet(tmp_path:
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_holds_when_ocr_context_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, Any]] = []
+
+    def _local_input(_shared: dict[str, Any], actuation: dict[str, Any]) -> dict[str, Any]:
+        local_calls.append(dict(actuation))
+        return {"success": True}
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_input,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="王生",
+            text="旧台词。",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={
+            "enabled": True,
+            "status": "active",
+            "detail": "capture_failed",
+            "ocr_context_state": "capture_failed",
+            "pid": 4242,
+        },
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert local_calls == []
+    assert fake_host.started == []
+    assert status["reason"] == "ocr_context_unavailable"
+    assert "capture_failed" in status["debug"]["ocr_capture_diagnostic"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_pauses_when_ocr_target_window_is_not_foreground(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway()
+    fake_host = _FakeHostAdapter()
+    local_calls: list[dict[str, Any]] = []
+
+    def _local_input(_shared: dict[str, Any], actuation: dict[str, Any]) -> dict[str, Any]:
+        local_calls.append(dict(actuation))
+        return {"success": True}
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=fake_host,
+        local_input_actuator=_local_input,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(
+            speaker="杨军爷",
+            text="这酒真不赖！",
+            scene_id="scene-a",
+            line_id="line-1",
+            ts="2026-04-21T08:31:00Z",
+        ),
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={
+            "enabled": True,
+            "status": "active",
+            "detail": "receiving_observed_text",
+            "ocr_context_state": "observed",
+            "process_name": "TheLamentingGeese.exe",
+            "window_title": "TheLamentingGeese",
+            "pid": 4242,
+            "target_is_foreground": False,
+        },
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert local_calls == []
+    assert fake_host.started == []
+    assert status["status"] == "active"
+    assert status["reason"] == "target_window_not_foreground"
+    assert status["debug"]["target_window_not_foreground"] is True
+    assert "已暂停 Agent 自动推进" in status["debug"]["target_window_diagnostic"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_holds_after_repeated_ocr_advance_without_observed(
     tmp_path: Path,
 ) -> None:
@@ -6146,13 +6353,14 @@ async def test_game_llm_agent_holds_after_repeated_ocr_advance_without_observed(
 
     assert agent._actuation is None
     assert agent._pending_strategy is None
-    assert "ocr_capture_diagnostic_required" in agent._ocr_capture_diagnostic
+    assert "input_advance_unconfirmed" in agent._ocr_capture_diagnostic
+    assert "本地点击已发送" in agent._ocr_capture_diagnostic
     agent._next_actuation_at = 0.0
     await agent.tick(shared)
     assert len(local_calls) == 3
 
     status = await agent.query_status(shared)
-    assert status["reason"] == "ocr_capture_diagnostic_required"
+    assert status["reason"] == "input_advance_unconfirmed"
     assert status["debug"]["ocr_capture_diagnostic_required"] is True
 
 

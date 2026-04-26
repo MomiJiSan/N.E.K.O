@@ -130,14 +130,88 @@ h1 {
   gap: 12px;
 }
 
-.bind-grid {
+.agent-grid {
   margin-top: 12px;
   grid-template-columns: 1.5fr auto auto;
 }
 
-.agent-grid {
-  margin-top: 12px;
-  grid-template-columns: 1.5fr auto auto;
+.settings-subpanel {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.binding-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.binding-summary h3 {
+  margin-top: 3px;
+  font-size: 16px;
+  word-break: break-all;
+}
+
+.binding-detail {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.binding-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 42px;
+  align-items: center;
+}
+
+.binding-chip {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 100%;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(14, 138, 124, 0.1);
+  color: var(--brand-strong);
+  font-size: 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.binding-chip-title {
+  font-weight: 700;
+}
+
+.binding-chip-detail {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.binding-chip.active {
+  background: var(--brand-strong);
+  color: #fff;
+}
+
+.binding-chip.active .binding-chip-detail {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.agent-debug-tools {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.agent-debug-tools summary {
+  cursor: pointer;
+  color: var(--brand-strong);
+  font-weight: 700;
 }
 
 .field {
@@ -790,11 +864,15 @@ button[disabled] {
   }
 
   .control-grid,
-  .bind-grid,
   .agent-grid,
   .dashboard-grid,
   .capture-profile-grid {
     grid-template-columns: 1fr;
+  }
+
+  .binding-summary {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .data-row {

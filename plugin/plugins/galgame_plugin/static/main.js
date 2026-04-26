@@ -192,8 +192,8 @@ const CONNECTION_STATE_LABELS_ZH = {
 
 const MODE_LABELS_ZH = {
   silent: '静默模式',
-  companion: '陪伴模式',
-  choice_advisor: '选项顾问模式',
+  companion: '伴读模式',
+  choice_advisor: '自动推进模式',
 };
 const ADVANCE_SPEED_LABELS_ZH = {
   slow: '慢',
@@ -361,17 +361,38 @@ function buildOcrMissingLineDiagnostic(status = {}) {
   if (status.ocr_capture_diagnostic) {
     parts.push(status.ocr_capture_diagnostic);
   }
+  if (status.agent_reason) {
+    parts.push(`agent_reason=${status.agent_reason}`);
+  }
+  if (status.agent_diagnostic) {
+    parts.push(status.agent_diagnostic);
+  }
   if (runtime.status) {
     parts.push(`status=${runtime.status}`);
   }
   if (runtime.detail) {
     parts.push(`detail=${runtime.detail}`);
   }
+  if (runtime.ocr_context_state) {
+    parts.push(`context_state=${runtime.ocr_context_state}`);
+  }
   if (runtime.backend_kind) {
     parts.push(`backend=${runtime.backend_kind}`);
   }
   if (runtime.backend_detail) {
     parts.push(`backend_detail=${runtime.backend_detail}`);
+  }
+  if (typeof status.bridge_poll_running === 'boolean') {
+    parts.push(`bridge_poll_running=${status.bridge_poll_running}`);
+  }
+  if (typeof status.bridge_poll_inflight_seconds === 'number') {
+    parts.push(`bridge_poll_inflight=${status.bridge_poll_inflight_seconds.toFixed(1)}s`);
+  }
+  if (typeof status.last_bridge_poll_duration_seconds === 'number') {
+    parts.push(`last_poll_duration=${status.last_bridge_poll_duration_seconds.toFixed(1)}s`);
+  }
+  if (status.last_error?.message) {
+    parts.push(`last_error=${status.last_error.message}`);
   }
   if (rapidocr.detail && rapidocr.detail !== 'installed') {
     parts.push(`rapidocr=${rapidocr.detail}`);
@@ -387,6 +408,12 @@ function buildOcrMissingLineDiagnostic(status = {}) {
   }
   if (runtime.last_observed_at) {
     parts.push(`last_observed_at=${runtime.last_observed_at}`);
+  }
+  if (runtime.last_capture_error) {
+    parts.push(`last_capture_error=${runtime.last_capture_error}`);
+  }
+  if (runtime.last_raw_ocr_text) {
+    parts.push(`last_raw=${String(runtime.last_raw_ocr_text).slice(0, 80)}`);
   }
   return parts.join(' | ');
 }
@@ -409,6 +436,20 @@ function mergedHistoryLines(history = {}) {
 function latestHistoryLine(history = {}) {
   const lines = mergedHistoryLines(history);
   return lines.length ? lines[lines.length - 1] : null;
+}
+
+function effectiveCurrentLine(snapshot = {}, history = {}, status = {}) {
+  const state = snapshot.snapshot || {};
+  if (state.line_id && state.text) {
+    return { ...state, source: 'snapshot', stability: state.stability || '' };
+  }
+  if (snapshot.effective_current_line?.line_id && snapshot.effective_current_line?.text) {
+    return { ...snapshot.effective_current_line };
+  }
+  if (status.effective_current_line?.line_id && status.effective_current_line?.text) {
+    return { ...status.effective_current_line };
+  }
+  return latestHistoryLine(history) || {};
 }
 
 function buildSummaryFallback(sceneId = '', diagnostic = 'missing scene_id') {
@@ -1021,7 +1062,6 @@ function renderStatus(status) {
   document.getElementById('modeSelect').value = status.mode || 'companion';
   document.getElementById('pushToggle').checked = Boolean(status.push_notifications);
   document.getElementById('advanceSpeedSelect').value = status.advance_speed || 'medium';
-  document.getElementById('bindInput').value = status.bound_game_id || '';
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
@@ -1041,6 +1081,10 @@ function renderStatus(status) {
     { label: 'connection_state', value: status.connection_state || '' },
     { label: 'active_data_source', value: status.active_data_source || '' },
     { label: 'mode', value: status.mode || '' },
+    { label: 'agent_status', value: status.agent_status || '' },
+    { label: 'agent_activity', value: status.agent_activity || '' },
+    { label: 'agent_reason', value: status.agent_reason || '' },
+    { label: 'agent_diagnostic', value: status.agent_diagnostic || '' },
     { label: 'push_notifications', value: String(Boolean(status.push_notifications)) },
     { label: 'advance_speed', value: ADVANCE_SPEED_LABELS_ZH[status.advance_speed] || status.advance_speed || 'medium' },
     { label: 'bound_game_id', value: status.bound_game_id || '(auto)' },
@@ -1051,6 +1095,9 @@ function renderStatus(status) {
     { label: 'ocr_reader_enabled', value: String(Boolean(status.ocr_reader_enabled)) },
     { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
     { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
+    { label: 'ocr_context_state', value: ocrRuntime.ocr_context_state || '' },
+    { label: 'target_is_foreground', value: String(Boolean(ocrRuntime.target_is_foreground)) },
+    { label: 'effective_current_line', value: status.effective_current_line?.text || '' },
     { label: 'ocr_capture_diagnostic_required', value: String(Boolean(status.ocr_capture_diagnostic_required)) },
     { label: 'ocr_capture_diagnostic', value: status.ocr_capture_diagnostic || '' },
     { label: 'ocr_reader_target', value: ocrTarget || '' },
@@ -1077,6 +1124,95 @@ function renderStatus(status) {
   renderTextractor(status);
   renderOcrWindowTargetStatus(status);
   renderOcrProfile(status);
+  renderGameBinding(status);
+}
+
+function renderGameBinding(status) {
+  const currentNode = document.getElementById('currentBoundGameId');
+  const detailNode = document.getElementById('currentBoundGameDetail');
+  const listNode = document.getElementById('availableGameIds');
+  if (!currentNode || !listNode) {
+    return;
+  }
+
+  const boundGameId = String(status.bound_game_id || '').trim();
+  const gameIds = Array.isArray(status.available_game_ids) ? status.available_game_ids : [];
+  const boundDescription = describeGameBindingId(boundGameId);
+  currentNode.textContent = boundGameId ? `已固定：${boundDescription.title}` : '自动选择游戏窗口';
+  if (detailNode) {
+    detailNode.textContent = boundGameId
+      ? `${boundDescription.detail}。点“恢复自动”后，插件会重新按当前可用目标选择。`
+      : '插件会优先选择当前可用目标。需要固定目标时，点击下面的候选项。';
+  }
+
+  if (!gameIds.length) {
+    listNode.className = 'binding-chip-row empty-inline';
+    listNode.textContent = '未发现可绑定游戏。请确认 Bridge/OCR/Memory Reader 已连接到游戏窗口。';
+    return;
+  }
+
+  const normalizedGameIds = gameIds.map((gameId) => String(gameId || '').trim()).filter(Boolean);
+  if (!normalizedGameIds.length) {
+    listNode.className = 'binding-chip-row empty-inline';
+    listNode.textContent = '可用游戏 ID 为空。';
+    return;
+  }
+
+  listNode.className = 'binding-chip-row';
+  listNode.replaceChildren(
+    ...normalizedGameIds
+      .map((normalized) => {
+        const active = normalized === boundGameId;
+        const description = describeGameBindingId(normalized);
+        const button = document.createElement('button');
+        button.className = `binding-chip${active ? ' active' : ''}`;
+        button.dataset.gameId = normalized;
+        button.disabled = active;
+        const title = document.createElement('span');
+        title.className = 'binding-chip-title';
+        title.textContent = active ? `当前：${description.title}` : description.title;
+        const detail = document.createElement('span');
+        detail.className = 'binding-chip-detail';
+        detail.textContent = description.detail;
+        button.replaceChildren(title, detail);
+        return button;
+      }),
+  );
+
+  listNode.querySelectorAll('[data-game-id]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const gameId = button.getAttribute('data-game-id') || '';
+      withButtonPending(button, '绑定中...', () => bindGame(gameId)).catch(() => {});
+    });
+  });
+}
+
+function describeGameBindingId(gameId) {
+  const normalized = String(gameId || '').trim();
+  if (!normalized) {
+    return {
+      title: '自动选择游戏窗口',
+      detail: '插件会优先选择当前可用目标',
+    };
+  }
+  const [prefix, ...rest] = normalized.split('-');
+  const suffix = rest.join('-') || normalized;
+  if (prefix === 'mem') {
+    return {
+      title: '内存读取目标',
+      detail: `ID ${suffix}`,
+    };
+  }
+  if (prefix === 'ocr') {
+    return {
+      title: 'OCR 窗口目标',
+      detail: `ID ${suffix}`,
+    };
+  }
+  return {
+    title: '游戏目标',
+    detail: normalized,
+  };
 }
 
 function formatConnectionStateZh(value) {
@@ -1141,10 +1277,21 @@ function buildStatusSummaryText(status) {
     parts.push(`告警：${warningMessage}`);
   }
   if (status.ocr_capture_diagnostic_required) {
-    parts.push('OCR诊断：截图区/窗口目标可能异常');
+    parts.push(`OCR诊断：${status.ocr_context_state || ocrRuntimeState(status) || '截图区/窗口目标可能异常'}`);
+  }
+  if (status.agent_diagnostic_required || status.agent_reason) {
+    const agentText = status.agent_diagnostic || status.agent_reason || status.agent_status || '';
+    if (agentText) {
+      parts.push(`Agent：${agentText}`);
+    }
   }
 
   return `${prefix}｜${parts.join('｜')}`;
+}
+
+function ocrRuntimeState(status) {
+  const runtime = status?.ocr_reader_runtime || {};
+  return runtime.ocr_context_state || runtime.detail || '';
 }
 
 function renderOcrRuntime(status) {
@@ -1173,6 +1320,13 @@ function renderOcrRuntime(status) {
     { label: 'last_observed_at', value: runtime.last_observed_at || '' },
     { label: 'last_capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[runtime.last_capture_stage] || runtime.last_capture_stage || '' },
     { label: 'last_capture_profile', value: formatCaptureProfile(runtime.last_capture_profile) || '' },
+    { label: 'ocr_context_state', value: runtime.ocr_context_state || '' },
+    { label: 'last_capture_attempt_at', value: runtime.last_capture_attempt_at || '' },
+    { label: 'last_capture_completed_at', value: runtime.last_capture_completed_at || '' },
+    { label: 'last_capture_error', value: runtime.last_capture_error || '' },
+    { label: 'last_raw_ocr_text', value: runtime.last_raw_ocr_text || '' },
+    { label: 'last_observed_line', value: runtime.last_observed_line?.text || '' },
+    { label: 'last_stable_line', value: runtime.last_stable_line?.text || '' },
     { label: 'ocr_capture_diagnostic_required', value: String(Boolean(runtime.ocr_capture_diagnostic_required)) },
     { label: 'backend_kind', value: runtime.backend_kind || '' },
     { label: 'backend_detail', value: runtime.backend_detail || '' },
@@ -1186,6 +1340,7 @@ function renderOcrRuntime(status) {
     { label: 'effective_window_key', value: runtime.effective_window_key || '' },
     { label: 'effective_window_title', value: runtime.effective_window_title || '' },
     { label: 'effective_process_name', value: runtime.effective_process_name || '' },
+    { label: 'target_is_foreground', value: String(Boolean(runtime.target_is_foreground)) },
     { label: 'candidate_count', value: String(runtime.candidate_count || 0) },
     { label: 'excluded_candidate_count', value: String(runtime.excluded_candidate_count || 0) },
     { label: 'last_exclude_reason', value: runtime.last_exclude_reason || '' },
@@ -1829,6 +1984,7 @@ function renderAgentStatus(payload) {
     { label: 'status', value: payload.status || 'standby' },
     { label: 'activity', value: payload.activity || 'idle' },
     { label: 'reason', value: payload.reason || '' },
+    { label: 'diagnostic', value: payload.debug?.ocr_capture_diagnostic || payload.error || '' },
     { label: 'input_source', value: payload.input_source || (latestStatus && latestStatus.active_data_source) || 'unknown' },
     { label: 'scene_stage', value: payload.scene_stage || 'unknown' },
     { label: 'scene_id', value: payload.scene_id || '' },
@@ -1898,12 +2054,31 @@ function renderSuggest(payload) {
 }
 
 async function refreshInsights(snapshot, { force = false, history = {}, status = {} } = {}) {
+  const mode = String(status.mode || '').trim();
+  if (mode === 'silent') {
+    const diagnostic = '静默模式：不自动解释、总结或建议。';
+    const explain = buildExplainFallback('', diagnostic);
+    const summary = buildSummaryFallback('', diagnostic);
+    const suggest = buildSuggestFallback('', diagnostic);
+    latestInsights.explainKey = 'silent';
+    latestInsights.explainPayload = explain;
+    latestInsights.summaryKey = 'silent';
+    latestInsights.summaryPayload = summary;
+    latestInsights.suggestKey = 'silent';
+    latestInsights.suggestPayload = suggest;
+    renderExplain(explain);
+    renderSummary(summary);
+    renderSuggest(suggest);
+    return;
+  }
+
   const state = snapshot.snapshot || {};
-  const fallbackLine = latestHistoryLine(history) || {};
+  const fallbackLine = effectiveCurrentLine(snapshot, history, status);
   const currentLineId = state.line_id || fallbackLine.line_id || '';
   const currentSceneId = state.scene_id || fallbackLine.scene_id || '';
   const choices = Array.isArray(state.choices) ? state.choices : [];
-  const hasChoices = Boolean(state.is_menu_open) && choices.length > 0;
+  const visibleChoiceMenu = Boolean(state.is_menu_open) && choices.length > 0;
+  const hasChoices = mode === 'choice_advisor' && visibleChoiceMenu;
   const explainKey = currentLineId || 'missing-line';
   const summaryKey = currentSceneId || 'missing-scene';
   const suggestKey = hasChoices
@@ -1938,7 +2113,10 @@ async function refreshInsights(snapshot, { force = false, history = {}, status =
         buildSuggestFallback(currentSceneId),
       )
       : Promise.resolve(latestInsights.suggestPayload)
-    : Promise.resolve(buildSuggestFallback(currentSceneId, 'no visible choices'));
+    : Promise.resolve(buildSuggestFallback(
+      currentSceneId,
+      visibleChoiceMenu ? '伴读模式：不自动生成选项建议。' : 'no visible choices',
+    ));
 
   const [explain, summary, suggest] = await Promise.all([
     explainPromise,
@@ -1991,15 +2169,7 @@ async function refreshAll(options = {}) {
         callPlugin('galgame_get_snapshot'),
         callPlugin('galgame_get_history', { limit: 20, include_events: true }),
       ]);
-      let agentStatus = latestAgentStatus
-        || { action: 'query_status', result: '', status: 'standby', recent_pushes: [] };
-      if (!silent || !latestAgentStatus) {
-        agentStatus = await safeCall(
-          'galgame_agent_command',
-          { action: 'query_status' },
-          { action: 'query_status', result: '', status: 'standby', recent_pushes: [] },
-        );
-      }
+      const agentStatus = status.agent || buildAgentStatusFromStatus(status);
       renderStatus(status);
       renderSnapshot(snapshot);
       renderHistory(history);
@@ -2019,6 +2189,39 @@ async function refreshAll(options = {}) {
     await refreshInFlight;
   } finally {
     refreshInFlight = null;
+  }
+}
+
+function buildAgentStatusFromStatus(status = {}) {
+  return {
+    action: 'peek_status',
+    result: status.agent_error || '',
+    status: status.agent_status || 'standby',
+    activity: status.agent_activity || '',
+    reason: status.agent_reason || '',
+    error: status.agent_error || '',
+    debug: {
+      ocr_capture_diagnostic: status.agent_diagnostic || status.ocr_capture_diagnostic || '',
+    },
+    recent_pushes: latestAgentStatus?.recent_pushes || [],
+  };
+}
+
+async function withButtonPending(buttonOrId, pendingText, fn) {
+  const button = typeof buttonOrId === 'string'
+    ? document.getElementById(buttonOrId)
+    : buttonOrId;
+  if (!button) {
+    return fn();
+  }
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = pendingText;
+  try {
+    return await fn();
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -2088,6 +2291,7 @@ async function saveMode() {
   const pushNotifications = document.getElementById('pushToggle').checked;
   const advanceSpeed = document.getElementById('advanceSpeedSelect').value || 'medium';
   try {
+    setFlash('正在保存设置...', 'info');
     await callPlugin('galgame_set_mode', {
       mode,
       push_notifications: pushNotifications,
@@ -2100,11 +2304,12 @@ async function saveMode() {
   }
 }
 
-async function bindGame() {
-  const gameId = document.getElementById('bindInput').value.trim();
+async function bindGame(gameId = '') {
+  const normalized = String(gameId || '').trim();
   try {
-    await callPlugin('galgame_bind_game', { game_id: gameId });
-    setFlash(gameId ? `已绑定 ${gameId}` : '已恢复自动选择', 'success');
+    setFlash(normalized ? `正在绑定 ${normalized}...` : '正在恢复自动选择...', 'info');
+    await callPlugin('galgame_bind_game', { game_id: normalized });
+    setFlash(normalized ? `已绑定 ${normalized}` : '已恢复自动选择', 'success');
     await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
@@ -2113,6 +2318,7 @@ async function bindGame() {
 
 async function setStandby(standby) {
   try {
+    setFlash(standby ? '正在进入待机...' : '正在恢复活跃...', 'info');
     const payload = await callPlugin('galgame_agent_command', {
       action: 'set_standby',
       standby,
@@ -2133,6 +2339,7 @@ async function askAgent(action) {
   }
 
   try {
+    setFlash(action === 'query_context' ? '正在查询上下文...' : '正在发送给 Agent...', 'info');
     const payload = await callPlugin(
       'galgame_agent_command',
       action === 'query_context'
@@ -2313,19 +2520,31 @@ async function initialize() {
 }
 
 document.getElementById('refreshBtn').addEventListener('click', async () => {
-  await refreshAll({ forceInsights: true });
-  await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
+  await withButtonPending('refreshBtn', '刷新中...', async () => {
+    setFlash('正在刷新插件状态...', 'info');
+    await refreshAll({ forceInsights: true });
+    await refreshOcrWindowTargets({ includeExcluded: true, silent: true });
+    setFlash('刷新完成', 'success');
+  });
 });
-document.getElementById('saveModeBtn').addEventListener('click', saveMode);
-document.getElementById('bindBtn').addEventListener('click', bindGame);
+document.getElementById('saveModeBtn').addEventListener('click', () => {
+  withButtonPending('saveModeBtn', '保存中...', saveMode).catch(() => {});
+});
 document.getElementById('clearBindBtn').addEventListener('click', async () => {
-  document.getElementById('bindInput').value = '';
-  await bindGame();
+  await withButtonPending('clearBindBtn', '恢复中...', () => bindGame(''));
 });
-document.getElementById('standbyOnBtn').addEventListener('click', () => setStandby(true));
-document.getElementById('standbyOffBtn').addEventListener('click', () => setStandby(false));
-document.getElementById('queryContextBtn').addEventListener('click', () => askAgent('query_context'));
-document.getElementById('sendMessageBtn').addEventListener('click', () => askAgent('send_message'));
+document.getElementById('standbyOnBtn').addEventListener('click', () => {
+  withButtonPending('standbyOnBtn', '切换中...', () => setStandby(true)).catch(() => {});
+});
+document.getElementById('standbyOffBtn').addEventListener('click', () => {
+  withButtonPending('standbyOffBtn', '恢复中...', () => setStandby(false)).catch(() => {});
+});
+document.getElementById('queryContextBtn').addEventListener('click', () => {
+  withButtonPending('queryContextBtn', '查询中...', () => askAgent('query_context')).catch(() => {});
+});
+document.getElementById('sendMessageBtn').addEventListener('click', () => {
+  withButtonPending('sendMessageBtn', '发送中...', () => askAgent('send_message')).catch(() => {});
+});
 document.getElementById('rapidocrInstallBtn').addEventListener('click', () => installRapidOcr(false));
 document.getElementById('tesseractInstallBtn').addEventListener('click', () => installTesseract(false));
 document.getElementById('textractorInstallBtn').addEventListener('click', () => installTextractor(false));
