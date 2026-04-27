@@ -6,7 +6,9 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
+from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
@@ -33,6 +35,7 @@ from .models import (
     OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
     OCR_CAPTURE_PROFILE_STAGE_MENU,
     OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
+    OCR_TRIGGER_MODE_AFTER_ADVANCE,
     build_ocr_capture_profile_bucket_key,
     compute_ocr_window_aspect_ratio,
     parse_ocr_capture_profile_bucket_key,
@@ -219,6 +222,15 @@ _AIHONG_MENU_DIALOGUE_MARKERS = (
     "】",
 )
 _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
+_OCR_DIALOGUE_STRONG_PUNCTUATION_RE = re.compile(r"[。！？!?…]|——|「|」|『|』|“|”")
+_OCR_DIALOGUE_WEAK_PUNCTUATION_RE = re.compile(r"[，,、：:]")
+_OCR_TRAILING_GARBAGE_AFTER_SENTENCE_RE = re.compile(r"([。！？!?…」』”\]］])\s*[号口日曰益]\s*$")
+_OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE = re.compile(
+    r"([\]］）】」』”])\s*[^。！？!?…，,、：:；;「」『』“”\[\]［］【】（）()]{1,4}\s*$"
+)
+_OCR_TRAILING_GARBAGE_AFTER_DASH_RE = re.compile(
+    r"((?:——|--|—|－|-))\s*[^。！？!?…，,、：:「」『』“”\[\]［］【】（）()]{1,4}\s*$"
+)
 _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS = 0.18
 _CAPTURE_BACKEND_AUTO = "auto"
 _CAPTURE_BACKEND_DXCAM = "dxcam"
@@ -301,6 +313,34 @@ def _looks_like_dialogue_line(text: str) -> bool:
     if not normalized:
         return False
     return any(marker in normalized for marker in _DIALOGUE_LINE_MARKERS)
+
+
+def _looks_like_ocr_dialogue_text(text: str) -> bool:
+    normalized = normalize_text(text).replace("\n", " ").strip()
+    if not normalized:
+        return False
+    significant_chars = _significant_char_count(normalized)
+    if significant_chars < 2 or significant_chars > 220:
+        return False
+    if _OCR_DIALOGUE_STRONG_PUNCTUATION_RE.search(normalized):
+        return True
+    if _OCR_DIALOGUE_WEAK_PUNCTUATION_RE.search(normalized) and significant_chars >= 8:
+        return True
+    return False
+
+
+def _clean_ocr_dialogue_text(text: str) -> str:
+    normalized = normalize_text(text).replace("\n", " ").strip()
+    if not normalized:
+        return ""
+    previous = None
+    cleaned = normalized
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = _OCR_TRAILING_GARBAGE_AFTER_SENTENCE_RE.sub(r"\1", cleaned).strip()
+        cleaned = _OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE.sub(r"\1", cleaned).strip()
+        cleaned = _OCR_TRAILING_GARBAGE_AFTER_DASH_RE.sub(r"\1", cleaned).strip()
+    return cleaned
 
 
 def _coerce_plain_choice_lines(lines: list[str]) -> list[str]:
@@ -1228,6 +1268,7 @@ class OcrReaderTickResult:
     warnings: list[str] = field(default_factory=list)
     should_rescan: bool = False
     runtime: dict[str, Any] = field(default_factory=dict)
+    stable_event_emitted: bool = False
 
 
 @dataclass(slots=True)
@@ -1825,6 +1866,21 @@ def _foreground_window_handle() -> int:
         return 0
 
 
+def _window_handle_from_point(x: int, y: int) -> int:
+    if os.name != "nt":
+        return 0
+    try:
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        user32 = ctypes.windll.user32
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.WindowFromPoint.argtypes = [POINT]
+        return int(user32.WindowFromPoint(POINT(int(x), int(y))) or 0)
+    except Exception:
+        return 0
+
+
 def _root_window_handle(hwnd: int) -> int:
     if not hwnd:
         return 0
@@ -1874,6 +1930,191 @@ def _foreground_matches_target(foreground_hwnd: int, target: DetectedGameWindow 
     if foreground_process and target_process and foreground_process == target_process:
         return True, "process"
     return False, "background"
+
+
+@dataclass(slots=True)
+class _MouseWheelEvent:
+    seq: int
+    ts: float
+    delta: int
+    foreground_hwnd: int
+    point_hwnd: int = 0
+    kind: str = "wheel"
+
+
+class _MouseWheelMonitor:
+    _MAX_EVENTS = 96
+    _MAX_EVENT_AGE_SECONDS = 15.0
+
+    def __init__(self, *, time_fn: Callable[[], float]) -> None:
+        self._time_fn = time_fn
+        self._lock = threading.Lock()
+        self._events: list[_MouseWheelEvent] = []
+        self._seq = 0
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+        self._hook_handle = 0
+        self._callback = None
+        self._stop = threading.Event()
+
+    def start(self) -> bool:
+        if os.name != "nt":
+            return False
+        if self._thread is not None:
+            return True
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="galgame-ocr-wheel-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if os.name == "nt" and self._thread_id:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(
+                    int(self._thread_id),
+                    0x0012,  # WM_QUIT
+                    0,
+                    0,
+                )
+            except Exception:
+                pass
+
+    def events_after(self, seq: int) -> list[_MouseWheelEvent]:
+        with self._lock:
+            self._prune_locked()
+            return [event for event in self._events if event.seq > seq]
+
+    def _record(
+        self,
+        *,
+        delta: int = 0,
+        kind: str = "wheel",
+        point_hwnd: int = 0,
+    ) -> None:
+        now = self._time_fn()
+        foreground_hwnd = _foreground_window_handle()
+        with self._lock:
+            self._seq += 1
+            self._events.append(
+                _MouseWheelEvent(
+                    seq=self._seq,
+                    ts=now,
+                    delta=int(delta),
+                    foreground_hwnd=max(0, int(foreground_hwnd or 0)),
+                    point_hwnd=max(0, int(point_hwnd or 0)),
+                    kind=str(kind or "wheel"),
+                )
+            )
+            self._prune_locked(now=now)
+
+    def _prune_locked(self, *, now: float | None = None) -> None:
+        now = self._time_fn() if now is None else now
+        min_ts = now - self._MAX_EVENT_AGE_SECONDS
+        self._events = [
+            event for event in self._events[-self._MAX_EVENTS :]
+            if event.ts >= min_ts
+        ]
+
+    def _run(self) -> None:
+        try:
+            low_level_mouse_proc = getattr(ctypes, "WINFUNCTYPE", None)
+            if low_level_mouse_proc is None:
+                return
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            self._thread_id = int(kernel32.GetCurrentThreadId())
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            class MSLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("pt", POINT),
+                    ("mouseData", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
+            proc_type = low_level_mouse_proc(
+                ctypes.c_longlong,
+                ctypes.c_int,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            hhook_type = getattr(wintypes, "HHOOK", wintypes.HANDLE)
+            hinstance_type = getattr(wintypes, "HINSTANCE", wintypes.HANDLE)
+            user32.CallNextHookEx.restype = ctypes.c_longlong
+            user32.CallNextHookEx.argtypes = [
+                hhook_type,
+                ctypes.c_int,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+
+            def callback(n_code, w_param, l_param):
+                message = int(w_param)
+                if n_code >= 0 and message in {0x020A, 0x0202}:  # WM_MOUSEWHEEL, WM_LBUTTONUP
+                    try:
+                        payload = ctypes.cast(
+                            l_param,
+                            ctypes.POINTER(MSLLHOOKSTRUCT),
+                        ).contents
+                        point_hwnd = _window_handle_from_point(
+                            int(payload.pt.x),
+                            int(payload.pt.y),
+                        )
+                        if message == 0x020A:
+                            delta = ctypes.c_short((int(payload.mouseData) >> 16) & 0xFFFF).value
+                            if delta:
+                                self._record(
+                                    delta=delta,
+                                    kind="wheel",
+                                    point_hwnd=point_hwnd,
+                                )
+                        else:
+                            self._record(kind="left_click", point_hwnd=point_hwnd)
+                    except Exception:
+                        pass
+                return user32.CallNextHookEx(
+                    self._hook_handle,
+                    n_code,
+                    w_param,
+                    l_param,
+                )
+
+            self._callback = proc_type(callback)
+            user32.SetWindowsHookExW.restype = hhook_type
+            user32.SetWindowsHookExW.argtypes = [
+                ctypes.c_int,
+                proc_type,
+                hinstance_type,
+                wintypes.DWORD,
+            ]
+            self._hook_handle = int(user32.SetWindowsHookExW(14, self._callback, 0, 0))
+            if not self._hook_handle:
+                return
+
+            msg = wintypes.MSG()
+            while not self._stop.is_set():
+                result = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            if self._hook_handle:
+                try:
+                    ctypes.windll.user32.UnhookWindowsHookEx(self._hook_handle)
+                except Exception:
+                    pass
+            self._hook_handle = 0
+            self._thread_id = 0
 
 
 def _classify_window_candidate(candidate: DetectedGameWindow) -> DetectedGameWindow:
@@ -2483,6 +2724,9 @@ class OcrReaderManager:
         self._last_background_hash = ""
         self._pending_background_hash = ""
         self._pending_background_change_count = 0
+        self._wheel_monitor = _MouseWheelMonitor(time_fn=self._time_fn)
+        self._wheel_monitor.start()
+        self._last_consumed_wheel_seq = 0
         self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
         self._capture_backend_detail = ""
 
@@ -2747,6 +2991,57 @@ class OcrReaderManager:
         self._runtime.foreground_hwnd = max(0, int(foreground_hwnd or 0))
         self._runtime.target_hwnd = max(0, int(target_hwnd or 0))
         return self._runtime.to_dict()
+
+    def consume_foreground_advance_input(self) -> bool:
+        target, _detail = self._foreground_refresh_target()
+        if target is None:
+            target = self._attached_window
+        if target is None and (
+            self._runtime.target_hwnd
+            or self._runtime.pid
+            or self._runtime.effective_process_name
+            or self._runtime.process_name
+        ):
+            target = DetectedGameWindow(
+                hwnd=int(self._runtime.target_hwnd or 0),
+                title=str(self._runtime.effective_window_title or self._runtime.window_title or ""),
+                process_name=str(
+                    self._runtime.effective_process_name
+                    or self._runtime.process_name
+                    or ""
+                ),
+                pid=int(self._runtime.pid or 0),
+                width=int(self._runtime.width or 0),
+                height=int(self._runtime.height or 0),
+            )
+        if target is None:
+            return False
+        events = self._wheel_monitor.events_after(self._last_consumed_wheel_seq)
+        if not events:
+            return False
+        triggered = False
+        max_seq = self._last_consumed_wheel_seq
+        for event in events:
+            max_seq = max(max_seq, int(event.seq or 0))
+            if event.kind == "wheel" and event.delta >= 0:
+                continue
+            if event.kind not in {"wheel", "left_click"}:
+                continue
+            is_target_foreground, _reason = _foreground_matches_target(
+                event.foreground_hwnd,
+                target,
+            )
+            is_target_under_pointer, _point_reason = _foreground_matches_target(
+                event.point_hwnd,
+                target,
+            )
+            if is_target_foreground or is_target_under_pointer:
+                triggered = True
+        self._last_consumed_wheel_seq = max_seq
+        return triggered
+
+    def consume_foreground_wheel_down(self) -> bool:
+        return self.consume_foreground_advance_input()
 
     def _foreground_refresh_target(self) -> tuple[DetectedGameWindow | None, str]:
         windows = list(self._last_detected_windows or [])
@@ -3322,20 +3617,26 @@ class OcrReaderManager:
         *,
         now: float,
         state: _StableOcrTextState | None = None,
+        emit_observed: bool = True,
     ) -> bool:
-        if _looks_like_noise_ocr_text(raw_text) or _looks_like_game_overlay_text(raw_text):
+        cleaned_text = _clean_ocr_dialogue_text(raw_text)
+        if (
+            _looks_like_noise_ocr_text(cleaned_text)
+            or _looks_like_game_overlay_text(cleaned_text)
+            or not _looks_like_ocr_dialogue_text(cleaned_text)
+        ):
             return False
         self._last_raw_ocr_text = str(raw_text or "")
-        if self._writer.emit_line_observed(raw_text, ts=utc_now_iso(now)):
+        if emit_observed and self._writer.emit_line_observed(cleaned_text, ts=utc_now_iso(now)):
             self._last_observed_line = self._line_payload_from_writer(stability="tentative")
         tracker = state or self._default_ocr_state
         if not self._stabilize_text_key(
-            raw_text,
+            cleaned_text,
             state=tracker,
             repeat_threshold=self._line_changed_repeat_threshold(),
         ):
             return False
-        emitted = self._writer.emit_line(raw_text, ts=utc_now_iso(now))
+        emitted = self._writer.emit_line(cleaned_text, ts=utc_now_iso(now))
         if emitted:
             stable_line = self._line_payload_from_writer(stability="stable")
             self._last_stable_line = stable_line
@@ -3472,6 +3773,7 @@ class OcrReaderManager:
         return self._prepare_window_inventory(scanned)
 
     async def shutdown(self) -> None:
+        self._wheel_monitor.stop()
         if self._writer.session_id:
             self._writer.end_session(ts=utc_now_iso(self._time_fn()))
         self._attached_window = None
@@ -3639,6 +3941,10 @@ class OcrReaderManager:
         runtime_profile = profile
         runtime_capture_profile_selection = capture_profile_selection
         event_seq_before_capture = int(self._writer.last_seq or 0)
+        emit_observed_lines = (
+            str(self._config.ocr_reader_trigger_mode or "").strip().lower()
+            != OCR_TRIGGER_MODE_AFTER_ADVANCE
+        )
         capture_attempted = False
         capture_completed = False
         capture_error = False
@@ -3726,6 +4032,7 @@ class OcrReaderManager:
                                     now=now,
                                     state=self._default_ocr_state,
                                     allow_choices=False,
+                                    emit_observed=emit_observed_lines,
                                 )
                             )
                         if (
@@ -3774,6 +4081,7 @@ class OcrReaderManager:
                                         now=followup_now,
                                         state=self._default_ocr_state,
                                         allow_choices=False,
+                                        emit_observed=emit_observed_lines,
                                     )
                                 )
                                 if dialogue_emitted:
@@ -3864,7 +4172,13 @@ class OcrReaderManager:
                                     elif menu_result.has_menu_candidate:
                                         self._aihong_stage = _AIHONG_MENU_STAGE
                 else:
-                    emitted = bool(self._consume_ocr_text(extraction.text, now=now))
+                    emitted = bool(
+                        self._consume_ocr_text(
+                            extraction.text,
+                            now=now,
+                            emit_observed=emit_observed_lines,
+                        )
+                    )
                     if (
                         not emitted
                         and self._should_attempt_followup_confirm(
@@ -3904,7 +4218,11 @@ class OcrReaderManager:
                         else:
                             followup_now = self._time_fn()
                             emitted = bool(
-                                self._consume_ocr_text(followup_extraction.text, now=followup_now)
+                                self._consume_ocr_text(
+                                    followup_extraction.text,
+                                    now=followup_now,
+                                    emit_observed=emit_observed_lines,
+                                )
                             )
                             if emitted:
                                 now = followup_now
@@ -3919,6 +4237,7 @@ class OcrReaderManager:
         observed_or_stable_emitted = int(self._writer.last_seq or 0) > event_seq_before_capture
 
         if emitted:
+            result.stable_event_emitted = True
             result.should_rescan = True
             self._mark_observed_progress(now=now)
             self._last_heartbeat_at = now
@@ -4561,6 +4880,7 @@ class OcrReaderManager:
         state: _StableOcrTextState | None = None,
         allow_choices: bool = True,
         allow_plain_text_choices: bool = False,
+        emit_observed: bool = True,
     ) -> bool:
         tracker = state or self._default_ocr_state
         lines = _stripped_ocr_lines(raw_text)
@@ -4568,7 +4888,12 @@ class OcrReaderManager:
             choices = _coerce_choice_lines(lines, allow_plain_text=allow_plain_text_choices)
             if choices:
                 return self._emit_choices_from_candidates(choices, now=now, state=tracker)
-        return self._emit_line_from_ocr_text(raw_text, now=now, state=tracker)
+        return self._emit_line_from_ocr_text(
+            raw_text,
+            now=now,
+            state=tracker,
+            emit_observed=emit_observed,
+        )
 
     async def _end_session_if_needed(self, now: float) -> None:
         if self._writer.session_id:

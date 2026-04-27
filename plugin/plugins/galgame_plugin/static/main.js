@@ -131,10 +131,18 @@ const FIELD_LABELS_ZH = {
   last_seq: '最新序号',
   stream_reset_pending: '等待重置流',
   available_game_ids: '可用游戏 ID',
+  performance_cpu_percent: '插件 CPU',
+  performance_memory_mb: '插件内存',
+  performance_memory_percent: '插件内存占比',
+  performance_thread_count: '插件线程数',
+  performance_process: '插件进程',
+  performance_detail: '性能指标状态',
   ocr_reader_enabled: 'OCR Reader 已启用',
   ocr_reader_status: 'OCR Reader 状态',
   ocr_reader_detail: 'OCR Reader 详情',
   ocr_reader_target: 'OCR Reader 目标',
+  ocr_poll_interval_seconds: 'OCR 识别间隔',
+  ocr_trigger_mode: 'OCR 触发方式',
   ocr_backend_selection: 'OCR 后端选择',
   ocr_capture_backend_selection: '截图后端选择',
   ocr_backend_kind: 'OCR 后端类型',
@@ -530,6 +538,12 @@ function buildOcrMissingLineDiagnostic(status = {}) {
   if (typeof status.last_bridge_poll_duration_seconds === 'number') {
     parts.push(`last_poll_duration=${status.last_bridge_poll_duration_seconds.toFixed(1)}s`);
   }
+  if (typeof status.pending_ocr_advance_captures === 'number' && status.pending_ocr_advance_captures > 0) {
+    parts.push(`pending_ocr=${status.pending_ocr_advance_captures}`);
+  }
+  if (status.last_ocr_advance_capture_reason) {
+    parts.push(`ocr_reason=${status.last_ocr_advance_capture_reason}`);
+  }
   if (status.last_error?.message) {
     parts.push(`last_error=${status.last_error.message}`);
   }
@@ -559,6 +573,15 @@ function buildOcrMissingLineDiagnostic(status = {}) {
 
 function normalizeLineText(value = '') {
   return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function formatOcrTriggerMode(value = '') {
+  return value === 'after_advance' ? '点击对白后识别' : '按间隔识别';
+}
+
+function formatFixedNumber(value, digits = 1) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : '0.0';
 }
 
 function isLikelyGameDialogueLine(item = {}) {
@@ -613,10 +636,13 @@ function isLikelyGameDialogueLine(item = {}) {
   if (text.startsWith('{') || text.startsWith('[') || (text.includes('{') && text.includes('}'))) {
     return false;
   }
-  const hasCjkOrKana = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(text);
-  const hasDialoguePunctuation = /[。！？!?…，,、：:]/.test(text);
+  const hasDialoguePunctuation = /[。！？!?…]|——|「|」|『|』|“|”/.test(text);
+  const hasWeakDialoguePunctuation = /[，,、：:]/.test(text);
   const hasSpeaker = Boolean(String(item.speaker || '').trim());
-  return hasCjkOrKana || hasDialoguePunctuation || hasSpeaker;
+  if (hasSpeaker || hasDialoguePunctuation) {
+    return true;
+  }
+  return hasWeakDialoguePunctuation && text.replace(/\s+/g, '').length >= 8;
 }
 
 function lineKey(item = {}) {
@@ -1440,6 +1466,10 @@ function renderStatus(status) {
     const interval = Number(status.ocr_reader_poll_interval_seconds || 2);
     ocrPollIntervalInput.value = Number.isFinite(interval) ? interval.toFixed(1) : '2.0';
   }
+  const ocrTriggerModeSelect = document.getElementById('ocrTriggerModeSelect');
+  if (ocrTriggerModeSelect) {
+    ocrTriggerModeSelect.value = status.ocr_reader_trigger_mode || 'after_advance';
+  }
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
@@ -1447,6 +1477,7 @@ function renderStatus(status) {
   const dxcam = status.dxcam || {};
   const textractor = status.textractor || {};
   const tesseract = status.tesseract || {};
+  const performance = status.performance || {};
 
   const memoryReaderProcess = memoryReaderRuntime.process_name
     ? `${memoryReaderRuntime.process_name} (${memoryReaderRuntime.pid || 0})`
@@ -1455,6 +1486,9 @@ function renderStatus(status) {
     ? `${ocrRuntime.process_name} (${ocrRuntime.pid || 0})`
     : '';
   const missingLanguages = (tesseract.missing_languages || []).join(', ');
+  const performanceProcess = performance.process_name
+    ? `${performance.process_name} (${performance.pid || 0})`
+    : String(performance.pid || '');
 
   renderGrid('statusGrid', [
     { label: 'connection_state', value: status.connection_state || '' },
@@ -1481,8 +1515,21 @@ function renderStatus(status) {
     { label: 'last_seq', value: String(status.last_seq || 0) },
     { label: 'stream_reset_pending', value: String(Boolean(status.stream_reset_pending)) },
     { label: 'available_game_ids', value: (status.available_game_ids || []).join(', ') || '(none)' },
+    { label: 'performance_cpu_percent', value: `${formatFixedNumber(performance.cpu_percent, 1)}%` },
+    { label: 'performance_memory_mb', value: `${formatFixedNumber(performance.memory_mb, 1)} MB` },
+    { label: 'performance_memory_percent', value: `${formatFixedNumber(performance.memory_percent, 2)}%` },
+    { label: 'performance_thread_count', value: String(performance.thread_count || 0) },
+    { label: 'performance_process', value: performanceProcess || '' },
+    { label: 'performance_detail', value: performance.detail || '' },
     { label: 'ocr_reader_enabled', value: String(Boolean(status.ocr_reader_enabled)) },
     { label: 'ocr_poll_interval_seconds', value: String(status.ocr_reader_poll_interval_seconds || '') },
+    { label: 'ocr_trigger_mode', value: formatOcrTriggerMode(status.ocr_reader_trigger_mode || 'after_advance') },
+    { label: 'pending_ocr_advance_captures', value: String(status.pending_ocr_advance_captures || 0) },
+    {
+      label: 'pending_ocr_advance_capture_age_seconds',
+      value: formatFixedNumber(status.pending_ocr_advance_capture_age_seconds, 1),
+    },
+    { label: 'last_ocr_advance_capture_reason', value: status.last_ocr_advance_capture_reason || '' },
     { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
     { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
     { label: 'ocr_context_state', value: ocrRuntime.ocr_context_state || '' },
@@ -2965,8 +3012,13 @@ async function saveMode() {
   const advanceSpeed = document.getElementById('advanceSpeedSelect').value || 'medium';
   const ocrPollIntervalRaw = document.getElementById('ocrPollIntervalInput')?.value || '';
   const ocrPollInterval = Number(ocrPollIntervalRaw || 2);
+  const ocrTriggerMode = document.getElementById('ocrTriggerModeSelect')?.value || 'after_advance';
   if (!Number.isFinite(ocrPollInterval) || ocrPollInterval < 0.5 || ocrPollInterval > 10) {
     setFlash('OCR/DXcam 识别间隔必须在 0.5 到 10 秒之间。', 'error');
+    return;
+  }
+  if (!['interval', 'after_advance'].includes(ocrTriggerMode)) {
+    setFlash('OCR 触发方式无效。', 'error');
     return;
   }
   try {
@@ -2978,6 +3030,7 @@ async function saveMode() {
     });
     await callPlugin('galgame_set_ocr_timing', {
       poll_interval_seconds: ocrPollInterval,
+      trigger_mode: ocrTriggerMode,
     });
     setFlash('设置已保存', 'success');
     await refreshAll({ preserveFlash: true, forceInsights: true });
@@ -3224,6 +3277,11 @@ function switchInstallTab(tab) {
 async function initialize() {
   initializePanelFullscreenControls();
   switchInstallTab(activeInstallTab);
+  try {
+    localStorage.removeItem(`${PLUGIN_ID}:last_ui_state:v1`);
+  } catch (error) {
+    console.warn('[galgame_plugin ui] clear cached state failed', error);
+  }
   renderInsightsPending('等待首轮状态刷新；解释、总结和选项建议会在后台更新。');
   setFlash('正在加载插件状态...', 'info');
   const loaded = await refreshAll({ forceInsights: false, showInsightPending: true });

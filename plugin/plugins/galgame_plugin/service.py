@@ -3,8 +3,15 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
 
 from .models import (
     DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
@@ -19,6 +26,9 @@ from .models import (
     MODE_COMPANION,
     MODES,
     MODE_SILENT,
+    OCR_TRIGGER_MODE_INTERVAL,
+    OCR_TRIGGER_MODE_AFTER_ADVANCE,
+    OCR_TRIGGER_MODES,
     STATE_ACTIVE,
     STATE_DISCONNECTED,
     STATE_ERROR,
@@ -47,6 +57,64 @@ from .textractor_support import (
     inspect_textractor_installation,
 )
 
+_PERFORMANCE_PROCESS = None
+
+
+def _current_process_performance() -> dict[str, Any]:
+    if psutil is None:
+        return {
+            "available": False,
+            "detail": "psutil_unavailable",
+            "pid": os.getpid(),
+            "process_name": "",
+            "cpu_percent": 0.0,
+            "memory_mb": 0.0,
+            "memory_percent": 0.0,
+            "thread_count": threading.active_count(),
+            "sampled_at": time.time(),
+        }
+
+    global _PERFORMANCE_PROCESS
+    try:
+        if _PERFORMANCE_PROCESS is None:
+            _PERFORMANCE_PROCESS = psutil.Process(os.getpid())
+            try:
+                _PERFORMANCE_PROCESS.cpu_percent(interval=None)
+            except Exception:
+                pass
+        process = _PERFORMANCE_PROCESS
+        with process.oneshot():
+            memory_info = process.memory_info()
+            try:
+                process_name = str(process.name() or "")
+            except Exception:
+                process_name = ""
+            return {
+                "available": True,
+                "detail": "ok",
+                "pid": int(process.pid),
+                "process_name": process_name,
+                "cpu_percent": round(float(process.cpu_percent(interval=None)), 2),
+                "memory_mb": round(float(memory_info.rss) / (1024 * 1024), 2),
+                "memory_percent": round(float(process.memory_percent()), 2),
+                "thread_count": int(process.num_threads()),
+                "sampled_at": time.time(),
+            }
+    except Exception as exc:
+        _PERFORMANCE_PROCESS = None
+        return {
+            "available": False,
+            "detail": f"metrics_failed: {exc}",
+            "pid": os.getpid(),
+            "process_name": "",
+            "cpu_percent": 0.0,
+            "memory_mb": 0.0,
+            "memory_percent": 0.0,
+            "thread_count": threading.active_count(),
+            "sampled_at": time.time(),
+        }
+
+
 _OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
     ".agent",
     ".codex",
@@ -68,8 +136,8 @@ _OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
     "ocr 目标窗口",
     "截图校准",
 )
-_CJK_OR_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
-_DIALOGUE_PUNCTUATION_RE = re.compile(r"[。！？!?…，,、：:]")
+_DIALOGUE_PUNCTUATION_RE = re.compile(r"[。！？!?…]|——|「|」|『|』|“|”")
+_DIALOGUE_WEAK_PUNCTUATION_RE = re.compile(r"[，,、：:]")
 _NON_DIALOGUE_CONTEXT_TOKENS = (
     "agent",
     "capture_failed",
@@ -134,10 +202,14 @@ def _looks_like_game_dialogue_context_line(line: dict[str, Any]) -> bool:
     significant_chars = _significant_char_count(text)
     if significant_chars < 2 or significant_chars > 220:
         return False
-    has_cjk_or_kana = bool(_CJK_OR_KANA_RE.search(text))
     has_dialogue_punctuation = bool(_DIALOGUE_PUNCTUATION_RE.search(text))
+    has_weak_dialogue_punctuation = bool(_DIALOGUE_WEAK_PUNCTUATION_RE.search(text))
     has_speaker = bool(str(line.get("speaker") or "").strip())
-    return has_cjk_or_kana or has_dialogue_punctuation or has_speaker
+    if has_speaker:
+        return True
+    if has_dialogue_punctuation:
+        return True
+    return has_weak_dialogue_punctuation and significant_chars >= 8
 
 
 def _payload_is_game_dialogue_line(payload_obj: dict[str, Any], *, ts: str = "") -> bool:
@@ -182,6 +254,13 @@ def _coerce_ocr_backend_selection(value: object, default: str = "auto") -> str:
 def _coerce_ocr_capture_backend(value: object, default: str = "auto") -> str:
     normalized = str(value or default).strip().lower()
     if normalized in {"auto", "dxcam", "imagegrab", "printwindow"}:
+        return normalized
+    return default
+
+
+def _coerce_ocr_trigger_mode(value: object, default: str = OCR_TRIGGER_MODE_AFTER_ADVANCE) -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized in OCR_TRIGGER_MODES:
         return normalized
     return default
 
@@ -315,6 +394,9 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ),
         ocr_reader_poll_interval_seconds=_coerce_float(
             ocr_reader_obj.get("poll_interval_seconds"), 2.0, minimum=0.1
+        ),
+        ocr_reader_trigger_mode=_coerce_ocr_trigger_mode(
+            ocr_reader_obj.get("trigger_mode"),
         ),
         ocr_reader_no_text_takeover_after_seconds=_coerce_float(
             ocr_reader_obj.get("no_text_takeover_after_seconds"), 30.0, minimum=0.0
@@ -938,6 +1020,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "stream_reset_pending": state.stream_reset_pending,
         "last_seq": state.last_seq,
         "last_error": json_copy(state.last_error),
+        "performance": _current_process_performance(),
         "memory_reader_runtime": json_copy(state.memory_reader_runtime),
         "ocr_reader_runtime": ocr_runtime,
         "effective_current_line": json_copy(effective_current_line or {}),
@@ -959,6 +1042,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "ocr_backend_selection": config.ocr_reader_backend_selection,
         "ocr_capture_backend_selection": config.ocr_reader_capture_backend,
         "ocr_reader_poll_interval_seconds": config.ocr_reader_poll_interval_seconds,
+        "ocr_reader_trigger_mode": config.ocr_reader_trigger_mode,
         "rapidocr_enabled": config.rapidocr_enabled,
         "dxcam": dxcam,
         "rapidocr": rapidocr,

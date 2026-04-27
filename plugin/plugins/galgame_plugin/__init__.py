@@ -41,6 +41,9 @@ from .models import (
     OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
     OCR_CAPTURE_PROFILE_STAGES,
     OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
+    OCR_TRIGGER_MODE_AFTER_ADVANCE,
+    OCR_TRIGGER_MODE_INTERVAL,
+    OCR_TRIGGER_MODES,
     parse_ocr_capture_profile_bucket_key,
     STATE_ACTIVE,
     STATE_ERROR,
@@ -107,6 +110,9 @@ _PLUGIN_TOML_PATH = Path(__file__).with_name("plugin.toml")
 _OCR_BACKEND_SELECTIONS = {"auto", "rapidocr", "tesseract"}
 _OCR_CAPTURE_BACKEND_SELECTIONS = {"auto", "dxcam", "imagegrab", "printwindow"}
 _BACKGROUND_BRIDGE_POLL_MIN_STALE_SECONDS = 45.0
+_OCR_AFTER_ADVANCE_CAPTURE_DELAY_SECONDS = 0.25
+_OCR_AFTER_ADVANCE_SETTLE_POLL_SECONDS = 0.15
+_OCR_AFTER_ADVANCE_MAX_SETTLE_SECONDS = 1.6
 
 
 def _replace_toml_section_value(text: str, *, section: str, key: str, value: str) -> str:
@@ -148,6 +154,13 @@ def _replace_toml_section_number_value(
             lines[index] = f"{prefix}{replacement}"
             return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
     raise ValueError(f"plugin.toml missing [{section}].{key}")
+
+
+def _normalize_ocr_trigger_mode(value: str | None) -> str:
+    normalized = str(value or OCR_TRIGGER_MODE_AFTER_ADVANCE).strip().lower()
+    if normalized not in OCR_TRIGGER_MODES:
+        raise ValueError(f"invalid OCR trigger_mode: {value!r}")
+    return normalized
 
 
 def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
@@ -321,6 +334,48 @@ class GalgamePlugin(NekoPluginBase):
         self._last_bridge_poll_launch_at = 0.0
         self._bridge_poll_launch_count = 0
         self._last_agent_tick_at = 0.0
+        self._pending_ocr_advance_captures = 0
+        self._last_ocr_advance_capture_requested_at = 0.0
+        self._last_ocr_advance_capture_reason = ""
+
+    def request_ocr_after_advance_capture(self, *, reason: str = "agent_advance") -> None:
+        with self._state_lock:
+            self._pending_ocr_advance_captures = min(
+                self._pending_ocr_advance_captures + 1,
+                8,
+            )
+            self._last_ocr_advance_capture_requested_at = time.monotonic()
+            self._last_ocr_advance_capture_reason = str(reason or "agent_advance")
+            self._state.next_poll_at_monotonic = 0.0
+        self._start_background_bridge_poll()
+
+    def _has_pending_ocr_advance_capture(self) -> bool:
+        with self._state_lock:
+            return self._pending_ocr_advance_captures > 0
+
+    def _pending_ocr_advance_capture_delay_remaining(self) -> float:
+        with self._state_lock:
+            if self._pending_ocr_advance_captures <= 0:
+                return 0.0
+            requested_at = float(self._last_ocr_advance_capture_requested_at or 0.0)
+        if requested_at <= 0.0:
+            return 0.0
+        elapsed = max(0.0, time.monotonic() - requested_at)
+        return max(0.0, _OCR_AFTER_ADVANCE_CAPTURE_DELAY_SECONDS - elapsed)
+
+    def _pending_ocr_advance_capture_age(self) -> float:
+        with self._state_lock:
+            if self._pending_ocr_advance_captures <= 0:
+                return 0.0
+            requested_at = float(self._last_ocr_advance_capture_requested_at or 0.0)
+        if requested_at <= 0.0:
+            return 0.0
+        return max(0.0, time.monotonic() - requested_at)
+
+    def _consume_ocr_advance_capture(self) -> None:
+        with self._state_lock:
+            if self._pending_ocr_advance_captures > 0:
+                self._pending_ocr_advance_captures -= 1
 
     def _snapshot_state(self) -> dict[str, Any]:
         with self._state_lock:
@@ -573,7 +628,20 @@ class GalgamePlugin(NekoPluginBase):
         )
         with self._state_lock:
             next_poll_at = float(self._state.next_poll_at_monotonic or 0.0)
+            pending_ocr_advance_captures = int(self._pending_ocr_advance_captures or 0)
+            last_ocr_advance_capture_requested_at = float(
+                self._last_ocr_advance_capture_requested_at or 0.0
+            )
+            last_ocr_advance_capture_reason = str(
+                self._last_ocr_advance_capture_reason or ""
+            )
         next_poll_in_seconds = max(0.0, next_poll_at - now) if next_poll_at > 0.0 else 0.0
+        pending_ocr_advance_capture_age_seconds = (
+            max(0.0, now - last_ocr_advance_capture_requested_at)
+            if pending_ocr_advance_captures > 0
+            and last_ocr_advance_capture_requested_at > 0.0
+            else 0.0
+        )
         return {
             "bridge_poll_running": poll_running,
             "bridge_poll_inflight_seconds": inflight_seconds,
@@ -582,6 +650,9 @@ class GalgamePlugin(NekoPluginBase):
             "last_agent_tick_at": self._last_agent_tick_at,
             "last_bridge_poll_launch_at": self._last_bridge_poll_launch_at,
             "bridge_poll_launch_count": self._bridge_poll_launch_count,
+            "pending_ocr_advance_captures": pending_ocr_advance_captures,
+            "pending_ocr_advance_capture_age_seconds": pending_ocr_advance_capture_age_seconds,
+            "last_ocr_advance_capture_reason": last_ocr_advance_capture_reason,
         }
 
     def _clear_completed_background_bridge_poll(self) -> None:
@@ -739,7 +810,14 @@ class GalgamePlugin(NekoPluginBase):
         started_at = self._bridge_poll_started_at or time.monotonic()
         self._bridge_poll_started_at = started_at
         try:
-            await self._poll_bridge(force=False)
+            while not self._bridge_poll_thread_stop.is_set():
+                await self._poll_bridge(force=False)
+                if not self._has_pending_ocr_advance_capture():
+                    break
+                delay = self._pending_ocr_advance_capture_delay_remaining()
+                if delay <= 0.0:
+                    delay = _OCR_AFTER_ADVANCE_SETTLE_POLL_SECONDS
+                await asyncio.sleep(min(delay, _OCR_AFTER_ADVANCE_SETTLE_POLL_SECONDS))
         except Exception as exc:
             with self._state_lock:
                 self._state.next_poll_at_monotonic = 0.0
@@ -808,13 +886,24 @@ class GalgamePlugin(NekoPluginBase):
             )
         _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
 
-    def _persist_ocr_timing(self, *, poll_interval_seconds: float) -> None:
+    def _persist_ocr_timing(
+        self,
+        *,
+        poll_interval_seconds: float,
+        trigger_mode: str,
+    ) -> None:
         text = _PLUGIN_TOML_PATH.read_text(encoding="utf-8")
         text = _replace_toml_section_number_value(
             text,
             section="ocr_reader",
             key="poll_interval_seconds",
             value=poll_interval_seconds,
+        )
+        text = _replace_toml_section_value(
+            text,
+            section="ocr_reader",
+            key="trigger_mode",
+            value=trigger_mode,
         )
         _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
 
@@ -1124,6 +1213,7 @@ class GalgamePlugin(NekoPluginBase):
     async def bridge_tick(self, **_):
         self._clear_completed_background_bridge_poll()
         self._refresh_ocr_foreground_state()
+        self._trigger_ocr_for_manual_foreground_advance()
         if self._game_agent is not None:
             self._last_agent_tick_at = time.monotonic()
             try:
@@ -1159,6 +1249,28 @@ class GalgamePlugin(NekoPluginBase):
             return
         with self._state_lock:
             self._state.ocr_reader_runtime = json_copy(runtime)
+
+    def _trigger_ocr_for_manual_foreground_advance(self) -> None:
+        if self._cfg is None or self._ocr_reader_manager is None:
+            return
+        if self._cfg.ocr_reader_trigger_mode != OCR_TRIGGER_MODE_AFTER_ADVANCE:
+            return
+        consume = getattr(self._ocr_reader_manager, "consume_foreground_advance_input", None)
+        if not callable(consume):
+            return
+        try:
+            should_capture = bool(consume())
+        except Exception as exc:
+            self._record_error(
+                make_error(
+                    f"ocr_reader foreground advance monitor failed: {exc}",
+                    source="ocr_reader",
+                    kind="warning",
+                )
+            )
+            return
+        if should_capture:
+            self.request_ocr_after_advance_capture(reason="manual_foreground_advance")
 
     async def _poll_bridge(self, *, force: bool) -> None:
         if self._cfg is None:
@@ -1245,7 +1357,49 @@ class GalgamePlugin(NekoPluginBase):
             except Exception as exc:
                 warnings.append(f"memory_reader tick failed: {exc}")
 
-        if self._ocr_reader_manager is not None:
+        ocr_trigger_mode = str(
+            getattr(self._cfg, "ocr_reader_trigger_mode", OCR_TRIGGER_MODE_AFTER_ADVANCE)
+            or OCR_TRIGGER_MODE_AFTER_ADVANCE
+        )
+        pending_ocr_advance_capture = self._has_pending_ocr_advance_capture()
+        pending_ocr_delay_remaining = (
+            self._pending_ocr_advance_capture_delay_remaining()
+            if pending_ocr_advance_capture and not force
+            else 0.0
+        )
+        if (
+            self._ocr_reader_manager is not None
+            and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+            and pending_ocr_delay_remaining <= 0.0
+        ):
+            was_foreground = bool(ocr_reader_runtime.get("target_is_foreground"))
+            refresh_foreground_state = getattr(
+                self._ocr_reader_manager,
+                "refresh_foreground_state",
+                None,
+            )
+            if callable(refresh_foreground_state):
+                try:
+                    refreshed_runtime = await asyncio.to_thread(refresh_foreground_state)
+                    if isinstance(refreshed_runtime, dict):
+                        ocr_reader_runtime = json_copy(refreshed_runtime)
+                        if (
+                            not was_foreground
+                            and bool(ocr_reader_runtime.get("target_is_foreground"))
+                        ):
+                            pending_ocr_advance_capture = True
+                            pending_ocr_delay_remaining = 0.0
+                except Exception as exc:
+                    warnings.append(f"ocr_reader foreground refresh failed: {exc}")
+        ocr_tick_allowed = (
+            ocr_trigger_mode == OCR_TRIGGER_MODE_INTERVAL
+            or force
+            or (pending_ocr_advance_capture and pending_ocr_delay_remaining <= 0.0)
+            or str(ocr_reader_runtime.get("status") or "") not in {"active"}
+            or str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
+        )
+
+        if self._ocr_reader_manager is not None and ocr_tick_allowed:
             self._ocr_reader_manager.update_config(self._cfg)
             update_advance_speed = getattr(
                 self._ocr_reader_manager,
@@ -1277,6 +1431,20 @@ class GalgamePlugin(NekoPluginBase):
                         warnings.append(f"persist OCR window target failed: {exc}")
             except Exception as exc:
                 warnings.append(f"ocr_reader tick failed: {exc}")
+            finally:
+                pending_capture_settled = bool(
+                    "ocr_reader_tick" in locals()
+                    and getattr(ocr_reader_tick, "stable_event_emitted", False)
+                )
+                pending_capture_expired = (
+                    self._pending_ocr_advance_capture_age()
+                    >= _OCR_AFTER_ADVANCE_MAX_SETTLE_SECONDS
+                )
+                if (
+                    pending_ocr_advance_capture
+                    and (force or pending_capture_settled or pending_capture_expired)
+                ):
+                    self._consume_ocr_advance_capture()
 
         local["memory_reader_runtime"] = memory_reader_runtime
         local["ocr_reader_runtime"] = ocr_reader_runtime
@@ -1473,10 +1641,25 @@ class GalgamePlugin(NekoPluginBase):
         )
         if (
             self._cfg.ocr_reader_enabled
+            and ocr_trigger_mode == OCR_TRIGGER_MODE_INTERVAL
             and str(ocr_reader_runtime.get("status") or "") in {"starting", "active"}
             and str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
         ):
             interval = min(interval, float(self._cfg.ocr_reader_poll_interval_seconds))
+        elif (
+            self._cfg.ocr_reader_enabled
+            and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+            and str(ocr_reader_runtime.get("status") or "") == "starting"
+        ):
+            interval = min(interval, float(self._cfg.ocr_reader_poll_interval_seconds))
+        if self._has_pending_ocr_advance_capture():
+            next_pending_delay = self._pending_ocr_advance_capture_delay_remaining()
+            interval = min(
+                interval,
+                next_pending_delay
+                if next_pending_delay > 0.0
+                else _OCR_AFTER_ADVANCE_SETTLE_POLL_SECONDS,
+            )
         local["next_poll_at_monotonic"] = now_monotonic + interval
         self._commit_state(local)
 
@@ -1861,8 +2044,8 @@ class GalgamePlugin(NekoPluginBase):
 
     @plugin_entry(
         id="galgame_set_ocr_timing",
-        name="设置 OCR 识别间隔",
-        description="设置 OCR Reader 轮询间隔；DXcam 截图后端会随 OCR 轮询一起触发。",
+        name="设置 OCR 识别时机",
+        description="设置 OCR Reader 触发模式与轮询间隔；DXcam 截图后端会随 OCR 触发。",
         input_schema={
             "type": "object",
             "properties": {
@@ -1870,6 +2053,11 @@ class GalgamePlugin(NekoPluginBase):
                     "type": "number",
                     "minimum": 0.5,
                     "maximum": 10.0,
+                },
+                "trigger_mode": {
+                    "type": "string",
+                    "enum": ["interval", "after_advance"],
+                    "default": "after_advance",
                 },
             },
             "required": ["poll_interval_seconds"],
@@ -1879,6 +2067,7 @@ class GalgamePlugin(NekoPluginBase):
     async def galgame_set_ocr_timing(
         self,
         poll_interval_seconds: float,
+        trigger_mode: str | None = None,
         **_,
     ):
         if self._cfg is None:
@@ -1889,23 +2078,36 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError("poll_interval_seconds must be a number"))
         if normalized_interval < 0.5 or normalized_interval > 10.0:
             return Err(SdkError("poll_interval_seconds must be between 0.5 and 10.0"))
+        try:
+            normalized_trigger_mode = _normalize_ocr_trigger_mode(
+                trigger_mode or self._cfg.ocr_reader_trigger_mode
+            )
+        except ValueError as exc:
+            return Err(SdkError(str(exc)))
 
         old_interval = self._cfg.ocr_reader_poll_interval_seconds
+        old_trigger_mode = self._cfg.ocr_reader_trigger_mode
         self._cfg.ocr_reader_poll_interval_seconds = normalized_interval
+        self._cfg.ocr_reader_trigger_mode = normalized_trigger_mode
         if self._ocr_reader_manager is not None:
             try:
                 self._ocr_reader_manager.update_config(self._cfg)
             except Exception as exc:
                 self._cfg.ocr_reader_poll_interval_seconds = old_interval
+                self._cfg.ocr_reader_trigger_mode = old_trigger_mode
                 return Err(SdkError(f"apply OCR timing failed: {exc}"))
 
         with self._state_lock:
             self._state.next_poll_at_monotonic = 0.0
 
         try:
-            self._persist_ocr_timing(poll_interval_seconds=normalized_interval)
+            self._persist_ocr_timing(
+                poll_interval_seconds=normalized_interval,
+                trigger_mode=normalized_trigger_mode,
+            )
         except Exception as exc:
             self._cfg.ocr_reader_poll_interval_seconds = old_interval
+            self._cfg.ocr_reader_trigger_mode = old_trigger_mode
             if self._ocr_reader_manager is not None:
                 try:
                     self._ocr_reader_manager.update_config(self._cfg)
@@ -1914,10 +2116,16 @@ class GalgamePlugin(NekoPluginBase):
             return Err(SdkError(f"persist OCR timing failed: {exc}"))
 
         self._start_background_bridge_poll()
+        trigger_mode_label = (
+            "点击对白后识别"
+            if self._cfg.ocr_reader_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+            else "按间隔识别"
+        )
         payload = {
             "poll_interval_seconds": self._cfg.ocr_reader_poll_interval_seconds,
+            "trigger_mode": self._cfg.ocr_reader_trigger_mode,
             "summary": (
-                "OCR/DXcam 识别间隔="
+                f"OCR/DXcam {trigger_mode_label}；间隔="
                 f"{self._cfg.ocr_reader_poll_interval_seconds:.1f}s"
             ),
         }

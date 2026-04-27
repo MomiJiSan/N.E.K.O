@@ -668,6 +668,25 @@ class GameLLMAgent:
             virtual_mouse_candidate_index=virtual_mouse_candidate_index,
         )
 
+    def _notify_ocr_after_advance_capture(
+        self,
+        shared: dict[str, Any],
+        *,
+        kind: str,
+        strategy_id: str,
+    ) -> None:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return
+        if kind not in {"advance", "probe"}:
+            return
+        requester = getattr(self._plugin, "request_ocr_after_advance_capture", None)
+        if not callable(requester):
+            return
+        try:
+            requester(reason=f"{kind}:{strategy_id or 'none'}")
+        except Exception as exc:
+            self._trace_runtime(f"notify OCR after-advance capture failed: {exc}")
+
     async def _start_actuation(
         self,
         shared: dict[str, Any],
@@ -727,6 +746,11 @@ class GameLLMAgent:
                     shared, actuation=actuation
                 )
                 self._actuation = actuation
+                self._notify_ocr_after_advance_capture(
+                    shared,
+                    kind=kind,
+                    strategy_id=strategy_id,
+                )
                 return
             self._trace_runtime(
                 "actuation preferred local input failed, falling back to computer_use: "
@@ -770,6 +794,11 @@ class GameLLMAgent:
                     shared, actuation=actuation
                 )
                 self._actuation = actuation
+                self._notify_ocr_after_advance_capture(
+                    shared,
+                    kind=kind,
+                    strategy_id=strategy_id,
+                )
                 return
             self._trace_runtime(
                 "actuation quota bypass local fallback failed: "
@@ -832,6 +861,11 @@ class GameLLMAgent:
             retry_reason=retry_reason,
             virtual_mouse_target_id=virtual_mouse_target_id,
             virtual_mouse_candidate_index=virtual_mouse_candidate_index,
+        )
+        self._notify_ocr_after_advance_capture(
+            shared,
+            kind=kind,
+            strategy_id=strategy_id,
         )
 
     def _build_actuation_state(

@@ -146,6 +146,7 @@ async def main() -> None:
         ocr_reader_install_target_dir="",
         ocr_reader_install_timeout_seconds=60.0,
         ocr_reader_poll_interval_seconds=2.0,
+        ocr_reader_trigger_mode="after_advance",
         ocr_reader_no_text_takeover_after_seconds=30.0,
         ocr_reader_languages="chi_sim+jpn+eng",
         ocr_reader_left_inset_ratio=DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO,

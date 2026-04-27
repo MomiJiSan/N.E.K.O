@@ -28,6 +28,10 @@ DATA_SOURCES = frozenset(
     }
 )
 
+OCR_TRIGGER_MODE_INTERVAL = "interval"
+OCR_TRIGGER_MODE_AFTER_ADVANCE = "after_advance"
+OCR_TRIGGER_MODES = frozenset({OCR_TRIGGER_MODE_INTERVAL, OCR_TRIGGER_MODE_AFTER_ADVANCE})
+
 DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO = 0.05
 DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO = 0.05
 DEFAULT_OCR_CAPTURE_TOP_RATIO = 0.62
@@ -339,6 +343,7 @@ class GalgameConfig:
     ocr_reader_install_target_dir: str
     ocr_reader_install_timeout_seconds: float
     ocr_reader_poll_interval_seconds: float
+    ocr_reader_trigger_mode: str
     ocr_reader_no_text_takeover_after_seconds: float
     ocr_reader_languages: str
     ocr_reader_left_inset_ratio: float

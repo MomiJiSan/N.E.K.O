@@ -82,6 +82,7 @@ install_manifest_url = ""
 install_target_dir = ""
 install_timeout_seconds = 60
 poll_interval_seconds = 2
+trigger_mode = "after_advance"
 no_text_takeover_after_seconds = 30
 languages = "chi_sim+jpn+eng"
 left_inset_ratio = 0.05
