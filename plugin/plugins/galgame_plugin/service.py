@@ -601,8 +601,6 @@ def choose_candidate(
             for item in candidates.values()
             if item.data_source == DATA_SOURCE_MEMORY_READER and _candidate_has_text(item)
         ]
-    if not preferred_candidates and normalized_reader_mode in {READER_MODE_MEMORY, READER_MODE_OCR}:
-        return None
     if not preferred_candidates and normalized_reader_mode != READER_MODE_MEMORY:
         preferred_candidates = [
             item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER

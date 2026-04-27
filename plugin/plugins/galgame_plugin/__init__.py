@@ -188,6 +188,27 @@ def _session_candidate_has_text(candidate: Any) -> bool:
     return isinstance(choices, list) and bool(choices)
 
 
+def _pending_data_source_for_reader_mode(
+    reader_mode: str,
+    *,
+    memory_reader_allowed: bool,
+    ocr_reader_allowed: bool,
+    memory_reader_candidate_available: bool,
+) -> str:
+    if reader_mode == READER_MODE_MEMORY:
+        return DATA_SOURCE_MEMORY_READER
+    if reader_mode == READER_MODE_OCR:
+        return DATA_SOURCE_OCR_READER
+    if reader_mode == READER_MODE_AUTO:
+        if memory_reader_candidate_available and memory_reader_allowed:
+            return DATA_SOURCE_MEMORY_READER
+        if ocr_reader_allowed:
+            return DATA_SOURCE_OCR_READER
+        if memory_reader_allowed:
+            return DATA_SOURCE_MEMORY_READER
+    return DATA_SOURCE_NONE
+
+
 def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
     normalized = str(stage or OCR_CAPTURE_PROFILE_STAGE_DEFAULT).strip().lower()
     if normalized not in OCR_CAPTURE_PROFILE_STAGES:
@@ -1678,7 +1699,12 @@ class GalgamePlugin(NekoPluginBase):
                     local["events_file_size"] = tail.file_size
                     local["line_buffer"] = tail.line_buffer
         else:
-            local["active_data_source"] = DATA_SOURCE_NONE
+            local["active_data_source"] = _pending_data_source_for_reader_mode(
+                reader_mode,
+                memory_reader_allowed=memory_reader_allowed,
+                ocr_reader_allowed=ocr_reader_allowed,
+                memory_reader_candidate_available=memory_reader_candidate_available,
+            )
             if not local["bound_game_id"]:
                 local["active_game_id"] = ""
                 local["active_session_id"] = ""
@@ -2019,6 +2045,13 @@ class GalgamePlugin(NekoPluginBase):
                 self._state.advance_speed = advance_speed
             if normalized_reader_mode == READER_MODE_MEMORY:
                 self._pending_ocr_advance_captures = 0
+            if not self._state.active_session_id:
+                self._state.active_data_source = _pending_data_source_for_reader_mode(
+                    normalized_reader_mode,
+                    memory_reader_allowed=normalized_reader_mode in {READER_MODE_AUTO, READER_MODE_MEMORY},
+                    ocr_reader_allowed=normalized_reader_mode in {READER_MODE_AUTO, READER_MODE_OCR},
+                    memory_reader_candidate_available=False,
+                )
             self._state.next_poll_at_monotonic = 0.0
             payload = {
                 "mode": self._state.mode,
