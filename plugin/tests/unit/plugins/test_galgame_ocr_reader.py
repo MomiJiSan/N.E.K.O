@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from plugin.plugins.galgame_plugin import ocr_reader as galgame_ocr_reader
 from plugin.plugins.galgame_plugin.models import (
     DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
     DEFAULT_OCR_CAPTURE_TOP_RATIO,
@@ -155,6 +156,74 @@ def test_build_config_defaults_ocr_languages_to_chi_sim_jpn_eng(tmp_path: Path) 
     assert cfg.ocr_reader_bottom_inset_ratio == pytest.approx(
         DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO
     )
+
+
+def test_ocr_reader_manager_initializes_with_rapidocr_warmup_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    warmup_calls = []
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.ocr_reader.RapidOcrBackend.warmup_async",
+        lambda self, logger=None: warmup_calls.append(logger),
+    )
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            backend_selection="rapidocr",
+            rapidocr_enabled=True,
+        ),
+    )
+
+    assert manager._writer.bridge_root == bridge_root
+    assert warmup_calls
+
+
+def test_rapidocr_runtime_cache_reuses_loaded_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_target_dir = str(tmp_path / "RapidOCR")
+    runtime = object()
+    load_calls = []
+
+    def fake_load_runtime(**kwargs):
+        load_calls.append(kwargs)
+        return runtime, {}
+
+    monkeypatch.setattr(galgame_ocr_reader, "load_rapidocr_runtime", fake_load_runtime)
+    cache_key = (
+        install_target_dir,
+        "onnxruntime",
+        "ch",
+        "mobile",
+        "PP-OCRv5",
+    )
+    galgame_ocr_reader._RAPIDOCR_RUNTIME_CACHE.pop(cache_key, None)
+    try:
+        first = galgame_ocr_reader.RapidOcrBackend(
+            install_target_dir_raw=install_target_dir,
+            engine_type="onnxruntime",
+            lang_type="ch",
+            model_type="mobile",
+            ocr_version="PP-OCRv5",
+        )
+        second = galgame_ocr_reader.RapidOcrBackend(
+            install_target_dir_raw=install_target_dir,
+            engine_type="onnxruntime",
+            lang_type="ch",
+            model_type="mobile",
+            ocr_version="PP-OCRv5",
+        )
+
+        assert first._ensure_runtime() is runtime
+        assert second._ensure_runtime() is runtime
+        assert len(load_calls) == 1
+    finally:
+        galgame_ocr_reader._RAPIDOCR_RUNTIME_CACHE.pop(cache_key, None)
 
 
 def test_score_ocr_text_prefers_cjk_dialogue_over_ascii_gibberish() -> None:

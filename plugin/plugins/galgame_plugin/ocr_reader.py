@@ -237,6 +237,8 @@ _CAPTURE_BACKEND_DXCAM = "dxcam"
 _CAPTURE_BACKEND_IMAGEGRAB = "imagegrab"
 _CAPTURE_BACKEND_PRINTWINDOW = "printwindow"
 _STALE_CAPTURE_FRAME_THRESHOLD = 3
+_RAPIDOCR_RUNTIME_CACHE_LOCK = threading.Lock()
+_RAPIDOCR_RUNTIME_CACHE: dict[tuple[str, str, str, str, str], Any] = {}
 _BACKGROUND_SCENE_HASH_SIZE = 8
 _BACKGROUND_SCENE_CHANGE_DISTANCE = 18
 _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS = 2
@@ -1775,14 +1777,26 @@ class RapidOcrBackend:
         if self._runtime is None:
             with self._runtime_lock:
                 if self._runtime is None:
-                    self._runtime, _metadata = load_rapidocr_runtime(
-                        install_target_dir_raw=self._install_target_dir_raw,
-                        engine_type=self._engine_type,
-                        lang_type=self._lang_type,
-                        model_type=self._model_type,
-                        ocr_version=self._ocr_version,
-                        force_reload=False,
+                    key = (
+                        str(self._install_target_dir_raw or ""),
+                        str(self._engine_type or ""),
+                        str(self._lang_type or ""),
+                        str(self._model_type or ""),
+                        str(self._ocr_version or ""),
                     )
+                    with _RAPIDOCR_RUNTIME_CACHE_LOCK:
+                        runtime = _RAPIDOCR_RUNTIME_CACHE.get(key)
+                        if runtime is None:
+                            runtime, _metadata = load_rapidocr_runtime(
+                                install_target_dir_raw=self._install_target_dir_raw,
+                                engine_type=self._engine_type,
+                                lang_type=self._lang_type,
+                                model_type=self._model_type,
+                                ocr_version=self._ocr_version,
+                                force_reload=False,
+                            )
+                            _RAPIDOCR_RUNTIME_CACHE[key] = runtime
+                        self._runtime = runtime
         return self._runtime
 
     def warmup_async(self, logger: Any | None = None) -> None:
@@ -2833,9 +2847,9 @@ class OcrReaderManager:
         if selection not in {"auto", "rapidocr"}:
             return
         self._rapidocr_backend_for_config().warmup_async(self._logger)
-        if self._writer.bridge_root != config.bridge_root:
+        if self._writer.bridge_root != self._config.bridge_root:
             self._writer = OcrReaderBridgeWriter(
-                bridge_root=config.bridge_root,
+                bridge_root=self._config.bridge_root,
                 time_fn=self._time_fn,
             )
 
@@ -2849,6 +2863,17 @@ class OcrReaderManager:
         if self._advance_speed == ADVANCE_SPEED_SLOW:
             return 3
         return 2
+
+    def _should_emit_observed_lines_for_capture(self, *, after_advance_trigger_mode: bool) -> bool:
+        if not after_advance_trigger_mode:
+            return True
+        state = getattr(self._writer, "_state", {})
+        if not isinstance(state, dict):
+            return True
+        has_current_text = bool(str(state.get("text") or "").strip())
+        choices = state.get("choices", [])
+        has_current_choices = isinstance(choices, list) and bool(choices)
+        return not has_current_text and not has_current_choices
 
     def _mark_observed_progress(self, *, now: float) -> None:
         self._consecutive_no_text_polls = 0
@@ -4061,7 +4086,9 @@ class OcrReaderManager:
             str(self._config.ocr_reader_trigger_mode or "").strip().lower()
             == OCR_TRIGGER_MODE_AFTER_ADVANCE
         )
-        emit_observed_lines = not after_advance_trigger_mode
+        emit_observed_lines = self._should_emit_observed_lines_for_capture(
+            after_advance_trigger_mode=after_advance_trigger_mode
+        )
         capture_attempted = False
         capture_completed = False
         capture_error = False

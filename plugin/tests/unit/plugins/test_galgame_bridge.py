@@ -3724,6 +3724,75 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_bootstrap_continues_until_stable_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "enabled": False,
+        },
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 999.0,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    clock = {"now": 1710000100.0}
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 201)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=201,
+                title="OCR Bootstrap Window",
+                process_name="DemoGame.exe",
+                pid=5252,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(
+            [
+                "雪乃：首次可见台词。",
+                "雪乃：首次可见台词。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["text"] == "首次可见台词。"
+    assert first_snapshot.value["snapshot"]["stability"] == "tentative"
+
+    clock["now"] += 1.0
+    plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    second_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(second_snapshot, Ok)
+    assert second_snapshot.value["snapshot"]["text"] == "首次可见台词。"
+    assert second_snapshot.value["snapshot"]["stability"] == "stable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_bridge_sdk_session_preempts_ocr_reader_candidate(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     install_root = tmp_path / "Tesseract"
