@@ -561,6 +561,64 @@ function normalizeLineText(value = '') {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function isLikelyGameDialogueLine(item = {}) {
+  if (!item || item.is_diagnostic) {
+    return false;
+  }
+  const text = normalizeLineText(item.text || '');
+  if (!text || text.length < 2 || text.length > 220) {
+    return false;
+  }
+  const lowered = text.toLowerCase();
+  const blockedTokens = [
+    'agent',
+    'capture_failed',
+    'context_state=',
+    'dxcam:',
+    'galgame_',
+    'gateway_unavailable',
+    'http://',
+    'https://',
+    'last_error=',
+    'ocr_context_unavailable',
+    'plugin/',
+    'plugin\\',
+    'powershell',
+    'status=',
+    'stability',
+    '当前快照',
+    '场景 id',
+    '场景id',
+    '会话 id',
+    '会话id',
+    '游戏 id',
+    '游戏id',
+    '菜单是否打开',
+    '台词 id',
+    '台词id',
+    '路线 id',
+    '路线id',
+    '快照时间',
+    '是否过期',
+    '退出全屏',
+    '收起',
+    '全屏',
+    'ocr 诊断',
+    'recent raw ocr',
+    '最近 raw ocr',
+  ];
+  if (blockedTokens.some((token) => lowered.includes(token))) {
+    return false;
+  }
+  if (text.startsWith('{') || text.startsWith('[') || (text.includes('{') && text.includes('}'))) {
+    return false;
+  }
+  const hasCjkOrKana = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(text);
+  const hasDialoguePunctuation = /[。！？!?…，,、：:]/.test(text);
+  const hasSpeaker = Boolean(String(item.speaker || '').trim());
+  return hasCjkOrKana || hasDialoguePunctuation || hasSpeaker;
+}
+
 function lineKey(item = {}) {
   const text = normalizeLineText(item.text || '');
   if (text) {
@@ -576,9 +634,15 @@ function lineKey(item = {}) {
 function mergedHistoryLines(history = {}) {
   const merged = new Map();
   (history.observed_lines || []).forEach((item) => {
+    if (!isLikelyGameDialogueLine(item)) {
+      return;
+    }
     merged.set(lineKey(item), { ...item, stability: item.stability || 'tentative' });
   });
   (history.stable_lines || []).forEach((item) => {
+    if (!isLikelyGameDialogueLine(item)) {
+      return;
+    }
     merged.set(lineKey(item), { ...item, stability: item.stability || 'stable' });
   });
   return Array.from(merged.values());
@@ -589,21 +653,155 @@ function scrollToBottom(node) {
     return;
   }
   requestAnimationFrame(() => {
-    node.scrollTop = node.scrollHeight;
+    requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
   });
 }
 
-function scrollAllRegionsToBottom() {
+function scrollAllRegionsToBottom(root = document) {
   requestAnimationFrame(() => {
-    document.querySelectorAll('.scroll-region, .reply-text-scroll').forEach((node) => {
-      node.scrollTop = node.scrollHeight;
+    requestAnimationFrame(() => {
+      root.querySelectorAll('.scroll-region, .reply-text-scroll').forEach((node) => {
+        node.scrollTop = node.scrollHeight;
+      });
+      if (root.classList?.contains('panel-fullscreen')) {
+        root.scrollTop = root.scrollHeight;
+      }
     });
+  });
+}
+
+function isScrollableNode(node) {
+  return Boolean(node && node.scrollHeight > node.clientHeight + 1);
+}
+
+function canScrollNode(node, deltaY) {
+  if (!isScrollableNode(node)) {
+    return false;
+  }
+  if (deltaY < 0) {
+    return node.scrollTop > 0;
+  }
+  if (deltaY > 0) {
+    return node.scrollTop + node.clientHeight < node.scrollHeight - 1;
+  }
+  return true;
+}
+
+function eventElement(eventTarget) {
+  if (eventTarget instanceof Element) {
+    return eventTarget;
+  }
+  return eventTarget?.parentElement || null;
+}
+
+function fullscreenWheelTarget(eventTarget, deltaY) {
+  const element = eventElement(eventTarget);
+  const panel = element?.closest?.('.panel-fullscreen');
+  if (!panel) {
+    return null;
+  }
+  let node = element;
+  while (node && node !== panel.parentElement) {
+    if (
+      node.matches?.('.scroll-region, .reply-text-scroll, .module-body, .list-card, .panel-fullscreen')
+      && canScrollNode(node, deltaY)
+    ) {
+      return node;
+    }
+    if (node === panel) {
+      break;
+    }
+    node = node.parentElement;
+  }
+  const nested = Array.from(panel.querySelectorAll('.scroll-region, .reply-text-scroll, .module-body, .list-card'))
+    .find((candidate) => canScrollNode(candidate, deltaY));
+  return nested || (canScrollNode(panel, deltaY) ? panel : null);
+}
+
+function pageWheelTarget(eventTarget, deltaY) {
+  let node = eventElement(eventTarget);
+  while (node && node !== document.body) {
+    if (
+      node.matches?.('.scroll-region, .reply-text-scroll, .module-body, .list-card')
+      && canScrollNode(node, deltaY)
+    ) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  const scroller = document.scrollingElement || document.documentElement || document.body;
+  return canScrollNode(scroller, deltaY) ? scroller : null;
+}
+
+function exitPanelFullscreen() {
+  document.querySelectorAll('.panel-fullscreen').forEach((panel) => {
+    panel.classList.remove('panel-fullscreen');
+    const button = panel.querySelector('.panel-fullscreen-toggle');
+    if (button) {
+      button.textContent = '全屏';
+      button.setAttribute('aria-label', '全屏');
+    }
+  });
+  document.body.classList.remove('panel-fullscreen-active');
+}
+
+function togglePanelFullscreen(panel) {
+  if (!panel) {
+    return;
+  }
+  const isActive = panel.classList.contains('panel-fullscreen');
+  exitPanelFullscreen();
+  if (isActive) {
+    return;
+  }
+  panel.open = true;
+  panel.classList.add('panel-fullscreen');
+  document.body.classList.add('panel-fullscreen-active');
+  const button = panel.querySelector('.panel-fullscreen-toggle');
+  if (button) {
+    button.textContent = '退出全屏';
+    button.setAttribute('aria-label', '退出全屏');
+  }
+  scrollAllRegionsToBottom(panel);
+}
+
+function initializePanelFullscreenControls() {
+  document.querySelectorAll('.dashboard-module, .settings-module').forEach((panel) => {
+    const summary = panel.querySelector(':scope > summary');
+    if (!summary || summary.querySelector('.panel-fullscreen-toggle')) {
+      return;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'panel-fullscreen-toggle';
+    button.textContent = '全屏';
+    button.setAttribute('aria-label', '全屏');
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      togglePanelFullscreen(panel);
+    });
+    summary.appendChild(button);
   });
 }
 
 function latestHistoryLine(history = {}) {
   const lines = mergedHistoryLines(history);
   return lines.length ? lines[lines.length - 1] : null;
+}
+
+function sceneSummaryKey(sceneId = '', history = {}, fallbackLine = {}) {
+  const stableLines = Array.isArray(history.stable_lines) ? history.stable_lines : [];
+  const observedLines = Array.isArray(history.observed_lines) ? history.observed_lines : [];
+  const latestLine = latestHistoryLine(history) || fallbackLine || {};
+  return [
+    sceneId || 'missing-scene',
+    stableLines.length,
+    observedLines.length,
+    lineKey(latestLine),
+  ].join('::');
 }
 
 function effectiveCurrentLine(snapshot = {}, history = {}, status = {}) {
@@ -2450,7 +2648,7 @@ async function refreshInsights(snapshot, { force = false, history = {}, status =
   const visibleChoiceMenu = Boolean(state.is_menu_open) && choices.length > 0;
   const hasChoices = mode === 'choice_advisor' && visibleChoiceMenu;
   const explainKey = currentLineId || 'missing-line';
-  const summaryKey = currentSceneId || 'missing-scene';
+  const summaryKey = sceneSummaryKey(currentSceneId, history, fallbackLine);
   const suggestKey = hasChoices
     ? `${currentSceneId}::${choices.map((item) => `${item.choice_id || ''}:${item.text || ''}`).join('|')}`
     : `${currentSceneId}::no-choices`;
@@ -3024,6 +3222,7 @@ function switchInstallTab(tab) {
 }
 
 async function initialize() {
+  initializePanelFullscreenControls();
   switchInstallTab(activeInstallTab);
   renderInsightsPending('等待首轮状态刷新；解释、总结和选项建议会在后台更新。');
   setFlash('正在加载插件状态...', 'info');
@@ -3099,8 +3298,29 @@ document.getElementById('ocrWindowSelectBtn').addEventListener('click', () => {
 });
 document.getElementById('ocrWindowModalClose').addEventListener('click', closeOcrWindowModal);
 document.querySelector('#ocrWindowModal .modal-overlay').addEventListener('click', closeOcrWindowModal);
+document.addEventListener('pointerdown', (event) => {
+  if (!document.body.classList.contains('panel-fullscreen-active')) {
+    return;
+  }
+  const panel = document.querySelector('.panel-fullscreen');
+  const target = eventElement(event.target);
+  if (panel && target && !panel.contains(target)) {
+    exitPanelFullscreen();
+  }
+});
+document.addEventListener('wheel', (event) => {
+  const target = document.body.classList.contains('panel-fullscreen-active')
+    ? fullscreenWheelTarget(event.target, event.deltaY)
+    : pageWheelTarget(event.target, event.deltaY);
+  if (!target) {
+    return;
+  }
+  target.scrollTop += event.deltaY;
+  event.preventDefault();
+}, { passive: false });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    exitPanelFullscreen();
     closeOcrWindowModal();
   }
 });

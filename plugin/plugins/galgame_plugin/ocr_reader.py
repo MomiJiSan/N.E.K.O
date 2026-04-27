@@ -155,6 +155,28 @@ _SELF_UI_GUARD_SUBSTRINGS = (
     "powershell",
     "ps c:",
 )
+_GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
+    "backlog",
+    "history",
+    "skip",
+    "auto",
+    "config",
+    "system",
+    "load",
+    "save",
+    "menu",
+    "回想",
+    "历史",
+    "履历",
+    "快进",
+    "跳过",
+    "自动",
+    "菜单",
+    "设置",
+    "系统",
+    "存档",
+    "读档",
+)
 _AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
 _AIHONG_TITLE_SUBSTRINGS = ("哀鸿", "aihong")
 _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET = {
@@ -203,6 +225,9 @@ _CAPTURE_BACKEND_DXCAM = "dxcam"
 _CAPTURE_BACKEND_IMAGEGRAB = "imagegrab"
 _CAPTURE_BACKEND_PRINTWINDOW = "printwindow"
 _STALE_CAPTURE_FRAME_THRESHOLD = 3
+_BACKGROUND_SCENE_HASH_SIZE = 8
+_BACKGROUND_SCENE_CHANGE_DISTANCE = 18
+_BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS = 2
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -242,6 +267,18 @@ def _looks_like_self_ui_text(text: str) -> bool:
     if not normalized:
         return False
     return any(token in normalized for token in _SELF_UI_GUARD_SUBSTRINGS)
+
+
+def _looks_like_game_overlay_text(text: str) -> bool:
+    normalized = normalize_text(text).strip().lower()
+    if not normalized:
+        return False
+    lines = _stripped_ocr_lines(normalized)
+    has_overlay_keyword = any(token in normalized for token in _GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS)
+    if has_overlay_keyword and (len(lines) >= 2 or _significant_char_count(normalized) <= 40):
+        return True
+    dialogue_like_lines = sum(1 for line in lines if _looks_like_dialogue_line(line))
+    return len(lines) >= 4 and dialogue_like_lines >= 2
 
 
 def _coerce_prefixed_choice_lines(lines: list[str]) -> list[str]:
@@ -1226,6 +1263,7 @@ class OcrExtractionResult:
     capture_backend_kind: str = ""
     capture_backend_detail: str = ""
     capture_image_hash: str = ""
+    background_hash: str = ""
 
 
 class CaptureBackend(Protocol):
@@ -1968,6 +2006,7 @@ class OcrReaderBridgeWriter:
         self._last_seq = 0
         self._last_event_ts = started_at
         self._state = self._initial_state(started_at)
+        self._scene_index = 1
         self._text_to_line_id.clear()
         self._line_id_owner.clear()
         self._bridge_dir().mkdir(parents=True, exist_ok=True)
@@ -2036,10 +2075,17 @@ class OcrReaderBridgeWriter:
         speaker, text = self._split_speaker_text(cleaned)
         if not text:
             return False
+        normalized_text = normalize_text(text)
         current_text = str(self._state.get("text") or "")
         current_speaker = str(self._state.get("speaker") or "")
         current_stability = str(self._state.get("stability") or "")
         if current_text == text and current_speaker == speaker and current_stability in {"tentative", "stable"}:
+            return False
+        current_line_id = str(self._state.get("line_id") or "")
+        existing_line_id = self._text_to_line_id.get(normalized_text)
+        if existing_line_id and existing_line_id != current_line_id:
+            return False
+        if existing_line_id and existing_line_id == current_line_id and current_stability == "choices":
             return False
         line_id = self._line_id_for_text(text)
         self._state = {
@@ -2158,6 +2204,49 @@ class OcrReaderBridgeWriter:
         self._append_event("error", payload, ts=ts, update_snapshot=False)
         return True
 
+    def emit_scene_changed(
+        self,
+        *,
+        scene_id: str,
+        ts: str,
+        reason: str,
+        background_hash: str = "",
+    ) -> bool:
+        if not self._session_id or not scene_id:
+            return False
+        if str(self._state.get("scene_id") or "") == scene_id:
+            return False
+        self._state = {
+            **self._state,
+            "scene_id": scene_id,
+            "choices": [],
+            "is_menu_open": False,
+            "stability": "",
+            "ts": ts,
+        }
+        self._append_event(
+            "scene_changed",
+            {
+                "scene_id": scene_id,
+                "route_id": self._state["route_id"],
+                "reason": reason,
+                "background_hash": background_hash,
+            },
+            ts=ts,
+        )
+        return True
+
+    def advance_visual_scene(self, *, ts: str, background_hash: str = "") -> str:
+        self._scene_index += 1
+        scene_id = f"ocr:{self._game_id or 'unknown'}:scene-{self._scene_index:04d}"
+        self.emit_scene_changed(
+            scene_id=scene_id,
+            ts=ts,
+            reason="background_changed",
+            background_hash=background_hash,
+        )
+        return scene_id
+
     def end_session(self, *, ts: str) -> bool:
         if not self._session_id:
             return False
@@ -2202,7 +2291,7 @@ class OcrReaderBridgeWriter:
         current = str(state.get("scene_id") or "").strip()
         if current and current != OCR_READER_UNKNOWN_SCENE:
             return current
-        return f"ocr:{self._game_id or 'unknown'}:scene-0001"
+        return f"ocr:{self._game_id or 'unknown'}:scene-{int(getattr(self, '_scene_index', 1) or 1):04d}"
 
     def _bridge_dir(self) -> Path:
         return self._bridge_root / self._game_id
@@ -2391,6 +2480,9 @@ class OcrReaderManager:
         self._last_capture_window_rect: dict[str, float] = {}
         self._consecutive_same_capture_frames = 0
         self._stale_capture_backend = False
+        self._last_background_hash = ""
+        self._pending_background_hash = ""
+        self._pending_background_change_count = 0
         self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
         self._capture_backend_detail = ""
 
@@ -2478,6 +2570,77 @@ class OcrReaderManager:
             return hashlib.sha1(repr(frame).encode("utf-8", "ignore")).hexdigest()[:16]
         except Exception:
             return ""
+
+    @staticmethod
+    def _background_capture_profile() -> OcrCaptureProfile:
+        return OcrCaptureProfile(
+            left_inset_ratio=0.0,
+            right_inset_ratio=0.0,
+            top_ratio=0.0,
+            bottom_inset_ratio=0.45,
+        )
+
+    @staticmethod
+    def _background_perceptual_hash(frame: Any) -> str:
+        if frame is None:
+            return ""
+        try:
+            from PIL import Image
+
+            resampling = getattr(Image, "Resampling", Image)
+            image = frame.convert("L").resize(
+                (_BACKGROUND_SCENE_HASH_SIZE, _BACKGROUND_SCENE_HASH_SIZE),
+                resampling.BILINEAR,
+            )
+            pixels = list(image.getdata())
+            if not pixels:
+                return ""
+            average = sum(int(pixel) for pixel in pixels) / len(pixels)
+            bits = "".join("1" if int(pixel) >= average else "0" for pixel in pixels)
+            return f"{int(bits, 2):016x}"
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _hash_distance(left: str, right: str) -> int:
+        if not left or not right:
+            return 0
+        try:
+            return (int(left, 16) ^ int(right, 16)).bit_count()
+        except Exception:
+            return 0
+
+    def _observe_background_hash(self, background_hash: str, *, now: float) -> bool:
+        if not background_hash:
+            return False
+        if not self._last_background_hash:
+            self._last_background_hash = background_hash
+            self._pending_background_hash = ""
+            self._pending_background_change_count = 0
+            return False
+        distance = self._hash_distance(self._last_background_hash, background_hash)
+        if distance < _BACKGROUND_SCENE_CHANGE_DISTANCE:
+            self._pending_background_hash = ""
+            self._pending_background_change_count = 0
+            return False
+        if background_hash == self._pending_background_hash:
+            self._pending_background_change_count += 1
+        else:
+            self._pending_background_hash = background_hash
+            self._pending_background_change_count = 1
+        if self._pending_background_change_count < _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS:
+            return False
+        self._last_background_hash = background_hash
+        self._pending_background_hash = ""
+        self._pending_background_change_count = 0
+        self._default_ocr_state.reset()
+        self._aihong_menu_ocr_state.reset()
+        return bool(
+            self._writer.advance_visual_scene(
+                ts=utc_now_iso(now),
+                background_hash=background_hash,
+            )
+        )
 
     def _line_payload_from_writer(self, *, stability: str) -> dict[str, Any]:
         state = getattr(self._writer, "_state", {})
@@ -3115,6 +3278,9 @@ class OcrReaderManager:
         self._last_capture_window_rect = {}
         self._consecutive_same_capture_frames = 0
         self._stale_capture_backend = False
+        self._last_background_hash = ""
+        self._pending_background_hash = ""
+        self._pending_background_change_count = 0
 
     def _reset_aihong_menu_state(self) -> None:
         self._aihong_menu_ocr_state.reset()
@@ -3157,7 +3323,7 @@ class OcrReaderManager:
         now: float,
         state: _StableOcrTextState | None = None,
     ) -> bool:
-        if _looks_like_noise_ocr_text(raw_text):
+        if _looks_like_noise_ocr_text(raw_text) or _looks_like_game_overlay_text(raw_text):
             return False
         self._last_raw_ocr_text = str(raw_text or "")
         if self._writer.emit_line_observed(raw_text, ts=utc_now_iso(now)):
@@ -3492,6 +3658,8 @@ class OcrReaderManager:
                 image_hash=extraction.capture_image_hash,
             )
             self._record_capture_geometry(extraction)
+            if self._observe_background_hash(extraction.background_hash, now=now):
+                result.should_rescan = True
             self._capture_backend_kind = extraction.capture_backend_kind
             self._capture_backend_detail = extraction.capture_backend_detail
             active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
@@ -4225,10 +4393,20 @@ class OcrReaderManager:
         profile: OcrCaptureProfile,
         plan: SelectedOcrBackendPlan,
     ) -> OcrExtractionResult:
+        background_hash = ""
+        try:
+            background_frame = self._capture_backend.capture_frame(
+                target,
+                self._background_capture_profile(),
+            )
+            background_hash = self._background_perceptual_hash(background_frame)
+        except Exception as exc:
+            self._logger.debug("ocr_reader background scene hash skipped: %s", exc)
         frame = self._capture_backend.capture_frame(target, profile)
         capture_hash = self._capture_image_hash(frame)
         extraction = self._extract_text_from_image(frame, plan=plan)
         extraction.capture_image_hash = capture_hash
+        extraction.background_hash = background_hash
         frame_info = getattr(frame, "info", {}) if frame is not None else {}
         if isinstance(frame_info, dict):
             extraction.capture_backend_kind = str(

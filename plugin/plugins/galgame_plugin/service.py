@@ -71,6 +71,7 @@ _OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
 _CJK_OR_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
 _DIALOGUE_PUNCTUATION_RE = re.compile(r"[。！？!?…，,、：:]")
 _NON_DIALOGUE_CONTEXT_TOKENS = (
+    "agent",
     "capture_failed",
     "context_state=",
     "dxcam:",
@@ -84,6 +85,27 @@ _NON_DIALOGUE_CONTEXT_TOKENS = (
     "plugin\\",
     "powershell",
     "status=",
+    "stability",
+    "当前快照",
+    "场景 id",
+    "场景id",
+    "会话 id",
+    "会话id",
+    "游戏 id",
+    "游戏id",
+    "菜单是否打开",
+    "台词 id",
+    "台词id",
+    "路线 id",
+    "路线id",
+    "快照时间",
+    "是否过期",
+    "退出全屏",
+    "收起",
+    "全屏",
+    "ocr 诊断",
+    "recent raw ocr",
+    "最近 raw ocr",
 )
 
 
@@ -116,6 +138,12 @@ def _looks_like_game_dialogue_context_line(line: dict[str, Any]) -> bool:
     has_dialogue_punctuation = bool(_DIALOGUE_PUNCTUATION_RE.search(text))
     has_speaker = bool(str(line.get("speaker") or "").strip())
     return has_cjk_or_kana or has_dialogue_punctuation or has_speaker
+
+
+def _payload_is_game_dialogue_line(payload_obj: dict[str, Any], *, ts: str = "") -> bool:
+    return _looks_like_game_dialogue_context_line(
+        _line_history_entry(payload_obj, ts=ts, stability=str(payload_obj.get("stability") or ""))
+    )
 
 
 def _coerce_float(value: object, default: float, *, minimum: float) -> float:
@@ -596,7 +624,6 @@ def _append_observed_line(
         )
         if same_line or same_text:
             history_observed_lines[index] = item
-            history_observed_lines.append(history_observed_lines.pop(index))
             if len(history_observed_lines) > limit:
                 del history_observed_lines[:-limit]
             return
@@ -657,7 +684,7 @@ def apply_event_to_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> 
         return next_snapshot
 
     if event_type in {"line_observed", "line_changed"}:
-        if _looks_like_ocr_overlay_text(payload_obj.get("text")):
+        if not _payload_is_game_dialogue_line(payload_obj, ts=event_ts):
             return next_snapshot
         next_snapshot["speaker"] = str(payload_obj.get("speaker") or "")
         next_snapshot["text"] = str(payload_obj.get("text") or "")
@@ -735,7 +762,7 @@ def apply_event_to_histories(
     _append_limited(history_events, summarize_event(event), config.history_events_limit)
 
     if event_type == "line_observed":
-        if _looks_like_ocr_overlay_text(payload_obj.get("text")):
+        if not _payload_is_game_dialogue_line(payload_obj, ts=event_ts):
             return
         if history_observed_lines is not None:
             _append_observed_line(
@@ -746,7 +773,7 @@ def apply_event_to_histories(
         return
 
     if event_type == "line_changed":
-        if _looks_like_ocr_overlay_text(payload_obj.get("text")):
+        if not _payload_is_game_dialogue_line(payload_obj, ts=event_ts):
             return
         fingerprint = _line_fingerprint(
             game_id,
@@ -969,11 +996,11 @@ def build_history_payload(state, *, limit: int, include_events: bool) -> dict[st
     bounded_limit = max(1, limit)
     stable_lines = [
         item for item in state.history_lines
-        if not _looks_like_ocr_overlay_text((item if isinstance(item, dict) else {}).get("text"))
+        if _looks_like_game_dialogue_context_line(item if isinstance(item, dict) else {})
     ]
     observed_lines = [
         item for item in state.history_observed_lines
-        if not _looks_like_ocr_overlay_text((item if isinstance(item, dict) else {}).get("text"))
+        if _looks_like_game_dialogue_context_line(item if isinstance(item, dict) else {})
     ]
     return {
         "game_id": state.active_game_id,
@@ -1032,7 +1059,7 @@ def _current_line_entry(snapshot: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if _looks_like_ocr_overlay_text(normalized.get("text")):
         return None
-    return {
+    entry = {
         "line_id": str(normalized.get("line_id") or ""),
         "speaker": str(normalized.get("speaker") or ""),
         "text": str(normalized.get("text") or ""),
@@ -1042,6 +1069,9 @@ def _current_line_entry(snapshot: dict[str, Any]) -> dict[str, Any] | None:
         "source": "snapshot",
         "ts": str(normalized.get("ts") or ""),
     }
+    if not _looks_like_game_dialogue_context_line(entry):
+        return None
+    return entry
 
 
 def resolve_effective_current_line(local_state: dict[str, Any]) -> dict[str, Any] | None:
@@ -1294,20 +1324,21 @@ def build_local_scene_summary(
 ) -> str:
     normalized_snapshot = sanitize_snapshot_state(snapshot)
     if lines:
-        first = lines[0]
-        last = lines[-1]
-        summary = (
-            f"场景 {scene_id or '(unknown)'} "
-            f"从「{str(first.get('speaker') or '旁白')}：{str(first.get('text') or '')}」"
-            f"推进到「{str(last.get('speaker') or '旁白')}：{str(last.get('text') or '')}」"
-        )
+        recent_parts = []
+        for item in lines[-6:]:
+            speaker = str(item.get("speaker") or "旁白").strip() or "旁白"
+            text = str(item.get("text") or "").strip()
+            if text:
+                recent_parts.append(f"{speaker}：{text}")
+        summary = f"当前场景 {scene_id or '(unknown)'} 的近期上下文是："
+        summary += "；".join(recent_parts) if recent_parts else "暂时只有零散台词。"
     elif normalized_snapshot.get("text"):
         summary = (
-            f"场景 {scene_id or '(unknown)'} 当前停留在"
+            f"当前场景 {scene_id or '(unknown)'} 目前停留在"
             f"「{str(normalized_snapshot.get('speaker') or '旁白')}：{str(normalized_snapshot.get('text') or '')}」"
         )
     else:
-        summary = f"场景 {scene_id or '(unknown)'} 暂无足够台词上下文。"
+        summary = f"当前场景 {scene_id or '(unknown)'} 暂时没有足够台词上下文。"
     if route_id:
         summary += f" 路线 {route_id}。"
     if selected_choices:

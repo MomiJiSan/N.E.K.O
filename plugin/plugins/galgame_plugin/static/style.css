@@ -711,6 +711,89 @@ button.active {
   grid-column: 1 / -1;
 }
 
+.panel > summary,
+.settings-module > summary {
+  gap: 12px;
+}
+
+.panel > summary small,
+.settings-module > summary small {
+  margin-left: auto;
+}
+
+.panel-fullscreen-toggle {
+  flex: 0 0 auto;
+  border: 1px solid rgba(31, 42, 51, 0.12);
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.06);
+  color: var(--muted);
+  padding: 5px 10px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.panel-fullscreen-toggle:hover {
+  background: rgba(31, 42, 51, 0.1);
+  color: var(--ink);
+}
+
+body.panel-fullscreen-active {
+  overflow: hidden;
+}
+
+details.panel-fullscreen {
+  position: fixed;
+  inset: 12px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: none;
+  height: calc(100vh - 24px);
+  grid-column: auto;
+  overflow: hidden;
+  box-shadow: 0 24px 80px rgba(31, 42, 51, 0.28);
+}
+
+details.panel-fullscreen > summary {
+  flex: 0 0 auto;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-bottom: 12px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+
+details.panel-fullscreen > .scroll-region,
+details.panel-fullscreen .scroll-region {
+  max-height: none !important;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+
+details.panel-fullscreen > .scroll-region,
+details.panel-fullscreen > .module-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+details.panel-fullscreen #linesList.scroll-region,
+details.panel-fullscreen #eventsList.scroll-region,
+details.panel-fullscreen #snapshotGrid.scroll-region,
+details.panel-fullscreen #agentStatusGrid.scroll-region,
+details.panel-fullscreen .result-panel.scroll-region {
+  max-height: none;
+}
+
+details.panel-fullscreen #linesList .list-card,
+details.panel-fullscreen #eventsList .list-card {
+  max-height: none;
+}
+
 .panel-scroll {
   display: flex;
   flex-direction: column;
@@ -758,6 +841,14 @@ button.active {
 
 #snapshotGrid.scroll-region {
   max-height: clamp(180px, 30vh, 340px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  align-content: start;
+}
+
+#agentStatusGrid.scroll-region {
+  max-height: clamp(160px, 28vh, 320px);
   overflow: auto;
   overflow-wrap: anywhere;
   word-break: break-word;
