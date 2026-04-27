@@ -143,7 +143,7 @@ class GalgameLLMBackend:
             max_completion_tokens=max_completion_tokens,
         )
         set_call_type("agent" if model_role == "agent" else "summary")
-        response = await llm.ainvoke(messages)
+        response = await asyncio.to_thread(llm.invoke, messages)
         return _as_str(getattr(response, "content", ""), str(response))
 
     async def _get_or_create_llm(

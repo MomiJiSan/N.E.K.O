@@ -77,12 +77,12 @@ poll_interval_seconds = 1
 # macOS/Linux: disabled by default.
 enabled = true
 backend_selection = "rapidocr"
-capture_backend = "dxcam"
+capture_backend = "auto"
 tesseract_path = ""
 install_manifest_url = ""
 install_target_dir = ""
 install_timeout_seconds = 60
-poll_interval_seconds = 2
+poll_interval_seconds = 1
 trigger_mode = "after_advance"
 no_text_takeover_after_seconds = 30
 languages = "chi_sim+jpn+eng"

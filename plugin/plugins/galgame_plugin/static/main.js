@@ -203,6 +203,14 @@ const FIELD_LABELS_ZH = {
   last_poll_completed_at: '最近 OCR poll 完成',
   last_poll_duration_seconds: '最近 OCR poll 耗时',
   last_poll_emitted_event: '最近 OCR poll 产生事件',
+  last_capture_total_duration_seconds: '最近 OCR 总耗时',
+  last_capture_frame_duration_seconds: '截图耗时',
+  last_capture_background_duration_seconds: '背景 Hash 耗时',
+  last_capture_image_hash_duration_seconds: '截图 Hash 耗时',
+  last_ocr_extract_duration_seconds: 'OCR 推理耗时',
+  last_backend_plan_duration_seconds: '后端选择耗时',
+  last_window_scan_duration_seconds: '窗口扫描耗时',
+  last_capture_background_hash_skipped: '已跳过背景 Hash',
   candidate_count: '候选窗口数',
   excluded_candidate_count: '排除窗口数',
   last_exclude_reason: '最近排除原因',
@@ -1820,6 +1828,35 @@ function renderOcrRuntime(status) {
       label: 'last_poll_duration_seconds',
       value: runtime.last_poll_duration_seconds ? Number(runtime.last_poll_duration_seconds).toFixed(2) : '',
     },
+    {
+      label: 'last_capture_total_duration_seconds',
+      value: runtime.last_capture_total_duration_seconds ? Number(runtime.last_capture_total_duration_seconds).toFixed(2) : '',
+    },
+    {
+      label: 'last_capture_frame_duration_seconds',
+      value: runtime.last_capture_frame_duration_seconds ? Number(runtime.last_capture_frame_duration_seconds).toFixed(2) : '',
+    },
+    {
+      label: 'last_capture_background_duration_seconds',
+      value: Number.isFinite(Number(runtime.last_capture_background_duration_seconds)) ? Number(runtime.last_capture_background_duration_seconds).toFixed(2) : '',
+    },
+    {
+      label: 'last_capture_image_hash_duration_seconds',
+      value: runtime.last_capture_image_hash_duration_seconds ? Number(runtime.last_capture_image_hash_duration_seconds).toFixed(2) : '',
+    },
+    {
+      label: 'last_ocr_extract_duration_seconds',
+      value: runtime.last_ocr_extract_duration_seconds ? Number(runtime.last_ocr_extract_duration_seconds).toFixed(2) : '',
+    },
+    {
+      label: 'last_backend_plan_duration_seconds',
+      value: Number.isFinite(Number(runtime.last_backend_plan_duration_seconds)) ? Number(runtime.last_backend_plan_duration_seconds).toFixed(2) : '',
+    },
+    {
+      label: 'last_window_scan_duration_seconds',
+      value: Number.isFinite(Number(runtime.last_window_scan_duration_seconds)) ? Number(runtime.last_window_scan_duration_seconds).toFixed(2) : '',
+    },
+    { label: 'last_capture_background_hash_skipped', value: String(Boolean(runtime.last_capture_background_hash_skipped)) },
     { label: 'last_poll_emitted_event', value: String(Boolean(runtime.last_poll_emitted_event)) },
     { label: 'candidate_count', value: String(runtime.candidate_count || 0) },
     { label: 'excluded_candidate_count', value: String(runtime.excluded_candidate_count || 0) },
@@ -1874,6 +1911,8 @@ function renderOcrWindowTargetStatus(status) {
     captureHint = '使用 DXcam 截图后端';
   } else if (runtime.capture_backend_detail === 'dxcam_unavailable_fallback') {
     captureHint = '未安装 DXcam，正在使用兼容截图；可安装 dxcam 降低遮挡或旧帧影响';
+  } else if (runtime.capture_backend_detail === 'dxcam_failed_fallback') {
+    captureHint = 'DXcam 截图失败，已自动切到兼容截图';
   } else if (runtime.capture_backend_kind) {
     captureHint = `使用 ${runtime.capture_backend_kind} 兼容截图`;
   }
