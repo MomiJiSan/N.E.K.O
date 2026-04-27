@@ -55,6 +55,14 @@
               </select>
             </label>
             <label class="field">
+              <span>文本读取模式</span>
+              <select id="readerModeSelect">
+                <option value="auto" selected>自动（内存优先，空则 OCR）</option>
+                <option value="memory_reader">内存读取</option>
+                <option value="ocr_reader">OCR</option>
+              </select>
+            </label>
+            <label class="field">
               <span>OCR/DXcam 识别间隔（秒）</span>
               <input id="ocrPollIntervalInput" type="number" min="0.5" max="10" step="0.1" placeholder="2.0">
             </label>

@@ -1178,6 +1178,13 @@ class OcrReaderRuntime:
     foreground_refresh_detail: str = ""
     foreground_hwnd: int = 0
     target_hwnd: int = 0
+    foreground_advance_monitor_running: bool = False
+    foreground_advance_last_seq: int = 0
+    foreground_advance_consumed_seq: int = 0
+    foreground_advance_last_kind: str = ""
+    foreground_advance_last_delta: int = 0
+    foreground_advance_last_matched: bool = False
+    foreground_advance_last_match_reason: str = ""
     last_poll_started_at: str = ""
     last_poll_completed_at: str = ""
     last_poll_duration_seconds: float = 0.0
@@ -1244,6 +1251,13 @@ class OcrReaderRuntime:
             "foreground_refresh_detail": self.foreground_refresh_detail,
             "foreground_hwnd": self.foreground_hwnd,
             "target_hwnd": self.target_hwnd,
+            "foreground_advance_monitor_running": self.foreground_advance_monitor_running,
+            "foreground_advance_last_seq": self.foreground_advance_last_seq,
+            "foreground_advance_consumed_seq": self.foreground_advance_consumed_seq,
+            "foreground_advance_last_kind": self.foreground_advance_last_kind,
+            "foreground_advance_last_delta": self.foreground_advance_last_delta,
+            "foreground_advance_last_matched": self.foreground_advance_last_matched,
+            "foreground_advance_last_match_reason": self.foreground_advance_last_match_reason,
             "last_poll_started_at": self.last_poll_started_at,
             "last_poll_completed_at": self.last_poll_completed_at,
             "last_poll_duration_seconds": self.last_poll_duration_seconds,
@@ -1742,6 +1756,10 @@ class RapidOcrBackend:
         self._model_type = model_type
         self._ocr_version = ocr_version
         self._runtime = None
+        self._runtime_lock = threading.Lock()
+        self._warmup_started = False
+        self._warmup_completed = False
+        self._warmup_error = ""
 
     def is_available(self) -> bool:
         inspection = inspect_rapidocr_installation(
@@ -1753,36 +1771,57 @@ class RapidOcrBackend:
         )
         return bool(inspection.get("installed"))
 
+    def _ensure_runtime(self) -> Any:
+        if self._runtime is None:
+            with self._runtime_lock:
+                if self._runtime is None:
+                    self._runtime, _metadata = load_rapidocr_runtime(
+                        install_target_dir_raw=self._install_target_dir_raw,
+                        engine_type=self._engine_type,
+                        lang_type=self._lang_type,
+                        model_type=self._model_type,
+                        ocr_version=self._ocr_version,
+                        force_reload=False,
+                    )
+        return self._runtime
+
+    def warmup_async(self, logger: Any | None = None) -> None:
+        if self._warmup_started or self._warmup_completed:
+            return
+        self._warmup_started = True
+
+        def _warmup() -> None:
+            try:
+                import numpy as np
+                from PIL import Image
+
+                runtime = self._ensure_runtime()
+                runtime(np.asarray(Image.new("RGB", (96, 32), "white")))
+                self._warmup_completed = True
+            except Exception as exc:
+                self._warmup_error = str(exc)
+                if logger is not None:
+                    try:
+                        logger.debug("ocr_reader RapidOCR warmup skipped/failed: %s", exc)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_warmup, name="galgame-rapidocr-warmup", daemon=True).start()
+
     def extract_text(self, image: Any) -> str:
         import numpy as np
 
-        if self._runtime is None:
-            self._runtime, _metadata = load_rapidocr_runtime(
-                install_target_dir_raw=self._install_target_dir_raw,
-                engine_type=self._engine_type,
-                lang_type=self._lang_type,
-                model_type=self._model_type,
-                ocr_version=self._ocr_version,
-                force_reload=False,
-            )
+        runtime = self._ensure_runtime()
         prepared = _prepare_ocr_image(image).convert("RGB")
-        output = self._runtime(np.asarray(prepared))
+        output = runtime(np.asarray(prepared))
         return _rapidocr_text_from_output(output)
 
     def extract_text_with_boxes(self, image: Any) -> tuple[str, list[OcrTextBox]]:
         import numpy as np
 
-        if self._runtime is None:
-            self._runtime, _metadata = load_rapidocr_runtime(
-                install_target_dir_raw=self._install_target_dir_raw,
-                engine_type=self._engine_type,
-                lang_type=self._lang_type,
-                model_type=self._model_type,
-                ocr_version=self._ocr_version,
-                force_reload=False,
-            )
+        runtime = self._ensure_runtime()
         prepared = _prepare_ocr_image(image).convert("RGB")
-        output = self._runtime(np.asarray(prepared))
+        output = runtime(np.asarray(prepared))
         lines = _rapidocr_lines_from_output(output)
         if not lines:
             return "", []
@@ -1960,8 +1999,11 @@ class _MouseWheelMonitor:
     def start(self) -> bool:
         if os.name != "nt":
             return False
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return True
+        self._thread = None
+        self._hook_handle = 0
+        self._thread_id = 0
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -1970,6 +2012,16 @@ class _MouseWheelMonitor:
         )
         self._thread.start()
         return True
+
+    def ensure_running(self) -> bool:
+        return self.start()
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def last_seq(self) -> int:
+        with self._lock:
+            return int(self._seq or 0)
 
     def stop(self) -> None:
         self._stop.set()
@@ -1985,6 +2037,7 @@ class _MouseWheelMonitor:
                 pass
 
     def events_after(self, seq: int) -> list[_MouseWheelEvent]:
+        self.ensure_running()
         with self._lock:
             self._prune_locked()
             return [event for event in self._events if event.seq > seq]
@@ -2729,6 +2782,9 @@ class OcrReaderManager:
         self._last_consumed_wheel_seq = 0
         self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
         self._capture_backend_detail = ""
+        self._rapidocr_backend_cache_key: tuple[str, str, str, str, str] | None = None
+        self._rapidocr_backend_cache: RapidOcrBackend | None = None
+        self._start_rapidocr_warmup_if_configured()
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -2744,6 +2800,39 @@ class OcrReaderManager:
                     getattr(self._capture_backend, "selection", "custom")
                 )
                 self._capture_backend_detail = ""
+        self._start_rapidocr_warmup_if_configured()
+
+    def _rapidocr_cache_key(self) -> tuple[str, str, str, str, str]:
+        return (
+            str(self._config.rapidocr_install_target_dir or ""),
+            str(self._config.rapidocr_engine_type or ""),
+            str(self._config.rapidocr_lang_type or ""),
+            str(self._config.rapidocr_model_type or ""),
+            str(self._config.rapidocr_ocr_version or ""),
+        )
+
+    def _rapidocr_backend_for_config(self) -> RapidOcrBackend:
+        key = self._rapidocr_cache_key()
+        if self._rapidocr_backend_cache_key == key and self._rapidocr_backend_cache is not None:
+            return self._rapidocr_backend_cache
+        backend = RapidOcrBackend(
+            install_target_dir_raw=self._config.rapidocr_install_target_dir,
+            engine_type=self._config.rapidocr_engine_type,
+            lang_type=self._config.rapidocr_lang_type,
+            model_type=self._config.rapidocr_model_type,
+            ocr_version=self._config.rapidocr_ocr_version,
+        )
+        self._rapidocr_backend_cache_key = key
+        self._rapidocr_backend_cache = backend
+        return backend
+
+    def _start_rapidocr_warmup_if_configured(self) -> None:
+        if self._custom_ocr_backend or not bool(self._config.rapidocr_enabled):
+            return
+        selection = self._configured_backend_selection()
+        if selection not in {"auto", "rapidocr"}:
+            return
+        self._rapidocr_backend_for_config().warmup_async(self._logger)
         if self._writer.bridge_root != config.bridge_root:
             self._writer = OcrReaderBridgeWriter(
                 bridge_root=config.bridge_root,
@@ -2993,6 +3082,10 @@ class OcrReaderManager:
         return self._runtime.to_dict()
 
     def consume_foreground_advance_input(self) -> bool:
+        self._wheel_monitor.ensure_running()
+        self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
+        self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
+        self._runtime.foreground_advance_consumed_seq = self._last_consumed_wheel_seq
         target, _detail = self._foreground_refresh_target()
         if target is None:
             target = self._attached_window
@@ -3017,27 +3110,50 @@ class OcrReaderManager:
         if target is None:
             return False
         events = self._wheel_monitor.events_after(self._last_consumed_wheel_seq)
+        self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
+        self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
         if not events:
             return False
         triggered = False
         max_seq = self._last_consumed_wheel_seq
+        last_kind = ""
+        last_delta = 0
+        last_matched = False
+        last_match_reason = ""
         for event in events:
             max_seq = max(max_seq, int(event.seq or 0))
+            last_kind = str(event.kind or "")
+            last_delta = int(event.delta or 0)
             if event.kind == "wheel" and event.delta >= 0:
+                last_match_reason = "ignored_wheel_up"
                 continue
             if event.kind not in {"wheel", "left_click"}:
+                last_match_reason = "ignored_event_kind"
                 continue
-            is_target_foreground, _reason = _foreground_matches_target(
+            is_target_foreground, foreground_reason = _foreground_matches_target(
                 event.foreground_hwnd,
                 target,
             )
-            is_target_under_pointer, _point_reason = _foreground_matches_target(
+            is_target_under_pointer, point_reason = _foreground_matches_target(
                 event.point_hwnd,
                 target,
             )
             if is_target_foreground or is_target_under_pointer:
                 triggered = True
+                last_matched = True
+                last_match_reason = (
+                    f"foreground_{foreground_reason}"
+                    if is_target_foreground
+                    else f"point_{point_reason}"
+                )
+            else:
+                last_match_reason = f"background:{foreground_reason}/{point_reason}"
         self._last_consumed_wheel_seq = max_seq
+        self._runtime.foreground_advance_consumed_seq = self._last_consumed_wheel_seq
+        self._runtime.foreground_advance_last_kind = last_kind
+        self._runtime.foreground_advance_last_delta = last_delta
+        self._runtime.foreground_advance_last_matched = last_matched
+        self._runtime.foreground_advance_last_match_reason = last_match_reason
         return triggered
 
     def consume_foreground_wheel_down(self) -> bool:
@@ -3941,10 +4057,11 @@ class OcrReaderManager:
         runtime_profile = profile
         runtime_capture_profile_selection = capture_profile_selection
         event_seq_before_capture = int(self._writer.last_seq or 0)
-        emit_observed_lines = (
+        after_advance_trigger_mode = (
             str(self._config.ocr_reader_trigger_mode or "").strip().lower()
-            != OCR_TRIGGER_MODE_AFTER_ADVANCE
+            == OCR_TRIGGER_MODE_AFTER_ADVANCE
         )
+        emit_observed_lines = not after_advance_trigger_mode
         capture_attempted = False
         capture_completed = False
         capture_error = False
@@ -4036,7 +4153,8 @@ class OcrReaderManager:
                                 )
                             )
                         if (
-                            not dialogue_emitted
+                            not after_advance_trigger_mode
+                            and not dialogue_emitted
                             and not dialogue_text_is_menu_status
                             and not dialogue_menu_choices
                             and self._should_attempt_followup_confirm(
@@ -4103,9 +4221,16 @@ class OcrReaderManager:
                             else:
                                 self._aihong_dialogue_idle_polls += 1
                             if (
-                                dialogue_text_is_menu_status
-                                or dialogue_menu_choices
-                                or self._aihong_dialogue_idle_polls >= 2
+                                (
+                                    not after_advance_trigger_mode
+                                    or dialogue_text_is_menu_status
+                                    or dialogue_menu_choices
+                                )
+                                and (
+                                    dialogue_text_is_menu_status
+                                    or dialogue_menu_choices
+                                    or self._aihong_dialogue_idle_polls >= 2
+                                )
                             ):
                                 menu_profile_selection = self._capture_profile_selection_for_target(
                                     target,
@@ -4180,7 +4305,8 @@ class OcrReaderManager:
                         )
                     )
                     if (
-                        not emitted
+                        not after_advance_trigger_mode
+                        and not emitted
                         and self._should_attempt_followup_confirm(
                             extraction.text,
                             state=self._default_ocr_state,
@@ -4387,13 +4513,7 @@ class OcrReaderManager:
             detail = "disabled_by_config"
         return OcrBackendDescriptor(
             kind="rapidocr",
-            backend=RapidOcrBackend(
-                install_target_dir_raw=self._config.rapidocr_install_target_dir,
-                engine_type=self._config.rapidocr_engine_type,
-                lang_type=self._config.rapidocr_lang_type,
-                model_type=self._config.rapidocr_model_type,
-                ocr_version=self._config.rapidocr_ocr_version,
-            ),
+            backend=self._rapidocr_backend_for_config(),
             path=str(inspection.get("detected_path") or ""),
             model=str(
                 inspection.get("selected_model")
@@ -4633,6 +4753,20 @@ class OcrReaderManager:
             ),
             stale_capture_backend=bool(
                 self._stale_capture_backend or self._runtime.stale_capture_backend
+            ),
+            foreground_advance_monitor_running=self._wheel_monitor.is_running(),
+            foreground_advance_last_seq=max(
+                int(self._wheel_monitor.last_seq() or 0),
+                int(self._runtime.foreground_advance_last_seq or 0),
+            ),
+            foreground_advance_consumed_seq=int(
+                self._runtime.foreground_advance_consumed_seq or self._last_consumed_wheel_seq
+            ),
+            foreground_advance_last_kind=str(self._runtime.foreground_advance_last_kind or ""),
+            foreground_advance_last_delta=int(self._runtime.foreground_advance_last_delta or 0),
+            foreground_advance_last_matched=bool(self._runtime.foreground_advance_last_matched),
+            foreground_advance_last_match_reason=str(
+                self._runtime.foreground_advance_last_match_reason or ""
             ),
         )
 

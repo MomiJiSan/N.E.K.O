@@ -39,6 +39,7 @@ warmup_replay_bytes_limit = 65536
 warmup_replay_events_limit = 50
 default_mode = "companion"
 push_notifications = true
+reader_mode = "auto"
 
 [llm]
 llm_call_timeout_seconds = 15

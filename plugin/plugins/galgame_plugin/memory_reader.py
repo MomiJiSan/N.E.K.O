@@ -51,6 +51,40 @@ _SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
 _ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 
 
+def _decode_textractor_stdout_line(raw: bytes) -> str:
+    payload = bytes(raw or b"").rstrip(b"\r\n")
+    if not payload:
+        return ""
+    candidates = [payload]
+    if payload.startswith(b"\x00"):
+        candidates.append(payload[1:])
+    if len(payload) % 2:
+        candidates.append(payload[:-1])
+        if payload.startswith(b"\x00"):
+            candidates.append(payload[1:-1])
+    if b"\x00" in payload:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                text = candidate.decode("utf-16-le", errors="replace")
+            except Exception:
+                continue
+            cleaned = text.replace("\x00", "").replace("\ufffd", "").strip()
+            if cleaned.startswith("[") or cleaned.startswith("Usage") or "]" in cleaned:
+                return cleaned
+    return payload.decode("utf-8", errors="replace").replace("\x00", "").replace("\ufffd", "").strip()
+
+
+def _textractor_hook_command(code: str, pid: int) -> str:
+    normalized = str(code or "").strip()
+    if not normalized:
+        return ""
+    if re.search(r"(?:^|\s)-P\d+\b", normalized):
+        return normalized
+    return f"{normalized} -P{int(pid)}"
+
+
 def is_windows_platform() -> bool:
     return os.name == "nt" or sys.platform.startswith("win")
 
@@ -204,7 +238,9 @@ class _AsyncioTextractorHandle:
                     raw = self._process.stdout.readline()
                     if not raw:
                         break
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    line = _decode_textractor_stdout_line(raw)
+                    if not line:
+                        continue
                     self._queue.put(line)
             except Exception:
                 pass
@@ -932,7 +968,9 @@ class MemoryReaderManager:
                         target.pid,
                     )
                     for code in hook_codes:
-                        await self._process.write(f"{code}\n")
+                        hook_command = _textractor_hook_command(code, target.pid)
+                        if hook_command:
+                            await self._process.write(f"{hook_command}\n")
             except Exception as exc:
                 self._runtime = MemoryReaderRuntime(
                     enabled=True,

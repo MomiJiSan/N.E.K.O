@@ -123,6 +123,7 @@ const FOCUS_PAUSE_REFRESH_INTERVAL_MS = 1000;
 const FIELD_LABELS_ZH = {
   connection_state: '连接状态',
   active_data_source: '当前数据源',
+  reader_mode: '文本读取模式',
   mode: '模式',
   push_notifications: '推送通知',
   advance_speed: '推进速度',
@@ -266,6 +267,12 @@ const DATA_SOURCE_LABELS_ZH = {
   bridge_sdk: 'Bridge SDK',
   ocr_reader: 'OCR 读取',
   memory_reader: '内存读取',
+};
+
+const READER_MODE_LABELS_ZH = {
+  auto: '自动（内存优先，空则 OCR）',
+  memory_reader: '内存读取',
+  ocr_reader: 'OCR',
 };
 
 let latestAgentReply = '暂无交互';
@@ -1461,6 +1468,10 @@ function renderStatus(status) {
   document.getElementById('modeSelect').value = status.mode || 'companion';
   document.getElementById('pushToggle').checked = Boolean(status.push_notifications);
   document.getElementById('advanceSpeedSelect').value = status.advance_speed || 'medium';
+  const readerModeSelect = document.getElementById('readerModeSelect');
+  if (readerModeSelect) {
+    readerModeSelect.value = status.reader_mode || 'auto';
+  }
   const ocrPollIntervalInput = document.getElementById('ocrPollIntervalInput');
   if (ocrPollIntervalInput) {
     const interval = Number(status.ocr_reader_poll_interval_seconds || 2);
@@ -1493,6 +1504,7 @@ function renderStatus(status) {
   renderGrid('statusGrid', [
     { label: 'connection_state', value: status.connection_state || '' },
     { label: 'active_data_source', value: status.active_data_source || '' },
+    { label: 'reader_mode', value: READER_MODE_LABELS_ZH[status.reader_mode] || status.reader_mode || 'auto' },
     { label: 'mode', value: status.mode || '' },
     {
       label: 'agent_user_status',
@@ -1795,6 +1807,13 @@ function renderOcrRuntime(status) {
     { label: 'foreground_refresh_detail', value: runtime.foreground_refresh_detail || '' },
     { label: 'foreground_hwnd', value: String(runtime.foreground_hwnd || 0) },
     { label: 'target_hwnd', value: String(runtime.target_hwnd || 0) },
+    { label: 'foreground_advance_monitor_running', value: String(Boolean(runtime.foreground_advance_monitor_running)) },
+    { label: 'foreground_advance_last_seq', value: String(runtime.foreground_advance_last_seq || 0) },
+    { label: 'foreground_advance_consumed_seq', value: String(runtime.foreground_advance_consumed_seq || 0) },
+    { label: 'foreground_advance_last_kind', value: runtime.foreground_advance_last_kind || '' },
+    { label: 'foreground_advance_last_delta', value: String(runtime.foreground_advance_last_delta || 0) },
+    { label: 'foreground_advance_last_matched', value: String(Boolean(runtime.foreground_advance_last_matched)) },
+    { label: 'foreground_advance_last_match_reason', value: runtime.foreground_advance_last_match_reason || '' },
     { label: 'last_poll_started_at', value: runtime.last_poll_started_at || '' },
     { label: 'last_poll_completed_at', value: runtime.last_poll_completed_at || '' },
     {
@@ -2115,6 +2134,11 @@ function renderDxcam(status) {
   const installed = Boolean(dxcam.installed) || (installState && installState.status === 'completed');
   const selectedCaptureBackend = status.ocr_capture_backend_selection || 'auto';
   const usingDxcam = runtime.capture_backend_kind === 'dxcam';
+  const captureBackendText = runtime.capture_backend_kind || (
+    selectedCaptureBackend === 'dxcam'
+      ? 'DXcam 已选择，等待下一次 OCR 截图确认'
+      : '未知'
+  );
   configureUseButton('dxcamUseBtn', {
     active: selectedCaptureBackend === 'dxcam',
     disabled: !installed,
@@ -2160,10 +2184,12 @@ function renderDxcam(status) {
     kicker.textContent = usingDxcam ? '截图依赖已接管' : '截图依赖已就绪';
     title.textContent = usingDxcam
       ? 'DXcam 正在作为截图后端工作'
-      : 'DXcam 已安装，等待 OCR Reader 自动使用';
+      : selectedCaptureBackend === 'dxcam'
+        ? 'DXcam 已选择，等待下一次 OCR 截图确认'
+        : 'DXcam 已安装，等待 OCR Reader 自动使用';
     body.textContent = usingDxcam
       ? '当前截图后端使用 DXcam。它仍要求游戏窗口前台可见，不做后台捕获或绕过。'
-      : `DXcam 已安装。当前截图后端: ${runtime.capture_backend_kind || '未知'}。`;
+      : `DXcam 已安装。当前截图后端: ${captureBackendText}。`;
     path.textContent = dxcam.detected_path ? `检测路径: ${dxcam.detected_path}` : '';
     button.hidden = true;
   } else {
@@ -3000,7 +3026,7 @@ async function setOcrBackendSelection({ backendSelection = null, captureBackend 
     setFlash(`正在${label}...`, 'info');
     await callPlugin('galgame_set_ocr_backend', args);
     setFlash(`${label} 已保存`, 'success');
-    await refreshAll({ preserveFlash: true });
+    await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -3010,9 +3036,14 @@ async function saveMode() {
   const mode = document.getElementById('modeSelect').value;
   const pushNotifications = document.getElementById('pushToggle').checked;
   const advanceSpeed = document.getElementById('advanceSpeedSelect').value || 'medium';
+  const readerMode = document.getElementById('readerModeSelect')?.value || 'auto';
   const ocrPollIntervalRaw = document.getElementById('ocrPollIntervalInput')?.value || '';
   const ocrPollInterval = Number(ocrPollIntervalRaw || 2);
   const ocrTriggerMode = document.getElementById('ocrTriggerModeSelect')?.value || 'after_advance';
+  if (!['auto', 'memory_reader', 'ocr_reader'].includes(readerMode)) {
+    setFlash('文本读取模式无效。', 'error');
+    return;
+  }
   if (!Number.isFinite(ocrPollInterval) || ocrPollInterval < 0.5 || ocrPollInterval > 10) {
     setFlash('OCR/DXcam 识别间隔必须在 0.5 到 10 秒之间。', 'error');
     return;
@@ -3027,6 +3058,7 @@ async function saveMode() {
       mode,
       push_notifications: pushNotifications,
       advance_speed: advanceSpeed,
+      reader_mode: readerMode,
     });
     await callPlugin('galgame_set_ocr_timing', {
       poll_interval_seconds: ocrPollInterval,

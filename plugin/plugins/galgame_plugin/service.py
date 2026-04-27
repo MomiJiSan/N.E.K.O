@@ -29,6 +29,10 @@ from .models import (
     OCR_TRIGGER_MODE_INTERVAL,
     OCR_TRIGGER_MODE_AFTER_ADVANCE,
     OCR_TRIGGER_MODES,
+    READER_MODE_AUTO,
+    READER_MODE_MEMORY,
+    READER_MODE_OCR,
+    READER_MODES,
     STATE_ACTIVE,
     STATE_DISCONNECTED,
     STATE_ERROR,
@@ -265,6 +269,13 @@ def _coerce_ocr_trigger_mode(value: object, default: str = OCR_TRIGGER_MODE_AFTE
     return default
 
 
+def _coerce_reader_mode(value: object, default: str = READER_MODE_AUTO) -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized in READER_MODES:
+        return normalized
+    return default
+
+
 def _default_bridge_root_raw() -> str:
     if sys.platform.startswith("win"):
         return "%LOCALAPPDATA%/N.E.K.O/galgame-bridge"
@@ -347,6 +358,7 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             llm_obj.get("llm_request_cache_ttl_seconds"), 2.0, minimum=0.0
         ),
         llm_target_entry_ref=str(llm_obj.get("target_entry_ref") or "").strip(),
+        reader_mode=_coerce_reader_mode(galgame_obj.get("reader_mode")),
         memory_reader_enabled=_coerce_bool(
             memory_reader_obj.get("enabled"),
             _default_memory_reader_enabled(),
@@ -553,22 +565,54 @@ def filter_ocr_reader_candidates(
     return filtered_ids, filtered_candidates
 
 
+def _candidate_has_text(candidate: SessionCandidate) -> bool:
+    state = candidate.session.get("state", {})
+    if not isinstance(state, dict):
+        return False
+    text = normalize_text(str(state.get("text") or ""))
+    if text:
+        return True
+    choices = state.get("choices", [])
+    return isinstance(choices, list) and bool(choices)
+
+
 def choose_candidate(
     candidates: dict[str, SessionCandidate],
     *,
     bound_game_id: str,
     current_game_id: str,
     keep_current: bool,
+    reader_mode: str = READER_MODE_AUTO,
 ) -> SessionCandidate | None:
     if bound_game_id:
         return candidates.get(bound_game_id)
-    preferred_candidates = [
-        item for item in candidates.values() if item.data_source == DATA_SOURCE_BRIDGE_SDK
-    ]
-    if not preferred_candidates:
+    normalized_reader_mode = _coerce_reader_mode(reader_mode)
+    if normalized_reader_mode == READER_MODE_MEMORY:
+        preferred_candidates = [
+            item for item in candidates.values() if item.data_source == DATA_SOURCE_MEMORY_READER
+        ]
+    elif normalized_reader_mode == READER_MODE_OCR:
         preferred_candidates = [
             item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER
         ]
+    else:
+        preferred_candidates = [
+            item
+            for item in candidates.values()
+            if item.data_source == DATA_SOURCE_MEMORY_READER and _candidate_has_text(item)
+        ]
+    if not preferred_candidates and normalized_reader_mode in {READER_MODE_MEMORY, READER_MODE_OCR}:
+        return None
+    if not preferred_candidates and normalized_reader_mode != READER_MODE_MEMORY:
+        preferred_candidates = [
+            item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER
+        ]
+    if not preferred_candidates:
+        preferred_candidates = [
+            item for item in candidates.values() if item.data_source == DATA_SOURCE_BRIDGE_SDK
+        ]
+    if not preferred_candidates and normalized_reader_mode == READER_MODE_AUTO:
+        return None
     if not preferred_candidates:
         preferred_candidates = list(candidates.values())
     if keep_current and current_game_id:
@@ -1037,6 +1081,7 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
             active_data_source=state.active_data_source,
         ),
         "phase": "phase_1",
+        "reader_mode": config.reader_mode,
         "memory_reader_enabled": config.memory_reader_enabled,
         "ocr_reader_enabled": config.ocr_reader_enabled,
         "ocr_backend_selection": config.ocr_reader_backend_selection,

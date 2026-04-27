@@ -27,6 +27,7 @@ from .dxcam_support import install_dxcam
 from .models import (
     ADVANCE_SPEEDS,
     ADVANCE_SPEED_MEDIUM,
+    DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_NONE,
     DATA_SOURCE_OCR_READER,
     MODE_COMPANION,
@@ -45,6 +46,10 @@ from .models import (
     OCR_TRIGGER_MODE_INTERVAL,
     OCR_TRIGGER_MODES,
     parse_ocr_capture_profile_bucket_key,
+    READER_MODE_AUTO,
+    READER_MODE_MEMORY,
+    READER_MODE_OCR,
+    READER_MODES,
     STATE_ACTIVE,
     STATE_ERROR,
     STORE_BOUND_GAME_ID,
@@ -161,6 +166,26 @@ def _normalize_ocr_trigger_mode(value: str | None) -> str:
     if normalized not in OCR_TRIGGER_MODES:
         raise ValueError(f"invalid OCR trigger_mode: {value!r}")
     return normalized
+
+
+def _normalize_reader_mode(value: str | None) -> str:
+    normalized = str(value or READER_MODE_AUTO).strip().lower()
+    if normalized not in READER_MODES:
+        raise ValueError(f"invalid reader_mode: {value!r}")
+    return normalized
+
+
+def _session_candidate_has_text(candidate: Any) -> bool:
+    session = getattr(candidate, "session", {})
+    if not isinstance(session, dict):
+        return False
+    state = session.get("state", {})
+    if not isinstance(state, dict):
+        return False
+    if str(state.get("text") or "").strip():
+        return True
+    choices = state.get("choices", [])
+    return isinstance(choices, list) and bool(choices)
 
 
 def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
@@ -339,6 +364,8 @@ class GalgamePlugin(NekoPluginBase):
         self._last_ocr_advance_capture_reason = ""
 
     def request_ocr_after_advance_capture(self, *, reason: str = "agent_advance") -> None:
+        if self._cfg is not None and getattr(self._cfg, "reader_mode", READER_MODE_AUTO) == READER_MODE_MEMORY:
+            return
         with self._state_lock:
             self._pending_ocr_advance_captures = min(
                 self._pending_ocr_advance_captures + 1,
@@ -886,6 +913,16 @@ class GalgamePlugin(NekoPluginBase):
             )
         _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
 
+    def _persist_reader_mode(self, *, reader_mode: str) -> None:
+        text = _PLUGIN_TOML_PATH.read_text(encoding="utf-8")
+        text = _replace_toml_section_value(
+            text,
+            section="galgame",
+            key="reader_mode",
+            value=reader_mode,
+        )
+        _PLUGIN_TOML_PATH.write_text(text, encoding="utf-8")
+
     def _persist_ocr_timing(
         self,
         *,
@@ -1231,6 +1268,8 @@ class GalgamePlugin(NekoPluginBase):
         return Ok({"status": "tick"})
 
     def _refresh_ocr_foreground_state(self) -> None:
+        if self._cfg is not None and getattr(self._cfg, "reader_mode", READER_MODE_AUTO) == READER_MODE_MEMORY:
+            return
         if self._ocr_reader_manager is None:
             return
         refresh = getattr(self._ocr_reader_manager, "refresh_foreground_state", None)
@@ -1252,6 +1291,8 @@ class GalgamePlugin(NekoPluginBase):
 
     def _trigger_ocr_for_manual_foreground_advance(self) -> None:
         if self._cfg is None or self._ocr_reader_manager is None:
+            return
+        if getattr(self._cfg, "reader_mode", READER_MODE_AUTO) == READER_MODE_MEMORY:
             return
         if self._cfg.ocr_reader_trigger_mode != OCR_TRIGGER_MODE_AFTER_ADVANCE:
             return
@@ -1307,6 +1348,9 @@ class GalgamePlugin(NekoPluginBase):
         raw_candidates: dict[str, Any] = {}
         memory_reader_runtime = json_copy(local.get("memory_reader_runtime") or {})
         ocr_reader_runtime = json_copy(local.get("ocr_reader_runtime") or {})
+        reader_mode = _normalize_reader_mode(getattr(self._cfg, "reader_mode", READER_MODE_AUTO))
+        memory_reader_allowed = reader_mode in {READER_MODE_AUTO, READER_MODE_MEMORY}
+        ocr_reader_allowed = reader_mode in {READER_MODE_AUTO, READER_MODE_OCR}
 
         try:
             raw_available_game_ids, raw_candidates, scan_warnings = await asyncio.to_thread(
@@ -1334,16 +1378,17 @@ class GalgamePlugin(NekoPluginBase):
                 pass
             return
 
-        bridge_sdk_available = any(
-            candidate.data_source == "bridge_sdk"
+        memory_reader_candidate_available = any(
+            candidate.data_source == DATA_SOURCE_MEMORY_READER
+            and _session_candidate_has_text(candidate)
             for candidate in raw_candidates.values()
         )
 
-        if self._memory_reader_manager is not None:
+        if self._memory_reader_manager is not None and memory_reader_allowed:
             self._memory_reader_manager.update_config(self._cfg)
             try:
                 memory_reader_tick = await self._memory_reader_manager.tick(
-                    bridge_sdk_available=bridge_sdk_available,
+                    bridge_sdk_available=False,
                 )
                 warnings.extend(memory_reader_tick.warnings)
                 memory_reader_runtime = memory_reader_tick.runtime
@@ -1356,6 +1401,15 @@ class GalgamePlugin(NekoPluginBase):
                     warnings.extend(rescan_warnings)
             except Exception as exc:
                 warnings.append(f"memory_reader tick failed: {exc}")
+        memory_reader_candidate_available = any(
+            candidate.data_source == DATA_SOURCE_MEMORY_READER
+            and _session_candidate_has_text(candidate)
+            for candidate in raw_candidates.values()
+        )
+        if reader_mode == READER_MODE_AUTO and memory_reader_candidate_available:
+            ocr_reader_allowed = False
+            with self._state_lock:
+                self._pending_ocr_advance_captures = 0
 
         ocr_trigger_mode = str(
             getattr(self._cfg, "ocr_reader_trigger_mode", OCR_TRIGGER_MODE_AFTER_ADVANCE)
@@ -1369,6 +1423,7 @@ class GalgamePlugin(NekoPluginBase):
         )
         if (
             self._ocr_reader_manager is not None
+            and ocr_reader_allowed
             and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
             and pending_ocr_delay_remaining <= 0.0
         ):
@@ -1392,11 +1447,14 @@ class GalgamePlugin(NekoPluginBase):
                 except Exception as exc:
                     warnings.append(f"ocr_reader foreground refresh failed: {exc}")
         ocr_tick_allowed = (
-            ocr_trigger_mode == OCR_TRIGGER_MODE_INTERVAL
-            or force
-            or (pending_ocr_advance_capture and pending_ocr_delay_remaining <= 0.0)
-            or str(ocr_reader_runtime.get("status") or "") not in {"active"}
-            or str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
+            ocr_reader_allowed
+            and (
+                ocr_trigger_mode == OCR_TRIGGER_MODE_INTERVAL
+                or force
+                or (pending_ocr_advance_capture and pending_ocr_delay_remaining <= 0.0)
+                or str(ocr_reader_runtime.get("status") or "") not in {"active"}
+                or str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
+            )
         )
 
         if self._ocr_reader_manager is not None and ocr_tick_allowed:
@@ -1410,7 +1468,7 @@ class GalgamePlugin(NekoPluginBase):
                 update_advance_speed(str(local.get("advance_speed") or ADVANCE_SPEED_MEDIUM))
             try:
                 ocr_reader_tick = await self._ocr_reader_manager.tick(
-                    bridge_sdk_available=bridge_sdk_available,
+                    bridge_sdk_available=False,
                     memory_reader_runtime=memory_reader_runtime,
                 )
                 warnings.extend(ocr_reader_tick.warnings)
@@ -1458,6 +1516,20 @@ class GalgamePlugin(NekoPluginBase):
             candidates,
             runtime=ocr_reader_runtime,
         )
+        if reader_mode == READER_MODE_MEMORY:
+            candidates = {
+                game_id: candidate
+                for game_id, candidate in candidates.items()
+                if candidate.data_source != DATA_SOURCE_OCR_READER
+            }
+            available_game_ids = [game_id for game_id in available_game_ids if game_id in candidates]
+        elif reader_mode == READER_MODE_OCR:
+            candidates = {
+                game_id: candidate
+                for game_id, candidate in candidates.items()
+                if candidate.data_source != DATA_SOURCE_MEMORY_READER
+            }
+            available_game_ids = [game_id for game_id in available_game_ids if game_id in candidates]
         local["available_game_ids"] = available_game_ids
 
         keep_current = (
@@ -1470,6 +1542,7 @@ class GalgamePlugin(NekoPluginBase):
             bound_game_id=str(local["bound_game_id"]),
             current_game_id=str(local["active_game_id"]),
             keep_current=keep_current,
+            reader_mode=reader_mode,
         )
 
         if candidate is not None:
@@ -1907,6 +1980,7 @@ class GalgamePlugin(NekoPluginBase):
                 "mode": {"type": "string", "enum": sorted(MODES)},
                 "push_notifications": {"type": "boolean"},
                 "advance_speed": {"type": "string", "enum": sorted(ADVANCE_SPEEDS)},
+                "reader_mode": {"type": "string", "enum": sorted(READER_MODES)},
             },
             "required": ["mode"],
         },
@@ -1917,27 +1991,45 @@ class GalgamePlugin(NekoPluginBase):
         mode: str,
         push_notifications: bool | None = None,
         advance_speed: str | None = None,
+        reader_mode: str | None = None,
         **_,
     ):
+        if self._cfg is None:
+            return Err(SdkError("galgame_plugin is not configured"))
         if mode not in MODES:
             return Err(SdkError(f"invalid galgame mode: {mode!r}"))
         if advance_speed is not None and advance_speed not in ADVANCE_SPEEDS:
             return Err(SdkError(f"invalid advance speed: {advance_speed!r}"))
+        try:
+            normalized_reader_mode = _normalize_reader_mode(reader_mode or self._cfg.reader_mode)
+        except ValueError as exc:
+            return Err(SdkError(str(exc)))
 
+        old_reader_mode = self._cfg.reader_mode
+        self._cfg.reader_mode = normalized_reader_mode
+        if self._memory_reader_manager is not None:
+            self._memory_reader_manager.update_config(self._cfg)
+        if self._ocr_reader_manager is not None:
+            self._ocr_reader_manager.update_config(self._cfg)
         with self._state_lock:
             self._state.mode = mode
             if push_notifications is not None:
                 self._state.push_notifications = bool(push_notifications)
             if advance_speed is not None:
                 self._state.advance_speed = advance_speed
+            if normalized_reader_mode == READER_MODE_MEMORY:
+                self._pending_ocr_advance_captures = 0
+            self._state.next_poll_at_monotonic = 0.0
             payload = {
                 "mode": self._state.mode,
                 "push_notifications": self._state.push_notifications,
                 "advance_speed": self._state.advance_speed,
+                "reader_mode": self._cfg.reader_mode,
                 "summary": (
                     f"mode={self._state.mode} "
                     f"push_notifications={self._state.push_notifications} "
-                    f"advance_speed={self._state.advance_speed}"
+                    f"advance_speed={self._state.advance_speed} "
+                    f"reader_mode={self._cfg.reader_mode}"
                 ),
             }
             bound_game_id = self._state.bound_game_id
@@ -1951,8 +2043,15 @@ class GalgamePlugin(NekoPluginBase):
                 push_notifications=persist_push,
                 advance_speed=persist_advance_speed,
             )
+            self._persist_reader_mode(reader_mode=normalized_reader_mode)
         except Exception as exc:
+            self._cfg.reader_mode = old_reader_mode
+            if self._memory_reader_manager is not None:
+                self._memory_reader_manager.update_config(self._cfg)
+            if self._ocr_reader_manager is not None:
+                self._ocr_reader_manager.update_config(self._cfg)
             return Err(SdkError(f"persist mode failed: {exc}"))
+        self._start_background_bridge_poll()
         if self._game_agent is not None and not mode_allows_agent_actuation(mode):
             try:
                 agent_payload = await self._game_agent.apply_mode_change(self._snapshot_state())

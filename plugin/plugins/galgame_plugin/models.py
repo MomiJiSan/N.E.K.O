@@ -28,6 +28,11 @@ DATA_SOURCES = frozenset(
     }
 )
 
+READER_MODE_AUTO = "auto"
+READER_MODE_MEMORY = DATA_SOURCE_MEMORY_READER
+READER_MODE_OCR = DATA_SOURCE_OCR_READER
+READER_MODES = frozenset({READER_MODE_AUTO, READER_MODE_MEMORY, READER_MODE_OCR})
+
 OCR_TRIGGER_MODE_INTERVAL = "interval"
 OCR_TRIGGER_MODE_AFTER_ADVANCE = "after_advance"
 OCR_TRIGGER_MODES = frozenset({OCR_TRIGGER_MODE_INTERVAL, OCR_TRIGGER_MODE_AFTER_ADVANCE})
@@ -327,6 +332,7 @@ class GalgameConfig:
     llm_max_in_flight: int
     llm_request_cache_ttl_seconds: float
     llm_target_entry_ref: str
+    reader_mode: str
     memory_reader_enabled: bool
     memory_reader_textractor_path: str
     memory_reader_install_release_api_url: str

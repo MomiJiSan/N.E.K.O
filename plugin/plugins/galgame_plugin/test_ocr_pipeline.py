@@ -130,6 +130,7 @@ async def main() -> None:
         llm_max_in_flight=2,
         llm_request_cache_ttl_seconds=2.0,
         llm_target_entry_ref="",
+        reader_mode="auto",
         memory_reader_enabled=False,
         memory_reader_textractor_path="",
         memory_reader_install_release_api_url="",
