@@ -544,6 +544,7 @@ async def _handle_agent_event(event: dict):
 
                 # Build structured callback and enqueue for LLM injection
                 cb_status = event.get("status") or ("completed" if event.get("success", True) else "failed")
+                event_metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
                 callback = {
                     "event": "agent_task_callback",
                     "task_id": event.get("task_id") or "",
@@ -554,6 +555,8 @@ async def _handle_agent_event(event: dict):
                     "detail": event.get("detail") or text,
                     "error_message": event.get("error_message") or "",
                     "timestamp": event.get("timestamp") or "",
+                    "metadata": event_metadata,
+                    "context_type": event_metadata.get("context_type") or "",
                 }
                 mgr.enqueue_agent_callback(callback)
                 logger.info("[EventBus] %s enqueued callback, scheduling trigger_agent_callbacks", event_type)

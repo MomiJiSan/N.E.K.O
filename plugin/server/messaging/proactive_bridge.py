@@ -146,6 +146,7 @@ class ProactiveBridge:
                             "detail": content,
                             "channel": f"plugin:{plugin_id}" if plugin_id else "plugin",
                             "task_id": metadata.get("task_id", ""),
+                            "metadata": metadata,
                             "success": True,
                             "status": "completed",
                             "timestamp": payload.get("time", ""),

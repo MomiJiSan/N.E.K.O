@@ -1156,23 +1156,41 @@ def _append_unique_line(
     if not line:
         return lines[-limit:]
     normalized = dict(line)
-    exists = any(
-        str(item.get("line_id") or "") == str(normalized.get("line_id") or "")
-        and str(item.get("text") or "") == str(normalized.get("text") or "")
-        for item in lines
-    )
+    target_key = _dialogue_line_dedupe_key(normalized)
+    exists = any(_dialogue_line_dedupe_key(item) == target_key for item in lines)
     if exists:
         return lines[-limit:]
     merged = list(lines) + [normalized]
     return merged[-limit:]
 
 
+def _dialogue_line_dedupe_key(item: dict[str, Any]) -> str:
+    text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+    if text:
+        return "::".join(
+            [
+                str(item.get("scene_id") or "").strip(),
+                str(item.get("speaker") or "").strip(),
+                text,
+            ]
+        )
+    return str(item.get("line_id") or "").strip()
+
+
 def _dialogue_context_lines(lines: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
-    return [
-        dict(item)
-        for item in lines
-        if _looks_like_game_dialogue_context_line(item)
-    ][-limit:]
+    deduped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for item in lines:
+        if not _looks_like_game_dialogue_context_line(item):
+            continue
+        normalized = dict(item)
+        key = _dialogue_line_dedupe_key(normalized)
+        if not key:
+            continue
+        if key not in deduped:
+            order.append(key)
+        deduped[key] = normalized
+    return [deduped[key] for key in order][-limit:]
 
 
 def _is_memory_reader_identifier(value: object) -> bool:

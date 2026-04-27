@@ -2709,12 +2709,10 @@ class GameLLMAgent:
         current_scene_id = str(snapshot.get("scene_id") or "")
         current_route_id = str(snapshot.get("route_id") or "")
         if current_scene_id and current_scene_id != self._observed_scene_id:
-            context = build_summarize_context(shared, scene_id=current_scene_id)
-            summary = build_local_scene_summary(
+            summary, context, summary_meta = await self._summarize_scene_for_cat(
+                shared,
                 scene_id=current_scene_id,
                 route_id=current_route_id,
-                lines=context["recent_lines"],
-                selected_choices=context["recent_choices"],
                 snapshot=snapshot,
             )
             self._append_bounded(
@@ -2731,16 +2729,21 @@ class GameLLMAgent:
                 self._push_agent_message(
                     shared,
                     kind="scene_summary",
-                    content=f"剧情摘要（请猫娘评论）：{summary}",
+                    content=f"游戏上下文（请猫娘自然回应）：{summary}",
                     scene_id=current_scene_id,
                     route_id=current_route_id,
+                    metadata={
+                        "context_type": "galgame_scene_context",
+                        "trigger": "scene_changed",
+                        **summary_meta,
+                    },
                 )
             self._observed_scene_id = current_scene_id
             self._summary_scene_id = current_scene_id
             self._summary_seen_line_keys.clear()
             self._summary_lines_since_push = 0
 
-        self._maybe_push_periodic_scene_summary(shared, snapshot=snapshot)
+        await self._maybe_push_periodic_scene_summary(shared, snapshot=snapshot)
 
         selected = latest_selected_choice(shared.get("history_choices", []))
         if selected is not None:
@@ -2779,12 +2782,14 @@ class GameLLMAgent:
                 self._observed_choice_marker = marker
 
     def _line_summary_key(self, line: dict[str, Any]) -> str:
-        line_id = str(line.get("line_id") or "").strip()
         text = str(line.get("text") or "").strip()
         speaker = str(line.get("speaker") or "").strip()
-        return line_id or f"{speaker}:{text}"
+        scene_id = str(line.get("scene_id") or "").strip()
+        if text:
+            return f"{scene_id}:{speaker}:{text}"
+        return str(line.get("line_id") or "").strip()
 
-    def _maybe_push_periodic_scene_summary(
+    async def _maybe_push_periodic_scene_summary(
         self,
         shared: dict[str, Any],
         *,
@@ -2818,25 +2823,104 @@ class GameLLMAgent:
         if self._summary_lines_since_push < self._SCENE_SUMMARY_PUSH_LINE_INTERVAL:
             return
 
-        summary = build_local_scene_summary(
+        route_id = str(context.get("route_id") or snapshot.get("route_id") or "")
+        summary, context, summary_meta = await self._summarize_scene_for_cat(
+            shared,
             scene_id=scene_id,
-            route_id=str(context.get("route_id") or snapshot.get("route_id") or ""),
-            lines=list(context.get("recent_lines") or []),
-            selected_choices=list(context.get("recent_choices") or []),
+            route_id=route_id,
             snapshot=snapshot,
         )
         self._summary_lines_since_push %= self._SCENE_SUMMARY_PUSH_LINE_INTERVAL
         self._push_agent_message(
             shared,
             kind="scene_summary",
-            content=f"剧情摘要（请猫娘评论）：{summary}",
+            content=f"游戏上下文（请猫娘自然回应）：{summary}",
             scene_id=scene_id,
-            route_id=str(context.get("route_id") or snapshot.get("route_id") or ""),
+            route_id=route_id,
             metadata={
+                "context_type": "galgame_scene_context",
                 "trigger": "line_count",
                 "line_interval": self._SCENE_SUMMARY_PUSH_LINE_INTERVAL,
+                **summary_meta,
             },
         )
+
+    async def _summarize_scene_for_cat(
+        self,
+        shared: dict[str, Any],
+        *,
+        scene_id: str,
+        route_id: str,
+        snapshot: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        context = build_summarize_context(shared, scene_id=scene_id)
+        summary = ""
+        meta: dict[str, Any] = {"summary_source": "local_context"}
+        if self._llm_gateway is not None:
+            try:
+                payload = await self._llm_gateway.summarize_scene(context)
+                payload_degraded = bool(payload.get("degraded"))
+                summary = "" if payload_degraded else str(payload.get("summary") or "").strip()
+                meta = {
+                    "summary_source": "local_context" if payload_degraded else "llm",
+                    "summary_degraded": payload_degraded,
+                    "summary_diagnostic": str(payload.get("diagnostic") or ""),
+                }
+            except Exception as exc:
+                meta = {
+                    "summary_source": "local_context",
+                    "summary_degraded": True,
+                    "summary_diagnostic": str(exc),
+                }
+        if not summary:
+            summary = self._build_scene_context_fallback(
+                scene_id=scene_id,
+                route_id=route_id or str(context.get("route_id") or ""),
+                lines=list(context.get("recent_lines") or []),
+                selected_choices=list(context.get("recent_choices") or []),
+                snapshot=snapshot,
+            )
+        return summary, context, meta
+
+    @staticmethod
+    def _build_scene_context_fallback(
+        *,
+        scene_id: str,
+        route_id: str,
+        lines: list[dict[str, Any]],
+        selected_choices: list[dict[str, Any]],
+        snapshot: dict[str, Any],
+    ) -> str:
+        recent_parts: list[str] = []
+        for line in lines[-6:]:
+            if not isinstance(line, dict):
+                continue
+            text = str(line.get("text") or "").strip()
+            if not text:
+                continue
+            speaker = str(line.get("speaker") or "旁白").strip() or "旁白"
+            recent_parts.append(f"{speaker}：{text}")
+        if not recent_parts:
+            current_text = str(snapshot.get("text") or "").strip()
+            if current_text:
+                speaker = str(snapshot.get("speaker") or "旁白").strip() or "旁白"
+                recent_parts.append(f"{speaker}：{current_text}")
+        prefix = f"当前场景 {scene_id or '(unknown)'}"
+        if route_id:
+            prefix += f" / 路线 {route_id}"
+        if recent_parts:
+            summary = f"{prefix} 的近期上下文是：" + "；".join(recent_parts)
+        else:
+            summary = f"{prefix} 暂时没有足够台词上下文。"
+        if selected_choices:
+            choices = [
+                str(choice.get("text") or "").strip()
+                for choice in selected_choices[-3:]
+                if isinstance(choice, dict) and str(choice.get("text") or "").strip()
+            ]
+            if choices:
+                summary += " 最近确认的选项：" + "；".join(choices)
+        return summary
 
     def _push_agent_message(
         self,

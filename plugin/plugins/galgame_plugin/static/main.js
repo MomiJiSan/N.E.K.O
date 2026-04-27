@@ -557,8 +557,20 @@ function buildOcrMissingLineDiagnostic(status = {}) {
   return parts.join(' | ');
 }
 
+function normalizeLineText(value = '') {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
 function lineKey(item = {}) {
-  return `${item.line_id || ''}::${item.text || ''}`;
+  const text = normalizeLineText(item.text || '');
+  if (text) {
+    return [
+      item.scene_id || '',
+      item.speaker || '',
+      text,
+    ].join('::');
+  }
+  return String(item.line_id || '').trim();
 }
 
 function mergedHistoryLines(history = {}) {
@@ -570,6 +582,23 @@ function mergedHistoryLines(history = {}) {
     merged.set(lineKey(item), { ...item, stability: item.stability || 'stable' });
   });
   return Array.from(merged.values());
+}
+
+function scrollToBottom(node) {
+  if (!node) {
+    return;
+  }
+  requestAnimationFrame(() => {
+    node.scrollTop = node.scrollHeight;
+  });
+}
+
+function scrollAllRegionsToBottom() {
+  requestAnimationFrame(() => {
+    document.querySelectorAll('.scroll-region, .reply-text-scroll').forEach((node) => {
+      node.scrollTop = node.scrollHeight;
+    });
+  });
 }
 
 function latestHistoryLine(history = {}) {
@@ -618,6 +647,7 @@ function renderGrid(nodeId, rows) {
       <dd>${escapeHtml(row.value)}</dd>
     </div>
   `).join('');
+  scrollToBottom(container);
 }
 
 function renderStackList(nodeId, items, formatter) {
@@ -625,10 +655,12 @@ function renderStackList(nodeId, items, formatter) {
   if (!items.length) {
     node.className = 'stack-list scroll-region empty-state';
     node.textContent = '暂无数据';
+    scrollToBottom(node);
     return;
   }
   node.className = 'stack-list scroll-region';
   node.innerHTML = items.map(formatter).join('');
+  scrollToBottom(node);
 }
 
 function isInstallTaskTerminal(state) {
@@ -2250,6 +2282,7 @@ function renderExplain(payload) {
     <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || '暂无解释')}</p>
     <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
   `;
+  scrollToBottom(node);
 }
 
 function renderSummary(payload) {
@@ -2264,6 +2297,7 @@ function renderSummary(payload) {
       ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
     </div>
   `;
+  scrollToBottom(node);
 }
 
 function renderSuggest(payload) {
@@ -2282,6 +2316,7 @@ function renderSuggest(payload) {
       `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || '暂无建议')}</div>`}
     </div>
   `;
+  scrollToBottom(node);
 }
 
 function formatInsightMeta(payload) {
@@ -2294,7 +2329,9 @@ function formatInsightMeta(payload) {
 
 function renderAgentStatus(payload) {
   latestAgentStatus = payload || latestAgentStatus;
-  document.getElementById('agentReplyText').textContent = latestAgentReply;
+  const replyNode = document.getElementById('agentReplyText');
+  replyNode.textContent = latestAgentReply;
+  scrollToBottom(replyNode);
   const memoryCounts = payload.memory_counts || {};
   renderGrid('agentStatusGrid', [
     {
@@ -2349,6 +2386,7 @@ function renderExplain(payload) {
     <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || 'No explanation yet')}</p>
     <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
   `;
+  scrollToBottom(node);
 }
 
 function renderSummary(payload) {
@@ -2363,6 +2401,7 @@ function renderSummary(payload) {
       ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
     </div>
   `;
+  scrollToBottom(node);
 }
 
 function renderSuggest(payload) {
@@ -2381,6 +2420,7 @@ function renderSuggest(payload) {
       `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || 'No suggestion yet')}</div>`}
     </div>
   `;
+  scrollToBottom(node);
 }
 
 async function refreshInsights(snapshot, { force = false, history = {}, status = {} } = {}) {
@@ -2552,6 +2592,7 @@ async function refreshAll(options = {}) {
           });
         }
       }
+      scrollAllRegionsToBottom();
       return true;
     } catch (error) {
       renderPluginUnavailable(error);

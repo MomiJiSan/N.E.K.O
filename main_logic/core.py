@@ -82,6 +82,36 @@ NO_RETRY_TTS_CODES = {'API_ARREARS', 'API_KEY_REJECTED'}
 # TTS 错误码：立即上报前端，不受"第3次才通知"门槛限制（含配额——仍允许重试）
 IMMEDIATE_REPORT_TTS_CODES = NO_RETRY_TTS_CODES | {'API_QUOTA_TIME'}
 
+
+def _is_galgame_context_callback(callback: dict) -> bool:
+    channel = str(callback.get("channel") or "")
+    metadata = callback.get("metadata") if isinstance(callback.get("metadata"), dict) else {}
+    context_type = str(callback.get("context_type") or metadata.get("context_type") or "")
+    return channel == "plugin:galgame_plugin" or context_type.startswith("galgame_")
+
+
+def _strip_galgame_context_prefix(text: str) -> str:
+    value = str(text or "").strip()
+    for prefix in (
+        "游戏上下文（请猫娘自然回应）：",
+        "剧情摘要（请猫娘评论）：",
+    ):
+        if value.startswith(prefix):
+            return value[len(prefix):].strip()
+    return value
+
+
+def _build_galgame_context_instruction(items: list[str]) -> str:
+    return (
+        "======[游戏上下文提示]\n"
+        "以下内容来自 galgame 插件对当前游戏画面和近期台词的理解。"
+        "这不是后台任务，也不是任务完成通知。回复时不要说“后台任务完成”、"
+        "“任务跑完了”、“插件完成了”。请直接以当前角色人格自然评论剧情、"
+        "回应角色处境，或给出简短陪伴式反应。\n"
+        + "\n".join(items)
+        + "\n======\n"
+    )
+
 # ---------------------------------------------------------------------------
 # 重要通知缓冲池
 # 任何模块随时可以调用 enqueue_prominent_notice() 往池里推消息；
@@ -2956,12 +2986,20 @@ class LLMSessionManager:
         if not self.pending_agent_callbacks:
             return
 
+        is_galgame_context = all(
+            _is_galgame_context_callback(cb)
+            for cb in self.pending_agent_callbacks
+        )
+
         # Build the instruction from all pending callbacks
         items: list[str] = []
         for cb in self.pending_agent_callbacks:
             status = cb.get("status", "completed")
             summary = (cb.get("summary") or "").strip()
             if not summary:
+                continue
+            if is_galgame_context:
+                items.append(_strip_galgame_context_prefix(summary))
                 continue
             tag = "✅" if status == "completed" else ("⚠️" if status == "partial" else "❌")
             detail = (cb.get("detail") or "").strip()
@@ -2984,10 +3022,13 @@ class LLMSessionManager:
             return
 
         _lang = normalize_language_code(self.user_language, format='short')
-        instruction = (
-            _loc(SYSTEM_NOTIFICATION_TASKS_DONE, _lang).format(name=self.lanlan_name, master=self.master_name)
-            + "\n".join(items)
-        )
+        if is_galgame_context:
+            instruction = _build_galgame_context_instruction(items)
+        else:
+            instruction = (
+                _loc(SYSTEM_NOTIFICATION_TASKS_DONE, _lang).format(name=self.lanlan_name, master=self.master_name)
+                + "\n".join(items)
+            )
         callbacks_snapshot = list(self.pending_agent_callbacks)
 
         # 原子 check-and-claim：若另一路 proactive（router/greeting）在跑或 AI
@@ -3235,11 +3276,19 @@ class LLMSessionManager:
             return ""
         try:
             _lang = normalize_language_code(getattr(self, 'user_language', '') or '', format='short') or get_global_language()
+            is_galgame_context = all(
+                _is_galgame_context_callback(cb)
+                for cb in self.pending_agent_callbacks
+            )
             lines: list[str] = []
             for cb in self.pending_agent_callbacks:
                 status = cb.get("status", "completed")
                 summary = (cb.get("summary") or "").strip()
                 detail = (cb.get("detail") or "").strip()
+                if is_galgame_context:
+                    if summary:
+                        lines.append(_strip_galgame_context_prefix(summary))
+                    continue
                 if status == "completed":
                     tag = _loc(RESULT_PARSER_PHRASES['task_completed'], _lang)
                 elif status == "partial":
@@ -3250,6 +3299,8 @@ class LLMSessionManager:
                 if detail and detail != summary:
                     prefix = _loc(RESULT_PARSER_PHRASES['detail_prefix'], _lang)
                     lines.append(f"{prefix}{detail[:300]}")
+            if is_galgame_context:
+                return _build_galgame_context_instruction(lines)
             return "\n".join(lines)
         finally:
             self.pending_agent_callbacks.clear()
@@ -3626,8 +3677,11 @@ class LLMSessionManager:
                         try:
                             ctx = self.drain_agent_callbacks_for_llm()
                             if ctx:
+                                prefix = ""
+                                if not ctx.startswith("======[游戏上下文提示]"):
+                                    prefix = _loc(AGENT_CALLBACK_NOTIFICATION, normalize_language_code(self.user_language, format='short'))
                                 await self.session.prompt_ephemeral(
-                                    _loc(AGENT_CALLBACK_NOTIFICATION, normalize_language_code(self.user_language, format='short')) + ctx,
+                                    prefix + ctx,
                                 )
                                 # prompt_ephemeral 通过 on_proactive_done → handle_proactive_complete
                                 # 发送 (None, None) 并置 _tts_done_queued_for_turn = True。

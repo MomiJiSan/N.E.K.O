@@ -7455,7 +7455,8 @@ async def test_game_llm_agent_pushes_scene_summary_after_eight_lines(
 
     assert ctx.pushed_messages[-1]["metadata"]["kind"] == "scene_summary"
     assert ctx.pushed_messages[-1]["metadata"]["trigger"] == "line_count"
-    assert "请猫娘评论" in ctx.pushed_messages[-1]["content"]
+    assert "游戏上下文" in ctx.pushed_messages[-1]["content"]
+    assert ctx.pushed_messages[-1]["metadata"]["context_type"] == "galgame_scene_context"
     status = await agent.query_status(shared)
     assert status["scene_summary_line_interval"] == 8
 
