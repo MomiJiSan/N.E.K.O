@@ -1241,6 +1241,13 @@ class OcrReaderRuntime:
     last_poll_completed_at: str = ""
     last_poll_duration_seconds: float = 0.0
     last_poll_emitted_event: bool = False
+    last_tick_skipped: bool = False
+    last_tick_skip_reason: str = ""
+    pending_visual_scene_count: int = 0
+    last_auto_recalibrate_attempts: int = 0
+    last_auto_recalibrate_duration_seconds: float = 0.0
+    last_auto_recalibrate_limited: bool = False
+    last_auto_recalibrate_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1322,6 +1329,13 @@ class OcrReaderRuntime:
             "last_poll_completed_at": self.last_poll_completed_at,
             "last_poll_duration_seconds": self.last_poll_duration_seconds,
             "last_poll_emitted_event": self.last_poll_emitted_event,
+            "last_tick_skipped": self.last_tick_skipped,
+            "last_tick_skip_reason": self.last_tick_skip_reason,
+            "pending_visual_scene_count": self.pending_visual_scene_count,
+            "last_auto_recalibrate_attempts": self.last_auto_recalibrate_attempts,
+            "last_auto_recalibrate_duration_seconds": self.last_auto_recalibrate_duration_seconds,
+            "last_auto_recalibrate_limited": self.last_auto_recalibrate_limited,
+            "last_auto_recalibrate_error": self.last_auto_recalibrate_error,
         }
 
 
@@ -1950,6 +1964,15 @@ class RapidOcrBackend:
         return "\n".join(text for text, _score, _box in lines), boxes
 
 
+from .ocr_backends import RapidOcrBackend, TesseractOcrBackend
+from .ocr_capture import (
+    DxcamCaptureBackend,
+    ImageGrabCaptureBackend,
+    PrintWindowCaptureBackend,
+    Win32CaptureBackend,
+)
+
+
 def _default_window_scanner() -> list[DetectedGameWindow]:
     try:
         import win32gui
@@ -2360,7 +2383,7 @@ def _window_sort_key(candidate: DetectedGameWindow) -> tuple[int, int, float, st
     )
 
 
-class OcrReaderBridgeWriter:
+class _LegacyOcrReaderBridgeWriter:
     def __init__(
         self,
         *,
@@ -2851,6 +2874,9 @@ class OcrReaderBridgeWriter:
         return "", raw_text.strip()
 
 
+from .ocr_bridge import OcrReaderBridgeWriter
+
+
 class OcrReaderManager:
     def __init__(
         self,
@@ -2919,6 +2945,10 @@ class OcrReaderManager:
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
         self._pending_visual_scene_count = 0
+        self._last_auto_recalibrate_attempts = 0
+        self._last_auto_recalibrate_duration_seconds = 0.0
+        self._last_auto_recalibrate_limited = False
+        self._last_auto_recalibrate_error = ""
         self._tick_lock = threading.Lock()
         self._wheel_monitor = _MouseWheelMonitor(time_fn=self._time_fn)
         self._wheel_monitor.start()
@@ -3580,8 +3610,30 @@ class OcrReaderManager:
         bottom = max(top, min(bottom, height))
         return (left, top, right, bottom)
 
+    def _record_auto_recalibrate_diagnostic(
+        self,
+        *,
+        started_at: float,
+        attempts: int,
+        limited: bool,
+        error: str = "",
+    ) -> None:
+        self._last_auto_recalibrate_attempts = max(0, int(attempts or 0))
+        self._last_auto_recalibrate_duration_seconds = max(
+            0.0,
+            float(self._time_fn() - started_at),
+        )
+        self._last_auto_recalibrate_limited = bool(limited)
+        self._last_auto_recalibrate_error = str(error or "")
+
     def auto_recalibrate_dialogue_profile(self) -> dict[str, Any]:
         started_at = self._time_fn()
+        self._record_auto_recalibrate_diagnostic(
+            started_at=started_at,
+            attempts=0,
+            limited=False,
+            error="",
+        )
         if not self._config.ocr_reader_enabled:
             raise ValueError("ocr_reader 未启用，无法自动重校准对白区")
         if not self._platform_fn():
@@ -3854,7 +3906,19 @@ class OcrReaderManager:
 
         if best_candidate is None:
             if scan_exhausted:
+                self._record_auto_recalibrate_diagnostic(
+                    started_at=started_at,
+                    attempts=ocr_attempts,
+                    limited=True,
+                    error="scan_budget_exhausted",
+                )
                 raise ValueError("auto recalibrate OCR dialogue profile timed out; please retry on a stable dialogue screen")
+            self._record_auto_recalibrate_diagnostic(
+                started_at=started_at,
+                attempts=ocr_attempts,
+                limited=False,
+                error="no_dialogue_candidate",
+            )
             raise ValueError("自动重校准失败：请先停在稳定对白界面再重试")
 
         window_width = max(0, int(target.width or image_width))
@@ -3866,6 +3930,12 @@ class OcrReaderManager:
         )
         capture_profile = best_candidate["profile"].to_dict()
         sample_text = str(best_candidate["sample_text"] or "")
+        self._record_auto_recalibrate_diagnostic(
+            started_at=started_at,
+            attempts=ocr_attempts,
+            limited=scan_exhausted,
+            error="",
+        )
         return {
             "process_name": process_name,
             "stage": OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
@@ -3902,6 +3972,7 @@ class OcrReaderManager:
         self._pending_background_change_count = 0
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
+        self._pending_visual_scene_count = 0
 
     def _reset_aihong_menu_state(self) -> None:
         self._aihong_menu_ocr_state.reset()
@@ -4118,6 +4189,8 @@ class OcrReaderManager:
         memory_reader_runtime: dict[str, Any],
     ) -> OcrReaderTickResult:
         if not self._tick_lock.acquire(blocking=False):
+            self._runtime.last_tick_skipped = True
+            self._runtime.last_tick_skip_reason = "previous_tick_running"
             result = OcrReaderTickResult(runtime=self._runtime.to_dict())
             result.warnings.append("ocr_reader tick skipped because previous tick is still running")
             return result
@@ -4140,6 +4213,8 @@ class OcrReaderManager:
         backend_plan_duration = 0.0
         window_scan_duration = 0.0
         result = OcrReaderTickResult(runtime=self._runtime.to_dict())
+        self._runtime.last_tick_skipped = False
+        self._runtime.last_tick_skip_reason = ""
         self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
 
         if not self._config.ocr_reader_enabled:
@@ -5135,6 +5210,18 @@ class OcrReaderManager:
                 if "background_hash_skipped" in capture_timing
                 else bool(self._runtime.last_capture_background_hash_skipped)
             ),
+            last_tick_skipped=bool(self._runtime.last_tick_skipped),
+            last_tick_skip_reason=str(self._runtime.last_tick_skip_reason or ""),
+            pending_visual_scene_count=max(0, int(self._pending_visual_scene_count or 0)),
+            last_auto_recalibrate_attempts=max(
+                0,
+                int(self._last_auto_recalibrate_attempts or 0),
+            ),
+            last_auto_recalibrate_duration_seconds=float(
+                self._last_auto_recalibrate_duration_seconds or 0.0
+            ),
+            last_auto_recalibrate_limited=bool(self._last_auto_recalibrate_limited),
+            last_auto_recalibrate_error=str(self._last_auto_recalibrate_error or ""),
         )
 
     def _extract_text_from_image(

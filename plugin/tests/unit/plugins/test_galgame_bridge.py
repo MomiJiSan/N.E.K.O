@@ -21,6 +21,16 @@ from plugin.plugins.galgame_plugin import service as galgame_service
 from plugin.plugins.galgame_plugin.game_llm_agent import GameLLMAgent
 from plugin.plugins.galgame_plugin.host_agent_adapter import HostAgentAdapter, HostAgentError
 from plugin.plugins.galgame_plugin.llm_gateway import LLMGateway
+from plugin.plugins.galgame_plugin.ocr_backends import (
+    RapidOcrBackend as ExtractedRapidOcrBackend,
+    TesseractOcrBackend as ExtractedTesseractOcrBackend,
+)
+from plugin.plugins.galgame_plugin.ocr_bridge import (
+    OcrReaderBridgeWriter as ExtractedOcrReaderBridgeWriter,
+)
+from plugin.plugins.galgame_plugin.ocr_capture import (
+    Win32CaptureBackend as ExtractedWin32CaptureBackend,
+)
 from plugin.plugins.galgame_plugin.memory_reader import (
     compute_memory_reader_game_id,
     DetectedGameProcess,
@@ -4758,6 +4768,80 @@ def test_ocr_writer_start_session_resets_initial_scene_to_game_id(tmp_path: Path
     assert session.session["state"]["scene_id"] == expected_scene_id
     assert events[0]["payload"]["scene_id"] == expected_scene_id
     assert "unknown" not in expected_scene_id
+
+
+@pytest.mark.plugin_unit
+def test_ocr_bridge_writer_is_reexported_from_extracted_module() -> None:
+    assert OcrReaderBridgeWriter is ExtractedOcrReaderBridgeWriter
+
+
+@pytest.mark.plugin_unit
+def test_ocr_backends_are_reexported_from_extracted_modules() -> None:
+    assert galgame_ocr_reader.Win32CaptureBackend is ExtractedWin32CaptureBackend
+    assert galgame_ocr_reader.RapidOcrBackend is ExtractedRapidOcrBackend
+    assert galgame_ocr_reader.TesseractOcrBackend is ExtractedTesseractOcrBackend
+
+
+@pytest.mark.plugin_unit
+def test_ocr_writer_current_state_is_snapshot_and_heartbeat_does_not_rewrite_session(tmp_path: Path) -> None:
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
+    writer.start_session(
+        DetectedGameWindow(
+            hwnd=404,
+            title="哀鸿",
+            process_name="TheLamentingGeese.exe",
+            pid=6104,
+        )
+    )
+
+    assert writer.emit_line_observed("王生：你好。", ts="2024-04-02T12:00:00Z") is True
+    state = writer.current_state
+    state["text"] = "mutated"
+
+    game_dir = tmp_path / writer.game_id
+    session_before = read_session_json(game_dir / "session.json")
+    assert session_before.session is not None
+    assert session_before.session["last_seq"] == 2
+    assert session_before.session["state"]["text"] == "你好。"
+    assert writer.current_state["text"] == "你好。"
+
+    assert writer.emit_heartbeat(ts="2024-04-02T12:00:01Z") is True
+    session_after = read_session_json(game_dir / "session.json")
+    events = _read_bridge_events(game_dir / "events.jsonl")
+
+    assert session_after.session is not None
+    assert session_after.session["last_seq"] == 2
+    assert events[-1]["type"] == "heartbeat"
+    assert events[-1]["seq"] == 3
+
+
+@pytest.mark.plugin_unit
+def test_ocr_hash_distance_accepts_prefixed_phash_values() -> None:
+    assert OcrReaderManager._hash_distance("000f", "0000") == 4
+    assert OcrReaderManager._hash_distance("phash:000f", "0000") == 4
+    assert OcrReaderManager._hash_distance("phash:000f", "phash:0000") == 4
+    assert OcrReaderManager._hash_distance("not-a-hash", "0000") == 0
+
+
+@pytest.mark.plugin_unit
+def test_ocr_runtime_reports_pending_visual_scene_count(tmp_path: Path) -> None:
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path, time_fn=lambda: 1712100100.0)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config({"galgame": {"bridge_root": str(tmp_path)}}),
+        writer=writer,
+    )
+    try:
+        manager._pending_visual_scene_count = 2
+        runtime = manager._build_runtime(
+            status="active",
+            detail="",
+            plan=galgame_ocr_reader.SelectedOcrBackendPlan(),
+        ).to_dict()
+    finally:
+        manager._wheel_monitor.stop()
+
+    assert runtime["pending_visual_scene_count"] == 2
 
 
 @pytest.mark.plugin_unit
