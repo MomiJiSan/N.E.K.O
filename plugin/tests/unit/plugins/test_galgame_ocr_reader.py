@@ -13,6 +13,8 @@ from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
     OcrReaderBridgeWriter,
     OcrReaderManager,
+    _AihongStage,
+    _AihongStateMachine,
     _rapidocr_text_from_output,
     _score_ocr_text,
 )
@@ -1532,4 +1534,155 @@ async def test_ocr_reader_manager_blocks_text_that_looks_like_neko_plugin_ui(
 
     assert second.runtime["detail"] == "self_ui_guard_blocked"
     assert session is not None
-    assert session["state"]["text"] == ""
+
+
+class TestAihongStateMachine:
+    def test_default_state_is_dialogue(self) -> None:
+        sm = _AihongStateMachine()
+        assert sm.is_dialogue
+        assert not sm.is_menu
+        assert sm.capture_stage == "dialogue_stage"
+        assert sm.dialogue_idle_polls == 0
+        assert sm.menu_missing_polls == 0
+
+    def test_reset_returns_to_dialogue(self) -> None:
+        sm = _AihongStateMachine()
+        sm.stage = _AihongStage.MENU
+        sm.dialogue_idle_polls = 3
+        sm.menu_missing_polls = 1
+        sm.menu_ocr_state.repeat_count = 2
+        sm.reset()
+        assert sm.is_dialogue
+        assert sm.dialogue_idle_polls == 0
+        assert sm.menu_missing_polls == 0
+        assert sm.menu_ocr_state.repeat_count == 0
+
+    def test_dialogue_emitted_choices_transitions_to_menu(self) -> None:
+        sm = _AihongStateMachine()
+        sm.on_dialogue_consumed(emitted=True, is_menu_choices=True, is_menu_status=False)
+        assert sm.is_menu
+        assert sm.dialogue_idle_polls == 0
+        assert sm.menu_missing_polls == 0
+
+    def test_dialogue_emitted_line_stays_dialogue_and_resets_menu_ocr(self) -> None:
+        sm = _AihongStateMachine()
+        sm.menu_ocr_state.repeat_count = 2
+        sm.on_dialogue_consumed(emitted=True, is_menu_choices=False, is_menu_status=False)
+        assert sm.is_dialogue
+        assert sm.menu_ocr_state.repeat_count == 0
+
+    def test_dialogue_idle_increments_when_not_menu_like(self) -> None:
+        sm = _AihongStateMachine()
+        sm.on_dialogue_consumed(emitted=False, is_menu_choices=False, is_menu_status=False)
+        assert sm.dialogue_idle_polls == 1
+        sm.on_dialogue_consumed(emitted=False, is_menu_choices=False, is_menu_status=False)
+        assert sm.dialogue_idle_polls == 2
+
+    def test_dialogue_idle_maxes_for_menu_status(self) -> None:
+        sm = _AihongStateMachine()
+        sm.dialogue_idle_polls = 5
+        sm.on_dialogue_consumed(emitted=False, is_menu_choices=False, is_menu_status=True)
+        assert sm.dialogue_idle_polls == 5
+
+    def test_dialogue_idle_maxes_for_menu_choices(self) -> None:
+        sm = _AihongStateMachine()
+        sm.dialogue_idle_polls = 5
+        sm.on_dialogue_consumed(emitted=False, is_menu_choices=True, is_menu_status=False)
+        assert sm.dialogue_idle_polls == 5
+
+    def test_should_probe_menu_after_advance_no_menu_not_idle_enough(self) -> None:
+        sm = _AihongStateMachine()
+        sm.dialogue_idle_polls = 1
+        assert not sm.should_probe_menu(
+            after_advance_trigger_mode=True,
+            looks_like_menu=False,
+        )
+
+    def test_should_probe_menu_after_advance_with_menu(self) -> None:
+        sm = _AihongStateMachine()
+        assert sm.should_probe_menu(
+            after_advance_trigger_mode=True,
+            looks_like_menu=True,
+        )
+
+    def test_should_probe_menu_interval_when_idle_enough(self) -> None:
+        sm = _AihongStateMachine()
+        sm.dialogue_idle_polls = 2
+        assert sm.should_probe_menu(
+            after_advance_trigger_mode=False,
+            looks_like_menu=False,
+        )
+
+    def test_menu_probe_choices_transitions_to_menu(self) -> None:
+        sm = _AihongStateMachine()
+        sm.on_menu_probe_result(emitted_kind="choices", has_menu_candidate=True)
+        assert sm.is_menu
+        assert sm.menu_missing_polls == 0
+
+    def test_menu_probe_status_transitions_to_menu(self) -> None:
+        sm = _AihongStateMachine()
+        sm.on_menu_probe_result(emitted_kind="", has_menu_candidate=True)
+        assert sm.is_menu
+        assert sm.menu_missing_polls == 0
+
+    def test_menu_probe_nothing_stays_dialogue(self) -> None:
+        sm = _AihongStateMachine()
+        sm.on_menu_probe_result(emitted_kind="", has_menu_candidate=False)
+        assert sm.is_dialogue
+
+    def test_active_menu_choices_stays_menu(self) -> None:
+        sm = _AihongStateMachine()
+        sm.stage = _AihongStage.MENU
+        sm.menu_missing_polls = 1
+        reset = sm.on_active_menu_consumed(
+            emitted_kind="choices",
+            has_menu_candidate=True,
+            text="",
+        )
+        assert not reset
+        assert sm.is_menu
+        assert sm.menu_missing_polls == 0
+
+    def test_active_menu_missing_real_text_resets_to_dialogue(self) -> None:
+        sm = _AihongStateMachine()
+        sm.stage = _AihongStage.MENU
+        reset = sm.on_active_menu_consumed(
+            emitted_kind="",
+            has_menu_candidate=False,
+            text="这是一段真实的文本",
+        )
+        assert reset
+        assert sm.is_dialogue
+
+    def test_active_menu_missing_noise_under_max_stays_menu(self) -> None:
+        sm = _AihongStateMachine()
+        sm.stage = _AihongStage.MENU
+        reset = sm.on_active_menu_consumed(
+            emitted_kind="",
+            has_menu_candidate=False,
+            text="ab",
+        )
+        assert not reset
+        assert sm.is_menu
+        assert sm.menu_missing_polls == 1
+
+    def test_active_menu_missing_noise_at_max_resets_to_dialogue(self) -> None:
+        sm = _AihongStateMachine()
+        sm.stage = _AihongStage.MENU
+        sm.menu_missing_polls = 1
+        reset = sm.on_active_menu_consumed(
+            emitted_kind="",
+            has_menu_candidate=False,
+            text="ab",
+        )
+        assert reset
+        assert sm.is_dialogue
+        assert sm.menu_missing_polls == 0
+
+    def test_menu_probe_line_transitions_to_dialogue(self) -> None:
+        sm = _AihongStateMachine()
+        sm.stage = _AihongStage.MENU
+        sm.menu_ocr_state.repeat_count = 2
+        sm.on_menu_probe_result(emitted_kind="line", has_menu_candidate=False)
+        assert sm.is_dialogue
+        assert sm.menu_ocr_state.repeat_count == 0

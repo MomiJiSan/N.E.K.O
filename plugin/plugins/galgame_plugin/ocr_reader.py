@@ -11,6 +11,7 @@ import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 from uuid import uuid4
@@ -242,6 +243,21 @@ _OCR_DIALOGUE_MIN_SIGNIFICANT_CHARS = 2
 _OCR_DIALOGUE_MAX_SIGNIFICANT_CHARS = 220
 _OCR_DIALOGUE_WEAK_PUNCTUATION_MIN_SIGNIFICANT_CHARS = 8
 _OCR_NOISE_MAX_NON_CJK_SIGNIFICANT_CHARS = 2
+_OCR_STABLE_TEXT_MIN_REPEAT_THRESHOLD = 1
+_OCR_STABLE_TEXT_DEFAULT_REPEAT_THRESHOLD = 2
+_OCR_LINE_REPEAT_THRESHOLD_FAST = 1
+_OCR_LINE_REPEAT_THRESHOLD_MEDIUM = 2
+_OCR_LINE_REPEAT_THRESHOLD_SLOW = 3
+_OCR_CHOICES_REPEAT_THRESHOLD = 2
+_OCR_FOLLOWUP_CONFIRM_REPEAT_COUNT = 1
+_OCR_CAPTURE_DIAGNOSTIC_NO_TEXT_POLLS = 3
+_AIHONG_MENU_MISSING_MAX_POLLS = 2
+_AIHONG_DIALOGUE_IDLE_BEFORE_MENU_PROBE_POLLS = 2
+_AIHONG_MENU_STATUS_IDLE_POLLS = 1
+_AFTER_ADVANCE_LINE_REPEAT_THRESHOLD = 1
+_AFTER_ADVANCE_BACKGROUND_CONFIRM_POLLS = 1
+_WINDOW_TITLE_MIN_CHARS = 2
+_WINDOW_SINGLE_FALLBACK_CANDIDATE_COUNT = 1
 _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS = 0.18
 _CAPTURE_BACKEND_AUTO = "auto"
 _CAPTURE_BACKEND_DXCAM = "dxcam"
@@ -265,7 +281,7 @@ _OCR_RATIO_MIN = 0.0
 _OCR_RATIO_MAX = 0.98
 _OCR_AUTO_RECALIBRATE_HORIZONTAL_MAX_INSET_RATIO = 0.45
 _OCR_AUTO_RECALIBRATE_MAX_TOTAL_HORIZONTAL_INSET_RATIO = 0.95
-_OCR_AUTO_RECALIBRATE_AIHHONG_HORIZONTAL_PAIRS = (
+_OCR_AUTO_RECALIBRATE_AIHONG_HORIZONTAL_PAIRS = (
     (0.0, 0.0),
     (0.02, 0.02),
     (0.05, 0.05),
@@ -277,12 +293,12 @@ _OCR_AUTO_RECALIBRATE_TOP_SCAN_STEP = 0.02
 _OCR_AUTO_RECALIBRATE_BOTTOM_SCAN_DELTA_START = -0.04
 _OCR_AUTO_RECALIBRATE_BOTTOM_SCAN_DELTA_END = 0.08
 _OCR_AUTO_RECALIBRATE_BOTTOM_SCAN_STEP = 0.02
-_OCR_AUTO_RECALIBRATE_AIHHONG_TOP_SCAN_DELTA_START = -0.08
-_OCR_AUTO_RECALIBRATE_AIHHONG_TOP_SCAN_DELTA_END = 0.08
-_OCR_AUTO_RECALIBRATE_AIHHONG_TOP_SCAN_STEP = 0.02
-_OCR_AUTO_RECALIBRATE_AIHHONG_BOTTOM_SCAN_DELTA_START = -0.05
-_OCR_AUTO_RECALIBRATE_AIHHONG_BOTTOM_SCAN_DELTA_END = 0.08
-_OCR_AUTO_RECALIBRATE_AIHHONG_BOTTOM_SCAN_STEP = 0.01
+_OCR_AUTO_RECALIBRATE_AIHONG_TOP_SCAN_DELTA_START = -0.08
+_OCR_AUTO_RECALIBRATE_AIHONG_TOP_SCAN_DELTA_END = 0.08
+_OCR_AUTO_RECALIBRATE_AIHONG_TOP_SCAN_STEP = 0.02
+_OCR_AUTO_RECALIBRATE_AIHONG_BOTTOM_SCAN_DELTA_START = -0.05
+_OCR_AUTO_RECALIBRATE_AIHONG_BOTTOM_SCAN_DELTA_END = 0.08
+_OCR_AUTO_RECALIBRATE_AIHONG_BOTTOM_SCAN_STEP = 0.01
 _OCR_AUTO_RECALIBRATE_MIN_CROP_HEIGHT_PX = 24
 _OCR_AUTO_RECALIBRATE_MIN_CROP_HEIGHT_RATIO = 0.08
 _OCR_AUTO_RECALIBRATE_MAX_CROP_HEIGHT_RATIO = 0.45
@@ -290,7 +306,7 @@ _OCR_AUTO_RECALIBRATE_MIN_CROP_WIDTH_PX = 10
 _OCR_AUTO_RECALIBRATE_MIN_CANDIDATE_SIGNIFICANT_CHARS = 8
 _OCR_AUTO_RECALIBRATE_SUMMARY_SAMPLE_CHARS = 24
 _OCR_AUTO_RECALIBRATE_PREFERRED_BOTTOM_DELTAS = (0.0, 0.02, -0.02, 0.04)
-_OCR_AUTO_RECALIBRATE_AIHHONG_PREFERRED_TOP_DELTAS = (0.0, -0.02, 0.02)
+_OCR_AUTO_RECALIBRATE_AIHONG_PREFERRED_TOP_DELTAS = (0.0, -0.02, 0.02)
 _OCR_AUTO_RECALIBRATE_BASE_PREFERRED_TOP_DELTAS = (0.0, -0.02, 0.02)
 _OCR_AUTO_RECALIBRATE_REFINE_TOP_DELTAS = (-0.02, 0.0, 0.02)
 
@@ -722,6 +738,115 @@ class _StableOcrTextState:
 class _MenuConsumeResult:
     emitted_kind: str = ""
     has_menu_candidate: bool = False
+
+
+class _AihongStage(Enum):
+    DIALOGUE = OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+    MENU = OCR_CAPTURE_PROFILE_STAGE_MENU
+
+
+@dataclass(slots=True)
+class _AihongStateMachine:
+    stage: _AihongStage = _AihongStage.DIALOGUE
+    dialogue_idle_polls: int = 0
+    menu_missing_polls: int = 0
+    menu_ocr_state: _StableOcrTextState = field(default_factory=_StableOcrTextState)
+
+    def reset(self) -> None:
+        self.stage = _AihongStage.DIALOGUE
+        self.dialogue_idle_polls = 0
+        self.menu_missing_polls = 0
+        self.menu_ocr_state.reset()
+
+    @property
+    def capture_stage(self) -> str:
+        return self.stage.value
+
+    @property
+    def is_dialogue(self) -> bool:
+        return self.stage == _AihongStage.DIALOGUE
+
+    @property
+    def is_menu(self) -> bool:
+        return self.stage == _AihongStage.MENU
+
+    def on_dialogue_consumed(
+        self,
+        *,
+        emitted: bool,
+        is_menu_choices: bool,
+        is_menu_status: bool,
+    ) -> None:
+        if emitted:
+            self.dialogue_idle_polls = 0
+            self.menu_missing_polls = 0
+            if is_menu_choices:
+                self.stage = _AihongStage.MENU
+            else:
+                self.menu_ocr_state.reset()
+        else:
+            if is_menu_status or is_menu_choices:
+                self.dialogue_idle_polls = max(
+                    self.dialogue_idle_polls,
+                    _AIHONG_MENU_STATUS_IDLE_POLLS,
+                )
+            else:
+                self.dialogue_idle_polls += 1
+
+    def should_probe_menu(
+        self,
+        *,
+        after_advance_trigger_mode: bool,
+        looks_like_menu: bool,
+    ) -> bool:
+        if after_advance_trigger_mode and not looks_like_menu:
+            return False
+        return looks_like_menu or self.dialogue_idle_polls >= _AIHONG_DIALOGUE_IDLE_BEFORE_MENU_PROBE_POLLS
+
+    def on_menu_probe_result(
+        self,
+        *,
+        emitted_kind: str,
+        has_menu_candidate: bool,
+    ) -> None:
+        if has_menu_candidate:
+            self.menu_missing_polls = 0
+        if emitted_kind == "line":
+            self._transition_to_dialogue()
+        elif emitted_kind == "choices":
+            self.stage = _AihongStage.MENU
+            self.menu_missing_polls = 0
+        elif has_menu_candidate:
+            self.stage = _AihongStage.MENU
+
+    def on_active_menu_consumed(
+        self,
+        *,
+        emitted_kind: str,
+        has_menu_candidate: bool,
+        text: str,
+    ) -> bool:
+        if emitted_kind == "line":
+            self._transition_to_dialogue()
+            return False
+        if has_menu_candidate:
+            self.menu_missing_polls = 0
+            return False
+        self.menu_missing_polls += 1
+        should_reset = False
+        if text and not _looks_like_noise_ocr_text(text):
+            should_reset = True
+        elif self.menu_missing_polls >= _AIHONG_MENU_MISSING_MAX_POLLS:
+            should_reset = True
+        if should_reset:
+            self.reset()
+        return should_reset
+
+    def _transition_to_dialogue(self) -> None:
+        self.stage = _AihongStage.DIALOGUE
+        self.dialogue_idle_polls = 0
+        self.menu_missing_polls = 0
+        self.menu_ocr_state.reset()
 
 
 def _canonical_choice_candidate_text(choices: list[str]) -> str:
@@ -1782,7 +1907,7 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
         width = rect[2] - rect[0]
         height = rect[3] - rect[1]
         title = win32gui.GetWindowText(hwnd)
-        if not title or len(title) < 2:
+        if not title or len(title) < _WINDOW_TITLE_MIN_CHARS:
             return
         class_name = win32gui.GetClassName(hwnd)
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -2221,10 +2346,7 @@ class OcrReaderManager:
         self._last_heartbeat_at = 0.0
         self._attached_window: DetectedGameWindow | None = None
         self._default_ocr_state = _StableOcrTextState()
-        self._aihong_menu_ocr_state = _StableOcrTextState()
-        self._aihong_stage = _AIHONG_DIALOGUE_STAGE
-        self._aihong_dialogue_idle_polls = 0
-        self._aihong_menu_missing_polls = 0
+        self._aihong_sm = _AihongStateMachine()
         self._manual_target = OcrWindowTarget()
         self._locked_target = OcrWindowTarget()
         self._last_detected_windows: list[DetectedGameWindow] = []
@@ -2346,10 +2468,10 @@ class OcrReaderManager:
 
     def _line_changed_repeat_threshold(self) -> int:
         if self._advance_speed == ADVANCE_SPEED_FAST:
-            return 1
+            return _OCR_LINE_REPEAT_THRESHOLD_FAST
         if self._advance_speed == ADVANCE_SPEED_SLOW:
-            return 3
-        return 2
+            return _OCR_LINE_REPEAT_THRESHOLD_SLOW
+        return _OCR_LINE_REPEAT_THRESHOLD_MEDIUM
 
     def _should_emit_observed_lines_for_capture(self, *, after_advance_trigger_mode: bool) -> bool:
         if not after_advance_trigger_mode:
@@ -2370,7 +2492,7 @@ class OcrReaderManager:
         self._consecutive_no_text_polls += 1
 
     def _ocr_capture_diagnostic_required(self) -> bool:
-        return self._consecutive_no_text_polls >= 3
+        return self._consecutive_no_text_polls >= _OCR_CAPTURE_DIAGNOSTIC_NO_TEXT_POLLS
 
     def _record_capture_attempt(self, *, now: float) -> None:
         self._last_capture_attempt_at = utc_now_iso(now)
@@ -2487,7 +2609,7 @@ class OcrReaderManager:
         self._pending_background_hash = ""
         self._pending_background_change_count = 0
         self._default_ocr_state.reset()
-        self._aihong_menu_ocr_state.reset()
+        self._aihong_sm.menu_ocr_state.reset()
         if defer_scene_emit:
             self._pending_visual_scene_count = 1
             self._pending_visual_scene_hash = background_hash
@@ -2847,7 +2969,7 @@ class OcrReaderManager:
         capture_stage = str(self._runtime.capture_stage or "").strip().lower()
         if not capture_stage or capture_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
             capture_stage = (
-                self._aihong_stage
+                self._aihong_sm.capture_stage
                 if self._should_use_aihong_two_stage(target)
                 else OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
             )
@@ -3056,7 +3178,7 @@ class OcrReaderManager:
                 horizontal_pairs.append(pair)
 
         if is_aihong_target:
-            for left_ratio, right_ratio in _OCR_AUTO_RECALIBRATE_AIHHONG_HORIZONTAL_PAIRS:
+            for left_ratio, right_ratio in _OCR_AUTO_RECALIBRATE_AIHONG_HORIZONTAL_PAIRS:
                 _add_horizontal_pair(left_ratio, right_ratio)
         _add_horizontal_pair(base_profile.left_inset_ratio, base_profile.right_inset_ratio)
         if not is_aihong_target and (
@@ -3094,18 +3216,18 @@ class OcrReaderManager:
                 top_values,
                 self._scan_ratio_values(
                     aihong_preset.top_ratio,
-                    delta_start=_OCR_AUTO_RECALIBRATE_AIHHONG_TOP_SCAN_DELTA_START,
-                    delta_end=_OCR_AUTO_RECALIBRATE_AIHHONG_TOP_SCAN_DELTA_END,
-                    step=_OCR_AUTO_RECALIBRATE_AIHHONG_TOP_SCAN_STEP,
+                    delta_start=_OCR_AUTO_RECALIBRATE_AIHONG_TOP_SCAN_DELTA_START,
+                    delta_end=_OCR_AUTO_RECALIBRATE_AIHONG_TOP_SCAN_DELTA_END,
+                    step=_OCR_AUTO_RECALIBRATE_AIHONG_TOP_SCAN_STEP,
                 ),
             )
             bottom_values = _append_ratio_values(
                 bottom_values,
                 self._scan_ratio_values(
                     aihong_preset.bottom_inset_ratio,
-                    delta_start=_OCR_AUTO_RECALIBRATE_AIHHONG_BOTTOM_SCAN_DELTA_START,
-                    delta_end=_OCR_AUTO_RECALIBRATE_AIHHONG_BOTTOM_SCAN_DELTA_END,
-                    step=_OCR_AUTO_RECALIBRATE_AIHHONG_BOTTOM_SCAN_STEP,
+                    delta_start=_OCR_AUTO_RECALIBRATE_AIHONG_BOTTOM_SCAN_DELTA_START,
+                    delta_end=_OCR_AUTO_RECALIBRATE_AIHONG_BOTTOM_SCAN_DELTA_END,
+                    step=_OCR_AUTO_RECALIBRATE_AIHONG_BOTTOM_SCAN_STEP,
                 ),
             )
         backend_plan = None if self._custom_ocr_backend else self._resolve_backend_plan()
@@ -3268,7 +3390,7 @@ class OcrReaderManager:
                 ),
                 _OCR_RATIO_ROUND_DIGITS,
             )
-            for delta in _OCR_AUTO_RECALIBRATE_AIHHONG_PREFERRED_TOP_DELTAS:
+            for delta in _OCR_AUTO_RECALIBRATE_AIHONG_PREFERRED_TOP_DELTAS:
                 candidate_value = round(preset_top + delta, _OCR_RATIO_ROUND_DIGITS)
                 if candidate_value in top_values and candidate_value not in preferred_top_values:
                     preferred_top_values.append(candidate_value)
@@ -3393,10 +3515,7 @@ class OcrReaderManager:
         self._pending_visual_scene_count = 0
 
     def _reset_aihong_menu_state(self) -> None:
-        self._aihong_menu_ocr_state.reset()
-        self._aihong_stage = _AIHONG_DIALOGUE_STAGE
-        self._aihong_dialogue_idle_polls = 0
-        self._aihong_menu_missing_polls = 0
+        self._aihong_sm.reset()
 
     def _has_manual_capture_profile(self, target: DetectedGameWindow) -> bool:
         return _uses_manual_capture_profile(self._capture_profiles, target)
@@ -3409,7 +3528,7 @@ class OcrReaderManager:
         text: str,
         *,
         state: _StableOcrTextState,
-        repeat_threshold: int = 2,
+        repeat_threshold: int = _OCR_STABLE_TEXT_DEFAULT_REPEAT_THRESHOLD,
     ) -> bool:
         cleaned = normalize_text(text)
         if not cleaned:
@@ -3419,7 +3538,7 @@ class OcrReaderManager:
         else:
             state.repeat_count = 1
             state.last_raw_text = cleaned
-        if state.repeat_count < max(1, int(repeat_threshold)):
+        if state.repeat_count < max(_OCR_STABLE_TEXT_MIN_REPEAT_THRESHOLD, int(repeat_threshold)):
             return False
         if cleaned == state.stable_text:
             return False
@@ -3484,7 +3603,7 @@ class OcrReaderManager:
         if not self._stabilize_text_key(
             _canonical_choice_candidate_text(choices),
             state=tracker,
-            repeat_threshold=2,
+            repeat_threshold=_OCR_CHOICES_REPEAT_THRESHOLD,
         ):
             return False
         self._commit_pending_visual_scene(now=now)
@@ -3507,7 +3626,7 @@ class OcrReaderManager:
         return (
             bool(state.stable_text)
             and
-            state.repeat_count == 1
+            state.repeat_count == _OCR_FOLLOWUP_CONFIRM_REPEAT_COUNT
             and state.last_raw_text == cleaned
             and state.stable_text != cleaned
         )
@@ -3599,7 +3718,7 @@ class OcrReaderManager:
                 if self._emit_choices_from_candidates(
                     choices,
                     now=now,
-                    state=self._aihong_menu_ocr_state,
+                    state=self._aihong_sm.menu_ocr_state,
                     choice_bounds=_aihong_choice_boxes(choices, list(boxes or [])),
                     choice_bounds_metadata=choice_bounds_metadata,
                 )
@@ -3626,21 +3745,12 @@ class OcrReaderManager:
             boxes=extraction.boxes,
             choice_bounds_metadata=_extraction_choice_bounds_metadata(extraction),
         )
-        emitted = bool(menu_result.emitted_kind)
-        if menu_result.emitted_kind == "line":
-            self._aihong_stage = _AIHONG_DIALOGUE_STAGE
-            self._aihong_dialogue_idle_polls = 0
-            self._aihong_menu_missing_polls = 0
-            self._aihong_menu_ocr_state.reset()
-        elif menu_result.has_menu_candidate:
-            self._aihong_menu_missing_polls = 0
-        else:
-            self._aihong_menu_missing_polls += 1
-            if extraction.text and not _looks_like_noise_ocr_text(extraction.text):
-                self._reset_aihong_menu_state()
-            elif self._aihong_menu_missing_polls >= 2:
-                self._reset_aihong_menu_state()
-        return emitted
+        self._aihong_sm.on_active_menu_consumed(
+            emitted_kind=menu_result.emitted_kind,
+            has_menu_candidate=menu_result.has_menu_candidate,
+            text=extraction.text,
+        )
+        return bool(menu_result.emitted_kind)
 
     async def _probe_aihong_menu_stage_for_tick(
         self,
@@ -3690,25 +3800,17 @@ class OcrReaderManager:
             choice_bounds_metadata=_extraction_choice_bounds_metadata(menu_extraction),
         )
         if menu_result.has_menu_candidate:
-            self._aihong_menu_missing_polls = 0
             output.runtime_profile = menu_profile
             output.runtime_capture_profile_selection = menu_profile_selection
-        if menu_result.emitted_kind == "line":
+        self._aihong_sm.on_menu_probe_result(
+            emitted_kind=menu_result.emitted_kind,
+            has_menu_candidate=menu_result.has_menu_candidate,
+        )
+        if menu_result.emitted_kind:
             output.emitted = True
-            self._aihong_stage = _AIHONG_DIALOGUE_STAGE
-            self._aihong_dialogue_idle_polls = 0
-            self._aihong_menu_missing_polls = 0
-            self._aihong_menu_ocr_state.reset()
+        if menu_result.emitted_kind in ("line", "choices"):
             output.runtime_profile = menu_profile
             output.runtime_capture_profile_selection = menu_profile_selection
-        elif menu_result.emitted_kind == "choices":
-            output.emitted = True
-            self._aihong_stage = _AIHONG_MENU_STAGE
-            self._aihong_menu_missing_polls = 0
-            output.runtime_profile = menu_profile
-            output.runtime_capture_profile_selection = menu_profile_selection
-        elif menu_result.has_menu_candidate:
-            self._aihong_stage = _AIHONG_MENU_STAGE
         return output
 
     async def _consume_aihong_dialogue_stage_for_tick(
@@ -3741,7 +3843,7 @@ class OcrReaderManager:
                 self._emit_choices_from_candidates(
                     dialogue_menu_choices,
                     now=now,
-                    state=self._aihong_menu_ocr_state,
+                    state=self._aihong_sm.menu_ocr_state,
                     choice_bounds=_aihong_choice_boxes(dialogue_menu_choices, extraction.boxes),
                     choice_bounds_metadata=_extraction_choice_bounds_metadata(extraction),
                 )
@@ -3785,30 +3887,17 @@ class OcrReaderManager:
             output.now = followup_result.now
 
         output.emitted = dialogue_emitted
+        self._aihong_sm.on_dialogue_consumed(
+            emitted=dialogue_emitted,
+            is_menu_choices=bool(dialogue_menu_choices),
+            is_menu_status=dialogue_text_is_menu_status,
+        )
         if dialogue_emitted:
-            self._aihong_dialogue_idle_polls = 0
-            self._aihong_menu_missing_polls = 0
-            if dialogue_menu_choices:
-                self._aihong_stage = _AIHONG_MENU_STAGE
-            else:
-                self._aihong_menu_ocr_state.reset()
             return output
 
-        if dialogue_text_is_menu_status or dialogue_menu_choices:
-            self._aihong_dialogue_idle_polls = max(self._aihong_dialogue_idle_polls, 1)
-        else:
-            self._aihong_dialogue_idle_polls += 1
-        should_probe_menu = (
-            (
-                not after_advance_trigger_mode
-                or dialogue_text_is_menu_status
-                or dialogue_menu_choices
-            )
-            and (
-                dialogue_text_is_menu_status
-                or dialogue_menu_choices
-                or self._aihong_dialogue_idle_polls >= 2
-            )
+        should_probe_menu = self._aihong_sm.should_probe_menu(
+            after_advance_trigger_mode=after_advance_trigger_mode,
+            looks_like_menu=dialogue_text_is_menu_status or bool(dialogue_menu_choices),
         )
         if not should_probe_menu:
             return output
@@ -3949,9 +4038,13 @@ class OcrReaderManager:
             emit_observed_lines=self._should_emit_observed_lines_for_capture(
                 after_advance_trigger_mode=after_advance_trigger_mode
             ),
-            line_repeat_threshold=1 if after_advance_trigger_mode else None,
+            line_repeat_threshold=(
+                _AFTER_ADVANCE_LINE_REPEAT_THRESHOLD if after_advance_trigger_mode else None
+            ),
             background_confirm_polls=(
-                1 if after_advance_trigger_mode else _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS
+                _AFTER_ADVANCE_BACKGROUND_CONFIRM_POLLS
+                if after_advance_trigger_mode
+                else _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS
             ),
         )
 
@@ -4006,12 +4099,14 @@ class OcrReaderManager:
             self._reset_default_ocr_state()
             self._reset_aihong_menu_state()
             startup_profile_stage = (
-                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+                self._aihong_sm.capture_stage
+                if aihong_two_stage_enabled
+                else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
             )
             startup_profile_selection = self._capture_profile_selection_for_target(
                 target,
                 stage=(
-                    self._aihong_stage
+                    self._aihong_sm.capture_stage
                     if aihong_two_stage_enabled
                     else _AIHONG_DIALOGUE_STAGE
                 ),
@@ -4072,7 +4167,7 @@ class OcrReaderManager:
             return False
         result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
         self._default_ocr_state.reset()
-        self._aihong_menu_ocr_state.reset()
+        self._aihong_sm.menu_ocr_state.reset()
         return True
 
     def _emit_heartbeat_if_due_for_tick(
@@ -4194,7 +4289,7 @@ class OcrReaderManager:
             backend_detail_override=backend_detail_override,
             target=target,
             capture_stage=(
-                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+                self._aihong_sm.capture_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
             ),
             capture_profile=runtime_profile.to_dict(),
             capture_profile_selection=runtime_capture_profile_selection,
@@ -4347,7 +4442,7 @@ class OcrReaderManager:
         aihong_two_stage_enabled = self._should_use_aihong_two_stage(target)
         if not aihong_two_stage_enabled:
             self._reset_aihong_menu_state()
-        profile_stage = self._aihong_stage if aihong_two_stage_enabled else _AIHONG_DIALOGUE_STAGE
+        profile_stage = self._aihong_sm.capture_stage if aihong_two_stage_enabled else _AIHONG_DIALOGUE_STAGE
         capture_profile_selection = self._capture_profile_selection_for_target(
             target,
             stage=profile_stage,
@@ -4410,7 +4505,7 @@ class OcrReaderManager:
                 guard_blocked = True
             else:
                 if aihong_two_stage_enabled:
-                    if self._aihong_stage == _AIHONG_MENU_STAGE:
+                    if self._aihong_sm.is_menu:
                         emitted = self._consume_aihong_active_menu_stage_for_tick(
                             extraction=extraction,
                             now=now,
@@ -5205,7 +5300,7 @@ class OcrReaderManager:
                     if selection.selection_mode == "auto":
                         selection.selection_detail = "foreground_window"
                     return True
-        if len(windows) == 1:
+        if len(windows) == _WINDOW_SINGLE_FALLBACK_CANDIDATE_COUNT:
             candidate = windows[0]
             if foreground_hwnd and _is_confident_auto_window(candidate):
                 selection.target = candidate
