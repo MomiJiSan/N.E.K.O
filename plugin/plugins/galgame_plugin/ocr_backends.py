@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -17,6 +18,13 @@ _OCR_PREPARE_MAX_LONG_EDGE = 1600
 _RAPIDOCR_RUNTIME_CACHE_LOCK = threading.Lock()
 _RAPIDOCR_RUNTIME_CACHE: dict[tuple[str, str, str, str, str], Any] = {}
 _RAPIDOCR_RUNTIME_CACHE_MAX_ENTRIES = 2
+
+
+def _ocr_reader_compat_symbol(name: str, fallback: Any) -> Any:
+    module = sys.modules.get("plugin.plugins.galgame_plugin.ocr_reader")
+    if module is None:
+        return fallback
+    return getattr(module, name, fallback)
 
 
 class OcrBackend(Protocol):
@@ -318,7 +326,11 @@ class RapidOcrBackend:
         self._warmup_error = ""
 
     def is_available(self) -> bool:
-        inspection = inspect_rapidocr_installation(
+        inspect_fn = _ocr_reader_compat_symbol(
+            "inspect_rapidocr_installation",
+            inspect_rapidocr_installation,
+        )
+        inspection = inspect_fn(
             install_target_dir_raw=self._install_target_dir_raw,
             engine_type=self._engine_type,
             lang_type=self._lang_type,
@@ -341,7 +353,11 @@ class RapidOcrBackend:
                     with _RAPIDOCR_RUNTIME_CACHE_LOCK:
                         runtime = _RAPIDOCR_RUNTIME_CACHE.get(key)
                         if runtime is None:
-                            runtime, _metadata = load_rapidocr_runtime(
+                            load_fn = _ocr_reader_compat_symbol(
+                                "load_rapidocr_runtime",
+                                load_rapidocr_runtime,
+                            )
+                            runtime, _metadata = load_fn(
                                 install_target_dir_raw=self._install_target_dir_raw,
                                 engine_type=self._engine_type,
                                 lang_type=self._lang_type,

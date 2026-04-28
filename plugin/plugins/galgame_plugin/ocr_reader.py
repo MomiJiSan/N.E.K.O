@@ -1372,6 +1372,19 @@ class _TickWindowSelectionResult:
 
 
 @dataclass(slots=True)
+class _TickPostCaptureStatus:
+    status: str
+    detail: str
+    observed_or_stable_emitted: bool = False
+
+
+@dataclass(slots=True)
+class _TickExtractionBookkeepingResult:
+    active_backend: OcrBackendDescriptor
+    backend_detail_override: str = ""
+
+
+@dataclass(slots=True)
 class OcrBackendDescriptor:
     kind: str = ""
     backend: OcrBackend | None = None
@@ -3032,6 +3045,17 @@ class OcrReaderManager:
                 time_fn=self._time_fn,
             )
 
+    def _custom_backend_plan(self) -> SelectedOcrBackendPlan:
+        return SelectedOcrBackendPlan(
+            selection="custom",
+            primary=OcrBackendDescriptor(
+                kind=str(self._runtime.backend_kind or "custom"),
+                backend=self._ocr_backend,
+                detail=str(self._runtime.backend_detail or "custom_backend"),
+                available=True,
+            ),
+        )
+
     def update_advance_speed(self, advance_speed: str) -> None:
         normalized = str(advance_speed or "").strip().lower()
         self._advance_speed = normalized if normalized in ADVANCE_SPEEDS else ADVANCE_SPEED_MEDIUM
@@ -4280,6 +4304,138 @@ class OcrReaderManager:
         self._remember_locked_target(target)
         return now
 
+    def _record_extraction_for_tick(
+        self,
+        *,
+        extraction: OcrExtractionResult,
+        result: OcrReaderTickResult,
+        now: float,
+        active_backend: OcrBackendDescriptor,
+        backend_detail_override: str,
+    ) -> _TickExtractionBookkeepingResult:
+        self._last_capture_timing.update(extraction.timing)
+        self._record_capture_completed(
+            now=now,
+            raw_text=extraction.text,
+            image_hash=extraction.capture_image_hash,
+        )
+        self._record_capture_geometry(extraction)
+        self._capture_backend_kind = extraction.capture_backend_kind
+        self._capture_backend_detail = extraction.capture_backend_detail
+        active_backend = extraction.backend if extraction.backend.kind else active_backend
+        backend_detail_override = extraction.backend_detail or backend_detail_override
+        result.warnings.extend(extraction.warnings)
+        return _TickExtractionBookkeepingResult(
+            active_backend=active_backend,
+            backend_detail_override=backend_detail_override,
+        )
+
+    def _handle_self_ui_guard_for_tick(
+        self,
+        *,
+        text: str,
+        result: OcrReaderTickResult,
+    ) -> bool:
+        if not text or not _looks_like_self_ui_text(text):
+            return False
+        result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
+        self._default_ocr_state.reset()
+        self._aihong_menu_ocr_state.reset()
+        return True
+
+    def _emit_heartbeat_if_due_for_tick(
+        self,
+        *,
+        now: float,
+        result: OcrReaderTickResult,
+    ) -> bool:
+        if not self._writer.session_id:
+            return False
+        if now - self._last_heartbeat_at < float(self._config.ocr_reader_poll_interval_seconds):
+            return False
+        if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+            result.should_rescan = True
+            self._last_heartbeat_at = now
+        return True
+
+    def _resolve_post_capture_status_for_tick(
+        self,
+        *,
+        result: OcrReaderTickResult,
+        now: float,
+        status: str,
+        detail: str,
+        emitted: bool,
+        guard_blocked: bool,
+        capture_error: bool,
+        capture_completed: bool,
+        capture_attempted: bool,
+        after_advance_trigger_mode: bool,
+        event_seq_before_capture: int,
+    ) -> _TickPostCaptureStatus:
+        pending_scene_committed = False
+        if (
+            after_advance_trigger_mode
+            and not emitted
+            and self._pending_visual_scene_hash
+            and now - float(self._pending_visual_scene_at or now) >= _PENDING_VISUAL_SCENE_MAX_AGE_SECONDS
+        ):
+            if self._commit_pending_visual_scene(now=now):
+                pending_scene_committed = True
+                result.should_rescan = True
+        observed_or_stable_emitted = (
+            int(self._writer.last_seq or 0) > event_seq_before_capture
+            and not pending_scene_committed
+        )
+
+        if emitted:
+            result.stable_event_emitted = True
+            result.should_rescan = True
+            self._mark_observed_progress(now=now)
+            self._last_heartbeat_at = now
+            status = "active"
+            detail = "receiving_text"
+        elif observed_or_stable_emitted:
+            result.should_rescan = True
+            self._mark_observed_progress(now=now)
+            self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            detail = "receiving_observed_text"
+        elif guard_blocked:
+            if status == "starting":
+                status = "active"
+            detail = "self_ui_guard_blocked"
+        elif capture_error:
+            if status == "starting":
+                status = "active"
+            detail = "capture_failed"
+        elif capture_completed:
+            self._mark_no_text_poll()
+            self._emit_heartbeat_if_due_for_tick(now=now, result=result)
+            if status == "starting":
+                status = "active"
+            detail = (
+                "ocr_capture_diagnostic_required"
+                if self._ocr_capture_diagnostic_required()
+                else "attached_no_text_yet"
+            )
+        elif capture_attempted:
+            if status == "starting":
+                status = "active"
+            detail = "capture_failed"
+        elif self._emit_heartbeat_if_due_for_tick(now=now, result=result):
+            if status == "starting":
+                status = "active"
+            if detail == "starting_capture":
+                detail = "attached_no_text_yet"
+
+        return _TickPostCaptureStatus(
+            status=status,
+            detail=detail,
+            observed_or_stable_emitted=observed_or_stable_emitted,
+        )
+
     def _finalize_tick_runtime(
         self,
         *,
@@ -4503,14 +4659,14 @@ class OcrReaderManager:
                 True,
                 not after_advance_trigger_mode,
             )
-            self._last_capture_timing.update(extraction.timing)
             capture_completed = True
-            self._record_capture_completed(
+            bookkeeping = self._record_extraction_for_tick(
+                extraction=extraction,
+                result=result,
                 now=now,
-                raw_text=extraction.text,
-                image_hash=extraction.capture_image_hash,
+                active_backend=active_backend,
+                backend_detail_override=backend_detail_override,
             )
-            self._record_capture_geometry(extraction)
             if self._observe_background_hash(
                 extraction.background_hash,
                 now=now,
@@ -4518,16 +4674,10 @@ class OcrReaderManager:
                 defer_scene_emit=after_advance_trigger_mode,
             ):
                 result.should_rescan = True
-            self._capture_backend_kind = extraction.capture_backend_kind
-            self._capture_backend_detail = extraction.capture_backend_detail
-            active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
-            backend_detail_override = extraction.backend_detail
-            result.warnings.extend(extraction.warnings)
-            if extraction.text and _looks_like_self_ui_text(extraction.text):
+            active_backend = bookkeeping.active_backend
+            backend_detail_override = bookkeeping.backend_detail_override
+            if self._handle_self_ui_guard_for_tick(text=extraction.text, result=result):
                 guard_blocked = True
-                result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
-                self._default_ocr_state.reset()
-                self._aihong_menu_ocr_state.reset()
             else:
                 if aihong_two_stage_enabled:
                     if self._aihong_stage == _AIHONG_MENU_STAGE:
@@ -4603,31 +4753,20 @@ class OcrReaderManager:
                                 profile,
                                 backend_plan,
                             )
-                            self._last_capture_timing.update(followup_extraction.timing)
-                            self._record_capture_completed(
+                            bookkeeping = self._record_extraction_for_tick(
+                                extraction=followup_extraction,
+                                result=result,
                                 now=self._time_fn(),
-                                raw_text=followup_extraction.text,
-                                image_hash=followup_extraction.capture_image_hash,
+                                active_backend=active_backend,
+                                backend_detail_override=backend_detail_override,
                             )
-                            self._record_capture_geometry(followup_extraction)
-                            self._capture_backend_kind = followup_extraction.capture_backend_kind
-                            self._capture_backend_detail = followup_extraction.capture_backend_detail
-                            active_backend = (
-                                followup_extraction.backend
-                                if followup_extraction.backend.kind
-                                else active_backend
-                            )
-                            backend_detail_override = (
-                                followup_extraction.backend_detail or backend_detail_override
-                            )
-                            result.warnings.extend(followup_extraction.warnings)
-                            if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
+                            active_backend = bookkeeping.active_backend
+                            backend_detail_override = bookkeeping.backend_detail_override
+                            if self._handle_self_ui_guard_for_tick(
+                                text=followup_extraction.text,
+                                result=result,
+                            ):
                                 guard_blocked = True
-                                self._default_ocr_state.reset()
-                                self._aihong_menu_ocr_state.reset()
-                                result.warnings.append(
-                                    "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
-                                )
                             else:
                                 followup_now = self._time_fn()
                                 dialogue_emitted = bool(
@@ -4677,37 +4816,26 @@ class OcrReaderManager:
                                 menu_profile = menu_profile_selection.profile
                                 menu_extraction = await asyncio.to_thread(
                                     self._capture_and_extract_text,
-                                target,
-                                menu_profile,
-                                backend_plan,
-                                True,
-                                not after_advance_trigger_mode,
-                            )
-                                self._last_capture_timing.update(menu_extraction.timing)
-                                self._record_capture_completed(
+                                    target,
+                                    menu_profile,
+                                    backend_plan,
+                                    True,
+                                    not after_advance_trigger_mode,
+                                )
+                                bookkeeping = self._record_extraction_for_tick(
+                                    extraction=menu_extraction,
+                                    result=result,
                                     now=self._time_fn(),
-                                    raw_text=menu_extraction.text,
-                                    image_hash=menu_extraction.capture_image_hash,
+                                    active_backend=active_backend,
+                                    backend_detail_override=backend_detail_override,
                                 )
-                                self._record_capture_geometry(menu_extraction)
-                                self._capture_backend_kind = menu_extraction.capture_backend_kind
-                                self._capture_backend_detail = menu_extraction.capture_backend_detail
-                                active_backend = (
-                                    menu_extraction.backend
-                                    if menu_extraction.backend.kind
-                                    else active_backend
-                                )
-                                backend_detail_override = (
-                                    menu_extraction.backend_detail or backend_detail_override
-                                )
-                                result.warnings.extend(menu_extraction.warnings)
-                                if menu_extraction.text and _looks_like_self_ui_text(menu_extraction.text):
+                                active_backend = bookkeeping.active_backend
+                                backend_detail_override = bookkeeping.backend_detail_override
+                                if self._handle_self_ui_guard_for_tick(
+                                    text=menu_extraction.text,
+                                    result=result,
+                                ):
                                     guard_blocked = True
-                                    self._default_ocr_state.reset()
-                                    self._aihong_menu_ocr_state.reset()
-                                    result.warnings.append(
-                                        "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
-                                    )
                                 else:
                                     menu_result = self._consume_aihong_menu_stage_text(
                                         menu_extraction.text,
@@ -4759,31 +4887,20 @@ class OcrReaderManager:
                             profile,
                             backend_plan,
                         )
-                        self._last_capture_timing.update(followup_extraction.timing)
-                        self._record_capture_completed(
+                        bookkeeping = self._record_extraction_for_tick(
+                            extraction=followup_extraction,
+                            result=result,
                             now=self._time_fn(),
-                            raw_text=followup_extraction.text,
-                            image_hash=followup_extraction.capture_image_hash,
+                            active_backend=active_backend,
+                            backend_detail_override=backend_detail_override,
                         )
-                        self._record_capture_geometry(followup_extraction)
-                        self._capture_backend_kind = followup_extraction.capture_backend_kind
-                        self._capture_backend_detail = followup_extraction.capture_backend_detail
-                        active_backend = (
-                            followup_extraction.backend
-                            if followup_extraction.backend.kind
-                            else active_backend
-                        )
-                        backend_detail_override = (
-                            followup_extraction.backend_detail or backend_detail_override
-                        )
-                        result.warnings.extend(followup_extraction.warnings)
-                        if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
+                        active_backend = bookkeeping.active_backend
+                        backend_detail_override = bookkeeping.backend_detail_override
+                        if self._handle_self_ui_guard_for_tick(
+                            text=followup_extraction.text,
+                            result=result,
+                        ):
                             guard_blocked = True
-                            self._default_ocr_state.reset()
-                            self._aihong_menu_ocr_state.reset()
-                            result.warnings.append(
-                                "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
-                            )
                         else:
                             followup_now = self._time_fn()
                             emitted = bool(
@@ -4802,80 +4919,25 @@ class OcrReaderManager:
             self._record_capture_error(now=now, error=exc)
             result.warnings.append(f"ocr_reader capture failed: {exc}")
 
-        status = self._runtime.status
-        detail = self._runtime.detail
-        pending_scene_committed = False
-        if (
-            after_advance_trigger_mode
-            and not emitted
-            and self._pending_visual_scene_hash
-            and now - float(self._pending_visual_scene_at or now) >= _PENDING_VISUAL_SCENE_MAX_AGE_SECONDS
-        ):
-            if self._commit_pending_visual_scene(now=now):
-                pending_scene_committed = True
-                result.should_rescan = True
-        observed_or_stable_emitted = (
-            int(self._writer.last_seq or 0) > event_seq_before_capture
-            and not pending_scene_committed
+        post_capture_status = self._resolve_post_capture_status_for_tick(
+            result=result,
+            now=now,
+            status=self._runtime.status,
+            detail=self._runtime.detail,
+            emitted=emitted,
+            guard_blocked=guard_blocked,
+            capture_error=capture_error,
+            capture_completed=capture_completed,
+            capture_attempted=capture_attempted,
+            after_advance_trigger_mode=after_advance_trigger_mode,
+            event_seq_before_capture=event_seq_before_capture,
         )
-
-        if emitted:
-            result.stable_event_emitted = True
-            result.should_rescan = True
-            self._mark_observed_progress(now=now)
-            self._last_heartbeat_at = now
-            status = "active"
-            detail = "receiving_text"
-        elif observed_or_stable_emitted:
-            result.should_rescan = True
-            self._mark_observed_progress(now=now)
-            self._last_heartbeat_at = now
-            if status == "starting":
-                status = "active"
-            detail = "receiving_observed_text"
-        elif guard_blocked:
-            if status == "starting":
-                status = "active"
-            detail = "self_ui_guard_blocked"
-        elif capture_error:
-            if status == "starting":
-                status = "active"
-            detail = "capture_failed"
-        elif capture_completed:
-            self._mark_no_text_poll()
-            if self._writer.session_id and now - self._last_heartbeat_at >= float(
-                self._config.ocr_reader_poll_interval_seconds
-            ):
-                if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
-                    result.should_rescan = True
-                    self._last_heartbeat_at = now
-            if status == "starting":
-                status = "active"
-            detail = (
-                "ocr_capture_diagnostic_required"
-                if self._ocr_capture_diagnostic_required()
-                else "attached_no_text_yet"
-            )
-        elif capture_attempted:
-            if status == "starting":
-                status = "active"
-            detail = "capture_failed"
-        elif self._writer.session_id and now - self._last_heartbeat_at >= float(
-            self._config.ocr_reader_poll_interval_seconds
-        ):
-            if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
-                result.should_rescan = True
-                self._last_heartbeat_at = now
-            if status == "starting":
-                status = "active"
-            if detail == "starting_capture":
-                detail = "attached_no_text_yet"
 
         return self._finalize_tick_runtime(
             result=result,
             poll_started_at=poll_started_at,
-            status=status,
-            detail=detail,
+            status=post_capture_status.status,
+            detail=post_capture_status.detail,
             backend_plan=backend_plan,
             active_backend=active_backend,
             backend_detail_override=backend_detail_override,
@@ -4885,7 +4947,7 @@ class OcrReaderManager:
             runtime_profile=runtime_profile,
             runtime_capture_profile_selection=runtime_capture_profile_selection,
             emitted=emitted,
-            observed_or_stable_emitted=observed_or_stable_emitted,
+            observed_or_stable_emitted=post_capture_status.observed_or_stable_emitted,
         )
 
     def _configured_backend_selection(self) -> str:
@@ -5048,7 +5110,9 @@ class OcrReaderManager:
             self._backend_plan_cache_at = now
             self._backend_plan_cache = plan
             return plan
-        plan.primary = tesseract
+        plan.primary = rapidocr if bool(self._config.rapidocr_enabled) else tesseract
+        if bool(self._config.rapidocr_enabled):
+            plan.fallback = tesseract
         self._backend_plan_cache_key = cache_key
         self._backend_plan_cache_at = now
         self._backend_plan_cache = plan
@@ -5326,14 +5390,7 @@ class OcrReaderManager:
         if plan is not None:
             resolved_plan = plan
         elif self._custom_ocr_backend:
-            resolved_plan = SelectedOcrBackendPlan(
-                primary=OcrBackendDescriptor(
-                    kind=str(self._runtime.backend_kind or "custom"),
-                    backend=self._ocr_backend,
-                    detail=str(self._runtime.backend_detail or "custom_backend"),
-                    available=True,
-                )
-            )
+            resolved_plan = self._custom_backend_plan()
         else:
             resolved_plan = self._resolve_backend_plan()
         if self._custom_ocr_backend:
@@ -5587,6 +5644,17 @@ class OcrReaderManager:
                     if selection.selection_mode == "auto":
                         selection.selection_detail = "foreground_window"
                     return selection
+        if len(windows) == 1:
+            candidate = windows[0]
+            if (
+                _is_confident_auto_window(candidate)
+                and int(candidate.width or 0) <= 0
+                and int(candidate.height or 0) <= 0
+            ):
+                selection.target = candidate
+                if selection.selection_mode == "auto":
+                    selection.selection_detail = "single_candidate_without_foreground_geometry"
+                return selection
         if selection.selection_mode == "auto":
             selection.selection_detail = "auto_detect_needs_manual_fallback"
         return selection
