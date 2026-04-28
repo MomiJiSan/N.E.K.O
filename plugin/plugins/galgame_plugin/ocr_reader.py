@@ -1360,6 +1360,18 @@ class OcrReaderTickResult:
 
 
 @dataclass(slots=True)
+class _TickBackendPlanResult:
+    plan: SelectedOcrBackendPlan
+    duration_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class _TickWindowSelectionResult:
+    selection: WindowSelectionResult
+    duration_seconds: float = 0.0
+
+
+@dataclass(slots=True)
 class OcrBackendDescriptor:
     kind: str = ""
     backend: OcrBackend | None = None
@@ -4182,6 +4194,136 @@ class OcrReaderManager:
             self._writer.end_session(ts=utc_now_iso(self._time_fn()))
         self._attached_window = None
 
+    def _begin_tick_poll(self, *, poll_started_at: float) -> None:
+        self._runtime.last_tick_skipped = False
+        self._runtime.last_tick_skip_reason = ""
+        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+
+    async def _resolve_backend_plan_for_tick(self) -> _TickBackendPlanResult:
+        started_at = self._time_fn()
+        plan = await asyncio.to_thread(self._resolve_backend_plan)
+        return _TickBackendPlanResult(
+            plan=plan,
+            duration_seconds=max(0.0, self._time_fn() - started_at),
+        )
+
+    async def _select_target_for_tick(
+        self,
+        *,
+        memory_reader_runtime: dict[str, Any],
+    ) -> _TickWindowSelectionResult:
+        started_at = self._time_fn()
+        scanned_windows = await asyncio.to_thread(self._window_scanner)
+        duration_seconds = max(0.0, self._time_fn() - started_at)
+        eligible_windows, excluded_windows = self._prepare_window_inventory(scanned_windows)
+        selection = self._select_target_window(
+            eligible_windows,
+            excluded_windows=excluded_windows,
+            memory_reader_runtime=memory_reader_runtime,
+        )
+        self._last_selection = selection
+        return _TickWindowSelectionResult(
+            selection=selection,
+            duration_seconds=duration_seconds,
+        )
+
+    def _prepare_attached_target_for_tick(
+        self,
+        *,
+        target: DetectedGameWindow,
+        selection: WindowSelectionResult,
+        backend_plan: SelectedOcrBackendPlan,
+        result: OcrReaderTickResult,
+        now: float,
+        aihong_two_stage_enabled: bool,
+    ) -> float:
+        if self._attached_window is None or self._attached_window.pid != target.pid:
+            if (
+                not self._writer.session_id
+                or self._writer.game_id != _ocr_game_id_from_process(target.process_name or target.title)
+            ):
+                self._writer.start_session(target)
+                now = max(now, self._time_fn())
+                result.should_rescan = True
+            self._attached_window = target
+            self._last_heartbeat_at = now
+            self._reset_default_ocr_state()
+            self._reset_aihong_menu_state()
+            startup_profile_stage = (
+                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            )
+            startup_profile_selection = self._capture_profile_selection_for_target(
+                target,
+                stage=(
+                    self._aihong_stage
+                    if aihong_two_stage_enabled
+                    else _AIHONG_DIALOGUE_STAGE
+                ),
+            )
+            self._runtime = self._build_runtime(
+                status="starting",
+                detail="starting_capture",
+                plan=backend_plan,
+                target=target,
+                capture_stage=startup_profile_stage,
+                capture_profile=startup_profile_selection.profile.to_dict(),
+                capture_profile_selection=startup_profile_selection,
+                selection=selection,
+                game_id=self._writer.game_id,
+                session_id=self._writer.session_id,
+                last_seq=self._writer.last_seq,
+                last_event_ts=self._writer.last_event_ts,
+            )
+
+        if self._attached_window is not None:
+            self._attached_window = target
+        self._remember_locked_target(target)
+        return now
+
+    def _finalize_tick_runtime(
+        self,
+        *,
+        result: OcrReaderTickResult,
+        poll_started_at: float,
+        status: str,
+        detail: str,
+        backend_plan: SelectedOcrBackendPlan,
+        active_backend: OcrBackendDescriptor,
+        backend_detail_override: str,
+        target: DetectedGameWindow,
+        selection: WindowSelectionResult,
+        aihong_two_stage_enabled: bool,
+        runtime_profile: OcrCaptureProfile,
+        runtime_capture_profile_selection: ResolvedOcrCaptureSelection,
+        emitted: bool,
+        observed_or_stable_emitted: bool,
+    ) -> OcrReaderTickResult:
+        self._runtime = self._build_runtime(
+            status=status,
+            detail=detail,
+            plan=backend_plan,
+            active_backend=active_backend,
+            backend_detail_override=backend_detail_override,
+            target=target,
+            capture_stage=(
+                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            ),
+            capture_profile=runtime_profile.to_dict(),
+            capture_profile_selection=runtime_capture_profile_selection,
+            selection=selection,
+            game_id=self._writer.game_id,
+            session_id=self._writer.session_id,
+            last_seq=self._writer.last_seq,
+            last_event_ts=self._writer.last_event_ts,
+        )
+        poll_completed_at = self._time_fn()
+        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+        self._runtime.last_poll_completed_at = utc_now_iso(poll_completed_at)
+        self._runtime.last_poll_duration_seconds = max(0.0, poll_completed_at - poll_started_at)
+        self._runtime.last_poll_emitted_event = bool(emitted or observed_or_stable_emitted)
+        result.runtime = self._runtime.to_dict()
+        return result
+
     async def tick(
         self,
         *,
@@ -4213,9 +4355,7 @@ class OcrReaderManager:
         backend_plan_duration = 0.0
         window_scan_duration = 0.0
         result = OcrReaderTickResult(runtime=self._runtime.to_dict())
-        self._runtime.last_tick_skipped = False
-        self._runtime.last_tick_skip_reason = ""
-        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+        self._begin_tick_poll(poll_started_at=poll_started_at)
 
         if not self._config.ocr_reader_enabled:
             self._runtime = OcrReaderRuntime(enabled=False, status="disabled", detail="disabled_by_config")
@@ -4234,9 +4374,9 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        backend_plan_started_at = self._time_fn()
-        backend_plan = await asyncio.to_thread(self._resolve_backend_plan)
-        backend_plan_duration = max(0.0, self._time_fn() - backend_plan_started_at)
+        backend_plan_result = await self._resolve_backend_plan_for_tick()
+        backend_plan = backend_plan_result.plan
+        backend_plan_duration = backend_plan_result.duration_seconds
         if not backend_plan.primary.available:
             self._runtime = self._build_runtime(
                 status="idle",
@@ -4293,16 +4433,11 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
-        window_scan_started_at = self._time_fn()
-        scanned_windows = await asyncio.to_thread(self._window_scanner)
-        window_scan_duration = max(0.0, self._time_fn() - window_scan_started_at)
-        eligible_windows, excluded_windows = self._prepare_window_inventory(scanned_windows)
-        selection = self._select_target_window(
-            eligible_windows,
-            excluded_windows=excluded_windows,
+        window_selection_result = await self._select_target_for_tick(
             memory_reader_runtime=memory_reader_runtime,
         )
-        self._last_selection = selection
+        selection = window_selection_result.selection
+        window_scan_duration = window_selection_result.duration_seconds
         target = selection.target
         if target is None:
             self._runtime = self._build_runtime(
@@ -4325,47 +4460,14 @@ class OcrReaderManager:
         )
         profile = capture_profile_selection.profile
 
-        if self._attached_window is None or self._attached_window.pid != target.pid:
-            if (
-                not self._writer.session_id
-                or self._writer.game_id != _ocr_game_id_from_process(target.process_name or target.title)
-            ):
-                self._writer.start_session(target)
-                now = max(now, self._time_fn())
-                result.should_rescan = True
-            self._attached_window = target
-            self._last_heartbeat_at = now
-            self._reset_default_ocr_state()
-            self._reset_aihong_menu_state()
-            startup_profile_stage = (
-                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
-            )
-            startup_profile_selection = self._capture_profile_selection_for_target(
-                target,
-                stage=(
-                    self._aihong_stage
-                    if aihong_two_stage_enabled
-                    else _AIHONG_DIALOGUE_STAGE
-                ),
-            )
-            self._runtime = self._build_runtime(
-                status="starting",
-                detail="starting_capture",
-                plan=backend_plan,
-                target=target,
-                capture_stage=startup_profile_stage,
-                capture_profile=startup_profile_selection.profile.to_dict(),
-                capture_profile_selection=startup_profile_selection,
-                selection=selection,
-                game_id=self._writer.game_id,
-                session_id=self._writer.session_id,
-                last_seq=self._writer.last_seq,
-                last_event_ts=self._writer.last_event_ts,
-            )
-
-        if self._attached_window is not None:
-            self._attached_window = target
-        self._remember_locked_target(target)
+        now = self._prepare_attached_target_for_tick(
+            target=target,
+            selection=selection,
+            backend_plan=backend_plan,
+            result=result,
+            now=now,
+            aihong_two_stage_enabled=aihong_two_stage_enabled,
+        )
 
         emitted = False
         guard_blocked = False
@@ -4769,31 +4871,22 @@ class OcrReaderManager:
             if detail == "starting_capture":
                 detail = "attached_no_text_yet"
 
-        self._runtime = self._build_runtime(
+        return self._finalize_tick_runtime(
+            result=result,
+            poll_started_at=poll_started_at,
             status=status,
             detail=detail,
-            plan=backend_plan,
+            backend_plan=backend_plan,
             active_backend=active_backend,
             backend_detail_override=backend_detail_override,
             target=target,
-            capture_stage=(
-                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
-            ),
-            capture_profile=runtime_profile.to_dict(),
-            capture_profile_selection=runtime_capture_profile_selection,
             selection=selection,
-            game_id=self._writer.game_id,
-            session_id=self._writer.session_id,
-            last_seq=self._writer.last_seq,
-            last_event_ts=self._writer.last_event_ts,
+            aihong_two_stage_enabled=aihong_two_stage_enabled,
+            runtime_profile=runtime_profile,
+            runtime_capture_profile_selection=runtime_capture_profile_selection,
+            emitted=emitted,
+            observed_or_stable_emitted=observed_or_stable_emitted,
         )
-        poll_completed_at = self._time_fn()
-        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
-        self._runtime.last_poll_completed_at = utc_now_iso(poll_completed_at)
-        self._runtime.last_poll_duration_seconds = max(0.0, poll_completed_at - poll_started_at)
-        self._runtime.last_poll_emitted_event = bool(emitted or observed_or_stable_emitted)
-        result.runtime = self._runtime.to_dict()
-        return result
 
     def _configured_backend_selection(self) -> str:
         selection = str(self._config.ocr_reader_backend_selection or "auto").strip().lower()
