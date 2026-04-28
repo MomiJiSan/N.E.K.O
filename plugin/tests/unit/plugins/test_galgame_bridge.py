@@ -1367,6 +1367,7 @@ async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(t
         "galgame_set_mode",
         "galgame_set_ocr_backend",
         "galgame_set_ocr_capture_profile",
+        "galgame_set_ocr_timing",
         "galgame_set_ocr_window_target",
         "galgame_suggest_choice",
         "galgame_summarize_scene",
@@ -2050,7 +2051,7 @@ async def test_windows_default_memory_reader_config_stays_idle_when_textractor_a
 
     assert isinstance(status, Ok)
     assert status.value["memory_reader_enabled"] is True
-    assert status.value["active_data_source"] == "none"
+    assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
     assert status.value["memory_reader_runtime"]["status"] == "idle"
     assert status.value["memory_reader_runtime"]["detail"] == "invalid_textractor_path"
 
@@ -3433,7 +3434,8 @@ async def test_ocr_reader_ignores_chinese_plugin_ui_text(
     result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
 
     assert capture_backend.capture_calls == 1
-    assert manager._writer.last_seq == 0
+    assert manager._writer.last_seq == 1
+    assert result.runtime["detail"] == "self_ui_guard_blocked"
     assert any("N.E.K.O plugin UI" in warning for warning in result.warnings)
 
 
@@ -3893,7 +3895,7 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
     assert isinstance(snapshot, Ok)
     assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
     assert status.value["summary"].startswith("已通过 OCR 读取连接（降级模式）")
-    assert snapshot.value["snapshot"]["scene_id"] == "ocr:unknown_scene"
+    assert snapshot.value["snapshot"]["scene_id"].startswith("ocr:ocr-")
     assert snapshot.value["snapshot"]["line_id"].startswith("ocr:")
     assert snapshot.value["snapshot"]["text"] == "来自 OCR 的台词。"
 
@@ -6133,8 +6135,8 @@ async def test_game_llm_agent_uses_cat_choice_advice_and_records_push_history(
     status = await agent.query_status(shared_after)
 
     assert len(ctx.pushed_messages) == 1
-    assert status["recent_pushes"][0]["kind"] == "choice_reason"
-    assert "推荐理由" in status["recent_pushes"][0]["content"]
+    assert status["recent_pushes"][-1]["kind"] == "choice_reason"
+    assert "推荐理由" in status["recent_pushes"][-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -7687,7 +7689,8 @@ async def test_game_llm_agent_choice_failure_retries_variant_then_next_candidate
 
     await agent.tick(shared)
     await asyncio.sleep(0)
-    await agent.tick(shared)
+    response = await agent.send_message(shared, message="建议选择 2，右边更符合当前目标")
+    assert response["selected_choice"]["choice_id"] == "choice-2"
     assert "\"右边\"" in fake_host.started[-1]
 
     fake_host.tasks["task-1"]["status"] = "failed"
@@ -7706,10 +7709,10 @@ async def test_game_llm_agent_choice_failure_retries_variant_then_next_candidate
     await agent.tick(shared)
 
     assert len(fake_host.started) == 3
-    assert "\"左边\"" in fake_host.started[-1]
+    assert "Do not select branch choices" in fake_host.started[-1]
     assert [item["strategy_id"] for item in agent._failure_memory[-2:]] == [
-        "choose_rank_1_variant_1",
-        "choose_rank_1_variant_2",
+        "choose_rank_2_variant_1",
+        "choose_rank_2_variant_2",
     ]
 
 

@@ -3120,6 +3120,10 @@ class OcrReaderManager:
     def _capture_image_hash(frame: Any) -> str:
         if frame is None:
             return ""
+        if isinstance(frame, (bytes, bytearray, memoryview)):
+            return hashlib.blake2b(bytes(frame), digest_size=8).hexdigest()
+        if isinstance(frame, str):
+            return hashlib.blake2b(frame.encode("utf-8", "ignore"), digest_size=8).hexdigest()
         try:
             if hasattr(frame, "tobytes"):
                 size = getattr(frame, "size", "")
@@ -3200,10 +3204,7 @@ class OcrReaderManager:
         self._default_ocr_state.reset()
         self._aihong_menu_ocr_state.reset()
         if defer_scene_emit:
-            if self._pending_visual_scene_hash:
-                self._pending_visual_scene_count += 1
-            else:
-                self._pending_visual_scene_count = 1
+            self._pending_visual_scene_count = 1
             self._pending_visual_scene_hash = background_hash
             self._pending_visual_scene_at = now
             return False
@@ -3900,10 +3901,42 @@ class OcrReaderManager:
             candidate_value = round(base_profile.bottom_inset_ratio + delta, 2)
             if candidate_value in bottom_values and candidate_value not in preferred_bottom_values:
                 preferred_bottom_values.append(candidate_value)
+        if is_aihong_target:
+            preset_bottom = round(
+                float(
+                    OcrCaptureProfile.from_dict(
+                        _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET
+                    ).bottom_inset_ratio
+                ),
+                2,
+            )
+            if preset_bottom in bottom_values and preset_bottom not in preferred_bottom_values:
+                preferred_bottom_values.append(preset_bottom)
         if not preferred_bottom_values:
             preferred_bottom_values = list(bottom_values)
 
-        for top_ratio in top_values:
+        preferred_top_values: list[float] = []
+        if is_aihong_target:
+            preset_top = round(
+                float(
+                    OcrCaptureProfile.from_dict(
+                        _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET
+                    ).top_ratio
+                ),
+                2,
+            )
+            for delta in (0.0, -0.02, 0.02):
+                candidate_value = round(preset_top + delta, 2)
+                if candidate_value in top_values and candidate_value not in preferred_top_values:
+                    preferred_top_values.append(candidate_value)
+        for delta in (0.0, -0.02, 0.02):
+            candidate_value = round(base_profile.top_ratio + delta, 2)
+            if candidate_value in top_values and candidate_value not in preferred_top_values:
+                preferred_top_values.append(candidate_value)
+        if not preferred_top_values:
+            preferred_top_values = list(top_values)
+
+        for top_ratio in preferred_top_values:
             for bottom_inset_ratio in preferred_bottom_values:
                 for left_inset_ratio, right_inset_ratio in horizontal_pairs:
                     _consider_candidate(
@@ -3948,7 +3981,7 @@ class OcrReaderManager:
                     limited=True,
                     error="scan_budget_exhausted",
                 )
-                raise ValueError("auto recalibrate OCR dialogue profile timed out; please retry on a stable dialogue screen")
+                raise ValueError("自动重校准超时：请先停在稳定对白界面再重试")
             self._record_auto_recalibrate_diagnostic(
                 started_at=started_at,
                 attempts=ocr_attempts,

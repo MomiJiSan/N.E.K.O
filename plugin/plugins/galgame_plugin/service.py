@@ -217,6 +217,8 @@ def _looks_like_game_dialogue_context_line(line: dict[str, Any]) -> bool:
 
 
 def _payload_is_game_dialogue_line(payload_obj: dict[str, Any], *, ts: str = "") -> bool:
+    if str(payload_obj.get("source") or "") == DATA_SOURCE_MEMORY_READER:
+        return bool(normalize_text(str(payload_obj.get("text") or "")).strip())
     return _looks_like_game_dialogue_context_line(
         _line_history_entry(payload_obj, ts=ts, stability=str(payload_obj.get("stability") or ""))
     )
@@ -599,8 +601,14 @@ def choose_candidate(
         preferred_candidates = [
             item
             for item in candidates.values()
-            if item.data_source == DATA_SOURCE_MEMORY_READER and _candidate_has_text(item)
+            if item.data_source == DATA_SOURCE_BRIDGE_SDK and _candidate_has_text(item)
         ]
+        if not preferred_candidates:
+            preferred_candidates = [
+                item
+                for item in candidates.values()
+                if item.data_source == DATA_SOURCE_MEMORY_READER and _candidate_has_text(item)
+            ]
     if not preferred_candidates and normalized_reader_mode != READER_MODE_MEMORY:
         preferred_candidates = [
             item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER
@@ -1457,15 +1465,15 @@ def build_local_scene_summary(
             text = str(item.get("text") or "").strip()
             if text:
                 recent_parts.append(f"{speaker}：{text}")
-        summary = f"当前场景 {scene_id or '(unknown)'} 的近期上下文是："
+        summary = f"场景 {scene_id or '(unknown)'} 的近期上下文是："
         summary += "；".join(recent_parts) if recent_parts else "暂时只有零散台词。"
     elif normalized_snapshot.get("text"):
         summary = (
-            f"当前场景 {scene_id or '(unknown)'} 目前停留在"
+            f"场景 {scene_id or '(unknown)'} 目前停留在"
             f"「{str(normalized_snapshot.get('speaker') or '旁白')}：{str(normalized_snapshot.get('text') or '')}」"
         )
     else:
-        summary = f"当前场景 {scene_id or '(unknown)'} 暂时没有足够台词上下文。"
+        summary = f"场景 {scene_id or '(unknown)'} 暂时没有足够台词上下文。"
     if route_id:
         summary += f" 路线 {route_id}。"
     if selected_choices:

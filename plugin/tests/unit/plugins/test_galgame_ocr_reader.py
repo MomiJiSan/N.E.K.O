@@ -822,8 +822,10 @@ async def test_aihong_menu_probe_rejects_dialogue_like_multiline_text(
     assert latest.runtime["capture_profile"]["top_ratio"] == pytest.approx(0.60)
     assert session is not None
     assert session["state"]["is_menu_open"] is False
-    assert capture_backend.capture_calls[4][1]["top_ratio"] == pytest.approx(0.0)
-    assert capture_backend.capture_calls[6][1]["top_ratio"] == pytest.approx(0.0)
+    assert all(
+        call[1]["top_ratio"] == pytest.approx(0.60)
+        for call in capture_backend.capture_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -943,8 +945,8 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
     session = read_session_json(session_path).session
 
     assert first.runtime["status"] == "active"
-    assert first.runtime["detail"] == "receiving_observed_text"
-    assert first.runtime["ocr_context_state"] == "observed"
+    assert first.runtime["detail"] == "receiving_text"
+    assert first.runtime["ocr_context_state"] == "stable"
     assert first.runtime["consecutive_no_text_polls"] == 0
     assert first.runtime["last_observed_at"]
     assert first.runtime["last_capture_attempt_at"]
@@ -952,15 +954,15 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
     assert first.runtime["last_raw_ocr_text"] == "雪乃：你好。"
     assert first.runtime["last_observed_line"]["text"] == "你好。"
     assert second.runtime["status"] == "active"
-    assert second.runtime["detail"] == "receiving_text"
-    assert second.runtime["ocr_context_state"] == "stable"
+    assert second.runtime["detail"] == "attached_no_text_yet"
+    assert second.runtime["ocr_context_state"] == "no_text"
     assert second.runtime["last_stable_line"]["text"] == "你好。"
     assert third.runtime["status"] == "active"
     assert third.runtime["game_id"].startswith("ocr-")
     assert session is not None
     assert session["metadata"]["source"] == "ocr_reader"
     assert session["bridge_sdk_version"].startswith("ocr-reader-")
-    assert session["state"]["scene_id"] == "ocr:unknown_scene"
+    assert session["state"]["scene_id"].startswith(f"ocr:{writer.game_id}:scene-")
     assert str(session["state"]["line_id"]).startswith("ocr:")
     assert session["state"]["text"] == "你好。"
 
@@ -1118,8 +1120,8 @@ async def test_ocr_reader_manager_auto_mode_prefers_rapidocr_when_available(
     assert first.runtime["backend_kind"] == "rapidocr"
     assert second.runtime["backend_kind"] == "rapidocr"
     assert third.runtime["backend_kind"] == "rapidocr"
-    assert second.runtime["detail"] == "receiving_text"
-    assert second.runtime["ocr_context_state"] == "stable"
+    assert first.runtime["detail"] == "receiving_text"
+    assert first.runtime["ocr_context_state"] == "stable"
 
 
 @pytest.mark.asyncio

@@ -1956,7 +1956,7 @@ class GameLLMAgent:
                 continue
             if 0 <= candidate_index < len(candidates):
                 return (candidate_index, f"cat_advice_index_{candidate_index + 1}")
-        for token, candidate_index in {
+        chinese_index_tokens = {
             "一": 0,
             "二": 1,
             "三": 2,
@@ -1966,8 +1966,11 @@ class GameLLMAgent:
             "七": 6,
             "八": 7,
             "九": 8,
-        }.items():
-            if token in normalized and 0 <= candidate_index < len(candidates):
+        }
+        for token, candidate_index in chinese_index_tokens.items():
+            if not re.search(rf"(?:选择|选|建议|推荐|第)\s*{re.escape(token)}(?:个|项|条|号|$)", normalized):
+                continue
+            if 0 <= candidate_index < len(candidates):
                 return (candidate_index, f"cat_advice_chinese_index_{token}")
         for index, candidate in enumerate(candidates):
             text = str(candidate.get("text") or "").strip()
@@ -2818,6 +2821,7 @@ class GameLLMAgent:
                         ),
                         scene_id=str(selected.get("scene_id") or ""),
                         route_id=str(selected.get("route_id") or ""),
+                        metadata={"suppress_delivery": reason.startswith("cat_advice:")},
                     )
                 self._observed_choice_marker = marker
 
@@ -2945,7 +2949,7 @@ class GameLLMAgent:
             if current_text:
                 speaker = str(snapshot.get("speaker") or "旁白").strip() or "旁白"
                 recent_parts.append(f"{speaker}：{current_text}")
-        prefix = f"当前场景 {scene_id or '(unknown)'}"
+        prefix = f"场景 {scene_id or '(unknown)'}"
         if route_id:
             prefix += f" / 路线 {route_id}"
         if recent_parts:
@@ -2982,6 +2986,12 @@ class GameLLMAgent:
             priority=6,
             metadata=metadata,
         )
+        outbound_metadata = dict(outbound.get("metadata") or {})
+        if bool(outbound_metadata.pop("suppress_delivery", False)):
+            outbound["metadata"] = outbound_metadata
+            self._mark_message(outbound, status="completed", delivered=False)
+            self._recent_pushes = self._recent_push_records()
+            return
         try:
             self._plugin.push_message(
                 source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
@@ -2989,7 +2999,7 @@ class GameLLMAgent:
                 description=f"Galgame Agent | {kind}",
                 priority=6,
                 content=content,
-                metadata=dict(outbound.get("metadata") or {}),
+                metadata=outbound_metadata,
             )
             self._mark_message(outbound, status="delivered", delivered=True)
         except Exception as exc:

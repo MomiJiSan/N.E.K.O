@@ -541,6 +541,7 @@ class MemoryReaderBridgeWriter:
         self._append_event(
             "line_changed",
             {
+                "source": DATA_SOURCE_MEMORY_READER,
                 "speaker": speaker,
                 "text": text,
                 "line_id": line_id,
