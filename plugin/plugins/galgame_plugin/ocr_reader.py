@@ -2098,18 +2098,7 @@ class _MouseWheelMonitor:
         self.ensure_running()
         with self._lock:
             self._prune_locked()
-            events = [event for event in self._events if event.seq > seq]
-        if not events:
-            return []
-        foreground_hwnd = _foreground_window_handle()
-        if not foreground_hwnd:
-            return events
-        return [
-            event
-            if event.foreground_hwnd
-            else replace(event, foreground_hwnd=max(0, int(foreground_hwnd or 0)))
-            for event in events
-        ]
+            return [event for event in self._events if event.seq > seq]
 
     def _record(
         self,
@@ -2117,6 +2106,7 @@ class _MouseWheelMonitor:
         delta: int = 0,
         kind: str = "wheel",
         point_hwnd: int = 0,
+        foreground_hwnd: int = 0,
     ) -> None:
         now = self._time_fn()
         with self._lock:
@@ -2126,7 +2116,7 @@ class _MouseWheelMonitor:
                     seq=self._seq,
                     ts=now,
                     delta=int(delta),
-                    foreground_hwnd=0,
+                    foreground_hwnd=max(0, int(foreground_hwnd or 0)),
                     point_hwnd=max(0, int(point_hwnd or 0)),
                     kind=str(kind or "wheel"),
                 )
@@ -2190,6 +2180,7 @@ class _MouseWheelMonitor:
                             int(payload.pt.x),
                             int(payload.pt.y),
                         )
+                        foreground_hwnd = user32.GetForegroundWindow()
                         if message == 0x020A:
                             delta = ctypes.c_short((int(payload.mouseData) >> 16) & 0xFFFF).value
                             if delta:
@@ -2197,9 +2188,14 @@ class _MouseWheelMonitor:
                                     delta=delta,
                                     kind="wheel",
                                     point_hwnd=point_hwnd,
+                                    foreground_hwnd=foreground_hwnd,
                                 )
                         else:
-                            self._record(kind="left_click", point_hwnd=point_hwnd)
+                            self._record(
+                                kind="left_click",
+                                point_hwnd=point_hwnd,
+                                foreground_hwnd=foreground_hwnd,
+                            )
                     except Exception:
                         pass
                 return user32.CallNextHookEx(
@@ -2474,15 +2470,8 @@ class OcrReaderManager:
         return _OCR_LINE_REPEAT_THRESHOLD_MEDIUM
 
     def _should_emit_observed_lines_for_capture(self, *, after_advance_trigger_mode: bool) -> bool:
-        if not after_advance_trigger_mode:
-            return True
-        state = self._writer.current_state
-        if not isinstance(state, dict):
-            return True
-        has_current_text = bool(str(state.get("text") or "").strip())
-        choices = state.get("choices", [])
-        has_current_choices = isinstance(choices, list) and bool(choices)
-        return not has_current_text and not has_current_choices
+        # after_advance 模式下应 emit observed，提供即时反馈
+        return True
 
     def _mark_observed_progress(self, *, now: float) -> None:
         self._consecutive_no_text_polls = 0
@@ -3861,8 +3850,7 @@ class OcrReaderManager:
             )
 
         if (
-            not after_advance_trigger_mode
-            and not dialogue_emitted
+            not dialogue_emitted
             and not dialogue_text_is_menu_status
             and not dialogue_menu_choices
         ):

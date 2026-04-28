@@ -1475,6 +1475,29 @@ class GalgamePlugin(NekoPluginBase):
             with self._state_lock:
                 self._pending_ocr_advance_captures = 0
 
+        # 始终检测手动输入，与 pending delay 解耦
+        if (
+            self._ocr_reader_manager is not None
+            and ocr_reader_allowed
+            and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+        ):
+            consume = getattr(
+                self._ocr_reader_manager,
+                "consume_foreground_advance_input",
+                None,
+            )
+            if callable(consume):
+                try:
+                    should_capture = bool(consume())
+                except Exception as exc:
+                    warnings.append(
+                        f"ocr_reader foreground advance monitor failed: {exc}"
+                    )
+                else:
+                    if should_capture:
+                        self.request_ocr_after_advance_capture(
+                            reason="manual_foreground_advance"
+                        )
         if (
             self._ocr_reader_manager is not None
             and ocr_reader_allowed
@@ -1507,11 +1530,6 @@ class GalgamePlugin(NekoPluginBase):
                 or force
                 or ocr_bootstrap_capture_needed
                 or (pending_ocr_advance_capture and pending_ocr_delay_remaining <= 0.0)
-                or (
-                    ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
-                    and str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
-                    and str(ocr_reader_runtime.get("status") or "") == "active"
-                )
                 or str(ocr_reader_runtime.get("status") or "") not in {"active"}
                 or str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
             )
