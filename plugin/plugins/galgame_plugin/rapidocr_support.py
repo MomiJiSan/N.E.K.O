@@ -670,6 +670,7 @@ async def install_rapidocr(
     client: httpx.AsyncClient | None = None
     current_phase = "metadata"
     package_specs: list[str] = []
+    install_succeeded = False
     if client_factory is None:
         client = httpx.AsyncClient(
             timeout=timeout_seconds,
@@ -809,6 +810,7 @@ async def install_rapidocr(
         if task_id:
             update_install_task_state(task_id, kind="rapidocr", **completed_progress)
         await _emit_progress(progress_callback, completed_progress)
+        install_succeeded = True
         return result
     except Exception as exc:
         if logger is not None:
@@ -858,8 +860,9 @@ async def install_rapidocr(
     finally:
         if owned_client and client is not None:
             await client.aclose()
-        try:
-            _purge_modules((RAPIDOCR_PACKAGE_NAME,))
-        except Exception as exc:
-            if logger is not None:
-                logger.warning("RapidOCR module cleanup failed: {}", exc)
+        if not install_succeeded:
+            try:
+                _purge_modules((RAPIDOCR_PACKAGE_NAME,))
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning("RapidOCR module cleanup failed: {}", exc)

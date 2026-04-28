@@ -97,6 +97,313 @@ h1 {
   font-size: 13px;
 }
 
+.primary-diagnosis,
+.first-run-guide,
+.current-line-overview,
+.ocr-pipeline-panel {
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 12px 32px rgba(23, 37, 43, 0.08);
+}
+
+.primary-diagnosis {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px 20px;
+}
+
+.primary-diagnosis.ok {
+  border-color: rgba(14, 138, 124, 0.24);
+  background: rgba(14, 138, 124, 0.08);
+}
+
+.primary-diagnosis.info {
+  border-color: rgba(31, 42, 51, 0.12);
+}
+
+.primary-diagnosis.warning {
+  border-color: rgba(178, 106, 28, 0.28);
+  background: var(--warning-bg);
+}
+
+.primary-diagnosis.error {
+  border-color: rgba(210, 95, 69, 0.34);
+  background: rgba(210, 95, 69, 0.1);
+}
+
+.primary-diagnosis-copy {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.primary-diagnosis-copy h2,
+.first-run-guide h2,
+.current-line-overview h2 {
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.primary-diagnosis-copy p:last-child {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.primary-diagnosis-actions,
+.first-run-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.first-run-guide {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(0, 2fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 18px 20px;
+}
+
+.first-run-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.first-run-step {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  gap: 10px;
+  align-items: start;
+  min-height: 88px;
+  padding: 12px;
+  border: 1px solid rgba(31, 42, 51, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.first-run-step.done {
+  border-color: rgba(14, 138, 124, 0.22);
+  background: rgba(14, 138, 124, 0.08);
+}
+
+.first-run-step.active {
+  border-color: rgba(178, 106, 28, 0.26);
+  background: rgba(178, 106, 28, 0.09);
+}
+
+.first-run-step-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.08);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.first-run-step.done .first-run-step-marker {
+  background: rgba(14, 138, 124, 0.14);
+  color: var(--brand-strong);
+}
+
+.first-run-step.active .first-run-step-marker {
+  background: rgba(178, 106, 28, 0.15);
+  color: var(--warning);
+}
+
+.first-run-step h3 {
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.first-run-step p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.current-line-overview {
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+}
+
+.current-line-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.current-line-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.current-line-item {
+  min-height: 116px;
+  max-height: 180px;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(31, 42, 51, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  overscroll-behavior: contain;
+}
+
+.current-line-item.empty {
+  color: var(--muted);
+  background: rgba(31, 42, 51, 0.04);
+}
+
+.current-line-item p:last-child {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.ocr-pipeline-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+}
+
+.ocr-pipeline-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.ocr-pipeline-panel h2 {
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.ocr-pipeline-steps {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ocr-pipeline-step {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  min-height: 190px;
+  padding: 14px;
+  border: 1px solid rgba(31, 42, 51, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.ocr-pipeline-step.ok {
+  border-color: rgba(14, 138, 124, 0.22);
+  background: rgba(14, 138, 124, 0.08);
+}
+
+.ocr-pipeline-step.warning {
+  border-color: rgba(178, 106, 28, 0.25);
+  background: rgba(178, 106, 28, 0.08);
+}
+
+.ocr-pipeline-step.error {
+  border-color: rgba(210, 95, 69, 0.3);
+  background: rgba(210, 95, 69, 0.09);
+}
+
+.ocr-pipeline-step h3 {
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.ocr-pipeline-step p {
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.ocr-pipeline-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  min-width: 42px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.08);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ocr-pipeline-step.ok .ocr-pipeline-dot {
+  background: rgba(14, 138, 124, 0.14);
+  color: var(--brand-strong);
+}
+
+.ocr-pipeline-step.warning .ocr-pipeline-dot {
+  background: rgba(178, 106, 28, 0.15);
+  color: var(--warning);
+}
+
+.ocr-pipeline-step.error .ocr-pipeline-dot {
+  background: rgba(210, 95, 69, 0.14);
+  color: #8c2f21;
+}
+
+.install-summary-chip {
+  display: inline-flex;
+  align-items: center;
+  margin: 2px 0 2px 6px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.07);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.install-summary-chip.installed {
+  background: rgba(14, 138, 124, 0.12);
+  color: var(--brand-strong);
+}
+
+.install-summary-chip.running,
+.install-summary-chip.warning,
+.install-summary-chip.missing {
+  background: rgba(178, 106, 28, 0.12);
+  color: var(--warning);
+}
+
+.install-summary-chip.failed {
+  background: rgba(210, 95, 69, 0.12);
+  color: #8c2f21;
+}
+
+#installCompactSummary {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 .panel {
   padding: 22px;
 }
@@ -662,6 +969,11 @@ button.active {
   color: var(--warning);
 }
 
+.status-chip.error {
+  background: rgba(210, 95, 69, 0.12);
+  color: #8c2f21;
+}
+
 .excluded-window-panel {
   margin-top: 14px;
   border-top: 1px dashed var(--line);
@@ -693,6 +1005,11 @@ button.active {
 .flash-message.info {
   background: rgba(31, 42, 51, 0.08);
   color: var(--ink);
+}
+
+.flash-message.warning {
+  background: var(--warning-bg);
+  color: var(--warning);
 }
 
 .flash-message.error {
@@ -1127,6 +1444,10 @@ details.panel-fullscreen #eventsList .list-card {
     text-align: left;
   }
 
+  #installCompactSummary {
+    justify-content: flex-start;
+  }
+
   .settings-module > summary::after,
   .dashboard-module > summary::after {
     align-self: flex-start;
@@ -1150,6 +1471,20 @@ details.panel-fullscreen #eventsList .list-card {
   .capture-profile-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
+
+  .ocr-pipeline-steps {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .first-run-guide,
+  .first-run-steps {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .first-run-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 900px) {
@@ -1164,8 +1499,36 @@ details.panel-fullscreen #eventsList .list-card {
   .control-grid,
   .agent-grid,
   .dashboard-grid,
-  .capture-profile-grid {
+  .capture-profile-grid,
+  .first-run-guide,
+  .first-run-steps,
+  .current-line-grid {
     grid-template-columns: 1fr;
+  }
+
+  .primary-diagnosis,
+  .current-line-head,
+  .ocr-pipeline-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .primary-diagnosis-actions,
+  .first-run-actions {
+    justify-content: stretch;
+  }
+
+  .primary-diagnosis-actions button,
+  .first-run-actions button {
+    width: 100%;
+  }
+
+  .ocr-pipeline-steps {
+    grid-template-columns: 1fr;
+  }
+
+  .ocr-pipeline-step {
+    min-height: 0;
   }
 
   .binding-summary {

@@ -43,6 +43,8 @@ def _normalize_task_id(task_id: str) -> str:
     normalized = str(task_id or "").strip()
     if not normalized:
         raise ValueError("task_id is required")
+    if ".." in normalized or "/" in normalized or "\\" in normalized:
+        raise ValueError("invalid task_id")
     return normalized
 
 

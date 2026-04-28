@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Galgame 插件设置</title>
-  <link rel="stylesheet" href="./style.css?v=20260427-context-scroll-fullscreen-summary-4">
+  <link rel="stylesheet" href="./style.css?v=20260429-page-diagnosis-p1">
 </head>
 <body>
   <div class="page-shell">
@@ -22,6 +22,51 @@
         <span id="summaryText" class="summary-pill">等待首次刷新</span>
       </div>
     </header>
+
+    <section id="primaryDiagnosisPanel" class="primary-diagnosis info" aria-live="polite">
+      <div class="primary-diagnosis-copy">
+        <p id="primaryDiagnosisKicker" class="list-kicker">运行诊断</p>
+        <h2 id="primaryDiagnosisTitle">等待插件状态</h2>
+        <p id="primaryDiagnosisBody">状态加载后，这里会显示当前能不能识别台词以及下一步操作。</p>
+      </div>
+      <div id="primaryDiagnosisActions" class="primary-diagnosis-actions"></div>
+    </section>
+
+    <section id="firstRunGuide" class="first-run-guide" hidden>
+      <div>
+        <p class="list-kicker">开始使用</p>
+        <h2>按顺序完成 4 步</h2>
+      </div>
+      <div id="firstRunSteps" class="first-run-steps"></div>
+      <div class="first-run-actions">
+        <button class="secondary" data-first-run-action="refresh_ocr_windows">刷新窗口</button>
+        <button class="secondary" data-first-run-action="select_ocr_window">选择游戏窗口</button>
+        <button class="primary" data-first-run-action="choice_advisor">开始自动识别</button>
+      </div>
+    </section>
+
+    <section id="currentLineOverview" class="current-line-overview">
+      <div class="current-line-head">
+        <div>
+          <p class="list-kicker">当前台词</p>
+          <h2 id="currentLineOverviewTitle">等待识别结果</h2>
+        </div>
+        <span id="currentLineOverviewStatus" class="status-chip">等待刷新</span>
+      </div>
+      <p id="currentLineOverviewHint" class="result-note">识别到文字后，这里会区分刚读到的候选台词和已确认台词。</p>
+      <div id="currentLineOverviewGrid" class="current-line-grid"></div>
+    </section>
+
+    <section id="ocrPipelinePanel" class="ocr-pipeline-panel">
+      <div class="ocr-pipeline-head">
+        <div>
+          <p class="list-kicker">OCR 链路</p>
+          <h2>窗口、截图、识别、台词确认</h2>
+        </div>
+        <span id="ocrPipelineSummary" class="status-chip">等待刷新</span>
+      </div>
+      <div id="ocrPipelineSteps" class="ocr-pipeline-steps"></div>
+    </section>
 
     <section class="panel panel-controls">
       <div class="panel-title-row">
@@ -109,10 +154,10 @@
         </div>
       </details>
 
-      <details class="settings-module">
+      <details id="dependencyModule" class="settings-module">
         <summary>
           <span>依赖安装</span>
-          <small>RapidOCR / DXcam 优先，Tesseract / Textractor 仅作兜底</small>
+          <small id="installCompactSummary">RapidOCR / DXcam 优先，Tesseract / Textractor 仅作兜底</small>
         </summary>
         <div class="module-body install-stack">
         <div class="install-tabs">
@@ -343,7 +388,7 @@
         <dl id="ocrRuntimeGrid" class="data-grid scroll-region"></dl>
       </details>
 
-      <details class="panel panel-scroll dashboard-module" open>
+      <details class="panel panel-scroll dashboard-module">
         <summary><span>当前快照</span><small>当前台词、选项、菜单状态</small></summary>
         <dl id="snapshotGrid" class="data-grid scroll-region"></dl>
       </details>
@@ -405,6 +450,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260427-ocr-trigger-dialogue-1"></script>
+  <script src="./main.js?v=20260429-page-diagnosis-p1"></script>
 </body>
 </html>

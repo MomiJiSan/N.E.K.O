@@ -18,6 +18,9 @@ _ALLOWED_OPERATIONS = frozenset(
 _EXPLAIN_EVIDENCE_TYPES = frozenset({"current_line", "history_line", "choice"})
 _KEY_POINT_TYPES = frozenset({"plot", "emotion", "decision", "reveal", "objective"})
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
+_JSON_CORRECTION_MAX_ATTEMPTS = 1
+_JSON_CORRECTION_BAD_OUTPUT_MAX_CHARS = 12000
+_JSON_CORRECTION_ERROR_MAX_CHARS = 600
 
 
 def _json_dump(value: object) -> str:
@@ -39,6 +42,14 @@ def _strip_code_fences(raw_text: str) -> str:
     return text
 
 
+def _bounded_prompt_text(value: object, *, max_chars: int) -> str:
+    text = _as_str(value, str(value))
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return f"{text[:max_chars]}\n...[truncated {omitted} chars]"
+
+
 class GalgameLLMBackend:
     def __init__(self, logger) -> None:
         self._logger = logger
@@ -52,8 +63,11 @@ class GalgameLLMBackend:
         for llm in llms:
             try:
                 await llm.aclose()
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    self._logger.warning("galgame LLM client close failed: {}", exc)
+                except Exception:
+                    pass
 
     async def invoke(
         self,
@@ -90,25 +104,68 @@ class GalgameLLMBackend:
             operation=operation,
             messages=messages,
         )
-        try:
-            self._parse_json_object(raw_text)
-            return raw_text
-        except SdkError:
-            correction_messages = list(messages)
-            correction_messages.append({"role": "assistant", "content": raw_text})
-            correction_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "你上一条回复不是合法 JSON。请只返回一个合法 JSON 对象，"
-                        "不要带 Markdown、解释或额外文本。"
-                    ),
-                }
+        last_error: SdkError | None = None
+        for attempt in range(_JSON_CORRECTION_MAX_ATTEMPTS + 1):
+            try:
+                self._parse_json_object(raw_text)
+                return raw_text
+            except SdkError as exc:
+                last_error = exc
+                if attempt >= _JSON_CORRECTION_MAX_ATTEMPTS:
+                    break
+
+            correction_messages = self._build_json_correction_messages(
+                operation=operation,
+                messages=messages,
+                bad_output=raw_text,
+                parse_error=last_error,
+                attempt=attempt + 1,
+                max_attempts=_JSON_CORRECTION_MAX_ATTEMPTS,
             )
-            return await self._call_model(
+            raw_text = await self._call_model(
                 operation=operation,
                 messages=correction_messages,
             )
+
+        raise SdkError(
+            "llm result is not valid json object after "
+            f"{_JSON_CORRECTION_MAX_ATTEMPTS} correction attempt(s): {last_error}"
+        )
+
+    def _build_json_correction_messages(
+        self,
+        *,
+        operation: str,
+        messages: list[dict[str, str]],
+        bad_output: object,
+        parse_error: object,
+        attempt: int,
+        max_attempts: int,
+    ) -> list[dict[str, str]]:
+        if operation not in _ALLOWED_OPERATIONS:
+            raise SdkError(f"unsupported operation: {operation!r}")
+        bounded_bad_output = _bounded_prompt_text(
+            bad_output,
+            max_chars=_JSON_CORRECTION_BAD_OUTPUT_MAX_CHARS,
+        )
+        bounded_error = _bounded_prompt_text(
+            parse_error,
+            max_chars=_JSON_CORRECTION_ERROR_MAX_CHARS,
+        )
+        correction_messages = list(messages)
+        correction_messages.append({"role": "assistant", "content": bounded_bad_output})
+        correction_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"JSON 修正请求 {attempt}/{max_attempts}，operation={operation}。\n"
+                    f"解析错误：{bounded_error}\n"
+                    "你上一条回复不是合法 JSON 对象。请只返回一个合法 JSON 对象，"
+                    "不要带 Markdown、解释或额外文本。"
+                ),
+            }
+        )
+        return correction_messages
 
     async def _call_model(
         self,

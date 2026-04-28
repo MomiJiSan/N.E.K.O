@@ -101,6 +101,11 @@ async def test_galgame_plugin_ui_index_route_serves_static_dashboard(
     assert "一键安装 Tesseract" in response.text
     assert "Textractor" in response.text
     assert "OCR 截图校准" in response.text
+    assert 'id="primaryDiagnosisPanel"' in response.text
+    assert 'id="firstRunGuide"' in response.text
+    assert 'id="currentLineOverview"' in response.text
+    assert 'id="ocrPipelinePanel"' in response.text
+    assert 'id="installCompactSummary"' in response.text
 
 
 @pytest.mark.asyncio
@@ -132,10 +137,19 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
     assert "galgame_agent_command" in response.text
     assert "galgame_set_ocr_capture_profile" in response.text
     assert "galgame_list_ocr_windows" in response.text
+    assert "force: Boolean(force)" in response.text
     assert "galgame_set_ocr_window_target" in response.text
     assert "active_data_source" in response.text
     assert "memory_reader_runtime" in response.text
     assert "ocr_reader_runtime" in response.text
+    assert "renderPrimaryDiagnosis" in response.text
+    assert "normalizePrimaryDiagnosis" in response.text
+    assert "primary_diagnosis" in response.text
+    assert "renderFirstRunGuide" in response.text
+    assert "renderCurrentLineOverview" in response.text
+    assert "renderOcrPipelinePanel" in response.text
+    assert "renderInstallCompactSummary" in response.text
+    assert "excluded_non_game_process" in response.text
     assert "rapidocr" in response.text
     assert "dxcam" in response.text
     assert "tesseract" in response.text

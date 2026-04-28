@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -11,8 +14,10 @@ from plugin.plugins.galgame_plugin.models import (
 )
 from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
+    OcrCaptureProfile,
     OcrReaderBridgeWriter,
     OcrReaderManager,
+    SelectedOcrBackendPlan,
     _rapidocr_text_from_output,
     _score_ocr_text,
 )
@@ -44,6 +49,15 @@ class _Logger:
 
     def exception(self, *args, **kwargs):
         return None
+
+
+class _CapturingLogger(_Logger):
+    def __init__(self) -> None:
+        self.warnings: list[tuple[object, ...]] = []
+
+    def warning(self, *args, **kwargs):
+        del kwargs
+        self.warnings.append(args)
 
 
 class _FakeCaptureBackend:
@@ -146,6 +160,869 @@ def _window() -> list[DetectedGameWindow]:
     ]
 
 
+def test_ocr_choices_emit_does_not_fall_through_to_dialogue(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    window = _window()[0]
+    writer.start_session(window)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+        writer=writer,
+    )
+    manager._default_ocr_state.last_raw_text = "去东院！\n去西院！"
+    manager._default_ocr_state.repeat_count = 1
+
+    assert manager._consume_ocr_text("1. 去东院！\n2. 去西院！", now=3000.0) is True
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert events[-1]["type"] == "choices_shown"
+    assert session is not None
+    assert session["state"]["stability"] == "choices"
+    assert session["state"]["is_menu_open"] is True
+    assert [item["text"] for item in session["state"]["choices"]] == ["去东院！", "去西院！"]
+
+
+def test_ocr_choice_candidates_do_not_pollute_dialogue_stability(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    writer.start_session(_window()[0])
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+        writer=writer,
+    )
+
+    assert manager._consume_ocr_text("1. Save her.\n2. Leave.", now=3000.0) is False
+    assert manager._consume_ocr_text("1. Save her.\n2. Leave.", now=3001.0) is True
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+
+    assert [event["type"] for event in events] == ["session_started", "choices_shown"]
+    assert session is not None
+    assert session["state"]["stability"] == "choices"
+    assert [item["text"] for item in session["state"]["choices"]] == ["Save her.", "Leave."]
+
+
+def test_ocr_session_snapshot_write_failure_is_nonfatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    logger = _CapturingLogger()
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: 3000.0,
+        logger=logger,
+    )
+
+    def _fail_replace(src, dst):
+        del src, dst
+        raise OSError("disk full")
+
+    monkeypatch.setattr(galgame_ocr_reader.os, "replace", _fail_replace)
+
+    writer.start_session(_window()[0])
+
+    assert logger.warnings
+    assert logger.warnings[0][0] == "ocr_reader session snapshot write failed: {}"
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    assert [event["type"] for event in events] == ["session_started"]
+
+
+def test_ocr_choice_candidates_use_single_read_threshold_when_requested(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    writer.start_session(_window()[0])
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+        writer=writer,
+    )
+
+    assert (
+        manager._consume_ocr_text(
+            "1. Save her.\n2. Leave.",
+            now=3000.0,
+            line_repeat_threshold=1,
+        )
+        is True
+    )
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    assert events[-1]["type"] == "choices_shown"
+
+
+def test_ocr_overlay_guard_does_not_drop_short_english_dialogue() -> None:
+    assert galgame_ocr_reader._looks_like_game_overlay_text("I must save her.") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Save her.") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("The system is collapsing.") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Don't skip the ceremony.") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Save") is True
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Save\nLoad") is True
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Auto Save") is True
+
+
+def test_ocr_overlay_guard_does_not_drop_chinese_dialogue_with_menu_words() -> None:
+    assert galgame_ocr_reader._looks_like_game_overlay_text("这是自动校准命中的对白文本。") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("系统已经崩溃了。") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("菜单上的名字忽然亮了起来。") is False
+    assert galgame_ocr_reader._looks_like_game_overlay_text("自动") is True
+    assert galgame_ocr_reader._looks_like_game_overlay_text("菜单\n设置") is True
+    assert galgame_ocr_reader._looks_like_game_overlay_text("系统设置") is True
+
+
+def test_ocr_reader_auto_target_excludes_razer_monitor_window() -> None:
+    candidate = DetectedGameWindow(
+        hwnd=67284,
+        title="RzMonitorForegroundWindow",
+        process_name="RazerAppEngine.exe",
+        pid=8200,
+        class_name="RzMonitorForegroundWindowClass",
+        exe_path=r"C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe",
+        width=0,
+        height=0,
+    )
+
+    classified = galgame_ocr_reader._classify_window_candidate(candidate)
+
+    assert classified.eligible is False
+    assert classified.exclude_reason in {"excluded_helper_window", "excluded_non_game_process"}
+
+
+def test_ocr_window_candidate_marks_minimized_window_as_excluded() -> None:
+    candidate = DetectedGameWindow(
+        hwnd=197524,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=30412,
+        class_name="UnityWndClass",
+        width=160,
+        height=28,
+        area=4480,
+        is_minimized=True,
+    )
+
+    classified = galgame_ocr_reader._classify_window_candidate(candidate)
+
+    assert classified.eligible is False
+    assert classified.exclude_reason == "excluded_minimized_window"
+    assert classified.category == "excluded_minimized_window"
+    assert classified.to_dict()["is_minimized"] is True
+
+
+def test_ocr_window_candidate_minimized_reason_takes_priority_over_small_window() -> None:
+    candidate = DetectedGameWindow(
+        hwnd=197524,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=30412,
+        class_name="UnityWndClass",
+        width=160,
+        height=28,
+        area=4480,
+        is_minimized=True,
+    )
+
+    classified = galgame_ocr_reader._classify_window_candidate(candidate)
+
+    assert classified.exclude_reason == "excluded_minimized_window"
+    assert classified.exclude_reason != "excluded_small_or_hidden_window"
+
+
+def test_default_window_scanner_retains_minimized_visible_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hwnd = 197524
+    pid = 30412
+
+    class _FakeWin32Gui:
+        @staticmethod
+        def IsWindowVisible(value: int) -> bool:
+            return value == hwnd
+
+        @staticmethod
+        def IsIconic(value: int) -> bool:
+            return value == hwnd
+
+        @staticmethod
+        def GetWindowRect(value: int) -> tuple[int, int, int, int]:
+            assert value == hwnd
+            return (-32000, -32000, -31840, -31972)
+
+        @staticmethod
+        def GetWindowText(value: int) -> str:
+            assert value == hwnd
+            return "TheLamentingGeese"
+
+        @staticmethod
+        def GetClassName(value: int) -> str:
+            assert value == hwnd
+            return "UnityWndClass"
+
+        @staticmethod
+        def EnumWindows(callback, payload) -> None:
+            callback(hwnd, payload)
+
+    class _FakeWin32Process:
+        @staticmethod
+        def GetWindowThreadProcessId(value: int) -> tuple[int, int]:
+            assert value == hwnd
+            return (1, pid)
+
+    class _FakeProcess:
+        def __init__(self, value: int) -> None:
+            assert value == pid
+
+        def name(self) -> str:
+            return "TheLamentingGeese.exe"
+
+        def exe(self) -> str:
+            return r"C:\Games\TheLamentingGeese.exe"
+
+    class _FakePsutil:
+        Process = _FakeProcess
+
+    monkeypatch.setitem(sys.modules, "win32gui", _FakeWin32Gui)
+    monkeypatch.setitem(sys.modules, "win32process", _FakeWin32Process)
+    monkeypatch.setattr(galgame_ocr_reader, "psutil", _FakePsutil)
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+
+    results = galgame_ocr_reader._default_window_scanner()
+
+    assert len(results) == 1
+    assert results[0].is_minimized is True
+    assert results[0].eligible is False
+    assert results[0].exclude_reason == "excluded_minimized_window"
+    assert results[0].to_dict()["is_minimized"] is True
+
+
+def test_ocr_select_target_window_reports_memory_reader_minimized_window(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    minimized = galgame_ocr_reader._classify_window_candidate(
+        DetectedGameWindow(
+            hwnd=197524,
+            title="TheLamentingGeese",
+            process_name="TheLamentingGeese.exe",
+            pid=30412,
+            class_name="UnityWndClass",
+            width=160,
+            height=28,
+            area=4480,
+            is_minimized=True,
+        )
+    )
+
+    selection = manager._select_target_window(
+        [],
+        excluded_windows=[minimized],
+        memory_reader_runtime={
+            "pid": 30412,
+            "process_name": "TheLamentingGeese.exe",
+        },
+    )
+
+    assert selection.target is None
+    assert selection.selection_detail == "memory_reader_window_minimized"
+    assert selection.last_exclude_reason == "excluded_minimized_window"
+
+
+def test_ocr_select_target_window_does_not_pick_unrelated_window_when_memory_target_minimized(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    minimized = galgame_ocr_reader._classify_window_candidate(
+        DetectedGameWindow(
+            hwnd=197524,
+            title="TheLamentingGeese",
+            process_name="TheLamentingGeese.exe",
+            pid=30412,
+            class_name="UnityWndClass",
+            width=160,
+            height=28,
+            area=4480,
+            is_minimized=True,
+        )
+    )
+    unrelated = DetectedGameWindow(
+        hwnd=300,
+        title="Other Window",
+        process_name="OtherGame.exe",
+        pid=5555,
+        width=1280,
+        height=720,
+        area=921600,
+    )
+
+    selection = manager._select_target_window(
+        [unrelated],
+        excluded_windows=[minimized],
+        memory_reader_runtime={
+            "pid": 30412,
+            "process_name": "TheLamentingGeese.exe",
+        },
+    )
+
+    assert selection.target is None
+    assert selection.selection_detail == "memory_reader_window_minimized"
+    assert selection.last_exclude_reason == "excluded_minimized_window"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_capture_timeout_returns_capture_failed_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+
+    class _SlowOcrBackend(_FakeOcrBackend):
+        def extract_text(self, image: str) -> str:
+            del image
+            self.calls += 1
+            time.sleep(0.05)
+            return "雪乃：迟到的台词。"
+
+    monkeypatch.setattr(galgame_ocr_reader, "_OCR_CAPTURE_TIMEOUT_SECONDS", 0.01)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            install_target_dir=str(install_root),
+            rapidocr_enabled=False,
+        ),
+        time_fn=lambda: 3001.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=102,
+                title="Demo Window",
+                process_name="DemoGame.exe",
+                pid=4243,
+                width=1280,
+                height=720,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_SlowOcrBackend(),
+        writer=OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3001.0),
+    )
+
+    started_at = time.monotonic()
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 2.0
+    assert result.runtime["detail"] == "capture_failed"
+    assert result.runtime["ocr_context_state"] == "capture_failed"
+    assert "timed out" in result.runtime["last_capture_error"]
+    assert any("timed out" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_capture_timeout_does_not_overlap_still_running_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingOcrBackend(_FakeOcrBackend):
+        def extract_text(self, image: str) -> str:
+            del image
+            self.calls += 1
+            started.set()
+            release.wait(timeout=2.0)
+            return "雪乃：恢复后的台词。"
+
+    backend = _BlockingOcrBackend()
+    monkeypatch.setattr(galgame_ocr_reader, "_OCR_CAPTURE_TIMEOUT_SECONDS", 0.01)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            install_target_dir=str(install_root),
+            rapidocr_enabled=False,
+        ),
+        time_fn=lambda: 3001.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [
+            DetectedGameWindow(
+                hwnd=102,
+                title="Demo Window",
+                process_name="DemoGame.exe",
+                pid=4243,
+                width=1280,
+                height=720,
+            )
+        ],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=backend,
+        writer=OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3001.0),
+    )
+
+    try:
+        first = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+        assert started.wait(timeout=0.5) is True
+        assert first.runtime["detail"] == "capture_failed"
+        assert "timed out" in first.runtime["last_capture_error"]
+
+        second = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+        assert backend.calls == 1
+        assert second.runtime["detail"] == "capture_failed"
+        assert "still running" in second.runtime["last_capture_error"]
+        assert any("still running" in warning for warning in second.warnings)
+    finally:
+        release.set()
+        await manager.shutdown()
+
+
+def test_rapidocr_line_grouping_uses_nearest_candidate_line() -> None:
+    def box(left: int, top: int, right: int, bottom: int) -> list[list[int]]:
+        return [[left, top], [right, top], [right, bottom], [left, bottom]]
+
+    lines = galgame_ocr_reader._rapidocr_lines_from_output(
+        [
+            (box(0, 85, 10, 115), "上", 0.9),
+            (box(0, 105, 10, 135), "下", 0.9),
+            (box(15, 106, 25, 120), "近", 0.9),
+        ]
+    )
+
+    assert [text for text, _score, _box in lines] == ["上", "下近"]
+
+
+def test_rapidocr_short_text_score_filter_uses_text_weighted_average() -> None:
+    def box(left: int, top: int, right: int, bottom: int) -> list[list[int]]:
+        return [[left, top], [right, top], [right, bottom], [left, bottom]]
+
+    output = [
+        (box(0, 0, 20, 10), "雪乃", 0.70),
+        (box(0, 20, 5, 30), ".", 0.30),
+    ]
+
+    assert _rapidocr_text_from_output(output) == "雪乃\n."
+
+
+def test_aihong_menu_choice_parser_accepts_plain_text_without_status_lines() -> None:
+    assert galgame_ocr_reader._coerce_aihong_menu_choices(
+        ["往南跑", "躲进巷子里"]
+    ) == ["往南跑", "躲进巷子里"]
+
+
+def test_capture_image_hash_normalizes_non_rgb_frames() -> None:
+    from PIL import Image
+
+    rgb = Image.new("RGB", (16, 16), (32, 64, 128))
+    rgba = Image.new("RGBA", (16, 16), (32, 64, 128, 255))
+
+    assert OcrReaderManager._capture_image_hash(rgb) == OcrReaderManager._capture_image_hash(rgba)
+
+
+def test_perceptual_hash_width_matches_requested_size() -> None:
+    from PIL import Image
+
+    image = Image.new("RGB", (16, 16), (255, 255, 255))
+
+    assert len(galgame_ocr_reader._perceptual_hash_image(image, size=4)) == 4
+    assert len(galgame_ocr_reader._perceptual_hash_image(image, size=8)) == 16
+
+
+def test_background_hash_excludes_bottom_dialogue_region() -> None:
+    from PIL import Image, ImageDraw
+
+    background_profile = OcrReaderManager._background_capture_profile()
+    assert background_profile.top_ratio == pytest.approx(0.0)
+    assert background_profile.bottom_inset_ratio == pytest.approx(0.45)
+
+    top_color = (20, 80, 140)
+    first = Image.new("RGB", (160, 100), top_color)
+    second = Image.new("RGB", (160, 100), top_color)
+    draw_first = ImageDraw.Draw(first)
+    draw_second = ImageDraw.Draw(second)
+    draw_first.rectangle((0, 60, 159, 99), fill=(255, 255, 255))
+    draw_second.rectangle((0, 60, 159, 99), fill=(0, 0, 0))
+
+    profile = galgame_ocr_reader.OcrCaptureProfile(
+        left_inset_ratio=0.0,
+        right_inset_ratio=0.0,
+        top_ratio=0.6,
+        bottom_inset_ratio=0.0,
+    )
+    cropped_first = galgame_ocr_reader._crop_window_image(
+        first,
+        window_rect=(0, 0, 160, 100),
+        profile=profile,
+        backend_kind="test",
+        backend_detail="test",
+    )
+    cropped_second = galgame_ocr_reader._crop_window_image(
+        second,
+        window_rect=(0, 0, 160, 100),
+        profile=profile,
+        backend_kind="test",
+        backend_detail="test",
+    )
+
+    assert (
+        cropped_first.info["galgame_source_background_hash"]
+        == cropped_second.info["galgame_source_background_hash"]
+    )
+
+
+def test_mouse_monitor_drains_pending_events_outside_hook_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 3000.0}
+    monitor = galgame_ocr_reader._MouseWheelMonitor(time_fn=lambda: clock["now"])
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 900)
+    monkeypatch.setattr(galgame_ocr_reader, "_window_handle_from_point", lambda x, y: x + y)
+
+    monitor._enqueue_pending_event(delta=120, kind="wheel", x=10, y=20)
+    clock["now"] += 1.0
+    monitor._enqueue_pending_event(kind="left_click", x=30, y=40)
+
+    events = monitor.events_after(0)
+
+    assert [event.kind for event in events] == ["wheel", "left_click"]
+    assert [event.seq for event in events] == [1, 2]
+    assert events[0].delta == 120
+    assert events[0].foreground_hwnd == 900
+    assert events[0].point_hwnd == 30
+    assert events[1].point_hwnd == 70
+
+
+def test_win32_capture_backend_explicit_selection_falls_back_with_detail() -> None:
+    class _SelectedBackend:
+        kind = "printwindow"
+
+        def is_available(self) -> bool:
+            return False
+
+        def capture_frame(self, target, profile):  # pragma: no cover
+            raise AssertionError("unavailable backend should not capture")
+
+    class _FallbackBackend:
+        kind = "dxcam"
+
+        def is_available(self) -> bool:
+            return True
+
+        def capture_frame(self, target, profile):
+            return "fallback-frame"
+
+    backend = galgame_ocr_reader.Win32CaptureBackend(selection="printwindow")
+    backend._backends = [_SelectedBackend(), _FallbackBackend()]
+
+    frame = backend.capture_frame(_window()[0], galgame_ocr_reader.OcrCaptureProfile())
+
+    assert frame == "fallback-frame"
+    assert backend.last_backend_kind == "dxcam"
+    assert backend.last_backend_detail == "printwindow_unavailable_fallback"
+
+
+def test_background_hash_scene_change_resets_no_text_counter_without_losing_scene(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager._last_background_hash = "0000000000000000"
+    manager._consecutive_no_text_polls = 3
+    manager._aihong_stage = galgame_ocr_reader._AIHONG_MENU_STAGE
+    manager._aihong_dialogue_idle_polls = 4
+    manager._aihong_menu_missing_polls = 3
+    manager._aihong_menu_ocr_state.last_raw_text = "去东院\n去西院"
+    manager._aihong_menu_ocr_state.repeat_count = 1
+
+    assert (
+        manager._observe_background_hash(
+            "ffffffffffffffff",
+            now=3000.0,
+            confirm_polls=1,
+            defer_scene_emit=True,
+        )
+        is False
+    )
+
+    assert manager._consecutive_no_text_polls == 0
+    assert manager._last_background_hash == "ffffffffffffffff"
+    assert manager._pending_visual_scene_hash == "ffffffffffffffff"
+    assert manager._aihong_stage == galgame_ocr_reader._AIHONG_DIALOGUE_STAGE
+    assert manager._aihong_dialogue_idle_polls == 0
+    assert manager._aihong_menu_missing_polls == 0
+    assert manager._aihong_menu_ocr_state.last_raw_text == ""
+
+
+def test_aihong_menu_reset_clears_no_text_counter(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager._consecutive_no_text_polls = 3
+    manager._aihong_stage = galgame_ocr_reader._AIHONG_MENU_STAGE
+
+    manager._reset_aihong_menu_state()
+
+    assert manager._consecutive_no_text_polls == 0
+    assert manager._aihong_stage == galgame_ocr_reader._AIHONG_DIALOGUE_STAGE
+
+
+def test_pending_visual_scene_commits_only_after_stable_line(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    writer.start_session(_window()[0])
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+        writer=writer,
+    )
+    manager._pending_visual_scene_hash = "ffffffffffffffff"
+    manager._pending_visual_scene_at = 3000.0
+
+    assert (
+        manager._emit_line_from_ocr_text(
+            "王生：先等等。",
+            now=3000.0,
+            repeat_threshold=2,
+        )
+        is False
+    )
+    assert manager._pending_visual_scene_hash == "ffffffffffffffff"
+
+    assert (
+        manager._emit_line_from_ocr_text(
+            "王生：先等等。",
+            now=3001.0,
+            repeat_threshold=2,
+        )
+        is True
+    )
+    assert manager._pending_visual_scene_hash == ""
+
+
+def test_followup_confirm_uses_cleaned_dialogue_text() -> None:
+    state = galgame_ocr_reader._StableOcrTextState(
+        last_raw_text="王生：新 台词。",
+        repeat_count=1,
+        stable_text="王生：旧台词。",
+    )
+
+    assert (
+        OcrReaderManager._should_attempt_followup_confirm(
+            "王生：新\n台词。",
+            state=state,
+        )
+        is True
+    )
+
+
+def test_stable_text_promotes_distinct_line_without_waiting_for_repeat(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    writer.start_session(_window()[0])
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+        writer=writer,
+    )
+
+    assert (
+        manager._emit_line_from_ocr_text(
+            "王生：旧台词。",
+            now=3000.0,
+            repeat_threshold=1,
+        )
+        is True
+    )
+    assert (
+        manager._emit_line_from_ocr_text(
+            "王生：新 台词。",
+            now=3001.0,
+            repeat_threshold=2,
+        )
+        is True
+    )
+
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+    assert session is not None
+    assert session["state"]["speaker"] == "王生"
+    assert session["state"]["text"] == "新 台词。"
+    assert manager._default_ocr_state.stable_text == "王生：新 台词。"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_runtime_exposes_stable_text_tracker(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["雪乃：你好。"]),
+    )
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["stable_ocr_last_raw_text"] == "雪乃：你好。"
+    assert result.runtime["stable_ocr_repeat_count"] == 1
+    assert result.runtime["stable_ocr_stable_text"] == ""
+    assert result.runtime["stable_ocr_block_reason"] == "waiting_for_repeat"
+
+
+def test_ocr_reader_starts_foreground_advance_monitor_for_real_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    started: list[bool] = []
+
+    def _start(self) -> bool:
+        started.append(True)
+        return True
+
+    monkeypatch.setattr(galgame_ocr_reader._MouseWheelMonitor, "start", _start)
+    monkeypatch.setattr(galgame_ocr_reader._MouseWheelMonitor, "is_running", lambda self: True)
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root, enabled=True),
+        platform_fn=lambda: True,
+        window_scanner=_window,
+    )
+
+    assert started == [True]
+    assert manager._runtime.foreground_advance_monitor_running is True
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_restarts_session_after_initial_capture_failure(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 3000.0}
+
+    class _FailOnceCaptureBackend(_FakeCaptureBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self._failed = False
+
+        def capture_frame(self, target: DetectedGameWindow, profile) -> str:
+            if not self._failed:
+                self._failed = True
+                raise RuntimeError("first capture failed")
+            return super().capture_frame(target, profile)
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FailOnceCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["王生：恢复了。", "王生：恢复了。"]),
+    )
+
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    assert manager._writer.session_id == ""
+
+    for _ in range(2):
+        clock["now"] += 1.0
+        await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    events = _read_events(bridge_root / manager._writer.game_id / "events.jsonl")
+    assert manager._writer.session_id
+    assert events[-1]["type"] == "line_changed"
+
+
 def test_build_config_defaults_ocr_languages_to_chi_sim_jpn_eng(tmp_path: Path) -> None:
     bridge_root = tmp_path / "bridge"
     cfg = build_config({"galgame": {"bridge_root": str(bridge_root)}})
@@ -182,6 +1059,71 @@ def test_ocr_reader_manager_initializes_with_rapidocr_warmup_enabled(
     assert warmup_calls
 
 
+@pytest.mark.asyncio
+async def test_ocr_capture_worker_reuses_executor(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: 3000.0,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["第一句。", "第二句。"]),
+    )
+    first_executor = manager._capture_executor
+
+    first = await manager._capture_and_extract_text_with_timeout(
+        _window()[0],
+        OcrCaptureProfile(),
+        SelectedOcrBackendPlan(),
+        collect_background_hash=False,
+    )
+    second = await manager._capture_and_extract_text_with_timeout(
+        _window()[0],
+        OcrCaptureProfile(),
+        SelectedOcrBackendPlan(),
+        collect_background_hash=False,
+    )
+
+    try:
+        assert first.text == "第一句。"
+        assert second.text == "第二句。"
+        assert manager._capture_executor is first_executor
+    finally:
+        await manager.shutdown()
+
+
+def test_ocr_window_scan_inventory_uses_ttl_cache(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    now = {"value": 1000.0}
+    calls = {"count": 0}
+
+    def scanner() -> list[DetectedGameWindow]:
+        calls["count"] += 1
+        return _window()
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        time_fn=lambda: now["value"],
+        platform_fn=lambda: True,
+        window_scanner=scanner,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    try:
+        assert manager._scan_window_inventory()[0]
+        now["value"] += 1.0
+        assert manager._scan_window_inventory()[0]
+        now["value"] += 5.1
+        assert manager._scan_window_inventory()[0]
+        assert calls["count"] == 2
+    finally:
+        manager._shutdown_capture_worker()
+
+
 def test_rapidocr_runtime_cache_reuses_loaded_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -210,6 +1152,90 @@ def test_rapidocr_runtime_cache_reuses_loaded_runtime(
             lang_type="ch",
             model_type="mobile",
             ocr_version="PP-OCRv5",
+        )
+        second = galgame_ocr_reader.RapidOcrBackend(
+            install_target_dir_raw=install_target_dir,
+            engine_type="onnxruntime",
+            lang_type="ch",
+            model_type="mobile",
+            ocr_version="PP-OCRv5",
+        )
+
+        assert first._ensure_runtime() is runtime
+        assert second._ensure_runtime() is runtime
+        assert len(load_calls) == 1
+    finally:
+        galgame_ocr_reader._RAPIDOCR_RUNTIME_CACHE.pop(cache_key, None)
+
+
+def test_rapidocr_runtime_cache_reloads_after_idle_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_target_dir = str(tmp_path / "RapidOCR")
+    runtimes = [object(), object()]
+    load_calls = []
+    now = {"value": 1000.0}
+
+    def fake_load_runtime(**kwargs):
+        load_calls.append(kwargs)
+        return runtimes[len(load_calls) - 1], {}
+
+    monkeypatch.setattr(galgame_ocr_reader, "load_rapidocr_runtime", fake_load_runtime)
+    monkeypatch.setattr(galgame_ocr_reader.time, "monotonic", lambda: now["value"])
+    cache_key = (
+        install_target_dir,
+        "onnxruntime",
+        "ch",
+        "mobile",
+        "PP-OCRv5",
+    )
+    galgame_ocr_reader._RAPIDOCR_RUNTIME_CACHE.pop(cache_key, None)
+    try:
+        backend = galgame_ocr_reader.RapidOcrBackend(
+            install_target_dir_raw=install_target_dir,
+            engine_type="onnxruntime",
+            lang_type="ch",
+            model_type="mobile",
+            ocr_version="PP-OCRv5",
+        )
+
+        assert backend._ensure_runtime() is runtimes[0]
+        now["value"] += galgame_ocr_reader._RAPIDOCR_RUNTIME_IDLE_TTL_SECONDS + 1.0
+        assert backend._ensure_runtime() is runtimes[1]
+        assert len(load_calls) == 2
+    finally:
+        galgame_ocr_reader._RAPIDOCR_RUNTIME_CACHE.pop(cache_key, None)
+
+
+def test_rapidocr_runtime_cache_key_normalizes_case_and_whitespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_target_dir = str(tmp_path / "RapidOCR")
+    runtime = object()
+    load_calls = []
+
+    def fake_load_runtime(**kwargs):
+        load_calls.append(kwargs)
+        return runtime, {}
+
+    monkeypatch.setattr(galgame_ocr_reader, "load_rapidocr_runtime", fake_load_runtime)
+    cache_key = (
+        install_target_dir,
+        "onnxruntime",
+        "ch",
+        "mobile",
+        "PP-OCRv5",
+    )
+    galgame_ocr_reader._RAPIDOCR_RUNTIME_CACHE.pop(cache_key, None)
+    try:
+        first = galgame_ocr_reader.RapidOcrBackend(
+            install_target_dir_raw=f" {install_target_dir} ",
+            engine_type="ONNXRUNTIME",
+            lang_type="CH",
+            model_type="Mobile",
+            ocr_version=" PP-OCRv5 ",
         )
         second = galgame_ocr_reader.RapidOcrBackend(
             install_target_dir_raw=install_target_dir,

@@ -118,8 +118,12 @@ const AIHONG_CAPTURE_PRESETS = {
   },
 };
 
-const AUTO_REFRESH_INTERVAL_MS = 3000;
+const AUTO_REFRESH_IDLE_INTERVAL_MS = 5000;
+const AUTO_REFRESH_ACTIVE_INTERVAL_MS = 2000;
+const AUTO_REFRESH_INTERVAL_MS = AUTO_REFRESH_ACTIVE_INTERVAL_MS;
 const FOCUS_PAUSE_REFRESH_INTERVAL_MS = 1000;
+const ERROR_REFRESH_INTERVAL_MS = 10000;
+const OCR_WINDOW_REFRESH_TTL_MS = 3000;
 const FIELD_LABELS_ZH = {
   connection_state: '连接状态',
   active_data_source: '当前数据源',
@@ -288,6 +292,9 @@ let latestAgentStatus = null;
 let latestStatus = null;
 let latestOcrWindowSnapshot = null;
 let refreshInFlight = null;
+let ocrWindowRefreshInFlight = null;
+let lastOcrWindowRefreshAt = 0;
+let emptyOcrWindowFocusForceRefreshDone = false;
 let autoRefreshTimer = null;
 let autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
 let activeInstallTab = 'rapidocr';
@@ -426,6 +433,774 @@ function setFlash(message, type = 'info') {
   node.hidden = !message;
   node.textContent = message || '';
   node.className = `flash-message ${type}`;
+}
+
+function textValue(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function lineText(line = {}) {
+  return textValue(line && typeof line === 'object' ? line.text : '');
+}
+
+function compactLineText(value) {
+  return textValue(value).replace(/\s+/g, '');
+}
+
+function getCurrentLineTexts(status = {}) {
+  const runtime = status.ocr_reader_runtime || {};
+  const effectiveText = lineText(status.effective_current_line);
+  const stableText = lineText(runtime.last_stable_line) || effectiveText;
+  const observedText = lineText(runtime.last_observed_line);
+  const rawText = textValue(runtime.last_raw_ocr_text);
+  return {
+    rawText,
+    observedText,
+    stableText,
+    effectiveText,
+  };
+}
+
+function formatStableBlockReason(reason) {
+  const mapping = {
+    waiting_for_repeat: '刚读到新文字，正在确认是不是同一句台词',
+    duplicate_stable_text: '这句台词已经显示过',
+    duplicate_raw_text: '识别结果和上一轮相同，暂不重复写入',
+    duplicate_observed_text: '候选台词和上一轮相同，正在等待变化',
+    duplicate_candidate_text: '候选台词和上一轮相同，正在等待变化',
+    empty_text: '文字识别暂时没有读到有效文本',
+    no_text: '文字识别暂时没有读到有效文本',
+    no_valid_text: '文字识别暂时没有读到有效文本',
+    low_confidence: '文字识别置信度较低，暂不写入台词',
+    overlay_text: '识别结果像系统界面文字，暂不写入台词',
+    game_overlay_text: '识别结果像游戏菜单或系统界面，暂不写入台词',
+    waiting_for_change: '画面文字没有变化，正在等待新台词',
+    waiting_for_new_text: '正在等待新台词出现',
+    capture_failed: '截图或识别失败，暂时不能确认台词',
+  };
+  const normalized = textValue(reason);
+  return mapping[normalized] || normalized;
+}
+
+function normalizePrimaryDiagnosis(diagnosis) {
+  if (!diagnosis || typeof diagnosis !== 'object') {
+    return null;
+  }
+  const severity = textValue(diagnosis.severity);
+  const title = textValue(diagnosis.title);
+  const body = textValue(diagnosis.message || diagnosis.body);
+  if (!title && !body) {
+    return null;
+  }
+  const actions = Array.isArray(diagnosis.actions)
+    ? diagnosis.actions.map((action) => {
+      if (!action || typeof action !== 'object') {
+        return null;
+      }
+      const id = textValue(action.id);
+      if (!id) {
+        return null;
+      }
+      return {
+        id,
+        label: textValue(action.label || action.title || id) || id,
+      };
+    }).filter(Boolean)
+    : [];
+  return {
+    severity: ['ok', 'info', 'warning', 'error'].includes(severity) ? severity : 'info',
+    title: title || '运行诊断',
+    body,
+    actions,
+  };
+}
+
+function buildPrimaryDiagnosis(status = {}) {
+  const backendDiagnosis = normalizePrimaryDiagnosis(status.primary_diagnosis);
+  if (backendDiagnosis) {
+    return backendDiagnosis;
+  }
+
+  const runtime = status.ocr_reader_runtime || {};
+  const detail = textValue(runtime.target_selection_detail);
+  const contextState = textValue(status.ocr_context_state || runtime.ocr_context_state);
+  const lastExcludeReason = textValue(runtime.last_exclude_reason);
+  const lastCaptureError = textValue(runtime.last_capture_error);
+  const lastError = textValue(status.last_error && status.last_error.message);
+  const agentPauseKind = textValue(status.agent_pause_kind);
+  const agentUserStatus = textValue(status.agent_user_status);
+  const { observedText, stableText, effectiveText } = getCurrentLineTexts(status);
+  const observedKey = compactLineText(observedText);
+  const stableKey = compactLineText(stableText);
+  const hasEffectiveWindow = Boolean(textValue(runtime.effective_window_key));
+  const candidateCount = Number(runtime.candidate_count || 0);
+  const hasOcrRuntimeSignal = Boolean(
+    status.ocr_reader_enabled
+    || runtime.status
+    || runtime.detail
+    || contextState
+    || detail
+    || Object.prototype.hasOwnProperty.call(runtime, 'candidate_count')
+  );
+
+  if (lastError) {
+    return {
+      severity: 'error',
+      title: '插件运行出错',
+      body: `${lastError}。可以先刷新状态；如果仍然出现，请查看调试详情。`,
+      actions: [
+        { id: 'refresh_all', label: '刷新全部' },
+        { id: 'debug_details', label: '查看调试详情' },
+      ],
+    };
+  }
+
+  if (detail === 'memory_reader_window_minimized' || lastExcludeReason === 'excluded_minimized_window') {
+    return {
+      severity: 'warning',
+      title: '游戏窗口最小化了',
+      body: '检测到游戏，但窗口最小化，文字识别不能截图。请恢复游戏窗口后继续。',
+      actions: [
+        { id: 'refresh_ocr_windows', label: '我已恢复，刷新窗口' },
+        { id: 'select_ocr_window', label: '选择游戏窗口' },
+      ],
+    };
+  }
+
+  if (contextState === 'capture_failed' || lastCaptureError) {
+    return {
+      severity: 'error',
+      title: '截图或文字识别失败',
+      body: lastCaptureError || '截图或识别后端返回错误，新台词不会更新。',
+      actions: [
+        { id: 'recalibrate_ocr', label: '重新截图校准' },
+        { id: 'capture_backend', label: '切换截图方式' },
+        { id: 'debug_details', label: '查看调试详情' },
+      ],
+    };
+  }
+
+  if (runtime.stale_capture_backend) {
+    return {
+      severity: 'warning',
+      title: '截图画面没有更新',
+      body: '当前截图源可能停在旧画面。请切回游戏窗口，或切换截图方式后再试。',
+      actions: [
+        { id: 'focus_game', label: '切回游戏窗口' },
+        { id: 'capture_backend', label: '切换 DXcam' },
+        { id: 'refresh_ocr_windows', label: '刷新窗口' },
+      ],
+    };
+  }
+
+  if (
+    detail === 'no_eligible_window'
+    || (!hasEffectiveWindow && candidateCount === 0 && hasOcrRuntimeSignal)
+  ) {
+    return {
+      severity: 'warning',
+      title: '没找到能识别的游戏窗口',
+      body: '游戏可能未启动、被最小化，或当前窗口不是游戏。请确认游戏窗口可见后刷新。',
+      actions: [
+        { id: 'refresh_ocr_windows', label: '刷新窗口' },
+        { id: 'select_ocr_window', label: '选择游戏窗口' },
+      ],
+    };
+  }
+
+  if (detail === 'foreground_window_needs_manual_confirmation' || detail === 'auto_detect_needs_manual_fallback') {
+    return {
+      severity: 'warning',
+      title: '需要手动选择游戏窗口',
+      body: '自动检测不够确定。手动选择一次可以避免识别到插件页面或其他窗口。',
+      actions: [
+        { id: 'select_ocr_window', label: '选择游戏窗口' },
+        { id: 'refresh_ocr_windows', label: '刷新窗口' },
+      ],
+    };
+  }
+
+  if (observedKey && observedKey !== stableKey) {
+    return {
+      severity: 'info',
+      title: '刚读到新文字',
+      body: '文字识别已经看到候选台词，正在确认这是不是同一句台词。',
+      actions: [
+        { id: 'line_details', label: '查看识别详情' },
+      ],
+    };
+  }
+
+  if (agentPauseKind === 'window_not_foreground' || agentUserStatus === 'paused_window_not_foreground') {
+    return {
+      severity: 'info',
+      title: '游戏不在前台',
+      body: '自动推进已暂停。切回游戏窗口后会继续，伴读信息仍会刷新。',
+      actions: [
+        { id: 'focus_game', label: '切回游戏窗口' },
+      ],
+    };
+  }
+
+  if (agentPauseKind === 'read_only' || agentUserStatus === 'read_only') {
+    return {
+      severity: 'info',
+      title: '当前是伴读模式',
+      body: '会显示台词和建议，但不会自动点击。需要自动推进时请切换模式。',
+      actions: [
+        { id: 'choice_advisor', label: '切换到自动推进模式' },
+      ],
+    };
+  }
+
+  if (effectiveText || stableText) {
+    const target = formatOcrTargetForUser(status);
+    return {
+      severity: 'ok',
+      title: '正在识别台词',
+      body: target ? `当前目标：${target}。已读到台词，页面会持续刷新。` : '已读到台词，页面会持续刷新。',
+      actions: [
+        { id: 'refresh_all', label: '刷新全部' },
+      ],
+    };
+  }
+
+  return {
+    severity: 'info',
+    title: '等待游戏状态',
+    body: status.summary || '暂时没有足够信息判断当前卡点。请先打开游戏，或刷新窗口列表。',
+    actions: [
+      { id: 'refresh_all', label: '刷新全部' },
+      { id: 'select_ocr_window', label: '选择游戏窗口' },
+    ],
+  };
+}
+
+function renderPrimaryDiagnosis(status = {}) {
+  const node = document.getElementById('primaryDiagnosisPanel');
+  if (!node) {
+    return;
+  }
+  const diagnosis = buildPrimaryDiagnosis(status);
+  const kicker = document.getElementById('primaryDiagnosisKicker');
+  const title = document.getElementById('primaryDiagnosisTitle');
+  const body = document.getElementById('primaryDiagnosisBody');
+  const actions = document.getElementById('primaryDiagnosisActions');
+  node.className = `primary-diagnosis ${diagnosis.severity || 'info'}`;
+  kicker.textContent = '运行诊断';
+  title.textContent = diagnosis.title;
+  body.textContent = diagnosis.body;
+  actions.innerHTML = (diagnosis.actions || []).map((action, index) => `
+    <button class="${index === 0 ? 'primary' : 'secondary'}" data-primary-action="${escapeHtml(action.id)}">
+      ${escapeHtml(action.label)}
+    </button>
+  `).join('');
+}
+
+function buildFirstRunSteps(status = {}) {
+  const runtime = status.ocr_reader_runtime || {};
+  const memoryRuntime = status.memory_reader_runtime || {};
+  const snapshotWindows = latestOcrWindowSnapshot && Array.isArray(latestOcrWindowSnapshot.windows)
+    ? latestOcrWindowSnapshot.windows
+    : [];
+  const availableGameIds = Array.isArray(status.available_game_ids) ? status.available_game_ids : [];
+  const detail = textValue(runtime.target_selection_detail);
+  const lastExcludeReason = textValue(runtime.last_exclude_reason);
+  const hasGame = Boolean(
+    textValue(status.active_session_id)
+    || availableGameIds.length
+    || Number(runtime.pid || 0)
+    || textValue(runtime.process_name)
+    || textValue(runtime.window_title)
+    || Number(memoryRuntime.pid || 0)
+    || textValue(memoryRuntime.process_name)
+  );
+  const hasWindow = Boolean(
+    textValue(runtime.effective_window_key)
+    || Number(runtime.candidate_count || 0) > 0
+    || snapshotWindows.length > 0
+  );
+  const hasConfirmedWindow = Boolean(
+    textValue(runtime.effective_window_key)
+    && detail !== 'no_eligible_window'
+    && detail !== 'memory_reader_window_minimized'
+    && lastExcludeReason !== 'excluded_minimized_window'
+  );
+  const { observedText, stableText, effectiveText } = getCurrentLineTexts(status);
+  const hasLine = Boolean(effectiveText || stableText || observedText);
+
+  return [
+    {
+      done: hasGame,
+      title: '启动或恢复游戏',
+      body: hasGame ? '已发现游戏状态。' : '打开游戏，并停在有文字的画面。',
+    },
+    {
+      done: hasWindow,
+      title: '刷新窗口',
+      body: hasWindow ? '已找到可检查的窗口。' : '回到插件页，点击“刷新窗口”。',
+    },
+    {
+      done: hasConfirmedWindow,
+      title: '选择游戏窗口',
+      body: hasConfirmedWindow ? '已确认识别窗口。' : '如果没有自动选中，请手动选择游戏窗口。',
+    },
+    {
+      done: hasLine,
+      title: '开始识别',
+      body: hasLine ? '已读到台词。' : '开始自动识别，或在游戏中推进到下一句台词。',
+    },
+  ];
+}
+
+function renderFirstRunGuide(status = {}) {
+  const node = document.getElementById('firstRunGuide');
+  const stepsNode = document.getElementById('firstRunSteps');
+  if (!node || !stepsNode) {
+    return;
+  }
+  const steps = buildFirstRunSteps(status);
+  const allDone = steps.every((step) => step.done);
+  node.hidden = allDone;
+  if (allDone) {
+    stepsNode.replaceChildren();
+    return;
+  }
+  const firstIncompleteIndex = steps.findIndex((step) => !step.done);
+  stepsNode.innerHTML = steps.map((step, index) => {
+    const stateClass = step.done ? 'done' : (index === firstIncompleteIndex ? 'active' : 'pending');
+    const marker = step.done ? '完成' : String(index + 1);
+    return `
+      <article class="first-run-step ${stateClass}">
+        <span class="first-run-step-marker">${escapeHtml(marker)}</span>
+        <div>
+          <h3>${escapeHtml(step.title)}</h3>
+          <p>${escapeHtml(step.body)}</p>
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+function renderCurrentLineOverview(status = {}) {
+  const node = document.getElementById('currentLineOverview');
+  if (!node) {
+    return;
+  }
+  const runtime = status.ocr_reader_runtime || {};
+  const title = document.getElementById('currentLineOverviewTitle');
+  const statusChip = document.getElementById('currentLineOverviewStatus');
+  const hint = document.getElementById('currentLineOverviewHint');
+  const grid = document.getElementById('currentLineOverviewGrid');
+  const { rawText, observedText, stableText, effectiveText } = getCurrentLineTexts(status);
+  const displayStable = stableText || effectiveText;
+  const observedKey = compactLineText(observedText);
+  const stableKey = compactLineText(displayStable);
+  const hasMismatch = Boolean(observedKey && observedKey !== stableKey);
+  const blockReason = formatStableBlockReason(runtime.stable_ocr_block_reason);
+  const repeatCount = Number(runtime.stable_ocr_repeat_count || 0);
+
+  node.classList.toggle('waiting', !rawText && !observedText && !displayStable);
+  statusChip.className = 'status-chip';
+  if (hasMismatch) {
+    title.textContent = '刚读到新文字';
+    statusChip.textContent = '确认中';
+    statusChip.classList.add('warning');
+    hint.textContent = blockReason || `正在确认这是不是同一句台词${repeatCount ? `，已连续看到 ${repeatCount} 次` : ''}。`;
+  } else if (displayStable) {
+    title.textContent = '已确认当前台词';
+    statusChip.textContent = '已确认';
+    statusChip.classList.add('active');
+    hint.textContent = '这句台词已经进入正式上下文，解释、总结和建议会以它为基础更新。';
+  } else if (rawText || observedText) {
+    title.textContent = '正在筛选识别结果';
+    statusChip.textContent = '筛选中';
+    statusChip.classList.add('warning');
+    hint.textContent = blockReason || '文字识别已有结果，但还没有写入正式台词。';
+  } else {
+    title.textContent = '等待识别结果';
+    statusChip.textContent = '等待刷新';
+    hint.textContent = buildOcrMissingLineDiagnostic(status);
+  }
+
+  const rows = [
+    {
+      label: '最新 OCR 原文',
+      value: rawText,
+      empty: '还没有 OCR 原文',
+    },
+    {
+      label: '刚读到的候选台词',
+      value: observedText,
+      empty: '还没有候选台词',
+    },
+    {
+      label: '已确认台词',
+      value: displayStable,
+      empty: '还没有已确认台词',
+    },
+  ];
+
+  grid.innerHTML = rows.map((row) => `
+    <article class="current-line-item${row.value ? '' : ' empty'}">
+      <p class="list-kicker">${escapeHtml(row.label)}</p>
+      <p>${escapeHtml(row.value || row.empty)}</p>
+    </article>
+  `).join('');
+}
+
+function pipelineStateLabel(state) {
+  const mapping = {
+    ok: '正常',
+    info: '等待',
+    warning: '注意',
+    error: '异常',
+  };
+  return mapping[state] || '等待';
+}
+
+function buildOcrPipelineSteps(status = {}) {
+  const runtime = status.ocr_reader_runtime || {};
+  const rapidocr = status.rapidocr || {};
+  const tesseract = status.tesseract || {};
+  const detail = textValue(runtime.target_selection_detail);
+  const contextState = textValue(status.ocr_context_state || runtime.ocr_context_state);
+  const lastExcludeReason = textValue(runtime.last_exclude_reason);
+  const lastCaptureError = textValue(runtime.last_capture_error);
+  const { rawText, observedText, stableText, effectiveText } = getCurrentLineTexts(status);
+  const displayStable = stableText || effectiveText;
+  const observedKey = compactLineText(observedText);
+  const stableKey = compactLineText(displayStable);
+  const hasObservedMismatch = Boolean(observedKey && observedKey !== stableKey);
+  const blockReason = formatStableBlockReason(runtime.stable_ocr_block_reason);
+  const targetName = [
+    textValue(runtime.effective_process_name || runtime.process_name),
+    textValue(runtime.effective_window_title || runtime.window_title),
+  ].filter(Boolean).join(' / ');
+  const captureBackend = textValue(runtime.capture_backend_kind || status.ocr_capture_backend_selection || 'auto');
+  const ocrBackend = textValue(runtime.backend_kind || status.ocr_backend_selection || 'auto');
+
+  let windowStep = {
+    key: 'window',
+    state: 'info',
+    title: '等待游戏窗口',
+    body: '请打开游戏，或点击“选择游戏窗口”。',
+    meta: detail ? formatOcrWindowSelectionDetail(detail) : '',
+  };
+  if (detail === 'memory_reader_window_minimized' || lastExcludeReason === 'excluded_minimized_window') {
+    windowStep = {
+      key: 'window',
+      state: 'warning',
+      title: '游戏窗口最小化',
+      body: 'OCR 不能截取最小化窗口。',
+      meta: formatOcrWindowReason(lastExcludeReason || 'excluded_minimized_window'),
+    };
+  } else if (textValue(runtime.effective_window_key)) {
+    windowStep = {
+      key: 'window',
+      state: 'ok',
+      title: '已确认游戏窗口',
+      body: targetName || '已找到可用 OCR 目标窗口。',
+      meta: runtime.target_is_foreground ? '前台窗口' : '非前台窗口',
+    };
+  } else if (Number(runtime.candidate_count || 0) > 0) {
+    windowStep = {
+      key: 'window',
+      state: 'info',
+      title: '发现候选窗口',
+      body: `发现 ${Number(runtime.candidate_count || 0)} 个候选窗口。`,
+      meta: '需要时可手动选择',
+    };
+  } else if (detail === 'no_eligible_window' || Object.prototype.hasOwnProperty.call(runtime, 'candidate_count')) {
+    windowStep = {
+      key: 'window',
+      state: 'warning',
+      title: '没有可识别窗口',
+      body: '游戏可能未启动、被最小化，或当前窗口不是游戏。',
+      meta: formatOcrWindowSelectionDetail(detail),
+    };
+  }
+
+  let captureStep = {
+    key: 'capture',
+    state: 'info',
+    title: '等待截图',
+    body: '确认窗口后才会截图。',
+    meta: captureBackend,
+  };
+  if (contextState === 'capture_failed' || lastCaptureError) {
+    captureStep = {
+      key: 'capture',
+      state: 'error',
+      title: '截图失败',
+      body: lastCaptureError || '截图后端返回错误。',
+      meta: captureBackend,
+    };
+  } else if (runtime.stale_capture_backend) {
+    captureStep = {
+      key: 'capture',
+      state: 'warning',
+      title: '截图画面未更新',
+      body: '截图源可能停在旧画面。',
+      meta: `${captureBackend}${runtime.consecutive_same_capture_frames ? ` | 连续 ${runtime.consecutive_same_capture_frames} 帧相同` : ''}`,
+    };
+  } else if (runtime.last_capture_completed_at || runtime.last_capture_image_hash || runtime.capture_backend_kind) {
+    captureStep = {
+      key: 'capture',
+      state: 'ok',
+      title: '截图后端可用',
+      body: runtime.last_capture_completed_at ? `最近截图：${runtime.last_capture_completed_at}` : '截图方式已选择。',
+      meta: captureBackend,
+    };
+  }
+
+  let ocrStep = {
+    key: 'ocr',
+    state: 'info',
+    title: '等待文字识别',
+    body: '截图完成后会进入文字识别。',
+    meta: ocrBackend,
+  };
+  if (!status.ocr_reader_enabled) {
+    ocrStep = {
+      key: 'ocr',
+      state: 'warning',
+      title: 'OCR Reader 未启用',
+      body: '当前不会通过 OCR 读取台词。',
+      meta: ocrBackend,
+    };
+  } else if (runtime.backend_detail === 'backend_unavailable' || runtime.detail === 'backend_unavailable') {
+    ocrStep = {
+      key: 'ocr',
+      state: 'error',
+      title: 'OCR 后端不可用',
+      body: '请安装 RapidOCR 或 Tesseract。',
+      meta: ocrBackend,
+    };
+  } else if (runtime.backend_kind || rawText || observedText || displayStable) {
+    ocrStep = {
+      key: 'ocr',
+      state: 'ok',
+      title: '文字识别可用',
+      body: rawText ? '最近已有 OCR 原文。' : 'OCR 后端已选定。',
+      meta: ocrBackend,
+    };
+  } else if (!rapidocr.installed && !tesseract.installed) {
+    ocrStep = {
+      key: 'ocr',
+      state: 'warning',
+      title: 'OCR 组件可能缺失',
+      body: '建议优先安装 RapidOCR。',
+      meta: ocrBackend,
+    };
+  }
+
+  const observedStep = observedText
+    ? {
+      key: 'observed',
+      state: hasObservedMismatch ? 'warning' : 'ok',
+      title: hasObservedMismatch ? '候选台词确认中' : '已读到候选台词',
+      body: observedText,
+      meta: hasObservedMismatch ? (blockReason || '等待稳定确认') : '候选与已确认台词一致',
+    }
+    : {
+      key: 'observed',
+      state: rawText ? 'info' : 'warning',
+      title: rawText ? '正在筛选 OCR 原文' : '还没有候选台词',
+      body: rawText || '等待 OCR 读到有效文字。',
+      meta: blockReason || '',
+    };
+
+  const stableStep = displayStable
+    ? {
+      key: 'stable',
+      state: 'ok',
+      title: '已确认台词',
+      body: displayStable,
+      meta: status.effective_current_line?.source || runtime.last_stable_line?.source || '',
+    }
+    : {
+      key: 'stable',
+      state: observedText ? 'warning' : 'info',
+      title: observedText ? '等待稳定确认' : '还没有已确认台词',
+      body: observedText ? '候选台词还没有进入正式上下文。' : '读到有效台词后会显示在这里。',
+      meta: blockReason || '',
+    };
+
+  let agentStep = {
+    key: 'agent',
+    state: 'info',
+    title: '等待 Agent 状态',
+    body: 'Agent 会根据模式决定是否自动推进。',
+    meta: status.mode || '',
+  };
+  if (status.agent_user_status === 'error') {
+    agentStep = {
+      key: 'agent',
+      state: 'error',
+      title: 'Agent 异常',
+      body: status.agent_reason || status.agent_diagnostic || 'Agent 返回错误状态。',
+      meta: status.agent_pause_kind || '',
+    };
+  } else if (status.agent_pause_kind === 'window_not_foreground' || status.agent_user_status === 'paused_window_not_foreground') {
+    agentStep = {
+      key: 'agent',
+      state: 'warning',
+      title: '游戏不在前台',
+      body: status.agent_pause_message || '自动推进已暂停，切回游戏后继续。',
+      meta: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || '',
+    };
+  } else if (status.agent_pause_kind === 'read_only' || status.agent_user_status === 'read_only') {
+    agentStep = {
+      key: 'agent',
+      state: 'info',
+      title: '伴读模式',
+      body: '会显示台词和建议，但不会自动点击。',
+      meta: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || '',
+    };
+  } else if (status.agent_user_status || status.agent_status) {
+    agentStep = {
+      key: 'agent',
+      state: 'ok',
+      title: 'Agent 状态正常',
+      body: status.agent_activity || status.agent_reason || '按当前模式运行。',
+      meta: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || status.agent_status || '',
+    };
+  }
+
+  return [windowStep, captureStep, ocrStep, observedStep, stableStep, agentStep];
+}
+
+function renderOcrPipelinePanel(status = {}) {
+  const node = document.getElementById('ocrPipelinePanel');
+  const stepsNode = document.getElementById('ocrPipelineSteps');
+  const summaryNode = document.getElementById('ocrPipelineSummary');
+  if (!node || !stepsNode || !summaryNode) {
+    return;
+  }
+  const steps = buildOcrPipelineSteps(status);
+  const worstState = steps.some((step) => step.state === 'error')
+    ? 'error'
+    : steps.some((step) => step.state === 'warning')
+      ? 'warning'
+      : steps.every((step) => step.state === 'ok')
+        ? 'ok'
+        : 'info';
+  summaryNode.className = `status-chip ${worstState === 'ok' ? 'active' : worstState}`;
+  summaryNode.textContent = worstState === 'ok'
+    ? '链路正常'
+    : worstState === 'error'
+      ? '链路异常'
+      : worstState === 'warning'
+        ? '需要处理'
+        : '等待状态';
+  stepsNode.innerHTML = steps.map((step) => `
+    <article class="ocr-pipeline-step ${escapeHtml(step.state)}">
+      <span class="ocr-pipeline-dot">${escapeHtml(pipelineStateLabel(step.state))}</span>
+      <div>
+        <p class="list-kicker">${escapeHtml(step.key)}</p>
+        <h3>${escapeHtml(step.title)}</h3>
+        <p>${escapeHtml(step.body || '')}</p>
+        ${step.meta ? `<p class="result-note">${escapeHtml(step.meta)}</p>` : ''}
+      </div>
+    </article>
+  `).join('');
+}
+
+function installTaskDisplayState(kind) {
+  const state = getInstallState(kind);
+  const task = state && state.state ? state.state : {};
+  if (state?.inProgress) {
+    return {
+      state: 'running',
+      labelText: '安装中',
+      needsAttention: true,
+    };
+  }
+  if (task.status === 'failed') {
+    return {
+      state: 'failed',
+      labelText: '安装失败',
+      needsAttention: true,
+    };
+  }
+  if (task.status === 'completed') {
+    return {
+      state: 'installed',
+      labelText: '已安装',
+      needsAttention: false,
+    };
+  }
+  return null;
+}
+
+function dependencySummaryItem(kind, status = {}) {
+  const taskState = installTaskDisplayState(kind);
+  if (taskState) {
+    return {
+      kind,
+      label: getInstallConfig(kind).label,
+      ...taskState,
+    };
+  }
+
+  if (kind === 'rapidocr') {
+    const rapidocr = status.rapidocr || {};
+    if (!rapidocr.install_supported) {
+      return { kind, label: 'RapidOCR', state: 'neutral', labelText: '不支持自动安装', needsAttention: false };
+    }
+    return rapidocr.installed
+      ? { kind, label: 'RapidOCR', state: 'installed', labelText: '已安装', needsAttention: false }
+      : { kind, label: 'RapidOCR', state: 'missing', labelText: '未安装', needsAttention: true };
+  }
+
+  if (kind === 'dxcam') {
+    const dxcam = status.dxcam || {};
+    return dxcam.installed
+      ? { kind, label: 'DXcam', state: 'installed', labelText: '已安装', needsAttention: false }
+      : { kind, label: 'DXcam', state: 'missing', labelText: '未安装', needsAttention: true };
+  }
+
+  if (kind === 'tesseract') {
+    const tesseract = status.tesseract || {};
+    const missingLanguages = Array.isArray(tesseract.missing_languages) ? tesseract.missing_languages : [];
+    if (tesseract.installed && !missingLanguages.length) {
+      return { kind, label: 'Tesseract', state: 'installed', labelText: '已安装', needsAttention: false };
+    }
+    if (tesseract.installed && missingLanguages.length) {
+      return {
+        kind,
+        label: 'Tesseract',
+        state: 'warning',
+        labelText: `缺少语言包 ${missingLanguages.join(', ')}`,
+        needsAttention: true,
+      };
+    }
+    return { kind, label: 'Tesseract', state: 'missing', labelText: '未安装', needsAttention: true };
+  }
+
+  const textractor = status.textractor || {};
+  return textractor.installed
+    ? { kind, label: 'Textractor', state: 'installed', labelText: '已安装', needsAttention: false }
+    : { kind, label: 'Textractor', state: 'optional', labelText: '未安装（可选）', needsAttention: false };
+}
+
+function renderInstallCompactSummary(status = {}) {
+  const summary = document.getElementById('installCompactSummary');
+  const module = document.getElementById('dependencyModule');
+  if (!summary) {
+    return;
+  }
+  const items = ['rapidocr', 'dxcam', 'tesseract', 'textractor'].map((kind) => dependencySummaryItem(kind, status));
+  summary.innerHTML = items.map((item) => `
+    <span class="install-summary-chip ${escapeHtml(item.state || 'neutral')}">
+      ${escapeHtml(item.label)} ${escapeHtml(item.labelText || item.label || '')}
+    </span>
+  `).join('');
+  const needsAttention = items.some((item) => item.needsAttention);
+  if (module && needsAttention) {
+    module.open = true;
+  }
 }
 
 function formatOcrTargetForUser(status = {}) {
@@ -1258,6 +2033,15 @@ function renderPluginUnavailable(error) {
   latestStatus = null;
   const message = error instanceof Error ? error.message : String(error || '插件尚未启动');
   document.getElementById('summaryText').textContent = '插件尚未启动';
+  renderPrimaryDiagnosis({
+    connection_state: 'plugin_not_started',
+    last_error: { message },
+    summary: '插件尚未启动',
+  });
+  renderFirstRunGuide({});
+  renderCurrentLineOverview({});
+  renderOcrPipelinePanel({});
+  renderInstallCompactSummary({});
   renderGrid('statusGrid', [
     { label: 'connection_state', value: 'plugin_not_started' },
     { label: 'status', value: '插件尚未启动' },
@@ -1508,6 +2292,12 @@ function renderStatus(status) {
   const performanceProcess = performance.process_name
     ? `${performance.process_name} (${performance.pid || 0})`
     : String(performance.pid || '');
+
+  renderPrimaryDiagnosis(status);
+  renderFirstRunGuide(status);
+  renderCurrentLineOverview(status);
+  renderOcrPipelinePanel(status);
+  renderInstallCompactSummary(status);
 
   renderGrid('statusGrid', [
     { label: 'connection_state', value: status.connection_state || '' },
@@ -1870,6 +2660,8 @@ function formatOcrWindowReason(reason) {
     excluded_overlay_window: '已排除 overlay / launcher / helper',
     excluded_helper_window: '已排除系统或宿主辅助窗口',
     excluded_small_or_hidden_window: '已排除过小或不可用窗口',
+    excluded_minimized_window: '游戏窗口已最小化，OCR 不能截图，请恢复窗口',
+    excluded_non_game_process: '非游戏进程，已忽略',
   };
   return mapping[reason] || reason || 'unknown';
 }
@@ -1885,6 +2677,7 @@ function formatOcrWindowSelectionDetail(detail) {
     auto_detect_needs_manual_fallback: '未找到可信自动目标，请手动选择游戏窗口',
     foreground_window_needs_manual_confirmation: '当前前台窗口不像游戏，请手动选择游戏窗口',
     no_eligible_window: '当前没有可用游戏窗口',
+    memory_reader_window_minimized: '游戏窗口已最小化，OCR 不能截图，请恢复窗口',
     memory_reader_pid: '优先沿用 Memory Reader 命中的 PID',
     memory_reader_process: '优先沿用 Memory Reader 命中的进程',
     attached_hwnd: '优先复用当前已附着窗口',
@@ -2019,6 +2812,9 @@ function renderOcrWindowTargetSnapshot(snapshot, status = latestStatus) {
   const excludedNode = document.getElementById('ocrExcludedWindowList');
   const windows = snapshot.windows || [];
   const excludedWindows = snapshot.excluded_windows || [];
+  emptyOcrWindowFocusForceRefreshDone = windows.length === 0
+    ? emptyOcrWindowFocusForceRefreshDone
+    : false;
 
   const modal = document.getElementById('ocrWindowModal');
   if (modal && !modal.hidden) {
@@ -2839,9 +3635,28 @@ function stopAutoRefresh() {
 }
 
 function desiredAutoRefreshInterval(status = latestStatus) {
-  return status?.agent_user_status === 'paused_window_not_foreground'
-    ? FOCUS_PAUSE_REFRESH_INTERVAL_MS
-    : AUTO_REFRESH_INTERVAL_MS;
+  if (!status || status.connection_state === 'error' || status.agent_user_status === 'error') {
+    return ERROR_REFRESH_INTERVAL_MS;
+  }
+  if (
+    status.agent_user_status === 'paused_window_not_foreground'
+    || status.agent_pause_kind === 'window_not_foreground'
+  ) {
+    return FOCUS_PAUSE_REFRESH_INTERVAL_MS;
+  }
+  const runtime = status.ocr_reader_runtime || {};
+  const { observedText, stableText, effectiveText } = getCurrentLineTexts(status);
+  if (
+    status.connection_state === 'active'
+    || runtime.status === 'active'
+    || runtime.status === 'running'
+    || observedText
+    || stableText
+    || effectiveText
+  ) {
+    return AUTO_REFRESH_ACTIVE_INTERVAL_MS;
+  }
+  return AUTO_REFRESH_IDLE_INTERVAL_MS;
 }
 
 function startAutoRefresh(intervalMs = AUTO_REFRESH_INTERVAL_MS) {
@@ -2860,6 +3675,71 @@ function syncAutoRefreshIntervalForStatus(status = latestStatus) {
   if (autoRefreshTimer !== null && desired !== autoRefreshIntervalMs) {
     startAutoRefresh(desired);
   }
+}
+
+function isOcrWindowModalOpen() {
+  const modal = document.getElementById('ocrWindowModal');
+  return Boolean(modal && !modal.hidden);
+}
+
+function shouldRefreshOcrWindowsForStatus(status) {
+  const runtime = status?.ocr_reader_runtime || {};
+  const detail = String(runtime.target_selection_detail || '');
+  const context = String(status?.ocr_context_state || runtime.ocr_context_state || '');
+  return (
+    context === 'waiting_for_valid_window'
+    || detail === 'no_eligible_window'
+    || detail === 'foreground_window_needs_manual_confirmation'
+    || detail === 'auto_detect_needs_manual_fallback'
+    || detail === 'memory_reader_window_minimized'
+    || Number(runtime.candidate_count || 0) === 0
+    || isOcrWindowModalOpen()
+  );
+}
+
+function refreshOcrWindowTargetsIfNeeded({
+  reason = '',
+  force = false,
+  silent = true,
+} = {}) {
+  if (ocrWindowRefreshInFlight) {
+    return ocrWindowRefreshInFlight;
+  }
+
+  const now = Date.now();
+  if (!force && now - lastOcrWindowRefreshAt < OCR_WINDOW_REFRESH_TTL_MS) {
+    return Promise.resolve(false);
+  }
+
+  ocrWindowRefreshInFlight = refreshOcrWindowTargets({
+    includeExcluded: true,
+    silent,
+    force,
+  }).then((refreshed) => {
+    if (refreshed) {
+      lastOcrWindowRefreshAt = Date.now();
+    }
+    return Boolean(refreshed);
+  }).catch((error) => {
+    console.warn(`[galgame_plugin ui] refresh OCR window targets for ${reason || 'unknown'} failed`, error);
+    if (!silent) {
+      setFlash(error instanceof Error ? error.message : String(error), 'error');
+    }
+    return false;
+  }).finally(() => {
+    ocrWindowRefreshInFlight = null;
+  });
+  return ocrWindowRefreshInFlight;
+}
+
+function refreshOcrWindowsOnPageFocus() {
+  if (document.hidden) {
+    return;
+  }
+  refreshOcrWindowTargetsIfNeeded({
+    reason: 'page_focus',
+    silent: true,
+  }).catch(() => {});
 }
 
 async function refreshAll(options = {}) {
@@ -2889,6 +3769,28 @@ async function refreshAll(options = {}) {
       renderSnapshot(snapshot);
       renderHistory(history);
       renderAgentStatus(agentStatus);
+      if (shouldRefreshOcrWindowsForStatus(status)) {
+        const snapshotWindows = latestOcrWindowSnapshot && Array.isArray(latestOcrWindowSnapshot.windows)
+          ? latestOcrWindowSnapshot.windows
+          : [];
+        const forceEmptyFocusedRefresh = Boolean(
+          !emptyOcrWindowFocusForceRefreshDone
+          && !document.hidden
+          && document.hasFocus()
+          && snapshotWindows.length === 0
+          && Number((status.ocr_reader_runtime || {}).candidate_count || 0) === 0
+        );
+        if (forceEmptyFocusedRefresh) {
+          emptyOcrWindowFocusForceRefreshDone = true;
+        }
+        runBackgroundTask('refresh OCR window targets after status', () => (
+          refreshOcrWindowTargetsIfNeeded({
+            reason: 'status_needs_window_refresh',
+            force: forceEmptyFocusedRefresh,
+            silent: true,
+          })
+        ));
+      }
       if (showInsightPending && !latestInsights.explainPayload) {
         renderInsightsPending();
       }
@@ -3257,18 +4159,21 @@ async function autoRecalibrateOcrDialogueProfile() {
   }
 }
 
-async function refreshOcrWindowTargets({ includeExcluded = true, silent = false } = {}) {
+async function refreshOcrWindowTargets({ includeExcluded = true, silent = false, force = false } = {}) {
   try {
     const payload = await callPlugin('galgame_list_ocr_windows', {
       include_excluded: Boolean(includeExcluded),
+      force: Boolean(force),
     });
     renderOcrWindowTargetSnapshot(payload, latestStatus);
+    return true;
   } catch (error) {
     if (silent) {
       console.warn('[galgame_plugin ui] refresh OCR window targets failed', error);
-      return;
+      return false;
     }
     setFlash(error instanceof Error ? error.message : String(error), 'error');
+    return false;
   }
 }
 
@@ -3278,7 +4183,14 @@ async function openOcrWindowModal() {
   modal.hidden = false;
   modalList.className = 'stack-list scroll-region empty-state window-candidate-list';
   modalList.textContent = '正在加载可用游戏窗口...';
-  await refreshOcrWindowTargets({ includeExcluded: true, silent: false });
+  const refreshed = await refreshOcrWindowTargetsIfNeeded({
+    reason: 'open_window_modal',
+    force: true,
+    silent: false,
+  });
+  if (!refreshed && !latestOcrWindowSnapshot) {
+    setFlash('OCR 窗口列表刷新失败，请稍后重试。', 'warning');
+  }
   const snapshot = latestOcrWindowSnapshot || {};
   renderOcrWindowListToNode(modalList, snapshot.windows || []);
 }
@@ -3302,7 +4214,11 @@ async function setOcrWindowTarget(windowKey) {
     refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
       console.warn('[galgame_plugin ui] refresh after OCR window lock failed', error);
     });
-    refreshOcrWindowTargets({ includeExcluded: true, silent: true }).catch(() => {});
+    refreshOcrWindowTargetsIfNeeded({
+      reason: 'lock_window_target',
+      force: true,
+      silent: true,
+    }).catch(() => {});
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -3318,7 +4234,11 @@ async function clearOcrWindowTarget() {
     refreshAll({ preserveFlash: true, forceInsights: true }).catch((error) => {
       console.warn('[galgame_plugin ui] refresh after OCR target clear failed', error);
     });
-    refreshOcrWindowTargets({ includeExcluded: true, silent: true }).catch(() => {});
+    refreshOcrWindowTargetsIfNeeded({
+      reason: 'clear_window_target',
+      force: true,
+      silent: true,
+    }).catch(() => {});
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   }
@@ -3326,6 +4246,95 @@ async function clearOcrWindowTarget() {
 
 async function clearOcrWindowTargetWithFeedback() {
   await withButtonPending('ocrWindowAutoBtn', '清除中...', clearOcrWindowTarget);
+}
+
+function expandAndScrollTo(elementId) {
+  const node = document.getElementById(elementId);
+  if (!node) {
+    return;
+  }
+  const details = node.closest('details');
+  if (details) {
+    details.open = true;
+  }
+  node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function revealDebugDetails() {
+  expandAndScrollTo('ocrRuntimeGrid');
+}
+
+function revealLineDetails() {
+  expandAndScrollTo('currentLineOverview');
+}
+
+function revealCaptureBackendSettings() {
+  switchInstallTab('dxcam');
+  expandAndScrollTo('dxcamPrompt');
+}
+
+async function refreshStatusAndWindowsFromAction() {
+  setFlash('正在刷新状态和窗口列表...', 'info');
+  const loaded = await refreshAll({ preserveFlash: true, forceInsights: true, showInsightPending: true });
+  const windowsLoaded = loaded
+    ? await refreshOcrWindowTargetsIfNeeded({
+      reason: 'primary_diagnosis',
+      force: true,
+      silent: false,
+    })
+    : false;
+  setFlash(
+    loaded
+      ? (windowsLoaded ? '状态和窗口列表已刷新。' : '状态已刷新；窗口列表刷新失败，请稍后重试。')
+      : '状态刷新失败，请稍后重试。',
+    loaded && windowsLoaded ? 'success' : 'warning',
+  );
+}
+
+async function switchToChoiceAdvisorMode() {
+  const modeSelect = document.getElementById('modeSelect');
+  if (modeSelect) {
+    modeSelect.value = 'choice_advisor';
+  }
+  await saveMode();
+}
+
+async function handleDiagnosisAction(action) {
+  switch (action) {
+    case 'refresh_all':
+      await refreshStatusAndWindowsFromAction();
+      break;
+    case 'refresh_ocr_windows':
+      await refreshStatusAndWindowsFromAction();
+      break;
+    case 'select_ocr_window':
+      await openOcrWindowModal();
+      break;
+    case 'debug_details':
+      revealDebugDetails();
+      setFlash('已展开 OCR 运行时调试详情。', 'info');
+      break;
+    case 'line_details':
+      revealLineDetails();
+      setFlash('已定位到当前台词识别详情。', 'info');
+      break;
+    case 'recalibrate_ocr':
+      await autoRecalibrateOcrDialogueProfile();
+      break;
+    case 'capture_backend':
+      revealCaptureBackendSettings();
+      setFlash('已定位到截图方式设置。可以切换 DXcam、ImageGrab 或 PrintWindow。', 'info');
+      break;
+    case 'choice_advisor':
+      await switchToChoiceAdvisorMode();
+      break;
+    case 'focus_game':
+      setFlash('请切回游戏窗口。窗口回到前台后，插件会在下一轮刷新中继续识别。', 'info');
+      break;
+    default:
+      setFlash('这个操作暂时不可用。', 'warning');
+      break;
+  }
 }
 
 function switchInstallTab(tab) {
@@ -3360,7 +4369,11 @@ async function initialize() {
     setFlash('插件状态已加载；解释/总结、窗口列表和依赖状态正在后台更新。', 'success');
   }
   runBackgroundTask('refresh OCR window targets', () => (
-    refreshOcrWindowTargets({ includeExcluded: true, silent: true })
+    refreshOcrWindowTargetsIfNeeded({
+      reason: 'initialize',
+      force: true,
+      silent: true,
+    })
   ));
   runBackgroundTask('restore install states', () => Promise.all([
     restoreRapidOcrInstallState(),
@@ -3375,12 +4388,43 @@ document.getElementById('refreshBtn').addEventListener('click', async () => {
   await withButtonPending('refreshBtn', '刷新中...', async () => {
     setFlash('正在刷新插件状态...', 'info');
     const loaded = await refreshAll({ forceInsights: true, showInsightPending: true });
-    runBackgroundTask('refresh OCR window targets', () => (
-      refreshOcrWindowTargets({ includeExcluded: true, silent: true })
-    ));
+    const windowsLoaded = loaded
+      ? await refreshOcrWindowTargetsIfNeeded({
+        reason: 'manual_refresh',
+        force: true,
+        silent: true,
+      })
+      : false;
     if (loaded) {
-      setFlash('状态已刷新；解释/总结和窗口列表在后台更新。', 'success');
+      setFlash(
+        windowsLoaded
+          ? '状态和窗口列表已刷新；解释/总结在后台更新。'
+          : '状态已刷新；窗口列表刷新失败，请稍后重试。',
+        windowsLoaded ? 'success' : 'warning',
+      );
     }
+  });
+});
+document.getElementById('primaryDiagnosisPanel').addEventListener('click', (event) => {
+  const target = eventElement(event.target);
+  const button = target ? target.closest('[data-primary-action]') : null;
+  if (!button) {
+    return;
+  }
+  const action = button.getAttribute('data-primary-action') || '';
+  withButtonPending(button, '处理中...', () => handleDiagnosisAction(action)).catch((error) => {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  });
+});
+document.getElementById('firstRunGuide').addEventListener('click', (event) => {
+  const target = eventElement(event.target);
+  const button = target ? target.closest('[data-first-run-action]') : null;
+  if (!button) {
+    return;
+  }
+  const action = button.getAttribute('data-first-run-action') || '';
+  withButtonPending(button, '处理中...', () => handleDiagnosisAction(action)).catch((error) => {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
   });
 });
 document.getElementById('saveModeBtn').addEventListener('click', () => {
@@ -3413,7 +4457,15 @@ document.getElementById('captureBackendAutoBtn').addEventListener('click', () =>
 document.getElementById('imagegrabUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'imagegrab' }));
 document.getElementById('printwindowUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'printwindow' }));
 document.getElementById('ocrWindowRefreshBtn').addEventListener('click', () => {
-  refreshOcrWindowTargets({ includeExcluded: true }).catch((error) => {
+  refreshOcrWindowTargetsIfNeeded({
+    reason: 'window_list_refresh_button',
+    force: true,
+    silent: false,
+  }).then((refreshed) => {
+    if (!refreshed) {
+      setFlash('OCR 窗口列表刷新失败，请稍后重试。', 'warning');
+    }
+  }).catch((error) => {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   });
 });
@@ -3484,11 +4536,13 @@ document.querySelectorAll('.install-tab').forEach((btn) => {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
     refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
+    refreshOcrWindowsOnPageFocus();
   }
 });
 
 window.addEventListener('focus', () => {
   refreshAll({ preserveFlash: true, silent: true }).catch(() => {});
+  refreshOcrWindowsOnPageFocus();
 });
 
 initialize();

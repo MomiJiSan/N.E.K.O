@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from plugin.sdk.plugin import (
@@ -27,6 +28,7 @@ from .dxcam_support import install_dxcam
 from .models import (
     ADVANCE_SPEEDS,
     ADVANCE_SPEED_MEDIUM,
+    DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_NONE,
     DATA_SOURCE_OCR_READER,
@@ -78,6 +80,7 @@ from .service import (
     build_explain_context,
     build_history_payload,
     build_ocr_context_diagnostic,
+    build_primary_diagnosis,
     build_snapshot_payload,
     build_status_payload,
     build_suggest_context,
@@ -111,13 +114,33 @@ def _format_install_entry_error(label: str, exc: Exception) -> str:
     return f"{prefix}：{message}"
 
 
+def _log_plugin_noncritical(logger: Any, level: str, message: str, *args: Any) -> None:
+    log_fn = getattr(logger, level, None)
+    if not callable(log_fn):
+        return
+    try:
+        log_fn(message, *args)
+    except Exception:
+        return
+
+
 _PLUGIN_TOML_PATH = Path(__file__).with_name("plugin.toml")
 _OCR_BACKEND_SELECTIONS = {"auto", "rapidocr", "tesseract"}
 _OCR_CAPTURE_BACKEND_SELECTIONS = {"auto", "dxcam", "imagegrab", "printwindow"}
 _BACKGROUND_BRIDGE_POLL_MIN_STALE_SECONDS = 45.0
+_OCR_FOREGROUND_REFRESH_TTL_SECONDS = 2.0
 _OCR_AFTER_ADVANCE_CAPTURE_DELAY_SECONDS = 0.15
 _OCR_AFTER_ADVANCE_SETTLE_POLL_SECONDS = 0.15
 _OCR_AFTER_ADVANCE_MAX_SETTLE_SECONDS = 2.0
+
+
+def _matches_toml_key(stripped_line: str, key: str) -> bool:
+    stripped = str(stripped_line or "").strip()
+    return (
+        stripped.startswith(f"{key}=")
+        or stripped.startswith(f"{key} ")
+        or stripped.startswith(f"{key}\t")
+    )
 
 
 def _replace_toml_section_value(text: str, *, section: str, key: str, value: str) -> str:
@@ -130,7 +153,7 @@ def _replace_toml_section_value(text: str, *, section: str, key: str, value: str
         if stripped.startswith("[") and stripped.endswith("]"):
             in_section = stripped == section_header
             continue
-        if in_section and stripped.startswith(f"{key}"):
+        if in_section and _matches_toml_key(stripped, key):
             prefix = line[: len(line) - len(line.lstrip())]
             lines[index] = f"{prefix}{replacement}"
             return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
@@ -154,7 +177,7 @@ def _replace_toml_section_number_value(
         if stripped.startswith("[") and stripped.endswith("]"):
             in_section = stripped == section_header
             continue
-        if in_section and stripped.startswith(f"{key}"):
+        if in_section and _matches_toml_key(stripped, key):
             prefix = line[: len(line) - len(line.lstrip())]
             lines[index] = f"{prefix}{replacement}"
             return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
@@ -204,8 +227,6 @@ def _pending_data_source_for_reader_mode(
             return DATA_SOURCE_MEMORY_READER
         if ocr_reader_allowed:
             return DATA_SOURCE_OCR_READER
-        if memory_reader_allowed:
-            return DATA_SOURCE_MEMORY_READER
     return DATA_SOURCE_NONE
 
 
@@ -354,6 +375,7 @@ class GalgamePlugin(NekoPluginBase):
         self._state_lock = threading.Lock()
         self._poll_bridge_lock = asyncio.Lock()
         self._poll_bridge_thread_lock = threading.RLock()
+        self._bridge_poll_task_lock = threading.RLock()
         self._textractor_install_lock = threading.Lock()
         self._tesseract_install_lock = threading.Lock()
         self._rapidocr_install_lock = threading.Lock()
@@ -383,6 +405,9 @@ class GalgamePlugin(NekoPluginBase):
         self._pending_ocr_advance_captures = 0
         self._last_ocr_advance_capture_requested_at = 0.0
         self._last_ocr_advance_capture_reason = ""
+        self._last_ocr_foreground_refresh_at = 0.0
+        self._state_dirty = True
+        self._cached_snapshot: dict[str, Any] | None = None
 
     def request_ocr_after_advance_capture(self, *, reason: str = "agent_advance") -> None:
         if self._cfg is not None and getattr(self._cfg, "reader_mode", READER_MODE_AUTO) == READER_MODE_MEMORY:
@@ -395,6 +420,8 @@ class GalgamePlugin(NekoPluginBase):
             self._last_ocr_advance_capture_requested_at = time.monotonic()
             self._last_ocr_advance_capture_reason = str(reason or "agent_advance")
             self._state.next_poll_at_monotonic = 0.0
+            self._state_dirty = True
+            self._cached_snapshot = None
         self._start_background_bridge_poll()
 
     def _has_pending_ocr_advance_capture(self) -> bool:
@@ -425,10 +452,16 @@ class GalgamePlugin(NekoPluginBase):
             if self._pending_ocr_advance_captures > 0:
                 self._pending_ocr_advance_captures -= 1
 
-    def _snapshot_state(self) -> dict[str, Any]:
+    def _clear_pending_ocr_advance_captures(self) -> None:
         with self._state_lock:
+            self._pending_ocr_advance_captures = 0
+
+    def _snapshot_state(self, *, fresh: bool = False) -> dict[str, Any]:
+        with self._state_lock:
+            if not fresh and not self._state_dirty and self._cached_snapshot is not None:
+                return self._cached_snapshot
             state = self._state
-            return {
+            snap = {
                 "bound_game_id": state.bound_game_id,
                 "available_game_ids": list(state.available_game_ids),
                 "mode": state.mode,
@@ -460,6 +493,15 @@ class GalgamePlugin(NekoPluginBase):
                 "ocr_window_target": json_copy(state.ocr_window_target),
                 "plugin_error": state.plugin_error,
             }
+            if not fresh:
+                self._cached_snapshot = snap
+                self._state_dirty = False
+            return snap
+
+    def _mark_state_dirty(self) -> None:
+        with self._state_lock:
+            self._state_dirty = True
+            self._cached_snapshot = None
 
     @staticmethod
     def _ocr_capture_scope_label(save_scope: str) -> str:
@@ -583,6 +625,8 @@ class GalgamePlugin(NekoPluginBase):
         self._persist.persist_ocr_capture_profiles(profiles)
         with self._state_lock:
             self._state.ocr_capture_profiles = json_copy(profiles)
+            self._state_dirty = True
+            self._cached_snapshot = None
         if self._ocr_reader_manager is not None:
             self._ocr_reader_manager.update_capture_profiles(profiles)
             try:
@@ -591,12 +635,14 @@ class GalgamePlugin(NekoPluginBase):
                 )
             except Exception as exc:
                 self.logger.warning(
-                    "galgame_plugin failed to refresh OCR runtime after saving capture profile: %s",
+                    "galgame_plugin failed to refresh OCR runtime after saving capture profile: {}",
                     exc,
                 )
             else:
                 with self._state_lock:
                     self._state.ocr_reader_runtime = json_copy(refreshed_runtime)
+                    self._state_dirty = True
+                    self._cached_snapshot = None
         payload = {
             "process_name": normalized_process_name,
             "stage": normalized_stage,
@@ -625,64 +671,86 @@ class GalgamePlugin(NekoPluginBase):
     def _commit_state(self, payload: dict[str, Any]) -> None:
         with self._state_lock:
             state = self._state
-            state.bound_game_id = str(payload["bound_game_id"])
-            state.available_game_ids = list(payload["available_game_ids"])
+            changed = False
+
+            def assign(name: str, value: Any) -> None:
+                nonlocal changed
+                if getattr(state, name) != value:
+                    setattr(state, name, value)
+                    changed = True
+
+            def assign_json(name: str, value: Any) -> None:
+                nonlocal changed
+                if getattr(state, name) != value:
+                    setattr(state, name, json_copy(value))
+                    changed = True
+
+            assign("bound_game_id", str(payload["bound_game_id"]))
+            assign("available_game_ids", list(payload["available_game_ids"]))
             # Preferences can be changed through plugin entries while a bridge poll is in
             # flight. Keep the live values instead of restoring the poll's stale snapshot.
-            state.mode = state.mode if state.mode in MODES else str(payload["mode"])
-            state.push_notifications = bool(state.push_notifications)
-            state.advance_speed = (
+            assign("mode", state.mode if state.mode in MODES else str(payload["mode"]))
+            assign("push_notifications", bool(state.push_notifications))
+            assign("advance_speed", (
                 state.advance_speed
                 if state.advance_speed in ADVANCE_SPEEDS
                 else str(payload.get("advance_speed") or ADVANCE_SPEED_MEDIUM)
-            )
-            state.active_game_id = str(payload["active_game_id"])
-            state.active_session_id = str(payload["active_session_id"])
-            state.active_session_meta = json_copy(payload["active_session_meta"])
-            state.active_data_source = str(payload["active_data_source"])
-            state.latest_snapshot = json_copy(payload["latest_snapshot"])
-            state.history_events = json_copy(payload["history_events"])
-            state.history_lines = json_copy(payload["history_lines"])
-            state.history_observed_lines = json_copy(payload.get("history_observed_lines", []))
-            state.history_choices = json_copy(payload["history_choices"])
-            state.dedupe_window = json_copy(payload["dedupe_window"])
-            state.line_buffer = payload["line_buffer"]
-            state.stream_reset_pending = bool(payload["stream_reset_pending"])
-            state.last_error = json_copy(payload["last_error"])
-            state.next_poll_at_monotonic = float(payload["next_poll_at_monotonic"])
-            state.current_connection_state = str(payload["current_connection_state"])
-            state.events_byte_offset = int(payload["events_byte_offset"])
-            state.events_file_size = int(payload["events_file_size"])
-            state.last_seq = int(payload["last_seq"])
-            state.last_seen_data_monotonic = float(payload["last_seen_data_monotonic"])
-            state.warmup_session_id = str(payload["warmup_session_id"])
-            state.memory_reader_runtime = json_copy(payload["memory_reader_runtime"])
-            state.ocr_reader_runtime = json_copy(payload["ocr_reader_runtime"])
-            state.ocr_capture_profiles = json_copy(payload["ocr_capture_profiles"])
-            state.ocr_window_target = json_copy(payload["ocr_window_target"])
-            state.plugin_error = str(payload["plugin_error"])
+            ))
+            assign("active_game_id", str(payload["active_game_id"]))
+            assign("active_session_id", str(payload["active_session_id"]))
+            assign_json("active_session_meta", payload["active_session_meta"])
+            assign("active_data_source", str(payload["active_data_source"]))
+            assign_json("latest_snapshot", payload["latest_snapshot"])
+            assign_json("history_events", payload["history_events"])
+            assign_json("history_lines", payload["history_lines"])
+            assign_json("history_observed_lines", payload.get("history_observed_lines", []))
+            assign_json("history_choices", payload["history_choices"])
+            assign_json("dedupe_window", payload["dedupe_window"])
+            assign("line_buffer", payload["line_buffer"])
+            assign("stream_reset_pending", bool(payload["stream_reset_pending"]))
+            assign_json("last_error", payload["last_error"])
+            assign("next_poll_at_monotonic", float(payload["next_poll_at_monotonic"]))
+            assign("current_connection_state", str(payload["current_connection_state"]))
+            assign("events_byte_offset", int(payload["events_byte_offset"]))
+            assign("events_file_size", int(payload["events_file_size"]))
+            assign("last_seq", int(payload["last_seq"]))
+            assign("last_seen_data_monotonic", float(payload["last_seen_data_monotonic"]))
+            assign("warmup_session_id", str(payload["warmup_session_id"]))
+            assign_json("memory_reader_runtime", payload["memory_reader_runtime"])
+            assign_json("ocr_reader_runtime", payload["ocr_reader_runtime"])
+            assign_json("ocr_capture_profiles", payload["ocr_capture_profiles"])
+            assign_json("ocr_window_target", payload["ocr_window_target"])
+            assign("plugin_error", str(payload["plugin_error"]))
+            if changed:
+                self._state_dirty = True
+                self._cached_snapshot = None
 
     def _record_error(self, error: dict[str, Any]) -> None:
         with self._state_lock:
             self._state.last_error = json_copy(error)
+            self._state_dirty = True
+            self._cached_snapshot = None
 
     def _bridge_poll_debug_payload(self) -> dict[str, Any]:
         now = time.monotonic()
-        poll_running = self._bridge_poll_task is not None and not self._bridge_poll_task.done()
+        with self._bridge_poll_task_lock:
+            with self._state_lock:
+                bridge_poll_task = self._bridge_poll_task
+                bridge_poll_started_at = float(self._bridge_poll_started_at or 0.0)
+                next_poll_at = float(self._state.next_poll_at_monotonic or 0.0)
+                pending_ocr_advance_captures = int(self._pending_ocr_advance_captures or 0)
+                last_ocr_advance_capture_requested_at = float(
+                    self._last_ocr_advance_capture_requested_at or 0.0
+                )
+                last_ocr_advance_capture_reason = str(
+                    self._last_ocr_advance_capture_reason or ""
+                )
+        poll_running = bridge_poll_task is not None and not bridge_poll_task.done()
         inflight_seconds = (
-            max(0.0, now - self._bridge_poll_started_at)
-            if poll_running and self._bridge_poll_started_at > 0.0
+            max(0.0, now - bridge_poll_started_at)
+            if poll_running and bridge_poll_started_at > 0.0
             else 0.0
         )
-        with self._state_lock:
-            next_poll_at = float(self._state.next_poll_at_monotonic or 0.0)
-            pending_ocr_advance_captures = int(self._pending_ocr_advance_captures or 0)
-            last_ocr_advance_capture_requested_at = float(
-                self._last_ocr_advance_capture_requested_at or 0.0
-            )
-            last_ocr_advance_capture_reason = str(
-                self._last_ocr_advance_capture_reason or ""
-            )
         next_poll_in_seconds = max(0.0, next_poll_at - now) if next_poll_at > 0.0 else 0.0
         pending_ocr_advance_capture_age_seconds = (
             max(0.0, now - last_ocr_advance_capture_requested_at)
@@ -703,23 +771,35 @@ class GalgamePlugin(NekoPluginBase):
             "last_ocr_advance_capture_reason": last_ocr_advance_capture_reason,
         }
 
-    def _clear_completed_background_bridge_poll(self) -> None:
-        task = self._bridge_poll_task
-        if task is None or not task.done():
-            return
-        self._bridge_poll_task = None
+    def _clear_completed_background_bridge_poll(
+        self,
+        completed_task: asyncio.Task[None] | Future[None] | None = None,
+    ) -> None:
+        with self._bridge_poll_task_lock:
+            task = self._bridge_poll_task
+            if task is None or not task.done():
+                return
+            if completed_task is not None and task is not completed_task:
+                return
+            self._bridge_poll_task = None
         if task.cancelled():
             with self._state_lock:
                 self._state.next_poll_at_monotonic = 0.0
+                self._state_dirty = True
+                self._cached_snapshot = None
             return
         try:
             task.exception()
         except asyncio.CancelledError:
             with self._state_lock:
                 self._state.next_poll_at_monotonic = 0.0
+                self._state_dirty = True
+                self._cached_snapshot = None
         except Exception as exc:
             with self._state_lock:
                 self._state.next_poll_at_monotonic = 0.0
+                self._state_dirty = True
+                self._cached_snapshot = None
             self._record_error(
                 make_error(
                     f"bridge background poll failed after completion: {exc}",
@@ -815,44 +895,62 @@ class GalgamePlugin(NekoPluginBase):
                     "OCR 轮询未继续执行，尚未完成首次截图；请检查插件 timer、后端重载状态或刷新运行中的插件。"
                 )
             enriched["ocr_context_state"] = str(runtime.get("ocr_context_state") or context_state)
+        enriched["primary_diagnosis"] = build_primary_diagnosis(enriched)
         return enriched
 
     def _start_background_bridge_poll(self) -> bool:
         if self._cfg is None:
             return False
         self._clear_completed_background_bridge_poll()
-        if self._bridge_poll_task is not None:
-            if not self._bridge_poll_task.done():
-                inflight_seconds = max(
-                    0.0,
-                    time.monotonic() - float(self._bridge_poll_started_at or 0.0),
-                )
-                if inflight_seconds >= self._background_bridge_poll_stale_timeout_seconds():
-                    self._record_error(
-                        make_error(
-                            (
-                                "bridge background poll timed out; canceling stale OCR poll "
-                                f"after {inflight_seconds:.1f}s"
-                            ),
-                            source="bridge_reader",
-                            kind="warning",
-                        )
+        with self._bridge_poll_task_lock:
+            if self._bridge_poll_task is not None:
+                if not self._bridge_poll_task.done():
+                    inflight_seconds = max(
+                        0.0,
+                        time.monotonic() - float(self._bridge_poll_started_at or 0.0),
                     )
-                    self._bridge_poll_task.cancel()
-                    with self._state_lock:
-                        self._state.next_poll_at_monotonic = 0.0
+                    if inflight_seconds >= self._background_bridge_poll_stale_timeout_seconds():
+                        self._record_error(
+                            make_error(
+                                (
+                                    "bridge background poll timed out; canceling stale OCR poll "
+                                    f"after {inflight_seconds:.1f}s"
+                                ),
+                                source="bridge_reader",
+                                kind="warning",
+                            )
+                        )
+                        self._bridge_poll_task.cancel()
+                        with self._state_lock:
+                            self._pending_ocr_advance_captures = 0
+                            self._state.next_poll_at_monotonic = 0.0
+                            self._state_dirty = True
+                            self._cached_snapshot = None
+                    return False
+                self._bridge_poll_task = None
+            self._bridge_poll_started_at = time.monotonic()
+            self._last_bridge_poll_launch_at = self._bridge_poll_started_at
+            self._bridge_poll_launch_count += 1
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is not None and not running_loop.is_closed():
+                task = running_loop.create_task(self._run_background_bridge_poll())
+                self._bridge_poll_task = task
+                task.add_done_callback(
+                    lambda completed: self._clear_completed_background_bridge_poll(completed)
+                )
+                return True
+            loop = self._ensure_bridge_poll_loop()
+            if loop is None:
                 return False
-            self._bridge_poll_task = None
-        self._bridge_poll_started_at = time.monotonic()
-        self._last_bridge_poll_launch_at = self._bridge_poll_started_at
-        self._bridge_poll_launch_count += 1
-        loop = self._ensure_bridge_poll_loop()
-        if loop is None:
-            return False
-        task = asyncio.run_coroutine_threadsafe(self._run_background_bridge_poll(), loop)
-        task.add_done_callback(lambda _task: self._clear_completed_background_bridge_poll())
-        self._bridge_poll_task = task
-        return True
+            task = asyncio.run_coroutine_threadsafe(self._run_background_bridge_poll(), loop)
+            self._bridge_poll_task = task
+            task.add_done_callback(
+                lambda completed: self._clear_completed_background_bridge_poll(completed)
+            )
+            return True
 
     async def _run_background_bridge_poll(self) -> None:
         started_at = self._bridge_poll_started_at or time.monotonic()
@@ -869,6 +967,8 @@ class GalgamePlugin(NekoPluginBase):
         except Exception as exc:
             with self._state_lock:
                 self._state.next_poll_at_monotonic = 0.0
+                self._state_dirty = True
+                self._cached_snapshot = None
             self._record_error(
                 make_error(
                     f"bridge background poll failed: {exc}",
@@ -882,18 +982,24 @@ class GalgamePlugin(NekoPluginBase):
             self._last_bridge_poll_duration_seconds = max(0.0, finished_at - started_at)
 
     async def _cancel_background_bridge_poll(self) -> None:
-        task = self._bridge_poll_task
-        if task is None:
-            return
-        self._bridge_poll_task = None
+        with self._bridge_poll_task_lock:
+            task = self._bridge_poll_task
+            if task is None:
+                return
+            self._bridge_poll_task = None
         if not task.done():
             task.cancel()
             try:
                 await asyncio.wrap_future(task) if isinstance(task, Future) else await task
             except asyncio.CancelledError:
                 pass
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame bridge background poll cancellation failed: {}",
+                    exc,
+                )
         self._stop_bridge_poll_loop()
 
     def _persist_preferences(
@@ -1002,6 +1108,8 @@ class GalgamePlugin(NekoPluginBase):
                     source="store",
                     kind="warning",
                 )
+            self._state_dirty = True
+            self._cached_snapshot = None
 
     def _current_status_payload(self) -> dict[str, Any]:
         if self._cfg is None:
@@ -1079,14 +1187,19 @@ class GalgamePlugin(NekoPluginBase):
         if self._cfg is None:
             return self._current_status_payload()
         self._refresh_ocr_foreground_state()
-        with self._state_lock:
-            state = json_copy(self._state)
-            config = self._cfg
-        payload = await asyncio.to_thread(build_status_payload, state, config=config)
+        state_snapshot = self._snapshot_state()
+        config = self._cfg
+        state = SimpleNamespace(**state_snapshot)
+        payload = await asyncio.to_thread(
+            build_status_payload,
+            state,
+            config=config,
+            state_is_snapshot=True,
+        )
         payload = self._add_bridge_poll_debug_payload(payload)
         if self._game_agent is not None:
             try:
-                agent_payload = await self._game_agent.peek_status(self._snapshot_state())
+                agent_payload = await self._game_agent.peek_status(state_snapshot)
                 payload["agent"] = json_copy(agent_payload)
                 payload["agent_status"] = str(agent_payload.get("status") or "")
                 payload["agent_user_status"] = str(agent_payload.get("agent_user_status") or "")
@@ -1148,6 +1261,7 @@ class GalgamePlugin(NekoPluginBase):
                 payload["agent_error"] = str(exc)
                 payload["agent_diagnostic"] = f"agent_status_unavailable: {exc}"
                 payload["agent_diagnostic_required"] = True
+        payload["primary_diagnosis"] = build_primary_diagnosis(payload)
         return payload
 
     def _resolve_current_run_id(self) -> str:
@@ -1239,32 +1353,62 @@ class GalgamePlugin(NekoPluginBase):
         if self._memory_reader_manager is not None:
             try:
                 await self._memory_reader_manager.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame memory reader shutdown failed: {}",
+                    exc,
+                )
         if self._ocr_reader_manager is not None:
             try:
                 await self._ocr_reader_manager.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame OCR reader shutdown failed: {}",
+                    exc,
+                )
         if self._game_agent is not None:
             try:
                 await self._game_agent.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame agent shutdown failed: {}",
+                    exc,
+                )
         if self._llm_gateway is not None:
             try:
                 await self._llm_gateway.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame LLM gateway shutdown failed: {}",
+                    exc,
+                )
         if self._host_agent_adapter is not None:
             try:
                 await self._host_agent_adapter.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame host agent adapter shutdown failed: {}",
+                    exc,
+                )
         try:
             await self.store.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_plugin_noncritical(
+                self.logger,
+                "warning",
+                "galgame store shutdown failed: {}",
+                exc,
+            )
         return Ok({"status": "stopped"})
 
     @timer_interval(id="bridge_tick", seconds=1, auto_start=True)
@@ -1288,13 +1432,20 @@ class GalgamePlugin(NekoPluginBase):
         await asyncio.sleep(0)
         return Ok({"status": "tick"})
 
-    def _refresh_ocr_foreground_state(self) -> None:
+    def _refresh_ocr_foreground_state(self, *, force: bool = False) -> None:
         if self._cfg is not None and getattr(self._cfg, "reader_mode", READER_MODE_AUTO) == READER_MODE_MEMORY:
             return
         if self._ocr_reader_manager is None:
             return
         refresh = getattr(self._ocr_reader_manager, "refresh_foreground_state", None)
         if not callable(refresh):
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self._last_ocr_foreground_refresh_at > 0.0
+            and now - self._last_ocr_foreground_refresh_at < _OCR_FOREGROUND_REFRESH_TTL_SECONDS
+        ):
             return
         try:
             runtime = refresh()
@@ -1307,8 +1458,11 @@ class GalgamePlugin(NekoPluginBase):
                 )
             )
             return
+        self._last_ocr_foreground_refresh_at = now
         with self._state_lock:
             self._state.ocr_reader_runtime = json_copy(runtime)
+            self._state_dirty = True
+            self._cached_snapshot = None
 
     def _trigger_ocr_for_manual_foreground_advance(self) -> None:
         if self._cfg is None or self._ocr_reader_manager is None:
@@ -1350,7 +1504,7 @@ class GalgamePlugin(NekoPluginBase):
             return
 
         now_monotonic = time.monotonic()
-        local = self._snapshot_state()
+        local = self._snapshot_state(fresh=True)
         next_poll_at = float(local["next_poll_at_monotonic"])
         max_reasonable_interval = max(
             float(self._cfg.active_poll_interval_seconds),
@@ -1395,12 +1549,22 @@ class GalgamePlugin(NekoPluginBase):
             self._commit_state(local)
             try:
                 self._persist_runtime_state(local)
-            except Exception:
-                pass
+            except Exception as persist_exc:
+                _log_plugin_noncritical(
+                    self.logger,
+                    "warning",
+                    "galgame persist runtime state after bridge scan failure failed: {}",
+                    persist_exc,
+                )
             return
 
         memory_reader_candidate_available = any(
             candidate.data_source == DATA_SOURCE_MEMORY_READER
+            and _session_candidate_has_text(candidate)
+            for candidate in raw_candidates.values()
+        )
+        bridge_sdk_candidate_available = any(
+            candidate.data_source == DATA_SOURCE_BRIDGE_SDK
             and _session_candidate_has_text(candidate)
             for candidate in raw_candidates.values()
         )
@@ -1420,32 +1584,29 @@ class GalgamePlugin(NekoPluginBase):
             )
         )
         pending_ocr_advance_capture = self._has_pending_ocr_advance_capture()
+        with self._state_lock:
+            pending_ocr_advance_reason = str(self._last_ocr_advance_capture_reason or "")
+        pending_manual_foreground_ocr_capture = (
+            pending_ocr_advance_capture
+            and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+            and pending_ocr_advance_reason in {
+                "manual_foreground_advance",
+                "foreground_target_activated",
+            }
+        )
         pending_ocr_delay_remaining = (
             self._pending_ocr_advance_capture_delay_remaining()
             if pending_ocr_advance_capture and not force
             else 0.0
         )
-        ocr_priority_capture_needed = (
-            reader_mode == READER_MODE_AUTO
-            and ocr_reader_allowed
-            and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
-            and not memory_reader_candidate_available
-            and (
-                ocr_bootstrap_capture_needed
-                or pending_ocr_advance_capture
-                or str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
-            )
-        )
-
         if (
             self._memory_reader_manager is not None
             and memory_reader_allowed
-            and not ocr_priority_capture_needed
         ):
             self._memory_reader_manager.update_config(self._cfg)
             try:
                 memory_reader_tick = await self._memory_reader_manager.tick(
-                    bridge_sdk_available=False,
+                    bridge_sdk_available=bridge_sdk_candidate_available,
                 )
                 warnings.extend(memory_reader_tick.warnings)
                 memory_reader_runtime = memory_reader_tick.runtime
@@ -1463,16 +1624,38 @@ class GalgamePlugin(NekoPluginBase):
             and _session_candidate_has_text(candidate)
             for candidate in raw_candidates.values()
         )
-        if reader_mode == READER_MODE_AUTO and memory_reader_candidate_available:
+        ocr_reader_explicitly_configured = bool(
+            str(getattr(self._cfg, "ocr_reader_tesseract_path", "") or "").strip()
+            or str(getattr(self._cfg, "ocr_reader_install_target_dir", "") or "").strip()
+            or str(getattr(self._cfg, "rapidocr_install_target_dir", "") or "").strip()
+        )
+        memory_reader_default_is_unavailable = (
+            reader_mode == READER_MODE_AUTO
+            and memory_reader_allowed
+            and bool(getattr(self._cfg, "memory_reader_enabled", False))
+            and not memory_reader_candidate_available
+            and str(memory_reader_runtime.get("status") or "") in {"idle", "backoff"}
+            and str(memory_reader_runtime.get("detail") or "")
+            in {"invalid_textractor_path", "no_detected_game_process"}
+            and not ocr_reader_explicitly_configured
+            and str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
+        )
+        if memory_reader_default_is_unavailable:
+            ocr_reader_allowed = False
+        if (
+            reader_mode == READER_MODE_AUTO
+            and memory_reader_candidate_available
+            and not pending_manual_foreground_ocr_capture
+        ):
             ocr_reader_allowed = False
             with self._state_lock:
                 self._pending_ocr_advance_captures = 0
 
+        ocr_reader_stable_event_emitted = False
         if (
             self._ocr_reader_manager is not None
             and ocr_reader_allowed
             and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
-            and pending_ocr_delay_remaining <= 0.0
         ):
             was_foreground = bool(ocr_reader_runtime.get("target_is_foreground"))
             refresh_foreground_state = getattr(
@@ -1489,10 +1672,25 @@ class GalgamePlugin(NekoPluginBase):
                             not was_foreground
                             and bool(ocr_reader_runtime.get("target_is_foreground"))
                         ):
+                            if not self._has_pending_ocr_advance_capture():
+                                with self._state_lock:
+                                    self._pending_ocr_advance_captures = min(
+                                        self._pending_ocr_advance_captures + 1,
+                                        8,
+                                    )
+                                    self._last_ocr_advance_capture_requested_at = time.monotonic()
+                                    self._last_ocr_advance_capture_reason = "foreground_target_activated"
+                                    self._state.next_poll_at_monotonic = 0.0
                             pending_ocr_advance_capture = True
                             pending_ocr_delay_remaining = 0.0
                 except Exception as exc:
                     warnings.append(f"ocr_reader foreground refresh failed: {exc}")
+        ocr_active_fallback_capture_needed = (
+            ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+            and str(ocr_reader_runtime.get("status") or "") == "active"
+            and str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
+            and not (pending_ocr_advance_capture and pending_ocr_delay_remaining > 0.0)
+        )
         ocr_tick_allowed = (
             ocr_reader_allowed
             and (
@@ -1500,11 +1698,7 @@ class GalgamePlugin(NekoPluginBase):
                 or force
                 or ocr_bootstrap_capture_needed
                 or (pending_ocr_advance_capture and pending_ocr_delay_remaining <= 0.0)
-                or (
-                    ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
-                    and str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
-                    and str(ocr_reader_runtime.get("status") or "") == "active"
-                )
+                or ocr_active_fallback_capture_needed
                 or str(ocr_reader_runtime.get("status") or "") not in {"active"}
                 or str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
             )
@@ -1519,10 +1713,16 @@ class GalgamePlugin(NekoPluginBase):
             )
             if callable(update_advance_speed):
                 update_advance_speed(str(local.get("advance_speed") or ADVANCE_SPEED_MEDIUM))
+            ocr_reader_tick = None
             try:
+                ocr_memory_reader_runtime = (
+                    {}
+                    if pending_manual_foreground_ocr_capture
+                    else memory_reader_runtime
+                )
                 ocr_reader_tick = await self._ocr_reader_manager.tick(
-                    bridge_sdk_available=False,
-                    memory_reader_runtime=memory_reader_runtime,
+                    bridge_sdk_available=bridge_sdk_candidate_available,
+                    memory_reader_runtime=ocr_memory_reader_runtime,
                 )
                 warnings.extend(ocr_reader_tick.warnings)
                 ocr_reader_runtime = ocr_reader_tick.runtime
@@ -1544,13 +1744,22 @@ class GalgamePlugin(NekoPluginBase):
                 warnings.append(f"ocr_reader tick failed: {exc}")
             finally:
                 pending_capture_settled = bool(
-                    "ocr_reader_tick" in locals()
+                    ocr_reader_tick is not None
                     and getattr(ocr_reader_tick, "stable_event_emitted", False)
+                )
+                ocr_reader_stable_event_emitted = pending_capture_settled
+                ocr_reader_capture_failed = bool(
+                    ocr_reader_tick is not None
+                    and isinstance(getattr(ocr_reader_tick, "runtime", None), dict)
+                    and str(ocr_reader_tick.runtime.get("detail") or "") == "capture_failed"
                 )
                 pending_capture_expired = (
                     self._pending_ocr_advance_capture_age()
                     >= _OCR_AFTER_ADVANCE_MAX_SETTLE_SECONDS
                 )
+                if pending_ocr_advance_capture and ocr_reader_capture_failed:
+                    self._clear_pending_ocr_advance_captures()
+                    pending_ocr_advance_capture = False
                 if (
                     pending_ocr_advance_capture
                     and (force or pending_capture_settled or pending_capture_expired)
@@ -1584,6 +1793,14 @@ class GalgamePlugin(NekoPluginBase):
             }
             available_game_ids = [game_id for game_id in available_game_ids if game_id in candidates]
         local["available_game_ids"] = available_game_ids
+        candidate_reader_mode = reader_mode
+        if (
+            reader_mode == READER_MODE_AUTO
+            and pending_manual_foreground_ocr_capture
+            and ocr_reader_stable_event_emitted
+            and not bridge_sdk_candidate_available
+        ):
+            candidate_reader_mode = READER_MODE_OCR
 
         keep_current = (
             not local["bound_game_id"]
@@ -1595,7 +1812,7 @@ class GalgamePlugin(NekoPluginBase):
             bound_game_id=str(local["bound_game_id"]),
             current_game_id=str(local["active_game_id"]),
             keep_current=keep_current,
-            reader_mode=reader_mode,
+            reader_mode=candidate_reader_mode,
         )
 
         if candidate is not None:
@@ -2092,6 +2309,8 @@ class GalgamePlugin(NekoPluginBase):
                     memory_reader_candidate_available=False,
                 )
             self._state.next_poll_at_monotonic = 0.0
+            self._state_dirty = True
+            self._cached_snapshot = None
             payload = {
                 "mode": self._state.mode,
                 "push_notifications": self._state.push_notifications,
@@ -2186,6 +2405,8 @@ class GalgamePlugin(NekoPluginBase):
 
         with self._state_lock:
             self._state.next_poll_at_monotonic = 0.0
+            self._state_dirty = True
+            self._cached_snapshot = None
 
         try:
             self._persist_ocr_backend_selection(
@@ -2198,8 +2419,13 @@ class GalgamePlugin(NekoPluginBase):
             if self._ocr_reader_manager is not None:
                 try:
                     self._ocr_reader_manager.update_config(self._cfg)
-                except Exception:
-                    pass
+                except Exception as rollback_exc:
+                    _log_plugin_noncritical(
+                        self.logger,
+                        "warning",
+                        "galgame OCR backend rollback update_config failed: {}",
+                        rollback_exc,
+                    )
             return Err(SdkError(f"persist OCR backend failed: {exc}"))
 
         self._start_background_bridge_poll()
@@ -2270,6 +2496,8 @@ class GalgamePlugin(NekoPluginBase):
 
         with self._state_lock:
             self._state.next_poll_at_monotonic = 0.0
+            self._state_dirty = True
+            self._cached_snapshot = None
 
         try:
             self._persist_ocr_timing(
@@ -2282,8 +2510,13 @@ class GalgamePlugin(NekoPluginBase):
             if self._ocr_reader_manager is not None:
                 try:
                     self._ocr_reader_manager.update_config(self._cfg)
-                except Exception:
-                    pass
+                except Exception as rollback_exc:
+                    _log_plugin_noncritical(
+                        self.logger,
+                        "warning",
+                        "galgame OCR timing rollback update_config failed: {}",
+                        rollback_exc,
+                    )
             return Err(SdkError(f"persist OCR timing failed: {exc}"))
 
         self._start_background_bridge_poll()
@@ -2322,6 +2555,8 @@ class GalgamePlugin(NekoPluginBase):
 
         with self._state_lock:
             self._state.bound_game_id = normalized
+            self._state_dirty = True
+            self._cached_snapshot = None
             bound_game_id = self._state.bound_game_id
             mode = self._state.mode
             push_notifications = self._state.push_notifications
@@ -2494,17 +2729,24 @@ class GalgamePlugin(NekoPluginBase):
             "type": "object",
             "properties": {
                 "include_excluded": {"type": "boolean", "default": False},
+                "force": {"type": "boolean", "default": False},
             },
         },
         llm_result_fields=["summary"],
     )
-    async def galgame_list_ocr_windows(self, include_excluded: bool = False, **_):
+    async def galgame_list_ocr_windows(
+        self,
+        include_excluded: bool = False,
+        force: bool = False,
+        **_,
+    ):
         if self._ocr_reader_manager is None:
             return Err(SdkError("ocr_reader manager is not initialized"))
         try:
             payload = await asyncio.to_thread(
                 self._ocr_reader_manager.list_windows_snapshot,
                 include_excluded=bool(include_excluded),
+                force=bool(force),
             )
         except Exception as exc:
             return Err(SdkError(f"list OCR windows failed: {exc}"))
@@ -2569,6 +2811,8 @@ class GalgamePlugin(NekoPluginBase):
 
         with self._state_lock:
             self._state.ocr_window_target = json_copy(target_payload)
+            self._state_dirty = True
+            self._cached_snapshot = None
         self._ocr_reader_manager.update_window_target(target_payload)
         background_poll_started = self._start_background_bridge_poll()
         return Ok(

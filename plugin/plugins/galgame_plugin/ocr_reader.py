@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 import hashlib
 import json
 import os
 import re
+import shutil
+import sys
 import threading
 import time
+from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -39,6 +43,19 @@ from .models import (
     build_ocr_capture_profile_bucket_key,
     compute_ocr_window_aspect_ratio,
     parse_ocr_capture_profile_bucket_key,
+)
+from .aihong_state import (
+    AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET as _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET,
+    AIHONG_DIALOGUE_STAGE as _AIHONG_DIALOGUE_STAGE,
+    AIHONG_MENU_CAPTURE_PROFILE_PRESET as _AIHONG_MENU_CAPTURE_PROFILE_PRESET,
+    AIHONG_MENU_MAX_LINES as _AIHONG_MENU_MAX_LINES,
+    AIHONG_MENU_MAX_SIGNIFICANT_CHARS as _AIHONG_MENU_MAX_SIGNIFICANT_CHARS,
+    AIHONG_MENU_STAGE as _AIHONG_MENU_STAGE,
+    coerce_aihong_menu_choices as _coerce_aihong_menu_choices,
+    levenshtein_distance as _levenshtein_distance,
+    looks_like_aihong_menu_status_only_text as _looks_like_aihong_menu_status_only_text,
+    matches_aihong_target as _matches_aihong_target_info,
+    normalize_aihong_choice_box_text as _normalize_aihong_choice_box_text,
 )
 from .rapidocr_support import (
     inspect_rapidocr_installation,
@@ -105,6 +122,7 @@ _AUTO_TARGET_DENY_PROCESS_NAMES = {
     "msedge.exe",
     "notepad.exe",
     "powershell.exe",
+    "razerappengine.exe",
     "windowsterminal.exe",
     "winword.exe",
     "wps.exe",
@@ -113,6 +131,7 @@ _HELPER_CLASS_NAMES = {
     "Shell_TrayWnd",
     "Windows.UI.Core.CoreWindow",
     "ApplicationFrameWindow",
+    "RzMonitorForegroundWindowClass",
     "Windows.UI.Composition.DesktopWindowContentBridge",
 }
 _SELF_UI_GUARD_SUBSTRINGS = (
@@ -180,46 +199,11 @@ _GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
     "存档",
     "读档",
 )
-_AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
-_AIHONG_TITLE_SUBSTRINGS = ("哀鸿", "aihong")
-_AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET = {
-    "left_inset_ratio": 0.0,
-    "right_inset_ratio": 0.0,
-    "top_ratio": 0.60,
-    "bottom_inset_ratio": 0.05,
-}
-_AIHONG_MENU_CAPTURE_PROFILE_PRESET = {
-    "left_inset_ratio": 0.0,
-    "right_inset_ratio": 0.0,
-    "top_ratio": 0.0,
-    "bottom_inset_ratio": 0.0,
-}
-_AIHONG_DIALOGUE_STAGE = OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
-_AIHONG_MENU_STAGE = OCR_CAPTURE_PROFILE_STAGE_MENU
-_AIHONG_MENU_MAX_LINES = 4
-_AIHONG_MENU_MIN_SIGNIFICANT_CHARS = 2
-_AIHONG_MENU_MAX_SIGNIFICANT_CHARS = 10
-_AIHONG_MENU_STATUS_KEYWORDS = ("银两剩余", "余额", "剩余")
-_AIHONG_MENU_AMOUNT_RE = re.compile(r"^\s*\d+\s*两\S{0,3}\s*$")
-_AIHONG_MENU_DIALOGUE_MARKERS = (
-    ",",
-    ".",
-    ":",
-    ";",
-    "?",
-    "!",
-    "[",
-    "]",
-    "，",
-    "。",
-    "：",
-    "；",
-    "？",
-    "！",
-    "「",
-    "」",
-    "【",
-    "】",
+_ENGLISH_GAME_OVERLAY_WORDS = frozenset(
+    token for token in _GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS if token.isascii()
+)
+_NON_ENGLISH_GAME_OVERLAY_SUBSTRINGS = tuple(
+    token for token in _GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS if not token.isascii()
 )
 _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
 _OCR_DIALOGUE_STRONG_PUNCTUATION_RE = re.compile(r"[。！？!?…]|——|「|」|『|』|“|”")
@@ -231,7 +215,12 @@ _OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE = re.compile(
 _OCR_TRAILING_GARBAGE_AFTER_DASH_RE = re.compile(
     r"((?:——|--|—|－|-))\s*[^。！？!?…，,、：:「」『』“”\[\]［］【】（）()]{1,4}\s*$"
 )
+_OCR_STABILITY_IGNORED_CHARS_RE = re.compile(
+    r"[\s　\-_.,，。:：;；!！?？…~～'\"“”‘’「」『』()\[\]［］【】]+"
+)
 _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS = 0.18
+_OCR_CAPTURE_TIMEOUT_SECONDS = 12.0
+_FOREGROUND_ADVANCE_STABLE_GRACE_SECONDS = 2.0
 _CAPTURE_BACKEND_AUTO = "auto"
 _CAPTURE_BACKEND_DXCAM = "dxcam"
 _CAPTURE_BACKEND_IMAGEGRAB = "imagegrab"
@@ -239,8 +228,11 @@ _CAPTURE_BACKEND_PRINTWINDOW = "printwindow"
 _DXCAM_GRAB_RETRY_ATTEMPTS = 2
 _DXCAM_GRAB_RETRY_DELAY_SECONDS = 0.05
 _STALE_CAPTURE_FRAME_THRESHOLD = 3
+_WINDOW_SCAN_CACHE_TTL_SECONDS = 5.0
+_RAPIDOCR_RUNTIME_IDLE_TTL_SECONDS = 300.0
 _RAPIDOCR_RUNTIME_CACHE_LOCK = threading.Lock()
-_RAPIDOCR_RUNTIME_CACHE: dict[tuple[str, str, str, str, str], Any] = {}
+_RAPIDOCR_RUNTIME_CACHE: dict[tuple[str, str, str, str, str], tuple[Any, float]] = {}
+_RAPIDOCR_INFERENCE_LOCK = threading.Lock()
 _OCR_PREPARE_UPSCALE_SOURCE_LONG_EDGE = 900
 _OCR_PREPARE_TARGET_LONG_EDGE = 1400
 _OCR_PREPARE_MAX_LONG_EDGE = 1600
@@ -291,16 +283,52 @@ def _looks_like_self_ui_text(text: str) -> bool:
     return any(token in normalized for token in _SELF_UI_GUARD_SUBSTRINGS)
 
 
-def _looks_like_game_overlay_text(text: str) -> bool:
-    normalized = normalize_text(text).strip().lower()
+def _looks_like_english_overlay_label(line: str) -> bool:
+    words = re.findall(r"[a-z]+", normalize_text(line).strip().lower())
+    if not words:
+        return False
+    if any(word not in _ENGLISH_GAME_OVERLAY_WORDS for word in words):
+        return False
+    return True
+
+
+def _looks_like_non_english_overlay_label(line: str) -> bool:
+    compact = re.sub(
+        r"[\s\-_.,，。:：;；!！?？/\\|()\[\]【】「」『』]+",
+        "",
+        normalize_text(line).strip().lower(),
+    )
+    if not compact:
+        return False
+    remainder = compact
+    matched = False
+    for token in sorted(_NON_ENGLISH_GAME_OVERLAY_SUBSTRINGS, key=len, reverse=True):
+        if token in remainder:
+            matched = True
+            remainder = remainder.replace(token, "")
+    return matched and not remainder
+
+
+def _looks_like_game_overlay_normalized_text(normalized: str) -> bool:
+    normalized = str(normalized or "").strip()
     if not normalized:
         return False
-    lines = _stripped_ocr_lines(normalized)
-    has_overlay_keyword = any(token in normalized for token in _GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS)
-    if has_overlay_keyword and (len(lines) >= 2 or _significant_char_count(normalized) <= 40):
+    lowered = normalized.lower()
+    lines = _stripped_ocr_lines(lowered)
+    non_english_overlay_lines = [
+        line for line in lines if _looks_like_non_english_overlay_label(line)
+    ]
+    if bool(lines) and len(non_english_overlay_lines) == len(lines):
         return True
-    dialogue_like_lines = sum(1 for line in lines if _looks_like_dialogue_line(line))
-    return len(lines) >= 4 and dialogue_like_lines >= 2
+    english_overlay_lines = [
+        line for line in lines if _looks_like_english_overlay_label(line)
+    ]
+    return bool(lines) and len(english_overlay_lines) == len(lines)
+
+
+def _looks_like_game_overlay_text(text: str) -> bool:
+    normalized = normalize_text(text).strip().lower()
+    return _looks_like_game_overlay_normalized_text(normalized)
 
 
 def _coerce_prefixed_choice_lines(lines: list[str]) -> list[str]:
@@ -327,6 +355,11 @@ def _looks_like_dialogue_line(text: str) -> bool:
 
 def _looks_like_ocr_dialogue_text(text: str) -> bool:
     normalized = normalize_text(text).replace("\n", " ").strip()
+    return _looks_like_ocr_dialogue_normalized_text(normalized)
+
+
+def _looks_like_ocr_dialogue_normalized_text(normalized: str) -> bool:
+    normalized = str(normalized or "").replace("\n", " ").strip()
     if not normalized:
         return False
     significant_chars = _significant_char_count(normalized)
@@ -340,17 +373,102 @@ def _looks_like_ocr_dialogue_text(text: str) -> bool:
 
 
 def _clean_ocr_dialogue_text(text: str) -> str:
-    normalized = normalize_text(text).replace("\n", " ").strip()
+    normalized = normalize_text(text).replace("\n", " ").replace("　", "").strip()
     if not normalized:
         return ""
-    previous = None
     cleaned = normalized
-    while previous != cleaned:
-        previous = cleaned
-        cleaned = _OCR_TRAILING_GARBAGE_AFTER_SENTENCE_RE.sub(r"\1", cleaned).strip()
-        cleaned = _OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE.sub(r"\1", cleaned).strip()
-        cleaned = _OCR_TRAILING_GARBAGE_AFTER_DASH_RE.sub(r"\1", cleaned).strip()
+    cleaned = _OCR_TRAILING_GARBAGE_AFTER_SENTENCE_RE.sub(r"\1", cleaned).strip()
+    cleaned = _OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE.sub(r"\1", cleaned).strip()
+    cleaned = _OCR_TRAILING_GARBAGE_AFTER_DASH_RE.sub(r"\1", cleaned).strip()
     return cleaned
+
+
+def _ocr_stability_key(text: str) -> str:
+    normalized = normalize_text(str(text or "")).replace("\n", " ").strip().lower()
+    if not normalized:
+        return ""
+    return _OCR_STABILITY_IGNORED_CHARS_RE.sub("", normalized)
+
+
+def _ocr_stability_keys_match(left: str, right: str) -> bool:
+    left_key = str(left or "")
+    right_key = str(right or "")
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    if min(len(left_key), len(right_key)) >= 8 and abs(len(left_key) - len(right_key)) <= 1:
+        return left_key.startswith(right_key) or right_key.startswith(left_key)
+    return False
+
+
+def _prefer_ocr_stability_text(existing: str, current: str) -> str:
+    existing_text = normalize_text(str(existing or "")).strip()
+    current_text = normalize_text(str(current or "")).strip()
+    if not existing_text:
+        return current_text
+    if not current_text:
+        return existing_text
+    existing_has_strong_end = bool(_OCR_DIALOGUE_STRONG_PUNCTUATION_RE.search(existing_text[-2:]))
+    current_has_strong_end = bool(_OCR_DIALOGUE_STRONG_PUNCTUATION_RE.search(current_text[-2:]))
+    if existing_has_strong_end != current_has_strong_end:
+        return existing_text if existing_has_strong_end else current_text
+    if _significant_char_count(current_text) > _significant_char_count(existing_text):
+        return current_text
+    return existing_text
+
+
+def _rapidocr_runtime_cache_key(
+    *,
+    install_target_dir_raw: str,
+    engine_type: str,
+    lang_type: str,
+    model_type: str,
+    ocr_version: str,
+) -> tuple[str, str, str, str, str]:
+    return (
+        str(install_target_dir_raw or "").strip(),
+        str(engine_type or "").strip().lower(),
+        str(lang_type or "").strip().lower(),
+        str(model_type or "").strip().lower(),
+        str(ocr_version or "").strip(),
+    )
+
+
+def _prune_rapidocr_runtime_cache(now: float) -> None:
+    stale_keys = [
+        key
+        for key, (_runtime, last_used_at) in _RAPIDOCR_RUNTIME_CACHE.items()
+        if now - float(last_used_at or 0.0) >= _RAPIDOCR_RUNTIME_IDLE_TTL_SECONDS
+    ]
+    for key in stale_keys:
+        _RAPIDOCR_RUNTIME_CACHE.pop(key, None)
+
+
+def _get_rapidocr_runtime_cache(
+    key: tuple[str, str, str, str, str],
+    *,
+    now: float,
+) -> Any | None:
+    cached = _RAPIDOCR_RUNTIME_CACHE.get(key)
+    if cached is None:
+        return None
+    runtime, last_used_at = cached
+    if now - float(last_used_at or 0.0) >= _RAPIDOCR_RUNTIME_IDLE_TTL_SECONDS:
+        _RAPIDOCR_RUNTIME_CACHE.pop(key, None)
+        return None
+    _RAPIDOCR_RUNTIME_CACHE[key] = (runtime, now)
+    return runtime
+
+
+def _store_rapidocr_runtime_cache(
+    key: tuple[str, str, str, str, str],
+    runtime: Any,
+    *,
+    now: float,
+) -> None:
+    _prune_rapidocr_runtime_cache(now)
+    _RAPIDOCR_RUNTIME_CACHE[key] = (runtime, now)
 
 
 def _coerce_plain_choice_lines(lines: list[str]) -> list[str]:
@@ -382,38 +500,6 @@ def _coerce_choice_lines(lines: list[str], *, allow_plain_text: bool = False) ->
     return []
 
 
-def _looks_like_aihong_dialogue_text(text: str) -> bool:
-    normalized = normalize_text(text).strip()
-    if not normalized:
-        return False
-    return any(marker in normalized for marker in _AIHONG_MENU_DIALOGUE_MARKERS)
-
-
-def _looks_like_aihong_menu_status_line(text: str) -> bool:
-    normalized = normalize_text(str(text or "")).replace("\n", " ").strip()
-    if not normalized:
-        return False
-    if any(keyword in normalized for keyword in _AIHONG_MENU_STATUS_KEYWORDS):
-        return True
-    return bool(_AIHONG_MENU_AMOUNT_RE.match(normalized))
-
-
-def _looks_like_aihong_menu_status_only_text(raw_text: str) -> bool:
-    lines = _stripped_ocr_lines(raw_text)
-    if not lines:
-        return False
-    return all(_looks_like_aihong_menu_status_line(line) for line in lines)
-
-
-def _normalize_aihong_choice_box_text(text: str) -> str:
-    normalized = normalize_text(str(text or "")).replace("\n", " ").strip()
-    if not normalized or _looks_like_aihong_menu_status_line(normalized):
-        return ""
-    if normalized.endswith("手") and _significant_char_count(normalized) > _AIHONG_MENU_MIN_SIGNIFICANT_CHARS:
-        normalized = normalized[:-1].strip()
-    return normalized
-
-
 def _aihong_choice_boxes(
     choices: list[str],
     boxes: list[OcrTextBox],
@@ -423,10 +509,18 @@ def _aihong_choice_boxes(
     for choice in choices:
         choice_text = normalize_text(str(choice or "")).strip()
         found_index = -1
+        best_dist = float("inf")
         for index, box in enumerate(remaining):
-            if _normalize_aihong_choice_box_text(box.text) == choice_text:
+            box_text = _normalize_aihong_choice_box_text(box.text)
+            if not box_text:
+                continue
+            dist = _levenshtein_distance(box_text, choice_text)
+            max_allowed = max(2, int(len(choice_text) * 0.3))
+            if dist <= max_allowed and dist < best_dist:
+                best_dist = dist
                 found_index = index
-                break
+                if dist == 0:
+                    break
         if found_index < 0:
             matched.append(None)
             continue
@@ -453,36 +547,6 @@ def _extraction_choice_bounds_metadata(extraction: "OcrExtractionResult") -> dic
     if extraction.window_rect:
         metadata["window_rect"] = dict(extraction.window_rect)
     return metadata
-
-
-def _coerce_aihong_menu_choices(lines: list[str]) -> list[str]:
-    status_lines = 0
-    filtered_lines: list[str] = []
-    for line in lines:
-        text = normalize_text(str(line or "")).replace("\n", " ").strip()
-        if not text:
-            continue
-        if _looks_like_aihong_menu_status_line(text):
-            status_lines += 1
-            continue
-        if text.endswith("手") and _significant_char_count(text) > _AIHONG_MENU_MIN_SIGNIFICANT_CHARS:
-            text = text[:-1].strip()
-        filtered_lines.append(text)
-    choices = _coerce_choice_lines(filtered_lines, allow_plain_text=True)
-    if not 2 <= len(choices) <= _AIHONG_MENU_MAX_LINES:
-        return []
-    normalized_choices: list[str] = []
-    for choice in choices:
-        text = normalize_text(str(choice or "")).replace("\n", " ").strip()
-        if not text or _looks_like_aihong_dialogue_text(text):
-            return []
-        significant_chars = _significant_char_count(text)
-        if not _AIHONG_MENU_MIN_SIGNIFICANT_CHARS <= significant_chars <= _AIHONG_MENU_MAX_SIGNIFICANT_CHARS:
-            return []
-        normalized_choices.append(text)
-    if status_lines and len(normalized_choices) >= 2:
-        return normalized_choices
-    return normalized_choices
 
 
 @dataclass(slots=True)
@@ -523,7 +587,9 @@ def _score_ocr_text(text: str) -> tuple[float, int, int]:
     cjk_count = len(_CJK_CHAR_RE.findall(normalized))
     kana_count = len(_KANA_CHAR_RE.findall(normalized))
     ascii_tokens = _ASCII_TOKEN_RE.findall(normalized)
-    isolated_ascii_tokens = sum(1 for token in ascii_tokens if len(token) == 1)
+    isolated_ascii_tokens = sum(
+        1 for token in ascii_tokens if len(token) == 1 and token.lower() not in {"i", "a"}
+    )
     multi_char_ascii_tokens = sum(1 for token in ascii_tokens if len(token) > 1)
     significant_chars = sum(1 for ch in normalized if not ch.isspace())
     score = (
@@ -542,6 +608,11 @@ def _significant_char_count(text: str) -> int:
 
 def _looks_like_noise_ocr_text(text: str) -> bool:
     normalized = normalize_text(str(text or "")).strip()
+    return _looks_like_noise_normalized_text(normalized)
+
+
+def _looks_like_noise_normalized_text(normalized: str) -> bool:
+    normalized = str(normalized or "").strip()
     if not normalized:
         return True
     significant_chars = _significant_char_count(normalized)
@@ -571,9 +642,8 @@ def _prepare_ocr_image(image: Any, *, apply_filters: bool = True) -> Any:
             ),
             resampling.LANCZOS,
         )
-    if apply_filters:
-        prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
-        prepared = prepared.filter(ImageFilter.SHARPEN)
+        if apply_filters:
+            prepared = prepared.filter(ImageFilter.SHARPEN)
     return prepared
 
 
@@ -590,7 +660,8 @@ def _perceptual_hash_image(frame: Any, *, size: int = _BACKGROUND_SCENE_HASH_SIZ
             return ""
         average = sum(int(pixel) for pixel in pixels) / len(pixels)
         bits = "".join("1" if int(pixel) >= average else "0" for pixel in pixels)
-        return f"{int(bits, 2):016x}"
+        width = max(1, (size * size + 3) // 4)
+        return f"{int(bits, 2):0{width}x}"
     except Exception:
         return ""
 
@@ -634,6 +705,22 @@ def _join_ocr_segments(parts: list[str]) -> str:
             rendered += " "
         rendered += normalized
     return rendered
+
+
+def _ocr_score_weight(text: str) -> int:
+    return max(_significant_char_count(text), 1)
+
+
+def _weighted_ocr_score(scores: Iterable[tuple[float, int]]) -> float:
+    total_weight = 0
+    weighted_sum = 0.0
+    for score, weight in scores:
+        normalized_weight = max(int(weight or 0), 1)
+        weighted_sum += float(score) * normalized_weight
+        total_weight += normalized_weight
+    if total_weight <= 0:
+        return 0.0
+    return weighted_sum / total_weight
 
 
 @dataclass(slots=True)
@@ -681,7 +768,7 @@ def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
             score_value = float(score)
         except (TypeError, ValueError):
             score_value = 0.0
-        if score_value < 0.45:
+        if score_value < 0.30:
             continue
         points = _rapidocr_points(box)
         if not points:
@@ -709,34 +796,97 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
     if not tokens:
         return []
     tokens.sort(key=lambda token: (token.top, token.left))
-    lines: list[list[_RapidOcrToken]] = []
+    token_heights = sorted(max(1.0, float(token.height or 1.0)) for token in tokens)
+    median_height = token_heights[len(token_heights) // 2]
+    bucket_size = max(1.0, median_height * 0.75)
+    line_entries: list[dict[str, Any]] = []
+    line_buckets: dict[int, list[dict[str, Any]]] = {}
+
+    def _bucket_key(center: float) -> int:
+        return int(center // bucket_size)
+
+    def _add_line_bucket(entry: dict[str, Any]) -> None:
+        line_buckets.setdefault(int(entry["bucket"]), []).append(entry)
+
+    def _remove_line_bucket(entry: dict[str, Any]) -> None:
+        bucket = line_buckets.get(int(entry["bucket"]))
+        if bucket is None:
+            return
+        for index, item in enumerate(bucket):
+            if item is entry:
+                del bucket[index]
+                break
+        else:
+            return
+        if not bucket:
+            line_buckets.pop(int(entry["bucket"]), None)
+
+    def _refresh_line_entry(entry: dict[str, Any]) -> None:
+        tokens_for_line = entry["tokens"]
+        top = min(item.top for item in tokens_for_line)
+        bottom = max(item.bottom for item in tokens_for_line)
+        center = (top + bottom) / 2.0
+        new_bucket = _bucket_key(center)
+        if new_bucket != int(entry["bucket"]):
+            _remove_line_bucket(entry)
+            entry["bucket"] = new_bucket
+            _add_line_bucket(entry)
+        entry["top"] = top
+        entry["bottom"] = bottom
+        entry["center"] = center
+
     for token in tokens:
         token_center = (token.top + token.bottom) / 2.0
-        placed = False
-        for line in lines:
-            line_top = min(item.top for item in line)
-            line_bottom = max(item.bottom for item in line)
-            line_center = (line_top + line_bottom) / 2.0
-            threshold = max((line_bottom - line_top) * 0.6, token.height * 0.6, 12.0)
-            if abs(token_center - line_center) <= threshold:
-                line.append(token)
-                placed = True
-                break
-        if not placed:
-            lines.append([token])
+        best_entry: dict[str, Any] | None = None
+        best_distance = float("inf")
+        max_line_height = max(
+            (float(entry["bottom"]) - float(entry["top"]) for entry in line_entries),
+            default=token.height,
+        )
+        search_radius = max(2, int(max(max_line_height, token.height) / bucket_size) + 2)
+        candidate_entries: list[dict[str, Any]] = []
+        token_bucket = _bucket_key(token_center)
+        for bucket_key in range(token_bucket - search_radius, token_bucket + search_radius + 1):
+            candidate_entries.extend(line_buckets.get(bucket_key, ()))
+        for entry in candidate_entries:
+            line_top = float(entry["top"])
+            line_bottom = float(entry["bottom"])
+            line_center = float(entry["center"])
+            threshold = max((line_bottom - line_top) * 0.6, token.height * 0.6, token.height * 0.3)
+            distance = abs(token_center - line_center)
+            if distance <= threshold and distance < best_distance:
+                best_entry = entry
+                best_distance = distance
+        if best_entry is not None:
+            best_entry["tokens"].append(token)
+            _refresh_line_entry(best_entry)
+        else:
+            entry = {
+                "tokens": [token],
+                "top": token.top,
+                "bottom": token.bottom,
+                "center": token_center,
+                "bucket": _bucket_key(token_center),
+            }
+            line_entries.append(entry)
+            _add_line_bucket(entry)
     rendered_lines: list[str] = []
     line_results: list[tuple[str, float, OcrTextBox]] = []
+    lines = [list(entry["tokens"]) for entry in line_entries]
     lines.sort(key=lambda line: (min(item.top for item in line), min(item.left for item in line)))
     for line in lines:
         line.sort(key=lambda item: item.left)
         text = _join_ocr_segments([item.text for item in line])
         if not text:
             continue
+        line_score = _weighted_ocr_score(
+            (item.score, _ocr_score_weight(item.text)) for item in line
+        )
         rendered_lines.append(text)
         line_results.append(
             (
                 text,
-                sum(item.score for item in line) / len(line),
+                line_score,
                 OcrTextBox(
                     text=text,
                     left=min(item.left for item in line),
@@ -750,8 +900,9 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
     normalized = normalize_text(text)
     if not normalized:
         return []
-    scores = [score for _, score, _ in line_results]
-    average_score = (sum(scores) / len(scores)) if scores else 0.0
+    average_score = _weighted_ocr_score(
+        (score, _ocr_score_weight(text)) for text, score, _box in line_results
+    )
     if _significant_char_count(normalized) < 4 and average_score < 0.55:
         return []
     return line_results
@@ -776,6 +927,7 @@ class DetectedGameWindow:
     height: int = 0
     area: int = 0
     is_foreground: bool = False
+    is_minimized: bool = False
     eligible: bool = True
     exclude_reason: str = ""
     category: str = "eligible_game_window"
@@ -811,6 +963,7 @@ class DetectedGameWindow:
             "eligible": self.eligible,
             "exclude_reason": self.exclude_reason,
             "is_foreground": self.is_foreground,
+            "is_minimized": self.is_minimized,
             "is_attached": is_attached,
             "is_manual_target": is_manual_target,
             "class_name": self.class_name,
@@ -822,11 +975,10 @@ class DetectedGameWindow:
 def _matches_aihong_target(target: DetectedGameWindow | None) -> bool:
     if target is None:
         return False
-    process_name = str(target.process_name or "").strip().lower()
-    if process_name in _AIHONG_PROCESS_NAMES:
-        return True
-    normalized_title = target.normalized_title
-    return any(token in normalized_title for token in _AIHONG_TITLE_SUBSTRINGS)
+    return _matches_aihong_target_info(
+        process_name=target.process_name,
+        normalized_title=target.normalized_title,
+    )
 
 
 def _builtin_capture_profile_for_target(target: DetectedGameWindow) -> OcrCaptureProfile | None:
@@ -848,13 +1000,19 @@ def _builtin_capture_profile_for_target_stage(
 @dataclass(slots=True)
 class _StableOcrTextState:
     last_raw_text: str = ""
+    last_text_key: str = ""
     repeat_count: int = 0
     stable_text: str = ""
+    stable_text_key: str = ""
+    last_block_reason: str = ""
 
     def reset(self) -> None:
         self.last_raw_text = ""
+        self.last_text_key = ""
         self.repeat_count = 0
         self.stable_text = ""
+        self.stable_text_key = ""
+        self.last_block_reason = ""
 
 
 @dataclass(slots=True)
@@ -1000,7 +1158,7 @@ def _parse_configured_capture_profiles(
                 )
             except Exception as exc:
                 logger.warning(
-                    "ocr_reader failed to parse capture profile for %s: %s",
+                    "ocr_reader failed to parse capture profile for {}: {}",
                     normalized_process_name,
                     exc,
                 )
@@ -1016,7 +1174,7 @@ def _parse_configured_capture_profiles(
                     stage_profiles[normalized_stage_name] = OcrCaptureProfile.from_dict(stage_profile)
                 except Exception as exc:
                     logger.warning(
-                        "ocr_reader failed to parse capture profile for %s/%s: %s",
+                        "ocr_reader failed to parse capture profile for {}/{}: {}",
                         normalized_process_name,
                         normalized_stage_name,
                         exc,
@@ -1057,7 +1215,7 @@ def _parse_configured_capture_profiles(
                         )
                     except Exception as exc:
                         logger.warning(
-                            "ocr_reader failed to parse capture profile for %s/%s/%s: %s",
+                            "ocr_reader failed to parse capture profile for {}/{}/{}: {}",
                             normalized_process_name,
                             normalized_bucket_key,
                             normalized_stage_name,
@@ -1205,6 +1363,10 @@ class OcrReaderRuntime:
     last_raw_ocr_text: str = ""
     last_observed_line: dict[str, Any] = field(default_factory=dict)
     last_stable_line: dict[str, Any] = field(default_factory=dict)
+    stable_ocr_last_raw_text: str = ""
+    stable_ocr_repeat_count: int = 0
+    stable_ocr_stable_text: str = ""
+    stable_ocr_block_reason: str = ""
     capture_backend_kind: str = ""
     capture_backend_detail: str = ""
     last_capture_image_hash: str = ""
@@ -1286,6 +1448,10 @@ class OcrReaderRuntime:
             "last_raw_ocr_text": self.last_raw_ocr_text,
             "last_observed_line": dict(self.last_observed_line),
             "last_stable_line": dict(self.last_stable_line),
+            "stable_ocr_last_raw_text": self.stable_ocr_last_raw_text,
+            "stable_ocr_repeat_count": self.stable_ocr_repeat_count,
+            "stable_ocr_stable_text": self.stable_ocr_stable_text,
+            "stable_ocr_block_reason": self.stable_ocr_block_reason,
             "capture_backend_kind": self.capture_backend_kind,
             "capture_backend_detail": self.capture_backend_detail,
             "last_capture_image_hash": self.last_capture_image_hash,
@@ -1394,12 +1560,16 @@ class OcrBackend(Protocol):
 def _target_window_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]:
     import win32gui
 
-    rect = win32gui.GetWindowRect(target.hwnd)
+    def _read_rect() -> tuple[int, int, int, int]:
+        left, top, right, bottom = win32gui.GetWindowRect(target.hwnd)
+        return (int(left), int(top), int(right), int(bottom))
+
+    rect = _run_with_thread_dpi_awareness(_read_rect)
     width = int(rect[2] - rect[0])
     height = int(rect[3] - rect[1])
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Invalid window dimensions: {width}x{height}")
-    return (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+    return rect
 
 
 def _run_with_thread_dpi_awareness(fn: Callable[[], tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
@@ -1408,6 +1578,8 @@ def _run_with_thread_dpi_awareness(fn: Callable[[], tuple[int, int, int, int]]) 
     set_context = getattr(user32, "SetThreadDpiAwarenessContext", None) if user32 is not None else None
     if not callable(set_context):
         return fn()
+    set_context.restype = ctypes.c_void_p
+    set_context.argtypes = [ctypes.c_void_p]
     old_context = None
     try:
         # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. This is thread-local and
@@ -1418,7 +1590,7 @@ def _run_with_thread_dpi_awareness(fn: Callable[[], tuple[int, int, int, int]]) 
     try:
         return fn()
     finally:
-        if old_context:
+        if old_context is not None:
             try:
                 set_context(old_context)
             except Exception:
@@ -1567,6 +1739,7 @@ class PrintWindowCaptureBackend:
         return f"{target.process_name}({target.pid}) {target.title}"
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
+        _require_visible_capture_target(target, backend_kind=self.kind)
         rect = _target_window_rect(target)
         image = self._capture_full_window(target.hwnd, rect)
         return _crop_window_image(
@@ -1602,8 +1775,12 @@ class PrintWindowCaptureBackend:
             mem_dc.SelectObject(bmp)
 
             # Try PrintWindow with PW_RENDERFULLCONTENT (3) for better game capture
+            # Only available on Windows 8.1+ (version 6.3+)
             PW_RENDERFULLCONTENT = 3
-            success = ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+            success = False
+            ver = sys.getwindowsversion()
+            if ver.major > 6 or (ver.major == 6 and ver.minor >= 3):
+                success = ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
             if not success:
                 mem_dc.BitBlt((0, 0), (width, height), hdc_mem, (0, 0), win32con.SRCCOPY)
 
@@ -1631,11 +1808,15 @@ class PrintWindowCaptureBackend:
 
 class DxcamCaptureBackend:
     kind = _CAPTURE_BACKEND_DXCAM
+    _MAX_CONSECUTIVE_FAILURES = 3
+    _FAILURE_COOLDOWN_SECONDS = 30.0
 
     def __init__(self, *, logger=None) -> None:
         self._logger = logger
         self._camera = None
         self._last_create_error = ""
+        self._consecutive_failures = 0
+        self._last_failure_time = 0.0
 
     def is_available(self) -> bool:
         try:
@@ -1652,14 +1833,21 @@ class DxcamCaptureBackend:
             return self._camera
         import dxcam
 
-        try:
-            self._camera = dxcam.create(output_color="RGB")
-        except Exception as exc:
-            self._last_create_error = str(exc)
-            raise RuntimeError(f"dxcam_create_failed: {exc}") from exc
-        if self._camera is None:
-            raise RuntimeError("dxcam_create_failed: returned None")
-        return self._camera
+        last_exc = None
+        for _attempt in range(3):
+            try:
+                self._camera = dxcam.create(output_color="RGB")
+            except Exception as exc:
+                last_exc = exc
+                self._last_create_error = str(exc)
+                time.sleep(0.5)
+                continue
+            if self._camera is not None:
+                return self._camera
+            time.sleep(0.5)
+        if last_exc is not None:
+            raise RuntimeError(f"dxcam_create_failed: {last_exc}") from last_exc
+        raise RuntimeError("dxcam_create_failed: returned None after retries")
 
     def _reset_camera(self) -> None:
         camera = self._camera
@@ -1675,14 +1863,25 @@ class DxcamCaptureBackend:
         from PIL import Image
 
         _require_visible_capture_target(target, backend_kind=self.kind)
-        rect = _target_client_rect(target)
+        now = time.monotonic()
+        if (
+            self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES
+            and now - self._last_failure_time < self._FAILURE_COOLDOWN_SECONDS
+        ):
+            raise RuntimeError(
+                f"dxcam rate limited after {self._consecutive_failures} consecutive failures"
+            )
+        rect = _target_window_rect(target)
         frame = None
         for attempt in range(_DXCAM_GRAB_RETRY_ATTEMPTS + 1):
             camera = self._camera_instance()
             frame = camera.grab(region=rect)
             if frame is not None:
+                self._consecutive_failures = 0
                 break
             self._reset_camera()
+            self._consecutive_failures += 1
+            self._last_failure_time = time.monotonic()
             if attempt < _DXCAM_GRAB_RETRY_ATTEMPTS:
                 time.sleep(_DXCAM_GRAB_RETRY_DELAY_SECONDS)
         if frame is None:
@@ -1695,7 +1894,7 @@ class DxcamCaptureBackend:
             window_rect=rect,
             profile=profile,
             backend_kind=self.kind,
-            backend_detail="selected_client_rect",
+            backend_detail="selected",
         )
 
 
@@ -1706,6 +1905,7 @@ class Win32CaptureBackend:
         self._backends = self._build_backends()
         self.last_backend_kind = ""
         self.last_backend_detail = ""
+        self._logged_fallback_details: set[str] = set()
 
     def _build_backends(self) -> list[CaptureBackend]:
         imagegrab = ImageGrabCaptureBackend(logger=self._logger)
@@ -1714,14 +1914,12 @@ class Win32CaptureBackend:
         if self.selection == _CAPTURE_BACKEND_DXCAM:
             return [dxcam, imagegrab, printwindow]
         if self.selection == _CAPTURE_BACKEND_IMAGEGRAB:
-            return [imagegrab]
+            return [imagegrab, dxcam, printwindow]
         if self.selection == _CAPTURE_BACKEND_PRINTWINDOW:
-            return [printwindow]
+            return [printwindow, dxcam, imagegrab]
         return [dxcam, imagegrab, printwindow]
 
     def is_available(self) -> bool:
-        if self.selection not in {_CAPTURE_BACKEND_AUTO, _CAPTURE_BACKEND_DXCAM}:
-            return bool(self._backends) and self._backends[0].is_available()
         return any(backend.is_available() for backend in self._backends)
 
     def describe_target(self, target: DetectedGameWindow) -> str:
@@ -1729,6 +1927,11 @@ class Win32CaptureBackend:
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         errors: list[str] = []
+        selected_kind = (
+            str(getattr(self._backends[0], "kind", self.selection))
+            if self._backends
+            else self.selection
+        )
         for backend in self._backends:
             kind = str(getattr(backend, "kind", backend.__class__.__name__))
             if not backend.is_available():
@@ -1743,7 +1946,15 @@ class Win32CaptureBackend:
                     if isinstance(frame_info, dict)
                     else ""
                 )
-                self.last_backend_detail = frame_backend_detail or (
+                fallback_detail = (
+                    f"{selected_kind}_unavailable_fallback"
+                    if kind != selected_kind and f"{selected_kind}_unavailable" in errors
+                    else f"{selected_kind}_failed_fallback"
+                    if kind != selected_kind
+                    and any(error.startswith(f"{selected_kind}_failed:") for error in errors)
+                    else ""
+                )
+                self.last_backend_detail = fallback_detail or frame_backend_detail or (
                     "dxcam_unavailable_fallback"
                     if kind != _CAPTURE_BACKEND_DXCAM and "dxcam_unavailable" in errors
                     else "dxcam_failed_fallback"
@@ -1754,6 +1965,8 @@ class Win32CaptureBackend:
                 if isinstance(frame_info, dict):
                     frame_info["galgame_capture_backend_kind"] = kind
                     frame_info["galgame_capture_backend_detail"] = self.last_backend_detail
+                if fallback_detail:
+                    self._warn_fallback_once(selected_kind, kind, fallback_detail)
                 return frame
             except Exception as exc:
                 errors.append(f"{kind}_failed:{exc}")
@@ -1767,8 +1980,6 @@ class Win32CaptureBackend:
                     )
                 ):
                     raise
-                if self.selection != _CAPTURE_BACKEND_AUTO:
-                    raise
                 continue
         if self.selection != _CAPTURE_BACKEND_AUTO:
             raise RuntimeError(
@@ -1776,6 +1987,22 @@ class Win32CaptureBackend:
                 + (f": {'; '.join(errors)}" if errors else "")
             )
         raise RuntimeError("; ".join(errors) or "capture_backend_unavailable")
+
+    def _warn_fallback_once(self, selected_kind: str, actual_kind: str, detail: str) -> None:
+        if detail in self._logged_fallback_details:
+            return
+        self._logged_fallback_details.add(detail)
+        if self._logger is None:
+            return
+        try:
+            self._logger.warning(
+                "ocr_reader capture backend {} unavailable/failed; falling back to {} ({})",
+                selected_kind,
+                actual_kind,
+                detail,
+            )
+        except Exception:
+            pass
 
 
 class TesseractOcrBackend:
@@ -1826,6 +2053,15 @@ class TesseractOcrBackend:
             if score > best_score:
                 best_text = text
                 best_score = score
+            score_value, cjk_or_kana_count, significant_chars = score
+            if (
+                significant_chars >= 8
+                and (
+                    (cjk_or_kana_count >= 2 and score_value >= 14.0)
+                    or score_value >= 20.0
+                )
+            ):
+                break
         return best_text
 
 
@@ -1846,6 +2082,8 @@ class RapidOcrBackend:
         self._ocr_version = ocr_version
         self._runtime = None
         self._runtime_lock = threading.Lock()
+        self._runtime_cache_key: tuple[str, str, str, str, str] | None = None
+        self._runtime_last_used_at = 0.0
         self._warmup_started = False
         self._warmup_completed = False
         self._warmup_error = ""
@@ -1861,30 +2099,42 @@ class RapidOcrBackend:
         return bool(inspection.get("installed"))
 
     def _ensure_runtime(self) -> Any:
-        if self._runtime is None:
-            with self._runtime_lock:
-                if self._runtime is None:
-                    key = (
-                        str(self._install_target_dir_raw or ""),
-                        str(self._engine_type or ""),
-                        str(self._lang_type or ""),
-                        str(self._model_type or ""),
-                        str(self._ocr_version or ""),
+        now = time.monotonic()
+        key = _rapidocr_runtime_cache_key(
+            install_target_dir_raw=self._install_target_dir_raw,
+            engine_type=self._engine_type,
+            lang_type=self._lang_type,
+            model_type=self._model_type,
+            ocr_version=self._ocr_version,
+        )
+        with self._runtime_lock:
+            if (
+                self._runtime is not None
+                and self._runtime_cache_key == key
+                and now - float(self._runtime_last_used_at or 0.0) < _RAPIDOCR_RUNTIME_IDLE_TTL_SECONDS
+            ):
+                self._runtime_last_used_at = now
+                with _RAPIDOCR_RUNTIME_CACHE_LOCK:
+                    _store_rapidocr_runtime_cache(key, self._runtime, now=now)
+                return self._runtime
+
+            self._runtime = None
+            self._runtime_cache_key = key
+            with _RAPIDOCR_RUNTIME_CACHE_LOCK:
+                runtime = _get_rapidocr_runtime_cache(key, now=now)
+                if runtime is None:
+                    runtime, _metadata = load_rapidocr_runtime(
+                        install_target_dir_raw=self._install_target_dir_raw,
+                        engine_type=self._engine_type,
+                        lang_type=self._lang_type,
+                        model_type=self._model_type,
+                        ocr_version=self._ocr_version,
+                        force_reload=False,
                     )
-                    with _RAPIDOCR_RUNTIME_CACHE_LOCK:
-                        runtime = _RAPIDOCR_RUNTIME_CACHE.get(key)
-                        if runtime is None:
-                            runtime, _metadata = load_rapidocr_runtime(
-                                install_target_dir_raw=self._install_target_dir_raw,
-                                engine_type=self._engine_type,
-                                lang_type=self._lang_type,
-                                model_type=self._model_type,
-                                ocr_version=self._ocr_version,
-                                force_reload=False,
-                            )
-                            _RAPIDOCR_RUNTIME_CACHE[key] = runtime
-                        self._runtime = runtime
-        return self._runtime
+                    _store_rapidocr_runtime_cache(key, runtime, now=now)
+            self._runtime = runtime
+            self._runtime_last_used_at = now
+            return runtime
 
     def warmup_async(self, logger: Any | None = None) -> None:
         if self._warmup_started or self._warmup_completed:
@@ -1897,13 +2147,14 @@ class RapidOcrBackend:
                 from PIL import Image
 
                 runtime = self._ensure_runtime()
-                runtime(np.asarray(Image.new("RGB", (96, 32), "white")))
+                with _RAPIDOCR_INFERENCE_LOCK:
+                    runtime(np.asarray(Image.new("RGB", (640, 360), "white")))
                 self._warmup_completed = True
             except Exception as exc:
                 self._warmup_error = str(exc)
                 if logger is not None:
                     try:
-                        logger.debug("ocr_reader RapidOCR warmup skipped/failed: %s", exc)
+                        logger.debug("ocr_reader RapidOCR warmup skipped/failed: {}", exc)
                     except Exception:
                         pass
 
@@ -1914,7 +2165,8 @@ class RapidOcrBackend:
 
         runtime = self._ensure_runtime()
         prepared = _prepare_ocr_image(image, apply_filters=False).convert("RGB")
-        output = runtime(np.asarray(prepared))
+        with _RAPIDOCR_INFERENCE_LOCK:
+            output = runtime(np.asarray(prepared))
         return _rapidocr_text_from_output(output)
 
     def extract_text_with_boxes(self, image: Any) -> tuple[str, list[OcrTextBox]]:
@@ -1922,7 +2174,8 @@ class RapidOcrBackend:
 
         runtime = self._ensure_runtime()
         prepared = _prepare_ocr_image(image, apply_filters=False).convert("RGB")
-        output = runtime(np.asarray(prepared))
+        with _RAPIDOCR_INFERENCE_LOCK:
+            output = runtime(np.asarray(prepared))
         lines = _rapidocr_lines_from_output(output)
         if not lines:
             return "", []
@@ -1948,15 +2201,16 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
     except ImportError:
         return []
 
-    results: list[DetectedGameWindow] = []
+    window_records: list[dict[str, Any]] = []
     foreground_hwnd = _foreground_window_handle()
 
     def callback(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
             return
-        if win32gui.IsIconic(hwnd):
-            return
-        rect = win32gui.GetWindowRect(hwnd)
+        is_minimized = bool(win32gui.IsIconic(hwnd))
+        rect = _run_with_thread_dpi_awareness(
+            lambda: tuple(int(value) for value in win32gui.GetWindowRect(hwnd))
+        )
         width = rect[2] - rect[0]
         height = rect[3] - rect[1]
         title = win32gui.GetWindowText(hwnd)
@@ -1964,33 +2218,52 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
             return
         class_name = win32gui.GetClassName(hwnd)
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        process_name = ""
-        exe_path = ""
-        if psutil is not None:
+        area = width * height
+        window_records.append(
+            {
+                "hwnd": hwnd,
+                "title": title,
+                "pid": int(pid),
+                "class_name": class_name,
+                "width": max(0, width),
+                "height": max(0, height),
+                "area": max(0, area),
+                "is_minimized": is_minimized,
+            }
+        )
+
+    win32gui.EnumWindows(callback, None)
+
+    process_metadata: dict[int, tuple[str, str]] = {}
+    if psutil is not None:
+        for pid in sorted({int(record["pid"]) for record in window_records if int(record["pid"]) > 0}):
             try:
                 proc = psutil.Process(pid)
-                process_name = proc.name()
-                exe_path = proc.exe()
+                process_metadata[pid] = (str(proc.name() or ""), str(proc.exe() or ""))
             except Exception:
-                pass
-        area = width * height
+                process_metadata[pid] = ("", "")
+
+    results: list[DetectedGameWindow] = []
+    for record in window_records:
+        pid = int(record["pid"])
+        process_name, exe_path = process_metadata.get(pid, ("", ""))
         candidate = DetectedGameWindow(
-            hwnd=hwnd,
-            title=title,
+            hwnd=int(record["hwnd"]),
+            title=str(record["title"]),
             process_name=process_name,
             pid=pid,
-            class_name=class_name,
+            class_name=str(record["class_name"]),
             exe_path=exe_path,
-            width=max(0, width),
-            height=max(0, height),
-            area=max(0, area),
-            is_foreground=hwnd == foreground_hwnd,
-            score=float(max(area, 0)),
+            width=int(record["width"]),
+            height=int(record["height"]),
+            area=int(record["area"]),
+            is_foreground=int(record["hwnd"]) == foreground_hwnd,
+            is_minimized=bool(record.get("is_minimized")),
+            score=float(record["area"]),
         )
         candidate.is_foreground = _foreground_matches_target(foreground_hwnd, candidate)[0]
         results.append(_classify_window_candidate(candidate))
 
-    win32gui.EnumWindows(callback, None)
     results.sort(key=_window_sort_key, reverse=True)
     return results
 
@@ -2082,20 +2355,54 @@ class _MouseWheelEvent:
     kind: str = "wheel"
 
 
+@dataclass(slots=True)
+class _PendingMouseInputEvent:
+    ts: float
+    delta: int
+    x: int
+    y: int
+    kind: str = "wheel"
+    foreground_hwnd: int = 0
+    point_hwnd: int = 0
+
+
 class _MouseWheelMonitor:
     _MAX_EVENTS = 96
     _MAX_EVENT_AGE_SECONDS = 15.0
 
-    def __init__(self, *, time_fn: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        *,
+        time_fn: Callable[[], float],
+        logger: Any | None = None,
+    ) -> None:
         self._time_fn = time_fn
+        self._logger = logger
+        self._post_quit_failure_logged = False
+        self._callback_failure_logged = False
+        self._unhook_failure_logged = False
         self._lock = threading.Lock()
         self._events: list[_MouseWheelEvent] = []
+        self._pending_events: deque[_PendingMouseInputEvent] = deque(
+            maxlen=self._MAX_EVENTS * 4
+        )
         self._seq = 0
         self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._hook_handle = 0
         self._callback = None
         self._stop = threading.Event()
+
+    def _debug_once(self, flag_name: str, message: str, exc: Exception) -> None:
+        if getattr(self, flag_name):
+            return
+        setattr(self, flag_name, True)
+        if self._logger is None:
+            return
+        try:
+            self._logger.debug(message, exc)
+        except Exception:
+            pass
 
     def start(self) -> bool:
         if os.name != "nt":
@@ -2121,6 +2428,7 @@ class _MouseWheelMonitor:
         return self._thread is not None and self._thread.is_alive()
 
     def last_seq(self) -> int:
+        self._drain_pending_events()
         with self._lock:
             return int(self._seq or 0)
 
@@ -2134,37 +2442,70 @@ class _MouseWheelMonitor:
                     0,
                     0,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self._debug_once(
+                    "_post_quit_failure_logged",
+                    "ocr_reader wheel monitor stop signal failed: {}",
+                    exc,
+                )
 
     def events_after(self, seq: int) -> list[_MouseWheelEvent]:
         self.ensure_running()
+        self._drain_pending_events()
         with self._lock:
             self._prune_locked()
             return [event for event in self._events if event.seq > seq]
 
-    def _record(
+    def _enqueue_pending_event(
         self,
         *,
         delta: int = 0,
         kind: str = "wheel",
+        x: int = 0,
+        y: int = 0,
+        foreground_hwnd: int = 0,
         point_hwnd: int = 0,
     ) -> None:
-        now = self._time_fn()
-        foreground_hwnd = _foreground_window_handle()
-        with self._lock:
-            self._seq += 1
-            self._events.append(
-                _MouseWheelEvent(
-                    seq=self._seq,
-                    ts=now,
-                    delta=int(delta),
-                    foreground_hwnd=max(0, int(foreground_hwnd or 0)),
-                    point_hwnd=max(0, int(point_hwnd or 0)),
-                    kind=str(kind or "wheel"),
-                )
+        self._pending_events.append(
+            _PendingMouseInputEvent(
+                ts=self._time_fn(),
+                delta=int(delta),
+                x=int(x),
+                y=int(y),
+                kind=str(kind or "wheel"),
+                foreground_hwnd=max(0, int(foreground_hwnd or 0)),
+                point_hwnd=max(0, int(point_hwnd or 0)),
             )
-            self._prune_locked(now=now)
+        )
+
+    def _drain_pending_events(self) -> None:
+        pending: list[_PendingMouseInputEvent] = []
+        while True:
+            try:
+                pending.append(self._pending_events.popleft())
+            except IndexError:
+                break
+        if not pending:
+            return
+        resolved: list[tuple[_PendingMouseInputEvent, int, int]] = []
+        for event in pending:
+            foreground_hwnd = int(event.foreground_hwnd or 0) or _foreground_window_handle()
+            point_hwnd = int(event.point_hwnd or 0) or _window_handle_from_point(event.x, event.y)
+            resolved.append((event, foreground_hwnd, point_hwnd))
+        with self._lock:
+            for event, foreground_hwnd, point_hwnd in resolved:
+                self._seq += 1
+                self._events.append(
+                    _MouseWheelEvent(
+                        seq=self._seq,
+                        ts=float(event.ts),
+                        delta=int(event.delta),
+                        foreground_hwnd=max(0, int(foreground_hwnd or 0)),
+                        point_hwnd=max(0, int(point_hwnd or 0)),
+                        kind=str(event.kind or "wheel"),
+                    )
+                )
+            self._prune_locked(now=max(event.ts for event in pending))
 
     def _prune_locked(self, *, now: float | None = None) -> None:
         now = self._time_fn() if now is None else now
@@ -2219,22 +2560,37 @@ class _MouseWheelMonitor:
                             l_param,
                             ctypes.POINTER(MSLLHOOKSTRUCT),
                         ).contents
-                        point_hwnd = _window_handle_from_point(
-                            int(payload.pt.x),
-                            int(payload.pt.y),
-                        )
                         if message == 0x020A:
                             delta = ctypes.c_short((int(payload.mouseData) >> 16) & 0xFFFF).value
                             if delta:
-                                self._record(
+                                self._enqueue_pending_event(
                                     delta=delta,
                                     kind="wheel",
-                                    point_hwnd=point_hwnd,
+                                    x=int(payload.pt.x),
+                                    y=int(payload.pt.y),
+                                    foreground_hwnd=_foreground_window_handle(),
+                                    point_hwnd=_window_handle_from_point(
+                                        int(payload.pt.x),
+                                        int(payload.pt.y),
+                                    ),
                                 )
                         else:
-                            self._record(kind="left_click", point_hwnd=point_hwnd)
-                    except Exception:
-                        pass
+                            self._enqueue_pending_event(
+                                kind="left_click",
+                                x=int(payload.pt.x),
+                                y=int(payload.pt.y),
+                                foreground_hwnd=_foreground_window_handle(),
+                                point_hwnd=_window_handle_from_point(
+                                    int(payload.pt.x),
+                                    int(payload.pt.y),
+                                ),
+                            )
+                    except Exception as exc:
+                        self._debug_once(
+                            "_callback_failure_logged",
+                            "ocr_reader wheel monitor callback failed: {}",
+                            exc,
+                        )
                 return user32.CallNextHookEx(
                     self._hook_handle,
                     n_code,
@@ -2265,8 +2621,12 @@ class _MouseWheelMonitor:
             if self._hook_handle:
                 try:
                     ctypes.windll.user32.UnhookWindowsHookEx(self._hook_handle)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._debug_once(
+                        "_unhook_failure_logged",
+                        "ocr_reader wheel monitor unhook failed: {}",
+                        exc,
+                    )
             self._hook_handle = 0
             self._thread_id = 0
 
@@ -2275,6 +2635,12 @@ def _classify_window_candidate(candidate: DetectedGameWindow) -> DetectedGameWin
     normalized_title = candidate.normalized_title
     lowered_process_name = str(candidate.process_name or "").strip().lower()
     lowered_class_name = str(candidate.class_name or "").strip().lower()
+
+    if candidate.is_minimized:
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_minimized_window"
+        candidate.category = "excluded_minimized_window"
+        return candidate
 
     if candidate.area and candidate.area < (400 * 300):
         candidate.eligible = False
@@ -2314,6 +2680,12 @@ def _classify_window_candidate(candidate: DetectedGameWindow) -> DetectedGameWin
         candidate.category = "excluded_self_window"
         return candidate
 
+    if lowered_process_name and lowered_process_name in _AUTO_TARGET_DENY_PROCESS_NAMES:
+        candidate.eligible = False
+        candidate.exclude_reason = "excluded_non_game_process"
+        candidate.category = "excluded_non_game_process"
+        return candidate
+
     candidate.eligible = True
     candidate.exclude_reason = ""
     candidate.category = "eligible_game_window"
@@ -2332,6 +2704,20 @@ def _is_confident_auto_window(candidate: DetectedGameWindow) -> bool:
     return bool(candidate.hwnd and candidate.eligible)
 
 
+def _is_legacy_geometryless_auto_window(candidate: DetectedGameWindow) -> bool:
+    if not candidate.hwnd or not candidate.eligible:
+        return False
+    if candidate.width or candidate.height or candidate.area:
+        return False
+    process_name = str(candidate.process_name or "").strip().lower()
+    class_name = str(candidate.class_name or "").strip().lower()
+    if process_name in _AUTO_TARGET_DENY_PROCESS_NAMES:
+        return False
+    if class_name.startswith("chrome_widgetwin"):
+        return False
+    return True
+
+
 def _window_sort_key(candidate: DetectedGameWindow) -> tuple[int, int, float, str]:
     return (
         1 if candidate.eligible else 0,
@@ -2348,10 +2734,12 @@ class OcrReaderBridgeWriter:
         bridge_root: Path,
         version: str = OCR_READER_BRIDGE_VERSION,
         time_fn: Callable[[], float] | None = None,
+        logger: Any | None = None,
     ) -> None:
         self._bridge_root = bridge_root
         self._version = version
         self._time_fn = time_fn or time.time
+        self._logger = logger
         self._game_id = ""
         self._session_id = ""
         self._process_name = ""
@@ -2361,6 +2749,7 @@ class OcrReaderBridgeWriter:
         self._started_at = ""
         self._last_seq = 0
         self._last_event_ts = ""
+        self._keep_unknown_scene_until_visual_scene = False
         self._state = self._initial_state("")
         self._text_to_line_id: dict[str, str] = {}
         self._line_id_owner: dict[str, str] = {}
@@ -2401,6 +2790,7 @@ class OcrReaderBridgeWriter:
         self._last_seq = 0
         self._last_event_ts = started_at
         self._scene_index = 1
+        self._keep_unknown_scene_until_visual_scene = False
         self._state = {}
         self._state = self._initial_state(started_at)
         self._text_to_line_id.clear()
@@ -2427,6 +2817,31 @@ class OcrReaderBridgeWriter:
             },
             ts=started_at,
         )
+
+    def keep_unknown_scene_until_visual_scene(self) -> None:
+        self._keep_unknown_scene_until_visual_scene = True
+        if self._state:
+            self._state["scene_id"] = OCR_READER_UNKNOWN_SCENE
+            self._write_session_snapshot()
+
+    def discard_session(self) -> None:
+        game_id = self._game_id
+        if game_id:
+            shutil.rmtree(self._bridge_root / game_id, ignore_errors=True)
+        self._game_id = ""
+        self._session_id = ""
+        self._process_name = ""
+        self._pid = 0
+        self._window_title = ""
+        self._engine = OCR_READER_DEFAULT_ENGINE
+        self._started_at = ""
+        self._last_seq = 0
+        self._last_event_ts = ""
+        self._scene_index = 1
+        self._keep_unknown_scene_until_visual_scene = False
+        self._state = self._initial_state("")
+        self._text_to_line_id.clear()
+        self._line_id_owner.clear()
 
     def emit_line(self, raw_text: str, *, ts: str) -> bool:
         cleaned = raw_text.strip()
@@ -2612,6 +3027,7 @@ class OcrReaderBridgeWriter:
             return False
         if str(self._state.get("scene_id") or "") == scene_id:
             return False
+        self._keep_unknown_scene_until_visual_scene = False
         self._state = {
             **self._state,
             "scene_id": scene_id,
@@ -2687,6 +3103,8 @@ class OcrReaderBridgeWriter:
         current = str(state.get("scene_id") or "").strip()
         if current and current != OCR_READER_UNKNOWN_SCENE:
             return current
+        if self._keep_unknown_scene_until_visual_scene:
+            return OCR_READER_UNKNOWN_SCENE
         return f"ocr:{self._game_id or 'unknown'}:scene-{int(getattr(self, '_scene_index', 1) or 1):04d}"
 
     def _bridge_dir(self) -> Path:
@@ -2730,18 +3148,29 @@ class OcrReaderBridgeWriter:
         }
 
     def _write_session_snapshot(self) -> None:
-        self._bridge_dir().mkdir(parents=True, exist_ok=True)
         tmp_path = self._session_path().with_suffix(".json.tmp")
-        payload = json.dumps(
-            self._session_snapshot(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        with tmp_path.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, self._session_path())
+        try:
+            self._bridge_dir().mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                self._session_snapshot(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            with tmp_path.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self._session_path())
+        except Exception as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if self._logger is not None:
+                try:
+                    self._logger.warning("ocr_reader session snapshot write failed: {}", exc)
+                except Exception:
+                    pass
 
     def _append_event(
         self,
@@ -2775,7 +3204,6 @@ class OcrReaderBridgeWriter:
         if update_snapshot:
             self._write_session_snapshot()
             return
-        self._write_session_snapshot()
 
     def _line_id_for_text(self, text: str) -> str:
         normalized = normalize_text(text)
@@ -2844,6 +3272,7 @@ class OcrReaderManager:
         self._writer = writer or OcrReaderBridgeWriter(
             bridge_root=config.bridge_root,
             time_fn=self._time_fn,
+            logger=logger,
         )
         self._runtime = OcrReaderRuntime(enabled=config.ocr_reader_enabled)
         self._capture_profiles: dict[str, ParsedOcrCaptureProcessConfig] = {}
@@ -2883,9 +3312,19 @@ class OcrReaderManager:
         self._pending_background_change_count = 0
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
-        self._wheel_monitor = _MouseWheelMonitor(time_fn=self._time_fn)
-        self._wheel_monitor.start()
+        self._wheel_monitor = _MouseWheelMonitor(
+            time_fn=self._time_fn,
+            logger=self._logger,
+        )
         self._last_consumed_wheel_seq = 0
+        self._foreground_advance_stable_until = 0.0
+        if (
+            self._config.ocr_reader_enabled
+            and self._platform_fn()
+            and not self._custom_capture_backend
+            and not self._custom_ocr_backend
+        ):
+            self.start_foreground_advance_monitor()
         self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
         self._capture_backend_detail = ""
         self._rapidocr_backend_cache_key: tuple[str, str, str, str, str] | None = None
@@ -2893,7 +3332,23 @@ class OcrReaderManager:
         self._backend_plan_cache_key: tuple[str, ...] | None = None
         self._backend_plan_cache_at = 0.0
         self._backend_plan_cache: SelectedOcrBackendPlan | None = None
+        self._capture_worker_lock = threading.Lock()
+        self._capture_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="galgame-ocr-capture",
+        )
+        self._capture_future: Future[OcrExtractionResult] | None = None
+        self._capture_future_started_at = 0.0
+        self._capture_future_timed_out = False
+        self._window_inventory_cache_at = 0.0
+        self._window_inventory_cache: list[DetectedGameWindow] = []
         self._start_rapidocr_warmup_if_configured()
+
+    def start_foreground_advance_monitor(self) -> bool:
+        started = bool(self._wheel_monitor.start())
+        self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
+        self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
+        return started
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -2917,12 +3372,12 @@ class OcrReaderManager:
         self._start_rapidocr_warmup_if_configured()
 
     def _rapidocr_cache_key(self) -> tuple[str, str, str, str, str]:
-        return (
-            str(self._config.rapidocr_install_target_dir or ""),
-            str(self._config.rapidocr_engine_type or ""),
-            str(self._config.rapidocr_lang_type or ""),
-            str(self._config.rapidocr_model_type or ""),
-            str(self._config.rapidocr_ocr_version or ""),
+        return _rapidocr_runtime_cache_key(
+            install_target_dir_raw=self._config.rapidocr_install_target_dir,
+            engine_type=self._config.rapidocr_engine_type,
+            lang_type=self._config.rapidocr_lang_type,
+            model_type=self._config.rapidocr_model_type,
+            ocr_version=self._config.rapidocr_ocr_version,
         )
 
     def _rapidocr_backend_for_config(self) -> RapidOcrBackend:
@@ -2965,15 +3420,7 @@ class OcrReaderManager:
         return 2
 
     def _should_emit_observed_lines_for_capture(self, *, after_advance_trigger_mode: bool) -> bool:
-        if not after_advance_trigger_mode:
-            return True
-        state = getattr(self._writer, "_state", {})
-        if not isinstance(state, dict):
-            return True
-        has_current_text = bool(str(state.get("text") or "").strip())
-        choices = state.get("choices", [])
-        has_current_choices = isinstance(choices, list) and bool(choices)
-        return not has_current_text and not has_current_choices
+        return True
 
     def _mark_observed_progress(self, *, now: float) -> None:
         self._consecutive_no_text_polls = 0
@@ -3018,10 +3465,10 @@ class OcrReaderManager:
         if frame is None:
             return ""
         try:
-            if hasattr(frame, "tobytes") and hasattr(frame, "size"):
-                size = getattr(frame, "size", "")
-                payload = frame.tobytes()
-                return hashlib.sha1(repr(size).encode("utf-8") + payload).hexdigest()[:16]
+            if hasattr(frame, "resize") and hasattr(frame, "tobytes"):
+                source = frame.convert("RGB") if hasattr(frame, "convert") else frame
+                small = source.resize((64, 64))
+                return hashlib.sha1(small.tobytes()).hexdigest()[:16]
         except Exception:
             return ""
         try:
@@ -3082,8 +3529,9 @@ class OcrReaderManager:
         self._last_background_hash = background_hash
         self._pending_background_hash = ""
         self._pending_background_change_count = 0
-        self._default_ocr_state.reset()
-        self._aihong_menu_ocr_state.reset()
+        self._reset_default_ocr_state()
+        self._last_background_hash = background_hash
+        self._reset_aihong_menu_state()
         if defer_scene_emit:
             self._pending_visual_scene_hash = background_hash
             self._pending_visual_scene_at = now
@@ -3215,11 +3663,47 @@ class OcrReaderManager:
         self._runtime.target_hwnd = max(0, int(target_hwnd or 0))
         return self._runtime.to_dict()
 
+    @staticmethod
+    def _is_supported_foreground_advance_event(event: _MouseWheelEvent) -> bool:
+        kind = str(getattr(event, "kind", "") or "")
+        if kind == "wheel" and int(getattr(event, "delta", 0) or 0) >= 0:
+            return False
+        return kind in {"wheel", "left_click"}
+
+    def _target_from_foreground_advance_events(
+        self,
+        events: list[_MouseWheelEvent],
+    ) -> tuple[DetectedGameWindow | None, str]:
+        if not any(self._is_supported_foreground_advance_event(event) for event in events):
+            return None, "no_supported_event"
+        eligible_windows, _excluded_windows = self._scan_window_inventory()
+        if not eligible_windows:
+            return None, "no_eligible_window"
+        for event in events:
+            if not self._is_supported_foreground_advance_event(event):
+                continue
+            for source, hwnd in (
+                ("foreground", int(getattr(event, "foreground_hwnd", 0) or 0)),
+                ("point", int(getattr(event, "point_hwnd", 0) or 0)),
+            ):
+                if not hwnd:
+                    continue
+                for candidate in eligible_windows:
+                    matched, reason = _foreground_matches_target(hwnd, candidate)
+                    if matched:
+                        return candidate, f"event_{source}_{reason}"
+        return None, "event_background"
+
     def consume_foreground_advance_input(self) -> bool:
         self._wheel_monitor.ensure_running()
         self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
         self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
         self._runtime.foreground_advance_consumed_seq = self._last_consumed_wheel_seq
+        events = self._wheel_monitor.events_after(self._last_consumed_wheel_seq)
+        self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
+        self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
+        if not events:
+            return False
         target, _detail = self._foreground_refresh_target()
         if target is None:
             target = self._attached_window
@@ -3242,11 +3726,8 @@ class OcrReaderManager:
                 height=int(self._runtime.height or 0),
             )
         if target is None:
-            return False
-        events = self._wheel_monitor.events_after(self._last_consumed_wheel_seq)
-        self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
-        self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
-        if not events:
+            target, _detail = self._target_from_foreground_advance_events(events)
+        if target is None:
             return False
         triggered = False
         max_seq = self._last_consumed_wheel_seq
@@ -3259,10 +3740,12 @@ class OcrReaderManager:
             last_kind = str(event.kind or "")
             last_delta = int(event.delta or 0)
             if event.kind == "wheel" and event.delta >= 0:
-                last_match_reason = "ignored_wheel_up"
+                if not last_matched:
+                    last_match_reason = "ignored_wheel_up"
                 continue
             if event.kind not in {"wheel", "left_click"}:
-                last_match_reason = "ignored_event_kind"
+                if not last_matched:
+                    last_match_reason = "ignored_event_kind"
                 continue
             is_target_foreground, foreground_reason = _foreground_matches_target(
                 event.foreground_hwnd,
@@ -3281,13 +3764,20 @@ class OcrReaderManager:
                     else f"point_{point_reason}"
                 )
             else:
-                last_match_reason = f"background:{foreground_reason}/{point_reason}"
+                if not last_matched:
+                    last_match_reason = f"background:{foreground_reason}/{point_reason}"
         self._last_consumed_wheel_seq = max_seq
         self._runtime.foreground_advance_consumed_seq = self._last_consumed_wheel_seq
         self._runtime.foreground_advance_last_kind = last_kind
         self._runtime.foreground_advance_last_delta = last_delta
         self._runtime.foreground_advance_last_matched = last_matched
         self._runtime.foreground_advance_last_match_reason = last_match_reason
+        if triggered:
+            self._remember_locked_target(target)
+            self._foreground_advance_stable_until = max(
+                float(self._foreground_advance_stable_until or 0.0),
+                self._time_fn() + _FOREGROUND_ADVANCE_STABLE_GRACE_SECONDS,
+            )
         return triggered
 
     def consume_foreground_wheel_down(self) -> bool:
@@ -3354,8 +3844,13 @@ class OcrReaderManager:
             selected_at=utc_now_iso(self._time_fn()),
         )
 
-    def list_windows_snapshot(self, *, include_excluded: bool = False) -> dict[str, Any]:
-        eligible_windows, excluded_windows = self._scan_window_inventory()
+    def list_windows_snapshot(
+        self,
+        *,
+        include_excluded: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        eligible_windows, excluded_windows = self._scan_window_inventory(force=force)
         payload = {
             "target_selection_mode": self._manual_target.mode,
             "manual_target": self._manual_target.to_dict(),
@@ -3387,7 +3882,7 @@ class OcrReaderManager:
         normalized_key = str(window_key or "").strip()
         if not normalized_key:
             raise ValueError("window_key is required")
-        eligible_windows, excluded_windows = self._scan_window_inventory()
+        eligible_windows, excluded_windows = self._scan_window_inventory(force=True)
         for candidate in eligible_windows:
             if candidate.window_key == normalized_key:
                 return OcrWindowTarget(
@@ -3543,6 +4038,17 @@ class OcrReaderManager:
             bottom_inset_ratio=0.0,
         )
         full_image = self._capture_backend.capture_frame(target, full_window_profile)
+        # Verify the screen is static by capturing a second frame and comparing hashes
+        time.sleep(0.15)
+        verify_image = self._capture_backend.capture_frame(target, full_window_profile)
+        hash_a = hashlib.blake2b(
+            full_image.resize((64, 64)).tobytes() if hasattr(full_image, "resize") else b"", digest_size=16
+        ).hexdigest() if full_image is not None else ""
+        hash_b = hashlib.blake2b(
+            verify_image.resize((64, 64)).tobytes() if hasattr(verify_image, "resize") else b"", digest_size=16
+        ).hexdigest() if verify_image is not None else ""
+        if hash_a != hash_b:
+            raise ValueError("画面未静止，自动重校准中止（请在稳定画面重试）")
         image_size = getattr(full_image, "size", None)
         if (
             not isinstance(image_size, tuple)
@@ -3832,10 +4338,16 @@ class OcrReaderManager:
         self._pending_visual_scene_at = 0.0
 
     def _reset_aihong_menu_state(self) -> None:
+        was_menu_state = (
+            self._aihong_stage == _AIHONG_MENU_STAGE
+            or bool(str(self._aihong_menu_ocr_state.last_raw_text or "").strip())
+        )
         self._aihong_menu_ocr_state.reset()
         self._aihong_stage = _AIHONG_DIALOGUE_STAGE
         self._aihong_dialogue_idle_polls = 0
         self._aihong_menu_missing_polls = 0
+        if was_menu_state:
+            self._consecutive_no_text_polls = 0
 
     def _has_manual_capture_profile(self, target: DetectedGameWindow) -> bool:
         return _uses_manual_capture_profile(self._capture_profiles, target)
@@ -3850,19 +4362,34 @@ class OcrReaderManager:
         state: _StableOcrTextState,
         repeat_threshold: int = 2,
     ) -> bool:
-        cleaned = normalize_text(text)
+        cleaned = normalize_text(text).strip()
+        text_key = _ocr_stability_key(cleaned)
         if not cleaned:
+            state.last_block_reason = "empty_text"
             return False
-        if cleaned == state.last_raw_text:
+        if not text_key:
+            state.last_block_reason = "empty_stability_key"
+            return False
+        last_key = state.last_text_key or _ocr_stability_key(state.last_raw_text)
+        if _ocr_stability_keys_match(text_key, last_key):
             state.repeat_count += 1
+            state.last_raw_text = _prefer_ocr_stability_text(state.last_raw_text, cleaned)
+            state.last_text_key = text_key if len(text_key) >= len(last_key) else last_key
         else:
             state.repeat_count = 1
             state.last_raw_text = cleaned
+            state.last_text_key = text_key
         if state.repeat_count < max(1, int(repeat_threshold)):
+            state.last_block_reason = "waiting_for_repeat"
             return False
-        if cleaned == state.stable_text:
+        stable_key = state.stable_text_key or _ocr_stability_key(state.stable_text)
+        if _ocr_stability_keys_match(state.last_text_key, stable_key):
+            state.repeat_count = 0
+            state.last_block_reason = "duplicate_stable_text"
             return False
-        state.stable_text = cleaned
+        state.stable_text = state.last_raw_text
+        state.stable_text_key = state.last_text_key
+        state.last_block_reason = ""
         return True
 
     def _emit_line_from_ocr_text(
@@ -3876,27 +4403,38 @@ class OcrReaderManager:
     ) -> bool:
         cleaned_text = _clean_ocr_dialogue_text(raw_text)
         if (
-            _looks_like_noise_ocr_text(cleaned_text)
-            or _looks_like_game_overlay_text(cleaned_text)
-            or not _looks_like_ocr_dialogue_text(cleaned_text)
+            _looks_like_noise_normalized_text(cleaned_text)
+            or _looks_like_game_overlay_normalized_text(cleaned_text)
+            or not _looks_like_ocr_dialogue_normalized_text(cleaned_text)
         ):
             return False
-        self._commit_pending_visual_scene(now=now)
         self._last_raw_ocr_text = str(raw_text or "")
         if emit_observed and self._writer.emit_line_observed(cleaned_text, ts=utc_now_iso(now)):
             self._last_observed_line = self._line_payload_from_writer(stability="tentative")
         tracker = state or self._default_ocr_state
+        effective_repeat_threshold = (
+            self._line_changed_repeat_threshold()
+            if repeat_threshold is None
+            else repeat_threshold
+        )
+        if tracker.stable_text and int(effective_repeat_threshold or 1) > 1:
+            cleaned_key = _ocr_stability_key(cleaned_text)
+            stable_key = tracker.stable_text_key or _ocr_stability_key(tracker.stable_text)
+            if (
+                cleaned_key
+                and stable_key
+                and not _ocr_stability_keys_match(cleaned_key, stable_key)
+            ):
+                effective_repeat_threshold = 1
         if not self._stabilize_text_key(
             cleaned_text,
             state=tracker,
-            repeat_threshold=(
-                self._line_changed_repeat_threshold()
-                if repeat_threshold is None
-                else repeat_threshold
-            ),
+            repeat_threshold=effective_repeat_threshold,
         ):
             return False
-        emitted = self._writer.emit_line(cleaned_text, ts=utc_now_iso(now))
+        self._commit_pending_visual_scene(now=now)
+        emitted_text = tracker.stable_text or cleaned_text
+        emitted = self._writer.emit_line(emitted_text, ts=utc_now_iso(now))
         if emitted:
             stable_line = self._line_payload_from_writer(stability="stable")
             self._last_stable_line = stable_line
@@ -3909,6 +4447,7 @@ class OcrReaderManager:
         *,
         now: float,
         state: _StableOcrTextState | None = None,
+        repeat_threshold: int = 2,
         choice_bounds: list[dict[str, float] | None] | None = None,
         choice_bounds_metadata: dict[str, Any] | None = None,
     ) -> bool:
@@ -3916,7 +4455,7 @@ class OcrReaderManager:
         if not self._stabilize_text_key(
             _canonical_choice_candidate_text(choices),
             state=tracker,
-            repeat_threshold=2,
+            repeat_threshold=max(1, int(repeat_threshold or 1)),
         ):
             return False
         self._commit_pending_visual_scene(now=now)
@@ -3933,26 +4472,138 @@ class OcrReaderManager:
         *,
         state: _StableOcrTextState,
     ) -> bool:
-        cleaned = normalize_text(raw_text).strip()
+        cleaned = normalize_text(_clean_ocr_dialogue_text(raw_text)).strip()
         if not cleaned:
             return False
+        cleaned_key = _ocr_stability_key(cleaned)
+        last_key = state.last_text_key or _ocr_stability_key(state.last_raw_text)
+        stable_key = state.stable_text_key or _ocr_stability_key(state.stable_text)
         return (
             bool(state.stable_text)
             and
-            state.repeat_count == 1
-            and state.last_raw_text == cleaned
-            and state.stable_text != cleaned
+            state.repeat_count >= 1
+            and _ocr_stability_keys_match(cleaned_key, last_key)
+            and not _ocr_stability_keys_match(cleaned_key, stable_key)
         )
+
+    def _shutdown_capture_worker(self) -> None:
+        executor: ThreadPoolExecutor | None = None
+        with self._capture_worker_lock:
+            future = self._capture_future
+            if future is not None and not future.done():
+                future.cancel()
+            executor = self._capture_executor
+            self._capture_executor = None
+            self._capture_future = None
+            self._capture_future_started_at = 0.0
+            self._capture_future_timed_out = False
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _clear_completed_capture_worker(self) -> None:
+        future: Future[OcrExtractionResult] | None = None
+        timed_out = False
+        with self._capture_worker_lock:
+            current = self._capture_future
+            if current is None or not current.done():
+                return
+            future = current
+            timed_out = bool(self._capture_future_timed_out)
+            self._capture_future = None
+            self._capture_future_started_at = 0.0
+            self._capture_future_timed_out = False
+        if timed_out and future is not None:
+            try:
+                future.result()
+            except Exception as exc:
+                self._logger.debug("ocr_reader previous timed-out capture eventually failed: {}", exc)
+
+    def _submit_capture_worker(
+        self,
+        target: DetectedGameWindow,
+        profile: OcrCaptureProfile,
+        backend_plan: SelectedOcrBackendPlan,
+        collect_background_hash: bool,
+        allow_separate_background_capture: bool,
+    ) -> Future[OcrExtractionResult]:
+        with self._capture_worker_lock:
+            current = self._capture_future
+            if current is not None and not current.done():
+                elapsed = max(0.0, time.monotonic() - float(self._capture_future_started_at or 0.0))
+                prefix = (
+                    "previous ocr_reader capture/OCR timed out and is still running"
+                    if self._capture_future_timed_out
+                    else "previous ocr_reader capture/OCR is still running"
+                )
+                raise TimeoutError(
+                    f"{prefix} after {elapsed:.1f}s; "
+                    "skipping new capture to avoid overlapping OCR work"
+                )
+            executor = self._capture_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="galgame-ocr-capture")
+                self._capture_executor = executor
+            future = executor.submit(
+                self._capture_and_extract_text,
+                target,
+                profile,
+                backend_plan,
+                collect_background_hash,
+                allow_separate_background_capture,
+            )
+            self._capture_executor = executor
+            self._capture_future = future
+            self._capture_future_started_at = time.monotonic()
+            self._capture_future_timed_out = False
+            return future
+
+    async def _capture_and_extract_text_with_timeout(
+        self,
+        target: DetectedGameWindow,
+        profile: OcrCaptureProfile,
+        backend_plan: SelectedOcrBackendPlan,
+        collect_background_hash: bool = True,
+        allow_separate_background_capture: bool = True,
+    ) -> OcrExtractionResult:
+        timeout_seconds = float(_OCR_CAPTURE_TIMEOUT_SECONDS)
+        if timeout_seconds <= 0.0:
+            timeout_seconds = 12.0
+        self._clear_completed_capture_worker()
+        future = self._submit_capture_worker(
+            target,
+            profile,
+            backend_plan,
+            collect_background_hash,
+            allow_separate_background_capture,
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            with self._capture_worker_lock:
+                if self._capture_future is future:
+                    self._capture_future_timed_out = True
+            raise TimeoutError(
+                f"ocr_reader capture/OCR timed out after {timeout_seconds:.1f}s"
+            ) from exc
+        finally:
+            if future.done():
+                self._clear_completed_capture_worker()
 
     async def _capture_followup_text(
         self,
         target: DetectedGameWindow,
         profile: OcrCaptureProfile,
         backend_plan: SelectedOcrBackendPlan,
+        *,
+        elapsed_since_capture: float = 0.0,
     ) -> OcrExtractionResult:
-        await asyncio.sleep(_OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS)
-        return await asyncio.to_thread(
-            self._capture_and_extract_text,
+        remaining = _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS - elapsed_since_capture
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        return await self._capture_and_extract_text_with_timeout(
             target,
             profile,
             backend_plan,
@@ -3965,6 +4616,7 @@ class OcrReaderManager:
         now: float,
         boxes: list[OcrTextBox] | None = None,
         choice_bounds_metadata: dict[str, Any] | None = None,
+        choice_repeat_threshold: int = 2,
     ) -> _MenuConsumeResult:
         lines = _stripped_ocr_lines(raw_text)
         choices = _coerce_aihong_menu_choices(lines)
@@ -3975,6 +4627,7 @@ class OcrReaderManager:
                     choices,
                     now=now,
                     state=self._aihong_menu_ocr_state,
+                    repeat_threshold=choice_repeat_threshold,
                     choice_bounds=_aihong_choice_boxes(choices, list(boxes or [])),
                     choice_bounds_metadata=choice_bounds_metadata,
                 )
@@ -4011,6 +4664,7 @@ class OcrReaderManager:
             candidate.pid = max(0, int(candidate.pid or 0))
             candidate.hwnd = max(0, int(candidate.hwnd or 0))
             candidate.area = max(0, int(candidate.area or 0))
+            candidate.is_minimized = bool(candidate.is_minimized)
             foreground_match, _ = _foreground_matches_target(foreground_hwnd, candidate)
             candidate.is_foreground = foreground_match
             candidate.score = float(max(candidate.area, 1))
@@ -4024,17 +4678,35 @@ class OcrReaderManager:
         self._last_excluded_windows = list(excluded_windows)
         return eligible_windows, excluded_windows
 
-    def _scan_window_inventory(self) -> tuple[list[DetectedGameWindow], list[DetectedGameWindow]]:
+    def _scan_raw_windows_cached(self, *, force: bool = False) -> list[DetectedGameWindow]:
+        now = self._time_fn()
+        if (
+            not force
+            and self._window_inventory_cache_at > 0.0
+            and now - float(self._window_inventory_cache_at or 0.0) < _WINDOW_SCAN_CACHE_TTL_SECONDS
+        ):
+            return list(self._window_inventory_cache)
+        scanned = list(self._window_scanner() or [])
+        self._window_inventory_cache = list(scanned)
+        self._window_inventory_cache_at = now
+        return scanned
+
+    def _scan_window_inventory(
+        self,
+        *,
+        force: bool = False,
+    ) -> tuple[list[DetectedGameWindow], list[DetectedGameWindow]]:
         if not self._platform_fn():
             self._last_detected_windows = []
             self._last_eligible_windows = []
             self._last_excluded_windows = []
             return [], []
-        scanned = list(self._window_scanner() or [])
+        scanned = self._scan_raw_windows_cached(force=force)
         return self._prepare_window_inventory(scanned)
 
     async def shutdown(self) -> None:
         self._wheel_monitor.stop()
+        self._shutdown_capture_worker()
         if self._writer.session_id:
             self._writer.end_session(ts=utc_now_iso(self._time_fn()))
         self._attached_window = None
@@ -4128,8 +4800,23 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
+        foreground_hwnd_for_scan = _foreground_window_handle()
+        force_window_scan = (
+            self._last_selection.selection_detail == "locked_target_unavailable"
+            or (
+                self._attached_window is not None
+                and foreground_hwnd_for_scan > 0
+                and not _foreground_matches_target(
+                    foreground_hwnd_for_scan,
+                    self._attached_window,
+                )[0]
+            )
+        )
         window_scan_started_at = self._time_fn()
-        scanned_windows = await asyncio.to_thread(self._window_scanner)
+        scanned_windows = await asyncio.to_thread(
+            self._scan_raw_windows_cached,
+            force=force_window_scan,
+        )
         window_scan_duration = max(0.0, self._time_fn() - window_scan_started_at)
         eligible_windows, excluded_windows = self._prepare_window_inventory(scanned_windows)
         selection = self._select_target_window(
@@ -4150,6 +4837,13 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return result
 
+        legacy_geometryless_auto_target = (
+            selection.selection_detail == "single_geometryless_candidate"
+            or (
+                _is_legacy_geometryless_auto_window(target)
+                and not bool(target.is_foreground)
+            )
+        )
         aihong_two_stage_enabled = self._should_use_aihong_two_stage(target)
         if not aihong_two_stage_enabled:
             self._reset_aihong_menu_state()
@@ -4160,12 +4854,18 @@ class OcrReaderManager:
         )
         profile = capture_profile_selection.profile
 
-        if self._attached_window is None or self._attached_window.pid != target.pid:
+        if (
+            self._attached_window is None
+            or self._attached_window.pid != target.pid
+            or not self._writer.session_id
+        ):
             if (
                 not self._writer.session_id
                 or self._writer.game_id != _ocr_game_id_from_process(target.process_name or target.title)
             ):
                 self._writer.start_session(target)
+                if legacy_geometryless_auto_target:
+                    self._writer.keep_unknown_scene_until_visual_scene()
                 now = max(now, self._time_fn())
                 result.should_rescan = True
             self._attached_window = target
@@ -4213,10 +4913,35 @@ class OcrReaderManager:
             str(self._config.ocr_reader_trigger_mode or "").strip().lower()
             == OCR_TRIGGER_MODE_AFTER_ADVANCE
         )
+        foreground_advance_stable_grace_active = (
+            after_advance_trigger_mode
+            and float(self._foreground_advance_stable_until or 0.0) >= now
+        )
         emit_observed_lines = self._should_emit_observed_lines_for_capture(
             after_advance_trigger_mode=after_advance_trigger_mode
         )
-        line_repeat_threshold = 1 if after_advance_trigger_mode else None
+        line_repeat_threshold = (
+            1
+            if (
+                after_advance_trigger_mode
+                and (
+                    foreground_advance_stable_grace_active
+                    or not legacy_geometryless_auto_target
+                )
+            )
+            else None
+        )
+        choice_repeat_threshold = (
+            1
+            if (
+                after_advance_trigger_mode
+                and (
+                    foreground_advance_stable_grace_active
+                    or not legacy_geometryless_auto_target
+                )
+            )
+            else 2
+        )
         background_confirm_polls = 1 if after_advance_trigger_mode else _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS
         self._last_capture_timing = {
             "backend_plan_duration_seconds": backend_plan_duration,
@@ -4228,8 +4953,7 @@ class OcrReaderManager:
         try:
             capture_attempted = True
             self._record_capture_attempt(now=now)
-            extraction = await asyncio.to_thread(
-                self._capture_and_extract_text,
+            extraction = await self._capture_and_extract_text_with_timeout(
                 target,
                 profile,
                 backend_plan,
@@ -4260,7 +4984,12 @@ class OcrReaderManager:
                 guard_blocked = True
                 result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
                 self._default_ocr_state.reset()
-                self._aihong_menu_ocr_state.reset()
+                self._reset_aihong_menu_state()
+                if (
+                    not legacy_geometryless_auto_target
+                    and int(event_seq_before_capture or 0) <= 1
+                ):
+                    self._writer.discard_session()
             else:
                 if aihong_two_stage_enabled:
                     if self._aihong_stage == _AIHONG_MENU_STAGE:
@@ -4269,17 +4998,14 @@ class OcrReaderManager:
                             now=now,
                             boxes=extraction.boxes,
                             choice_bounds_metadata=_extraction_choice_bounds_metadata(extraction),
+                            choice_repeat_threshold=choice_repeat_threshold,
                         )
                         emitted = bool(menu_result.emitted_kind)
-                        if menu_result.emitted_kind == "line":
-                            self._aihong_stage = _AIHONG_DIALOGUE_STAGE
-                            self._aihong_dialogue_idle_polls = 0
-                            self._aihong_menu_missing_polls = 0
-                            self._aihong_menu_ocr_state.reset()
-                        elif menu_result.has_menu_candidate:
+                        if menu_result.has_menu_candidate:
                             self._aihong_menu_missing_polls = 0
                         else:
                             self._aihong_menu_missing_polls += 1
+                            self._aihong_menu_ocr_state.reset()
                             if (
                                 extraction.text
                                 and not _looks_like_noise_ocr_text(extraction.text)
@@ -4301,6 +5027,7 @@ class OcrReaderManager:
                                     dialogue_menu_choices,
                                     now=now,
                                     state=self._aihong_menu_ocr_state,
+                                    repeat_threshold=choice_repeat_threshold,
                                     choice_bounds=_aihong_choice_boxes(
                                         dialogue_menu_choices,
                                         extraction.boxes,
@@ -4310,6 +5037,8 @@ class OcrReaderManager:
                                     ),
                                 )
                             )
+                            if not dialogue_emitted:
+                                self._aihong_stage = _AIHONG_MENU_STAGE
                         elif not dialogue_text_is_menu_status:
                             dialogue_emitted = bool(
                                 self._consume_ocr_text(
@@ -4322,8 +5051,7 @@ class OcrReaderManager:
                                 )
                             )
                         if (
-                            not after_advance_trigger_mode
-                            and not dialogue_emitted
+                            not dialogue_emitted
                             and not dialogue_text_is_menu_status
                             and not dialogue_menu_choices
                             and self._should_attempt_followup_confirm(
@@ -4335,6 +5063,7 @@ class OcrReaderManager:
                                 target,
                                 profile,
                                 backend_plan,
+                                elapsed_since_capture=extraction.timing.get("total_duration_seconds", 0.0),
                             )
                             self._last_capture_timing.update(followup_extraction.timing)
                             self._record_capture_completed(
@@ -4357,7 +5086,7 @@ class OcrReaderManager:
                             if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
                                 guard_blocked = True
                                 self._default_ocr_state.reset()
-                                self._aihong_menu_ocr_state.reset()
+                                self._reset_aihong_menu_state()
                                 result.warnings.append(
                                     "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                 )
@@ -4383,6 +5112,10 @@ class OcrReaderManager:
                                 self._aihong_stage = _AIHONG_MENU_STAGE
                             else:
                                 self._aihong_menu_ocr_state.reset()
+                        elif int(self._writer.last_seq or 0) > event_seq_before_capture:
+                            self._aihong_dialogue_idle_polls = 0
+                            self._aihong_menu_missing_polls = 0
+                            self._aihong_menu_ocr_state.reset()
                         else:
                             if dialogue_text_is_menu_status or dialogue_menu_choices:
                                 self._aihong_dialogue_idle_polls = max(
@@ -4392,15 +5125,24 @@ class OcrReaderManager:
                             else:
                                 self._aihong_dialogue_idle_polls += 1
                             if (
+                                not dialogue_menu_choices
+                                and
                                 (
                                     not after_advance_trigger_mode
+                                    or legacy_geometryless_auto_target
                                     or dialogue_text_is_menu_status
-                                    or dialogue_menu_choices
                                 )
                                 and (
                                     dialogue_text_is_menu_status
-                                    or dialogue_menu_choices
-                                    or self._aihong_dialogue_idle_polls >= 2
+                                    or self._aihong_dialogue_idle_polls
+                                    >= (
+                                        1
+                                        if (
+                                            after_advance_trigger_mode
+                                            and not legacy_geometryless_auto_target
+                                        )
+                                        else 2
+                                    )
                                 )
                             ):
                                 menu_profile_selection = self._capture_profile_selection_for_target(
@@ -4408,14 +5150,13 @@ class OcrReaderManager:
                                     stage=_AIHONG_MENU_STAGE,
                                 )
                                 menu_profile = menu_profile_selection.profile
-                                menu_extraction = await asyncio.to_thread(
-                                    self._capture_and_extract_text,
-                                target,
-                                menu_profile,
-                                backend_plan,
-                                True,
-                                not after_advance_trigger_mode,
-                            )
+                                menu_extraction = await self._capture_and_extract_text_with_timeout(
+                                    target,
+                                    menu_profile,
+                                    backend_plan,
+                                    True,
+                                    not after_advance_trigger_mode,
+                                )
                                 self._last_capture_timing.update(menu_extraction.timing)
                                 self._record_capture_completed(
                                     now=self._time_fn(),
@@ -4437,7 +5178,7 @@ class OcrReaderManager:
                                 if menu_extraction.text and _looks_like_self_ui_text(menu_extraction.text):
                                     guard_blocked = True
                                     self._default_ocr_state.reset()
-                                    self._aihong_menu_ocr_state.reset()
+                                    self._reset_aihong_menu_state()
                                     result.warnings.append(
                                         "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                     )
@@ -4449,20 +5190,15 @@ class OcrReaderManager:
                                         choice_bounds_metadata=_extraction_choice_bounds_metadata(
                                             menu_extraction
                                         ),
+                                        choice_repeat_threshold=choice_repeat_threshold,
                                     )
                                     if menu_result.has_menu_candidate:
                                         self._aihong_menu_missing_polls = 0
                                         runtime_profile = menu_profile
                                         runtime_capture_profile_selection = menu_profile_selection
-                                    if menu_result.emitted_kind == "line":
-                                        emitted = True
-                                        self._aihong_stage = _AIHONG_DIALOGUE_STAGE
-                                        self._aihong_dialogue_idle_polls = 0
-                                        self._aihong_menu_missing_polls = 0
+                                    else:
                                         self._aihong_menu_ocr_state.reset()
-                                        runtime_profile = menu_profile
-                                        runtime_capture_profile_selection = menu_profile_selection
-                                    elif menu_result.emitted_kind == "choices":
+                                    if menu_result.emitted_kind == "choices":
                                         emitted = True
                                         self._aihong_stage = _AIHONG_MENU_STAGE
                                         self._aihong_menu_missing_polls = 0
@@ -4480,8 +5216,7 @@ class OcrReaderManager:
                         )
                     )
                     if (
-                        not after_advance_trigger_mode
-                        and not emitted
+                        not emitted
                         and self._should_attempt_followup_confirm(
                             extraction.text,
                             state=self._default_ocr_state,
@@ -4491,6 +5226,7 @@ class OcrReaderManager:
                             target,
                             profile,
                             backend_plan,
+                            elapsed_since_capture=extraction.timing.get("total_duration_seconds", 0.0),
                         )
                         self._last_capture_timing.update(followup_extraction.timing)
                         self._record_capture_completed(
@@ -4513,7 +5249,7 @@ class OcrReaderManager:
                         if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
                             guard_blocked = True
                             self._default_ocr_state.reset()
-                            self._aihong_menu_ocr_state.reset()
+                            self._reset_aihong_menu_state()
                             result.warnings.append(
                                 "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                             )
@@ -4530,16 +5266,29 @@ class OcrReaderManager:
                             if emitted:
                                 now = followup_now
         except Exception as exc:
-            self._logger.warning("ocr_reader capture/OCR failed: %s", exc)
+            self._logger.warning("ocr_reader capture/OCR failed: {}", exc)
             capture_error = True
             self._record_capture_error(now=now, error=exc)
+            self._reset_aihong_menu_state()
+            if int(self._writer.last_seq or 0) <= 1:
+                self._writer.discard_session()
             result.warnings.append(f"ocr_reader capture failed: {exc}")
+
+        # Timeout-based fallback: commit pending visual scene if waiting too long
+        if (
+            self._pending_visual_scene_hash
+            and self._pending_visual_scene_at > 0
+            and now - self._pending_visual_scene_at > 5.0
+        ):
+            self._commit_pending_visual_scene(now=now)
 
         status = self._runtime.status
         detail = self._runtime.detail
         observed_or_stable_emitted = int(self._writer.last_seq or 0) > event_seq_before_capture
 
         if emitted:
+            if foreground_advance_stable_grace_active:
+                self._foreground_advance_stable_until = 0.0
             result.stable_event_emitted = True
             result.should_rescan = True
             self._mark_observed_progress(now=now)
@@ -4703,16 +5452,18 @@ class OcrReaderManager:
     @staticmethod
     def _backend_plan_config_key(config: GalgameConfig) -> tuple[str, ...]:
         return (
-            str(config.ocr_reader_backend_selection or ""),
-            str(config.ocr_reader_tesseract_path or ""),
-            str(config.ocr_reader_install_target_dir or ""),
-            str(config.ocr_reader_languages or ""),
+            str(config.ocr_reader_backend_selection or "").strip().lower(),
+            str(config.ocr_reader_tesseract_path or "").strip(),
+            str(config.ocr_reader_install_target_dir or "").strip(),
+            str(config.ocr_reader_languages or "").strip().lower(),
             str(bool(config.rapidocr_enabled)),
-            str(config.rapidocr_install_target_dir or ""),
-            str(config.rapidocr_engine_type or ""),
-            str(config.rapidocr_lang_type or ""),
-            str(config.rapidocr_model_type or ""),
-            str(config.rapidocr_ocr_version or ""),
+            *_rapidocr_runtime_cache_key(
+                install_target_dir_raw=config.rapidocr_install_target_dir,
+                engine_type=config.rapidocr_engine_type,
+                lang_type=config.rapidocr_lang_type,
+                model_type=config.rapidocr_model_type,
+                ocr_version=config.rapidocr_ocr_version,
+            ),
         )
 
     def _resolve_backend_plan(self) -> SelectedOcrBackendPlan:
@@ -4944,6 +5695,13 @@ class OcrReaderManager:
             last_raw_ocr_text=str(self._last_raw_ocr_text or self._runtime.last_raw_ocr_text),
             last_observed_line=dict(self._last_observed_line or self._runtime.last_observed_line),
             last_stable_line=dict(self._last_stable_line or self._runtime.last_stable_line),
+            stable_ocr_last_raw_text=str(self._default_ocr_state.last_raw_text or ""),
+            stable_ocr_repeat_count=max(
+                0,
+                int(self._default_ocr_state.repeat_count or 0),
+            ),
+            stable_ocr_stable_text=str(self._default_ocr_state.stable_text or ""),
+            stable_ocr_block_reason=str(self._default_ocr_state.last_block_reason or ""),
             capture_backend_kind=str(
                 self._capture_backend_kind
                 or self._runtime.capture_backend_kind
@@ -5080,6 +5838,16 @@ class OcrReaderManager:
                 if callable(extract_with_boxes):
                     try:
                         text, boxes = extract_with_boxes(image)
+                        if not str(text or "").strip() and not isinstance(
+                            descriptor.backend,
+                            RapidOcrBackend,
+                        ):
+                            extract_text = getattr(descriptor.backend, "extract_text", None)
+                            if callable(extract_text):
+                                fallback_text = extract_text(image)
+                                if str(fallback_text or "").strip():
+                                    text = fallback_text
+                                    boxes = []
                     except Exception as boxes_exc:
                         extract_text = getattr(descriptor.backend, "extract_text", None)
                         if not callable(extract_text):
@@ -5107,7 +5875,7 @@ class OcrReaderManager:
                 last_error = exc
                 warning = f"ocr_reader {descriptor.kind} failed: {exc}"
                 warnings.append(warning)
-                self._logger.warning("ocr_reader backend %s failed: %s", descriptor.kind, exc)
+                self._logger.warning("ocr_reader backend {} failed: {}", descriptor.kind, exc)
         if last_error is not None:
             raise last_error
         return OcrExtractionResult(backend=resolved_plan.primary, warnings=warnings)
@@ -5154,7 +5922,7 @@ class OcrReaderManager:
                 background_hash_skipped = False
                 self._last_background_hash_capture_at = started_at
             except Exception as exc:
-                self._logger.debug("ocr_reader background scene hash skipped: %s", exc)
+                self._logger.debug("ocr_reader background scene hash skipped: {}", exc)
         hash_started_at = self._time_fn()
         capture_hash = self._capture_image_hash(frame)
         capture_hash_duration = max(0.0, self._time_fn() - hash_started_at)
@@ -5223,12 +5991,52 @@ class OcrReaderManager:
             excluded_candidate_count=len(excluded),
             last_exclude_reason=str(excluded[0].exclude_reason or "") if excluded else "",
         )
+        preferred_pid = int((memory_reader_runtime or {}).get("pid") or 0)
+        preferred_process_name = str(
+            (memory_reader_runtime or {}).get("process_name") or ""
+        ).strip().lower()
+
+        def _memory_reader_minimized_window() -> DetectedGameWindow | None:
+            if preferred_pid <= 0 and not preferred_process_name:
+                return None
+            for candidate in excluded:
+                if str(candidate.exclude_reason or "") != "excluded_minimized_window":
+                    continue
+                if preferred_pid > 0 and candidate.pid == preferred_pid:
+                    return candidate
+                if (
+                    preferred_process_name
+                    and str(candidate.process_name or "").strip().lower()
+                    == preferred_process_name
+                ):
+                    return candidate
+            return None
+
+        def _use_memory_reader_minimized_diagnostic(
+            candidate: DetectedGameWindow,
+        ) -> WindowSelectionResult:
+            selection.selection_detail = "memory_reader_window_minimized"
+            selection.last_exclude_reason = "excluded_minimized_window"
+            selection.excluded_candidate_count = len(excluded)
+            return selection
+
         if not windows:
+            minimized_window = _memory_reader_minimized_window()
+            if minimized_window is not None:
+                return _use_memory_reader_minimized_diagnostic(minimized_window)
             selection.selection_detail = (
                 "manual_target_unavailable_fallback_to_auto"
                 if self._manual_target.is_manual()
                 else "no_eligible_window"
             )
+            if selection.selection_mode == "auto":
+                foreground_hwnd = _foreground_window_handle()
+                for candidate in excluded:
+                    if candidate.is_foreground or (
+                        foreground_hwnd and candidate.hwnd == foreground_hwnd
+                    ):
+                        selection.selection_detail = "foreground_window_needs_manual_confirmation"
+                        break
             return selection
 
         if self._manual_target.is_manual():
@@ -5252,10 +6060,6 @@ class OcrReaderManager:
                     return selection
             selection.selection_detail = "manual_target_unavailable_fallback_to_auto"
 
-        preferred_pid = int((memory_reader_runtime or {}).get("pid") or 0)
-        preferred_process_name = str(
-            (memory_reader_runtime or {}).get("process_name") or ""
-        ).strip().lower()
         if preferred_pid > 0:
             for candidate in windows:
                 if candidate.pid == preferred_pid:
@@ -5270,6 +6074,9 @@ class OcrReaderManager:
                     if selection.selection_mode == "auto":
                         selection.selection_detail = "memory_reader_process"
                     return selection
+        minimized_window = _memory_reader_minimized_window()
+        if minimized_window is not None:
+            return _use_memory_reader_minimized_diagnostic(minimized_window)
         if self._attached_window is not None:
             for candidate in windows:
                 if candidate.hwnd == self._attached_window.hwnd:
@@ -5312,6 +6119,30 @@ class OcrReaderManager:
                     if selection.selection_mode == "auto":
                         selection.selection_detail = "foreground_window"
                     return selection
+        if len(windows) == 1:
+            configured_profile = _lookup_capture_profile(
+                self._capture_profiles,
+                windows[0],
+                stage=_AIHONG_DIALOGUE_STAGE,
+            )
+            if configured_profile is not None:
+                selection.target = windows[0]
+                if selection.selection_mode == "auto":
+                    selection.selection_detail = "single_configured_profile_candidate"
+                return selection
+            if (
+                _is_confident_auto_window(windows[0])
+                and not _is_legacy_geometryless_auto_window(windows[0])
+            ):
+                selection.target = windows[0]
+                if selection.selection_mode == "auto":
+                    selection.selection_detail = "single_confident_candidate"
+                return selection
+        if len(windows) == 1 and _is_legacy_geometryless_auto_window(windows[0]):
+            selection.target = windows[0]
+            if selection.selection_mode == "auto":
+                selection.selection_detail = "single_geometryless_candidate"
+            return selection
         if selection.selection_mode == "auto":
             selection.selection_detail = "auto_detect_needs_manual_fallback"
         return selection
@@ -5332,7 +6163,16 @@ class OcrReaderManager:
         if allow_choices:
             choices = _coerce_choice_lines(lines, allow_plain_text=allow_plain_text_choices)
             if choices:
-                return self._emit_choices_from_candidates(choices, now=now, state=tracker)
+                return self._emit_choices_from_candidates(
+                    choices,
+                    now=now,
+                    state=tracker,
+                    repeat_threshold=(
+                        line_repeat_threshold
+                        if line_repeat_threshold is not None
+                        else 2
+                    ),
+                )
         return self._emit_line_from_ocr_text(
             raw_text,
             now=now,

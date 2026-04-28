@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import threading
 import time
 from ctypes import wintypes
 from typing import Any
@@ -60,6 +61,19 @@ VIRTUAL_MOUSE_FORBIDDEN_ZONES = (
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TOKEN_QUERY = 0x0008
 TokenElevation = 20
+_LAST_FOCUS_WINDOW_DIAGNOSTIC = ""
+_LAST_FOCUS_WINDOW_DIAGNOSTIC_LOCK = threading.Lock()
+
+
+def _set_last_focus_window_diagnostic(value: str) -> None:
+    global _LAST_FOCUS_WINDOW_DIAGNOSTIC
+    with _LAST_FOCUS_WINDOW_DIAGNOSTIC_LOCK:
+        _LAST_FOCUS_WINDOW_DIAGNOSTIC = str(value or "")
+
+
+def _get_last_focus_window_diagnostic() -> str:
+    with _LAST_FOCUS_WINDOW_DIAGNOSTIC_LOCK:
+        return str(_LAST_FOCUS_WINDOW_DIAGNOSTIC or "")
 
 
 class TOKEN_ELEVATION(ctypes.Structure):
@@ -256,14 +270,15 @@ def _foreground_matches_target_window(foreground_hwnd: int, target_hwnd: int, ta
 
 
 def _focus_window(hwnd: int) -> bool:
+    _set_last_focus_window_diagnostic("")
     user32 = ctypes.windll.user32
     target_pid = _window_process_id(hwnd)
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
     try:
         user32.AllowSetForegroundWindow(-1)
-    except Exception:
-        pass
+    except Exception as exc:
+        _set_last_focus_window_diagnostic(f"AllowSetForegroundWindow failed: {exc}")
     foreground = user32.GetForegroundWindow()
     current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
     foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
@@ -279,8 +294,8 @@ def _focus_window(hwnd: int) -> bool:
         user32.SetForegroundWindow(hwnd)
         user32.SetActiveWindow(hwnd)
         user32.SetFocus(hwnd)
-    except Exception:
-        pass
+    except Exception as exc:
+        _set_last_focus_window_diagnostic(f"SetForegroundWindow failed: {exc}")
     finally:
         if attached_target:
             user32.AttachThreadInput(current_thread, target_thread, False)
@@ -288,12 +303,19 @@ def _focus_window(hwnd: int) -> bool:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
     time.sleep(0.12)
     try:
-        return _foreground_matches_target_window(
+        focused = _foreground_matches_target_window(
             int(user32.GetForegroundWindow()),
             int(hwnd),
             int(target_pid),
         )
-    except Exception:
+        if focused:
+            _set_last_focus_window_diagnostic("")
+            return True
+        if not _get_last_focus_window_diagnostic():
+            _set_last_focus_window_diagnostic("foreground window did not match target")
+        return False
+    except Exception as exc:
+        _set_last_focus_window_diagnostic(f"foreground verification failed: {exc}")
         return False
 
 
@@ -420,10 +442,12 @@ def _click(hwnd: int, x: int, y: int) -> None:
     user32 = ctypes.windll.user32
     user32.SetCursorPos(int(x), int(y))
     time.sleep(0.04)
-    screen_w = max(user32.GetSystemMetrics(0) - 1, 1)
-    screen_h = max(user32.GetSystemMetrics(1) - 1, 1)
-    abs_x = int(max(0, min(int(x), screen_w)) * 65535 / screen_w)
-    abs_y = int(max(0, min(int(y), screen_h)) * 65535 / screen_h)
+    virt_x = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+    virt_y = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+    virt_w = max(user32.GetSystemMetrics(78) - 1, 1)  # SM_CXVIRTUALSCREEN
+    virt_h = max(user32.GetSystemMetrics(79) - 1, 1)  # SM_CYVIRTUALSCREEN
+    abs_x = int((int(x) - virt_x) * 65535 / virt_w)
+    abs_y = int((int(y) - virt_y) * 65535 / virt_h)
     inputs = (INPUT * 3)(
         INPUT(INPUT_MOUSE, INPUT_UNION(mi=MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, None))),
         INPUT(INPUT_MOUSE, INPUT_UNION(mi=MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_LEFTDOWN, 0, None))),
@@ -740,13 +764,16 @@ def perform_local_input_actuation(
             "hwnd": hwnd,
         }
 
+    _set_last_focus_window_diagnostic("")
     if not _focus_window(hwnd):
+        focus_diagnostic = _get_last_focus_window_diagnostic() or "target window could not be focused"
         return {
             "success": False,
             "reason": "blocked_by_input_safety_policy",
             "safety_policy": {
                 "blocked": True,
                 "detail": "blocked_by_input_safety_policy: target window could not be focused",
+                "focus_diagnostic": focus_diagnostic,
                 "pid": pid,
                 "process_name": str(target.get("process_name") or ""),
                 "runtime_window_title": str(target.get("window_title") or ""),

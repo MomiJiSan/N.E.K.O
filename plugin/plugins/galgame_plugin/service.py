@@ -140,7 +140,7 @@ _OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
     "ocr 目标窗口",
     "截图校准",
 )
-_DIALOGUE_PUNCTUATION_RE = re.compile(r"[。！？!?…]|——|「|」|『|』|“|”")
+_DIALOGUE_PUNCTUATION_RE = re.compile(r"[。！？!?…]|[.](?:\s|$)|——|「|」|『|』|“|”")
 _DIALOGUE_WEAK_PUNCTUATION_RE = re.compile(r"[，,、：:]")
 _NON_DIALOGUE_CONTEXT_TOKENS = (
     "agent",
@@ -201,7 +201,7 @@ def _looks_like_game_dialogue_context_line(line: dict[str, Any]) -> bool:
     lowered = text.lower()
     if any(token in lowered for token in _NON_DIALOGUE_CONTEXT_TOKENS):
         return False
-    if text.startswith("{") or text.startswith("[") or "{" in text and "}" in text:
+    if text.startswith("{") or text.startswith("[") or ("{" in text and "}" in text):
         return False
     significant_chars = _significant_char_count(text)
     if significant_chars < 2 or significant_chars > 220:
@@ -596,6 +596,14 @@ def choose_candidate(
             item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER
         ]
     else:
+        preferred_candidates = []
+    if not preferred_candidates and normalized_reader_mode == READER_MODE_AUTO:
+        preferred_candidates = [
+            item
+            for item in candidates.values()
+            if item.data_source == DATA_SOURCE_BRIDGE_SDK and _candidate_has_text(item)
+        ]
+    if not preferred_candidates and normalized_reader_mode == READER_MODE_AUTO:
         preferred_candidates = [
             item
             for item in candidates.values()
@@ -700,6 +708,235 @@ def summarize_status(
     if isinstance(message, str) and message:
         parts.append(f"warning={message}")
     return " | ".join(parts)
+
+
+def _diagnosis_action(action_id: str, label: str) -> dict[str, str]:
+    return {
+        "id": action_id,
+        "label": label,
+    }
+
+
+def _primary_diagnosis(
+    severity: str,
+    title: str,
+    message: str,
+    actions: list[dict[str, str]],
+) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "title": title,
+        "message": message,
+        "actions": actions,
+    }
+
+
+def _status_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _status_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _line_text_from_status(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    return _status_text(value.get("text"))
+
+
+def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
+    runtime = local_state.get("ocr_reader_runtime")
+    runtime_obj = runtime if isinstance(runtime, dict) else {}
+    last_error = local_state.get("last_error")
+    last_error_obj = last_error if isinstance(last_error, dict) else {}
+    effective_line = local_state.get("effective_current_line")
+    effective_line_obj = effective_line if isinstance(effective_line, dict) else {}
+
+    context_state = _status_text(local_state.get("ocr_context_state") or runtime_obj.get("ocr_context_state"))
+    detail = _status_text(runtime_obj.get("target_selection_detail"))
+    runtime_detail = _status_text(runtime_obj.get("detail"))
+    last_exclude_reason = _status_text(runtime_obj.get("last_exclude_reason"))
+    last_capture_error = _status_text(runtime_obj.get("last_capture_error"))
+    last_error_message = _status_text(last_error_obj.get("message"))
+    ocr_capture_diagnostic = _status_text(local_state.get("ocr_capture_diagnostic"))
+    agent_pause_kind = _status_text(local_state.get("agent_pause_kind"))
+    agent_user_status = _status_text(local_state.get("agent_user_status"))
+
+    if last_error_message:
+        return _primary_diagnosis(
+            "error",
+            "插件运行出错",
+            f"{last_error_message}。可以先刷新状态；如果仍然出现，请查看调试详情。",
+            [
+                _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if detail == "memory_reader_window_minimized" or last_exclude_reason == "excluded_minimized_window":
+        return _primary_diagnosis(
+            "warning",
+            "游戏窗口已最小化",
+            "检测到游戏窗口，但窗口已最小化，OCR 不能截图。请恢复游戏窗口后继续。",
+            [
+                _diagnosis_action("refresh_ocr_windows", "我已恢复，刷新窗口"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+            ],
+        )
+
+    if context_state == "poll_not_running":
+        return _primary_diagnosis(
+            "error",
+            "OCR 轮询没有继续运行",
+            ocr_capture_diagnostic or "OCR 轮询尚未完成首次截图，新台词不会继续刷新。",
+            [
+                _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if context_state == "capture_failed" or last_capture_error:
+        return _primary_diagnosis(
+            "error",
+            "截图或文字识别失败",
+            last_capture_error or "截图或识别后端返回错误，新台词不会更新。",
+            [
+                _diagnosis_action("recalibrate_ocr", "重新截图校准"),
+                _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if bool(runtime_obj.get("stale_capture_backend")) or context_state == "stale_capture_backend":
+        return _primary_diagnosis(
+            "warning",
+            "截图画面没有更新",
+            "当前截图源可能停在旧画面。请切回游戏窗口，或切换截图方式后再试。",
+            [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+                _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("refresh_ocr_windows", "刷新窗口"),
+            ],
+        )
+
+    if (
+        context_state == "diagnostic_required"
+        or bool(local_state.get("ocr_capture_diagnostic_required"))
+        or runtime_detail == "ocr_capture_diagnostic_required"
+    ):
+        return _primary_diagnosis(
+            "warning",
+            "OCR 需要检查截图链路",
+            ocr_capture_diagnostic or "OCR 截图或识别上下文不可用，请检查窗口、截图区域和截图方式。",
+            [
+                _diagnosis_action("recalibrate_ocr", "重新截图校准"),
+                _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    has_effective_window = bool(_status_text(runtime_obj.get("effective_window_key")))
+    candidate_count = _status_int(runtime_obj.get("candidate_count"))
+    has_ocr_runtime_signal = bool(
+        local_state.get("ocr_reader_enabled")
+        or runtime_obj.get("status")
+        or runtime_detail
+        or context_state
+        or detail
+        or "candidate_count" in runtime_obj
+    )
+    if detail == "no_eligible_window" or (
+        not has_effective_window and candidate_count == 0 and has_ocr_runtime_signal
+    ):
+        return _primary_diagnosis(
+            "warning",
+            "没找到能识别的游戏窗口",
+            "游戏可能未启动、被最小化，或当前窗口不是游戏。请确认游戏窗口可见后刷新。",
+            [
+                _diagnosis_action("refresh_ocr_windows", "刷新窗口"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+            ],
+        )
+
+    if detail in {"foreground_window_needs_manual_confirmation", "auto_detect_needs_manual_fallback"}:
+        return _primary_diagnosis(
+            "warning",
+            "需要手动选择游戏窗口",
+            "自动检测不够确定。手动选择一次可以避免识别到插件页面或其他窗口。",
+            [
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+                _diagnosis_action("refresh_ocr_windows", "刷新窗口"),
+            ],
+        )
+
+    observed_text = _line_text_from_status(runtime_obj.get("last_observed_line"))
+    stable_text = (
+        _line_text_from_status(runtime_obj.get("last_stable_line"))
+        or _line_text_from_status(effective_line_obj)
+    )
+    if observed_text and normalize_text(observed_text) != normalize_text(stable_text):
+        return _primary_diagnosis(
+            "info",
+            "刚读到新文字",
+            "文字识别已经看到候选台词，正在确认这是不是同一句台词。",
+            [
+                _diagnosis_action("line_details", "查看识别详情"),
+            ],
+        )
+
+    if agent_pause_kind == "window_not_foreground" or agent_user_status == "paused_window_not_foreground":
+        return _primary_diagnosis(
+            "info",
+            "游戏不在前台",
+            "自动推进已暂停。切回游戏窗口后会继续，伴读信息仍会刷新。",
+            [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+            ],
+        )
+
+    if agent_pause_kind == "read_only" or agent_user_status == "read_only":
+        return _primary_diagnosis(
+            "info",
+            "当前是伴读模式",
+            "会显示台词和建议，但不会自动点击。需要自动推进时请切换模式。",
+            [
+                _diagnosis_action("choice_advisor", "切换到自动推进模式"),
+            ],
+        )
+
+    effective_text = _line_text_from_status(effective_line_obj)
+    if effective_text or stable_text:
+        target = " / ".join(
+            item
+            for item in (
+                _status_text(runtime_obj.get("effective_process_name") or runtime_obj.get("process_name")),
+                _status_text(runtime_obj.get("effective_window_title") or runtime_obj.get("window_title")),
+            )
+            if item
+        )
+        return _primary_diagnosis(
+            "ok",
+            "正在识别台词",
+            f"当前目标：{target}。已读到台词，页面会持续刷新。" if target else "已读到台词，页面会持续刷新。",
+            [
+                _diagnosis_action("refresh_all", "刷新全部"),
+            ],
+        )
+
+    summary = _status_text(local_state.get("summary"))
+    return _primary_diagnosis(
+        "info",
+        "等待游戏状态",
+        summary or "暂时没有足够信息判断当前卡点。请先打开游戏，或刷新窗口列表。",
+        [
+            _diagnosis_action("refresh_all", "刷新全部"),
+            _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+        ],
+    )
 
 
 def _append_limited(items: list[dict[str, Any]], item: dict[str, Any], limit: int) -> None:
@@ -1006,7 +1243,17 @@ def rebuild_histories_from_events(
     )
 
 
-def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
+def build_status_payload(
+    state,
+    *,
+    config: GalgameConfig,
+    state_is_snapshot: bool = False,
+) -> dict[str, Any]:
+    def copy_for_payload(value: Any) -> Any:
+        if state_is_snapshot:
+            return value
+        return json_copy(value)
+
     dxcam = inspect_dxcam_installation()
     textractor = inspect_textractor_installation(
         configured_path=config.memory_reader_textractor_path,
@@ -1024,7 +1271,8 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         install_target_dir_raw=config.ocr_reader_install_target_dir,
         languages=config.ocr_reader_languages,
     )
-    ocr_runtime = json_copy(state.ocr_reader_runtime)
+    ocr_runtime = copy_for_payload(state.ocr_reader_runtime)
+    last_error = copy_for_payload(state.last_error)
     ocr_capture_diagnostic_required = bool(
         isinstance(ocr_runtime, dict)
         and (
@@ -1039,17 +1287,38 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         ocr_capture_diagnostic = build_ocr_context_diagnostic(
             {
                 "ocr_reader_runtime": ocr_runtime,
-                "last_error": json_copy(state.last_error),
+                "last_error": last_error,
             }
         )
     local_state = {
-        "latest_snapshot": json_copy(state.latest_snapshot),
-        "history_observed_lines": json_copy(state.history_observed_lines),
-        "history_lines": json_copy(state.history_lines),
+        "latest_snapshot": copy_for_payload(state.latest_snapshot),
+        "history_observed_lines": copy_for_payload(state.history_observed_lines),
+        "history_lines": copy_for_payload(state.history_lines),
         "ocr_reader_runtime": ocr_runtime,
-        "last_error": json_copy(state.last_error),
+        "last_error": last_error,
     }
     effective_current_line = resolve_effective_current_line(local_state)
+    summary = summarize_status(
+        connection_state=state.current_connection_state,
+        mode=state.mode,
+        bound_game_id=state.bound_game_id or state.active_game_id,
+        active_session_id=state.active_session_id,
+        last_seq=state.last_seq,
+        last_error=last_error,
+        active_data_source=state.active_data_source,
+    )
+    primary_diagnosis = build_primary_diagnosis(
+        {
+            "ocr_reader_runtime": ocr_runtime,
+            "last_error": last_error,
+            "effective_current_line": effective_current_line or {},
+            "ocr_context_state": ocr_runtime.get("ocr_context_state") if isinstance(ocr_runtime, dict) else "",
+            "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
+            "ocr_capture_diagnostic": ocr_capture_diagnostic,
+            "ocr_reader_enabled": config.ocr_reader_enabled,
+            "summary": summary,
+        }
+    )
     return {
         "connection_state": state.current_connection_state,
         "mode": state.mode,
@@ -1061,23 +1330,16 @@ def build_status_payload(state, *, config: GalgameConfig) -> dict[str, Any]:
         "active_data_source": state.active_data_source,
         "stream_reset_pending": state.stream_reset_pending,
         "last_seq": state.last_seq,
-        "last_error": json_copy(state.last_error),
+        "last_error": last_error,
         "performance": _current_process_performance(),
-        "memory_reader_runtime": json_copy(state.memory_reader_runtime),
+        "memory_reader_runtime": copy_for_payload(state.memory_reader_runtime),
         "ocr_reader_runtime": ocr_runtime,
-        "effective_current_line": json_copy(effective_current_line or {}),
+        "effective_current_line": copy_for_payload(effective_current_line or {}),
         "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
         "ocr_capture_diagnostic": ocr_capture_diagnostic,
-        "ocr_capture_profiles": json_copy(state.ocr_capture_profiles),
-        "summary": summarize_status(
-            connection_state=state.current_connection_state,
-            mode=state.mode,
-            bound_game_id=state.bound_game_id or state.active_game_id,
-            active_session_id=state.active_session_id,
-            last_seq=state.last_seq,
-            last_error=state.last_error,
-            active_data_source=state.active_data_source,
-        ),
+        "primary_diagnosis": primary_diagnosis,
+        "ocr_capture_profiles": copy_for_payload(state.ocr_capture_profiles),
+        "summary": summary,
         "phase": "phase_1",
         "reader_mode": config.reader_mode,
         "memory_reader_enabled": config.memory_reader_enabled,
@@ -1232,12 +1494,23 @@ def build_ocr_context_diagnostic(local_state: dict[str, Any]) -> str:
     context_state = str(runtime_obj.get("ocr_context_state") or "").strip()
     detail = str(runtime_obj.get("detail") or "").strip()
     status = str(runtime_obj.get("status") or "").strip()
+    target_selection_detail = str(runtime_obj.get("target_selection_detail") or "").strip()
+    last_exclude_reason = str(runtime_obj.get("last_exclude_reason") or "").strip()
+    if (
+        target_selection_detail == "memory_reader_window_minimized"
+        or last_exclude_reason == "excluded_minimized_window"
+    ):
+        parts.append("游戏窗口已最小化，OCR 不能截图。请恢复游戏窗口后继续。")
     if context_state:
         parts.append(f"context_state={context_state}")
     if status:
         parts.append(f"status={status}")
     if detail:
         parts.append(f"detail={detail}")
+    if target_selection_detail:
+        parts.append(f"target_selection_detail={target_selection_detail}")
+    if last_exclude_reason:
+        parts.append(f"last_exclude_reason={last_exclude_reason}")
     backend = str(runtime_obj.get("backend_kind") or "").strip()
     if backend:
         parts.append(f"backend={backend}")
@@ -1457,15 +1730,15 @@ def build_local_scene_summary(
             text = str(item.get("text") or "").strip()
             if text:
                 recent_parts.append(f"{speaker}：{text}")
-        summary = f"当前场景 {scene_id or '(unknown)'} 的近期上下文是："
+        summary = f"场景 {scene_id or '(unknown)'} 的近期上下文是："
         summary += "；".join(recent_parts) if recent_parts else "暂时只有零散台词。"
     elif normalized_snapshot.get("text"):
         summary = (
-            f"当前场景 {scene_id or '(unknown)'} 目前停留在"
+            f"场景 {scene_id or '(unknown)'} 目前停留在"
             f"「{str(normalized_snapshot.get('speaker') or '旁白')}：{str(normalized_snapshot.get('text') or '')}」"
         )
     else:
-        summary = f"当前场景 {scene_id or '(unknown)'} 暂时没有足够台词上下文。"
+        summary = f"场景 {scene_id or '(unknown)'} 暂时没有足够台词上下文。"
     if route_id:
         summary += f" 路线 {route_id}。"
     if selected_choices:

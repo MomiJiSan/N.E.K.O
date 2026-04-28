@@ -116,11 +116,12 @@ def _make_config(
     [
         (False, True, True, "unsupported_platform", "Windows-only"),
         (True, False, True, "manual_pid_unimplemented", "auto_detect=false"),
-        (True, True, False, "invalid_textractor_path", "textractor_path"),
+        (True, True, False, "invalid_textractor_path", "TextractorCLI.exe"),
     ],
 )
 async def test_memory_reader_manager_returns_recoverable_warnings_for_unavailable_runtime(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     platform_value: bool,
     auto_detect: bool,
     textractor_exists: bool,
@@ -132,6 +133,10 @@ async def test_memory_reader_manager_returns_recoverable_warnings_for_unavailabl
     textractor_path = tmp_path / "TextractorCLI.exe"
     if textractor_exists:
         textractor_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "programfiles"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "programfiles_x86"))
 
     manager = MemoryReaderManager(
         logger=_Logger(),
@@ -417,7 +422,7 @@ async def test_memory_reader_manager_marks_attached_without_text_when_only_textr
     events_path = bridge_root / game_id / "events.jsonl"
     events = tail_events_jsonl(events_path, offset=0, line_buffer=b"").events
     assert [event["type"] for event in events] == ["session_started"]
-    assert any(level == "debug" and args[0] == "memory_reader Textractor log: %s" for level, args in logger.messages)
+    assert any(level == "debug" and args[0] == "memory_reader Textractor log: {}" for level, args in logger.messages)
 
     await manager.shutdown()
 
@@ -441,8 +446,15 @@ def test_inspect_textractor_installation_reports_custom_install_target(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_install_textractor_downloads_and_extracts_latest_release_zip(tmp_path: Path) -> None:
+async def test_install_textractor_downloads_and_extracts_latest_release_zip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     install_root = tmp_path / "TextractorInstalled"
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "programfiles"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "programfiles_x86"))
     archive_root = tmp_path / "archive"
     archive_root.mkdir()
     archive_path = archive_root / "Textractor.zip"

@@ -123,6 +123,17 @@ DEFAULT_SAVE_CONTEXT = {
 
 
 def json_copy(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        if all(item is None or isinstance(item, (str, int, float, bool)) for item in value):
+            return list(value)
+    elif isinstance(value, dict):
+        if all(
+            (item is None or isinstance(item, (str, int, float, bool)))
+            for item in value.values()
+        ):
+            return dict(value)
     return copy.deepcopy(value)
 
 

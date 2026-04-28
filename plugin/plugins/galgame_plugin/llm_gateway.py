@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import json
 import time
 from typing import Any, Callable
 
@@ -17,6 +19,14 @@ from .service import (
 
 _EXPLAIN_EVIDENCE_TYPES = frozenset({"current_line", "history_line", "choice"})
 _KEY_POINT_TYPES = frozenset({"plot", "emotion", "decision", "reveal", "objective"})
+_LLM_RESPONSE_CACHE_MAX_ITEMS = 50
+
+
+def _json_payload_copy(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return json_copy(value)
 
 
 class LLMGateway:
@@ -28,7 +38,7 @@ class LLMGateway:
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._active_calls = 0
 
     def update_config(self, config) -> None:
@@ -130,14 +140,17 @@ class LLMGateway:
         degraded: Callable[[str], dict[str, Any]],
     ) -> dict[str, Any]:
         self._ensure_loop_affinity()
-        fingerprint = f"{operation}:{repr(context)}"
+        fingerprint = self._cache_fingerprint(operation, context)
         now = time.monotonic()
         wait_task: asyncio.Task[dict[str, Any]] | None = None
 
         async with self._lock:
             cached = self._cache.get(fingerprint)
             if cached is not None and cached[0] > now:
-                return json_copy(cached[1])
+                self._cache.move_to_end(fingerprint)
+                return _json_payload_copy(cached[1])
+            if cached is not None:
+                self._cache.pop(fingerprint, None)
 
             in_flight = self._inflight.get(fingerprint)
             if in_flight is not None:
@@ -158,7 +171,20 @@ class LLMGateway:
                 )
                 self._inflight[fingerprint] = wait_task
 
-        return json_copy(await wait_task)
+        return _json_payload_copy(await wait_task)
+
+    @staticmethod
+    def _cache_fingerprint(operation: str, context: dict[str, Any]) -> str:
+        try:
+            normalized_context = json.dumps(
+                context,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            normalized_context = repr(context)
+        return f"{operation}:{normalized_context}"
 
     async def _perform_call(
         self,
@@ -179,7 +205,10 @@ class LLMGateway:
             ttl = max(0.0, float(self._config.llm_request_cache_ttl_seconds))
             async with self._lock:
                 if ttl > 0:
-                    self._cache[fingerprint] = (time.monotonic() + ttl, json_copy(result))
+                    self._cache[fingerprint] = (time.monotonic() + ttl, _json_payload_copy(result))
+                    self._cache.move_to_end(fingerprint)
+                    while len(self._cache) > _LLM_RESPONSE_CACHE_MAX_ITEMS:
+                        self._cache.popitem(last=False)
             return result
         finally:
             async with self._lock:
