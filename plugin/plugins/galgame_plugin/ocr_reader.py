@@ -1250,7 +1250,7 @@ class OcrReaderRuntime:
     last_auto_recalibrate_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "enabled": self.enabled,
             "status": self.status,
             "detail": self.detail,
@@ -1337,6 +1337,94 @@ class OcrReaderRuntime:
             "last_auto_recalibrate_limited": self.last_auto_recalibrate_limited,
             "last_auto_recalibrate_error": self.last_auto_recalibrate_error,
         }
+        payload["window"] = {
+            "process_name": self.process_name,
+            "pid": self.pid,
+            "title": self.window_title,
+            "width": self.width,
+            "height": self.height,
+            "aspect_ratio": self.aspect_ratio,
+            "selection_mode": self.target_selection_mode,
+            "selection_detail": self.target_selection_detail,
+            "effective_window_key": self.effective_window_key,
+            "effective_window_title": self.effective_window_title,
+            "effective_process_name": self.effective_process_name,
+            "target_is_foreground": self.target_is_foreground,
+            "manual_target": dict(self.manual_target),
+            "locked_target": dict(self.locked_target),
+            "candidate_count": self.candidate_count,
+            "excluded_candidate_count": self.excluded_candidate_count,
+            "last_exclude_reason": self.last_exclude_reason,
+            "foreground_refresh_at": self.foreground_refresh_at,
+            "foreground_refresh_detail": self.foreground_refresh_detail,
+            "foreground_hwnd": self.foreground_hwnd,
+            "target_hwnd": self.target_hwnd,
+        }
+        payload["capture"] = {
+            "stage": self.capture_stage,
+            "profile": dict(self.capture_profile),
+            "profile_match_source": self.capture_profile_match_source,
+            "profile_bucket_key": self.capture_profile_bucket_key,
+            "last_profile": dict(self.last_capture_profile),
+            "last_stage": self.last_capture_stage,
+            "backend_kind": self.capture_backend_kind,
+            "backend_detail": self.capture_backend_detail,
+            "last_image_hash": self.last_capture_image_hash,
+            "last_source_size": dict(self.last_capture_source_size),
+            "last_rect": dict(self.last_capture_rect),
+            "last_window_rect": dict(self.last_capture_window_rect),
+            "consecutive_same_frames": self.consecutive_same_capture_frames,
+            "stale_backend": self.stale_capture_backend,
+            "diagnostic_required": self.ocr_capture_diagnostic_required,
+        }
+        payload["ocr"] = {
+            "backend_kind": self.backend_kind,
+            "backend_detail": self.backend_detail,
+            "backend_path": self.backend_path,
+            "backend_model": self.backend_model,
+            "tesseract_path": self.tesseract_path,
+            "languages": self.languages,
+            "context_state": self.ocr_context_state,
+            "consecutive_no_text_polls": self.consecutive_no_text_polls,
+            "last_observed_at": self.last_observed_at,
+            "last_capture_attempt_at": self.last_capture_attempt_at,
+            "last_capture_completed_at": self.last_capture_completed_at,
+            "last_capture_error": self.last_capture_error,
+            "last_raw_text": self.last_raw_ocr_text,
+            "last_observed_line": dict(self.last_observed_line),
+            "last_stable_line": dict(self.last_stable_line),
+        }
+        payload["timing"] = {
+            "last_capture_total_duration_seconds": self.last_capture_total_duration_seconds,
+            "last_capture_frame_duration_seconds": self.last_capture_frame_duration_seconds,
+            "last_capture_background_duration_seconds": self.last_capture_background_duration_seconds,
+            "last_capture_image_hash_duration_seconds": self.last_capture_image_hash_duration_seconds,
+            "last_ocr_extract_duration_seconds": self.last_ocr_extract_duration_seconds,
+            "last_backend_plan_duration_seconds": self.last_backend_plan_duration_seconds,
+            "last_window_scan_duration_seconds": self.last_window_scan_duration_seconds,
+            "last_poll_started_at": self.last_poll_started_at,
+            "last_poll_completed_at": self.last_poll_completed_at,
+            "last_poll_duration_seconds": self.last_poll_duration_seconds,
+        }
+        payload["advance"] = {
+            "foreground_monitor_running": self.foreground_advance_monitor_running,
+            "foreground_last_seq": self.foreground_advance_last_seq,
+            "foreground_consumed_seq": self.foreground_advance_consumed_seq,
+            "foreground_last_kind": self.foreground_advance_last_kind,
+            "foreground_last_delta": self.foreground_advance_last_delta,
+            "foreground_last_matched": self.foreground_advance_last_matched,
+            "foreground_last_match_reason": self.foreground_advance_last_match_reason,
+            "last_background_hash_skipped": self.last_capture_background_hash_skipped,
+            "last_poll_emitted_event": self.last_poll_emitted_event,
+            "last_tick_skipped": self.last_tick_skipped,
+            "last_tick_skip_reason": self.last_tick_skip_reason,
+            "pending_visual_scene_count": self.pending_visual_scene_count,
+            "last_auto_recalibrate_attempts": self.last_auto_recalibrate_attempts,
+            "last_auto_recalibrate_duration_seconds": self.last_auto_recalibrate_duration_seconds,
+            "last_auto_recalibrate_limited": self.last_auto_recalibrate_limited,
+            "last_auto_recalibrate_error": self.last_auto_recalibrate_error,
+        }
+        return payload
 
 
 @dataclass(slots=True)

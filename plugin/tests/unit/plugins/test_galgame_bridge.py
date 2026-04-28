@@ -2980,6 +2980,12 @@ async def test_ocr_reader_runtime_exposes_window_bucket_match_metadata(tmp_path:
     assert result.runtime["aspect_ratio"] == pytest.approx(1280 / 720, rel=1e-4)
     assert result.runtime["capture_profile_match_source"] == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
     assert result.runtime["capture_profile_bucket_key"] == bucket_key
+    assert result.runtime["window"]["width"] == 1280
+    assert result.runtime["window"]["height"] == 720
+    assert result.runtime["window"]["selection_mode"] == result.runtime["target_selection_mode"]
+    assert result.runtime["capture"]["profile_match_source"] == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT
+    assert result.runtime["capture"]["profile_bucket_key"] == bucket_key
+    assert result.runtime["ocr"]["backend_kind"] == result.runtime["backend_kind"]
 
 
 @pytest.mark.plugin_unit
@@ -4844,6 +4850,8 @@ def test_ocr_runtime_reports_pending_visual_scene_count(tmp_path: Path) -> None:
         manager._wheel_monitor.stop()
 
     assert runtime["pending_visual_scene_count"] == 2
+    assert runtime["advance"]["pending_visual_scene_count"] == 2
+    assert runtime["capture"]["diagnostic_required"] is False
 
 
 @pytest.mark.plugin_unit
