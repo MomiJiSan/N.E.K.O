@@ -1802,121 +1802,155 @@ function buildStatusSummaryText(status) {
 
 function ocrRuntimeState(status) {
   const runtime = status?.ocr_reader_runtime || {};
-  return runtime.ocr_context_state || runtime.detail || '';
+  return readOcrRuntimeValue(runtime, 'ocr', 'context_state', 'ocr_context_state') || runtime.detail || '';
+}
+
+function ocrRuntimeGroup(runtime, groupName) {
+  const group = runtime?.[groupName];
+  return group && typeof group === 'object' ? group : {};
+}
+
+function readOcrRuntimeValue(runtime, groupName, groupKey, legacyKey = groupKey) {
+  const group = ocrRuntimeGroup(runtime, groupName);
+  const groupedValue = group[groupKey];
+  if (groupedValue !== undefined && groupedValue !== null && groupedValue !== '') {
+    return groupedValue;
+  }
+  const legacyValue = runtime?.[legacyKey];
+  return legacyValue !== undefined && legacyValue !== null ? legacyValue : '';
+}
+
+function formatOcrRuntimeSeconds(value) {
+  if (value === undefined || value === null || value === '') {
+    return '';
+  }
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue.toFixed(2) : '';
 }
 
 function renderOcrRuntime(status) {
   const runtime = status.ocr_reader_runtime || {};
+  const fromWindow = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'window', key, legacyKey);
+  const fromCapture = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'capture', key, legacyKey);
+  const fromOcr = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'ocr', key, legacyKey);
+  const fromTiming = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'timing', key, legacyKey);
+  const fromAdvance = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'advance', key, legacyKey);
+  const windowTitle = fromWindow('title', 'window_title');
+  const captureStage = fromCapture('stage', 'capture_stage');
+  const captureProfile = fromCapture('profile', 'capture_profile');
+  const captureProfileMatchSource = fromCapture('profile_match_source', 'capture_profile_match_source');
+  const lastCaptureStage = fromCapture('last_stage', 'last_capture_stage');
+  const lastCaptureProfile = fromCapture('last_profile', 'last_capture_profile');
   renderGrid('ocrRuntimeGrid', [
     { label: 'status', value: runtime.status || '' },
     { label: 'detail', value: runtime.detail || '' },
-    { label: 'process_name', value: runtime.process_name || '' },
-    { label: 'pid', value: String(runtime.pid || 0) },
-    { label: 'window_title', value: runtime.window_title || '' },
-    { label: 'width', value: String(runtime.width || 0) },
-    { label: 'height', value: String(runtime.height || 0) },
-    { label: 'aspect_ratio', value: runtime.aspect_ratio ? Number(runtime.aspect_ratio).toFixed(4) : '' },
+    { label: 'process_name', value: fromWindow('process_name') || '' },
+    { label: 'pid', value: String(fromWindow('pid') || 0) },
+    { label: 'window_title', value: windowTitle || '' },
+    { label: 'width', value: String(fromWindow('width') || 0) },
+    { label: 'height', value: String(fromWindow('height') || 0) },
+    { label: 'aspect_ratio', value: fromWindow('aspect_ratio') ? Number(fromWindow('aspect_ratio')).toFixed(4) : '' },
     { label: 'game_id', value: runtime.game_id || '' },
     { label: 'session_id', value: runtime.session_id || '' },
     { label: 'last_seq', value: String(runtime.last_seq || 0) },
     { label: 'last_event_ts', value: runtime.last_event_ts || '' },
-    { label: 'capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[runtime.capture_stage] || runtime.capture_stage || '通用区域' },
-    { label: 'capture_profile', value: formatCaptureProfile(runtime.capture_profile) || '(default)' },
+    { label: 'capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[captureStage] || captureStage || '通用区域' },
+    { label: 'capture_profile', value: formatCaptureProfile(captureProfile) || '(default)' },
     {
       label: 'capture_profile_match_source',
-      value: OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH[runtime.capture_profile_match_source] || runtime.capture_profile_match_source || '',
+      value: OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH[captureProfileMatchSource] || captureProfileMatchSource || '',
     },
-    { label: 'capture_profile_bucket_key', value: runtime.capture_profile_bucket_key || '' },
-    { label: 'consecutive_no_text_polls', value: String(runtime.consecutive_no_text_polls || 0) },
-    { label: 'last_observed_at', value: runtime.last_observed_at || '' },
-    { label: 'last_capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[runtime.last_capture_stage] || runtime.last_capture_stage || '' },
-    { label: 'last_capture_profile', value: formatCaptureProfile(runtime.last_capture_profile) || '' },
-    { label: 'ocr_context_state', value: runtime.ocr_context_state || '' },
-    { label: 'last_capture_attempt_at', value: runtime.last_capture_attempt_at || '' },
-    { label: 'last_capture_completed_at', value: runtime.last_capture_completed_at || '' },
-    { label: 'last_capture_error', value: runtime.last_capture_error || '' },
-    { label: 'capture_backend_kind', value: runtime.capture_backend_kind || '' },
-    { label: 'capture_backend_detail', value: runtime.capture_backend_detail || '' },
-    { label: 'last_capture_image_hash', value: runtime.last_capture_image_hash || '' },
-    { label: 'consecutive_same_capture_frames', value: String(runtime.consecutive_same_capture_frames || 0) },
-    { label: 'stale_capture_backend', value: String(Boolean(runtime.stale_capture_backend)) },
-    { label: 'last_raw_ocr_text', value: runtime.last_raw_ocr_text || '' },
-    { label: 'last_observed_line', value: runtime.last_observed_line?.text || '' },
-    { label: 'last_stable_line', value: runtime.last_stable_line?.text || '' },
-    { label: 'ocr_capture_diagnostic_required', value: String(Boolean(runtime.ocr_capture_diagnostic_required)) },
-    { label: 'backend_kind', value: runtime.backend_kind || '' },
-    { label: 'backend_detail', value: runtime.backend_detail || '' },
-    { label: 'backend_path', value: runtime.backend_path || '' },
-    { label: 'backend_model', value: runtime.backend_model || '' },
-    { label: 'tesseract_path', value: runtime.tesseract_path || '' },
-    { label: 'languages', value: runtime.languages || '' },
+    { label: 'capture_profile_bucket_key', value: fromCapture('profile_bucket_key', 'capture_profile_bucket_key') || '' },
+    { label: 'consecutive_no_text_polls', value: String(fromOcr('consecutive_no_text_polls') || 0) },
+    { label: 'last_observed_at', value: fromOcr('last_observed_at') || '' },
+    { label: 'last_capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[lastCaptureStage] || lastCaptureStage || '' },
+    { label: 'last_capture_profile', value: formatCaptureProfile(lastCaptureProfile) || '' },
+    { label: 'ocr_context_state', value: fromOcr('context_state', 'ocr_context_state') || '' },
+    { label: 'last_capture_attempt_at', value: fromOcr('last_capture_attempt_at') || '' },
+    { label: 'last_capture_completed_at', value: fromOcr('last_capture_completed_at') || '' },
+    { label: 'last_capture_error', value: fromOcr('last_capture_error') || '' },
+    { label: 'capture_backend_kind', value: fromCapture('backend_kind', 'capture_backend_kind') || '' },
+    { label: 'capture_backend_detail', value: fromCapture('backend_detail', 'capture_backend_detail') || '' },
+    { label: 'last_capture_image_hash', value: fromCapture('last_image_hash', 'last_capture_image_hash') || '' },
+    { label: 'consecutive_same_capture_frames', value: String(fromCapture('consecutive_same_frames', 'consecutive_same_capture_frames') || 0) },
+    { label: 'stale_capture_backend', value: String(Boolean(fromCapture('stale_backend', 'stale_capture_backend'))) },
+    { label: 'last_raw_ocr_text', value: fromOcr('last_raw_text', 'last_raw_ocr_text') || '' },
+    { label: 'last_observed_line', value: fromOcr('last_observed_line')?.text || '' },
+    { label: 'last_stable_line', value: fromOcr('last_stable_line')?.text || '' },
+    { label: 'ocr_capture_diagnostic_required', value: String(Boolean(fromCapture('diagnostic_required', 'ocr_capture_diagnostic_required'))) },
+    { label: 'backend_kind', value: fromOcr('backend_kind') || '' },
+    { label: 'backend_detail', value: fromOcr('backend_detail') || '' },
+    { label: 'backend_path', value: fromOcr('backend_path') || '' },
+    { label: 'backend_model', value: fromOcr('backend_model') || '' },
+    { label: 'tesseract_path', value: fromOcr('tesseract_path') || '' },
+    { label: 'languages', value: fromOcr('languages') || '' },
     { label: 'takeover_reason', value: runtime.takeover_reason || '' },
-    { label: 'target_selection_mode', value: runtime.target_selection_mode || '' },
-    { label: 'target_selection_detail', value: runtime.target_selection_detail || '' },
-    { label: 'effective_window_key', value: runtime.effective_window_key || '' },
-    { label: 'effective_window_title', value: runtime.effective_window_title || '' },
-    { label: 'effective_process_name', value: runtime.effective_process_name || '' },
-    { label: 'target_is_foreground', value: String(Boolean(runtime.target_is_foreground)) },
-    { label: 'foreground_refresh_at', value: runtime.foreground_refresh_at || '' },
-    { label: 'foreground_refresh_detail', value: runtime.foreground_refresh_detail || '' },
-    { label: 'foreground_hwnd', value: String(runtime.foreground_hwnd || 0) },
-    { label: 'target_hwnd', value: String(runtime.target_hwnd || 0) },
-    { label: 'foreground_advance_monitor_running', value: String(Boolean(runtime.foreground_advance_monitor_running)) },
-    { label: 'foreground_advance_last_seq', value: String(runtime.foreground_advance_last_seq || 0) },
-    { label: 'foreground_advance_consumed_seq', value: String(runtime.foreground_advance_consumed_seq || 0) },
-    { label: 'foreground_advance_last_kind', value: runtime.foreground_advance_last_kind || '' },
-    { label: 'foreground_advance_last_delta', value: String(runtime.foreground_advance_last_delta || 0) },
-    { label: 'foreground_advance_last_matched', value: String(Boolean(runtime.foreground_advance_last_matched)) },
-    { label: 'foreground_advance_last_match_reason', value: runtime.foreground_advance_last_match_reason || '' },
-    { label: 'last_poll_started_at', value: runtime.last_poll_started_at || '' },
-    { label: 'last_poll_completed_at', value: runtime.last_poll_completed_at || '' },
+    { label: 'target_selection_mode', value: fromWindow('selection_mode', 'target_selection_mode') || '' },
+    { label: 'target_selection_detail', value: fromWindow('selection_detail', 'target_selection_detail') || '' },
+    { label: 'effective_window_key', value: fromWindow('effective_window_key') || '' },
+    { label: 'effective_window_title', value: fromWindow('effective_window_title') || '' },
+    { label: 'effective_process_name', value: fromWindow('effective_process_name') || '' },
+    { label: 'target_is_foreground', value: String(Boolean(fromWindow('target_is_foreground'))) },
+    { label: 'foreground_refresh_at', value: fromWindow('foreground_refresh_at') || '' },
+    { label: 'foreground_refresh_detail', value: fromWindow('foreground_refresh_detail') || '' },
+    { label: 'foreground_hwnd', value: String(fromWindow('foreground_hwnd') || 0) },
+    { label: 'target_hwnd', value: String(fromWindow('target_hwnd') || 0) },
+    { label: 'foreground_advance_monitor_running', value: String(Boolean(fromAdvance('foreground_monitor_running', 'foreground_advance_monitor_running'))) },
+    { label: 'foreground_advance_last_seq', value: String(fromAdvance('foreground_last_seq', 'foreground_advance_last_seq') || 0) },
+    { label: 'foreground_advance_consumed_seq', value: String(fromAdvance('foreground_consumed_seq', 'foreground_advance_consumed_seq') || 0) },
+    { label: 'foreground_advance_last_kind', value: fromAdvance('foreground_last_kind', 'foreground_advance_last_kind') || '' },
+    { label: 'foreground_advance_last_delta', value: String(fromAdvance('foreground_last_delta', 'foreground_advance_last_delta') || 0) },
+    { label: 'foreground_advance_last_matched', value: String(Boolean(fromAdvance('foreground_last_matched', 'foreground_advance_last_matched'))) },
+    { label: 'foreground_advance_last_match_reason', value: fromAdvance('foreground_last_match_reason', 'foreground_advance_last_match_reason') || '' },
+    { label: 'last_poll_started_at', value: fromTiming('last_poll_started_at') || '' },
+    { label: 'last_poll_completed_at', value: fromTiming('last_poll_completed_at') || '' },
     {
       label: 'last_poll_duration_seconds',
-      value: runtime.last_poll_duration_seconds ? Number(runtime.last_poll_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_poll_duration_seconds')),
     },
     {
       label: 'last_capture_total_duration_seconds',
-      value: runtime.last_capture_total_duration_seconds ? Number(runtime.last_capture_total_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_capture_total_duration_seconds')),
     },
     {
       label: 'last_capture_frame_duration_seconds',
-      value: runtime.last_capture_frame_duration_seconds ? Number(runtime.last_capture_frame_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_capture_frame_duration_seconds')),
     },
     {
       label: 'last_capture_background_duration_seconds',
-      value: Number.isFinite(Number(runtime.last_capture_background_duration_seconds)) ? Number(runtime.last_capture_background_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_capture_background_duration_seconds')),
     },
     {
       label: 'last_capture_image_hash_duration_seconds',
-      value: runtime.last_capture_image_hash_duration_seconds ? Number(runtime.last_capture_image_hash_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_capture_image_hash_duration_seconds')),
     },
     {
       label: 'last_ocr_extract_duration_seconds',
-      value: runtime.last_ocr_extract_duration_seconds ? Number(runtime.last_ocr_extract_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_ocr_extract_duration_seconds')),
     },
     {
       label: 'last_backend_plan_duration_seconds',
-      value: Number.isFinite(Number(runtime.last_backend_plan_duration_seconds)) ? Number(runtime.last_backend_plan_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_backend_plan_duration_seconds')),
     },
     {
       label: 'last_window_scan_duration_seconds',
-      value: Number.isFinite(Number(runtime.last_window_scan_duration_seconds)) ? Number(runtime.last_window_scan_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromTiming('last_window_scan_duration_seconds')),
     },
-    { label: 'last_capture_background_hash_skipped', value: String(Boolean(runtime.last_capture_background_hash_skipped)) },
-    { label: 'last_poll_emitted_event', value: String(Boolean(runtime.last_poll_emitted_event)) },
-    { label: 'last_tick_skipped', value: String(Boolean(runtime.last_tick_skipped)) },
-    { label: 'last_tick_skip_reason', value: runtime.last_tick_skip_reason || '' },
-    { label: 'pending_visual_scene_count', value: String(runtime.pending_visual_scene_count || 0) },
-    { label: 'last_auto_recalibrate_attempts', value: String(runtime.last_auto_recalibrate_attempts || 0) },
+    { label: 'last_capture_background_hash_skipped', value: String(Boolean(fromAdvance('last_background_hash_skipped', 'last_capture_background_hash_skipped'))) },
+    { label: 'last_poll_emitted_event', value: String(Boolean(fromAdvance('last_poll_emitted_event'))) },
+    { label: 'last_tick_skipped', value: String(Boolean(fromAdvance('last_tick_skipped'))) },
+    { label: 'last_tick_skip_reason', value: fromAdvance('last_tick_skip_reason') || '' },
+    { label: 'pending_visual_scene_count', value: String(fromAdvance('pending_visual_scene_count') || 0) },
+    { label: 'last_auto_recalibrate_attempts', value: String(fromAdvance('last_auto_recalibrate_attempts') || 0) },
     {
       label: 'last_auto_recalibrate_duration_seconds',
-      value: Number.isFinite(Number(runtime.last_auto_recalibrate_duration_seconds)) ? Number(runtime.last_auto_recalibrate_duration_seconds).toFixed(2) : '',
+      value: formatOcrRuntimeSeconds(fromAdvance('last_auto_recalibrate_duration_seconds')),
     },
-    { label: 'last_auto_recalibrate_limited', value: String(Boolean(runtime.last_auto_recalibrate_limited)) },
-    { label: 'last_auto_recalibrate_error', value: runtime.last_auto_recalibrate_error || '' },
-    { label: 'candidate_count', value: String(runtime.candidate_count || 0) },
-    { label: 'excluded_candidate_count', value: String(runtime.excluded_candidate_count || 0) },
-    { label: 'last_exclude_reason', value: runtime.last_exclude_reason || '' },
+    { label: 'last_auto_recalibrate_limited', value: String(Boolean(fromAdvance('last_auto_recalibrate_limited'))) },
+    { label: 'last_auto_recalibrate_error', value: fromAdvance('last_auto_recalibrate_error') || '' },
+    { label: 'candidate_count', value: String(fromWindow('candidate_count') || 0) },
+    { label: 'excluded_candidate_count', value: String(fromWindow('excluded_candidate_count') || 0) },
+    { label: 'last_exclude_reason', value: fromWindow('last_exclude_reason') || '' },
   ]);
 }
 
