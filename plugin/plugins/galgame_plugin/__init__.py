@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
+from concurrent.futures import Future as ConcurrentFuture
 from pathlib import Path
 import threading
 import time
@@ -27,6 +27,7 @@ from .dxcam_support import install_dxcam
 from .models import (
     ADVANCE_SPEEDS,
     ADVANCE_SPEED_MEDIUM,
+    DATA_SOURCE_BRIDGE_SDK,
     DATA_SOURCE_MEMORY_READER,
     DATA_SOURCE_NONE,
     DATA_SOURCE_OCR_READER,
@@ -370,7 +371,7 @@ class GalgamePlugin(NekoPluginBase):
         self._game_agent: GameLLMAgent | None = None
         self._memory_reader_manager: MemoryReaderManager | None = None
         self._ocr_reader_manager: OcrReaderManager | None = None
-        self._bridge_poll_task: asyncio.Task[None] | Future[None] | None = None
+        self._bridge_poll_task: asyncio.Future[None] | ConcurrentFuture[None] | None = None
         self._bridge_poll_loop: asyncio.AbstractEventLoop | None = None
         self._bridge_poll_thread: threading.Thread | None = None
         self._bridge_poll_thread_stop = threading.Event()
@@ -846,10 +847,17 @@ class GalgamePlugin(NekoPluginBase):
         self._bridge_poll_started_at = time.monotonic()
         self._last_bridge_poll_launch_at = self._bridge_poll_started_at
         self._bridge_poll_launch_count += 1
-        loop = self._ensure_bridge_poll_loop()
-        if loop is None:
-            return False
-        task = asyncio.run_coroutine_threadsafe(self._run_background_bridge_poll(), loop)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is not None and running_loop.is_running():
+            task = running_loop.create_task(self._run_background_bridge_poll())
+        else:
+            loop = self._ensure_bridge_poll_loop()
+            if loop is None:
+                return False
+            task = asyncio.run_coroutine_threadsafe(self._run_background_bridge_poll(), loop)
         task.add_done_callback(lambda _task: self._clear_completed_background_bridge_poll())
         self._bridge_poll_task = task
         return True
@@ -889,7 +897,10 @@ class GalgamePlugin(NekoPluginBase):
         if not task.done():
             task.cancel()
             try:
-                await asyncio.wrap_future(task) if isinstance(task, Future) else await task
+                if isinstance(task, ConcurrentFuture):
+                    await asyncio.wrap_future(task)
+                else:
+                    await task
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -1399,6 +1410,11 @@ class GalgamePlugin(NekoPluginBase):
                 pass
             return
 
+        bridge_sdk_candidate_available = any(
+            candidate.data_source == DATA_SOURCE_BRIDGE_SDK
+            and _session_candidate_has_text(candidate)
+            for candidate in raw_candidates.values()
+        )
         memory_reader_candidate_available = any(
             candidate.data_source == DATA_SOURCE_MEMORY_READER
             and _session_candidate_has_text(candidate)
@@ -1425,27 +1441,14 @@ class GalgamePlugin(NekoPluginBase):
             if pending_ocr_advance_capture and not force
             else 0.0
         )
-        ocr_priority_capture_needed = (
-            reader_mode == READER_MODE_AUTO
-            and ocr_reader_allowed
-            and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
-            and not memory_reader_candidate_available
-            and (
-                ocr_bootstrap_capture_needed
-                or pending_ocr_advance_capture
-                or str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
-            )
-        )
-
         if (
             self._memory_reader_manager is not None
             and memory_reader_allowed
-            and not ocr_priority_capture_needed
         ):
             self._memory_reader_manager.update_config(self._cfg)
             try:
                 memory_reader_tick = await self._memory_reader_manager.tick(
-                    bridge_sdk_available=False,
+                    bridge_sdk_available=bridge_sdk_candidate_available,
                 )
                 warnings.extend(memory_reader_tick.warnings)
                 memory_reader_runtime = memory_reader_tick.runtime
@@ -1463,6 +1466,10 @@ class GalgamePlugin(NekoPluginBase):
             and _session_candidate_has_text(candidate)
             for candidate in raw_candidates.values()
         )
+        if reader_mode == READER_MODE_AUTO and bridge_sdk_candidate_available:
+            ocr_reader_allowed = False
+            with self._state_lock:
+                self._pending_ocr_advance_captures = 0
         if reader_mode == READER_MODE_AUTO and memory_reader_candidate_available:
             ocr_reader_allowed = False
             with self._state_lock:
@@ -1521,7 +1528,7 @@ class GalgamePlugin(NekoPluginBase):
                 update_advance_speed(str(local.get("advance_speed") or ADVANCE_SPEED_MEDIUM))
             try:
                 ocr_reader_tick = await self._ocr_reader_manager.tick(
-                    bridge_sdk_available=False,
+                    bridge_sdk_available=bridge_sdk_candidate_available,
                     memory_reader_runtime=memory_reader_runtime,
                 )
                 warnings.extend(ocr_reader_tick.warnings)

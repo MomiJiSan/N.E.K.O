@@ -92,6 +92,7 @@ class GameLLMAgent:
     )
     _OCR_DIALOGUE_ADVANCE_VARIANT_ORDER = (
         "advance_click",
+        "advance_click",
         "advance_enter",
         "advance_space",
     )

@@ -5646,14 +5646,10 @@ class OcrReaderManager:
                     return selection
         if len(windows) == 1:
             candidate = windows[0]
-            if (
-                _is_confident_auto_window(candidate)
-                and int(candidate.width or 0) <= 0
-                and int(candidate.height or 0) <= 0
-            ):
+            if foreground_hwnd and _is_confident_auto_window(candidate):
                 selection.target = candidate
                 if selection.selection_mode == "auto":
-                    selection.selection_detail = "single_candidate_without_foreground_geometry"
+                    selection.selection_detail = "single_confident_candidate_without_foreground_match"
                 return selection
         if selection.selection_mode == "auto":
             selection.selection_detail = "auto_detect_needs_manual_fallback"

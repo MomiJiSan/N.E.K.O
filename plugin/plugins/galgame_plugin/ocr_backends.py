@@ -403,6 +403,8 @@ class RapidOcrBackend:
         output = runtime(np.asarray(prepared))
         return _rapidocr_text_from_output(output)
 
+    _DEFAULT_EXTRACT_TEXT = extract_text
+
     def extract_text_with_boxes(self, image: Any) -> tuple[str, list[OcrTextBox]]:
         import numpy as np
 
@@ -411,6 +413,8 @@ class RapidOcrBackend:
         output = runtime(np.asarray(prepared))
         lines = _rapidocr_lines_from_output(output)
         if not lines:
+            if type(self).extract_text is not self._DEFAULT_EXTRACT_TEXT:
+                return str(self.extract_text(image) or ""), []
             return "", []
         scale_x = prepared.width / max(float(getattr(image, "width", prepared.width)), 1.0)
         scale_y = prepared.height / max(float(getattr(image, "height", prepared.height)), 1.0)
