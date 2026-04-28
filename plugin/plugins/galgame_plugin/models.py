@@ -183,6 +183,21 @@ def sanitize_save_context(value: object) -> dict[str, str]:
     }
 
 
+def _sanitize_choice_bounds(bounds: object) -> dict[str, float]:
+    if not isinstance(bounds, dict):
+        return {}
+    try:
+        sanitized = {
+            key: float(bounds.get(key))  # type: ignore[arg-type]
+            for key in ("left", "top", "right", "bottom")
+        }
+    except (TypeError, ValueError):
+        return {}
+    if sanitized["right"] <= sanitized["left"] or sanitized["bottom"] <= sanitized["top"]:
+        return {}
+    return sanitized
+
+
 def sanitize_choice(value: object) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     choice = {
@@ -191,17 +206,9 @@ def sanitize_choice(value: object) -> dict[str, Any]:
         "index": _int(raw.get("index"), 0),
         "enabled": _bool(raw.get("enabled"), True),
     }
-    bounds = raw.get("bounds")
-    if isinstance(bounds, dict):
-        sanitized_bounds: dict[str, float] = {}
-        for key in ("left", "top", "right", "bottom"):
-            try:
-                sanitized_bounds[key] = float(bounds.get(key))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                sanitized_bounds = {}
-                break
-        if sanitized_bounds and sanitized_bounds["right"] > sanitized_bounds["left"] and sanitized_bounds["bottom"] > sanitized_bounds["top"]:
-            choice["bounds"] = sanitized_bounds
+    sanitized_bounds = _sanitize_choice_bounds(raw.get("bounds"))
+    if sanitized_bounds:
+        choice["bounds"] = sanitized_bounds
     bounds_coordinate_space = _string(raw.get("bounds_coordinate_space")).strip()
     if bounds_coordinate_space:
         choice["bounds_coordinate_space"] = bounds_coordinate_space

@@ -241,6 +241,7 @@ _DXCAM_GRAB_RETRY_DELAY_SECONDS = 0.05
 _STALE_CAPTURE_FRAME_THRESHOLD = 3
 _RAPIDOCR_RUNTIME_CACHE_LOCK = threading.Lock()
 _RAPIDOCR_RUNTIME_CACHE: dict[tuple[str, str, str, str, str], Any] = {}
+_RAPIDOCR_RUNTIME_CACHE_MAX_ENTRIES = 2
 _OCR_PREPARE_UPSCALE_SOURCE_LONG_EDGE = 900
 _OCR_PREPARE_TARGET_LONG_EDGE = 1400
 _OCR_PREPARE_MAX_LONG_EDGE = 1600
@@ -250,6 +251,10 @@ _BACKEND_PLAN_CACHE_TTL_SECONDS = 5.0
 _BACKGROUND_SCENE_HASH_SIZE = 8
 _BACKGROUND_SCENE_CHANGE_DISTANCE = 18
 _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS = 2
+_PENDING_VISUAL_SCENE_MAX_AGE_SECONDS = 2.0
+_OCR_LINE_ID_MAX_COLLISION_SUFFIX = 10000
+_OCR_AUTO_RECALIBRATE_MAX_SECONDS = 15.0
+_OCR_AUTO_RECALIBRATE_MAX_OCR_ATTEMPTS = 96
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -1567,6 +1572,7 @@ class PrintWindowCaptureBackend:
         return f"{target.process_name}({target.pid}) {target.title}"
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
+        _require_visible_capture_target(target, backend_kind=self.kind)
         rect = _target_window_rect(target)
         image = self._capture_full_window(target.hwnd, rect)
         return _crop_window_image(
@@ -1883,6 +1889,9 @@ class RapidOcrBackend:
                                 force_reload=False,
                             )
                             _RAPIDOCR_RUNTIME_CACHE[key] = runtime
+                            while len(_RAPIDOCR_RUNTIME_CACHE) > _RAPIDOCR_RUNTIME_CACHE_MAX_ENTRIES:
+                                old_key = next(iter(_RAPIDOCR_RUNTIME_CACHE))
+                                _RAPIDOCR_RUNTIME_CACHE.pop(old_key, None)
                         self._runtime = runtime
         return self._runtime
 
@@ -2141,7 +2150,18 @@ class _MouseWheelMonitor:
         self.ensure_running()
         with self._lock:
             self._prune_locked()
-            return [event for event in self._events if event.seq > seq]
+            events = [event for event in self._events if event.seq > seq]
+        if not events:
+            return []
+        foreground_hwnd = _foreground_window_handle()
+        if not foreground_hwnd:
+            return events
+        return [
+            event
+            if event.foreground_hwnd
+            else replace(event, foreground_hwnd=max(0, int(foreground_hwnd or 0)))
+            for event in events
+        ]
 
     def _record(
         self,
@@ -2151,7 +2171,6 @@ class _MouseWheelMonitor:
         point_hwnd: int = 0,
     ) -> None:
         now = self._time_fn()
-        foreground_hwnd = _foreground_window_handle()
         with self._lock:
             self._seq += 1
             self._events.append(
@@ -2159,7 +2178,7 @@ class _MouseWheelMonitor:
                     seq=self._seq,
                     ts=now,
                     delta=int(delta),
-                    foreground_hwnd=max(0, int(foreground_hwnd or 0)),
+                    foreground_hwnd=0,
                     point_hwnd=max(0, int(point_hwnd or 0)),
                     kind=str(kind or "wheel"),
                 )
@@ -2364,6 +2383,7 @@ class OcrReaderBridgeWriter:
         self._state = self._initial_state("")
         self._text_to_line_id: dict[str, str] = {}
         self._line_id_owner: dict[str, str] = {}
+        self._lock = threading.RLock()
 
     @property
     def bridge_root(self) -> Path:
@@ -2389,128 +2409,138 @@ class OcrReaderBridgeWriter:
     def last_event_ts(self) -> str:
         return self._last_event_ts
 
+    @property
+    def current_state(self) -> dict[str, Any]:
+        with self._lock:
+            if not isinstance(self._state, dict):
+                return {}
+            return json.loads(json.dumps(self._state))
+
     def start_session(self, window: DetectedGameWindow) -> None:
-        started_at = utc_now_iso(self._time_fn())
-        self._game_id = _ocr_game_id_from_process(window.process_name or window.title)
-        self._session_id = f"ocr-{uuid4()}"
-        self._process_name = window.process_name
-        self._pid = window.pid
-        self._window_title = window.title
-        self._engine = OCR_READER_DEFAULT_ENGINE
-        self._started_at = started_at
-        self._last_seq = 0
-        self._last_event_ts = started_at
-        self._scene_index = 1
-        self._state = {}
-        self._state = self._initial_state(started_at)
-        self._text_to_line_id.clear()
-        self._line_id_owner.clear()
-        self._bridge_dir().mkdir(parents=True, exist_ok=True)
-        self._events_path().write_bytes(b"")
-        self._write_session_snapshot()
-        self._append_event(
-            "session_started",
-            {
-                "game_title": window.title or window.process_name,
-                "engine": self._engine,
-                "locale": "",
-                "started_at": started_at,
-                "scene_id": self._state["scene_id"],
-                "line_id": self._state["line_id"],
-                "route_id": self._state["route_id"],
-                "is_menu_open": self._state["is_menu_open"],
-                "speaker": self._state["speaker"],
-                "text": self._state["text"],
-                "choices": self._state["choices"],
-                "save_context": self._state["save_context"],
-                "stability": self._state.get("stability", ""),
-            },
-            ts=started_at,
-        )
+        with self._lock:
+            started_at = utc_now_iso(self._time_fn())
+            self._game_id = _ocr_game_id_from_process(window.process_name or window.title)
+            self._session_id = f"ocr-{uuid4()}"
+            self._process_name = window.process_name
+            self._pid = window.pid
+            self._window_title = window.title
+            self._engine = OCR_READER_DEFAULT_ENGINE
+            self._started_at = started_at
+            self._last_seq = 0
+            self._last_event_ts = started_at
+            self._scene_index = 1
+            self._state = {}
+            self._state = self._initial_state(started_at)
+            self._text_to_line_id.clear()
+            self._line_id_owner.clear()
+            self._bridge_dir().mkdir(parents=True, exist_ok=True)
+            self._events_path().write_bytes(b"")
+            self._write_session_snapshot()
+            self._append_event(
+                "session_started",
+                {
+                    "game_title": window.title or window.process_name,
+                    "engine": self._engine,
+                    "locale": "",
+                    "started_at": started_at,
+                    "scene_id": self._state["scene_id"],
+                    "line_id": self._state["line_id"],
+                    "route_id": self._state["route_id"],
+                    "is_menu_open": self._state["is_menu_open"],
+                    "speaker": self._state["speaker"],
+                    "text": self._state["text"],
+                    "choices": self._state["choices"],
+                    "save_context": self._state["save_context"],
+                    "stability": self._state.get("stability", ""),
+                },
+                ts=started_at,
+            )
 
     def emit_line(self, raw_text: str, *, ts: str) -> bool:
-        cleaned = raw_text.strip()
-        if not cleaned or not self._session_id:
-            return False
-        speaker, text = self._split_speaker_text(cleaned)
-        if not text:
-            return False
-        line_id = self._line_id_for_text(text)
-        self._state = {
-            **self._state,
-            "speaker": speaker,
-            "text": text,
-            "choices": [],
-            "scene_id": self._current_scene_id(),
-            "line_id": line_id,
-            "route_id": OCR_READER_ROUTE_ID,
-            "is_menu_open": False,
-            "save_context": self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""}),
-            "stability": "stable",
-            "ts": ts,
-        }
-        self._append_event(
-            "line_changed",
-            {
+        with self._lock:
+            cleaned = raw_text.strip()
+            if not cleaned or not self._session_id:
+                return False
+            speaker, text = self._split_speaker_text(cleaned)
+            if not text:
+                return False
+            line_id = self._line_id_for_text(text)
+            self._state = {
+                **self._state,
                 "speaker": speaker,
                 "text": text,
+                "choices": [],
+                "scene_id": self._current_scene_id(),
                 "line_id": line_id,
-                "line_id_source": "text_hash",
-                "scene_id": self._state["scene_id"],
-                "route_id": self._state["route_id"],
+                "route_id": OCR_READER_ROUTE_ID,
+                "is_menu_open": False,
+                "save_context": self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""}),
                 "stability": "stable",
-            },
-            ts=ts,
-        )
-        return True
+                "ts": ts,
+            }
+            self._append_event(
+                "line_changed",
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "line_id": line_id,
+                    "line_id_source": "text_hash",
+                    "scene_id": self._state["scene_id"],
+                    "route_id": self._state["route_id"],
+                    "stability": "stable",
+                },
+                ts=ts,
+            )
+            return True
 
     def emit_line_observed(self, raw_text: str, *, ts: str) -> bool:
-        cleaned = raw_text.strip()
-        if not cleaned or not self._session_id:
-            return False
-        speaker, text = self._split_speaker_text(cleaned)
-        if not text:
-            return False
-        normalized_text = normalize_text(text)
-        current_text = str(self._state.get("text") or "")
-        current_speaker = str(self._state.get("speaker") or "")
-        current_stability = str(self._state.get("stability") or "")
-        if current_text == text and current_speaker == speaker and current_stability in {"tentative", "stable"}:
-            return False
-        current_line_id = str(self._state.get("line_id") or "")
-        existing_line_id = self._text_to_line_id.get(normalized_text)
-        if existing_line_id and existing_line_id != current_line_id:
-            return False
-        if existing_line_id and existing_line_id == current_line_id and current_stability == "choices":
-            return False
-        line_id = self._line_id_for_text(text)
-        self._state = {
-            **self._state,
-            "speaker": speaker,
-            "text": text,
-            "choices": [],
-            "scene_id": self._current_scene_id(),
-            "line_id": line_id,
-            "route_id": OCR_READER_ROUTE_ID,
-            "is_menu_open": False,
-            "save_context": self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""}),
-            "stability": "tentative",
-            "ts": ts,
-        }
-        self._append_event(
-            "line_observed",
-            {
+        with self._lock:
+            cleaned = raw_text.strip()
+            if not cleaned or not self._session_id:
+                return False
+            speaker, text = self._split_speaker_text(cleaned)
+            if not text:
+                return False
+            normalized_text = normalize_text(text)
+            current_text = str(self._state.get("text") or "")
+            current_speaker = str(self._state.get("speaker") or "")
+            current_stability = str(self._state.get("stability") or "")
+            if current_text == text and current_speaker == speaker and current_stability in {"tentative", "stable"}:
+                return False
+            current_line_id = str(self._state.get("line_id") or "")
+            existing_line_id = self._text_to_line_id.get(normalized_text)
+            if existing_line_id and existing_line_id != current_line_id:
+                return False
+            if existing_line_id and existing_line_id == current_line_id and current_stability == "choices":
+                return False
+            line_id = self._line_id_for_text(text)
+            self._state = {
+                **self._state,
                 "speaker": speaker,
                 "text": text,
+                "choices": [],
+                "scene_id": self._current_scene_id(),
                 "line_id": line_id,
-                "line_id_source": "text_hash",
-                "scene_id": self._state["scene_id"],
-                "route_id": self._state["route_id"],
+                "route_id": OCR_READER_ROUTE_ID,
+                "is_menu_open": False,
+                "save_context": self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""}),
                 "stability": "tentative",
-            },
-            ts=ts,
-        )
-        return True
+                "ts": ts,
+            }
+            self._append_event(
+                "line_observed",
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "line_id": line_id,
+                    "line_id_source": "text_hash",
+                    "scene_id": self._state["scene_id"],
+                    "route_id": self._state["route_id"],
+                    "stability": "tentative",
+                },
+                ts=ts,
+            )
+            return True
 
     def emit_choices(
         self,
@@ -2520,85 +2550,88 @@ class OcrReaderBridgeWriter:
         choice_bounds: list[dict[str, float] | None] | None = None,
         choice_bounds_metadata: dict[str, Any] | None = None,
     ) -> bool:
-        if not choices or not self._session_id:
-            return False
-        line_id = str(self._state.get("line_id") or "")
-        if not line_id:
-            line_id = self._line_id_for_text(_canonical_choice_candidate_text(choices))
-        bounds = list(choice_bounds or [])
-        bounds_metadata = dict(choice_bounds_metadata or {})
-        payload_choices = []
-        for index, text in enumerate(choices):
-            item = {
-                "choice_id": f"{line_id}#choice{index}",
-                "text": text,
-                "index": index,
-                "enabled": True,
-            }
-            if index < len(bounds) and bounds[index]:
-                item["bounds"] = dict(bounds[index] or {})
-                for key in (
-                    "bounds_coordinate_space",
-                    "source_size",
-                    "capture_rect",
-                    "window_rect",
-                ):
-                    value = bounds_metadata.get(key)
-                    if value:
-                        item[key] = dict(value) if isinstance(value, dict) else value
-            payload_choices.append(item)
-        self._state = {
-            **self._state,
-            "line_id": line_id,
-            "scene_id": self._current_scene_id(),
-            "choices": payload_choices,
-            "is_menu_open": True,
-            "stability": "choices",
-            "ts": ts,
-        }
-        self._append_event(
-            "choices_shown",
-            {
+        with self._lock:
+            if not choices or not self._session_id:
+                return False
+            line_id = str(self._state.get("line_id") or "")
+            if not line_id:
+                line_id = self._line_id_for_text(_canonical_choice_candidate_text(choices))
+            bounds = list(choice_bounds or [])
+            bounds_metadata = dict(choice_bounds_metadata or {})
+            payload_choices = []
+            for index, text in enumerate(choices):
+                item = {
+                    "choice_id": f"{line_id}#choice{index}",
+                    "text": text,
+                    "index": index,
+                    "enabled": True,
+                }
+                if index < len(bounds) and bounds[index]:
+                    item["bounds"] = dict(bounds[index] or {})
+                    for key in (
+                        "bounds_coordinate_space",
+                        "source_size",
+                        "capture_rect",
+                        "window_rect",
+                    ):
+                        value = bounds_metadata.get(key)
+                        if value:
+                            item[key] = dict(value) if isinstance(value, dict) else value
+                payload_choices.append(item)
+            self._state = {
+                **self._state,
                 "line_id": line_id,
-                "scene_id": self._state["scene_id"],
-                "route_id": self._state["route_id"],
+                "scene_id": self._current_scene_id(),
                 "choices": payload_choices,
-            },
-            ts=ts,
-        )
-        return True
+                "is_menu_open": True,
+                "stability": "choices",
+                "ts": ts,
+            }
+            self._append_event(
+                "choices_shown",
+                {
+                    "line_id": line_id,
+                    "scene_id": self._state["scene_id"],
+                    "route_id": self._state["route_id"],
+                    "choices": payload_choices,
+                },
+                ts=ts,
+            )
+            return True
 
     def emit_heartbeat(self, *, ts: str) -> bool:
-        if not self._session_id:
-            return False
-        self._append_event(
-            "heartbeat",
-            {
-                "state_ts": str(self._state.get("ts") or ""),
-                "idle_seconds": 0,
+        with self._lock:
+            if not self._session_id:
+                return False
+            self._append_event(
+                "heartbeat",
+                {
+                    "state_ts": str(self._state.get("ts") or ""),
+                    "idle_seconds": 0,
+                    "scene_id": self._state["scene_id"],
+                    "line_id": self._state["line_id"],
+                    "route_id": self._state["route_id"],
+                },
+                ts=ts,
+                update_snapshot=False,
+            )
+            return True
+
+    def emit_error(self, message: str, *, ts: str, details: dict[str, Any] | None = None) -> bool:
+        with self._lock:
+            if not self._session_id:
+                return False
+            payload: dict[str, Any] = {
+                "message": message,
+                "source": DATA_SOURCE_OCR_READER,
                 "scene_id": self._state["scene_id"],
                 "line_id": self._state["line_id"],
                 "route_id": self._state["route_id"],
-            },
-            ts=ts,
-            update_snapshot=False,
-        )
-        return True
-
-    def emit_error(self, message: str, *, ts: str, details: dict[str, Any] | None = None) -> bool:
-        if not self._session_id:
-            return False
-        payload: dict[str, Any] = {
-            "message": message,
-            "source": DATA_SOURCE_OCR_READER,
-            "scene_id": self._state["scene_id"],
-            "line_id": self._state["line_id"],
-            "route_id": self._state["route_id"],
-        }
-        if details:
-            payload["details"] = dict(details)
-        self._append_event("error", payload, ts=ts, update_snapshot=False)
-        return True
+            }
+            if details:
+                payload["details"] = dict(details)
+            self._append_event("error", payload, ts=ts, update_snapshot=False)
+            return True
 
     def emit_scene_changed(
         self,
@@ -2608,65 +2641,69 @@ class OcrReaderBridgeWriter:
         reason: str,
         background_hash: str = "",
     ) -> bool:
-        if not self._session_id or not scene_id:
-            return False
-        if str(self._state.get("scene_id") or "") == scene_id:
-            return False
-        self._state = {
-            **self._state,
-            "scene_id": scene_id,
-            "choices": [],
-            "is_menu_open": False,
-            "stability": "",
-            "ts": ts,
-        }
-        self._append_event(
-            "scene_changed",
-            {
+        with self._lock:
+            if not self._session_id or not scene_id:
+                return False
+            if str(self._state.get("scene_id") or "") == scene_id:
+                return False
+            self._state = {
+                **self._state,
                 "scene_id": scene_id,
-                "route_id": self._state["route_id"],
-                "reason": reason,
-                "background_hash": background_hash,
-            },
-            ts=ts,
-        )
-        return True
+                "choices": [],
+                "is_menu_open": False,
+                "stability": "",
+                "ts": ts,
+            }
+            self._append_event(
+                "scene_changed",
+                {
+                    "scene_id": scene_id,
+                    "route_id": self._state["route_id"],
+                    "reason": reason,
+                    "background_hash": background_hash,
+                },
+                ts=ts,
+            )
+            return True
 
     def advance_visual_scene(self, *, ts: str, background_hash: str = "") -> str:
-        self._scene_index += 1
-        scene_id = f"ocr:{self._game_id or 'unknown'}:scene-{self._scene_index:04d}"
-        self.emit_scene_changed(
-            scene_id=scene_id,
-            ts=ts,
-            reason="background_changed",
-            background_hash=background_hash,
-        )
-        return scene_id
+        with self._lock:
+            self._scene_index += 1
+            scene_id = f"ocr:{self._game_id or 'unknown'}:scene-{self._scene_index:04d}"
+            self.emit_scene_changed(
+                scene_id=scene_id,
+                ts=ts,
+                reason="background_changed",
+                background_hash=background_hash,
+            )
+            return scene_id
 
     def end_session(self, *, ts: str) -> bool:
-        if not self._session_id:
-            return False
-        payload = {
-            "scene_id": self._state["scene_id"],
-            "line_id": self._state["line_id"],
-            "route_id": self._state["route_id"],
-        }
-        self._append_event("session_ended", payload, ts=ts, update_snapshot=False)
-        return True
+        with self._lock:
+            if not self._session_id:
+                return False
+            payload = {
+                "scene_id": self._state["scene_id"],
+                "line_id": self._state["line_id"],
+                "route_id": self._state["route_id"],
+            }
+            self._append_event("session_ended", payload, ts=ts, update_snapshot=False)
+            return True
 
     def runtime(self) -> OcrReaderRuntime:
-        return OcrReaderRuntime(
-            enabled=True,
-            status="active" if self._session_id else "idle",
-            detail="",
-            process_name=self._process_name,
-            pid=self._pid,
-            window_title=self._window_title,
-            game_id=self._game_id,
-            session_id=self._session_id,
-            last_seq=self._last_seq,
-            last_event_ts=self._last_event_ts,
-        )
+        with self._lock:
+            return OcrReaderRuntime(
+                enabled=True,
+                status="active" if self._session_id else "idle",
+                detail="",
+                process_name=self._process_name,
+                pid=self._pid,
+                window_title=self._window_title,
+                game_id=self._game_id,
+                session_id=self._session_id,
+                last_seq=self._last_seq,
+                last_event_ts=self._last_event_ts,
+            )
 
     def _initial_state(self, ts: str) -> dict[str, Any]:
         return {
@@ -2751,31 +2788,30 @@ class OcrReaderBridgeWriter:
         ts: str,
         update_snapshot: bool = True,
     ) -> None:
-        self._last_seq += 1
-        self._last_event_ts = ts
-        event = {
-            "protocol_version": 1,
-            "seq": self._last_seq,
-            "ts": ts,
-            "type": event_type,
-            "session_id": self._session_id,
-            "game_id": self._game_id,
-            "payload": payload,
-        }
-        with self._events_path().open("ab") as handle:
-            handle.write(
-                json.dumps(
-                    event,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                + b"\n"
-            )
-            handle.flush()
-        if update_snapshot:
-            self._write_session_snapshot()
-            return
-        self._write_session_snapshot()
+        with self._lock:
+            self._last_seq += 1
+            self._last_event_ts = ts
+            event = {
+                "protocol_version": 1,
+                "seq": self._last_seq,
+                "ts": ts,
+                "type": event_type,
+                "session_id": self._session_id,
+                "game_id": self._game_id,
+                "payload": payload,
+            }
+            with self._events_path().open("ab") as handle:
+                handle.write(
+                    json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                handle.flush()
+            if update_snapshot:
+                self._write_session_snapshot()
 
     def _line_id_for_text(self, text: str) -> str:
         normalized = normalize_text(text)
@@ -2793,15 +2829,14 @@ class OcrReaderBridgeWriter:
                 self._line_id_owner[candidate] = normalized
                 self._text_to_line_id[normalized] = candidate
                 return candidate
-        suffix = 1
-        while True:
+        for suffix in range(1, _OCR_LINE_ID_MAX_COLLISION_SUFFIX + 1):
             candidate = f"ocr:{digest}#{suffix}"
             owner = self._line_id_owner.get(candidate)
             if owner in {None, normalized}:
                 self._line_id_owner[candidate] = normalized
                 self._text_to_line_id[normalized] = candidate
                 return candidate
-            suffix += 1
+        raise RuntimeError("ocr line_id collision limit exceeded")
 
     @staticmethod
     def _split_speaker_text(raw_text: str) -> tuple[str, str]:
@@ -2883,6 +2918,8 @@ class OcrReaderManager:
         self._pending_background_change_count = 0
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
+        self._pending_visual_scene_count = 0
+        self._tick_lock = threading.Lock()
         self._wheel_monitor = _MouseWheelMonitor(time_fn=self._time_fn)
         self._wheel_monitor.start()
         self._last_consumed_wheel_seq = 0
@@ -2967,7 +3004,7 @@ class OcrReaderManager:
     def _should_emit_observed_lines_for_capture(self, *, after_advance_trigger_mode: bool) -> bool:
         if not after_advance_trigger_mode:
             return True
-        state = getattr(self._writer, "_state", {})
+        state = self._writer.current_state
         if not isinstance(state, dict):
             return True
         has_current_text = bool(str(state.get("text") or "").strip())
@@ -3018,16 +3055,22 @@ class OcrReaderManager:
         if frame is None:
             return ""
         try:
-            if hasattr(frame, "tobytes") and hasattr(frame, "size"):
+            if hasattr(frame, "tobytes"):
                 size = getattr(frame, "size", "")
+                mode = getattr(frame, "mode", "")
+                shape = getattr(frame, "shape", "")
                 payload = frame.tobytes()
-                return hashlib.sha1(repr(size).encode("utf-8") + payload).hexdigest()[:16]
+                metadata = f"{size!r}|{mode!r}|{shape!r}".encode("utf-8", "ignore")
+                return hashlib.blake2b(metadata + payload, digest_size=8).hexdigest()
         except Exception:
-            return ""
+            pass
         try:
-            return hashlib.sha1(repr(frame).encode("utf-8", "ignore")).hexdigest()[:16]
+            background_hash = _perceptual_hash_image(frame)
+            if background_hash:
+                return f"phash:{background_hash}"
         except Exception:
             return ""
+        return ""
 
     @staticmethod
     def _background_capture_profile() -> OcrCaptureProfile:
@@ -3046,6 +3089,12 @@ class OcrReaderManager:
     def _hash_distance(left: str, right: str) -> int:
         if not left or not right:
             return 0
+        left = str(left or "").strip()
+        right = str(right or "").strip()
+        if left.startswith("phash:"):
+            left = left.split(":", 1)[1]
+        if right.startswith("phash:"):
+            right = right.split(":", 1)[1]
         try:
             return (int(left, 16) ^ int(right, 16)).bit_count()
         except Exception:
@@ -3085,6 +3134,10 @@ class OcrReaderManager:
         self._default_ocr_state.reset()
         self._aihong_menu_ocr_state.reset()
         if defer_scene_emit:
+            if self._pending_visual_scene_hash:
+                self._pending_visual_scene_count += 1
+            else:
+                self._pending_visual_scene_count = 1
             self._pending_visual_scene_hash = background_hash
             self._pending_visual_scene_at = now
             return False
@@ -3100,17 +3153,22 @@ class OcrReaderManager:
         if not background_hash:
             return False
         scene_at = float(self._pending_visual_scene_at or now)
+        scene_count = max(1, int(self._pending_visual_scene_count or 1))
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
-        return bool(
-            self._writer.advance_visual_scene(
-                ts=utc_now_iso(scene_at if scene_at > 0 else now),
-                background_hash=background_hash,
-            )
-        )
+        self._pending_visual_scene_count = 0
+        committed = False
+        for _index in range(scene_count):
+            committed = bool(
+                self._writer.advance_visual_scene(
+                    ts=utc_now_iso(scene_at if scene_at > 0 else now),
+                    background_hash=background_hash,
+                )
+            ) or committed
+        return committed
 
     def _line_payload_from_writer(self, *, stability: str) -> dict[str, Any]:
-        state = getattr(self._writer, "_state", {})
+        state = self._writer.current_state
         if not isinstance(state, dict):
             return {}
         text = str(state.get("text") or "")
@@ -3140,7 +3198,7 @@ class OcrReaderManager:
             return "diagnostic_required"
         if detail in {"attached_no_text_yet", "self_ui_guard_blocked"}:
             return "no_text"
-        state = getattr(self._writer, "_state", {})
+        state = self._writer.current_state
         stability = str(state.get("stability") or "") if isinstance(state, dict) else ""
         if stability == "choices":
             return "choices"
@@ -3523,6 +3581,7 @@ class OcrReaderManager:
         return (left, top, right, bottom)
 
     def auto_recalibrate_dialogue_profile(self) -> dict[str, Any]:
+        started_at = self._time_fn()
         if not self._config.ocr_reader_enabled:
             raise ValueError("ocr_reader 未启用，无法自动重校准对白区")
         if not self._platform_fn():
@@ -3647,6 +3706,8 @@ class OcrReaderManager:
         min_height = max(24, int(image_height * 0.08))
         max_height = max(min_height, int(image_height * 0.45))
         visited_pairs: set[tuple[float, float, float, float]] = set()
+        ocr_attempts = 0
+        scan_exhausted = False
 
         def _consider_candidate(
             top_ratio: float,
@@ -3654,7 +3715,9 @@ class OcrReaderManager:
             left_inset_ratio: float,
             right_inset_ratio: float,
         ) -> None:
-            nonlocal best_candidate
+            nonlocal best_candidate, ocr_attempts, scan_exhausted
+            if scan_exhausted:
+                return
             key = (
                 round(top_ratio, 2),
                 round(bottom_inset_ratio, 2),
@@ -3682,6 +3745,13 @@ class OcrReaderManager:
                 return
             if right_px - left_px < 10:
                 return
+            if (
+                self._time_fn() - started_at >= _OCR_AUTO_RECALIBRATE_MAX_SECONDS
+                or ocr_attempts >= _OCR_AUTO_RECALIBRATE_MAX_OCR_ATTEMPTS
+            ):
+                scan_exhausted = True
+                return
+            ocr_attempts += 1
             extracted = self._extract_text_from_image(
                 full_image.crop((left_px, top_px, right_px, bottom_px)),
                 plan=backend_plan,
@@ -3783,6 +3853,8 @@ class OcrReaderManager:
                         )
 
         if best_candidate is None:
+            if scan_exhausted:
+                raise ValueError("auto recalibrate OCR dialogue profile timed out; please retry on a stable dialogue screen")
             raise ValueError("自动重校准失败：请先停在稳定对白界面再重试")
 
         window_width = max(0, int(target.width or image_width))
@@ -4040,6 +4112,24 @@ class OcrReaderManager:
         self._attached_window = None
 
     async def tick(
+        self,
+        *,
+        bridge_sdk_available: bool,
+        memory_reader_runtime: dict[str, Any],
+    ) -> OcrReaderTickResult:
+        if not self._tick_lock.acquire(blocking=False):
+            result = OcrReaderTickResult(runtime=self._runtime.to_dict())
+            result.warnings.append("ocr_reader tick skipped because previous tick is still running")
+            return result
+        try:
+            return await self._tick_unlocked(
+                bridge_sdk_available=bridge_sdk_available,
+                memory_reader_runtime=memory_reader_runtime,
+            )
+        finally:
+            self._tick_lock.release()
+
+    async def _tick_unlocked(
         self,
         *,
         bridge_sdk_available: bool,
@@ -4537,7 +4627,20 @@ class OcrReaderManager:
 
         status = self._runtime.status
         detail = self._runtime.detail
-        observed_or_stable_emitted = int(self._writer.last_seq or 0) > event_seq_before_capture
+        pending_scene_committed = False
+        if (
+            after_advance_trigger_mode
+            and not emitted
+            and self._pending_visual_scene_hash
+            and now - float(self._pending_visual_scene_at or now) >= _PENDING_VISUAL_SCENE_MAX_AGE_SECONDS
+        ):
+            if self._commit_pending_visual_scene(now=now):
+                pending_scene_committed = True
+                result.should_rescan = True
+        observed_or_stable_emitted = (
+            int(self._writer.last_seq or 0) > event_seq_before_capture
+            and not pending_scene_committed
+        )
 
         if emitted:
             result.stable_event_emitted = True
@@ -4773,14 +4876,6 @@ class OcrReaderManager:
         if tesseract.available:
             tesseract.detail = f"auto_fallback_from_rapidocr:{rapidocr.detail}"
             plan.primary = tesseract
-            self._backend_plan_cache_key = cache_key
-            self._backend_plan_cache_at = now
-            self._backend_plan_cache = plan
-            return plan
-        if rapidocr.available or bool(self._config.rapidocr_enabled):
-            plan.primary = rapidocr
-            if tesseract.kind:
-                plan.fallback = tesseract
             self._backend_plan_cache_key = cache_key
             self._backend_plan_cache_at = now
             self._backend_plan_cache = plan

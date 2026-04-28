@@ -291,6 +291,17 @@ let refreshInFlight = null;
 let autoRefreshTimer = null;
 let autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
 let activeInstallTab = 'rapidocr';
+let settingsDirty = false;
+let settingsSaveInFlight = false;
+
+const SETTINGS_CONTROL_IDS = new Set([
+  'modeSelect',
+  'pushToggle',
+  'advanceSpeedSelect',
+  'readerModeSelect',
+  'ocrPollIntervalInput',
+  'ocrTriggerModeSelect',
+]);
 
 const latestInsights = {
   explainKey: '',
@@ -466,6 +477,34 @@ function syncAgentResumeButton(status = {}) {
   }
 }
 
+function isSettingsControlElement(element) {
+  return Boolean(element && SETTINGS_CONTROL_IDS.has(element.id || ''));
+}
+
+function shouldPreserveSettingsControls() {
+  return settingsDirty || settingsSaveInFlight || isSettingsControlElement(document.activeElement);
+}
+
+function syncSettingsValue(id, value) {
+  if (shouldPreserveSettingsControls()) {
+    return;
+  }
+  const node = document.getElementById(id);
+  if (node) {
+    node.value = value;
+  }
+}
+
+function syncSettingsChecked(id, checked) {
+  if (shouldPreserveSettingsControls()) {
+    return;
+  }
+  const node = document.getElementById(id);
+  if (node) {
+    node.checked = Boolean(checked);
+  }
+}
+
 function renderAgentUserNotice(status = {}) {
   const node = document.getElementById('agentUserNotice');
   const title = document.getElementById('agentUserNoticeTitle');
@@ -475,10 +514,16 @@ function renderAgentUserNotice(status = {}) {
   const pauseKind = status.agent_pause_kind || 'none';
   const label = AGENT_USER_STATUS_LABELS_ZH[userStatus] || userStatus || '等待状态';
   const targetText = formatOcrTargetForUser(status);
+  const mode = status.mode || '';
+  const waitingInAutoMode = userStatus === 'read_only' && mode === 'choice_advisor';
+  const displayLabel = waitingInAutoMode ? '等待可操作状态' : label;
+  const displayPauseMessage = waitingInAutoMode && !status.agent_pause_message
+    ? '自动推进已开启，正在等待游戏会话、OCR 台词或目标窗口进入可操作状态。'
+    : status.agent_pause_message;
 
   node.hidden = false;
-  title.textContent = label;
-  body.textContent = status.agent_pause_message
+  title.textContent = displayLabel;
+  body.textContent = displayPauseMessage
     || (userStatus === 'read_only' && status.mode === 'companion'
       ? '游戏窗口已在前台，但伴读模式不会自动推进。需要自动推进时请切到自动推进模式。'
       : '')
@@ -1473,22 +1518,16 @@ async function restoreTesseractInstallState() {
 function renderStatus(status) {
   latestStatus = status;
   document.getElementById('summaryText').textContent = buildStatusSummaryText(status);
-  document.getElementById('modeSelect').value = status.mode || 'companion';
-  document.getElementById('pushToggle').checked = Boolean(status.push_notifications);
-  document.getElementById('advanceSpeedSelect').value = status.advance_speed || 'medium';
-  const readerModeSelect = document.getElementById('readerModeSelect');
-  if (readerModeSelect) {
-    readerModeSelect.value = status.reader_mode || 'auto';
-  }
+  syncSettingsValue('modeSelect', status.mode || 'companion');
+  syncSettingsChecked('pushToggle', Boolean(status.push_notifications));
+  syncSettingsValue('advanceSpeedSelect', status.advance_speed || 'medium');
+  syncSettingsValue('readerModeSelect', status.reader_mode || 'auto');
   const ocrPollIntervalInput = document.getElementById('ocrPollIntervalInput');
-  if (ocrPollIntervalInput) {
+  if (ocrPollIntervalInput && !shouldPreserveSettingsControls()) {
     const interval = Number(status.ocr_reader_poll_interval_seconds || 2);
     ocrPollIntervalInput.value = Number.isFinite(interval) ? interval.toFixed(1) : '2.0';
   }
-  const ocrTriggerModeSelect = document.getElementById('ocrTriggerModeSelect');
-  if (ocrTriggerModeSelect) {
-    ocrTriggerModeSelect.value = status.ocr_reader_trigger_mode || 'after_advance';
-  }
+  syncSettingsValue('ocrTriggerModeSelect', status.ocr_reader_trigger_mode || 'after_advance');
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
@@ -2863,17 +2902,25 @@ function syncAutoRefreshIntervalForStatus(status = latestStatus) {
 }
 
 async function refreshAll(options = {}) {
-  if (refreshInFlight) {
-    return refreshInFlight;
-  }
-
   const {
     preserveFlash = false,
     silent = false,
     forceInsights = false,
     insightMode = 'background',
     showInsightPending = false,
+    forceRefresh = false,
   } = options;
+  if (refreshInFlight) {
+    if (!forceRefresh) {
+      return refreshInFlight;
+    }
+    try {
+      await refreshInFlight;
+    } catch (error) {
+      console.warn('[galgame_plugin ui] ignored stale refresh before forced refresh', error);
+    }
+  }
+
   refreshInFlight = (async () => {
     if (!preserveFlash && !silent) {
       setFlash('', 'info');
@@ -3092,6 +3139,7 @@ async function saveMode() {
     return;
   }
   try {
+    settingsSaveInFlight = true;
     setFlash('正在保存设置...', 'info');
     await callPlugin('galgame_set_mode', {
       mode,
@@ -3104,9 +3152,13 @@ async function saveMode() {
       trigger_mode: ocrTriggerMode,
     });
     setFlash('设置已保存', 'success');
-    await refreshAll({ preserveFlash: true, forceInsights: true });
+    settingsDirty = false;
+    settingsSaveInFlight = false;
+    await refreshAll({ preserveFlash: true, forceInsights: true, forceRefresh: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
+  } finally {
+    settingsSaveInFlight = false;
   }
 }
 
@@ -3385,6 +3437,19 @@ document.getElementById('refreshBtn').addEventListener('click', async () => {
 });
 document.getElementById('saveModeBtn').addEventListener('click', () => {
   withButtonPending('saveModeBtn', '保存中...', saveMode).catch(() => {});
+});
+SETTINGS_CONTROL_IDS.forEach((id) => {
+  const node = document.getElementById(id);
+  if (!node) {
+    return;
+  }
+  const markDirty = () => {
+    if (!settingsSaveInFlight) {
+      settingsDirty = true;
+    }
+  };
+  node.addEventListener('input', markDirty);
+  node.addEventListener('change', markDirty);
 });
 document.getElementById('clearBindBtn').addEventListener('click', async () => {
   await withButtonPending('clearBindBtn', '恢复中...', () => bindGame(''));

@@ -92,8 +92,8 @@ class GameLLMAgent:
     )
     _OCR_DIALOGUE_ADVANCE_VARIANT_ORDER = (
         "advance_click",
-        "advance_click",
-        "advance_click",
+        "advance_enter",
+        "advance_space",
     )
     _VIRTUAL_MOUSE_RECENT_SUCCESS_SECONDS = 30.0
     _VIRTUAL_MOUSE_SKIP_AFTER_CONSECUTIVE_FAILURES = 2
@@ -219,7 +219,12 @@ class GameLLMAgent:
         try:
             if task_loop.is_closed():
                 return
-            task_loop.call_soon_threadsafe(task.cancel)
+
+            def _cancel_if_pending() -> None:
+                if not task.done():
+                    task.cancel()
+
+            task_loop.call_soon_threadsafe(_cancel_if_pending)
         except RuntimeError:
             return
 
@@ -3099,6 +3104,15 @@ class GameLLMAgent:
                 "agent_can_resume_by_focus": False,
             }
         if user_status == "read_only":
+            if mode == "choice_advisor" and not self._is_actionable(shared):
+                return {
+                    "agent_pause_kind": "read_only",
+                    "agent_pause_message": (
+                        "自动推进已开启，正在等待游戏会话、OCR 台词或目标窗口进入可操作状态。"
+                    ),
+                    "agent_can_resume_by_button": False,
+                    "agent_can_resume_by_focus": False,
+                }
             mode_label = "伴读/静默模式" if mode in {"silent", "companion"} else "只读模式"
             return {
                 "agent_pause_kind": "read_only",
