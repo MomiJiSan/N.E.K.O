@@ -324,8 +324,9 @@ class DxcamCaptureBackend:
         if callable(stop):
             try:
                 stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                if self._logger is not None:
+                    self._logger.debug("ocr_reader dxcam camera stop failed during reset: %s", exc, exc_info=True)
 
     def capture_frame(self, target: Any, profile: Any) -> Any:
         from PIL import Image
@@ -413,6 +414,14 @@ class Win32CaptureBackend:
                 return frame
             except Exception as exc:
                 errors.append(f"{kind}_failed:{exc}")
+                if self._logger is not None:
+                    self._logger.debug(
+                        "ocr_reader capture backend %s failed while selection=%s: %s",
+                        kind,
+                        self.selection,
+                        exc,
+                        exc_info=True,
+                    )
                 if any(
                     marker in str(exc)
                     for marker in (

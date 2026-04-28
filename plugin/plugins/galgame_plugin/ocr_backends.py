@@ -389,7 +389,7 @@ class RapidOcrBackend:
                 self._warmup_error = str(exc)
                 if logger is not None:
                     try:
-                        logger.debug("ocr_reader RapidOCR warmup skipped/failed: %s", exc)
+                        logger.debug("ocr_reader RapidOCR warmup skipped/failed: %s", exc, exc_info=True)
                     except Exception:
                         pass
 

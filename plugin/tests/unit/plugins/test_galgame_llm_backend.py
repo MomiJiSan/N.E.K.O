@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tomllib
 from pathlib import Path
 
@@ -24,6 +26,78 @@ class _Logger:
 
     def exception(self, *args, **kwargs):
         return None
+
+
+@pytest.mark.plugin_unit
+def test_llm_backend_prompt_message_contracts_are_stable() -> None:
+    backend = GalgameLLMBackend(_Logger())
+    contexts = {
+        "explain_line": {"line_id": "line-1", "text": "line text"},
+        "summarize_scene": {"scene_id": "scene-a", "lines": [{"text": "line text"}]},
+        "suggest_choice": {
+            "visible_choices": [
+                {"choice_id": "choice-1", "text": "left"},
+                {"choice_id": "choice-2", "text": "right"},
+            ]
+        },
+        "agent_reply": {
+            "prompt": "what is happening?",
+            "public_context": {"scene_id": "scene-a"},
+        },
+    }
+    expected_schema_tokens = {
+        "explain_line": ("explanation", "evidence"),
+        "summarize_scene": ("summary", "key_points"),
+        "suggest_choice": ("choices", "choice_id"),
+        "agent_reply": ("reply", "public_context"),
+    }
+
+    for operation, context in contexts.items():
+        messages = backend._build_messages(operation, context)
+
+        assert [message["role"] for message in messages] == ["system", "user"]
+        assert "JSON" in messages[0]["content"]
+        assert "context:" in messages[1]["content"]
+        for token in expected_schema_tokens[operation]:
+            assert token in messages[1]["content"]
+
+    payload = {
+        operation: backend._build_messages(operation, context)
+        for operation, context in contexts.items()
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert hashlib.sha256(text.encode("utf-8")).hexdigest() == (
+        "5b68170c5190399f399acb76ca63bdbea29d7d4d7db61510e55ea3728a92e80d"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_backend_json_correction_prompt_preserves_invalid_reply() -> None:
+    backend = GalgameLLMBackend(_Logger())
+    calls: list[list[dict[str, str]]] = []
+
+    async def _fake_call_model(*, operation: str, messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not-json"
+        return '{"reply": "ok"}'
+
+    backend._call_model = _fake_call_model  # type: ignore[method-assign]
+
+    raw_text = await backend._invoke_json_with_correction(
+        operation="agent_reply",
+        messages=[
+            {"role": "system", "content": "system JSON"},
+            {"role": "user", "content": "user context"},
+        ],
+    )
+
+    assert raw_text == '{"reply": "ok"}'
+    assert len(calls) == 2
+    assert calls[1][-2] == {"role": "assistant", "content": "not-json"}
+    assert calls[1][-1]["role"] == "user"
+    assert "JSON" in calls[1][-1]["content"]
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from plugin.plugins.galgame_plugin.memory_reader import (
 from plugin.plugins.galgame_plugin.models import (
     OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST,
     OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT,
+    OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET,
     OCR_CAPTURE_PROFILE_SAVE_SCOPE_PROCESS_FALLBACK,
     OCR_CAPTURE_PROFILE_SAVE_SCOPE_WINDOW_BUCKET,
     DATA_SOURCE_BRIDGE_SDK,
@@ -56,6 +57,7 @@ from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
     OcrReaderBridgeWriter,
     OcrReaderManager,
+    OcrReaderRuntime,
     _coerce_aihong_menu_choices,
     _looks_like_aihong_menu_status_only_text,
     _looks_like_noise_ocr_text,
@@ -3123,6 +3125,7 @@ def test_ocr_reader_foreground_refresh_updates_target_without_capture(
     assert runtime["foreground_hwnd"] == target.hwnd
     assert runtime["target_hwnd"] == target.hwnd
     assert runtime["foreground_refresh_detail"] == "manual_target_exact:foreground_hwnd"
+    _assert_window_runtime_group_matches_flat(runtime)
 
     monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 999999)
     runtime = manager.refresh_foreground_state()
@@ -3131,6 +3134,7 @@ def test_ocr_reader_foreground_refresh_updates_target_without_capture(
     assert runtime["foreground_hwnd"] == 999999
     assert runtime["target_hwnd"] == target.hwnd
     assert runtime["foreground_refresh_detail"] == "manual_target_exact:background"
+    _assert_window_runtime_group_matches_flat(runtime)
 
     monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 888888)
     monkeypatch.setattr(galgame_ocr_reader, "_window_process_id", lambda hwnd: target.pid)
@@ -3140,6 +3144,7 @@ def test_ocr_reader_foreground_refresh_updates_target_without_capture(
     assert runtime["foreground_hwnd"] == 888888
     assert runtime["target_hwnd"] == target.hwnd
     assert runtime["foreground_refresh_detail"] == "manual_target_exact:foreground_pid"
+    _assert_window_runtime_group_matches_flat(runtime)
 
 
 @pytest.mark.plugin_unit
@@ -3183,6 +3188,7 @@ def test_ocr_reader_foreground_refresh_rebounds_manual_target_by_signature(
     assert runtime["target_is_foreground"] is True
     assert runtime["target_hwnd"] == rebound.hwnd
     assert runtime["foreground_refresh_detail"] == "manual_target_rebound:foreground_hwnd"
+    _assert_window_runtime_group_matches_flat(runtime)
 
 
 @pytest.mark.plugin_unit
@@ -4852,6 +4858,240 @@ def test_ocr_runtime_reports_pending_visual_scene_count(tmp_path: Path) -> None:
     assert runtime["pending_visual_scene_count"] == 2
     assert runtime["advance"]["pending_visual_scene_count"] == 2
     assert runtime["capture"]["diagnostic_required"] is False
+
+
+@pytest.mark.plugin_unit
+def _assert_window_runtime_group_matches_flat(runtime: dict[str, object]) -> None:
+    window = runtime["window"]
+    assert isinstance(window, dict)
+    assert window["process_name"] == runtime["process_name"]
+    assert window["pid"] == runtime["pid"]
+    assert window["title"] == runtime["window_title"]
+    assert window["width"] == runtime["width"]
+    assert window["height"] == runtime["height"]
+    assert window["aspect_ratio"] == runtime["aspect_ratio"]
+    assert window["selection_mode"] == runtime["target_selection_mode"]
+    assert window["selection_detail"] == runtime["target_selection_detail"]
+    assert window["effective_window_key"] == runtime["effective_window_key"]
+    assert window["effective_window_title"] == runtime["effective_window_title"]
+    assert window["effective_process_name"] == runtime["effective_process_name"]
+    assert window["target_is_foreground"] == runtime["target_is_foreground"]
+    assert window["manual_target"] == runtime["manual_target"]
+    assert window["locked_target"] == runtime["locked_target"]
+    assert window["candidate_count"] == runtime["candidate_count"]
+    assert window["excluded_candidate_count"] == runtime["excluded_candidate_count"]
+    assert window["last_exclude_reason"] == runtime["last_exclude_reason"]
+    assert window["foreground_refresh_at"] == runtime["foreground_refresh_at"]
+    assert window["foreground_refresh_detail"] == runtime["foreground_refresh_detail"]
+    assert window["foreground_hwnd"] == runtime["foreground_hwnd"]
+    assert window["target_hwnd"] == runtime["target_hwnd"]
+
+
+def test_ocr_runtime_group_states_match_serialized_groups() -> None:
+    runtime = OcrReaderRuntime(
+        enabled=True,
+        status="active",
+        process_name="DemoGame.exe",
+        pid=7001,
+        window_title="Demo Window",
+        width=1280,
+        height=720,
+        aspect_ratio=1280 / 720,
+        capture_stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        capture_profile={"top_ratio": 0.47},
+        capture_profile_match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT,
+        capture_profile_bucket_key="1280x720",
+        backend_kind="rapidocr",
+        backend_detail="ready",
+        backend_path="rapidocr",
+        backend_model="default",
+        tesseract_path="C:/Tesseract/tesseract.exe",
+        languages="chi_sim+eng",
+        target_selection_mode="auto",
+        target_selection_detail="foreground",
+        effective_window_key="hwnd:401",
+        effective_window_title="Demo Window",
+        effective_process_name="DemoGame.exe",
+        target_is_foreground=True,
+        manual_target={"mode": "manual"},
+        locked_target={"window_key": "hwnd:401"},
+        candidate_count=2,
+        excluded_candidate_count=1,
+        last_exclude_reason="self-ui",
+        consecutive_no_text_polls=3,
+        last_observed_at="2026-04-28T00:00:00Z",
+        last_capture_profile={"top_ratio": 0.50},
+        last_capture_stage=OCR_CAPTURE_PROFILE_STAGE_MENU,
+        ocr_capture_diagnostic_required=True,
+        ocr_context_state="stable-dialogue",
+        last_capture_attempt_at="2026-04-28T00:00:01Z",
+        last_capture_completed_at="2026-04-28T00:00:02Z",
+        last_capture_error="",
+        last_raw_ocr_text="hello",
+        last_observed_line={"text": "hello"},
+        last_stable_line={"text": "hello"},
+        capture_backend_kind="dxcam",
+        capture_backend_detail="active",
+        last_capture_image_hash="phash:000f",
+        last_capture_source_size={"width": 1280, "height": 720},
+        last_capture_rect={"left": 0, "top": 360, "right": 1280, "bottom": 720},
+        last_capture_window_rect={"left": 10, "top": 20, "right": 1290, "bottom": 740},
+        consecutive_same_capture_frames=4,
+        stale_capture_backend=True,
+        foreground_refresh_at="2026-04-28T00:00:03Z",
+        foreground_refresh_detail="matched",
+        foreground_hwnd=401,
+        target_hwnd=401,
+        foreground_advance_monitor_running=True,
+        foreground_advance_last_seq=7,
+        foreground_advance_consumed_seq=6,
+        foreground_advance_last_kind="wheel_down",
+        foreground_advance_last_delta=-120,
+        foreground_advance_last_matched=True,
+        foreground_advance_last_match_reason="foreground",
+        last_capture_total_duration_seconds=0.12,
+        last_capture_frame_duration_seconds=0.03,
+        last_capture_background_duration_seconds=0.01,
+        last_capture_image_hash_duration_seconds=0.02,
+        last_ocr_extract_duration_seconds=0.05,
+        last_backend_plan_duration_seconds=0.004,
+        last_window_scan_duration_seconds=0.006,
+        last_capture_background_hash_skipped=True,
+        last_poll_started_at="2026-04-28T00:00:04Z",
+        last_poll_completed_at="2026-04-28T00:00:05Z",
+        last_poll_duration_seconds=0.2,
+        last_poll_emitted_event=True,
+        last_tick_skipped=True,
+        last_tick_skip_reason="busy",
+        pending_visual_scene_count=2,
+        last_auto_recalibrate_attempts=5,
+        last_auto_recalibrate_duration_seconds=1.2,
+        last_auto_recalibrate_limited=True,
+        last_auto_recalibrate_error="budget exhausted",
+    )
+    updated_window = runtime.update_window_state(
+        process_name="UpdatedGame.exe",
+        pid=7002,
+        title="Updated Window",
+        width=1600,
+        height=900,
+        aspect_ratio=1600 / 900,
+        selection_mode="manual",
+        selection_detail="manual_target_rebound",
+        effective_window_key="hwnd:402",
+        effective_window_title="Updated Window",
+        effective_process_name="UpdatedGame.exe",
+        target_is_foreground=False,
+        manual_target={"window_key": "hwnd:402"},
+        locked_target={"window_key": "hwnd:401"},
+        candidate_count=3,
+        excluded_candidate_count=2,
+        last_exclude_reason="minimized",
+        foreground_refresh_at="2026-04-28T00:00:30Z",
+        foreground_refresh_detail="manual_target_rebound:background",
+        foreground_hwnd=500,
+        target_hwnd=402,
+    )
+    updated_timing = runtime.update_timing_state(
+        last_poll_started_at="2026-04-28T00:01:00Z",
+        last_poll_completed_at="2026-04-28T00:01:01Z",
+        last_poll_duration_seconds=1.0,
+    )
+    updated_capture = runtime.update_capture_state(
+        stage=OCR_CAPTURE_PROFILE_STAGE_MENU,
+        profile={"top_ratio": 0.25},
+        profile_match_source=OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET,
+        profile_bucket_key="builtin:menu",
+        last_profile={"top_ratio": 0.25},
+        last_stage=OCR_CAPTURE_PROFILE_STAGE_MENU,
+        backend_kind="printwindow",
+        backend_detail="fallback",
+        last_image_hash="phash:ffff",
+        last_source_size={"width": 1024, "height": 768},
+        last_rect={"left": 0, "top": 100, "right": 1024, "bottom": 768},
+        last_window_rect={"left": 20, "top": 40, "right": 1044, "bottom": 808},
+        consecutive_same_frames=5,
+        stale_backend=False,
+        diagnostic_required=False,
+    )
+    updated_ocr = runtime.update_ocr_state(
+        backend_kind="tesseract",
+        backend_detail="fallback_after_runtime_error",
+        backend_path="C:/Tesseract/tesseract.exe",
+        backend_model="legacy",
+        tesseract_path="C:/Tesseract/tesseract.exe",
+        languages="jpn+eng",
+        context_state="diagnostic_required",
+        consecutive_no_text_polls=4,
+        last_observed_at="2026-04-28T00:02:00Z",
+        last_capture_attempt_at="2026-04-28T00:02:01Z",
+        last_capture_completed_at="2026-04-28T00:02:02Z",
+        last_capture_error="ocr timeout",
+        last_raw_text="raw text",
+        last_observed_line={"text": "observed"},
+        last_stable_line={"text": "stable"},
+    )
+    updated_advance = runtime.update_advance_state(
+        foreground_last_seq=8,
+        foreground_last_kind="left_click",
+        foreground_last_matched=False,
+        last_poll_emitted_event=False,
+        last_tick_skipped=False,
+        last_tick_skip_reason="",
+        pending_visual_scene_count=3,
+    )
+    payload = runtime.to_dict()
+
+    assert payload["window"] == runtime.window_state().to_dict()
+    assert payload["capture"] == runtime.capture_state().to_dict()
+    assert payload["ocr"] == runtime.ocr_state().to_dict()
+    assert payload["timing"] == runtime.timing_state().to_dict()
+    assert payload["advance"] == runtime.advance_state().to_dict()
+    assert payload["window"] == updated_window.to_dict()
+    assert payload["timing"] == updated_timing.to_dict()
+    assert payload["capture"] == updated_capture.to_dict()
+    assert payload["ocr"] == updated_ocr.to_dict()
+    assert payload["advance"] == updated_advance.to_dict()
+    _assert_window_runtime_group_matches_flat(payload)
+    assert payload["last_poll_started_at"] == "2026-04-28T00:01:00Z"
+    assert payload["last_poll_duration_seconds"] == 1.0
+    assert payload["capture_stage"] == OCR_CAPTURE_PROFILE_STAGE_MENU
+    assert payload["capture_profile"] == {"top_ratio": 0.25}
+    assert payload["capture_profile_match_source"] == OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET
+    assert payload["capture_backend_kind"] == "printwindow"
+    assert payload["last_capture_image_hash"] == "phash:ffff"
+    assert payload["last_capture_source_size"] == {"width": 1024, "height": 768}
+    assert payload["consecutive_same_capture_frames"] == 5
+    assert payload["stale_capture_backend"] is False
+    assert payload["ocr_capture_diagnostic_required"] is False
+    assert payload["backend_kind"] == "tesseract"
+    assert payload["backend_detail"] == "fallback_after_runtime_error"
+    assert payload["backend_path"] == "C:/Tesseract/tesseract.exe"
+    assert payload["backend_model"] == "legacy"
+    assert payload["tesseract_path"] == "C:/Tesseract/tesseract.exe"
+    assert payload["languages"] == "jpn+eng"
+    assert payload["ocr_context_state"] == "diagnostic_required"
+    assert payload["consecutive_no_text_polls"] == 4
+    assert payload["last_observed_at"] == "2026-04-28T00:02:00Z"
+    assert payload["last_capture_error"] == "ocr timeout"
+    assert payload["last_raw_ocr_text"] == "raw text"
+    assert payload["last_observed_line"] == {"text": "observed"}
+    assert payload["last_stable_line"] == {"text": "stable"}
+    assert payload["foreground_advance_last_seq"] == 8
+    assert payload["foreground_advance_last_kind"] == "left_click"
+    assert payload["last_tick_skipped"] is False
+    assert payload["pending_visual_scene_count"] == 3
+    assert payload["process_name"] == "UpdatedGame.exe"
+    assert payload["pid"] == 7002
+    assert payload["window_title"] == "Updated Window"
+    assert payload["width"] == 1600
+    assert payload["height"] == 900
+    assert payload["target_selection_mode"] == "manual"
+    assert payload["target_selection_detail"] == "manual_target_rebound"
+    assert payload["effective_window_key"] == "hwnd:402"
+    assert payload["target_is_foreground"] is False
+    assert payload["foreground_refresh_detail"] == "manual_target_rebound:background"
+    assert payload["target_hwnd"] == 402
 
 
 @pytest.mark.plugin_unit

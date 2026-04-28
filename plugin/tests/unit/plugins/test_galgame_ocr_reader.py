@@ -92,6 +92,7 @@ def _make_config(
     languages: str = DEFAULT_TESSERACT_LANGUAGES,
     rapidocr_enabled: bool = True,
     rapidocr_install_target_dir: str = "",
+    trigger_mode: str = "after_advance",
 ) -> object:
     return build_config(
         {
@@ -106,6 +107,7 @@ def _make_config(
                 "poll_interval_seconds": poll_interval_seconds,
                 "no_text_takeover_after_seconds": no_text_takeover_after_seconds,
                 "languages": languages,
+                "trigger_mode": trigger_mode,
             },
             "rapidocr": {
                 "enabled": rapidocr_enabled,
@@ -144,6 +146,52 @@ def _window() -> list[DetectedGameWindow]:
             pid=4242,
         )
     ]
+
+
+def _assert_ocr_runtime_group_matches_flat(runtime: dict[str, object]) -> None:
+    ocr = runtime["ocr"]
+    assert isinstance(ocr, dict)
+    assert ocr["backend_kind"] == runtime["backend_kind"]
+    assert ocr["backend_detail"] == runtime["backend_detail"]
+    assert ocr["backend_path"] == runtime["backend_path"]
+    assert ocr["backend_model"] == runtime["backend_model"]
+    assert ocr["tesseract_path"] == runtime["tesseract_path"]
+    assert ocr["languages"] == runtime["languages"]
+    assert ocr["context_state"] == runtime["ocr_context_state"]
+    assert ocr["consecutive_no_text_polls"] == runtime["consecutive_no_text_polls"]
+    assert ocr["last_observed_at"] == runtime["last_observed_at"]
+    assert ocr["last_capture_attempt_at"] == runtime["last_capture_attempt_at"]
+    assert ocr["last_capture_completed_at"] == runtime["last_capture_completed_at"]
+    assert ocr["last_capture_error"] == runtime["last_capture_error"]
+    assert ocr["last_raw_text"] == runtime["last_raw_ocr_text"]
+    assert ocr["last_observed_line"] == runtime["last_observed_line"]
+    assert ocr["last_stable_line"] == runtime["last_stable_line"]
+
+
+def _assert_window_runtime_group_matches_flat(runtime: dict[str, object]) -> None:
+    window = runtime["window"]
+    assert isinstance(window, dict)
+    assert window["process_name"] == runtime["process_name"]
+    assert window["pid"] == runtime["pid"]
+    assert window["title"] == runtime["window_title"]
+    assert window["width"] == runtime["width"]
+    assert window["height"] == runtime["height"]
+    assert window["aspect_ratio"] == runtime["aspect_ratio"]
+    assert window["selection_mode"] == runtime["target_selection_mode"]
+    assert window["selection_detail"] == runtime["target_selection_detail"]
+    assert window["effective_window_key"] == runtime["effective_window_key"]
+    assert window["effective_window_title"] == runtime["effective_window_title"]
+    assert window["effective_process_name"] == runtime["effective_process_name"]
+    assert window["target_is_foreground"] == runtime["target_is_foreground"]
+    assert window["manual_target"] == runtime["manual_target"]
+    assert window["locked_target"] == runtime["locked_target"]
+    assert window["candidate_count"] == runtime["candidate_count"]
+    assert window["excluded_candidate_count"] == runtime["excluded_candidate_count"]
+    assert window["last_exclude_reason"] == runtime["last_exclude_reason"]
+    assert window["foreground_refresh_at"] == runtime["foreground_refresh_at"]
+    assert window["foreground_refresh_detail"] == runtime["foreground_refresh_detail"]
+    assert window["foreground_hwnd"] == runtime["foreground_hwnd"]
+    assert window["target_hwnd"] == runtime["target_hwnd"]
 
 
 def test_build_config_defaults_ocr_languages_to_chi_sim_jpn_eng(tmp_path: Path) -> None:
@@ -472,6 +520,7 @@ async def test_ocr_reader_manager_does_not_treat_memory_reader_heartbeats_as_liv
     assert result.runtime["status"] == "active"
     assert result.runtime["detail"] == "attached_no_text_yet"
     assert result.runtime["ocr_context_state"] == "no_text"
+    _assert_ocr_runtime_group_matches_flat(result.runtime)
 
 
 @pytest.mark.asyncio
@@ -530,6 +579,7 @@ async def test_ocr_reader_manager_prefers_memory_reader_game_window_over_foregro
     assert result.runtime["ocr_context_state"] == "no_text"
     assert result.runtime["process_name"] == "TheLamentingGeese.exe"
     assert result.runtime["pid"] == 28828
+    _assert_ocr_runtime_group_matches_flat(result.runtime)
 
 
 @pytest.mark.asyncio
@@ -586,6 +636,7 @@ async def test_ocr_reader_manager_locks_auto_target_when_user_focuses_other_wind
     assert first.runtime["target_is_foreground"] is True
     assert first.runtime["locked_target"]["process_name"] == "TheLamentingGeese.exe"
     assert capture_backend.capture_calls[-1][0] == game_window.hwnd
+    _assert_window_runtime_group_matches_flat(first.runtime)
 
     foreground["hwnd"] = other_window.hwnd
     windows["items"] = [other_window]
@@ -595,6 +646,7 @@ async def test_ocr_reader_manager_locks_auto_target_when_user_focuses_other_wind
     assert second.runtime["detail"] == "waiting_for_valid_window"
     assert second.runtime["target_selection_detail"] == "locked_target_unavailable"
     assert len(capture_backend.capture_calls) == 1
+    _assert_window_runtime_group_matches_flat(second.runtime)
 
     windows["items"] = [other_window, rebound_game_window]
     third = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
@@ -605,6 +657,7 @@ async def test_ocr_reader_manager_locks_auto_target_when_user_focuses_other_wind
     assert third.runtime["target_selection_detail"] == "locked_target_rebound"
     assert third.runtime["target_is_foreground"] is False
     assert capture_backend.capture_calls[-1][0] == rebound_game_window.hwnd
+    _assert_window_runtime_group_matches_flat(third.runtime)
 
 
 @pytest.mark.asyncio
@@ -953,10 +1006,12 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
     assert first.runtime["last_capture_completed_at"]
     assert first.runtime["last_raw_ocr_text"] == "雪乃：你好。"
     assert first.runtime["last_observed_line"]["text"] == "你好。"
+    _assert_ocr_runtime_group_matches_flat(first.runtime)
     assert second.runtime["status"] == "active"
     assert second.runtime["detail"] == "attached_no_text_yet"
     assert second.runtime["ocr_context_state"] == "no_text"
     assert second.runtime["last_stable_line"]["text"] == "你好。"
+    _assert_ocr_runtime_group_matches_flat(second.runtime)
     assert third.runtime["status"] == "active"
     assert third.runtime["game_id"].startswith("ocr-")
     assert session is not None
@@ -965,6 +1020,58 @@ async def test_ocr_reader_manager_starts_capture_and_emits_stable_line(tmp_path:
     assert session["state"]["scene_id"].startswith(f"ocr:{writer.game_id}:scene-")
     assert str(session["state"]["line_id"]).startswith("ocr:")
     assert session["state"]["text"] == "你好。"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_followup_confirm_emits_next_line_in_same_tick(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 1100.0}
+    writer = OcrReaderBridgeWriter(
+        bridge_root=bridge_root,
+        time_fn=lambda: clock["now"],
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            poll_interval_seconds=999.0,
+            trigger_mode="interval",
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "\u96ea\u4e43\uff1a\u4f60\u597d\u3002",
+                "\u96ea\u4e43\uff1a\u4f60\u597d\u3002",
+                "\u96ea\u4e43\uff1a\u4e0b\u4e00\u53e5\u3002",
+                "\u96ea\u4e43\uff1a\u4e0b\u4e00\u53e5\u3002",
+            ]
+        ),
+        writer=writer,
+    )
+
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+    clock["now"] += 1.0
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    session = read_session_json(bridge_root / writer.game_id / "session.json").session
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+
+    assert result.stable_event_emitted is True
+    assert session is not None
+    assert session["state"]["text"] == "\u4e0b\u4e00\u53e5\u3002"
+    assert events[-1]["type"] == "line_changed"
+    assert len(capture_backend.capture_calls) >= 4
 
 
 @pytest.mark.asyncio
@@ -1004,9 +1111,11 @@ async def test_ocr_reader_manager_reports_capture_diagnostic_after_repeated_no_t
     assert third.runtime["detail"] == "ocr_capture_diagnostic_required"
     assert third.runtime["consecutive_no_text_polls"] == 3
     assert third.runtime["ocr_context_state"] == "diagnostic_required"
+    _assert_ocr_runtime_group_matches_flat(third.runtime)
     assert fourth.runtime["ocr_capture_diagnostic_required"] is True
     assert fourth.runtime["last_capture_stage"]
     assert fourth.runtime["last_capture_profile"]
+    _assert_ocr_runtime_group_matches_flat(fourth.runtime)
 
 
 @pytest.mark.asyncio
@@ -1122,6 +1231,7 @@ async def test_ocr_reader_manager_auto_mode_prefers_rapidocr_when_available(
     assert third.runtime["backend_kind"] == "rapidocr"
     assert first.runtime["detail"] == "receiving_text"
     assert first.runtime["ocr_context_state"] == "stable"
+    _assert_ocr_runtime_group_matches_flat(first.runtime)
 
 
 @pytest.mark.asyncio
@@ -1163,6 +1273,7 @@ async def test_ocr_reader_manager_auto_mode_falls_back_to_tesseract_when_rapidoc
 
     assert first.runtime["backend_kind"] == "tesseract"
     assert first.runtime["backend_detail"].startswith("auto_fallback_from_rapidocr")
+    _assert_ocr_runtime_group_matches_flat(first.runtime)
 
 
 @pytest.mark.asyncio
@@ -1214,6 +1325,7 @@ async def test_ocr_reader_manager_falls_back_to_tesseract_after_rapidocr_runtime
     assert second.runtime["backend_kind"] == "tesseract"
     assert second.runtime["backend_detail"] == "fallback_after_runtime_error"
     assert any("rapidocr failed" in warning for warning in second.warnings)
+    _assert_ocr_runtime_group_matches_flat(second.runtime)
 
 
 @pytest.mark.asyncio
@@ -1301,6 +1413,7 @@ async def test_ocr_reader_manager_excludes_neko_self_window_and_waits_for_valid_
     assert result.runtime["candidate_count"] == 0
     assert result.runtime["excluded_candidate_count"] == 1
     assert result.runtime["last_exclude_reason"] == "excluded_self_window"
+    _assert_window_runtime_group_matches_flat(result.runtime)
 
 
 @pytest.mark.asyncio
@@ -1373,6 +1486,7 @@ async def test_ocr_reader_manager_prefers_manual_target_and_rebinds_by_signature
     assert result.runtime["manual_target"]["pid"] == rebound_window.pid
     assert manager.current_window_target()["window_key"] == rebound_window.window_key
     assert manager.current_window_target()["pid"] == rebound_window.pid
+    _assert_window_runtime_group_matches_flat(result.runtime)
 
 
 @pytest.mark.asyncio
