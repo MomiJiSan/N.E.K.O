@@ -217,6 +217,8 @@ def _looks_like_game_dialogue_context_line(line: dict[str, Any]) -> bool:
 
 
 def _payload_is_game_dialogue_line(payload_obj: dict[str, Any], *, ts: str = "") -> bool:
+    if str(payload_obj.get("source") or "") == DATA_SOURCE_MEMORY_READER:
+        return bool(normalize_text(str(payload_obj.get("text") or "")).strip())
     return _looks_like_game_dialogue_context_line(
         _line_history_entry(payload_obj, ts=ts, stability=str(payload_obj.get("stability") or ""))
     )
@@ -607,8 +609,14 @@ def choose_candidate(
         preferred_candidates = [
             item
             for item in candidates.values()
-            if item.data_source == DATA_SOURCE_MEMORY_READER and _candidate_has_text(item)
+            if item.data_source == DATA_SOURCE_BRIDGE_SDK and _candidate_has_text(item)
         ]
+        if not preferred_candidates:
+            preferred_candidates = [
+                item
+                for item in candidates.values()
+                if item.data_source == DATA_SOURCE_MEMORY_READER and _candidate_has_text(item)
+            ]
     if not preferred_candidates and normalized_reader_mode != READER_MODE_MEMORY:
         preferred_candidates = [
             item for item in candidates.values() if item.data_source == DATA_SOURCE_OCR_READER

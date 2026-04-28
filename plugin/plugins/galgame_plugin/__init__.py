@@ -1638,6 +1638,7 @@ class GalgamePlugin(NekoPluginBase):
             and str(memory_reader_runtime.get("detail") or "")
             in {"invalid_textractor_path", "no_detected_game_process"}
             and not ocr_reader_explicitly_configured
+            and not pending_manual_foreground_ocr_capture
             and str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
         )
         if memory_reader_default_is_unavailable:

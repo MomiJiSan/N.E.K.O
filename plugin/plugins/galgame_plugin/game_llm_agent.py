@@ -93,7 +93,8 @@ class GameLLMAgent:
     _OCR_DIALOGUE_ADVANCE_VARIANT_ORDER = (
         "advance_click",
         "advance_click",
-        "advance_click",
+        "advance_enter",
+        "advance_space",
     )
     _VIRTUAL_MOUSE_RECENT_SUCCESS_SECONDS = 30.0
     _VIRTUAL_MOUSE_SKIP_AFTER_CONSECUTIVE_FAILURES = 2
@@ -219,7 +220,12 @@ class GameLLMAgent:
         try:
             if task_loop.is_closed():
                 return
-            task_loop.call_soon_threadsafe(task.cancel)
+
+            def _cancel_if_pending() -> None:
+                if not task.done():
+                    task.cancel()
+
+            task_loop.call_soon_threadsafe(_cancel_if_pending)
         except RuntimeError:
             return
 
@@ -1974,7 +1980,7 @@ class GameLLMAgent:
                 continue
             if 0 <= candidate_index < len(candidates):
                 return (candidate_index, f"cat_advice_index_{candidate_index + 1}")
-        for token, candidate_index in {
+        chinese_index_tokens = {
             "一": 0,
             "二": 1,
             "三": 2,
@@ -1984,7 +1990,8 @@ class GameLLMAgent:
             "七": 6,
             "八": 7,
             "九": 8,
-        }.items():
+        }
+        for token, candidate_index in chinese_index_tokens.items():
             if (
                 re.search(rf"(?:选择|选|建议|推荐)\s*(?:第\s*)?{re.escape(token)}(?:个|项|号|条)?(?=$|[\s。！？,.，、:：;；）)】\]])", normalized)
                 or re.search(rf"第\s*{re.escape(token)}(?:个|项|号|条)", normalized)
@@ -2838,29 +2845,19 @@ class GameLLMAgent:
                     limit=64,
                 )
                 reason = self._suggestion_reasons.pop(choice_id, "")
-                if reason:
-                    content = (
-                        f"\u5df2\u9009\u62e9\u300c{choice_text}\u300d\u3002"
-                        f"\u63a8\u8350\u7406\u7531\uff1a{reason}"
+                self._suggestion_reasons.clear()
+                if self._should_push_choice(shared) and reason:
+                    self._push_agent_message(
+                        shared,
+                        kind="choice_reason",
+                        content=(
+                            f"\u5df2\u9009\u62e9\u300c{choice_text}\u300d\u3002"
+                            f"\u63a8\u8350\u7406\u7531\uff1a{reason}"
+                        ),
+                        scene_id=str(selected.get("scene_id") or ""),
+                        route_id=str(selected.get("route_id") or ""),
+                        metadata={"suppress_delivery": reason.startswith("cat_advice:")},
                     )
-                    if reason.startswith("cat_advice:"):
-                        outbound = self._enqueue_outbound_message(
-                            kind="choice_reason",
-                            content=content,
-                            scene_id=str(selected.get("scene_id") or ""),
-                            route_id=str(selected.get("route_id") or ""),
-                            priority=6,
-                        )
-                        self._mark_message(outbound, status="delivered", delivered=True)
-                        self._recent_pushes = self._recent_push_records()
-                    elif self._should_push_choice(shared):
-                        self._push_agent_message(
-                            shared,
-                            kind="choice_reason",
-                            content=content,
-                            scene_id=str(selected.get("scene_id") or ""),
-                            route_id=str(selected.get("route_id") or ""),
-                        )
                 self._observed_choice_marker = marker
 
     def _line_summary_key(self, line: dict[str, Any]) -> str:
@@ -2987,7 +2984,7 @@ class GameLLMAgent:
             if current_text:
                 speaker = str(snapshot.get("speaker") or "旁白").strip() or "旁白"
                 recent_parts.append(f"{speaker}：{current_text}")
-        prefix = f"当前场景 {scene_id or '(unknown)'}"
+        prefix = f"场景 {scene_id or '(unknown)'}"
         if route_id:
             prefix += f" / 路线 {route_id}"
         if recent_parts:
@@ -3024,6 +3021,12 @@ class GameLLMAgent:
             priority=6,
             metadata=metadata,
         )
+        outbound_metadata = dict(outbound.get("metadata") or {})
+        if bool(outbound_metadata.pop("suppress_delivery", False)):
+            outbound["metadata"] = outbound_metadata
+            self._mark_message(outbound, status="completed", delivered=False)
+            self._recent_pushes = self._recent_push_records()
+            return
         try:
             self._plugin.push_message(
                 source=str(getattr(self._plugin, "plugin_id", "") or "galgame_plugin"),
@@ -3031,7 +3034,7 @@ class GameLLMAgent:
                 description=f"Galgame Agent | {kind}",
                 priority=6,
                 content=content,
-                metadata=dict(outbound.get("metadata") or {}),
+                metadata=outbound_metadata,
             )
             self._mark_message(outbound, status="delivered", delivered=True)
         except Exception as exc:
@@ -3147,6 +3150,15 @@ class GameLLMAgent:
                 "agent_can_resume_by_focus": False,
             }
         if user_status == "read_only":
+            if mode == "choice_advisor" and not self._is_actionable(shared):
+                return {
+                    "agent_pause_kind": "read_only",
+                    "agent_pause_message": (
+                        "自动推进已开启，正在等待游戏会话、OCR 台词或目标窗口进入可操作状态。"
+                    ),
+                    "agent_can_resume_by_button": False,
+                    "agent_can_resume_by_focus": False,
+                }
             mode_label = "伴读/静默模式" if mode in {"silent", "companion"} else "只读模式"
             return {
                 "agent_pause_kind": "read_only",
