@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Galgame 插件设置</title>
-  <link rel="stylesheet" href="./style.css?v=20260429-ux-review">
+  <link rel="stylesheet" href="./style.css?v=20260429-details-scroll">
 </head>
 <body>
   <div class="page-shell">
@@ -103,7 +103,7 @@
             <label class="field">
               <span>文本读取模式</span>
               <select id="readerModeSelect">
-                <option value="auto" selected>自动（内存优先，空则 OCR）</option>
+                <option value="auto" selected>自动（内存有新文本优先，停更后 OCR 接管）</option>
                 <option value="memory_reader">内存读取</option>
                 <option value="ocr_reader">OCR</option>
               </select>
@@ -115,8 +115,8 @@
             <label class="field">
               <span>OCR 触发方式</span>
               <select id="ocrTriggerModeSelect">
-                <option value="after_advance" selected>点击对白后识别</option>
-                <option value="interval">按间隔识别</option>
+                <option value="after_advance">点击对白后识别</option>
+                <option value="interval" selected>按间隔识别</option>
               </select>
             </label>
             <label class="field checkbox-field">
@@ -165,6 +165,29 @@
               <button id="clearBindBtn" class="ghost">恢复自动</button>
             </div>
             <div id="availableGameIds" class="binding-chip-row empty-inline">等待刷新可用游戏 ID</div>
+          </div>
+
+          <div class="settings-subpanel memory-target-panel">
+            <div class="panel-title-row compact">
+              <div>
+                <h3>Memory Reader 目标进程</h3>
+                <p class="section-copy">自动识别失败时可手动锁定游戏进程；进程重启后会按 exe 路径和进程名重新绑定。</p>
+              </div>
+              <div class="capture-profile-actions">
+                <button id="memoryProcessRefreshBtn" class="secondary">刷新进程</button>
+                <button id="memoryProcessAutoBtn" class="ghost">清除锁定</button>
+              </div>
+            </div>
+            <p id="memoryReaderTargetModeText" class="result-note"></p>
+            <p id="memoryReaderRuntimeHint" class="panel-subcopy">等待 Memory Reader 进程候选列表。</p>
+
+            <div id="memoryLockedProcessCard" class="locked-window-card">
+              <div class="locked-window-empty">暂无锁定的 Memory Reader 进程，请点击下方按钮选择。</div>
+            </div>
+
+            <div class="window-target-actions">
+              <button id="memoryProcessSelectBtn" class="primary">选择进程</button>
+            </div>
           </div>
 
           <div class="settings-subpanel window-target-panel">
@@ -306,6 +329,19 @@
         </div>
       </details>
 
+      <div id="memoryProcessModal" class="modal" hidden>
+        <div class="modal-overlay"></div>
+        <div class="modal-content">
+          <div class="modal-header">
+            <h3>选择 Memory Reader 进程</h3>
+            <button id="memoryProcessModalClose" class="ghost modal-close" aria-label="关闭">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div id="memoryProcessList" class="stack-list scroll-region empty-state">暂无候选进程</div>
+          </div>
+        </div>
+      </div>
+
       <div id="ocrWindowModal" class="modal" hidden>
         <div class="modal-overlay"></div>
         <div class="modal-content">
@@ -329,16 +365,23 @@
       <details id="dependencyModule" class="settings-module">
         <summary>
           <span>依赖安装</span>
-          <small id="installCompactSummary">RapidOCR / DXcam 优先，Tesseract / Textractor 仅作兜底</small>
+          <small id="installCompactSummary">OCR 识别依赖与内存读取依赖分开管理</small>
         </summary>
         <div class="module-body install-stack">
-        <div class="install-tabs">
-          <button class="install-tab active" data-install-tab="rapidocr">RapidOCR</button>
-          <button class="install-tab" data-install-tab="dxcam">DXcam</button>
-          <button class="install-tab" data-install-tab="tesseract">Tesseract</button>
-          <button class="install-tab" data-install-tab="textractor">Textractor</button>
-        </div>
-        <div class="install-panels">
+          <section class="install-module install-module-ocr">
+            <div class="install-module-head">
+              <div>
+                <p class="list-kicker">OCR 识别模块</p>
+                <h3>OCR Reader 依赖</h3>
+              </div>
+              <p class="install-module-summary">RapidOCR 是主识别后端，DXcam 负责稳定截图，Tesseract 仅作为兼容兜底。</p>
+            </div>
+            <div class="install-tabs">
+              <button class="install-tab active" data-install-tab="rapidocr">RapidOCR</button>
+              <button class="install-tab" data-install-tab="dxcam">DXcam</button>
+              <button class="install-tab" data-install-tab="tesseract">Tesseract</button>
+            </div>
+            <div class="install-panels install-panels-ocr">
           <div id="rapidocrPrompt" class="install-banner install-banner-rapidocr" hidden>
             <div class="install-copy">
               <p id="rapidocrPromptKicker" class="list-kicker">OCR 主后端</p>
@@ -414,8 +457,19 @@
               <button id="tesseractInstallBtn" class="primary">一键安装 Tesseract</button>
             </div>
           </div>
+            </div>
+          </section>
 
-          <div id="textractorPrompt" class="install-banner install-banner-textractor" hidden>
+          <section class="install-module install-module-memory">
+            <div class="install-module-head">
+              <div>
+                <p class="list-kicker">内存读取模块</p>
+                <h3>Memory Reader 依赖</h3>
+              </div>
+              <p class="install-module-summary">Textractor 只服务于内存读取兜底路径，不影响 OCR 截图识别链路。</p>
+            </div>
+            <div class="install-panels install-panels-memory">
+          <div id="textractorPrompt" class="install-banner install-banner-textractor">
             <div class="install-copy">
               <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
               <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
@@ -437,7 +491,8 @@
               <button id="textractorInstallBtn" class="secondary">一键安装 Textractor</button>
             </div>
           </div>
-        </div>
+            </div>
+          </section>
         </div>
       </details>
     </section>
@@ -525,6 +580,6 @@
     </section>
   </div>
 
-  <script src="./main.js?v=20260429-ux-review"></script>
+  <script src="./main.js?v=20260429-install-restore"></script>
 </body>
 </html>

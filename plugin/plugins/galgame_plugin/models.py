@@ -117,6 +117,7 @@ STORE_DEDUPE_WINDOW = "dedupe_window"
 STORE_LAST_ERROR = "last_error"
 STORE_OCR_CAPTURE_PROFILES = "ocr_capture_profiles"
 STORE_OCR_WINDOW_TARGET = "ocr_window_target"
+STORE_MEMORY_READER_TARGET = "memory_reader_target"
 STORE_KEYS = (
     STORE_BOUND_GAME_ID,
     STORE_MODE,
@@ -130,6 +131,7 @@ STORE_KEYS = (
     STORE_LAST_ERROR,
     STORE_OCR_CAPTURE_PROFILES,
     STORE_OCR_WINDOW_TARGET,
+    STORE_MEMORY_READER_TARGET,
 )
 
 DEFAULT_SAVE_CONTEXT = {
@@ -498,20 +500,24 @@ class GalgameMemoryReaderConfig:
     memory_reader_install_timeout_seconds: float = 60.0
     memory_reader_auto_detect: bool = True
     memory_reader_hook_codes: list[str] = field(default_factory=list)
+    memory_reader_engine_hook_codes: dict[str, list[str]] = field(default_factory=dict)
     memory_reader_poll_interval_seconds: float = 1.0
 
 
 @dataclass(slots=True)
 class GalgameOcrReaderConfig:
     ocr_reader_enabled: bool = False
+    ocr_reader_enabled_explicit: bool = False
     ocr_reader_backend_selection: str = "auto"
+    ocr_reader_backend_selection_explicit: bool = False
     ocr_reader_capture_backend: str = "auto"
+    ocr_reader_capture_backend_explicit: bool = False
     ocr_reader_tesseract_path: str = ""
     ocr_reader_install_manifest_url: str = ""
     ocr_reader_install_target_dir: str = ""
     ocr_reader_install_timeout_seconds: float = 300.0
     ocr_reader_poll_interval_seconds: float = 2.0
-    ocr_reader_trigger_mode: str = OCR_TRIGGER_MODE_AFTER_ADVANCE
+    ocr_reader_trigger_mode: str = OCR_TRIGGER_MODE_INTERVAL
     ocr_reader_no_text_takeover_after_seconds: float = 30.0
     ocr_reader_languages: str = "chi_sim+jpn+eng"
     ocr_reader_left_inset_ratio: float = DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO
@@ -532,6 +538,7 @@ class GalgameOcrReaderConfig:
 @dataclass(slots=True)
 class GalgameRapidOcrConfig:
     rapidocr_enabled: bool = False
+    rapidocr_enabled_explicit: bool = False
     rapidocr_install_manifest_url: str = ""
     rapidocr_install_target_dir: str = ""
     rapidocr_install_timeout_seconds: float = 180.0
@@ -584,13 +591,26 @@ class GalgameConfig:
         ),
         "memory_reader_auto_detect": ("memory_reader", "memory_reader_auto_detect"),
         "memory_reader_hook_codes": ("memory_reader", "memory_reader_hook_codes"),
+        "memory_reader_engine_hook_codes": (
+            "memory_reader",
+            "memory_reader_engine_hook_codes",
+        ),
         "memory_reader_poll_interval_seconds": (
             "memory_reader",
             "memory_reader_poll_interval_seconds",
         ),
         "ocr_reader_enabled": ("ocr_reader", "ocr_reader_enabled"),
+        "ocr_reader_enabled_explicit": ("ocr_reader", "ocr_reader_enabled_explicit"),
         "ocr_reader_backend_selection": ("ocr_reader", "ocr_reader_backend_selection"),
+        "ocr_reader_backend_selection_explicit": (
+            "ocr_reader",
+            "ocr_reader_backend_selection_explicit",
+        ),
         "ocr_reader_capture_backend": ("ocr_reader", "ocr_reader_capture_backend"),
+        "ocr_reader_capture_backend_explicit": (
+            "ocr_reader",
+            "ocr_reader_capture_backend_explicit",
+        ),
         "ocr_reader_tesseract_path": ("ocr_reader", "ocr_reader_tesseract_path"),
         "ocr_reader_install_manifest_url": ("ocr_reader", "ocr_reader_install_manifest_url"),
         "ocr_reader_install_target_dir": ("ocr_reader", "ocr_reader_install_target_dir"),
@@ -643,6 +663,7 @@ class GalgameConfig:
         ),
         "ocr_reader_screen_templates": ("ocr_reader", "ocr_reader_screen_templates"),
         "rapidocr_enabled": ("rapidocr", "rapidocr_enabled"),
+        "rapidocr_enabled_explicit": ("rapidocr", "rapidocr_enabled_explicit"),
         "rapidocr_install_manifest_url": ("rapidocr", "rapidocr_install_manifest_url"),
         "rapidocr_install_target_dir": ("rapidocr", "rapidocr_install_target_dir"),
         "rapidocr_install_timeout_seconds": ("rapidocr", "rapidocr_install_timeout_seconds"),

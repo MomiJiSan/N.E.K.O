@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import fields
 import hashlib
 import json
+import logging
 import sys
 import threading
 import time
@@ -28,6 +29,9 @@ from plugin.plugins.galgame_plugin.models import (
     OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
     OCR_CAPTURE_PROFILE_STAGE_TITLE,
     OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+    OCR_TRIGGER_MODE_AFTER_ADVANCE,
+    OCR_TRIGGER_MODE_INTERVAL,
+    READER_MODE_AUTO,
 )
 from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
@@ -51,6 +55,7 @@ from plugin.plugins.galgame_plugin.screen_classifier import (
     classify_screen_awareness_model,
     classify_screen_from_ocr,
     _layout_features,
+    _normalized_bounds,
 )
 from plugin.plugins.galgame_plugin.service import build_config
 from plugin.plugins.galgame_plugin.tesseract_support import (
@@ -146,11 +151,14 @@ def _make_config(
     screen_awareness_model_enabled: bool = False,
     screen_awareness_model_path: str = "",
     screen_awareness_model_min_confidence: float = 0.55,
+    reader_mode: str = READER_MODE_AUTO,
+    trigger_mode: str = OCR_TRIGGER_MODE_AFTER_ADVANCE,
 ) -> object:
     return build_config(
         {
             "galgame": {
                 "bridge_root": str(bridge_root),
+                "reader_mode": reader_mode,
             },
             "llm": {
                 "vision_enabled": llm_vision_enabled,
@@ -170,6 +178,7 @@ def _make_config(
                 "screen_awareness_model_enabled": screen_awareness_model_enabled,
                 "screen_awareness_model_path": screen_awareness_model_path,
                 "screen_awareness_model_min_confidence": screen_awareness_model_min_confidence,
+                "trigger_mode": trigger_mode,
             },
             "rapidocr": {
                 "enabled": rapidocr_enabled,
@@ -217,6 +226,7 @@ def _window() -> list[DetectedGameWindow]:
         ("Save\nLoad\nPage 1\nSlot 01\nBack", OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD),
         ("BGM Volume\nVoice Volume\nText Speed\nWindow Mode\nBack", OCR_CAPTURE_PROFILE_STAGE_CONFIG),
         ("Gallery\nCG Mode\nScene Replay\nBack", OCR_CAPTURE_PROFILE_STAGE_GALLERY),
+        ("Backlog\n雪乃：前の台詞。\n王生：もう一度確認する。", OCR_CAPTURE_PROFILE_STAGE_GALLERY),
         ("Mini Game\nScore\nCombo\nTime", OCR_CAPTURE_PROFILE_STAGE_MINIGAME),
         ("Game Over\nRetry\nReturn to Title", OCR_CAPTURE_PROFILE_STAGE_GAME_OVER),
         ("1. Save her.\n2. Leave.", OCR_CAPTURE_PROFILE_STAGE_MENU),
@@ -232,6 +242,46 @@ def test_screen_classifier_recognizes_common_ocr_text(ocr_text: str, expected_st
         assert classified.confidence == 0.0
     else:
         assert classified.confidence > 0.0
+
+
+def test_screen_classifier_recognizes_backlog_dialogue_list_without_title() -> None:
+    classified = classify_screen_from_ocr(
+        "\n".join(
+            [
+                "雪乃：さっきの話だけど。",
+                "王生：まだ覚えている。",
+                "雪乃：本当に？",
+                "王生：ああ、忘れない。",
+            ]
+        ),
+        boxes=[
+            OcrTextBox(text="雪乃：さっきの話だけど。", left=120, top=80, right=720, bottom=116),
+            OcrTextBox(text="王生：まだ覚えている。", left=120, top=162, right=700, bottom=198),
+            OcrTextBox(text="雪乃：本当に？", left=120, top=244, right=520, bottom=280),
+            OcrTextBox(text="王生：ああ、忘れない。", left=120, top=326, right=760, bottom=362),
+        ],
+        bounds_metadata={"source_size": {"width": 1280, "height": 720}},
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_GALLERY
+    assert classified.debug["reason"] == "backlog_dialogue_list"
+
+
+def test_screen_classifier_recognizes_text_only_backlog_dialogue_history_sample() -> None:
+    classified = classify_screen_from_ocr(
+        "\n".join(
+            [
+                "【雪乃】先に帰るね。",
+                "【王生】送っていくよ。",
+                "【雪乃】大丈夫。",
+                "【王生】でも心配だ。",
+                "【雪乃】ありがとう。",
+            ]
+        )
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_GALLERY
+    assert classified.debug["reason"] == "backlog_dialogue_list"
 
 
 def test_screen_classifier_prefers_matching_screen_template() -> None:
@@ -480,6 +530,20 @@ def test_layout_features_do_not_mix_normalized_and_raw_bounds() -> None:
     )
 
     assert raw_layout["button_layout_score"] > 0.0
+
+
+def test_normalized_bounds_expands_clamped_degenerate_edges() -> None:
+    normalized = _normalized_bounds(
+        {"left": 1600.0, "top": 900.0, "right": 1700.0, "bottom": 930.0},
+        {"source_size": {"width": 1280.0, "height": 720.0}},
+    )
+
+    assert normalized["left"] == pytest.approx(0.99)
+    assert normalized["right"] == pytest.approx(1.0)
+    assert normalized["top"] == pytest.approx(0.99)
+    assert normalized["bottom"] == pytest.approx(1.0)
+    assert normalized["left"] < normalized["right"]
+    assert normalized["top"] < normalized["bottom"]
 
 
 def test_screen_classifier_merges_full_frame_ocr_regions() -> None:
@@ -859,6 +923,29 @@ def test_ocr_choice_candidates_use_single_read_threshold_when_requested(tmp_path
     assert events[-1]["type"] == "choices_shown"
 
 
+def test_ocr_stability_keys_use_character_distance_not_prefix() -> None:
+    assert galgame_ocr_reader._ocr_stability_keys_match("abcdefgh", "abcdefgh") is True
+    assert galgame_ocr_reader._ocr_stability_keys_match("abcdefgh", "abcxefgh") is True
+    assert galgame_ocr_reader._ocr_stability_keys_match("abcdefgh", "abcdefghi") is False
+    assert galgame_ocr_reader._ocr_stability_keys_match("abcdefgh", "abcdwxyz") is False
+
+
+def test_rapidocr_low_confidence_tokens_are_logged(caplog: pytest.LogCaptureFixture) -> None:
+    raw_output = [
+        [
+            [[0.0, 0.0], [30.0, 0.0], [30.0, 12.0], [0.0, 12.0]],
+            "noise",
+            0.12,
+        ]
+    ]
+
+    with caplog.at_level(logging.DEBUG, logger=galgame_ocr_reader._LOGGER.name):
+        tokens = galgame_ocr_reader._rapidocr_tokens_from_output(raw_output)
+
+    assert tokens == []
+    assert "rapidocr discarded 1 low-confidence token(s)" in caplog.text
+
+
 def test_ocr_overlay_guard_does_not_drop_short_english_dialogue() -> None:
     assert galgame_ocr_reader._looks_like_game_overlay_text("I must save her.") is False
     assert galgame_ocr_reader._looks_like_game_overlay_text("Save her.") is False
@@ -867,6 +954,8 @@ def test_ocr_overlay_guard_does_not_drop_short_english_dialogue() -> None:
     assert galgame_ocr_reader._looks_like_game_overlay_text("Save") is True
     assert galgame_ocr_reader._looks_like_game_overlay_text("Save\nLoad") is True
     assert galgame_ocr_reader._looks_like_game_overlay_text("Auto Save") is True
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Quick Save") is True
+    assert galgame_ocr_reader._looks_like_game_overlay_text("Fast Forward") is True
 
 
 def test_ocr_overlay_guard_does_not_drop_chinese_dialogue_with_menu_words() -> None:
@@ -1481,15 +1570,19 @@ def test_mouse_monitor_drains_pending_events_outside_hook_callback(monkeypatch: 
     monitor._enqueue_pending_event(delta=120, kind="wheel", x=10, y=20)
     clock["now"] += 1.0
     monitor._enqueue_pending_event(kind="left_click", x=30, y=40)
+    clock["now"] += 1.0
+    monitor._enqueue_pending_event(kind="key", key_code=0x20)
 
     events = monitor.events_after(0)
 
-    assert [event.kind for event in events] == ["wheel", "left_click"]
-    assert [event.seq for event in events] == [1, 2]
+    assert [event.kind for event in events] == ["wheel", "left_click", "key"]
+    assert [event.seq for event in events] == [1, 2, 3]
     assert events[0].delta == 120
     assert events[0].foreground_hwnd == 900
     assert events[0].point_hwnd == 30
     assert events[1].point_hwnd == 70
+    assert events[2].key_code == 0x20
+    assert events[2].foreground_hwnd == 900
 
 
 def test_win32_capture_backend_explicit_selection_falls_back_with_detail() -> None:
@@ -1764,6 +1857,251 @@ def test_ocr_reader_starts_foreground_advance_monitor_for_real_runtime(
     assert manager._runtime.foreground_advance_monitor_running is True
 
 
+def test_ocr_reader_does_not_autostart_foreground_monitor_in_interval_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    started: list[bool] = []
+
+    def _start(self) -> bool:
+        started.append(True)
+        return True
+
+    monkeypatch.setattr(galgame_ocr_reader._MouseWheelMonitor, "start", _start)
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            trigger_mode=OCR_TRIGGER_MODE_INTERVAL,
+            rapidocr_enabled=False,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=_window,
+    )
+
+    assert started == []
+    assert manager._runtime.foreground_advance_monitor_running is False
+
+
+def test_ocr_reader_update_config_stops_foreground_monitor_outside_after_advance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    started: list[bool] = []
+    stopped: list[float] = []
+    running = {"value": False}
+
+    def _start(self) -> bool:
+        started.append(True)
+        running["value"] = True
+        return True
+
+    def _stop(self, *, join_timeout: float = 1.0) -> None:
+        stopped.append(join_timeout)
+        running["value"] = False
+
+    monkeypatch.setattr(galgame_ocr_reader._MouseWheelMonitor, "start", _start)
+    monkeypatch.setattr(galgame_ocr_reader._MouseWheelMonitor, "stop", _stop)
+    monkeypatch.setattr(
+        galgame_ocr_reader._MouseWheelMonitor,
+        "is_running",
+        lambda self: running["value"],
+    )
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            trigger_mode=OCR_TRIGGER_MODE_AFTER_ADVANCE,
+            rapidocr_enabled=False,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=_window,
+    )
+
+    assert started == [True]
+    assert manager._runtime.foreground_advance_monitor_running is True
+
+    manager.update_config(
+        _make_config(
+            bridge_root,
+            enabled=True,
+            trigger_mode=OCR_TRIGGER_MODE_INTERVAL,
+            rapidocr_enabled=False,
+        )
+    )
+
+    assert stopped == [1.0]
+    assert running["value"] is False
+    assert manager._runtime.foreground_advance_monitor_running is False
+    assert manager._runtime.foreground_advance_last_seq == 0
+
+
+def test_ocr_reader_interval_consume_does_not_lazy_start_foreground_monitor(
+    tmp_path: Path,
+) -> None:
+    class _FakeMonitor:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+            self.stop_calls: list[float] = []
+            self.running = True
+
+        def ensure_running(self) -> bool:
+            self.ensure_calls += 1
+            self.running = True
+            return True
+
+        def is_running(self) -> bool:
+            return self.running
+
+        def last_seq(self) -> int:
+            return 7
+
+        def events_after(self, seq: int) -> list[object]:
+            del seq
+            self.ensure_running()
+            return [object()]
+
+        def stop(self, *, join_timeout: float = 1.0) -> None:
+            self.stop_calls.append(join_timeout)
+            self.running = False
+
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            trigger_mode=OCR_TRIGGER_MODE_INTERVAL,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    fake_monitor = _FakeMonitor()
+    manager._wheel_monitor = fake_monitor
+
+    result = manager.consume_foreground_advance_inputs()
+
+    assert result.triggered is False
+    assert fake_monitor.ensure_calls == 0
+    assert fake_monitor.stop_calls == [1.0]
+    assert manager._runtime.foreground_advance_monitor_running is False
+    assert manager._runtime.foreground_advance_last_seq == 0
+
+
+def test_ocr_reader_after_advance_still_consumes_injected_monitor_events(
+    tmp_path: Path,
+) -> None:
+    class _FakeMonitor:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+            self.running = True
+            self.events = [
+                galgame_ocr_reader._MouseWheelEvent(
+                    seq=1,
+                    ts=100.0,
+                    delta=-120,
+                    foreground_hwnd=101,
+                    point_hwnd=101,
+                    kind="wheel",
+                )
+            ]
+
+        def ensure_running(self) -> bool:
+            self.ensure_calls += 1
+            return True
+
+        def is_running(self) -> bool:
+            return self.running
+
+        def last_seq(self) -> int:
+            return 1
+
+        def events_after(self, seq: int) -> list[object]:
+            return [event for event in self.events if event.seq > seq]
+
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            trigger_mode=OCR_TRIGGER_MODE_AFTER_ADVANCE,
+        ),
+        time_fn=lambda: 100.5,
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    fake_monitor = _FakeMonitor()
+    manager._wheel_monitor = fake_monitor
+
+    result = manager.consume_foreground_advance_inputs()
+
+    assert result.triggered is True
+    assert fake_monitor.ensure_calls == 1
+    assert manager._runtime.foreground_advance_monitor_running is True
+    assert manager._runtime.foreground_advance_last_seq == 1
+
+
+def test_mouse_monitor_stop_joins_and_clears_exited_thread() -> None:
+    class _FakeThread:
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_calls: list[float] = []
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(float(timeout or 0.0))
+            self.alive = False
+
+    monitor = galgame_ocr_reader._MouseWheelMonitor(time_fn=lambda: 0.0)
+    thread = _FakeThread()
+    monitor._thread = thread
+
+    monitor.stop(join_timeout=0.2)
+
+    assert thread.join_calls == [0.2]
+    assert monitor._thread is None
+
+
+def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _StuckThread:
+        def __init__(self) -> None:
+            self.join_calls: list[float] = []
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(float(timeout or 0.0))
+
+    monitor = galgame_ocr_reader._MouseWheelMonitor(time_fn=lambda: 0.0)
+    thread = _StuckThread()
+    monitor._thread = thread
+    monitor._stop.set()
+    monkeypatch.setattr(galgame_ocr_reader.os, "name", "nt")
+
+    assert monitor.start() is False
+    assert thread.join_calls == [0.25]
+
+
 def test_ocr_reader_runtime_groups_fields_and_keeps_flat_compatibility() -> None:
     runtime = OcrReaderRuntime(
         enabled=True,
@@ -1885,6 +2223,7 @@ def test_build_config_defaults_ocr_languages_to_chi_sim_jpn_eng(tmp_path: Path) 
 
     assert cfg.ocr_reader_languages == "chi_sim+jpn+eng"
     assert cfg.ocr_reader_backend_selection == "auto"
+    assert cfg.ocr_reader_trigger_mode == OCR_TRIGGER_MODE_INTERVAL
     assert cfg.ocr_reader_top_ratio == pytest.approx(DEFAULT_OCR_CAPTURE_TOP_RATIO)
     assert cfg.ocr_reader_bottom_inset_ratio == pytest.approx(
         DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO
@@ -2276,7 +2615,14 @@ async def test_ocr_reader_manager_yields_bridge_sdk_and_memory_reader_statuses(t
     )
     memory_result = await manager.tick(
         bridge_sdk_available=False,
-        memory_reader_runtime={"detail": "receiving_text", "last_seq": 3},
+        memory_reader_runtime={
+            "status": "active",
+            "detail": "receiving_text",
+            "game_id": "mem-demo",
+            "session_id": "mem-session",
+            "last_seq": 3,
+            "last_text_seq": 2,
+        },
     )
 
     assert bridge_result.runtime["detail"] == "bridge_sdk_available"
@@ -2309,16 +2655,85 @@ async def test_ocr_reader_manager_waits_before_taking_over_after_memory_reader_t
 
     await manager.tick(
         bridge_sdk_available=False,
-        memory_reader_runtime={"detail": "receiving_text", "last_seq": 2},
+        memory_reader_runtime={
+            "status": "active",
+            "detail": "receiving_text",
+            "game_id": "mem-demo",
+            "session_id": "mem-session",
+            "last_seq": 2,
+            "last_text_seq": 2,
+        },
     )
     clock["now"] += 5.0
     result = await manager.tick(
         bridge_sdk_available=False,
-        memory_reader_runtime={},
+        memory_reader_runtime={
+            "status": "active",
+            "detail": "attached_idle_after_text",
+            "game_id": "mem-demo",
+            "session_id": "mem-session",
+            "last_seq": 3,
+            "last_text_seq": 2,
+        },
     )
 
     assert result.runtime["status"] == "idle"
     assert result.runtime["detail"] == "waiting_for_takeover_window"
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_clears_memory_wait_on_new_idle_memory_session(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    clock = {"now": 1000.0}
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            no_text_takeover_after_seconds=30.0,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    first = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={
+            "status": "active",
+            "detail": "receiving_text",
+            "game_id": "mem-demo",
+            "session_id": "mem-session-a",
+            "last_seq": 2,
+            "last_text_seq": 2,
+        },
+    )
+    assert first.runtime["detail"] == "memory_reader_active"
+
+    clock["now"] += 5.0
+    second = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={
+            "status": "active",
+            "detail": "attached_idle_after_text",
+            "game_id": "mem-demo",
+            "session_id": "mem-session-b",
+            "last_seq": 5,
+            "last_text_seq": 4,
+        },
+    )
+
+    assert second.runtime["detail"] != "waiting_for_takeover_window"
+    assert capture_backend.capture_calls
 
 
 @pytest.mark.asyncio

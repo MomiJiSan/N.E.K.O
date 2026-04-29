@@ -261,7 +261,7 @@ h1 {
   border: 1px solid rgba(31, 42, 51, 0.1);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.72);
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
 }
 
 .current-line-item.empty {
@@ -367,10 +367,23 @@ h1 {
   color: #8c2f21;
 }
 
+.install-summary-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.install-summary-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .install-summary-chip {
   display: inline-flex;
   align-items: center;
-  margin: 2px 0 2px 6px;
+  margin: 2px 0;
   padding: 4px 8px;
   border-radius: 999px;
   background: rgba(31, 42, 51, 0.07);
@@ -401,7 +414,7 @@ h1 {
   display: flex;
   justify-content: flex-end;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 8px;
 }
 
 .panel {
@@ -429,6 +442,25 @@ h1 {
   margin-top: 14px;
 }
 
+details[open]:not(.panel-fullscreen) {
+  min-height: 0;
+  max-height: min(720px, calc(100vh - 32px));
+  overflow: auto;
+  overscroll-behavior: auto;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+}
+
+details[open]:not(.panel-fullscreen) > summary {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+details[open]:not(.panel-fullscreen) > :not(summary) {
+  min-height: 0;
+}
+
 .settings-module {
   border: 1px solid rgba(31, 42, 51, 0.08);
   border-radius: 18px;
@@ -452,10 +484,12 @@ h1 {
 
 .settings-module > summary {
   padding: 15px 18px;
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .dashboard-module > summary {
   margin-bottom: 14px;
+  background: var(--paper);
 }
 
 .settings-module > summary::-webkit-details-marker,
@@ -612,6 +646,10 @@ h1 {
   cursor: pointer;
   color: var(--brand-strong);
   font-weight: 700;
+}
+
+.agent-debug-tools[open] > summary {
+  background: var(--paper);
 }
 
 .agent-user-notice {
@@ -807,7 +845,38 @@ button[disabled] {
 
 .install-stack {
   display: grid;
+  gap: 16px;
+}
+
+.install-module {
+  display: grid;
   gap: 14px;
+  padding: 16px;
+  border: 1px solid rgba(31, 42, 51, 0.1);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.install-module-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.install-module-head h3 {
+  margin: 2px 0 0;
+  color: var(--ink);
+  font-size: 16px;
+}
+
+.install-module-summary {
+  max-width: 520px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: right;
 }
 
 .install-tabs {
@@ -1091,6 +1160,7 @@ button.active {
 
 .excluded-window-panel[open] summary {
   margin-bottom: 12px;
+  background: var(--paper);
 }
 
 .flash-message {
@@ -1131,6 +1201,7 @@ button.active {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
+  align-items: stretch;
   min-width: 0;
   min-height: 0;
 }
@@ -1250,21 +1321,53 @@ details.panel-fullscreen #eventsList .list-card {
   flex-direction: column;
   min-height: 0;
   max-height: clamp(320px, 48vh, 560px);
+  overflow: auto;
+}
+
+details.panel-scroll[open] {
+  max-height: clamp(320px, 48vh, 560px);
+}
+
+.panel-scroll > summary {
+  flex: 0 0 auto;
 }
 
 .panel-scroll-wide {
   max-height: clamp(360px, 58vh, 680px);
 }
 
+details.panel-scroll-wide[open] {
+  max-height: clamp(360px, 58vh, 680px);
+}
+
 .scroll-region {
   min-height: 0;
   overflow: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
+  overflow-anchor: none;
   padding-right: 6px;
 }
 
 .panel-scroll > .scroll-region {
   flex: 1 1 auto;
+  max-height: none !important;
+}
+
+.panel-scroll > .dashboard-section-grid {
+  flex: 1 1 auto;
+  grid-auto-rows: minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel-scroll > .dashboard-section-grid > .dashboard-subsection {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel-scroll > .dashboard-section-grid > .dashboard-subsection > .scroll-region {
+  flex: 1 1 auto;
+  max-height: none !important;
 }
 
 .scroll-region::-webkit-scrollbar,
@@ -1331,6 +1434,7 @@ details.panel-fullscreen #eventsList .list-card {
 
 .status-debug-panel[open] > summary {
   margin-bottom: 10px;
+  background: var(--paper);
 }
 
 .status-debug-panel[open] > summary::after {
@@ -1394,7 +1498,7 @@ details.panel-fullscreen #eventsList .list-card {
 #linesList .list-card {
   max-height: clamp(180px, 30vh, 360px);
   overflow: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
 }
 
 #linesList .list-card p,
@@ -1414,7 +1518,7 @@ details.panel-fullscreen #eventsList .list-card {
 #eventsList .list-card {
   max-height: clamp(160px, 28vh, 320px);
   overflow: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
 }
 
 #eventsList .list-card p,
@@ -1472,6 +1576,7 @@ details.panel-fullscreen #eventsList .list-card {
 .reply-text-scroll {
   max-height: 180px;
   overflow: auto;
+  overflow-anchor: none;
   padding-right: 6px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1597,7 +1702,12 @@ details.panel-fullscreen #eventsList .list-card {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 18px 22px;
+}
+
+.modal .scroll-region {
+  overscroll-behavior: contain;
 }
 
 .modal-body .stack-list {
@@ -1731,6 +1841,15 @@ details.panel-fullscreen #eventsList .list-card {
 
   .install-banner {
     flex-direction: column;
+  }
+
+  .install-module-head {
+    flex-direction: column;
+  }
+
+  .install-module-summary {
+    max-width: none;
+    text-align: left;
   }
 
   .install-actions,

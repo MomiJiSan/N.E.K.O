@@ -60,10 +60,15 @@ install_release_api_url = ""
 install_target_dir = ""
 install_timeout_seconds = 60
 auto_detect = true
-hook_codes = [
+hook_codes = []
+poll_interval_seconds = 1
+
+[memory_reader.engine_hooks]
+unity = [
     "/HQ14+3C@GameAssembly.dll#0x33A440",
 ]
-poll_interval_seconds = 1
+kirikiri = []
+renpy = []
 
 [ocr_reader]
 enabled = true

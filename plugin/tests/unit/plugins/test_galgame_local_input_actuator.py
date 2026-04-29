@@ -32,6 +32,35 @@ def test_local_input_choose_index_uses_choice_payload_index() -> None:
     ) == 2
 
 
+def test_local_input_choose_keyboard_reset_uses_visible_choice_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    taps: list[tuple[int, int]] = []
+    choices = [{"text": f"Choice {index}", "index": index} for index in range(12)]
+
+    monkeypatch.setattr(local_input.sys, "platform", "win32")
+    monkeypatch.setattr(local_input, "_runtime_target", lambda shared: {"pid": 1234})
+    monkeypatch.setattr(local_input, "_find_window_for_pid", lambda pid: (5678, (0, 0, 1280, 720)))
+    monkeypatch.setattr(local_input, "_window_text", lambda hwnd: "Demo Game")
+    monkeypatch.setattr(local_input, "_input_safety_policy_block_reason", lambda **kwargs: "")
+    monkeypatch.setattr(local_input, "_focus_window", lambda hwnd: True)
+    monkeypatch.setattr(
+        local_input,
+        "_tap_key",
+        lambda hwnd, vk, count=1, delay=0.05: taps.append((vk, count)),
+    )
+
+    result = local_input.perform_local_input_actuation(
+        {"ocr_reader_runtime": {"pid": 1234}},
+        {"kind": "choose", "candidate_index": 10, "candidate_choices": choices},
+    )
+
+    assert result["success"] is True
+    assert taps[0] == (local_input.VK_UP, len(choices))
+    assert taps[1] == (local_input.VK_DOWN, 10)
+    assert taps[2] == (local_input.VK_RETURN, 1)
+
+
 def test_local_input_virtual_mouse_skips_forbidden_candidate() -> None:
     target = local_input._resolve_virtual_mouse_dialogue_target(
         {"virtual_mouse_target_id": "unsafe"},
@@ -47,4 +76,3 @@ def test_local_input_virtual_mouse_skips_forbidden_candidate() -> None:
     assert target["screen_x"] == 400
     assert target["screen_y"] == 760
     assert target["skipped_candidates"][0]["forbidden_zone"] == "bottom_toolbar"
-

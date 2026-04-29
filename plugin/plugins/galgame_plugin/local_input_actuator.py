@@ -884,6 +884,7 @@ def perform_local_input_actuation(
             _tap_key(hwnd, VK_ESCAPE)
     elif kind == "choose":
         choice_index = _choose_index(actuation)
+        candidate_choices = list(actuation.get("candidate_choices") or [])
         bounds = _choose_bounds(actuation)
         if bounds:
             client_rect = _client_screen_rect(hwnd)
@@ -906,7 +907,8 @@ def perform_local_input_actuation(
                 "method": "choice_bounds_click",
                 **choice_target,
             }
-        _tap_key(hwnd, VK_UP, count=8, delay=0.02)
+        reset_count = max(len(candidate_choices), choice_index + 1, 1)
+        _tap_key(hwnd, VK_UP, count=reset_count, delay=0.02)
         if choice_index > 0:
             _tap_key(hwnd, VK_DOWN, count=choice_index, delay=0.035)
         _tap_key(hwnd, VK_RETURN)

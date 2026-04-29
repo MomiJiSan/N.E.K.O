@@ -30,7 +30,7 @@ from .game_llm_agent import GameLLMAgent
 from .host_agent_adapter import HostAgentAdapter
 from .llm_gateway import LLMGateway
 from .memory_reader import MemoryReaderManager
-from .ocr_reader import OcrReaderManager
+from .ocr_reader import OcrReaderManager, utc_now_iso
 from .dxcam_support import install_dxcam
 from .models import (
     ADVANCE_SPEEDS,
@@ -76,6 +76,7 @@ from .models import (
     STORE_EVENTS_FILE_SIZE,
     STORE_LAST_ERROR,
     STORE_LAST_SEQ,
+    STORE_MEMORY_READER_TARGET,
     STORE_MODE,
     STORE_OCR_CAPTURE_PROFILES,
     STORE_OCR_WINDOW_TARGET,
@@ -95,6 +96,7 @@ from .service import (
     build_explain_context,
     build_history_payload,
     build_ocr_context_diagnostic,
+    build_ocr_background_status,
     build_primary_diagnosis,
     build_snapshot_payload,
     build_status_payload,
@@ -261,7 +263,7 @@ def _replace_toml_section_number_value(
 
 
 def _normalize_ocr_trigger_mode(value: str | None) -> str:
-    normalized = str(value or OCR_TRIGGER_MODE_AFTER_ADVANCE).strip().lower()
+    normalized = str(value or OCR_TRIGGER_MODE_INTERVAL).strip().lower()
     if normalized not in OCR_TRIGGER_MODES:
         raise ValueError(f"invalid OCR trigger_mode: {value!r}")
     return normalized
@@ -304,6 +306,201 @@ def _pending_data_source_for_reader_mode(
         if ocr_reader_allowed:
             return DATA_SOURCE_OCR_READER
     return DATA_SOURCE_NONE
+
+
+_AFTER_ADVANCE_SCREEN_REFRESH_STAGES = {
+    OCR_CAPTURE_PROFILE_STAGE_TITLE,
+    OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+    OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+    OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+    OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+    OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
+}
+
+
+def _after_advance_screen_refresh_needed(
+    *,
+    local: dict[str, Any],
+    ocr_reader_runtime: dict[str, Any],
+    ocr_reader_allowed: bool,
+    ocr_trigger_mode: str,
+) -> bool:
+    if ocr_trigger_mode != OCR_TRIGGER_MODE_AFTER_ADVANCE:
+        return False
+    if not ocr_reader_allowed:
+        return False
+    if str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER:
+        return False
+    if str(ocr_reader_runtime.get("status") or "") != "active":
+        return False
+    context_state = str(ocr_reader_runtime.get("ocr_context_state") or "")
+    detail = str(ocr_reader_runtime.get("detail") or "")
+    snapshot = local.get("latest_snapshot")
+    snapshot_obj = snapshot if isinstance(snapshot, dict) else {}
+    screen_type = str(snapshot_obj.get("screen_type") or local.get("screen_type") or "")
+    context_is_screen_classified = (
+        context_state == "screen_classified" or detail == "screen_classified"
+    )
+    if not context_is_screen_classified:
+        return False
+    try:
+        screen_confidence = float(
+            snapshot_obj.get("screen_confidence")
+            or local.get("screen_confidence")
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        screen_confidence = 0.0
+    if screen_confidence < 0.45:
+        return False
+    if screen_type == OCR_CAPTURE_PROFILE_STAGE_MENU:
+        choices = snapshot_obj.get("choices")
+        return (
+            not bool(snapshot_obj.get("is_menu_open"))
+            and not (choices if isinstance(choices, list) else [])
+        )
+    return screen_type in _AFTER_ADVANCE_SCREEN_REFRESH_STAGES
+
+
+def _companion_after_advance_ocr_refresh_needed(
+    *,
+    local: dict[str, Any],
+    ocr_reader_runtime: dict[str, Any],
+    ocr_reader_allowed: bool,
+    ocr_trigger_mode: str,
+) -> bool:
+    return (
+        ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+        and ocr_reader_allowed
+        and str(local.get("mode") or "") == MODE_COMPANION
+        and str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
+        and str(ocr_reader_runtime.get("status") or "") in {"starting", "active"}
+    )
+
+
+def _ocr_reader_allowed_block_reason(
+    *,
+    reader_mode: str,
+    memory_reader_default_is_unavailable: bool,
+    memory_reader_recent_text_available: bool,
+) -> str:
+    if reader_mode == READER_MODE_MEMORY:
+        return "reader_mode_memory_only"
+    if memory_reader_recent_text_available:
+        return "memory_reader_recent_text"
+    if memory_reader_default_is_unavailable:
+        return "memory_reader_default_unavailable"
+    return ""
+
+
+def _ocr_tick_block_reason(
+    *,
+    ocr_tick_allowed: bool,
+    ocr_reader_manager_available: bool,
+    ocr_reader_allowed: bool,
+    ocr_reader_allowed_block_reason: str,
+    ocr_trigger_mode: str,
+    pending_ocr_advance_capture: bool,
+    pending_ocr_delay_remaining: float,
+    ocr_bootstrap_capture_needed: bool,
+    after_advance_screen_refresh_needed: bool,
+    companion_after_advance_ocr_refresh_needed: bool,
+    ocr_reader_runtime: dict[str, Any],
+    active_data_source: str,
+    mode: str,
+) -> str:
+    if ocr_tick_allowed:
+        return ""
+    if not ocr_reader_allowed:
+        return ocr_reader_allowed_block_reason or "ocr_reader_not_allowed"
+    if not ocr_reader_manager_available:
+        return "ocr_reader_unavailable"
+    if pending_ocr_advance_capture and pending_ocr_delay_remaining > 0.0:
+        return "waiting_pending_advance_delay"
+    if ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE:
+        runtime_status = str(ocr_reader_runtime.get("status") or "")
+        if (
+            not ocr_bootstrap_capture_needed
+            and not after_advance_screen_refresh_needed
+            and not companion_after_advance_ocr_refresh_needed
+            and not pending_ocr_advance_capture
+            and runtime_status == "active"
+            and active_data_source == DATA_SOURCE_OCR_READER
+            and mode != MODE_COMPANION
+        ):
+            return "trigger_mode_after_advance_waiting_for_input"
+        return "trigger_mode_after_advance_waiting_for_refresh"
+    return "tick_gate_closed"
+
+
+def _ocr_emit_block_reason(
+    *,
+    ocr_tick_allowed: bool,
+    ocr_reader_stable_event_emitted: bool,
+    ocr_reader_runtime: dict[str, Any],
+) -> str:
+    if not ocr_tick_allowed or ocr_reader_stable_event_emitted:
+        return ""
+    context_state = str(ocr_reader_runtime.get("ocr_context_state") or "")
+    detail = str(ocr_reader_runtime.get("detail") or "")
+    stable_block_reason = str(ocr_reader_runtime.get("stable_ocr_block_reason") or "")
+    last_raw_text = str(ocr_reader_runtime.get("last_raw_ocr_text") or "").strip()
+    if context_state == "capture_failed" or detail == "capture_failed":
+        return "capture_failed"
+    if bool(ocr_reader_runtime.get("stale_capture_backend")) or context_state == "stale_capture_backend":
+        return "stale_capture_backend"
+    if context_state == "screen_classified" or detail == "screen_classified":
+        return "screen_classification_skipped_dialogue"
+    if stable_block_reason:
+        return stable_block_reason
+    if detail == "receiving_observed_text" or context_state == "observed":
+        return "waiting_for_repeat"
+    if context_state in {"no_text", "diagnostic_required"} or detail in {
+        "attached_no_text_yet",
+        "self_ui_guard_blocked",
+        "ocr_capture_diagnostic_required",
+    }:
+        return "no_dialogue_text"
+    if last_raw_text:
+        return "no_dialogue_text"
+    return ""
+
+
+def _apply_ocr_decision_diagnostics(
+    ocr_reader_runtime: dict[str, Any],
+    *,
+    ocr_tick_allowed: bool,
+    ocr_tick_block_reason: str,
+    ocr_emit_block_reason: str,
+    ocr_reader_allowed: bool,
+    ocr_reader_allowed_block_reason: str,
+    ocr_trigger_mode: str,
+    active_data_source: str,
+) -> dict[str, Any]:
+    runtime = json_copy(ocr_reader_runtime or {})
+    waiting_for_advance = ocr_tick_block_reason == "trigger_mode_after_advance_waiting_for_input"
+    display_source_not_ocr_reason = (
+        f"active_data_source={active_data_source}"
+        if active_data_source and active_data_source != DATA_SOURCE_OCR_READER
+        else ""
+    )
+    runtime.update(
+        {
+            "ocr_tick_allowed": bool(ocr_tick_allowed),
+            "ocr_tick_block_reason": str(ocr_tick_block_reason or ""),
+            "ocr_emit_block_reason": str(ocr_emit_block_reason or ""),
+            "ocr_reader_allowed": bool(ocr_reader_allowed),
+            "ocr_reader_allowed_block_reason": str(ocr_reader_allowed_block_reason or ""),
+            "ocr_trigger_mode_effective": str(ocr_trigger_mode or ""),
+            "ocr_waiting_for_advance": waiting_for_advance,
+            "ocr_waiting_for_advance_reason": (
+                str(ocr_tick_block_reason or "") if waiting_for_advance else ""
+            ),
+            "ocr_last_tick_decision_at": utc_now_iso(),
+            "display_source_not_ocr_reason": display_source_not_ocr_reason,
+        }
+    )
+    return runtime
 
 
 def _normalize_ocr_capture_profile_stage(stage: str | None) -> str:
@@ -575,13 +772,21 @@ class GalgamePluginConfigService:
         _update_plugin_toml(_update)
 
     def persist_runtime_state(self, payload: dict[str, Any]) -> None:
+        def _payload_int(key: str) -> int:
+            try:
+                return int(payload.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        dedupe_window = payload.get("dedupe_window")
+        last_error = payload.get("last_error")
         self._plugin._persist.persist_runtime(
-            session_id=str(payload["active_session_id"]),
-            events_byte_offset=int(payload["events_byte_offset"]),
-            events_file_size=int(payload["events_file_size"]),
-            last_seq=int(payload["last_seq"]),
-            dedupe_window=list(payload["dedupe_window"]),
-            last_error=dict(payload["last_error"]),
+            session_id=str(payload.get("active_session_id") or ""),
+            events_byte_offset=_payload_int("events_byte_offset"),
+            events_file_size=_payload_int("events_file_size"),
+            last_seq=_payload_int("last_seq"),
+            dedupe_window=list(dedupe_window) if isinstance(dedupe_window, list) else [],
+            last_error=dict(last_error) if isinstance(last_error, dict) else {},
         )
 
 
@@ -627,11 +832,79 @@ class GalgamePlugin(NekoPluginBase):
         self._last_ocr_advance_capture_requested_at = 0.0
         self._last_ocr_advance_capture_reason = ""
         self._last_ocr_foreground_refresh_at = 0.0
+        self._last_memory_reader_text_game_id = ""
+        self._last_memory_reader_text_session_id = ""
+        self._last_memory_reader_text_seq = 0
+        self._last_memory_reader_text_seen_at_monotonic = 0.0
         self._ocr_capture_profile_auto_apply_enabled = False
         self._ocr_capture_profile_pending_rollback: dict[str, Any] = {}
         self._ocr_capture_profile_last_rollback_reason = ""
         self._state_dirty = True
         self._cached_snapshot: dict[str, Any] | None = None
+
+    def _update_memory_reader_text_freshness(
+        self,
+        runtime: dict[str, Any],
+        *,
+        now_monotonic: float,
+    ) -> bool:
+        if self._cfg is None:
+            return False
+        status = str(runtime.get("status") or "")
+        game_id = str(runtime.get("game_id") or "")
+        session_id = str(runtime.get("session_id") or "")
+        try:
+            last_text_seq = int(runtime.get("last_text_seq") or 0)
+        except (TypeError, ValueError):
+            last_text_seq = 0
+        received_text_this_tick = (
+            str(runtime.get("detail") or "") == "receiving_text" and last_text_seq > 0
+        )
+        try:
+            threshold = max(
+                0.0,
+                float(self._cfg.ocr_reader_no_text_takeover_after_seconds),
+            )
+        except (TypeError, ValueError):
+            threshold = 0.0
+
+        with self._state_lock:
+            if status not in {"attaching", "active"} or not game_id or not session_id:
+                self._last_memory_reader_text_game_id = ""
+                self._last_memory_reader_text_session_id = ""
+                self._last_memory_reader_text_seq = 0
+                self._last_memory_reader_text_seen_at_monotonic = 0.0
+                runtime["last_text_recent"] = False
+                runtime["last_text_age_seconds"] = 0.0
+                return False
+
+            tracked_changed = (
+                game_id != self._last_memory_reader_text_game_id
+                or session_id != self._last_memory_reader_text_session_id
+                or last_text_seq < self._last_memory_reader_text_seq
+            )
+            if tracked_changed:
+                self._last_memory_reader_text_game_id = game_id
+                self._last_memory_reader_text_session_id = session_id
+                self._last_memory_reader_text_seq = last_text_seq
+                self._last_memory_reader_text_seen_at_monotonic = (
+                    now_monotonic if received_text_this_tick else 0.0
+                )
+            elif last_text_seq > self._last_memory_reader_text_seq:
+                self._last_memory_reader_text_seq = last_text_seq
+                self._last_memory_reader_text_seen_at_monotonic = now_monotonic
+
+            last_seen = self._last_memory_reader_text_seen_at_monotonic
+            recent = (
+                last_text_seq > 0
+                and last_seen > 0.0
+                and now_monotonic - last_seen <= threshold
+            )
+            runtime["last_text_recent"] = recent
+            runtime["last_text_age_seconds"] = (
+                max(0.0, now_monotonic - last_seen) if last_seen > 0.0 else 0.0
+            )
+            return recent
 
     def should_request_ocr_after_advance_capture(self) -> bool:
         return (
@@ -769,6 +1042,7 @@ class GalgamePlugin(NekoPluginBase):
                 "last_seen_data_monotonic": state.last_seen_data_monotonic,
                 "warmup_session_id": state.warmup_session_id,
                 "memory_reader_runtime": dict(state.memory_reader_runtime),
+                "memory_reader_target": dict(state.memory_reader_target),
                 "ocr_reader_runtime": dict(state.ocr_reader_runtime),
                 "ocr_capture_profiles": dict(state.ocr_capture_profiles),
                 "ocr_window_target": dict(state.ocr_window_target),
@@ -809,6 +1083,7 @@ class GalgamePlugin(NekoPluginBase):
             "last_seen_data_monotonic": raw["last_seen_data_monotonic"],
             "warmup_session_id": raw["warmup_session_id"],
             "memory_reader_runtime": json_copy(raw["memory_reader_runtime"]),
+            "memory_reader_target": json_copy(raw["memory_reader_target"]),
             "ocr_reader_runtime": json_copy(raw["ocr_reader_runtime"]),
             "ocr_capture_profiles": json_copy(raw["ocr_capture_profiles"]),
             "ocr_window_target": json_copy(raw["ocr_window_target"]),
@@ -1544,6 +1819,7 @@ class GalgamePlugin(NekoPluginBase):
             assign("last_seen_data_monotonic", float(payload["last_seen_data_monotonic"]))
             assign("warmup_session_id", str(payload["warmup_session_id"]))
             assign_json("memory_reader_runtime", payload["memory_reader_runtime"])
+            assign_json_if_live_unchanged("memory_reader_target", payload["memory_reader_target"])
             assign_json("ocr_reader_runtime", payload["ocr_reader_runtime"])
             assign_json_if_live_unchanged("ocr_capture_profiles", payload["ocr_capture_profiles"])
             assign_json_if_live_unchanged("ocr_window_target", payload["ocr_window_target"])
@@ -1708,6 +1984,7 @@ class GalgamePlugin(NekoPluginBase):
     def _stop_bridge_poll_loop(self) -> None:
         loop = self._bridge_poll_loop
         thread = self._bridge_poll_thread
+        loop_key = id(loop) if loop is not None else None
         self._bridge_poll_loop = None
         self._bridge_poll_thread = None
         self._bridge_poll_thread_stop.set()
@@ -1729,6 +2006,9 @@ class GalgamePlugin(NekoPluginBase):
                     loop.call_soon_threadsafe(loop.stop)
                 except RuntimeError:
                     pass
+        if loop_key is not None:
+            with self._bridge_poll_task_lock:
+                self._poll_bridge_locks.pop(loop_key, None)
         if thread is not None and thread.is_alive():
             thread.join(timeout=3.0)
             if thread.is_alive():
@@ -1780,6 +2060,19 @@ class GalgamePlugin(NekoPluginBase):
                     "OCR 轮询未继续执行，尚未完成首次截图；请检查插件 timer、后端重载状态或刷新运行中的插件。"
                 )
             enriched["ocr_context_state"] = str(runtime.get("ocr_context_state") or context_state)
+        ocr_background_status = build_ocr_background_status(enriched)
+        enriched["ocr_background_status"] = ocr_background_status
+        enriched["ocr_background_state"] = str(ocr_background_status.get("state") or "")
+        enriched["ocr_background_message"] = str(ocr_background_status.get("message") or "")
+        enriched["ocr_background_polling"] = bool(
+            ocr_background_status.get("background_polling")
+        )
+        enriched["ocr_foreground_resume_pending"] = bool(
+            ocr_background_status.get("foreground_resume_pending")
+        )
+        enriched["ocr_capture_backend_blocked"] = bool(
+            ocr_background_status.get("capture_backend_blocked")
+        )
         enriched["primary_diagnosis"] = build_primary_diagnosis(enriched)
         return enriched
 
@@ -2029,6 +2322,9 @@ class GalgamePlugin(NekoPluginBase):
             self._state.last_error = json_copy(restored.get(STORE_LAST_ERROR, {}))
             self._state.active_data_source = DATA_SOURCE_NONE
             self._state.memory_reader_runtime = {}
+            self._state.memory_reader_target = json_copy(
+                restored.get(STORE_MEMORY_READER_TARGET, {})
+            )
             self._state.ocr_reader_runtime = {}
             self._state.ocr_capture_profiles = json_copy(
                 restored.get(STORE_OCR_CAPTURE_PROFILES, {})
@@ -2060,6 +2356,7 @@ class GalgamePlugin(NekoPluginBase):
                 "phase": "phase_1",
                 "memory_reader_enabled": False,
                 "memory_reader_runtime": {},
+                "memory_reader_target": {},
                 "ocr_reader_enabled": False,
                 "ocr_reader_runtime": {},
                 "ocr_capture_profiles": {},
@@ -2261,6 +2558,7 @@ class GalgamePlugin(NekoPluginBase):
             logger=self.logger,
             config=self._cfg,
         )
+        self._memory_reader_manager.update_process_target(self._state.memory_reader_target)
         self._ocr_reader_manager = OcrReaderManager(
             logger=self.logger,
             config=self._cfg,
@@ -2714,14 +3012,16 @@ class GalgamePlugin(NekoPluginBase):
                 self._pending_ocr_advance_capture_age()
                 >= _OCR_AFTER_ADVANCE_MAX_SETTLE_SECONDS
             )
-            if pending_ocr_advance_capture and ocr_reader_capture_failed:
+            if pending_ocr_advance_capture and pending_capture_expired:
                 self._clear_pending_ocr_advance_captures()
                 pending_ocr_advance_capture = False
-            if (
+            elif (
                 pending_ocr_advance_capture
-                and (force or pending_capture_settled or pending_capture_expired)
+                and not ocr_reader_capture_failed
+                and (force or pending_capture_settled)
             ):
                 self._consume_ocr_advance_capture()
+                pending_ocr_advance_capture = self._has_pending_ocr_advance_capture()
         return (
             raw_available_game_ids,
             raw_candidates,
@@ -2774,6 +3074,8 @@ class GalgamePlugin(NekoPluginBase):
         now_monotonic: float,
         ocr_trigger_mode: str,
         ocr_reader_runtime: dict[str, Any],
+        after_advance_screen_refresh_needed: bool,
+        companion_after_advance_ocr_refresh_needed: bool,
     ) -> None:
         if self._cfg is None:
             return
@@ -2816,6 +3118,10 @@ class GalgamePlugin(NekoPluginBase):
             and ocr_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
             and str(ocr_reader_runtime.get("status") or "") == "starting"
         ):
+            interval = min(interval, float(self._cfg.ocr_reader_poll_interval_seconds))
+        elif self._cfg.ocr_reader_enabled and after_advance_screen_refresh_needed:
+            interval = min(interval, float(self._cfg.ocr_reader_poll_interval_seconds))
+        elif self._cfg.ocr_reader_enabled and companion_after_advance_ocr_refresh_needed:
             interval = min(interval, float(self._cfg.ocr_reader_poll_interval_seconds))
         if self._has_pending_ocr_advance_capture():
             next_pending_delay = self._pending_ocr_advance_capture_delay_remaining()
@@ -3038,6 +3344,9 @@ class GalgamePlugin(NekoPluginBase):
         reader_mode = _normalize_reader_mode(getattr(self._cfg, "reader_mode", READER_MODE_AUTO))
         memory_reader_allowed = reader_mode in {READER_MODE_AUTO, READER_MODE_MEMORY}
         ocr_reader_allowed = reader_mode in {READER_MODE_AUTO, READER_MODE_OCR}
+        ocr_reader_allowed_block_reason = (
+            "reader_mode_memory_only" if reader_mode == READER_MODE_MEMORY else ""
+        )
 
         try:
             raw_available_game_ids, raw_candidates, scan_warnings = await self._scan_candidates()
@@ -3061,8 +3370,8 @@ class GalgamePlugin(NekoPluginBase):
             for candidate in raw_candidates.values()
         )
         ocr_trigger_mode = str(
-            getattr(self._cfg, "ocr_reader_trigger_mode", OCR_TRIGGER_MODE_AFTER_ADVANCE)
-            or OCR_TRIGGER_MODE_AFTER_ADVANCE
+            getattr(self._cfg, "ocr_reader_trigger_mode", OCR_TRIGGER_MODE_INTERVAL)
+            or OCR_TRIGGER_MODE_INTERVAL
         )
         ocr_context_state = str(ocr_reader_runtime.get("ocr_context_state") or "")
         ocr_bootstrap_capture_needed = (
@@ -3104,15 +3413,58 @@ class GalgamePlugin(NekoPluginBase):
             memory_reader_runtime=memory_reader_runtime,
         )
         warnings.extend(memory_tick_warnings)
+        current_memory_target = (
+            getattr(self._memory_reader_manager, "current_process_target", None)
+            if self._memory_reader_manager is not None
+            else None
+        )
+        if callable(current_memory_target):
+            resolved_memory_target = current_memory_target()
+            if resolved_memory_target != json_copy(local.get("memory_reader_target") or {}):
+                local["memory_reader_target"] = json_copy(resolved_memory_target)
+                try:
+                    self._persist.persist_memory_reader_target(resolved_memory_target)
+                except Exception as exc:
+                    warnings.append(f"persist memory reader target failed: {exc}")
         memory_reader_candidate_available = any(
             candidate.data_source == DATA_SOURCE_MEMORY_READER
             and _session_candidate_has_text(candidate)
             for candidate in raw_candidates.values()
         )
+        if memory_reader_allowed:
+            memory_reader_recent_text_available = self._update_memory_reader_text_freshness(
+                memory_reader_runtime,
+                now_monotonic=now_monotonic,
+            )
+        else:
+            self._update_memory_reader_text_freshness({}, now_monotonic=now_monotonic)
+            memory_reader_recent_text_available = False
         ocr_reader_explicitly_configured = bool(
-            str(getattr(self._cfg, "ocr_reader_tesseract_path", "") or "").strip()
+            (
+                bool(getattr(self._cfg, "ocr_reader_enabled", False))
+                and bool(getattr(self._cfg, "ocr_reader_enabled_explicit", False))
+            )
+            or str(getattr(self._cfg, "ocr_reader_tesseract_path", "") or "").strip()
             or str(getattr(self._cfg, "ocr_reader_install_target_dir", "") or "").strip()
             or str(getattr(self._cfg, "rapidocr_install_target_dir", "") or "").strip()
+            or (
+                bool(getattr(self._cfg, "rapidocr_enabled", False))
+                and bool(getattr(self._cfg, "rapidocr_enabled_explicit", False))
+            )
+            or (
+                bool(getattr(self._cfg, "ocr_reader_backend_selection_explicit", False))
+                and str(getattr(self._cfg, "ocr_reader_backend_selection", "") or "")
+                .strip()
+                .lower()
+                in {"rapidocr", "tesseract"}
+            )
+            or (
+                bool(getattr(self._cfg, "ocr_reader_capture_backend_explicit", False))
+                and str(getattr(self._cfg, "ocr_reader_capture_backend", "") or "")
+                .strip()
+                .lower()
+                in {"dxcam", "imagegrab", "printwindow"}
+            )
         )
         memory_reader_default_is_unavailable = (
             reader_mode == READER_MODE_AUTO
@@ -3124,16 +3476,29 @@ class GalgamePlugin(NekoPluginBase):
             in {"invalid_textractor_path", "no_detected_game_process"}
             and not ocr_reader_explicitly_configured
             and not pending_manual_foreground_ocr_capture
-            and str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
+            and not (
+                str(local.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
+                and bool(str(local.get("active_session_id") or ""))
+            )
         )
         if memory_reader_default_is_unavailable:
             ocr_reader_allowed = False
+            ocr_reader_allowed_block_reason = _ocr_reader_allowed_block_reason(
+                reader_mode=reader_mode,
+                memory_reader_default_is_unavailable=memory_reader_default_is_unavailable,
+                memory_reader_recent_text_available=False,
+            )
         if (
             reader_mode == READER_MODE_AUTO
-            and memory_reader_candidate_available
+            and memory_reader_recent_text_available
             and not pending_manual_foreground_ocr_capture
         ):
             ocr_reader_allowed = False
+            ocr_reader_allowed_block_reason = _ocr_reader_allowed_block_reason(
+                reader_mode=reader_mode,
+                memory_reader_default_is_unavailable=memory_reader_default_is_unavailable,
+                memory_reader_recent_text_available=True,
+            )
             with self._state_lock:
                 self._clear_pending_ocr_advance_captures_locked()
 
@@ -3151,16 +3516,50 @@ class GalgamePlugin(NekoPluginBase):
             pending_ocr_delay_remaining=pending_ocr_delay_remaining,
         )
         warnings.extend(foreground_refresh_warnings)
-        ocr_tick_allowed = (
+        after_advance_screen_refresh_tick_needed = _after_advance_screen_refresh_needed(
+            local=local,
+            ocr_reader_runtime=ocr_reader_runtime,
+            ocr_reader_allowed=ocr_reader_allowed,
+            ocr_trigger_mode=ocr_trigger_mode,
+        )
+        companion_after_advance_ocr_refresh_tick_needed = (
+            _companion_after_advance_ocr_refresh_needed(
+                local=local,
+                ocr_reader_runtime=ocr_reader_runtime,
+                ocr_reader_allowed=ocr_reader_allowed,
+                ocr_trigger_mode=ocr_trigger_mode,
+            )
+        )
+        ocr_tick_gate_allowed = (
             ocr_reader_allowed
             and (
                 ocr_trigger_mode == OCR_TRIGGER_MODE_INTERVAL
                 or force
                 or ocr_bootstrap_capture_needed
+                or after_advance_screen_refresh_tick_needed
+                or companion_after_advance_ocr_refresh_tick_needed
                 or (pending_ocr_advance_capture and pending_ocr_delay_remaining <= 0.0)
                 or str(ocr_reader_runtime.get("status") or "") not in {"active"}
                 or str(local.get("active_data_source") or "") != DATA_SOURCE_OCR_READER
             )
+        )
+        ocr_tick_allowed = bool(ocr_tick_gate_allowed and self._ocr_reader_manager is not None)
+        ocr_tick_block_reason = _ocr_tick_block_reason(
+            ocr_tick_allowed=ocr_tick_allowed,
+            ocr_reader_manager_available=self._ocr_reader_manager is not None,
+            ocr_reader_allowed=ocr_reader_allowed,
+            ocr_reader_allowed_block_reason=ocr_reader_allowed_block_reason,
+            ocr_trigger_mode=ocr_trigger_mode,
+            pending_ocr_advance_capture=pending_ocr_advance_capture,
+            pending_ocr_delay_remaining=pending_ocr_delay_remaining,
+            ocr_bootstrap_capture_needed=ocr_bootstrap_capture_needed,
+            after_advance_screen_refresh_needed=after_advance_screen_refresh_tick_needed,
+            companion_after_advance_ocr_refresh_needed=(
+                companion_after_advance_ocr_refresh_tick_needed
+            ),
+            ocr_reader_runtime=ocr_reader_runtime,
+            active_data_source=str(local.get("active_data_source") or ""),
+            mode=str(local.get("mode") or ""),
         )
 
         (
@@ -3183,6 +3582,21 @@ class GalgamePlugin(NekoPluginBase):
             force=force,
         )
         warnings.extend(ocr_tick_warnings)
+        ocr_emit_block_reason = _ocr_emit_block_reason(
+            ocr_tick_allowed=ocr_tick_allowed,
+            ocr_reader_stable_event_emitted=ocr_reader_stable_event_emitted,
+            ocr_reader_runtime=ocr_reader_runtime,
+        )
+        ocr_reader_runtime = _apply_ocr_decision_diagnostics(
+            ocr_reader_runtime,
+            ocr_tick_allowed=ocr_tick_allowed,
+            ocr_tick_block_reason=ocr_tick_block_reason,
+            ocr_emit_block_reason=ocr_emit_block_reason,
+            ocr_reader_allowed=ocr_reader_allowed,
+            ocr_reader_allowed_block_reason=ocr_reader_allowed_block_reason,
+            ocr_trigger_mode=ocr_trigger_mode,
+            active_data_source=str(local.get("active_data_source") or ""),
+        )
 
         local["memory_reader_runtime"] = memory_reader_runtime
         local["ocr_reader_runtime"] = ocr_reader_runtime
@@ -3200,6 +3614,16 @@ class GalgamePlugin(NekoPluginBase):
             and pending_manual_foreground_ocr_capture
             and ocr_reader_stable_event_emitted
             and not bridge_sdk_candidate_available
+        ):
+            candidate_reader_mode = READER_MODE_OCR
+        elif (
+            reader_mode == READER_MODE_AUTO
+            and not memory_reader_recent_text_available
+            and not bridge_sdk_candidate_available
+            and any(
+                candidate.data_source == DATA_SOURCE_OCR_READER
+                for candidate in candidates.values()
+            )
         ):
             candidate_reader_mode = READER_MODE_OCR
 
@@ -3229,15 +3653,33 @@ class GalgamePlugin(NekoPluginBase):
                 reader_mode=reader_mode,
                 memory_reader_allowed=memory_reader_allowed,
                 ocr_reader_allowed=ocr_reader_allowed,
-                memory_reader_candidate_available=memory_reader_candidate_available,
+                memory_reader_candidate_available=memory_reader_recent_text_available,
             )
 
+        after_advance_screen_refresh_schedule_needed = _after_advance_screen_refresh_needed(
+            local=local,
+            ocr_reader_runtime=ocr_reader_runtime,
+            ocr_reader_allowed=ocr_reader_allowed,
+            ocr_trigger_mode=ocr_trigger_mode,
+        )
+        companion_after_advance_ocr_refresh_schedule_needed = (
+            _companion_after_advance_ocr_refresh_needed(
+                local=local,
+                ocr_reader_runtime=ocr_reader_runtime,
+                ocr_reader_allowed=ocr_reader_allowed,
+                ocr_trigger_mode=ocr_trigger_mode,
+            )
+        )
         self._finalize_bridge_poll_state(
             local,
             warnings=warnings,
             now_monotonic=now_monotonic,
             ocr_trigger_mode=ocr_trigger_mode,
             ocr_reader_runtime=ocr_reader_runtime,
+            after_advance_screen_refresh_needed=after_advance_screen_refresh_schedule_needed,
+            companion_after_advance_ocr_refresh_needed=(
+                companion_after_advance_ocr_refresh_schedule_needed
+            ),
         )
 
     @plugin_entry(
@@ -3502,12 +3944,62 @@ class GalgamePlugin(NekoPluginBase):
         except ValueError as exc:
             return Err(SdkError(str(exc)))
 
+        with self._state_lock:
+            old_mode = str(self._state.mode or "")
+            old_push_notifications = bool(self._state.push_notifications)
+            old_advance_speed = str(self._state.advance_speed or ADVANCE_SPEED_MEDIUM)
+            old_active_data_source = str(self._state.active_data_source or "")
+            old_next_poll_at_monotonic = float(self._state.next_poll_at_monotonic or 0.0)
+            old_pending_ocr_advance_captures = int(self._pending_ocr_advance_captures or 0)
+            old_last_ocr_advance_capture_requested_at = float(
+                self._last_ocr_advance_capture_requested_at or 0.0
+            )
+            old_last_ocr_advance_capture_reason = str(
+                self._last_ocr_advance_capture_reason or ""
+            )
         old_reader_mode = self._cfg.reader_mode
+
+        def _restore_mode_runtime_state() -> None:
+            self._cfg.reader_mode = old_reader_mode
+            with self._state_lock:
+                self._state.mode = old_mode
+                self._state.push_notifications = old_push_notifications
+                self._state.advance_speed = old_advance_speed
+                self._state.active_data_source = old_active_data_source
+                self._state.next_poll_at_monotonic = old_next_poll_at_monotonic
+                self._pending_ocr_advance_captures = old_pending_ocr_advance_captures
+                self._last_ocr_advance_capture_requested_at = (
+                    old_last_ocr_advance_capture_requested_at
+                )
+                self._last_ocr_advance_capture_reason = old_last_ocr_advance_capture_reason
+                self._state_dirty = True
+                self._cached_snapshot = None
+            for manager, label in (
+                (self._memory_reader_manager, "memory reader"),
+                (self._ocr_reader_manager, "OCR reader"),
+            ):
+                if manager is None:
+                    continue
+                try:
+                    manager.update_config(self._cfg)
+                except Exception as rollback_exc:
+                    _log_plugin_noncritical(
+                        self.logger,
+                        "warning",
+                        "galgame {} mode rollback update_config failed: {}",
+                        label,
+                        rollback_exc,
+                    )
+
         self._cfg.reader_mode = normalized_reader_mode
-        if self._memory_reader_manager is not None:
-            self._memory_reader_manager.update_config(self._cfg)
-        if self._ocr_reader_manager is not None:
-            self._ocr_reader_manager.update_config(self._cfg)
+        try:
+            if self._memory_reader_manager is not None:
+                self._memory_reader_manager.update_config(self._cfg)
+            if self._ocr_reader_manager is not None:
+                self._ocr_reader_manager.update_config(self._cfg)
+        except Exception as exc:
+            _restore_mode_runtime_state()
+            return Err(SdkError(f"apply mode failed: {exc}"))
         with self._state_lock:
             self._state.mode = mode
             if push_notifications is not None:
@@ -3551,13 +4043,14 @@ class GalgamePlugin(NekoPluginBase):
             )
             self._config_service.persist_reader_mode(reader_mode=normalized_reader_mode)
         except Exception as exc:
-            self._cfg.reader_mode = old_reader_mode
-            if self._memory_reader_manager is not None:
-                self._memory_reader_manager.update_config(self._cfg)
-            if self._ocr_reader_manager is not None:
-                self._ocr_reader_manager.update_config(self._cfg)
+            _restore_mode_runtime_state()
             return Err(SdkError(f"persist mode failed: {exc}"))
         await self._ensure_ocr_foreground_advance_monitor()
+        if (
+            mode_allows_agent_actuation(old_mode)
+            and not mode_allows_agent_actuation(mode)
+        ):
+            self.request_ocr_after_advance_capture(reason="mode_change_to_read_only")
         self._start_background_bridge_poll()
         if self._game_agent is not None and not mode_allows_agent_actuation(mode):
             try:
@@ -3605,6 +4098,8 @@ class GalgamePlugin(NekoPluginBase):
 
         old_backend = self._cfg.ocr_reader_backend_selection
         old_capture = self._cfg.ocr_reader_capture_backend
+        backend_changed = normalized_backend is not None and normalized_backend != old_backend
+        capture_changed = normalized_capture is not None and normalized_capture != old_capture
         if normalized_backend is not None:
             self._cfg.ocr_reader_backend_selection = normalized_backend
         if normalized_capture is not None:
@@ -3644,6 +4139,23 @@ class GalgamePlugin(NekoPluginBase):
                     )
             return Err(SdkError(f"persist OCR backend failed: {exc}"))
 
+        if self._ocr_reader_manager is not None and (backend_changed or capture_changed):
+            reset_capture_runtime = getattr(
+                self._ocr_reader_manager,
+                "reset_capture_runtime_diagnostics",
+                None,
+            )
+            if callable(reset_capture_runtime):
+                try:
+                    reset_capture_runtime()
+                except Exception as exc:
+                    _log_plugin_noncritical(
+                        self.logger,
+                        "warning",
+                        "galgame OCR backend switch diagnostic reset failed: {}",
+                        exc,
+                    )
+
         self._start_background_bridge_poll()
         payload = {
             "backend_selection": self._cfg.ocr_reader_backend_selection,
@@ -3670,7 +4182,7 @@ class GalgamePlugin(NekoPluginBase):
                 "trigger_mode": {
                     "type": "string",
                     "enum": ["interval", "after_advance"],
-                    "default": "after_advance",
+                    "default": "interval",
                 },
             },
             "required": ["poll_interval_seconds"],
@@ -4368,6 +4880,117 @@ class GalgamePlugin(NekoPluginBase):
         if payload is None:
             return Err(SdkError("no pending recommended OCR capture profile rollback"))
         return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_list_memory_reader_processes",
+        name="列出 Memory Reader 候选进程",
+        description="返回 Memory Reader 可选进程，包含 exe 路径、检测到的引擎和识别原因。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "include_unknown": {"type": "boolean", "default": True},
+            },
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_list_memory_reader_processes(
+        self,
+        include_unknown: bool = True,
+        **_,
+    ):
+        if self._memory_reader_manager is None:
+            return Err(SdkError("memory_reader manager is not initialized"))
+        try:
+            payload = await asyncio.to_thread(
+                self._memory_reader_manager.list_processes_snapshot,
+                include_unknown=bool(include_unknown),
+            )
+        except Exception as exc:
+            return Err(SdkError(f"list Memory Reader processes failed: {exc}"))
+        payload["summary"] = (
+            f"processes={int(payload.get('candidate_count') or 0)} "
+            f"mode={payload.get('target_selection_mode') or 'auto'}"
+        )
+        return Ok(payload)
+
+    @plugin_entry(
+        id="galgame_set_memory_reader_target",
+        name="设置 Memory Reader 目标进程",
+        description="锁定或清除 Memory Reader 的手动进程目标。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "process_key": {"type": "string", "default": ""},
+                "pid": {"type": "integer", "default": 0},
+                "exe_path": {"type": "string", "default": ""},
+                "process_name": {"type": "string", "default": ""},
+                "clear": {"type": "boolean", "default": False},
+            },
+        },
+        llm_result_fields=["summary"],
+    )
+    async def galgame_set_memory_reader_target(
+        self,
+        process_key: str = "",
+        pid: int = 0,
+        exe_path: str = "",
+        process_name: str = "",
+        clear: bool = False,
+        **_,
+    ):
+        if self._memory_reader_manager is None:
+            return Err(SdkError("memory_reader manager is not initialized"))
+
+        if clear:
+            target_payload = {
+                "mode": "auto",
+                "process_key": "",
+                "process_name": "",
+                "exe_path": "",
+                "pid": 0,
+                "engine": "",
+                "detected_engine": "",
+                "detection_reason": "",
+                "create_time": 0.0,
+                "selected_at": "",
+            }
+            summary = "Memory Reader process target cleared; using auto detection"
+        else:
+            try:
+                target_payload = await asyncio.to_thread(
+                    self._memory_reader_manager.resolve_manual_process_target,
+                    process_key=process_key,
+                    pid=pid,
+                    exe_path=exe_path,
+                    process_name=process_name,
+                )
+            except ValueError as exc:
+                return Err(SdkError(str(exc)))
+            except Exception as exc:
+                return Err(SdkError(f"resolve Memory Reader process target failed: {exc}"))
+            summary = (
+                f"Memory Reader target locked to {target_payload.get('process_name') or '(unknown)'}"
+            )
+
+        try:
+            self._persist.persist_memory_reader_target(target_payload)
+        except Exception as exc:
+            return Err(SdkError(f"persist Memory Reader target failed: {exc}"))
+
+        self._memory_reader_manager.update_process_target(target_payload)
+        with self._state_lock:
+            self._state.memory_reader_target = json_copy(target_payload)
+            self._state_dirty = True
+            self._cached_snapshot = None
+        background_poll_started = self._start_background_bridge_poll()
+        return Ok(
+            {
+                "process_target": json_copy(target_payload),
+                "cleared": bool(clear),
+                "summary": summary,
+                "background_poll_started": background_poll_started,
+            }
+        )
 
     @plugin_entry(
         id="galgame_list_ocr_windows",

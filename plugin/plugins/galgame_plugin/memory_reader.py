@@ -43,6 +43,19 @@ MEMORY_READER_DEFAULT_ENGINE = "unknown"
 MEMORY_READER_MAX_HOOK_CACHE = 256
 _MEMORY_LINE_ID_MAX_COLLISION_SUFFIX = 10000
 TEXTRACTOR_EXECUTABLE = "TextractorCLI.exe"
+_KIRIKIRI_DIR_CACHE_TTL_SECONDS = 10.0
+_KIRIKIRI_COMMON_XP3_NAMES = {
+    "data.xp3",
+    "patch.xp3",
+    "scenario.xp3",
+}
+_KIRIKIRI_PROCESS_SIGNATURE_PRESETS = (
+    {
+        "id": "senren_banka",
+        "tokens": ("senrenbanka",),
+        "steam_app_ids": ("1144400",),
+    },
+)
 _EXCLUDED_PROCESS_NAMES = {
     "crashpad_handler",
 }
@@ -54,6 +67,8 @@ _EXCLUDED_PROCESS_NAME_SUBSTRINGS = (
 _TEXTRACTOR_PROCESS_LOCK = threading.Lock()
 _TEXTRACTOR_PROCESSES: set[subprocess.Popen] = set()
 _TEXTRACTOR_JOB_HANDLES: dict[subprocess.Popen, int] = {}
+_KIRIKIRI_DIR_CACHE_LOCK = threading.Lock()
+_KIRIKIRI_DIR_CACHE: dict[str, tuple[float, str, str]] = {}
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
@@ -216,6 +231,25 @@ def _textractor_hook_command(code: str, pid: int) -> str:
     return f"{normalized} -P{int(pid)}"
 
 
+def _select_hook_codes_for_engine(
+    config: GalgameConfig,
+    engine: str,
+) -> tuple[list[str], str]:
+    normalized_engine = str(engine or "").strip().lower() or MEMORY_READER_DEFAULT_ENGINE
+    engine_hooks = getattr(config, "memory_reader_engine_hook_codes", {}) or {}
+    configured_codes = engine_hooks.get(normalized_engine)
+    if configured_codes is not None:
+        return list(configured_codes), "hook_codes_sent" if configured_codes else "hook_codes_none"
+    legacy_codes = list(getattr(config, "memory_reader_hook_codes", []) or [])
+    if not legacy_codes:
+        return [], "hook_codes_none"
+    if normalized_engine == "unity":
+        return legacy_codes, "hook_codes_sent"
+    if normalized_engine == MEMORY_READER_DEFAULT_ENGINE:
+        return [], "hook_codes_skipped_for_unknown_engine"
+    return [], "hook_codes_skipped_for_engine"
+
+
 def is_windows_platform() -> bool:
     return os.name == "nt" or sys.platform.startswith("win")
 
@@ -265,6 +299,53 @@ def _engine_from_text(text: str) -> str:
     return ""
 
 
+def _normalize_process_signature_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _path_parts_for_signature(path: str) -> list[str]:
+    normalized = str(path or "").strip()
+    if not normalized:
+        return []
+    parts: list[str] = [normalized]
+    try:
+        path_obj = Path(normalized)
+        parts.append(path_obj.stem)
+        parts.append(path_obj.name)
+        parts.append(path_obj.parent.name)
+        parts.extend(path_obj.parts[-4:])
+    except Exception:
+        pass
+    return [part for part in parts if part]
+
+
+def _kirikiri_preset_detection(
+    *,
+    name: str,
+    cmdline: str,
+    exe_path: str,
+) -> tuple[str, str]:
+    raw_values = [name, cmdline, *_path_parts_for_signature(exe_path)]
+    normalized_values = [
+        normalized
+        for value in raw_values
+        if (normalized := _normalize_process_signature_text(value))
+    ]
+    if not normalized_values:
+        return "", ""
+    combined = "\n".join(normalized_values)
+    steam_context = any("steam" in value or "steamapps" in value for value in normalized_values)
+    for preset in _KIRIKIRI_PROCESS_SIGNATURE_PRESETS:
+        preset_id = str(preset.get("id") or "").strip()
+        tokens = tuple(str(token or "").strip().lower() for token in preset.get("tokens", ()))
+        if any(token and token in combined for token in tokens):
+            return "kirikiri", f"detected_kirikiri_preset_{preset_id}"
+        app_ids = tuple(str(app_id or "").strip() for app_id in preset.get("steam_app_ids", ()))
+        if steam_context and any(app_id and app_id in combined for app_id in app_ids):
+            return "kirikiri", f"detected_kirikiri_preset_{preset_id}"
+    return "", ""
+
+
 def _is_excluded_helper_process(name: str, cmdline: str) -> bool:
     lowered_name = str(name or "").strip().lower()
     lowered_cmdline = str(cmdline or "").strip().lower()
@@ -283,6 +364,33 @@ class DetectedGameProcess:
     name: str
     create_time: float
     engine: str
+    exe_path: str = ""
+    detection_reason: str = ""
+
+    @property
+    def process_key(self) -> str:
+        path_digest = hashlib.sha1(self.exe_path.encode("utf-8")).hexdigest()[:12] if self.exe_path else "noexe"
+        name_digest = hashlib.sha1(self.name.lower().encode("utf-8")).hexdigest()[:8] if self.name else "noname"
+        return f"memproc:{int(self.pid)}:{name_digest}:{path_digest}"
+
+    def to_dict(
+        self,
+        *,
+        is_attached: bool = False,
+        is_manual_target: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "process_key": self.process_key,
+            "pid": self.pid,
+            "process_name": self.name,
+            "exe_path": self.exe_path,
+            "detected_engine": self.engine or MEMORY_READER_DEFAULT_ENGINE,
+            "engine": self.engine or MEMORY_READER_DEFAULT_ENGINE,
+            "detection_reason": self.detection_reason,
+            "create_time": self.create_time,
+            "is_attached": is_attached,
+            "is_manual_target": is_manual_target,
+        }
 
 
 @dataclass(slots=True)
@@ -303,26 +411,42 @@ class MemoryReaderRuntime:
     enabled: bool = False
     status: str = "disabled"
     detail: str = ""
+    target_selection_mode: str = "auto"
+    target_selection_detail: str = ""
     process_name: str = ""
     pid: int = 0
+    exe_path: str = ""
     engine: str = ""
+    detection_reason: str = ""
+    hook_code_count: int = 0
+    hook_code_detail: str = ""
     game_id: str = ""
     session_id: str = ""
     last_seq: int = 0
     last_event_ts: str = ""
+    last_text_seq: int = 0
+    last_text_ts: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
             "status": self.status,
             "detail": self.detail,
+            "target_selection_mode": self.target_selection_mode,
+            "target_selection_detail": self.target_selection_detail,
             "process_name": self.process_name,
             "pid": self.pid,
+            "exe_path": self.exe_path,
             "engine": self.engine,
+            "detection_reason": self.detection_reason,
+            "hook_code_count": self.hook_code_count,
+            "hook_code_detail": self.hook_code_detail,
             "game_id": self.game_id,
             "session_id": self.session_id,
             "last_seq": self.last_seq,
             "last_event_ts": self.last_event_ts,
+            "last_text_seq": self.last_text_seq,
+            "last_text_ts": self.last_text_ts,
         }
 
 
@@ -331,6 +455,93 @@ class MemoryReaderTickResult:
     warnings: list[str] = field(default_factory=list)
     should_rescan: bool = False
     runtime: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MemoryReaderProcessTarget:
+    mode: str = "auto"
+    process_key: str = ""
+    process_name: str = ""
+    exe_path: str = ""
+    pid: int = 0
+    engine: str = ""
+    detection_reason: str = ""
+    create_time: float = 0.0
+    selected_at: str = ""
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any] | None) -> MemoryReaderProcessTarget:
+        raw = value if isinstance(value, dict) else {}
+        mode = str(raw.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "manual"}:
+            mode = "auto"
+        try:
+            pid = int(raw.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        try:
+            create_time = float(raw.get("create_time") or 0.0)
+        except (TypeError, ValueError):
+            create_time = 0.0
+        return cls(
+            mode=mode,
+            process_key=str(raw.get("process_key") or "").strip(),
+            process_name=str(raw.get("process_name") or raw.get("name") or "").strip(),
+            exe_path=str(raw.get("exe_path") or "").strip(),
+            pid=max(0, pid),
+            engine=str(raw.get("engine") or raw.get("detected_engine") or "").strip().lower(),
+            detection_reason=str(raw.get("detection_reason") or "").strip(),
+            create_time=max(0.0, create_time),
+            selected_at=str(raw.get("selected_at") or "").strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "process_key": self.process_key,
+            "process_name": self.process_name,
+            "exe_path": self.exe_path,
+            "pid": self.pid,
+            "engine": self.engine,
+            "detected_engine": self.engine,
+            "detection_reason": self.detection_reason,
+            "create_time": self.create_time,
+            "selected_at": self.selected_at,
+        }
+
+    def is_manual(self) -> bool:
+        return self.mode == "manual"
+
+    def matches_exact(self, candidate: DetectedGameProcess) -> bool:
+        if self.process_key and self.process_key == candidate.process_key:
+            return True
+        return bool(self.pid) and self.pid == candidate.pid
+
+    def matches_signature(self, candidate: DetectedGameProcess) -> bool:
+        process_name = self.process_name.strip().lower()
+        candidate_name = candidate.name.strip().lower()
+        exe_path = os.path.normcase(self.exe_path.strip())
+        candidate_exe = os.path.normcase(candidate.exe_path.strip())
+        if exe_path and candidate_exe and exe_path != candidate_exe:
+            return False
+        if process_name and process_name != candidate_name:
+            return False
+        if not process_name and not exe_path and self.pid > 0:
+            return candidate.pid == self.pid
+        return bool(process_name or exe_path or self.pid)
+
+    def resolved_for(self, candidate: DetectedGameProcess) -> MemoryReaderProcessTarget:
+        return MemoryReaderProcessTarget(
+            mode="manual",
+            process_key=candidate.process_key,
+            process_name=candidate.name,
+            exe_path=candidate.exe_path,
+            pid=candidate.pid,
+            engine=candidate.engine,
+            detection_reason=candidate.detection_reason,
+            create_time=candidate.create_time,
+            selected_at=self.selected_at,
+        )
 
 
 class TextractorProcessHandle(Protocol):
@@ -553,11 +764,84 @@ def _loaded_module_names(proc: Any) -> set[str]:
     return names
 
 
-def _default_process_scanner() -> list[DetectedGameProcess]:
+def _kirikiri_directory_detection(exe_path: str) -> tuple[str, str]:
+    normalized_path = str(exe_path or "").strip()
+    if not normalized_path:
+        return "", ""
+    try:
+        exe_dir = Path(normalized_path).parent
+    except Exception:
+        return "", ""
+    if not str(exe_dir):
+        return "", ""
+    cache_key = os.path.normcase(str(exe_dir))
+    now = time.monotonic()
+    with _KIRIKIRI_DIR_CACHE_LOCK:
+        cached = _KIRIKIRI_DIR_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _KIRIKIRI_DIR_CACHE_TTL_SECONDS:
+            return cached[1], cached[2]
+    engine = ""
+    reason = ""
+    try:
+        names = {item.name.lower() for item in exe_dir.iterdir()}
+    except Exception:
+        names = set()
+    if "startup.tjs" in names:
+        engine = "kirikiri"
+        reason = "detected_kirikiri_startup_tjs"
+    elif any(name in names for name in _KIRIKIRI_COMMON_XP3_NAMES):
+        engine = "kirikiri"
+        reason = "detected_kirikiri_common_xp3"
+    elif any(name.endswith(".xp3") for name in names):
+        engine = "kirikiri"
+        reason = "detected_kirikiri_xp3"
+    with _KIRIKIRI_DIR_CACHE_LOCK:
+        _KIRIKIRI_DIR_CACHE[cache_key] = (now, engine, reason)
+        if len(_KIRIKIRI_DIR_CACHE) > 512:
+            for stale_key in list(_KIRIKIRI_DIR_CACHE)[:-512]:
+                _KIRIKIRI_DIR_CACHE.pop(stale_key, None)
+    return engine, reason
+
+
+def _detect_process_engine(
+    *,
+    name: str,
+    cmdline: str,
+    exe_path: str,
+    modules: set[str],
+) -> tuple[str, str]:
+    lowered_name = name.lower()
+    lowered_cmdline = cmdline.lower()
+    if "python" in lowered_name and "renpy" in lowered_cmdline:
+        return "renpy", "detected_renpy_cmdline"
+    if "renpy.pyd" in modules or "pygame" in modules:
+        return "renpy", "detected_renpy_module"
+    if "unity" in lowered_name or "unity" in lowered_cmdline:
+        return "unity", "detected_unity_name_or_cmdline"
+    if "unityplayer.dll" in modules or "assembly-csharp.dll" in modules:
+        return "unity", "detected_unity_module"
+    if "kirikiri" in lowered_name or "krkr" in lowered_name:
+        return "kirikiri", "detected_kirikiri_process_name"
+    if "krkr.dll" in modules:
+        return "kirikiri", "detected_kirikiri_module"
+    directory_engine, directory_reason = _kirikiri_directory_detection(exe_path)
+    if directory_engine:
+        return directory_engine, directory_reason
+    preset_engine, preset_reason = _kirikiri_preset_detection(
+        name=name,
+        cmdline=cmdline,
+        exe_path=exe_path,
+    )
+    if preset_engine:
+        return preset_engine, preset_reason
+    return "", ""
+
+
+def _scan_processes(*, include_unknown: bool = False) -> list[DetectedGameProcess]:
     if psutil is None:
         return []
     detected: list[DetectedGameProcess] = []
-    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time", "exe"]):
         try:
             info = proc.info
             name = str(info.get("name") or "")
@@ -565,30 +849,24 @@ def _default_process_scanner() -> list[DetectedGameProcess]:
             cmdline = " ".join(str(item) for item in cmdline_parts)
             if _is_excluded_helper_process(name, cmdline):
                 continue
-            lowered_name = name.lower()
-            lowered_cmdline = cmdline.lower()
+            exe_path = str(info.get("exe") or "")
             modules = _loaded_module_names(proc)
-            engine = ""
-            if "python" in lowered_name and "renpy" in lowered_cmdline:
-                engine = "renpy"
-            elif "renpy.pyd" in modules or "pygame" in modules:
-                engine = "renpy"
-            elif "unity" in lowered_name or "unity" in lowered_cmdline:
-                engine = "unity"
-            elif "unityplayer.dll" in modules or "assembly-csharp.dll" in modules:
-                engine = "unity"
-            elif "kirikiri" in lowered_name or "krkr" in lowered_name:
-                engine = "kirikiri"
-            elif "krkr.dll" in modules:
-                engine = "kirikiri"
-            if not engine:
+            engine, detection_reason = _detect_process_engine(
+                name=name,
+                cmdline=cmdline,
+                exe_path=exe_path,
+                modules=modules,
+            )
+            if not engine and not include_unknown:
                 continue
             detected.append(
                 DetectedGameProcess(
                     pid=int(info.get("pid") or 0),
                     name=name or f"pid-{int(info.get('pid') or 0)}",
                     create_time=float(info.get("create_time") or 0.0),
-                    engine=engine,
+                    engine=engine or MEMORY_READER_DEFAULT_ENGINE,
+                    exe_path=exe_path,
+                    detection_reason=detection_reason or "unknown_engine",
                 )
             )
         except Exception:
@@ -600,6 +878,14 @@ def _default_process_scanner() -> list[DetectedGameProcess]:
             continue
     detected.sort(key=lambda item: (-item.create_time, item.pid))
     return detected
+
+
+def _default_process_scanner() -> list[DetectedGameProcess]:
+    return _scan_processes(include_unknown=False)
+
+
+def _default_process_inventory() -> list[DetectedGameProcess]:
+    return _scan_processes(include_unknown=True)
 
 
 class MemoryReaderBridgeWriter:
@@ -617,10 +903,14 @@ class MemoryReaderBridgeWriter:
         self._session_id = ""
         self._process_name = ""
         self._pid = 0
+        self._exe_path = ""
+        self._detection_reason = ""
         self._engine = MEMORY_READER_DEFAULT_ENGINE
         self._started_at = ""
         self._last_seq = 0
         self._last_event_ts = ""
+        self._last_text_seq = 0
+        self._last_text_ts = ""
         self._state = self._initial_state("")
         self._text_to_line_id: dict[str, str] = {}
         self._line_id_owner: dict[str, str] = {}
@@ -650,6 +940,18 @@ class MemoryReaderBridgeWriter:
     def last_event_ts(self) -> str:
         return self._last_event_ts
 
+    @property
+    def last_text_seq(self) -> int:
+        return self._last_text_seq
+
+    @property
+    def last_text_ts(self) -> str:
+        return self._last_text_ts
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
     def update_engine(self, engine: str) -> bool:
         normalized = engine or MEMORY_READER_DEFAULT_ENGINE
         if normalized == self._engine or not self._session_id:
@@ -664,10 +966,14 @@ class MemoryReaderBridgeWriter:
         self._session_id = f"mem-{uuid4()}"
         self._process_name = process.name
         self._pid = process.pid
+        self._exe_path = process.exe_path
+        self._detection_reason = process.detection_reason
         self._engine = process.engine or MEMORY_READER_DEFAULT_ENGINE
         self._started_at = started_at
         self._last_seq = 0
         self._last_event_ts = started_at
+        self._last_text_seq = 0
+        self._last_text_ts = ""
         self._state = self._initial_state(started_at)
         self._text_to_line_id.clear()
         self._line_id_owner.clear()
@@ -725,6 +1031,7 @@ class MemoryReaderBridgeWriter:
                 "route_id": self._state["route_id"],
             },
             ts=ts,
+            text_event=True,
         )
         return True
 
@@ -760,6 +1067,7 @@ class MemoryReaderBridgeWriter:
                 "choices": payload_choices,
             },
             ts=ts,
+            text_event=True,
         )
         return True
 
@@ -815,11 +1123,15 @@ class MemoryReaderBridgeWriter:
             detail="",
             process_name=self._process_name,
             pid=self._pid,
+            exe_path=self._exe_path,
             engine=self._engine,
+            detection_reason=self._detection_reason,
             game_id=self._game_id,
             session_id=self._session_id,
             last_seq=self._last_seq,
             last_event_ts=self._last_event_ts,
+            last_text_seq=self._last_text_seq,
+            last_text_ts=self._last_text_ts,
         )
 
     def _initial_state(self, ts: str) -> dict[str, Any]:
@@ -863,6 +1175,8 @@ class MemoryReaderBridgeWriter:
                 "source": DATA_SOURCE_MEMORY_READER,
                 "game_process_name": self._process_name,
                 "game_pid": self._pid,
+                "game_exe_path": str(getattr(self, "_exe_path", "") or ""),
+                "detection_reason": str(getattr(self, "_detection_reason", "") or ""),
             },
             "state": {
                 "speaker": str(self._state.get("speaker") or ""),
@@ -899,10 +1213,14 @@ class MemoryReaderBridgeWriter:
         *,
         ts: str,
         update_snapshot: bool = True,
-    ) -> None:
+        text_event: bool = False,
+    ) -> int:
         with self._io_lock:
             self._last_seq += 1
             self._last_event_ts = ts
+            if text_event:
+                self._last_text_seq = self._last_seq
+                self._last_text_ts = ts
             event = {
                 "protocol_version": 1,
                 "seq": self._last_seq,
@@ -924,6 +1242,7 @@ class MemoryReaderBridgeWriter:
                 handle.flush()
             if update_snapshot:
                 self._write_session_snapshot()
+            return self._last_seq
 
     def _line_id_for_text(self, text: str) -> str:
         normalized = normalize_text(text)
@@ -962,6 +1281,7 @@ class MemoryReaderManager:
         config: GalgameConfig,
         process_factory: Callable[[str], Awaitable[TextractorProcessHandle]] | None = None,
         process_scanner: Callable[[], list[DetectedGameProcess]] | None = None,
+        process_inventory_scanner: Callable[[], list[DetectedGameProcess]] | None = None,
         time_fn: Callable[[], float] | None = None,
         platform_fn: Callable[[], bool] | None = None,
         writer: MemoryReaderBridgeWriter | None = None,
@@ -976,6 +1296,7 @@ class MemoryReaderManager:
         else:
             self._process_factory = process_factory
         self._process_scanner = process_scanner or _default_process_scanner
+        self._process_inventory_scanner = process_inventory_scanner or _default_process_inventory
         self._time_fn = time_fn or time.time
         self._platform_fn = platform_fn or is_windows_platform
         self._writer = writer or MemoryReaderBridgeWriter(
@@ -985,6 +1306,10 @@ class MemoryReaderManager:
         self._runtime = MemoryReaderRuntime(enabled=config.memory_reader_enabled)
         self._process: TextractorProcessHandle | None = None
         self._attached_process: DetectedGameProcess | None = None
+        self._manual_target = MemoryReaderProcessTarget()
+        self._target_selection_detail = "auto_candidate_scan"
+        self._last_process_inventory: list[DetectedGameProcess] = []
+        self._target_restart_requested = False
         self._attach_started_at = 0.0
         self._backoff_until = 0.0
         self._restart_attempts = 0
@@ -993,6 +1318,8 @@ class MemoryReaderManager:
         self._config_update_lock = threading.RLock()
         self._last_heartbeat_at = 0.0
         self._last_no_text_warning_at = 0.0
+        self._last_hook_code_count = 0
+        self._last_hook_code_detail = "hook_codes_none"
 
     def update_config(self, config: GalgameConfig) -> None:
         with self._config_update_lock:
@@ -1011,12 +1338,177 @@ class MemoryReaderManager:
                 detail="bridge_root_changed",
             )
             self._attached_process = None
+            self._target_restart_requested = False
             self._attach_started_at = 0.0
             self._backoff_until = 0.0
             self._last_heartbeat_at = 0.0
             self._last_no_text_warning_at = 0.0
+            self._last_hook_code_count = 0
+            self._last_hook_code_detail = "hook_codes_none"
             with self._last_hook_text_lock:
                 self._last_hook_text.clear()
+
+    def update_process_target(self, target: dict[str, Any] | None) -> None:
+        old_target = self._manual_target.to_dict()
+        self._manual_target = MemoryReaderProcessTarget.from_dict(target)
+        self._target_selection_detail = (
+            "manual_target_active" if self._manual_target.is_manual() else "auto_candidate_scan"
+        )
+        if old_target != self._manual_target.to_dict() and (
+            self._attached_process is not None or self._process is not None
+        ):
+            self._target_restart_requested = True
+
+    def current_process_target(self) -> dict[str, Any]:
+        return self._manual_target.to_dict()
+
+    def list_processes_snapshot(self, *, include_unknown: bool = True) -> dict[str, Any]:
+        scanner = self._process_inventory_scanner if include_unknown else self._process_scanner
+        processes = scanner()
+        self._last_process_inventory = list(processes)
+        manual = self._manual_target
+        return {
+            "target_selection_mode": "manual" if manual.is_manual() else "auto",
+            "manual_target": manual.to_dict(),
+            "candidate_count": len(processes),
+            "processes": [
+                item.to_dict(
+                    is_attached=(
+                        self._attached_process is not None
+                        and item.pid == self._attached_process.pid
+                    ),
+                    is_manual_target=(
+                        manual.is_manual()
+                        and (manual.matches_exact(item) or manual.matches_signature(item))
+                    ),
+                )
+                for item in processes
+            ],
+        }
+
+    def resolve_manual_process_target(
+        self,
+        *,
+        process_key: str = "",
+        pid: int = 0,
+        exe_path: str = "",
+        process_name: str = "",
+    ) -> dict[str, Any]:
+        normalized_key = str(process_key or "").strip()
+        normalized_exe = os.path.normcase(str(exe_path or "").strip())
+        normalized_name = str(process_name or "").strip().lower()
+        try:
+            normalized_pid = int(pid or 0)
+        except (TypeError, ValueError):
+            normalized_pid = 0
+        if not any([normalized_key, normalized_pid, normalized_exe, normalized_name]):
+            raise ValueError("process_key, pid, exe_path, or process_name is required")
+        processes = self._process_inventory_scanner()
+        self._last_process_inventory = list(processes)
+        for candidate in processes:
+            if normalized_key and candidate.process_key == normalized_key:
+                return MemoryReaderProcessTarget(
+                    mode="manual",
+                    process_key=candidate.process_key,
+                    process_name=candidate.name,
+                    exe_path=candidate.exe_path,
+                    pid=candidate.pid,
+                    engine=candidate.engine,
+                    detection_reason=candidate.detection_reason,
+                    create_time=candidate.create_time,
+                    selected_at=utc_now_iso(self._time_fn()),
+                ).to_dict()
+        for candidate in processes:
+            if normalized_pid > 0 and candidate.pid == normalized_pid:
+                return MemoryReaderProcessTarget(
+                    mode="manual",
+                    process_key=candidate.process_key,
+                    process_name=candidate.name,
+                    exe_path=candidate.exe_path,
+                    pid=candidate.pid,
+                    engine=candidate.engine,
+                    detection_reason=candidate.detection_reason,
+                    create_time=candidate.create_time,
+                    selected_at=utc_now_iso(self._time_fn()),
+                ).to_dict()
+        for candidate in processes:
+            candidate_exe = os.path.normcase(candidate.exe_path.strip())
+            candidate_name = candidate.name.strip().lower()
+            if normalized_exe and candidate_exe != normalized_exe:
+                continue
+            if normalized_name and candidate_name != normalized_name:
+                continue
+            if normalized_exe or normalized_name:
+                return MemoryReaderProcessTarget(
+                    mode="manual",
+                    process_key=candidate.process_key,
+                    process_name=candidate.name,
+                    exe_path=candidate.exe_path,
+                    pid=candidate.pid,
+                    engine=candidate.engine,
+                    detection_reason=candidate.detection_reason,
+                    create_time=candidate.create_time,
+                    selected_at=utc_now_iso(self._time_fn()),
+                ).to_dict()
+        raise ValueError("process target not found")
+
+    def _select_target_process(
+        self,
+        processes: list[DetectedGameProcess],
+    ) -> tuple[DetectedGameProcess | None, str]:
+        if self._manual_target.is_manual():
+            for candidate in processes:
+                if self._manual_target.matches_exact(candidate):
+                    resolved = self._manual_target.resolved_for(candidate)
+                    resolved.selected_at = self._manual_target.selected_at
+                    self._manual_target = resolved
+                    return candidate, "manual_target_exact"
+            for candidate in processes:
+                if self._manual_target.matches_signature(candidate):
+                    resolved = self._manual_target.resolved_for(candidate)
+                    resolved.selected_at = self._manual_target.selected_at
+                    self._manual_target = resolved
+                    return candidate, "manual_target_rebound"
+            return None, "manual_target_unavailable"
+        if not self._config.memory_reader_auto_detect:
+            return None, "manual_pid_unimplemented"
+        if not processes:
+            return None, "no_detected_game_process"
+        return processes[0], processes[0].detection_reason or "auto_candidate_scan"
+
+    def _current_runtime(
+        self,
+        *,
+        status: str,
+        detail: str,
+        process: DetectedGameProcess | None = None,
+    ) -> MemoryReaderRuntime:
+        attached = process or self._attached_process
+        return MemoryReaderRuntime(
+            enabled=True,
+            status=status,
+            detail=detail,
+            target_selection_mode="manual" if self._manual_target.is_manual() else "auto",
+            target_selection_detail=self._target_selection_detail,
+            process_name=attached.name if attached else "",
+            pid=attached.pid if attached else 0,
+            exe_path=attached.exe_path if attached else "",
+            engine=(
+                self._writer.engine
+                if self._writer.session_id
+                else (attached.engine if attached else MEMORY_READER_DEFAULT_ENGINE)
+            )
+            or MEMORY_READER_DEFAULT_ENGINE,
+            detection_reason=attached.detection_reason if attached else "",
+            hook_code_count=self._last_hook_code_count,
+            hook_code_detail=self._last_hook_code_detail,
+            game_id=self._writer.game_id,
+            session_id=self._writer.session_id,
+            last_seq=self._writer.last_seq,
+            last_event_ts=self._writer.last_event_ts,
+            last_text_seq=self._writer.last_text_seq,
+            last_text_ts=self._writer.last_text_ts,
+        )
 
     async def shutdown(self) -> None:
         await self._stop_textractor()
@@ -1054,10 +1546,10 @@ class MemoryReaderManager:
             result.warnings.append("memory_reader TextractorCLI.exe is invalid or missing")
             result.runtime = self._runtime.to_dict()
             return result
-        if not self._config.memory_reader_auto_detect:
+        if not self._config.memory_reader_auto_detect and not self._manual_target.is_manual():
             await self._stop_textractor()
-            self._runtime = MemoryReaderRuntime(
-                enabled=True,
+            self._target_selection_detail = "manual_pid_unimplemented"
+            self._runtime = self._current_runtime(
                 status="idle",
                 detail="manual_pid_unimplemented",
             )
@@ -1077,9 +1569,20 @@ class MemoryReaderManager:
                 session_id=self._runtime.session_id,
                 last_seq=self._runtime.last_seq,
                 last_event_ts=self._runtime.last_event_ts,
+                last_text_seq=self._runtime.last_text_seq,
+                last_text_ts=self._runtime.last_text_ts,
             )
             result.runtime = self._runtime.to_dict()
             return result
+        if self._target_restart_requested:
+            self._target_restart_requested = False
+            if self._writer.end_session(ts=utc_now_iso(now)):
+                result.should_rescan = True
+            await self._stop_textractor()
+            self._runtime = self._current_runtime(
+                status="scanning",
+                detail="target_changed",
+            )
         if self._backoff_until and now < self._backoff_until:
             self._runtime.status = "backoff"
             self._runtime.detail = "waiting_before_restart"
@@ -1089,7 +1592,9 @@ class MemoryReaderManager:
         if self._attached_process is None:
             self._runtime.status = "scanning"
             self._runtime.detail = "scanning_processes"
-        processes = await asyncio.to_thread(self._process_scanner)
+        scanner = self._process_inventory_scanner if self._manual_target.is_manual() else self._process_scanner
+        processes = await asyncio.to_thread(scanner)
+        self._last_process_inventory = list(processes)
         if self._attached_process is None and processes:
             preview = ", ".join(f"{item.name}({item.pid},{item.engine})" for item in processes[:5])
             self._logger.debug("memory_reader detected candidate processes: {}", preview)
@@ -1097,22 +1602,16 @@ class MemoryReaderManager:
             process_lookup = {item.pid: item for item in processes}
             attached = process_lookup.get(self._attached_process.pid)
             if attached is None:
+                previous = self._attached_process
                 self._logger.info(
                     "memory_reader detached because process disappeared: {}({})",
-                    self._attached_process.name,
-                    self._attached_process.pid,
+                    previous.name,
+                    previous.pid,
                 )
                 if self._writer.end_session(ts=utc_now_iso(now)):
                     result.should_rescan = True
                 await self._stop_textractor()
                 self._attached_process = None
-                self._runtime = MemoryReaderRuntime(
-                    enabled=True,
-                    status="idle",
-                    detail="no_detected_game_process",
-                )
-                result.runtime = self._runtime.to_dict()
-                return result
             self._attached_process = attached
 
         if self._process is not None and self._process.poll() is not None:
@@ -1128,16 +1627,20 @@ class MemoryReaderManager:
                 return result
 
         if self._attached_process is None:
-            if not processes:
-                self._runtime = MemoryReaderRuntime(
-                    enabled=True,
+            target, selection_detail = self._select_target_process(processes)
+            self._target_selection_detail = selection_detail
+            if target is None:
+                self._runtime = self._current_runtime(
                     status="idle",
-                    detail="no_detected_game_process",
+                    detail=selection_detail,
                 )
                 result.runtime = self._runtime.to_dict()
                 return result
-            target = processes[0]
-            if not self._writer.session_id or self._writer.game_id != compute_memory_reader_game_id(target.name):
+            if (
+                not self._writer.session_id
+                or self._writer.game_id != compute_memory_reader_game_id(target.name)
+                or self._writer.pid != target.pid
+            ):
                 self._writer.start_session(target)
                 result.should_rescan = True
             self._attached_process = target
@@ -1156,12 +1659,18 @@ class MemoryReaderManager:
                     target.engine,
                 )
                 await self._process.write(f"attach -P{target.pid}\n")
-                # Send user-configured hook codes after attach (needed for IL2CPP etc.)
-                hook_codes = self._config.memory_reader_hook_codes
+                hook_codes, hook_code_detail = _select_hook_codes_for_engine(
+                    self._config,
+                    target.engine,
+                )
+                self._last_hook_code_count = len(hook_codes)
+                self._last_hook_code_detail = hook_code_detail
                 self._logger.info(
-                    "memory_reader hook_codes config: {} (count={})",
+                    "memory_reader hook_codes selected: {} (count={}, engine={}, detail={})",
                     hook_codes,
                     len(hook_codes),
+                    target.engine,
+                    hook_code_detail,
                 )
                 if hook_codes:
                     self._logger.info(
@@ -1174,18 +1683,19 @@ class MemoryReaderManager:
                         hook_command = _textractor_hook_command(code, target.pid)
                         if hook_command:
                             await self._process.write(f"{hook_command}\n")
+                elif hook_code_detail.startswith("hook_codes_skipped"):
+                    self._logger.info(
+                        "memory_reader skipped hook code injection for {}({}) engine={} reason={}",
+                        target.name,
+                        target.pid,
+                        target.engine,
+                        hook_code_detail,
+                    )
             except Exception as exc:
-                self._runtime = MemoryReaderRuntime(
-                    enabled=True,
+                self._runtime = self._current_runtime(
                     status="backoff",
                     detail="attach_command_failed",
-                    process_name=target.name,
-                    pid=target.pid,
-                    engine=target.engine,
-                    game_id=self._writer.game_id,
-                    session_id=self._writer.session_id,
-                    last_seq=self._writer.last_seq,
-                    last_event_ts=self._writer.last_event_ts,
+                    process=target,
                 )
                 self._backoff_until = now + 5.0
                 result.warnings.append(f"memory_reader attach failed: {exc}")
@@ -1194,17 +1704,10 @@ class MemoryReaderManager:
                 result.runtime = self._runtime.to_dict()
                 return result
             self._attach_started_at = now
-            self._runtime = MemoryReaderRuntime(
-                enabled=True,
+            self._runtime = self._current_runtime(
                 status="attaching",
                 detail="waiting_for_attach_confirmation",
-                process_name=target.name,
-                pid=target.pid,
-                engine=target.engine,
-                game_id=self._writer.game_id,
-                session_id=self._writer.session_id,
-                last_seq=self._writer.last_seq,
-                last_event_ts=self._writer.last_event_ts,
+                process=target,
             )
 
         try:
@@ -1232,9 +1735,13 @@ class MemoryReaderManager:
                 session_id=self._writer.session_id,
                 last_seq=self._writer.last_seq,
                 last_event_ts=self._writer.last_event_ts,
+                last_text_seq=self._writer.last_text_seq,
+                last_text_ts=self._writer.last_text_ts,
             ).to_dict()
             return result
         result.warnings.extend(parse_warnings)
+        if parse_warnings and not parsed_lines and not log_lines:
+            self._runtime.detail = "textractor_stdout_parse_failed"
         engine_override = self._engine_from_logs(log_lines)
         if engine_override and self._writer.update_engine(engine_override):
             result.should_rescan = True
@@ -1279,14 +1786,18 @@ class MemoryReaderManager:
             self._last_heartbeat_at = now
             self._last_no_text_warning_at = 0.0
             self._runtime.detail = "receiving_text"
-        elif self._runtime.status == "active" and now - self._last_heartbeat_at >= float(
-            self._config.memory_reader_poll_interval_seconds
-        ):
-            if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
-                result.should_rescan = True
-                self._last_heartbeat_at = now
-            if self._writer.last_seq <= 1:
+        elif self._runtime.status == "active":
+            if self._writer.last_text_seq > 0:
+                self._runtime.detail = "attached_idle_after_text"
+            else:
                 self._runtime.detail = "attached_no_text_yet"
+            if now - self._last_heartbeat_at >= float(
+                self._config.memory_reader_poll_interval_seconds
+            ):
+                if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+                    result.should_rescan = True
+                    self._last_heartbeat_at = now
+            if self._writer.last_text_seq <= 0:
                 if now - self._attach_started_at >= 3.0 and now - self._last_no_text_warning_at >= 10.0:
                     self._last_no_text_warning_at = now
                     self._logger.warning(
@@ -1295,17 +1806,9 @@ class MemoryReaderManager:
                         self._attached_process.pid if self._attached_process else 0,
                     )
 
-        self._runtime = MemoryReaderRuntime(
-            enabled=True,
+        self._runtime = self._current_runtime(
             status=self._runtime.status,
             detail=self._runtime.detail,
-            process_name=self._attached_process.name if self._attached_process else "",
-            pid=self._attached_process.pid if self._attached_process else 0,
-            engine=self._writer.engine or MEMORY_READER_DEFAULT_ENGINE,
-            game_id=self._writer.game_id,
-            session_id=self._writer.session_id,
-            last_seq=self._writer.last_seq,
-            last_event_ts=self._writer.last_event_ts,
         )
         result.runtime = self._runtime.to_dict()
         return result
@@ -1356,6 +1859,8 @@ class MemoryReaderManager:
             self._attach_started_at = 0.0
             self._last_heartbeat_at = 0.0
             self._last_no_text_warning_at = 0.0
+            self._last_hook_code_count = 0
+            self._last_hook_code_detail = "hook_codes_none"
             with self._last_hook_text_lock:
                 self._last_hook_text.clear()
 
@@ -1409,7 +1914,7 @@ class MemoryReaderManager:
         metadata = raw_line[1:close]
         text = raw_line[close + 1 :].lstrip()
         parts = metadata.split(":")
-        if len(parts) != 4:
+        if len(parts) < 4:
             return None, f"memory_reader failed to parse Textractor metadata: {raw_line}"
         try:
             pid = int(parts[0])

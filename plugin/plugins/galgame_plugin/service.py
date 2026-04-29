@@ -311,6 +311,22 @@ def _coerce_string_list(value: object) -> list[str]:
     return result
 
 
+def _coerce_memory_reader_engine_hook_codes(value: object) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for raw_engine, raw_codes in value.items():
+        engine = str(raw_engine or "").strip().lower()
+        if not engine:
+            continue
+        codes = _coerce_string_list(raw_codes)
+        if codes:
+            result[engine] = codes
+        else:
+            result.setdefault(engine, [])
+    return result
+
+
 def _sanitize_ocr_screen_template_regions(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -439,7 +455,7 @@ def _coerce_ocr_capture_backend(value: object, default: str = "auto") -> str:
     return default
 
 
-def _coerce_ocr_trigger_mode(value: object, default: str = OCR_TRIGGER_MODE_AFTER_ADVANCE) -> str:
+def _coerce_ocr_trigger_mode(value: object, default: str = OCR_TRIGGER_MODE_INTERVAL) -> str:
     normalized = str(value or default).strip().lower()
     if normalized in OCR_TRIGGER_MODES:
         return normalized
@@ -556,9 +572,11 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             memory_reader_obj.get("install_timeout_seconds"), 60.0, minimum=1.0
         ),
         memory_reader_auto_detect=bool(memory_reader_obj.get("auto_detect", True)),
-        memory_reader_hook_codes=list(
+        memory_reader_hook_codes=_coerce_string_list(
             memory_reader_obj.get("hook_codes")
-            or []
+        ),
+        memory_reader_engine_hook_codes=_coerce_memory_reader_engine_hook_codes(
+            memory_reader_obj.get("engine_hooks")
         ),
         memory_reader_poll_interval_seconds=_coerce_float(
             memory_reader_obj.get("poll_interval_seconds"), 1.0, minimum=0.1
@@ -567,14 +585,17 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             ocr_reader_obj.get("enabled"),
             _default_ocr_reader_enabled(),
         ),
+        ocr_reader_enabled_explicit="enabled" in ocr_reader_obj,
         ocr_reader_backend_selection=_coerce_ocr_backend_selection(
             ocr_reader_obj.get("backend_selection"),
             "auto",
         ),
+        ocr_reader_backend_selection_explicit="backend_selection" in ocr_reader_obj,
         ocr_reader_capture_backend=_coerce_ocr_capture_backend(
             ocr_reader_obj.get("capture_backend"),
             "auto",
         ),
+        ocr_reader_capture_backend_explicit="capture_backend" in ocr_reader_obj,
         ocr_reader_tesseract_path=str(ocr_reader_obj.get("tesseract_path") or ""),
         ocr_reader_install_manifest_url=str(
             ocr_reader_obj.get("install_manifest_url") or ""
@@ -656,6 +677,7 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             rapidocr_obj.get("enabled"),
             _default_ocr_reader_enabled(),
         ),
+        rapidocr_enabled_explicit="enabled" in rapidocr_obj,
         rapidocr_install_manifest_url=str(
             rapidocr_obj.get("install_manifest_url") or ""
         ).strip(),
@@ -966,6 +988,97 @@ def _line_text_from_status(value: Any) -> str:
     return _status_text(value.get("text"))
 
 
+def build_ocr_background_status(local_state: dict[str, Any]) -> dict[str, Any]:
+    runtime = local_state.get("ocr_reader_runtime")
+    runtime_obj = runtime if isinstance(runtime, dict) else {}
+    trigger_mode = _status_text(
+        local_state.get("ocr_reader_trigger_mode")
+        or runtime_obj.get("ocr_trigger_mode_effective")
+        or runtime_obj.get("trigger_mode")
+    ).lower()
+    context_state = _status_text(
+        local_state.get("ocr_context_state") or runtime_obj.get("ocr_context_state")
+    )
+    detail = _status_text(runtime_obj.get("target_selection_detail"))
+    runtime_detail = _status_text(runtime_obj.get("detail"))
+    last_exclude_reason = _status_text(runtime_obj.get("last_exclude_reason"))
+    last_capture_error = _status_text(runtime_obj.get("last_capture_error"))
+    target_known = "target_is_foreground" in runtime_obj
+    target_is_foreground = bool(runtime_obj.get("target_is_foreground"))
+    target_in_background = target_known and not target_is_foreground
+    pending_advance_captures = _status_int(local_state.get("pending_ocr_advance_captures"))
+    pending_advance_reason = _status_text(local_state.get("last_ocr_advance_capture_reason"))
+    capture_backend = _status_text(
+        runtime_obj.get("capture_backend_kind")
+        or local_state.get("ocr_capture_backend_selection")
+        or "auto"
+    )
+    capture_backend_blocked = (
+        context_state in {"capture_failed", "stale_capture_backend"}
+        or runtime_detail == "capture_failed"
+        or bool(runtime_obj.get("stale_capture_backend"))
+        or bool(last_capture_error)
+        or detail == "memory_reader_window_minimized"
+        or last_exclude_reason == "excluded_minimized_window"
+    )
+    foreground_resume_pending = (
+        trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+        and (
+            target_in_background
+            or (
+                pending_advance_captures > 0
+                and pending_advance_reason == "foreground_target_activated"
+            )
+        )
+    )
+    background_polling = (
+        trigger_mode == OCR_TRIGGER_MODE_INTERVAL
+        and target_in_background
+        and not capture_backend_blocked
+        and bool(
+            local_state.get("bridge_poll_running")
+            or str(runtime_obj.get("status") or "") in {"starting", "active", "running"}
+            or str(local_state.get("active_data_source") or "") == DATA_SOURCE_OCR_READER
+        )
+    )
+    capture_backend_advice = (
+        "确认目标游戏窗口可见且未最小化；若后台截图仍失败，请切换截图方式或重新选择 OCR 窗口。"
+    )
+
+    if capture_backend_blocked:
+        state = "capture_backend_blocked"
+        message = (
+            "OCR 截图后端当前被窗口状态或捕获方式阻塞。"
+            if not (trigger_mode == OCR_TRIGGER_MODE_INTERVAL and target_in_background)
+            else "定时 OCR 正在尝试后台读取，但截图后端被窗口状态或捕获方式阻塞。"
+        )
+        message = f"{message}{capture_backend_advice}"
+    elif background_polling:
+        state = "background_polling"
+        message = "定时 OCR 正在尝试后台读取；实际效果取决于窗口可见性、非最小化状态和截图后端。"
+    elif foreground_resume_pending:
+        state = "foreground_resume_pending"
+        message = "等待目标游戏窗口回到前台；切回后会触发 OCR 重新采集。"
+    elif target_known and target_is_foreground:
+        state = "foreground_active"
+        message = "目标游戏窗口在前台，OCR 可按当前触发方式采集。"
+    else:
+        state = "idle"
+        message = "OCR 后台读取状态未激活。"
+
+    return {
+        "state": state,
+        "message": message,
+        "trigger_mode": trigger_mode,
+        "capture_backend": capture_backend,
+        "target_is_foreground": target_is_foreground if target_known else None,
+        "background_polling": background_polling,
+        "foreground_resume_pending": foreground_resume_pending,
+        "capture_backend_blocked": capture_backend_blocked,
+        "capture_backend_advice": capture_backend_advice if capture_backend_blocked else "",
+    }
+
+
 def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
     runtime = local_state.get("ocr_reader_runtime")
     runtime_obj = runtime if isinstance(runtime, dict) else {}
@@ -977,12 +1090,24 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
     context_state = _status_text(local_state.get("ocr_context_state") or runtime_obj.get("ocr_context_state"))
     detail = _status_text(runtime_obj.get("target_selection_detail"))
     runtime_detail = _status_text(runtime_obj.get("detail"))
+    ocr_tick_block_reason = _status_text(
+        local_state.get("ocr_tick_block_reason") or runtime_obj.get("ocr_tick_block_reason")
+    )
+    ocr_emit_block_reason = _status_text(
+        local_state.get("ocr_emit_block_reason") or runtime_obj.get("ocr_emit_block_reason")
+    )
     last_exclude_reason = _status_text(runtime_obj.get("last_exclude_reason"))
     last_capture_error = _status_text(runtime_obj.get("last_capture_error"))
     last_error_message = _status_text(last_error_obj.get("message"))
     ocr_capture_diagnostic = _status_text(local_state.get("ocr_capture_diagnostic"))
     agent_pause_kind = _status_text(local_state.get("agent_pause_kind"))
     agent_user_status = _status_text(local_state.get("agent_user_status"))
+    ocr_background_status = build_ocr_background_status(local_state)
+    interval_background_blocked = (
+        ocr_background_status.get("state") == "capture_backend_blocked"
+        and ocr_background_status.get("trigger_mode") == OCR_TRIGGER_MODE_INTERVAL
+        and runtime_obj.get("target_is_foreground") is False
+    )
     rapidocr = local_state.get("rapidocr")
     rapidocr_obj = rapidocr if isinstance(rapidocr, dict) else {}
     should_offer_rapidocr_install = (
@@ -1036,27 +1161,52 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if context_state == "capture_failed" or last_capture_error:
+        message = last_capture_error or "截图或识别后端返回错误，新台词不会更新。"
+        actions = [
+            _diagnosis_action("recalibrate_ocr", "重新截图校准"),
+            _diagnosis_action("capture_backend", "切换截图方式"),
+            _diagnosis_action("debug_details", "查看调试详情"),
+        ]
+        if interval_background_blocked:
+            message = (
+                f"{message}当前为定时 OCR 后台读取，后台截图可能受窗口最小化、不可见或截图后端限制影响。"
+                "请确认窗口可见且未最小化；如果仍失败，切换截图方式或重新选择 OCR 窗口。"
+            )
+            actions = [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+                _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ]
         return diagnosis(
             "error",
             "截图或文字识别失败",
-            last_capture_error or "截图或识别后端返回错误，新台词不会更新。",
-            [
-                _diagnosis_action("recalibrate_ocr", "重新截图校准"),
-                _diagnosis_action("capture_backend", "切换截图方式"),
-                _diagnosis_action("debug_details", "查看调试详情"),
-            ],
+            message,
+            actions,
         )
 
     if bool(runtime_obj.get("stale_capture_backend")) or context_state == "stale_capture_backend":
+        message = "当前截图源可能停在旧画面。请切回游戏窗口，或切换截图方式后再试。"
+        actions = [
+            _diagnosis_action("focus_game", "切回游戏窗口"),
+            _diagnosis_action("capture_backend", "切换截图方式"),
+            _diagnosis_action("refresh_ocr_windows", "刷新窗口"),
+        ]
+        if interval_background_blocked:
+            message = (
+                "定时 OCR 后台读取时截图画面没有更新。请确认游戏窗口可见且未最小化；"
+                "如果仍停在旧画面，请切换截图方式或重新选择 OCR 窗口。"
+            )
+            actions = [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+                _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+            ]
         return diagnosis(
             "warning",
             "截图画面没有更新",
-            "当前截图源可能停在旧画面。请切回游戏窗口，或切换截图方式后再试。",
-            [
-                _diagnosis_action("focus_game", "切回游戏窗口"),
-                _diagnosis_action("capture_backend", "切换截图方式"),
-                _diagnosis_action("refresh_ocr_windows", "刷新窗口"),
-            ],
+            message,
+            actions,
         )
 
     if (
@@ -1071,6 +1221,65 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
             [
                 _diagnosis_action("recalibrate_ocr", "重新截图校准"),
                 _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if ocr_tick_block_reason == "trigger_mode_after_advance_waiting_for_input":
+        return diagnosis(
+            "info",
+            "OCR 正在等待游戏推进",
+            "当前为点击对白后识别模式，上一轮已完成；需要在游戏窗口内点击、滚轮向下或按推进键后才会重新采集。",
+            [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if ocr_tick_block_reason == "memory_reader_recent_text":
+        return diagnosis(
+            "info",
+            "内存读取正在优先提供文本",
+            "自动模式检测到内存读取仍有近期文本，因此暂时不主动轮询 OCR。需要只看 OCR 时可切换文本读取模式。",
+            [
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if ocr_tick_block_reason:
+        return diagnosis(
+            "info",
+            "OCR 轮询暂未执行",
+            f"当前轮询门控原因：{ocr_tick_block_reason}。",
+            [
+                _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if ocr_emit_block_reason == "screen_classification_skipped_dialogue":
+        return diagnosis(
+            "warning",
+            "OCR 画面被判定为非对白界面",
+            "截图和识别已执行，但屏幕分类判断当前画面不适合写入对白。若游戏实际在对白界面，请重新校准截图区域或收集误判样本。",
+            [
+                _diagnosis_action("recalibrate_ocr", "重新截图校准"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if ocr_emit_block_reason in {"duplicate_stable_text", "waiting_for_repeat", "no_dialogue_text"}:
+        message_by_reason = {
+            "duplicate_stable_text": "截图和识别已执行，但识别结果与上一条稳定台词相同，暂不重复写入。",
+            "waiting_for_repeat": "截图和识别已执行，已看到候选文字，正在等待稳定确认。",
+            "no_dialogue_text": "截图和识别已执行，但没有得到可写入的对白文本。",
+        }
+        return diagnosis(
+            "info",
+            "OCR 已执行但没有新台词",
+            message_by_reason.get(ocr_emit_block_reason, f"未写入原因：{ocr_emit_block_reason}。"),
+            [
+                _diagnosis_action("line_details", "查看识别详情"),
                 _diagnosis_action("debug_details", "查看调试详情"),
             ],
         )
@@ -1125,10 +1334,23 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if agent_pause_kind == "window_not_foreground" or agent_user_status == "paused_window_not_foreground":
+        trigger_mode = _status_text(local_state.get("ocr_reader_trigger_mode")).lower()
+        if trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE:
+            message = (
+                "自动推进已暂停。当前为按推进后识别模式，后台期间不会持续 OCR；"
+                "切回游戏窗口后会继续，并触发 OCR 重新采集。"
+            )
+        elif trigger_mode == OCR_TRIGGER_MODE_INTERVAL:
+            message = (
+                "自动推进已暂停。当前为定时 OCR，会尝试定时后台读取；"
+                "实际效果取决于窗口可见性、非最小化状态和捕获后端。"
+            )
+        else:
+            message = "自动推进已暂停。切回游戏窗口后会继续。"
         return diagnosis(
             "info",
             "游戏不在前台",
-            "自动推进已暂停。切回游戏窗口后会继续，伴读信息仍会刷新。",
+            message,
             [
                 _diagnosis_action("focus_game", "切回游戏窗口"),
             ],
@@ -1558,18 +1780,19 @@ def build_status_payload(
         ),
     )
     ocr_runtime = copy_for_payload(state.ocr_reader_runtime)
+    ocr_runtime_obj = ocr_runtime if isinstance(ocr_runtime, dict) else {}
     last_error = copy_for_payload(state.last_error)
     ocr_capture_diagnostic_required = bool(
-        isinstance(ocr_runtime, dict)
+        ocr_runtime_obj
         and (
-            ocr_runtime.get("ocr_capture_diagnostic_required")
-            or str(ocr_runtime.get("ocr_context_state") or "")
+            ocr_runtime_obj.get("ocr_capture_diagnostic_required")
+            or str(ocr_runtime_obj.get("ocr_context_state") or "")
             in {"poll_not_running", "capture_failed", "diagnostic_required", "stale_capture_backend"}
-            or str(ocr_runtime.get("detail") or "") == "ocr_capture_diagnostic_required"
+            or str(ocr_runtime_obj.get("detail") or "") == "ocr_capture_diagnostic_required"
         )
     )
     ocr_capture_diagnostic = ""
-    if ocr_capture_diagnostic_required and isinstance(ocr_runtime, dict):
+    if ocr_capture_diagnostic_required and ocr_runtime_obj:
         ocr_capture_diagnostic = build_ocr_context_diagnostic(
             {
                 "ocr_reader_runtime": ocr_runtime,
@@ -1593,15 +1816,29 @@ def build_status_payload(
         last_error=last_error,
         active_data_source=state.active_data_source,
     )
+    ocr_background_status = build_ocr_background_status(
+        {
+            "ocr_reader_runtime": ocr_runtime,
+            "ocr_context_state": ocr_runtime_obj.get("ocr_context_state", ""),
+            "ocr_reader_trigger_mode": config.ocr_reader_trigger_mode,
+            "ocr_capture_backend_selection": config.ocr_reader_capture_backend,
+            "active_data_source": state.active_data_source,
+        }
+    )
     primary_diagnosis = build_primary_diagnosis(
         {
             "ocr_reader_runtime": ocr_runtime,
             "last_error": last_error,
             "effective_current_line": effective_current_line or {},
-            "ocr_context_state": ocr_runtime.get("ocr_context_state") if isinstance(ocr_runtime, dict) else "",
+            "ocr_context_state": ocr_runtime_obj.get("ocr_context_state", ""),
             "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
             "ocr_capture_diagnostic": ocr_capture_diagnostic,
+            "ocr_tick_block_reason": str(ocr_runtime_obj.get("ocr_tick_block_reason") or ""),
+            "ocr_emit_block_reason": str(ocr_runtime_obj.get("ocr_emit_block_reason") or ""),
             "ocr_reader_enabled": config.ocr_reader_enabled,
+            "ocr_reader_trigger_mode": config.ocr_reader_trigger_mode,
+            "ocr_background_status": ocr_background_status,
+            "active_data_source": state.active_data_source,
             "rapidocr_enabled": config.rapidocr_enabled,
             "rapidocr": rapidocr,
             "summary": summary,
@@ -1621,6 +1858,7 @@ def build_status_payload(
         "last_error": last_error,
         "performance": _current_process_performance(),
         "memory_reader_runtime": copy_for_payload(state.memory_reader_runtime),
+        "memory_reader_target": copy_for_payload(getattr(state, "memory_reader_target", {})),
         "ocr_reader_runtime": ocr_runtime,
         "screen_type": str(getattr(state, "screen_type", "") or ""),
         "screen_ui_elements": copy_for_payload(getattr(state, "screen_ui_elements", [])),
@@ -1629,6 +1867,36 @@ def build_status_payload(
         "effective_current_line": copy_for_payload(effective_current_line or {}),
         "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
         "ocr_capture_diagnostic": ocr_capture_diagnostic,
+        "ocr_tick_allowed": bool(ocr_runtime_obj.get("ocr_tick_allowed")),
+        "ocr_tick_block_reason": str(ocr_runtime_obj.get("ocr_tick_block_reason") or ""),
+        "ocr_emit_block_reason": str(ocr_runtime_obj.get("ocr_emit_block_reason") or ""),
+        "ocr_reader_allowed": bool(ocr_runtime_obj.get("ocr_reader_allowed")),
+        "ocr_reader_allowed_block_reason": str(
+            ocr_runtime_obj.get("ocr_reader_allowed_block_reason") or ""
+        ),
+        "ocr_trigger_mode_effective": str(
+            ocr_runtime_obj.get("ocr_trigger_mode_effective") or config.ocr_reader_trigger_mode
+        ),
+        "ocr_waiting_for_advance": bool(ocr_runtime_obj.get("ocr_waiting_for_advance")),
+        "ocr_waiting_for_advance_reason": str(
+            ocr_runtime_obj.get("ocr_waiting_for_advance_reason") or ""
+        ),
+        "ocr_background_status": ocr_background_status,
+        "ocr_background_state": str(ocr_background_status.get("state") or ""),
+        "ocr_background_message": str(ocr_background_status.get("message") or ""),
+        "ocr_background_polling": bool(ocr_background_status.get("background_polling")),
+        "ocr_foreground_resume_pending": bool(
+            ocr_background_status.get("foreground_resume_pending")
+        ),
+        "ocr_capture_backend_blocked": bool(
+            ocr_background_status.get("capture_backend_blocked")
+        ),
+        "ocr_last_tick_decision_at": str(
+            ocr_runtime_obj.get("ocr_last_tick_decision_at") or ""
+        ),
+        "display_source_not_ocr_reason": str(
+            ocr_runtime_obj.get("display_source_not_ocr_reason") or ""
+        ),
         "primary_diagnosis": primary_diagnosis,
         "ocr_capture_profiles": copy_for_payload(state.ocr_capture_profiles),
         "summary": summary,

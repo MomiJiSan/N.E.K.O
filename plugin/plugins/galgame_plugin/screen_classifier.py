@@ -46,6 +46,7 @@ _DEFAULT_MODEL_FEATURE_SCALES = {
     "texture_score": 128.0,
     "button_layout_score": 1.0,
     "dialogue_layout_score": 1.0,
+    "backlog_list_score": 1.0,
     "save_load_grid_score": 1.0,
     "element_count": 10.0,
     "line_count": 20.0,
@@ -138,6 +139,30 @@ _CONFIG_KEYWORDS = (
     "メッセージ",
 )
 _BACK_KEYWORDS = ("back", "return", "close", "戻る", "返回", "取消")
+_BACKLOG_KEYWORDS = (
+    "backlog",
+    "message log",
+    "dialogue log",
+    "dialog log",
+    "text log",
+    "history",
+    "履歴",
+    "会話履歴",
+    "バックログ",
+    "ログ",
+    "历史",
+    "歷史",
+    "历史记录",
+    "歷史記錄",
+    "对话历史",
+    "對話歷史",
+    "对白历史",
+    "對白歷史",
+    "文本历史",
+    "文本歷史",
+    "讯息记录",
+    "訊息記錄",
+)
 _GALLERY_KEYWORDS = (
     "gallery",
     "cg mode",
@@ -265,6 +290,7 @@ def classify_screen_from_ocr(
     save_hits = _keyword_hits(normalized_lines, _SAVE_LOAD_KEYWORDS)
     config_hits = _keyword_hits(normalized_lines, _CONFIG_KEYWORDS)
     back_hits = _keyword_hits(normalized_lines, _BACK_KEYWORDS)
+    backlog_hits = _keyword_hits(normalized_lines, _BACKLOG_KEYWORDS)
     gallery_hits = _keyword_hits(normalized_lines, _GALLERY_KEYWORDS)
     minigame_hits = _keyword_hits(normalized_lines, _MINIGAME_KEYWORDS)
     game_over_hits = _keyword_hits(normalized_lines, _GAME_OVER_KEYWORDS)
@@ -275,6 +301,7 @@ def classify_screen_from_ocr(
                 "save_load": save_hits,
                 "config": config_hits,
                 "back": back_hits,
+                "backlog": backlog_hits,
                 "gallery": gallery_hits,
                 "minigame": minigame_hits,
                 "game_over": game_over_hits,
@@ -316,6 +343,26 @@ def classify_screen_from_ocr(
             ui_elements=ui_elements,
             debug=debug,
             reason="prefixed_menu_lines",
+        )
+
+    if _looks_like_backlog(backlog_hits, lines, normalized_lines):
+        return _classified(
+            OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+            0.62 + min(backlog_hits, 4) * 0.05 + min(back_hits, 1) * 0.03,
+            lines=lines,
+            ui_elements=ui_elements,
+            debug=debug,
+            reason="backlog_keywords",
+        )
+
+    if _looks_like_backlog_dialogue_list(lines, layout=layout):
+        return _classified(
+            OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+            0.58 + min(layout.get("backlog_list_score", 0.0), 0.18),
+            lines=lines,
+            ui_elements=ui_elements,
+            debug=debug,
+            reason="backlog_dialogue_list",
         )
 
     if _looks_like_save_load(save_hits, config_hits, title_hits, normalized_lines, joined):
@@ -1085,6 +1132,7 @@ def _layout_features(elements: list[dict[str, Any]]) -> dict[str, float]:
             "button_layout_score": 0.0,
             "save_load_grid_score": 0.0,
             "dialogue_layout_score": 0.0,
+            "backlog_list_score": 0.0,
         }
     short_texts = sum(1 for _box, text in records if _visible_len(text) <= 18)
     bottom_texts = sum(
@@ -1122,11 +1170,53 @@ def _layout_features(elements: list[dict[str, Any]]) -> dict[str, float]:
             + min(max(widths) / 0.7, 1.0) * 0.25
             + min(vertical_spread / 0.18, 1.0) * 0.15,
         )
+    dialogue_like_texts = sum(
+        1
+        for _box, text in records
+        if _DIALOGUE_COLON_RE.match(text)
+        or _SPEAKER_QUOTE_RE.match(text)
+        or _BRACKET_SPEAKER_RE.match(text)
+    )
+    backlog_list_score = 0.0
+    if len(boxes) >= 4 and row_count >= 4 and dialogue_like_texts >= 3:
+        top_or_middle_ratio = sum(
+            1 for box in boxes if (box["top"] + box["bottom"]) / 2.0 <= 0.72
+        ) / max(len(boxes), 1)
+        dialogue_like_ratio = dialogue_like_texts / max(len(boxes), 1)
+        backlog_list_score = min(
+            1.0,
+            0.25
+            + min(vertical_spread / 0.55, 1.0) * 0.25
+            + min(row_count / 6.0, 1.0) * 0.2
+            + top_or_middle_ratio * 0.15
+            + dialogue_like_ratio * 0.15,
+        )
     return {
         "button_layout_score": round(button_layout_score, 2),
         "save_load_grid_score": round(save_load_grid_score, 2),
         "dialogue_layout_score": round(dialogue_layout_score, 2),
+        "backlog_list_score": round(backlog_list_score, 2),
     }
+
+
+def _clamp_unit(value: float) -> float:
+    return max(0.0, min(float(value), 1.0))
+
+
+def _nondegenerate_unit_interval(start: float, end: float) -> tuple[float, float]:
+    left = _clamp_unit(start)
+    right = _clamp_unit(end)
+    if left < right:
+        return left, right
+    min_span = 0.01
+    if left >= 1.0:
+        return max(0.0, 1.0 - min_span), 1.0
+    if right <= 0.0:
+        return 0.0, min_span
+    right = min(left + min_span, 1.0)
+    if left >= right:
+        left = max(0.0, right - min_span)
+    return left, right
 
 
 def _normalized_bounds(bounds: dict[str, float], metadata: dict[str, Any]) -> dict[str, float]:
@@ -1143,19 +1233,35 @@ def _normalized_bounds(bounds: dict[str, float], metadata: dict[str, Any]) -> di
             return {}
         if width <= 0 or height <= 0:
             return {}
+        left, right = _nondegenerate_unit_interval(
+            float(bounds["left"]) / width,
+            float(bounds["right"]) / width,
+        )
+        top, bottom = _nondegenerate_unit_interval(
+            float(bounds["top"]) / height,
+            float(bounds["bottom"]) / height,
+        )
         return {
-            "left": max(0.0, min(float(bounds["left"]) / width, 1.0)),
-            "top": max(0.0, min(float(bounds["top"]) / height, 1.0)),
-            "right": max(0.0, min(float(bounds["right"]) / width, 1.0)),
-            "bottom": max(0.0, min(float(bounds["bottom"]) / height, 1.0)),
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
         }
     window_width = max(window_rect["right"] - window_rect["left"], 1.0)
     window_height = max(window_rect["bottom"] - window_rect["top"], 1.0)
+    left, right = _nondegenerate_unit_interval(
+        (capture_rect["left"] + float(bounds["left"]) - window_rect["left"]) / window_width,
+        (capture_rect["left"] + float(bounds["right"]) - window_rect["left"]) / window_width,
+    )
+    top, bottom = _nondegenerate_unit_interval(
+        (capture_rect["top"] + float(bounds["top"]) - window_rect["top"]) / window_height,
+        (capture_rect["top"] + float(bounds["bottom"]) - window_rect["top"]) / window_height,
+    )
     return {
-        "left": max(0.0, min((capture_rect["left"] + float(bounds["left"]) - window_rect["left"]) / window_width, 1.0)),
-        "top": max(0.0, min((capture_rect["top"] + float(bounds["top"]) - window_rect["top"]) / window_height, 1.0)),
-        "right": max(0.0, min((capture_rect["left"] + float(bounds["right"]) - window_rect["left"]) / window_width, 1.0)),
-        "bottom": max(0.0, min((capture_rect["top"] + float(bounds["bottom"]) - window_rect["top"]) / window_height, 1.0)),
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
     }
 
 
@@ -1278,6 +1384,99 @@ def _looks_like_game_over(
     ):
         return True
     return False
+
+
+def _is_backlog_label(normalized_line: str) -> bool:
+    compact = re.sub(
+        r"[\s\-_.,，。:：;；!！?？/\\|()\[\]【】「」『』]+",
+        "",
+        str(normalized_line or "").casefold(),
+    )
+    if not compact:
+        return False
+    return compact in {
+        "backlog",
+        "history",
+        "messagelog",
+        "dialoguelog",
+        "dialoglog",
+        "textlog",
+        "履歴",
+        "会話履歴",
+        "バックログ",
+        "ログ",
+        "历史",
+        "歷史",
+        "历史记录",
+        "歷史記錄",
+        "对话历史",
+        "對話歷史",
+        "对白历史",
+        "對白歷史",
+        "文本历史",
+        "文本歷史",
+        "讯息记录",
+        "訊息記錄",
+    }
+
+
+def _looks_like_backlog(
+    backlog_hits: int,
+    lines: list[str],
+    normalized_lines: list[str],
+) -> bool:
+    if backlog_hits <= 0:
+        return False
+    if any(_is_backlog_label(line) for line in normalized_lines):
+        return True
+    dialogue_like_count = sum(
+        1
+        for line in lines
+        if _DIALOGUE_COLON_RE.match(line)
+        or _SPEAKER_QUOTE_RE.match(line)
+        or _BRACKET_SPEAKER_RE.match(line)
+    )
+    if backlog_hits >= 2 and len(lines) >= 2:
+        return True
+    return backlog_hits >= 1 and len(lines) >= 4 and dialogue_like_count >= 2
+
+
+def _dialogue_list_signal(lines: list[str]) -> tuple[int, int]:
+    dialogue_like_count = 0
+    speakers: set[str] = set()
+    for line in lines:
+        text = str(line or "")
+        speaker = ""
+        colon_match = _DIALOGUE_COLON_RE.match(text)
+        if colon_match:
+            speaker = re.split(r"[:：]", text, maxsplit=1)[0].strip()
+        elif _SPEAKER_QUOTE_RE.match(text):
+            speaker = re.split(r"[「『]", text, maxsplit=1)[0].strip()
+        else:
+            bracket_match = re.match(r"^[【\[]([^\]】]{1,40})[\]】]", text)
+            if bracket_match:
+                speaker = bracket_match.group(1).strip()
+        if speaker:
+            dialogue_like_count += 1
+            speakers.add(_normalize_for_match(speaker))
+    return dialogue_like_count, len({speaker for speaker in speakers if speaker})
+
+
+def _looks_like_backlog_dialogue_list(
+    lines: list[str],
+    *,
+    layout: dict[str, float],
+) -> bool:
+    if len(lines) < 4:
+        return False
+    dialogue_like_count, distinct_speaker_count = _dialogue_list_signal(lines)
+    if dialogue_like_count < 3:
+        return False
+    if layout.get("dialogue_layout_score", 0.0) >= 0.58:
+        return False
+    if layout.get("backlog_list_score", 0.0) >= 0.58:
+        return True
+    return len(lines) >= 5 and dialogue_like_count >= 4 and distinct_speaker_count >= 2
 
 
 def _looks_like_gallery(

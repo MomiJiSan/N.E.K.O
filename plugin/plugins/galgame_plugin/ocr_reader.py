@@ -53,6 +53,8 @@ from .models import (
     OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
     OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
     OCR_TRIGGER_MODE_AFTER_ADVANCE,
+    READER_MODE_AUTO,
+    READER_MODE_MEMORY,
     build_ocr_capture_profile_bucket_key,
     compute_ocr_window_aspect_ratio,
     json_copy,
@@ -108,6 +110,19 @@ _OCR_LINE_ID_MAX_COLLISION_SUFFIX = 10000
 _LOGGER = logging.getLogger(__name__)
 _VISION_SNAPSHOT_TTL_SECONDS = 8.0
 _VISION_SNAPSHOT_JPEG_QUALITY = 72
+_WM_MOUSEWHEEL = 0x020A
+_WM_LBUTTONDOWN = 0x0201
+_WM_LBUTTONUP = 0x0202
+_WM_KEYDOWN = 0x0100
+_WM_SYSKEYDOWN = 0x0104
+_WH_KEYBOARD_LL = 13
+_WH_MOUSE_LL = 14
+_KEYBOARD_ADVANCE_VK_CODES = frozenset({
+    0x0D,  # Enter
+    0x20,  # Space
+    0x22,  # PageDown
+    0x28,  # Down
+})
 
 _SPEAKER_QUOTE_RE = re.compile(
     r"^\s*([^\u300c\u300d:\uff1a]{1,40})[\u300c\u300e](.+)[\u300d\u300f]\s*$"
@@ -223,6 +238,9 @@ _GAME_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
     "history",
     "skip",
     "auto",
+    "quick",
+    "fast",
+    "forward",
     "config",
     "system",
     "load",
@@ -438,8 +456,10 @@ def _ocr_stability_keys_match(left: str, right: str) -> bool:
         return False
     if left_key == right_key:
         return True
-    if min(len(left_key), len(right_key)) >= 8 and abs(len(left_key) - len(right_key)) <= 1:
-        return left_key.startswith(right_key) or right_key.startswith(left_key)
+    if len(left_key) == len(right_key) and len(left_key) >= 8:
+        distance = sum(1 for left_char, right_char in zip(left_key, right_key) if left_char != right_char)
+        allowed_distance = max(1, int(len(left_key) * 0.08))
+        return distance <= allowed_distance
     return False
 
 
@@ -845,6 +865,7 @@ def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
     if not isinstance(payload, list):
         return []
     tokens: list[_RapidOcrToken] = []
+    low_confidence_count = 0
     for item in payload:
         if not isinstance(item, (list, tuple)) or len(item) < 3:
             continue
@@ -857,6 +878,7 @@ def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
         except (TypeError, ValueError):
             score_value = 0.0
         if score_value < 0.30:
+            low_confidence_count += 1
             continue
         points = _rapidocr_points(box)
         if not points:
@@ -875,6 +897,11 @@ def _rapidocr_tokens_from_output(raw_output: Any) -> list[_RapidOcrToken]:
                 bottom=bottom,
                 height=max(bottom - top, 1.0),
             )
+        )
+    if low_confidence_count:
+        _LOGGER.debug(
+            "rapidocr discarded %d low-confidence token(s)",
+            low_confidence_count,
         )
     return tokens
 
@@ -2844,6 +2871,7 @@ class _MouseWheelEvent:
     foreground_hwnd: int
     point_hwnd: int = 0
     kind: str = "wheel"
+    key_code: int = 0
 
 
 @dataclass(slots=True)
@@ -2872,6 +2900,7 @@ class _PendingMouseInputEvent:
     kind: str = "wheel"
     foreground_hwnd: int = 0
     point_hwnd: int = 0
+    key_code: int = 0
 
 
 class _MouseWheelMonitor:
@@ -2898,7 +2927,9 @@ class _MouseWheelMonitor:
         self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._hook_handle = 0
+        self._keyboard_hook_handle = 0
         self._callback = None
+        self._keyboard_callback = None
         self._stop = threading.Event()
 
     def _debug_once(self, flag_name: str, message: str, exc: Exception) -> None:
@@ -2915,10 +2946,17 @@ class _MouseWheelMonitor:
     def start(self) -> bool:
         if os.name != "nt":
             return False
-        if self._thread is not None and self._thread.is_alive():
-            return True
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            if not self._stop.is_set():
+                return True
+            if thread is not threading.current_thread():
+                thread.join(timeout=0.25)
+            if thread.is_alive():
+                return False
         self._thread = None
         self._hook_handle = 0
+        self._keyboard_hook_handle = 0
         self._thread_id = 0
         self._stop.clear()
         self._thread = threading.Thread(
@@ -2940,8 +2978,9 @@ class _MouseWheelMonitor:
         with self._lock:
             return int(self._seq or 0)
 
-    def stop(self) -> None:
+    def stop(self, *, join_timeout: float = 1.0) -> None:
         self._stop.set()
+        thread = self._thread
         if os.name == "nt" and self._thread_id:
             try:
                 ctypes.windll.user32.PostThreadMessageW(
@@ -2956,6 +2995,10 @@ class _MouseWheelMonitor:
                     "ocr_reader wheel monitor stop signal failed: {}",
                     exc,
                 )
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(join_timeout)))
+        if thread is not None and not thread.is_alive() and self._thread is thread:
+            self._thread = None
 
     def events_after(self, seq: int) -> list[_MouseWheelEvent]:
         self.ensure_running()
@@ -2973,6 +3016,7 @@ class _MouseWheelMonitor:
         y: int = 0,
         foreground_hwnd: int = 0,
         point_hwnd: int = 0,
+        key_code: int = 0,
     ) -> None:
         self._pending_events.append(
             _PendingMouseInputEvent(
@@ -2983,6 +3027,7 @@ class _MouseWheelMonitor:
                 kind=str(kind or "wheel"),
                 foreground_hwnd=max(0, int(foreground_hwnd or 0)),
                 point_hwnd=max(0, int(point_hwnd or 0)),
+                key_code=max(0, int(key_code or 0)),
             )
         )
 
@@ -3011,6 +3056,7 @@ class _MouseWheelMonitor:
                         foreground_hwnd=max(0, int(foreground_hwnd or 0)),
                         point_hwnd=max(0, int(point_hwnd or 0)),
                         kind=str(event.kind or "wheel"),
+                        key_code=max(0, int(event.key_code or 0)),
                     )
                 )
             self._prune_locked(now=max(event.ts for event in pending))
@@ -3044,6 +3090,15 @@ class _MouseWheelMonitor:
                     ("dwExtraInfo", ctypes.c_void_p),
                 ]
 
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
             proc_type = low_level_mouse_proc(
                 ctypes.c_longlong,
                 ctypes.c_int,
@@ -3060,15 +3115,15 @@ class _MouseWheelMonitor:
                 wintypes.LPARAM,
             ]
 
-            def callback(n_code, w_param, l_param):
+            def mouse_callback(n_code, w_param, l_param):
                 message = int(w_param)
-                if n_code >= 0 and message in {0x020A, 0x0201, 0x0202}:  # WM_MOUSEWHEEL, WM_LBUTTONDOWN, WM_LBUTTONUP
+                if n_code >= 0 and message in {_WM_MOUSEWHEEL, _WM_LBUTTONDOWN, _WM_LBUTTONUP}:
                     try:
                         payload = ctypes.cast(
                             l_param,
                             ctypes.POINTER(MSLLHOOKSTRUCT),
                         ).contents
-                        if message == 0x020A:
+                        if message == _WM_MOUSEWHEEL:
                             delta = ctypes.c_short((int(payload.mouseData) >> 16) & 0xFFFF).value
                             if delta:
                                 self._enqueue_pending_event(
@@ -3106,7 +3161,37 @@ class _MouseWheelMonitor:
                     l_param,
                 )
 
-            self._callback = proc_type(callback)
+            def keyboard_callback(n_code, w_param, l_param):
+                message = int(w_param)
+                if n_code >= 0 and message in {_WM_KEYDOWN, _WM_SYSKEYDOWN}:
+                    try:
+                        payload = ctypes.cast(
+                            l_param,
+                            ctypes.POINTER(KBDLLHOOKSTRUCT),
+                        ).contents
+                        key_code = int(payload.vkCode or 0)
+                        if key_code in _KEYBOARD_ADVANCE_VK_CODES:
+                            self._enqueue_pending_event(
+                                delta=0,
+                                kind="key",
+                                key_code=key_code,
+                                foreground_hwnd=_foreground_window_handle(),
+                            )
+                    except Exception as exc:
+                        self._debug_once(
+                            "_callback_failure_logged",
+                            "ocr_reader keyboard monitor callback failed: {}",
+                            exc,
+                        )
+                return user32.CallNextHookEx(
+                    self._keyboard_hook_handle,
+                    n_code,
+                    w_param,
+                    l_param,
+                )
+
+            self._callback = proc_type(mouse_callback)
+            self._keyboard_callback = proc_type(keyboard_callback)
             user32.SetWindowsHookExW.restype = hhook_type
             user32.SetWindowsHookExW.argtypes = [
                 ctypes.c_int,
@@ -3114,8 +3199,11 @@ class _MouseWheelMonitor:
                 hinstance_type,
                 wintypes.DWORD,
             ]
-            self._hook_handle = int(user32.SetWindowsHookExW(14, self._callback, 0, 0))
-            if not self._hook_handle:
+            self._hook_handle = int(user32.SetWindowsHookExW(_WH_MOUSE_LL, self._callback, 0, 0))
+            self._keyboard_hook_handle = int(
+                user32.SetWindowsHookExW(_WH_KEYBOARD_LL, self._keyboard_callback, 0, 0)
+            )
+            if not self._hook_handle and not self._keyboard_hook_handle:
                 return
 
             msg = wintypes.MSG()
@@ -3135,7 +3223,17 @@ class _MouseWheelMonitor:
                         "ocr_reader wheel monitor unhook failed: {}",
                         exc,
                     )
+            if self._keyboard_hook_handle:
+                try:
+                    ctypes.windll.user32.UnhookWindowsHookEx(self._keyboard_hook_handle)
+                except Exception as exc:
+                    self._debug_once(
+                        "_unhook_failure_logged",
+                        "ocr_reader keyboard monitor unhook failed: {}",
+                        exc,
+                    )
             self._hook_handle = 0
+            self._keyboard_hook_handle = 0
             self._thread_id = 0
 
 
@@ -3985,6 +4083,9 @@ class OcrReaderManager:
         self._runtime = OcrReaderRuntime(enabled=config.ocr_reader_enabled)
         self._capture_profiles: dict[str, ParsedOcrCaptureProcessConfig] = {}
         self._last_memory_reader_text_at = 0.0
+        self._last_seen_memory_reader_game_id = ""
+        self._last_seen_memory_reader_session_id = ""
+        self._last_seen_memory_reader_text_seq = 0
         self._last_heartbeat_at = 0.0
         self._attached_window: DetectedGameWindow | None = None
         self._default_ocr_state = _StableOcrTextState()
@@ -4043,12 +4144,7 @@ class OcrReaderManager:
         )
         self._last_consumed_wheel_seq = 0
         self._foreground_advance_stable_until = 0.0
-        if (
-            self._config.ocr_reader_enabled
-            and self._platform_fn()
-            and not self._custom_capture_backend
-            and not self._custom_ocr_backend
-        ):
+        if self._foreground_advance_monitor_should_autostart():
             self.start_foreground_advance_monitor()
         self._capture_backend_kind = str(getattr(self._capture_backend, "selection", "custom"))
         self._capture_backend_detail = ""
@@ -4069,11 +4165,115 @@ class OcrReaderManager:
         self._window_inventory_cache: list[DetectedGameWindow] = []
         self._start_rapidocr_warmup_if_configured()
 
+    def _foreground_advance_monitor_enabled(self) -> bool:
+        return (
+            bool(self._config.ocr_reader_enabled)
+            and self._platform_fn()
+            and getattr(self._config, "reader_mode", READER_MODE_AUTO) != READER_MODE_MEMORY
+            and self._config.ocr_reader_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
+        )
+
+    def _foreground_advance_monitor_should_autostart(self) -> bool:
+        return (
+            self._foreground_advance_monitor_enabled()
+            and not self._custom_capture_backend
+            and not self._custom_ocr_backend
+        )
+
+    def _stop_foreground_advance_monitor(self, *, join_timeout: float = 1.0) -> None:
+        stop = getattr(self._wheel_monitor, "stop", None)
+        if callable(stop):
+            try:
+                stop(join_timeout=join_timeout)
+            except TypeError:
+                stop()
+        self._runtime.foreground_advance_monitor_running = False
+        self._runtime.foreground_advance_last_seq = 0
+
+    def _reset_memory_reader_text_progress_tracking(self) -> None:
+        self._last_memory_reader_text_at = 0.0
+        self._last_seen_memory_reader_game_id = ""
+        self._last_seen_memory_reader_session_id = ""
+        self._last_seen_memory_reader_text_seq = 0
+
+    def _observe_memory_reader_text_progress(
+        self,
+        memory_reader_runtime: dict[str, Any],
+        *,
+        now: float,
+    ) -> bool:
+        status = str(memory_reader_runtime.get("status") or "")
+        game_id = str(memory_reader_runtime.get("game_id") or "")
+        session_id = str(memory_reader_runtime.get("session_id") or "")
+        try:
+            last_text_seq = int(memory_reader_runtime.get("last_text_seq") or 0)
+        except (TypeError, ValueError):
+            last_text_seq = 0
+        received_text_this_tick = (
+            str(memory_reader_runtime.get("detail") or "") == "receiving_text"
+            and last_text_seq > 0
+        )
+
+        if status not in {"attaching", "active"} or not game_id or not session_id:
+            self._reset_memory_reader_text_progress_tracking()
+            return False
+
+        if "last_text_recent" in memory_reader_runtime:
+            self._last_seen_memory_reader_game_id = game_id
+            self._last_seen_memory_reader_session_id = session_id
+            self._last_seen_memory_reader_text_seq = max(0, last_text_seq)
+            if bool(memory_reader_runtime.get("last_text_recent")) and last_text_seq > 0:
+                self._last_memory_reader_text_at = now
+                return True
+            self._last_memory_reader_text_at = 0.0
+            return False
+
+        session_changed = (
+            game_id != self._last_seen_memory_reader_game_id
+            or session_id != self._last_seen_memory_reader_session_id
+        )
+        seq_reset = last_text_seq < self._last_seen_memory_reader_text_seq
+        if session_changed or seq_reset:
+            self._last_seen_memory_reader_game_id = game_id
+            self._last_seen_memory_reader_session_id = session_id
+            self._last_seen_memory_reader_text_seq = last_text_seq
+            self._last_memory_reader_text_at = now if received_text_this_tick else 0.0
+            return received_text_this_tick
+
+        if last_text_seq > self._last_seen_memory_reader_text_seq:
+            self._last_seen_memory_reader_text_seq = last_text_seq
+            self._last_memory_reader_text_at = now
+            return True
+        return False
+
     def start_foreground_advance_monitor(self) -> bool:
+        if not self._foreground_advance_monitor_should_autostart():
+            self._stop_foreground_advance_monitor()
+            return False
         started = bool(self._wheel_monitor.start())
         self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
         self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
         return started
+
+    def reset_capture_runtime_diagnostics(self) -> None:
+        self._consecutive_no_text_polls = 0
+        self._last_capture_error = ""
+        self._last_capture_image_hash = ""
+        self._last_capture_timing = {}
+        self._consecutive_same_capture_frames = 0
+        self._stale_capture_backend = False
+        self._runtime.last_capture_error = ""
+        self._runtime.last_capture_image_hash = ""
+        self._runtime.consecutive_same_capture_frames = 0
+        self._runtime.stale_capture_backend = False
+        self._runtime.consecutive_no_text_polls = 0
+        self._runtime.ocr_capture_diagnostic_required = False
+        if self._runtime.ocr_context_state in {
+            "capture_failed",
+            "diagnostic_required",
+            "stale_capture_backend",
+        }:
+            self._runtime.ocr_context_state = ""
 
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
@@ -4096,6 +4296,11 @@ class OcrReaderManager:
                     getattr(self._capture_backend, "selection", "custom")
                 )
                 self._capture_backend_detail = ""
+                self.reset_capture_runtime_diagnostics()
+        if self._foreground_advance_monitor_should_autostart():
+            self.start_foreground_advance_monitor()
+        else:
+            self._stop_foreground_advance_monitor()
         self._start_rapidocr_warmup_if_configured()
 
     def _rapidocr_cache_key(self) -> tuple[str, str, str, str, str]:
@@ -4395,6 +4600,8 @@ class OcrReaderManager:
         kind = str(getattr(event, "kind", "") or "")
         if kind == "wheel" and int(getattr(event, "delta", 0) or 0) >= 0:
             return False
+        if kind == "key":
+            return int(getattr(event, "key_code", 0) or 0) in _KEYBOARD_ADVANCE_VK_CODES
         return kind in {"wheel", "left_click"}
 
     def _target_from_foreground_advance_events(
@@ -4422,6 +4629,9 @@ class OcrReaderManager:
         return None, "event_background"
 
     def consume_foreground_advance_inputs(self) -> ForegroundAdvanceConsumeResult:
+        if not self._foreground_advance_monitor_enabled():
+            self._stop_foreground_advance_monitor()
+            return ForegroundAdvanceConsumeResult()
         self._wheel_monitor.ensure_running()
         self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
         self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
@@ -4473,7 +4683,11 @@ class OcrReaderManager:
                 if not last_matched:
                     last_match_reason = "ignored_wheel_up"
                 continue
-            if event.kind not in {"wheel", "left_click"}:
+            if event.kind == "key" and int(getattr(event, "key_code", 0) or 0) not in _KEYBOARD_ADVANCE_VK_CODES:
+                if not last_matched:
+                    last_match_reason = "ignored_key"
+                continue
+            if event.kind not in {"wheel", "left_click", "key"}:
                 if not last_matched:
                     last_match_reason = "ignored_event_kind"
                 continue
@@ -5502,7 +5716,7 @@ class OcrReaderManager:
         return self._prepare_window_inventory(scanned)
 
     async def shutdown(self) -> None:
-        self._wheel_monitor.stop()
+        self._stop_foreground_advance_monitor()
         self._shutdown_capture_worker()
         if self._writer.session_id:
             self._writer.end_session(ts=utc_now_iso(self._time_fn()))
@@ -5553,6 +5767,7 @@ class OcrReaderManager:
             )
 
         if bridge_sdk_available:
+            self._reset_memory_reader_text_progress_tracking()
             self._runtime = self._build_runtime(
                 status="idle",
                 detail="bridge_sdk_available",
@@ -5567,9 +5782,11 @@ class OcrReaderManager:
                 should_return=True,
             )
 
-        memory_reader_has_text = str(memory_reader_runtime.get("detail") or "") == "receiving_text"
-        if memory_reader_has_text:
-            self._last_memory_reader_text_at = now
+        memory_reader_has_recent_text = self._observe_memory_reader_text_progress(
+            memory_reader_runtime,
+            now=now,
+        )
+        if memory_reader_has_recent_text:
             self._runtime = self._build_runtime(
                 status="idle",
                 detail="memory_reader_active",
@@ -6589,6 +6806,15 @@ class OcrReaderManager:
             if last_seq is not None
             else int(self._writer.last_seq or self._runtime.last_seq)
         )
+        foreground_advance_enabled = self._foreground_advance_monitor_enabled()
+        foreground_advance_last_seq = (
+            max(
+                int(self._wheel_monitor.last_seq() or 0),
+                int(self._runtime.foreground_advance_last_seq or 0),
+            )
+            if foreground_advance_enabled
+            else 0
+        )
         capture_timing = dict(self._last_capture_timing)
         vision_snapshot = self._vision_snapshot_runtime_status()
         recommendation = dict(self._recommended_capture_profile or {})
@@ -6724,11 +6950,10 @@ class OcrReaderManager:
             stale_capture_backend=bool(
                 self._stale_capture_backend or self._runtime.stale_capture_backend
             ),
-            foreground_advance_monitor_running=self._wheel_monitor.is_running(),
-            foreground_advance_last_seq=max(
-                int(self._wheel_monitor.last_seq() or 0),
-                int(self._runtime.foreground_advance_last_seq or 0),
+            foreground_advance_monitor_running=(
+                foreground_advance_enabled and self._wheel_monitor.is_running()
             ),
+            foreground_advance_last_seq=foreground_advance_last_seq,
             foreground_advance_consumed_seq=int(
                 self._runtime.foreground_advance_consumed_seq or self._last_consumed_wheel_seq
             ),

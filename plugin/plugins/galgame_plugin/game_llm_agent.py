@@ -30,6 +30,8 @@ from .models import (
     OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
     OCR_CAPTURE_PROFILE_STAGE_TITLE,
     OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+    OCR_TRIGGER_MODE_AFTER_ADVANCE,
+    OCR_TRIGGER_MODE_INTERVAL,
     SharedStatePayload,
     json_copy,
     sanitize_snapshot_state,
@@ -78,6 +80,23 @@ _TITLE_EXCLUDED_TEXT_MARKERS = (
     "終了",
     "コンフィグ",
     "オプション",
+)
+
+_SCREEN_RECOVERY_STAGES = frozenset(
+    {
+        "save_load",
+        "config_screen",
+        "gallery_screen",
+        "game_over_screen",
+    }
+)
+_SCREEN_ESCAPE_STRATEGY_IDS = frozenset(
+    {
+        "save_load_escape",
+        "config_escape",
+        "gallery_escape",
+        "game_over_escape",
+    }
 )
 
 
@@ -444,6 +463,7 @@ class GameLLMAgent:
         self._ocr_last_progress_seq = 0
         self._advance_retry_budget: dict[str, int] = {}
         self._ocr_capture_diagnostic = ""
+        self._screen_recovery_diagnostic = ""
         self._computer_use_quota_bypass_until = 0.0
         self._local_task_seq = 0
         self._scene_state = self._build_empty_scene_state()
@@ -602,6 +622,7 @@ class GameLLMAgent:
             self._ocr_last_progress_seq = 0
             self._advance_retry_budget.clear()
             self._ocr_capture_diagnostic = ""
+            self._screen_recovery_diagnostic = ""
             self._computer_use_quota_bypass_until = 0.0
             self._local_task_seq = 0
             self._next_actuation_at = 0.0
@@ -615,6 +636,8 @@ class GameLLMAgent:
             await self._observe(shared)
             now = time.monotonic()
             self._update_scene_state(shared, now)
+            self._clear_actuation_error_if_read_only(shared)
+            self._convert_screen_recovery_hard_error_if_applicable(shared, now=now)
             self._recover_retryable_error_if_ready(now)
             snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
             visible_choices = list(snapshot.get("choices", []))
@@ -669,6 +692,17 @@ class GameLLMAgent:
                 self._trace_runtime(
                     "tick paused: minigame screen detected "
                     f"stage={self._scene_state['stage']} choices={len(visible_choices)}"
+                )
+                self._next_actuation_at = now + 1.0
+                self._last_status = status
+                return
+
+            if self._should_pause_for_screen_recovery(shared):
+                self._pending_strategy = None
+                self._trace_runtime(
+                    "tick paused: screen recovery input unavailable "
+                    f"stage={self._scene_state['stage']} choices={len(visible_choices)} "
+                    f"reason={self._screen_recovery_diagnostic}"
                 )
                 self._next_actuation_at = now + 1.0
                 self._last_status = status
@@ -1091,6 +1125,7 @@ class GameLLMAgent:
             self._next_actuation_at = now + 0.2
             return
 
+        local_fallback_reason = ""
         if self._should_prefer_local_input_for_ocr(
             shared,
             kind=kind,
@@ -1121,6 +1156,7 @@ class GameLLMAgent:
             fallback = await self._run_local_input_fallback(shared, actuation=actuation)
             if bool(fallback.get("success")):
                 self._clear_hard_error()
+                self._screen_recovery_diagnostic = ""
                 self._trace_runtime(
                     "actuation local input preferred for OCR: "
                     f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
@@ -1138,6 +1174,7 @@ class GameLLMAgent:
                     strategy_id=strategy_id,
                 )
                 return
+            local_fallback_reason = str(fallback.get("reason") or fallback)
             self._trace_runtime(
                 "actuation preferred local input failed, falling back to computer_use: "
                 f"kind={kind} strategy_id={strategy_id or 'none'} "
@@ -1169,6 +1206,7 @@ class GameLLMAgent:
             fallback = await self._run_local_input_fallback(shared, actuation=actuation)
             if bool(fallback.get("success")):
                 self._clear_hard_error()
+                self._screen_recovery_diagnostic = ""
                 self._trace_runtime(
                     "actuation local fallback started under quota bypass: "
                     f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
@@ -1186,6 +1224,7 @@ class GameLLMAgent:
                     strategy_id=strategy_id,
                 )
                 return
+            local_fallback_reason = str(fallback.get("reason") or fallback)
             self._trace_runtime(
                 "actuation quota bypass local fallback failed: "
                 f"kind={kind} strategy_id={strategy_id or 'none'} "
@@ -1196,6 +1235,16 @@ class GameLLMAgent:
             availability = await self._host_adapter.get_computer_use_availability()
         except HostAgentError as exc:
             self._trace_runtime(f"actuation blocked by availability error: {exc}")
+            if self._pause_screen_recovery_after_input_unavailable(
+                shared,
+                kind=kind,
+                strategy_family=strategy_family,
+                strategy_id=strategy_id,
+                reason=str(exc),
+                now=now,
+                local_fallback_reason=local_fallback_reason,
+            ):
+                return
             self._set_hard_error(str(exc), retryable=True)
             self._next_actuation_at = now + 1.0
             return
@@ -1203,6 +1252,16 @@ class GameLLMAgent:
             reasons = availability.get("reasons")
             detail = reasons[0] if isinstance(reasons, list) and reasons else "computer_use unavailable"
             self._trace_runtime(f"actuation blocked: computer_use not ready ({detail})")
+            if self._pause_screen_recovery_after_input_unavailable(
+                shared,
+                kind=kind,
+                strategy_family=strategy_family,
+                strategy_id=strategy_id,
+                reason=str(detail),
+                now=now,
+                local_fallback_reason=local_fallback_reason,
+            ):
+                return
             self._set_hard_error(str(detail), retryable=True)
             self._next_actuation_at = now + 1.0
             return
@@ -1211,6 +1270,16 @@ class GameLLMAgent:
             started = await self._host_adapter.run_computer_use_instruction(instruction)
         except HostAgentError as exc:
             self._trace_runtime(f"actuation start failed: {exc}")
+            if self._pause_screen_recovery_after_input_unavailable(
+                shared,
+                kind=kind,
+                strategy_family=strategy_family,
+                strategy_id=strategy_id,
+                reason=str(exc),
+                now=now,
+                local_fallback_reason=local_fallback_reason,
+            ):
+                return
             self._set_hard_error(str(exc), retryable=True)
             self._next_actuation_at = now + 1.0
             return
@@ -1227,6 +1296,7 @@ class GameLLMAgent:
 
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
         self._clear_hard_error()
+        self._screen_recovery_diagnostic = ""
         self._trace_runtime(
             "actuation started: "
             f"kind={kind} strategy_id={strategy_id or 'none'} task_id={task_id}"
@@ -1479,6 +1549,96 @@ class GameLLMAgent:
         except (TypeError, ValueError):
             confidence = 0.0
         return confidence >= 0.45
+
+    def _should_pause_for_screen_recovery(self, shared: dict[str, Any]) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return False
+        if not self._screen_recovery_diagnostic:
+            return False
+        return self._current_screen_recovery_stage() != ""
+
+    def _current_screen_recovery_stage(self) -> str:
+        stage = str(self._scene_state.get("stage") or "")
+        return stage if stage in _SCREEN_RECOVERY_STAGES else ""
+
+    @staticmethod
+    def _is_screen_escape_strategy(
+        *,
+        kind: str,
+        strategy_family: str,
+        strategy_id: str,
+    ) -> bool:
+        return (
+            kind == "recover"
+            and strategy_family in _SCREEN_RECOVERY_STAGES
+            and strategy_id in _SCREEN_ESCAPE_STRATEGY_IDS
+        )
+
+    def _pause_screen_recovery_after_input_unavailable(
+        self,
+        shared: dict[str, Any],
+        *,
+        kind: str,
+        strategy_family: str,
+        strategy_id: str,
+        reason: str,
+        now: float,
+        local_fallback_reason: str = "",
+    ) -> bool:
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return False
+        if not self._is_screen_escape_strategy(
+            kind=kind,
+            strategy_family=strategy_family,
+            strategy_id=strategy_id,
+        ):
+            return False
+        detail = str(reason or "computer_use unavailable").strip()
+        if local_fallback_reason:
+            detail = f"{detail}; local_input={local_fallback_reason}"
+        self._screen_recovery_diagnostic = detail
+        self._record_failure(
+            kind=kind,
+            strategy_id=strategy_id,
+            reason=detail,
+            scene_id=str((shared.get("latest_snapshot") or {}).get("scene_id") or ""),
+        )
+        self._clear_hard_error()
+        self._actuation = None
+        self._pending_strategy = None
+        self._next_actuation_at = now + 1.0
+        self._trace_runtime(
+            "screen recovery paused: "
+            f"stage={self._current_screen_recovery_stage() or strategy_family} "
+            f"strategy_id={strategy_id} reason={detail}"
+        )
+        return True
+
+    def _convert_screen_recovery_hard_error_if_applicable(
+        self,
+        shared: dict[str, Any],
+        *,
+        now: float,
+    ) -> None:
+        if not self._hard_error:
+            return
+        if self._current_input_source(shared) != DATA_SOURCE_OCR_READER:
+            return
+        if not self._current_screen_recovery_stage():
+            return
+        message = str(self._hard_error or "")
+        lowered = message.lower()
+        if "computer_use" not in lowered and "local input" not in lowered:
+            return
+        self._screen_recovery_diagnostic = message
+        self._clear_hard_error()
+        self._actuation = None
+        self._pending_strategy = None
+        self._next_actuation_at = now + 1.0
+        self._trace_runtime(
+            "screen recovery converted stale hard_error to pause: "
+            f"stage={self._current_screen_recovery_stage()} reason={message}"
+        )
 
     def _target_window_focus_diagnostic(self, shared: dict[str, Any]) -> str:
         if not self._should_pause_for_target_window_focus(shared):
@@ -1849,6 +2009,7 @@ class GameLLMAgent:
             )
             self._record_virtual_mouse_outcome(actuation, success=True, now=now)
             self._clear_hard_error()
+            self._screen_recovery_diagnostic = ""
             self._actuation = None
             self._pending_strategy = None
             self._next_actuation_at = now + self._post_progress_delay(shared, actuation=actuation)
@@ -2892,6 +3053,8 @@ class GameLLMAgent:
         )
         signature_changed = signature != self._scene_state.get("signature")
         next_stage = self._classify_scene_stage(snapshot, now=now, scene_changed=scene_changed)
+        if next_stage not in _SCREEN_RECOVERY_STAGES:
+            self._screen_recovery_diagnostic = ""
 
         if scene_changed:
             summary_context = build_summarize_context(shared, scene_id=scene_id)
@@ -2956,7 +3119,7 @@ class GameLLMAgent:
             if screen_type == OCR_CAPTURE_PROFILE_STAGE_DIALOGUE:
                 return "choice_menu" if bool(snapshot.get("is_menu_open")) and choices else "dialogue"
             if screen_type == OCR_CAPTURE_PROFILE_STAGE_MENU:
-                return "choice_menu"
+                return "choice_menu" if choices else "unknown"
             if screen_type == OCR_CAPTURE_PROFILE_STAGE_TITLE:
                 return "title_or_menu"
             if screen_type == OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD:
@@ -3062,6 +3225,10 @@ class GameLLMAgent:
     def _clear_hard_error(self) -> None:
         self._hard_error = ""
         self._hard_error_retryable = False
+
+    def _clear_actuation_error_if_read_only(self, shared: dict[str, Any]) -> None:
+        if self._hard_error and not self._should_actuate(shared):
+            self._clear_hard_error()
 
     def _recover_retryable_error_if_ready(self, now: float) -> None:
         if not self._hard_error or not self._hard_error_retryable:
@@ -3229,6 +3396,7 @@ class GameLLMAgent:
             await self._observe(shared)
             if not self._should_actuate(shared):
                 await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
+                self._clear_hard_error()
                 self._next_actuation_at = time.monotonic() + 1.0
             status = self._compute_status(shared)
             self._last_status = status
@@ -3241,6 +3409,8 @@ class GameLLMAgent:
             await self._observe(shared, allow_agent_side_effects=False)
             now = time.monotonic()
             self._update_scene_state(shared, now)
+            self._clear_actuation_error_if_read_only(shared)
+            self._convert_screen_recovery_hard_error_if_applicable(shared, now=now)
             self._recover_retryable_error_if_ready(now)
             status = self._compute_status(shared)
             self._last_status = status
@@ -3259,6 +3429,8 @@ class GameLLMAgent:
             await self._observe(shared, allow_agent_side_effects=False)
             now = time.monotonic()
             self._update_scene_state(shared, now)
+            self._clear_actuation_error_if_read_only(shared)
+            self._convert_screen_recovery_hard_error_if_applicable(shared, now=now)
             self._recover_retryable_error_if_ready(now)
             status = self._compute_status(shared)
             self._last_status = status
@@ -3466,6 +3638,7 @@ class GameLLMAgent:
             )
             if self._observed_scene_id and self._should_push_scene(shared):
                 self._schedule_scene_summary_task(
+                    shared=shared,
                     session_id=session_id,
                     scene_id=current_scene_id,
                     route_id=current_route_id,
@@ -3555,6 +3728,7 @@ class GameLLMAgent:
     def _schedule_scene_summary_task(
         self,
         *,
+        shared: dict[str, Any],
         session_id: str,
         scene_id: str,
         route_id: str,
@@ -3567,10 +3741,12 @@ class GameLLMAgent:
         if not session_id or not scene_id:
             return
         try:
+            shared_payload = json_copy(shared)
             snapshot_payload = json_copy(snapshot)
             context_payload = json_copy(context)
             metadata_payload = json_copy(metadata)
         except Exception:
+            shared_payload = dict(shared)
             snapshot_payload = dict(snapshot)
             context_payload = dict(context)
             metadata_payload = dict(metadata)
@@ -3580,6 +3756,7 @@ class GameLLMAgent:
                 session_id=session_id,
                 scene_id=scene_id,
                 route_id=route_id,
+                shared=shared_payload,
                 snapshot=snapshot_payload,
                 context=context_payload,
                 trigger=trigger,
@@ -3596,6 +3773,7 @@ class GameLLMAgent:
         session_id: str,
         scene_id: str,
         route_id: str,
+        shared: dict[str, Any],
         snapshot: dict[str, Any],
         context: dict[str, Any],
         trigger: str,
@@ -3643,7 +3821,7 @@ class GameLLMAgent:
             if trigger:
                 push_metadata.setdefault("trigger", trigger)
             self._push_agent_message(
-                {},
+                shared,
                 kind="scene_summary",
                 content=f"游戏上下文（请猫娘自然回应）：{summary}",
                 scene_id=scene_id,
@@ -3692,6 +3870,7 @@ class GameLLMAgent:
         route_id = str(context.get("route_id") or snapshot.get("route_id") or "")
         self._summary_lines_since_push = 0
         self._schedule_scene_summary_task(
+            shared=shared,
             session_id=str(shared.get("active_session_id") or ""),
             scene_id=scene_id,
             route_id=route_id,
@@ -3992,7 +4171,10 @@ class GameLLMAgent:
             return "paused_by_user"
         if self._should_pause_for_target_window_focus(shared):
             return "paused_window_not_foreground"
-        if self._should_pause_for_minigame_screen(shared):
+        if (
+            self._should_pause_for_minigame_screen(shared)
+            or self._should_pause_for_screen_recovery(shared)
+        ):
             return "screen_safety_pause"
         if self._should_hold_for_ocr_capture_diagnostic(shared):
             return "ocr_unavailable"
@@ -4007,6 +4189,36 @@ class GameLLMAgent:
         if str(self._scene_state.get("stage") or "") == "choice_menu":
             return "waiting_choice"
         return "running"
+
+    def _ocr_reader_trigger_mode(self, shared: dict[str, Any]) -> str:
+        cfg = getattr(self._plugin, "_cfg", None)
+        cfg_mode = str(getattr(cfg, "ocr_reader_trigger_mode", "") or "").strip().lower()
+        if cfg_mode:
+            return cfg_mode
+        shared_mode = str(shared.get("ocr_reader_trigger_mode") or "").strip().lower()
+        return shared_mode or OCR_TRIGGER_MODE_INTERVAL
+
+    def _ocr_window_not_foreground_pause_message(
+        self,
+        shared: dict[str, Any],
+        *,
+        target_note: str,
+    ) -> str:
+        base = "已暂停：游戏窗口不在前台。切回游戏窗口后自动继续。"
+        if target_note:
+            base += target_note
+        trigger_mode = self._ocr_reader_trigger_mode(shared)
+        if trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE:
+            return (
+                f"{base}当前为按推进后识别模式，后台期间不会持续 OCR；"
+                "切回后会尝试重新采集。"
+            )
+        if trigger_mode == OCR_TRIGGER_MODE_INTERVAL:
+            return (
+                f"{base}当前为定时 OCR，会尝试在后台读取；"
+                "实际效果取决于窗口可见性、非最小化状态和捕获后端。"
+            )
+        return f"{base}OCR 后台读取状态取决于触发模式和捕获后端。"
 
     def _agent_pause_info(self, shared: dict[str, Any], *, status: str) -> dict[str, Any]:
         user_status = self._agent_user_status(shared, status=status)
@@ -4023,14 +4235,25 @@ class GameLLMAgent:
             target_note = f"当前目标：{target}。" if target else ""
             return {
                 "agent_pause_kind": "window_not_foreground",
-                "agent_pause_message": (
-                    "已暂停：游戏窗口不在前台。切回游戏窗口后自动继续。"
-                    f"{target_note}OCR 仍在后台读取。"
+                "agent_pause_message": self._ocr_window_not_foreground_pause_message(
+                    shared,
+                    target_note=target_note,
                 ),
                 "agent_can_resume_by_button": False,
                 "agent_can_resume_by_focus": True,
             }
         if user_status == "screen_safety_pause":
+            recovery_diagnostic = str(self._screen_recovery_diagnostic or "")
+            if recovery_diagnostic:
+                return {
+                    "agent_pause_kind": "screen_safety",
+                    "agent_pause_message": (
+                        "Automatic screen recovery is paused because local input or "
+                        f"computer_use is unavailable: {recovery_diagnostic}"
+                    ),
+                    "agent_can_resume_by_button": False,
+                    "agent_can_resume_by_focus": False,
+                }
             return {
                 "agent_pause_kind": "screen_safety",
                 "agent_pause_message": "已暂停自动推进：当前像小游戏或非 VN 操作画面，避免盲目输入。",
@@ -4186,6 +4409,7 @@ class GameLLMAgent:
                     or self._should_hold_for_ocr_capture_diagnostic(shared)
                 ),
                 "ocr_capture_diagnostic": self._ocr_capture_diagnostic,
+                "screen_recovery_diagnostic": self._screen_recovery_diagnostic,
                 "ocr_context_state": str(
                     (shared.get("ocr_reader_runtime") or {}).get("ocr_context_state") or ""
                 )
@@ -4254,6 +4478,8 @@ class GameLLMAgent:
             return "retry_pending"
         if self._should_pause_for_minigame_screen(shared):
             return "minigame_screen_pause"
+        if self._should_pause_for_screen_recovery(shared):
+            return "screen_recovery_pause"
         if self._should_hold_for_ocr_capture_diagnostic(shared):
             return self._hold_reason_from_diagnostic()
         return "background_loop_ready"

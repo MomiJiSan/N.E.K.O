@@ -364,6 +364,130 @@ def test_default_process_scanner_excludes_unity_crash_handler_and_crashpad(
     ]
 
 
+def test_default_process_scanner_detects_kirikiri_from_xp3_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    game_dir = tmp_path / "SenrenBanka"
+    game_dir.mkdir()
+    exe_path = game_dir / "SenrenBanka.exe"
+    exe_path.write_text("", encoding="utf-8")
+    (game_dir / "data.xp3").write_text("", encoding="utf-8")
+
+    class _Proc:
+        def __init__(self, info: dict[str, object]) -> None:
+            self.info = info
+
+        def memory_maps(self, grouped: bool = False):
+            del grouped
+            return []
+
+    fake_psutil = SimpleNamespace(
+        process_iter=lambda fields: [
+            _Proc(
+                {
+                    "pid": 1144400,
+                    "name": "SenrenBanka.exe",
+                    "cmdline": [str(exe_path)],
+                    "create_time": 20.0,
+                    "exe": str(exe_path),
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.memory_reader.psutil",
+        fake_psutil,
+    )
+    with galgame_memory_reader._KIRIKIRI_DIR_CACHE_LOCK:
+        galgame_memory_reader._KIRIKIRI_DIR_CACHE.clear()
+
+    detected = _default_process_scanner()
+
+    assert len(detected) == 1
+    assert detected[0].engine == "kirikiri"
+    assert detected[0].exe_path == str(exe_path)
+    assert detected[0].detection_reason == "detected_kirikiri_common_xp3"
+
+
+def test_default_process_scanner_detects_senren_banka_from_process_preset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exe_path = tmp_path / "SenrenBanka.exe"
+
+    class _Proc:
+        def __init__(self, info: dict[str, object]) -> None:
+            self.info = info
+
+        def memory_maps(self, grouped: bool = False):
+            del grouped
+            return []
+
+    fake_psutil = SimpleNamespace(
+        process_iter=lambda fields: [
+            _Proc(
+                {
+                    "pid": 1144400,
+                    "name": "SenrenBanka.exe",
+                    "cmdline": [str(exe_path)],
+                    "create_time": 20.0,
+                    "exe": str(exe_path),
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.memory_reader.psutil",
+        fake_psutil,
+    )
+
+    detected = _default_process_scanner()
+
+    assert len(detected) == 1
+    assert detected[0].engine == "kirikiri"
+    assert detected[0].detection_reason == "detected_kirikiri_preset_senren_banka"
+
+
+def test_default_process_scanner_detects_senren_banka_from_steam_app_preset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exe_path = tmp_path / "SteamLibrary" / "steamapps" / "common" / "1144400" / "Game.exe"
+
+    class _Proc:
+        def __init__(self, info: dict[str, object]) -> None:
+            self.info = info
+
+        def memory_maps(self, grouped: bool = False):
+            del grouped
+            return []
+
+    fake_psutil = SimpleNamespace(
+        process_iter=lambda fields: [
+            _Proc(
+                {
+                    "pid": 1144401,
+                    "name": "Game.exe",
+                    "cmdline": [str(exe_path)],
+                    "create_time": 20.0,
+                    "exe": str(exe_path),
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.memory_reader.psutil",
+        fake_psutil,
+    )
+
+    detected = _default_process_scanner()
+
+    assert len(detected) == 1
+    assert detected[0].engine == "kirikiri"
+    assert detected[0].detection_reason == "detected_kirikiri_preset_senren_banka"
+
+
 def test_memory_reader_bridge_writer_emits_stable_bridge_schema_and_choice_ids(
     tmp_path: Path,
 ) -> None:
@@ -422,6 +546,52 @@ def test_memory_line_id_collision_suffix_has_limit(
 
     with pytest.raises(RuntimeError, match="collision limit"):
         writer._line_id_for_text(text)
+
+
+def test_parse_textractor_line_accepts_extended_metadata() -> None:
+    parsed, error = MemoryReaderManager._parse_textractor_line(
+        "[1:0:0:FFFFFFFFFFFFFFFF:FFFFFFFFFFFFFFFF:Clipboard:HB0@0] dialogue text"
+    )
+
+    assert error == ""
+    assert parsed is not None
+    assert parsed.pid == 1
+    assert parsed.hook_addr == "0"
+    assert parsed.ctx == "0"
+    assert parsed.sub_ctx == "FFFFFFFFFFFFFFFF"
+    assert parsed.text == "dialogue text"
+
+
+def test_memory_writer_tracks_text_seq_separately_from_heartbeat(tmp_path: Path) -> None:
+    writer = MemoryReaderBridgeWriter(
+        bridge_root=tmp_path,
+        time_fn=lambda: 1710000000.0,
+    )
+    writer.start_session(
+        DetectedGameProcess(
+            pid=4242,
+            name="RenPy Demo.exe",
+            create_time=1709999999.0,
+            engine="renpy",
+        )
+    )
+
+    assert writer.last_text_seq == 0
+    assert writer.last_text_ts == ""
+    assert writer.emit_line("first memory line", ts="2026-04-29T01:00:00Z") is True
+    text_seq = writer.last_text_seq
+    text_ts = writer.last_text_ts
+    assert text_seq == writer.last_seq
+    assert text_ts == "2026-04-29T01:00:00Z"
+
+    assert writer.emit_heartbeat(ts="2026-04-29T01:00:01Z") is True
+    assert writer.last_seq == text_seq + 1
+    assert writer.last_text_seq == text_seq
+    assert writer.last_text_ts == text_ts
+
+    session = read_session_json(tmp_path / writer.game_id / "session.json").session
+    assert session is not None
+    assert session["state"]["text"] == "first memory line"
 
 
 @pytest.mark.asyncio
@@ -488,6 +658,221 @@ async def test_memory_reader_manager_attaches_consumes_textractor_output_and_emi
 
     await manager.shutdown()
     assert handle.terminated is True
+
+
+@pytest.mark.asyncio
+async def test_memory_reader_manager_skips_legacy_hook_codes_for_kirikiri(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    handle = _FakeTextractorHandle([])
+
+    async def _process_factory(path: str):
+        del path
+        return handle
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=build_config(
+            {
+                "galgame": {"bridge_root": str(bridge_root)},
+                "memory_reader": {
+                    "enabled": True,
+                    "textractor_path": str(textractor_path),
+                    "hook_codes": ["/HQ14+3C@GameAssembly.dll#0x33A440"],
+                    "auto_detect": True,
+                },
+            }
+        ),
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="SenrenBanka.exe",
+                create_time=1709999999.0,
+                engine="kirikiri",
+                exe_path=str(tmp_path / "SenrenBanka.exe"),
+                detection_reason="detected_kirikiri_xp3",
+            )
+        ],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+    )
+
+    first = await manager.tick(bridge_sdk_available=False)
+
+    assert handle.writes == ["attach -P4242\n"]
+    assert first.runtime["hook_code_count"] == 0
+    assert first.runtime["hook_code_detail"] == "hook_codes_skipped_for_engine"
+
+
+@pytest.mark.asyncio
+async def test_memory_reader_manager_sends_engine_hook_codes_for_unity(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    handle = _FakeTextractorHandle([])
+
+    async def _process_factory(path: str):
+        del path
+        return handle
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=build_config(
+            {
+                "galgame": {"bridge_root": str(bridge_root)},
+                "memory_reader": {
+                    "enabled": True,
+                    "textractor_path": str(textractor_path),
+                    "hook_codes": [],
+                    "engine_hooks": {
+                        "unity": ["/HQ14+3C@GameAssembly.dll#0x33A440"],
+                        "kirikiri": [],
+                    },
+                    "auto_detect": True,
+                },
+            }
+        ),
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="UnityGame.exe",
+                create_time=1709999999.0,
+                engine="unity",
+                detection_reason="detected_unity_module",
+            )
+        ],
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+    )
+
+    first = await manager.tick(bridge_sdk_available=False)
+
+    assert handle.writes == [
+        "attach -P4242\n",
+        "/HQ14+3C@GameAssembly.dll#0x33A440 -P4242\n",
+    ]
+    assert first.runtime["hook_code_count"] == 1
+    assert first.runtime["hook_code_detail"] == "hook_codes_sent"
+
+
+@pytest.mark.asyncio
+async def test_memory_reader_manual_target_rebounds_by_process_signature(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    exe_path = str(tmp_path / "SenrenBanka.exe")
+    old_process = DetectedGameProcess(
+        pid=100,
+        name="SenrenBanka.exe",
+        create_time=1709999900.0,
+        engine="kirikiri",
+        exe_path=exe_path,
+        detection_reason="detected_kirikiri_xp3",
+    )
+    new_process = DetectedGameProcess(
+        pid=200,
+        name="SenrenBanka.exe",
+        create_time=1710000000.0,
+        engine="kirikiri",
+        exe_path=exe_path,
+        detection_reason="detected_kirikiri_xp3",
+    )
+    inventory = {"items": [old_process]}
+    handle = _FakeTextractorHandle([])
+
+    async def _process_factory(path: str):
+        del path
+        return handle
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            textractor_path=str(textractor_path),
+            auto_detect=True,
+        ),
+        process_factory=_process_factory,
+        process_scanner=lambda: [],
+        process_inventory_scanner=lambda: list(inventory["items"]),
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+    )
+    target = manager.resolve_manual_process_target(process_key=old_process.process_key)
+    manager.update_process_target(target)
+    inventory["items"] = [new_process]
+
+    first = await manager.tick(bridge_sdk_available=False)
+
+    assert first.runtime["pid"] == 200
+    assert first.runtime["target_selection_mode"] == "manual"
+    assert first.runtime["target_selection_detail"] == "manual_target_rebound"
+    assert manager.current_process_target()["pid"] == 200
+    assert handle.writes == ["attach -P200\n"]
+
+
+@pytest.mark.asyncio
+async def test_memory_reader_manager_marks_idle_after_text_on_heartbeat(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    textractor_path = tmp_path / "TextractorCLI.exe"
+    textractor_path.write_text("", encoding="utf-8")
+    handle = _FakeTextractorHandle(["[4242:100:0:0] first memory line"])
+    clock = {"now": 1710000000.0}
+
+    async def _process_factory(path: str):
+        del path
+        return handle
+
+    manager = MemoryReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            textractor_path=str(textractor_path),
+            auto_detect=True,
+            poll_interval_seconds=0.5,
+        ),
+        process_factory=_process_factory,
+        process_scanner=lambda: [
+            DetectedGameProcess(
+                pid=4242,
+                name="RenPy Demo.exe",
+                create_time=1709999999.0,
+                engine="renpy",
+            )
+        ],
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+    )
+
+    first = await manager.tick(bridge_sdk_available=False)
+    assert first.runtime["detail"] == "receiving_text"
+    text_seq = first.runtime["last_text_seq"]
+    assert text_seq > 0
+
+    clock["now"] += 1.0
+    second = await manager.tick(bridge_sdk_available=False)
+
+    assert second.runtime["detail"] == "attached_idle_after_text"
+    assert second.runtime["last_text_seq"] == text_seq
+    assert second.runtime["last_seq"] > text_seq
+
+    await manager.shutdown()
 
 
 @pytest.mark.asyncio

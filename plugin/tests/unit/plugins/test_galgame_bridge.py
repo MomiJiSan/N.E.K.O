@@ -1487,6 +1487,148 @@ def test_request_ocr_after_advance_capture_respects_trigger_mode_and_reader_stat
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_set_mode_from_choice_advisor_to_companion_queues_after_advance_ocr_capture(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        galgame={"reader_mode": DATA_SOURCE_OCR_READER},
+        ocr_reader={"enabled": True, "trigger_mode": "after_advance"},
+    )
+    plugin = GalgameBridgePlugin(_Ctx(plugin_dir, cfg))
+    plugin._cfg = build_config(cfg)
+    plugin._config_service = SimpleNamespace(
+        persist_preferences=lambda **kwargs: None,
+        persist_reader_mode=lambda **kwargs: None,
+    )
+    starts: list[bool] = []
+    plugin._start_background_bridge_poll = lambda: starts.append(True) or True  # type: ignore[method-assign]
+
+    async def _ensure_monitor() -> bool:
+        return False
+
+    plugin._ensure_ocr_foreground_advance_monitor = _ensure_monitor  # type: ignore[method-assign]
+    with plugin._state_lock:
+        plugin._state.mode = "choice_advisor"
+        plugin._state.active_data_source = DATA_SOURCE_OCR_READER
+        plugin._state.active_session_id = "ocr-session"
+
+    result = await plugin.galgame_set_mode(mode="companion")
+
+    assert isinstance(result, Ok)
+    assert plugin._has_pending_ocr_advance_capture() is True
+    assert plugin._last_ocr_advance_capture_reason == "mode_change_to_read_only"
+    assert starts
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("initial_mode", "ocr_reader", "reader_mode"),
+    [
+        ("choice_advisor", {"enabled": True, "trigger_mode": "interval"}, DATA_SOURCE_OCR_READER),
+        ("choice_advisor", {"enabled": False, "trigger_mode": "after_advance"}, DATA_SOURCE_OCR_READER),
+        ("choice_advisor", {"enabled": True, "trigger_mode": "after_advance"}, DATA_SOURCE_MEMORY_READER),
+        ("companion", {"enabled": True, "trigger_mode": "after_advance"}, DATA_SOURCE_OCR_READER),
+    ],
+)
+async def test_set_mode_to_read_only_does_not_queue_ocr_capture_when_ineligible(
+    tmp_path: Path,
+    initial_mode: str,
+    ocr_reader: dict[str, object],
+    reader_mode: str,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        galgame={"reader_mode": reader_mode},
+        ocr_reader=ocr_reader,
+    )
+    plugin = GalgameBridgePlugin(_Ctx(plugin_dir, cfg))
+    plugin._cfg = build_config(cfg)
+    plugin._config_service = SimpleNamespace(
+        persist_preferences=lambda **kwargs: None,
+        persist_reader_mode=lambda **kwargs: None,
+    )
+    plugin._start_background_bridge_poll = lambda: True  # type: ignore[method-assign]
+
+    async def _ensure_monitor() -> bool:
+        return False
+
+    plugin._ensure_ocr_foreground_advance_monitor = _ensure_monitor  # type: ignore[method-assign]
+    with plugin._state_lock:
+        plugin._state.mode = initial_mode
+        plugin._state.active_data_source = DATA_SOURCE_OCR_READER
+        plugin._state.active_session_id = "ocr-session"
+
+    result = await plugin.galgame_set_mode(mode="companion")
+
+    assert isinstance(result, Ok)
+    assert plugin._has_pending_ocr_advance_capture() is False
+    assert plugin._last_ocr_advance_capture_reason == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_mode_rolls_back_runtime_state_when_reader_mode_persist_fails(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        galgame={"reader_mode": DATA_SOURCE_OCR_READER},
+        ocr_reader={"enabled": True, "trigger_mode": "after_advance"},
+    )
+    plugin = GalgameBridgePlugin(_Ctx(plugin_dir, cfg))
+    plugin._cfg = build_config(cfg)
+
+    def _fail_reader_mode(**_kwargs):
+        raise RuntimeError("store unavailable")
+
+    plugin._config_service = SimpleNamespace(
+        persist_preferences=lambda **kwargs: None,
+        persist_reader_mode=_fail_reader_mode,
+    )
+    manager_updates: list[str] = []
+    fake_manager = SimpleNamespace(
+        update_config=lambda config: manager_updates.append(str(config.reader_mode))
+    )
+    plugin._memory_reader_manager = fake_manager
+    plugin._ocr_reader_manager = fake_manager
+    with plugin._state_lock:
+        plugin._state.mode = "choice_advisor"
+        plugin._state.push_notifications = True
+        plugin._state.advance_speed = "medium"
+        plugin._state.active_data_source = DATA_SOURCE_OCR_READER
+        plugin._state.next_poll_at_monotonic = 123.0
+        plugin._pending_ocr_advance_captures = 2
+        plugin._last_ocr_advance_capture_requested_at = time.monotonic() - 1.0
+        plugin._last_ocr_advance_capture_reason = "manual_foreground_advance"
+
+    result = await plugin.galgame_set_mode(
+        mode="companion",
+        push_notifications=False,
+        advance_speed="fast",
+        reader_mode=DATA_SOURCE_MEMORY_READER,
+    )
+
+    assert isinstance(result, Err)
+    assert plugin._cfg.reader_mode == DATA_SOURCE_OCR_READER
+    with plugin._state_lock:
+        assert plugin._state.mode == "choice_advisor"
+        assert plugin._state.push_notifications is True
+        assert plugin._state.advance_speed == "medium"
+        assert plugin._state.active_data_source == DATA_SOURCE_OCR_READER
+        assert plugin._state.next_poll_at_monotonic == 123.0
+    assert plugin._has_pending_ocr_advance_capture() is True
+    assert plugin._last_ocr_advance_capture_reason == "manual_foreground_advance"
+    assert DATA_SOURCE_MEMORY_READER in manager_updates
+    assert DATA_SOURCE_OCR_READER in manager_updates
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_set_ocr_timing_to_interval_clears_after_advance_pending(
     tmp_path: Path,
 ) -> None:
@@ -1515,6 +1657,35 @@ async def test_set_ocr_timing_to_interval_clears_after_advance_pending(
     assert plugin._last_ocr_advance_capture_requested_at == 0.0
     assert plugin._last_ocr_advance_capture_reason == ""
     assert plugin._cfg.ocr_reader_trigger_mode == "interval"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_set_ocr_backend_resets_capture_runtime_diagnostics_on_change(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        ocr_reader={"enabled": True, "backend_selection": "rapidocr", "capture_backend": "dxcam"},
+    )
+    plugin = GalgameBridgePlugin(_Ctx(plugin_dir, cfg))
+    plugin._cfg = build_config(cfg)
+    plugin._config_service = SimpleNamespace(
+        persist_ocr_backend_selection=lambda **kwargs: None,
+    )
+    resets: list[bool] = []
+    plugin._ocr_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        reset_capture_runtime_diagnostics=lambda: resets.append(True),
+    )
+    plugin._start_background_bridge_poll = lambda: False  # type: ignore[method-assign]
+
+    result = await plugin.galgame_set_ocr_backend(capture_backend="imagegrab")
+
+    assert isinstance(result, Ok)
+    assert plugin._cfg.ocr_reader_capture_backend == "imagegrab"
+    assert resets == [True]
 
 
 @pytest.mark.asyncio
@@ -1760,6 +1931,14 @@ def test_stop_bridge_poll_loop_cancels_pending_loop_tasks(tmp_path: Path) -> Non
 
     loop = plugin._ensure_bridge_poll_loop()
     assert loop is not None
+
+    async def _touch_poll_lock() -> int:
+        plugin._poll_bridge_async_lock()
+        return id(asyncio.get_running_loop())
+
+    loop_key = asyncio.run_coroutine_threadsafe(_touch_poll_lock(), loop).result(timeout=1.0)
+    assert loop_key in plugin._poll_bridge_locks
+
     future = asyncio.run_coroutine_threadsafe(_pending_task(), loop)
     assert started.wait(timeout=1.0)
 
@@ -1769,6 +1948,66 @@ def test_stop_bridge_poll_loop_cancels_pending_loop_tasks(tmp_path: Path) -> Non
     assert future.done()
     assert plugin._bridge_poll_loop is None
     assert plugin._bridge_poll_thread is None
+    assert loop_key not in plugin._poll_bridge_locks
+
+
+@pytest.mark.plugin_unit
+def test_config_service_persist_runtime_state_uses_defaults_for_missing_keys() -> None:
+    class _Persist:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] = {}
+
+        def persist_runtime(self, **kwargs) -> None:
+            self.payload = dict(kwargs)
+
+    persist = _Persist()
+    service = galgame_plugin_module.GalgamePluginConfigService(
+        SimpleNamespace(_persist=persist)
+    )
+
+    service.persist_runtime_state({})
+
+    assert persist.payload == {
+        "session_id": "",
+        "events_byte_offset": 0,
+        "events_file_size": 0,
+        "last_seq": 0,
+        "dedupe_window": [],
+        "last_error": {},
+    }
+
+
+@pytest.mark.plugin_unit
+def test_game_llm_agent_menu_stage_without_choices_is_unknown(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    snapshot = _session_state(
+        text="",
+        line_id="",
+        choices=[],
+        is_menu_open=False,
+        screen_type=OCR_CAPTURE_PROFILE_STAGE_MENU,
+        screen_confidence=0.72,
+        screen_ui_elements=[
+            {
+                "text": "Config",
+                "bounds": {"left": 100.0, "top": 100.0, "right": 200.0, "bottom": 140.0},
+            }
+        ],
+    )
+
+    assert agent._classify_scene_stage(
+        snapshot,
+        now=1000.0,
+        scene_changed=False,
+    ) == "unknown"
 
 
 @pytest.mark.asyncio
@@ -1902,10 +2141,12 @@ async def test_public_surface_preserves_phase1_entries_and_adds_phase2_entries(t
         "galgame_install_rapidocr",
         "galgame_install_tesseract",
         "galgame_install_textractor",
+        "galgame_list_memory_reader_processes",
         "galgame_list_ocr_windows",
         "galgame_open_ui",
         "galgame_rollback_ocr_capture_profile",
         "galgame_set_llm_vision",
+        "galgame_set_memory_reader_target",
         "galgame_set_mode",
         "galgame_set_ocr_backend",
         "galgame_set_ocr_capture_profile",
@@ -2599,6 +2840,198 @@ async def test_windows_default_memory_reader_config_stays_idle_when_textractor_a
     assert status.value["active_data_source"] == "none"
     assert status.value["memory_reader_runtime"]["status"] == "idle"
     assert status.value["memory_reader_runtime"]["detail"] == "invalid_textractor_path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_auto_reader_keeps_configured_ocr_available_when_memory_default_unavailable(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        galgame={"reader_mode": "auto"},
+        memory_reader={
+            "enabled": True,
+            "auto_detect": True,
+            "poll_interval_seconds": 1,
+        },
+        ocr_reader={
+            "enabled": True,
+            "backend_selection": "rapidocr",
+            "capture_backend": "dxcam",
+            "trigger_mode": "interval",
+            "poll_interval_seconds": 1.0,
+        },
+        rapidocr={"enabled": True},
+    )
+    ocr_game_id = "ocr-configured"
+    ocr_session_id = "ocr-session"
+    _create_game_dir(
+        bridge_root,
+        game_id=ocr_game_id,
+        session_payload=_ocr_reader_session(
+            game_id=ocr_game_id,
+            session_id=ocr_session_id,
+            last_seq=1,
+            state=_session_state(
+                speaker="ocr",
+                text="configured OCR line",
+                scene_id="ocr-scene",
+                line_id="ocr-line",
+            ),
+        ),
+        events=[],
+    )
+
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    plugin._cfg = build_config(cfg)
+    plugin._start_background_bridge_poll = lambda: False  # type: ignore[method-assign]
+
+    ocr_ticks: list[dict[str, object]] = []
+
+    async def _memory_tick(**_kwargs):
+        return SimpleNamespace(
+            warnings=[],
+            should_rescan=False,
+            runtime={
+                "enabled": True,
+                "status": "idle",
+                "detail": "invalid_textractor_path",
+            },
+        )
+
+    async def _ocr_tick(**kwargs):
+        ocr_ticks.append(dict(kwargs))
+        return SimpleNamespace(
+            warnings=[],
+            should_rescan=False,
+            stable_event_emitted=True,
+            runtime={
+                "enabled": True,
+                "status": "active",
+                "detail": "stable",
+                "game_id": ocr_game_id,
+                "session_id": ocr_session_id,
+            },
+        )
+
+    plugin._memory_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        tick=_memory_tick,
+    )
+    plugin._ocr_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        update_advance_speed=lambda speed: None,
+        tick=_ocr_tick,
+        current_window_target=lambda: {},
+    )
+
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert ocr_ticks
+    assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
+    assert snapshot.value["snapshot"]["text"] == "configured OCR line"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_auto_reader_keeps_rapidocr_enabled_ocr_available_when_backend_auto(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        galgame={"reader_mode": "auto"},
+        memory_reader={
+            "enabled": True,
+            "auto_detect": True,
+            "poll_interval_seconds": 1,
+        },
+        ocr_reader={
+            "enabled": True,
+            "backend_selection": "auto",
+            "capture_backend": "auto",
+            "trigger_mode": "interval",
+            "poll_interval_seconds": 1.0,
+        },
+        rapidocr={"enabled": True},
+    )
+    ocr_game_id = "ocr-rapidocr-enabled"
+    ocr_session_id = "ocr-session"
+    _create_game_dir(
+        bridge_root,
+        game_id=ocr_game_id,
+        session_payload=_ocr_reader_session(
+            game_id=ocr_game_id,
+            session_id=ocr_session_id,
+            last_seq=1,
+            state=_session_state(
+                speaker="ocr",
+                text="rapidocr enabled OCR line",
+                scene_id="ocr-scene",
+                line_id="ocr-line",
+            ),
+        ),
+        events=[],
+    )
+
+    plugin = GalgameBridgePlugin(_Ctx(plugin_dir, cfg))
+    plugin._cfg = build_config(cfg)
+    plugin._start_background_bridge_poll = lambda: False  # type: ignore[method-assign]
+    ocr_ticks: list[dict[str, object]] = []
+
+    async def _memory_tick(**_kwargs):
+        return SimpleNamespace(
+            warnings=[],
+            should_rescan=False,
+            runtime={
+                "enabled": True,
+                "status": "idle",
+                "detail": "invalid_textractor_path",
+            },
+        )
+
+    async def _ocr_tick(**kwargs):
+        ocr_ticks.append(dict(kwargs))
+        return SimpleNamespace(
+            warnings=[],
+            should_rescan=False,
+            stable_event_emitted=True,
+            runtime={
+                "enabled": True,
+                "status": "active",
+                "detail": "stable",
+                "game_id": ocr_game_id,
+                "session_id": ocr_session_id,
+            },
+        )
+
+    plugin._memory_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        tick=_memory_tick,
+    )
+    plugin._ocr_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        update_advance_speed=lambda speed: None,
+        tick=_ocr_tick,
+        current_window_target=lambda: {},
+    )
+
+    await plugin._poll_bridge(force=True)
+    status = await plugin.galgame_get_status()
+    snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(status, Ok)
+    assert isinstance(snapshot, Ok)
+    assert ocr_ticks
+    assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
+    assert snapshot.value["snapshot"]["text"] == "rapidocr enabled OCR line"
 
 
 @pytest.mark.asyncio
@@ -4368,6 +4801,66 @@ async def test_ocr_reader_marks_stale_capture_backend_after_repeated_same_frame(
     assert result.runtime["ocr_context_state"] == "stale_capture_backend"
 
 
+@pytest.mark.plugin_unit
+def test_ocr_reader_capture_backend_switch_clears_stale_capture_diagnostics(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(
+            _make_effective_config(
+                bridge_root,
+                ocr_reader={
+                    "enabled": True,
+                    "capture_backend": "dxcam",
+                    "trigger_mode": "interval",
+                },
+                rapidocr={"enabled": False},
+            )
+        ),
+        platform_fn=lambda: False,
+        window_scanner=lambda: [],
+    )
+    manager._last_capture_error = "old capture failure"
+    manager._last_capture_image_hash = "same-frame"
+    manager._consecutive_same_capture_frames = 5
+    manager._stale_capture_backend = True
+    manager._runtime.last_capture_error = "old capture failure"
+    manager._runtime.last_capture_image_hash = "same-frame"
+    manager._runtime.consecutive_same_capture_frames = 5
+    manager._runtime.stale_capture_backend = True
+    manager._runtime.consecutive_no_text_polls = 3
+    manager._runtime.ocr_capture_diagnostic_required = True
+    manager._runtime.ocr_context_state = "stale_capture_backend"
+
+    manager.update_config(
+        build_config(
+            _make_effective_config(
+                bridge_root,
+                ocr_reader={
+                    "enabled": True,
+                    "capture_backend": "imagegrab",
+                    "trigger_mode": "interval",
+                },
+                rapidocr={"enabled": False},
+            )
+        )
+    )
+
+    assert manager._last_capture_error == ""
+    assert manager._last_capture_image_hash == ""
+    assert manager._consecutive_same_capture_frames == 0
+    assert manager._stale_capture_backend is False
+    assert manager._runtime.last_capture_error == ""
+    assert manager._runtime.last_capture_image_hash == ""
+    assert manager._runtime.consecutive_same_capture_frames == 0
+    assert manager._runtime.stale_capture_backend is False
+    assert manager._runtime.consecutive_no_text_polls == 0
+    assert manager._runtime.ocr_capture_diagnostic_required is False
+    assert manager._runtime.ocr_context_state == ""
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_auto_recalibrate_ocr_dialogue_profile_persists_bucket_and_survives_restart(
@@ -4719,6 +5212,160 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_auto_reader_interval_ocr_takes_over_from_stale_memory_snapshot(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={
+            "enabled": True,
+            "textractor_path": str(tmp_path / "TextractorCLI.exe"),
+        },
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 1.0,
+            "trigger_mode": "interval",
+            "no_text_takeover_after_seconds": 0.0,
+        },
+    )
+    memory_game_id = "mem-stale"
+    memory_session_id = "mem-session"
+    _create_game_dir(
+        bridge_root,
+        game_id=memory_game_id,
+        session_payload=_memory_reader_session(
+            game_id=memory_game_id,
+            session_id=memory_session_id,
+            last_seq=4,
+            state=_session_state(
+                speaker="memory",
+                text="old memory line",
+                scene_id="mem-scene",
+                line_id="mem-line",
+            ),
+        ),
+        events=[],
+    )
+
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    plugin._memory_reader_manager = SimpleNamespace(
+        update_config=lambda config: None,
+        tick=lambda **kwargs: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                warnings=[],
+                should_rescan=False,
+                runtime={
+                    "enabled": True,
+                    "status": "active",
+                    "detail": "attached_idle_after_text",
+                    "process_name": "RenPy Demo.exe",
+                    "pid": 4242,
+                    "engine": "renpy",
+                    "game_id": memory_game_id,
+                    "session_id": memory_session_id,
+                    "last_seq": 5,
+                    "last_event_ts": "2026-04-29T01:00:05Z",
+                    "last_text_seq": 2,
+                    "last_text_ts": "2026-04-29T01:00:00Z",
+                },
+            ),
+        ),
+        shutdown=lambda: asyncio.sleep(0, result=None),
+    )
+    target = DetectedGameWindow(
+        hwnd=205,
+        title="OCR Interval Window",
+        process_name="DemoGame.exe",
+        pid=5252,
+        width=1040,
+        height=807,
+    )
+    capture_backend = _FakeCaptureBackend()
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: 1710000400.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(["新しい台詞です。"]),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: 1710000400.0,
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    await plugin._poll_bridge(force=True)
+    await plugin._poll_bridge(force=True)
+    snapshot = await plugin.galgame_get_snapshot()
+    status = await plugin.galgame_get_status()
+
+    assert isinstance(snapshot, Ok)
+    assert isinstance(status, Ok)
+    assert status.value["active_data_source"] == DATA_SOURCE_OCR_READER
+    assert snapshot.value["snapshot"]["text"] == "新しい台詞です。"
+    assert capture_backend.capture_calls >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_memory_reader_text_freshness_resets_when_session_changes(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            memory_reader={"enabled": True},
+            ocr_reader={
+                "enabled": True,
+                "no_text_takeover_after_seconds": 30.0,
+            },
+        ),
+    )
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    now = time.monotonic()
+
+    first_runtime = {
+        "status": "active",
+        "detail": "receiving_text",
+        "game_id": "mem-demo",
+        "session_id": "mem-session-a",
+        "last_text_seq": 3,
+    }
+    assert plugin._update_memory_reader_text_freshness(
+        first_runtime,
+        now_monotonic=now,
+    ) is True
+    assert first_runtime["last_text_recent"] is True
+
+    second_runtime = {
+        "status": "active",
+        "detail": "attached_idle_after_text",
+        "game_id": "mem-demo",
+        "session_id": "mem-session-b",
+        "last_text_seq": 3,
+    }
+    assert plugin._update_memory_reader_text_freshness(
+        second_runtime,
+        now_monotonic=now + 1.0,
+    ) is False
+    assert second_runtime["last_text_recent"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_ocr_reader_after_advance_bootstrap_continues_until_stable_line(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4884,6 +5531,8 @@ async def test_ocr_reader_after_advance_active_waits_for_explicit_capture(
     plugin = GalgameBridgePlugin(ctx)
     await plugin.startup()
     plugin._start_background_bridge_poll = lambda: False
+    with plugin._state_lock:
+        plugin._state.mode = "choice_advisor"
     clock = {"now": 1710000250.0}
     capture_backend = _FakeCaptureBackend()
     target = DetectedGameWindow(
@@ -4925,6 +5574,17 @@ async def test_ocr_reader_after_advance_active_waits_for_explicit_capture(
     assert second_snapshot.value["snapshot"]["text"] == "第一句。"
     assert capture_backend.capture_calls == 1
 
+    with plugin._state_lock:
+        waiting_runtime = dict(plugin._state.ocr_reader_runtime)
+    assert waiting_runtime["ocr_tick_allowed"] is False
+    assert waiting_runtime["ocr_tick_block_reason"] == "trigger_mode_after_advance_waiting_for_input"
+    assert waiting_runtime["ocr_emit_block_reason"] == ""
+    assert waiting_runtime["ocr_reader_allowed"] is True
+    assert waiting_runtime["ocr_trigger_mode_effective"] == "after_advance"
+    assert waiting_runtime["ocr_waiting_for_advance"] is True
+    assert waiting_runtime["ocr_waiting_for_advance_reason"] == "trigger_mode_after_advance_waiting_for_input"
+    assert waiting_runtime["ocr_last_tick_decision_at"]
+
     plugin.request_ocr_after_advance_capture(reason="manual_foreground_advance")
     clock["now"] += 1.0
     with plugin._state_lock:
@@ -4935,6 +5595,696 @@ async def test_ocr_reader_after_advance_active_waits_for_explicit_capture(
 
     assert isinstance(clicked_snapshot, Ok)
     assert clicked_snapshot.value["snapshot"]["text"] == "第二句。"
+    assert capture_backend.capture_calls == 2
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_companion_keeps_snapshot_refreshing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 0.5,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    clock = {"now": 1710000252.0}
+    capture_backend = _FakeCaptureBackend()
+    target = DetectedGameWindow(
+        hwnd=213,
+        title="OCR Companion Window",
+        process_name="DemoGame.exe",
+        pid=5364,
+        width=1280,
+        height=720,
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "Alice: first line.",
+                "Alice: second line.",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["text"] == "first line."
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    second_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(second_snapshot, Ok)
+    assert second_snapshot.value["snapshot"]["text"] == "second line."
+    assert capture_backend.capture_calls == 2
+    assert plugin._has_pending_ocr_advance_capture() is False
+    with plugin._state_lock:
+        companion_runtime = dict(plugin._state.ocr_reader_runtime)
+    assert companion_runtime["ocr_tick_allowed"] is True
+    assert companion_runtime["ocr_tick_block_reason"] == ""
+    assert companion_runtime["ocr_reader_allowed"] is True
+    assert companion_runtime["ocr_waiting_for_advance"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_title_screen_refreshes_without_pending_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 0.5,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    clock = {"now": 1710000255.0}
+    capture_backend = _FakeCaptureBackend()
+    target = DetectedGameWindow(
+        hwnd=204,
+        title="OCR Title Screen Window",
+        process_name="DemoGame.exe",
+        pid=5355,
+        width=1280,
+        height=720,
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "Start Game\nContinue\nConfig\nExit",
+                "Start Game\nContinue\nConfig\nExit",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["screen_type"] == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert first_snapshot.value["snapshot"]["text"] == ""
+    with plugin._state_lock:
+        first_runtime = dict(plugin._state.ocr_reader_runtime)
+        first_history_lines = list(plugin._state.history_lines)
+    assert first_runtime["detail"] == "screen_classified"
+    assert first_runtime["ocr_context_state"] == "screen_classified"
+    assert first_history_lines == []
+    assert capture_backend.capture_calls == 1
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    second_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(second_snapshot, Ok)
+    assert second_snapshot.value["snapshot"]["screen_type"] == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    with plugin._state_lock:
+        second_history_lines = list(plugin._state.history_lines)
+    assert second_history_lines == []
+    assert capture_backend.capture_calls == 2
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_title_refresh_stops_after_dialogue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 0.5,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    with plugin._state_lock:
+        plugin._state.mode = "choice_advisor"
+    clock = {"now": 1710000258.0}
+    capture_backend = _FakeCaptureBackend()
+    target = DetectedGameWindow(
+        hwnd=205,
+        title="OCR Title To Dialogue Window",
+        process_name="DemoGame.exe",
+        pid=5356,
+        width=1280,
+        height=720,
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "Start Game\nContinue\nConfig\nExit",
+                "雪乃：重新进入游戏。",
+                "雪乃：重新进入游戏。",
+                "雪乃：不应被连续读取。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    title_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(title_snapshot, Ok)
+    assert title_snapshot.value["snapshot"]["screen_type"] == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert capture_backend.capture_calls == 1
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    dialogue_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(dialogue_snapshot, Ok)
+    assert dialogue_snapshot.value["snapshot"]["text"] == "重新进入游戏。"
+    assert capture_backend.capture_calls == 2
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    final_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(final_snapshot, Ok)
+    assert final_snapshot.value["snapshot"]["text"] == "重新进入游戏。"
+    assert capture_backend.capture_calls == 2
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    stable_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(stable_snapshot, Ok)
+    assert stable_snapshot.value["snapshot"]["text"] == "重新进入游戏。"
+    assert capture_backend.capture_calls == 2
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_backlog_screen_does_not_block_new_dialogue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 0.5,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    with plugin._state_lock:
+        plugin._state.mode = "choice_advisor"
+    clock = {"now": 1710000259.0}
+    capture_backend = _FakeCaptureBackend()
+    target = DetectedGameWindow(
+        hwnd=206,
+        title="OCR Backlog Window",
+        process_name="DemoGame.exe",
+        pid=5357,
+        width=1280,
+        height=720,
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "雪乃：今の台詞。",
+                "Backlog\n雪乃：前の台詞。\n王生：今の台詞。",
+                "雪乃：新しい台詞。",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["text"] == "今の台詞。"
+    assert capture_backend.capture_calls == 1
+
+    plugin.request_ocr_after_advance_capture(reason="manual_foreground_advance")
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._last_ocr_advance_capture_requested_at = time.monotonic() - 1.0
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    backlog_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(backlog_snapshot, Ok)
+    assert backlog_snapshot.value["snapshot"]["screen_type"] == OCR_CAPTURE_PROFILE_STAGE_GALLERY
+    assert backlog_snapshot.value["snapshot"]["text"] == "今の台詞。"
+    with plugin._state_lock:
+        backlog_runtime = dict(plugin._state.ocr_reader_runtime)
+        backlog_history_lines = list(plugin._state.history_lines)
+    assert backlog_runtime["detail"] in {"screen_classified", "receiving_text"}
+    assert [item["text"] for item in backlog_history_lines] == ["今の台詞。"]
+    assert capture_backend.capture_calls == 2
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    final_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(final_snapshot, Ok)
+    assert final_snapshot.value["snapshot"]["text"] == "新しい台詞。"
+    assert capture_backend.capture_calls == 3
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_title_screen_with_previous_dialogue_keeps_refreshing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 0.5,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    with plugin._state_lock:
+        plugin._state.mode = "choice_advisor"
+    clock = {"now": 1710000261.0}
+    capture_backend = _FakeCaptureBackend()
+    target = DetectedGameWindow(
+        hwnd=207,
+        title="OCR Dialogue Title Window",
+        process_name="DemoGame.exe",
+        pid=5358,
+        width=1280,
+        height=720,
+    )
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(
+            [
+                "Alice: old line.",
+                "Start Game\nContinue\nConfig\nExit",
+                "Alice: new line.",
+            ]
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["text"] == "old line."
+
+    plugin.request_ocr_after_advance_capture(reason="manual_foreground_advance")
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._last_ocr_advance_capture_requested_at = time.monotonic() - 3.0
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    title_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(title_snapshot, Ok)
+    assert title_snapshot.value["snapshot"]["screen_type"] == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert title_snapshot.value["snapshot"]["text"] == "old line."
+    with plugin._state_lock:
+        title_runtime = dict(plugin._state.ocr_reader_runtime)
+    assert title_runtime["detail"] == "screen_classified"
+    assert capture_backend.capture_calls == 2
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    final_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(final_snapshot, Ok)
+    assert final_snapshot.value["snapshot"]["text"] == "new line."
+    assert capture_backend.capture_calls == 3
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_capture_failure_keeps_pending_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    install_root = tmp_path / "Tesseract"
+    _prepare_fake_tesseract_install(install_root)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "install_target_dir": str(install_root),
+            "poll_interval_seconds": 0.5,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    clock = {"now": 1710000262.0}
+    capture_backend = _FakeCaptureBackend()
+    target = DetectedGameWindow(
+        hwnd=208,
+        title="OCR Retry Window",
+        process_name="DemoGame.exe",
+        pid=5359,
+        width=1280,
+        height=720,
+    )
+
+    class _FailOnCallOcrBackend(_FakeOcrBackend):
+        def __init__(self, texts: list[str], *, fail_on_calls: set[int]) -> None:
+            super().__init__(texts)
+            self._calls = 0
+            self._fail_on_calls = set(fail_on_calls)
+
+        def extract_text(self, image: str) -> str:
+            self._calls += 1
+            if self._calls in self._fail_on_calls:
+                raise RuntimeError("temporary OCR failure")
+            return super().extract_text(image)
+
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: 0)
+    plugin._ocr_reader_manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FailOnCallOcrBackend(
+            ["Alice: first line.", "Alice: second line."],
+            fail_on_calls={2},
+        ),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["text"] == "first line."
+
+    plugin.request_ocr_after_advance_capture(reason="manual_foreground_advance")
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._last_ocr_advance_capture_requested_at = time.monotonic() - 1.0
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    failed_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(failed_snapshot, Ok)
+    assert failed_snapshot.value["snapshot"]["text"] == "first line."
+    with plugin._state_lock:
+        failed_runtime = dict(plugin._state.ocr_reader_runtime)
+    assert failed_runtime["detail"] == "capture_failed"
+    assert capture_backend.capture_calls == 2
+    assert plugin._has_pending_ocr_advance_capture() is True
+
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._state.next_poll_at_monotonic = 0.0
+    await plugin._poll_bridge(force=False)
+    final_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(final_snapshot, Ok)
+    assert final_snapshot.value["snapshot"]["text"] == "second line."
+    assert capture_backend.capture_calls == 3
+    assert plugin._has_pending_ocr_advance_capture() is False
+
+
+@pytest.mark.plugin_unit
+def test_after_advance_screen_refresh_needed_is_limited_to_non_dialogue_screens() -> None:
+    def needed(
+        screen_type: str,
+        *,
+        active_data_source: str = DATA_SOURCE_OCR_READER,
+        choices: list[dict[str, object]] | None = None,
+        is_menu_open: bool = False,
+        ocr_reader_allowed: bool = True,
+        context_state: str = "screen_classified",
+        detail: str = "",
+        confidence: float = 0.64,
+        text: str = "",
+    ) -> bool:
+        return galgame_plugin_module._after_advance_screen_refresh_needed(
+            local={
+                "active_data_source": active_data_source,
+                "latest_snapshot": {
+                    "screen_type": screen_type,
+                    "screen_confidence": confidence,
+                    "text": text,
+                    "line_id": "line-1" if text else "",
+                    "choices": list(choices or []),
+                    "is_menu_open": is_menu_open,
+                },
+            },
+            ocr_reader_runtime={
+                "status": "active",
+                "ocr_context_state": context_state,
+                "detail": detail,
+            },
+            ocr_reader_allowed=ocr_reader_allowed,
+            ocr_trigger_mode="after_advance",
+        )
+
+    for screen_type in {
+        OCR_CAPTURE_PROFILE_STAGE_TITLE,
+        OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+        OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+        OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+        OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+        OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
+    }:
+        assert needed(screen_type) is True
+
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_MENU) is True
+    assert needed(
+        OCR_CAPTURE_PROFILE_STAGE_MENU,
+        choices=[{"choice_id": "c1", "text": "左边"}],
+    ) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_MENU, is_menu_open=True) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_DIALOGUE) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_DEFAULT) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_MINIGAME) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_TITLE, active_data_source=DATA_SOURCE_MEMORY_READER) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_TITLE, ocr_reader_allowed=False) is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_TITLE, context_state="stable") is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_TITLE, context_state="stable", text="dialogue") is False
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_TITLE, text="old dialogue") is True
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_CONFIG, text="old dialogue") is True
+    assert needed(
+        OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+        context_state="stable",
+        detail="screen_classified",
+        text="old dialogue",
+    ) is True
+    assert (
+        needed(
+            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+            detail="screen_classified",
+            text="dialogue",
+        )
+        is False
+    )
+    assert needed(OCR_CAPTURE_PROFILE_STAGE_TITLE, confidence=0.44) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_after_advance_keyboard_writes_next_stable_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        memory_reader={"enabled": False},
+        ocr_reader={
+            "enabled": True,
+            "poll_interval_seconds": 1.0,
+            "trigger_mode": "after_advance",
+        },
+    )
+    ctx = _Ctx(plugin_dir, cfg)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
+    clock = {"now": 1710000260.0}
+    target = DetectedGameWindow(
+        hwnd=204,
+        title="OCR Keyboard Advance Window",
+        process_name="DemoGame.exe",
+        pid=5355,
+        width=1280,
+        height=720,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=plugin.logger,
+        config=plugin._cfg,
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(["雪乃：第一句。", "雪乃：第二句。"]),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: clock["now"],
+        ),
+    )
+    plugin._ocr_reader_manager = manager
+    monkeypatch.setattr(galgame_ocr_reader, "_foreground_window_handle", lambda: target.hwnd)
+    monkeypatch.setattr(galgame_ocr_reader, "_root_window_handle", lambda hwnd: int(hwnd or 0))
+    monkeypatch.setattr(galgame_ocr_reader, "_window_process_id", lambda hwnd: 0)
+
+    await plugin._poll_bridge(force=True)
+    first_snapshot = await plugin.galgame_get_snapshot()
+    assert isinstance(first_snapshot, Ok)
+    assert first_snapshot.value["snapshot"]["text"] == "第一句。"
+
+    manager._wheel_monitor = _FakeAdvanceInputMonitor(
+        [
+            galgame_ocr_reader._MouseWheelEvent(
+                seq=1,
+                ts=clock["now"],
+                delta=0,
+                foreground_hwnd=target.hwnd,
+                kind="key",
+                key_code=0x20,
+            )
+        ]
+    )
+    plugin._trigger_ocr_for_manual_foreground_advance()
+    assert plugin._has_pending_ocr_advance_capture() is True
+    clock["now"] += 1.0
+    with plugin._state_lock:
+        plugin._last_ocr_advance_capture_requested_at = time.monotonic() - 1.0
+        plugin._state.next_poll_at_monotonic = 0.0
+
+    await plugin._poll_bridge(force=False)
+    second_snapshot = await plugin.galgame_get_snapshot()
+
+    assert isinstance(second_snapshot, Ok)
+    assert second_snapshot.value["snapshot"]["text"] == "第二句。"
     assert capture_backend.capture_calls == 2
     assert plugin._has_pending_ocr_advance_capture() is False
 
@@ -5238,6 +6588,8 @@ async def test_after_advance_manual_click_ocr_is_not_blocked_by_memory_candidate
                     "game_id": memory_game_id,
                     "session_id": "mem-session",
                     "last_seq": 1,
+                    "last_text_seq": 1,
+                    "last_text_ts": "2026-04-29T01:00:00Z",
                 },
             ),
         ),
@@ -5368,6 +6720,8 @@ async def test_after_advance_manual_click_discovers_ocr_target_while_memory_acti
                     "game_id": memory_game_id,
                     "session_id": "mem-session",
                     "last_seq": 1,
+                    "last_text_seq": 1,
+                    "last_text_ts": "2026-04-29T01:00:00Z",
                 },
             ),
         ),
@@ -7672,6 +9026,146 @@ def test_game_llm_agent_uses_screen_type_for_stage_and_strategy(tmp_path: Path) 
     assert game_over_strategy["strategy_id"] == "game_over_escape"
 
 
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_config_screen_pauses_when_recovery_input_unavailable(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_host = _FakeHostAdapter(ready=False)
+
+    async def _availability(*, timeout: float = 1.5):
+        del timeout
+        return {"ready": False, "reasons": ["computer_use disabled before dispatch"]}
+
+    fake_host.get_computer_use_availability = _availability  # type: ignore[method-assign]
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=fake_host,
+    )
+    config_snapshot = _session_state(
+        speaker="",
+        text="",
+        line_id="",
+        screen_type=OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+        screen_confidence=0.82,
+    )
+    shared = _shared_state(
+        snapshot=config_snapshot,
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"status": "active"},
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert status["status"] == "active"
+    assert status["agent_user_status"] == "screen_safety_pause"
+    assert status["reason"] == "screen_recovery_pause"
+    assert status["error"] == ""
+    assert "computer_use disabled before dispatch" in status["agent_pause_message"]
+    assert status["debug"]["screen_recovery_diagnostic"].startswith(
+        "computer_use disabled before dispatch"
+    )
+    assert fake_host.started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_config_screen_converts_stale_computer_use_error_to_pause(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    config_snapshot = _session_state(
+        speaker="",
+        text="",
+        line_id="",
+        screen_type=OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+        screen_confidence=0.82,
+    )
+    shared = _shared_state(
+        snapshot=config_snapshot,
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"status": "active"},
+    )
+    await agent.query_status(shared)
+    agent._set_hard_error("computer_use disabled before dispatch", retryable=True)
+
+    status = await agent.query_status(shared)
+
+    assert status["status"] == "active"
+    assert status["agent_user_status"] == "screen_safety_pause"
+    assert status["reason"] == "screen_recovery_pause"
+    assert status["error"] == ""
+    assert status["debug"]["screen_recovery_diagnostic"] == "computer_use disabled before dispatch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_config_screen_uses_local_escape_before_computer_use(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_host = _FakeHostAdapter(ready=False)
+    local_calls: list[dict[str, object]] = []
+
+    def _local_input(_shared: dict[str, object], actuation: dict[str, object]) -> dict[str, object]:
+        local_calls.append(dict(actuation))
+        return {
+            "success": True,
+            "reason": "",
+            "kind": actuation.get("kind"),
+            "strategy_id": actuation.get("strategy_id"),
+            "method": "keyboard_escape",
+        }
+
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=fake_host,
+        local_input_actuator=_local_input,
+    )
+    config_snapshot = _session_state(
+        speaker="",
+        text="",
+        line_id="",
+        screen_type=OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+        screen_confidence=0.82,
+    )
+    shared = _shared_state(
+        snapshot=config_snapshot,
+        active_data_source=DATA_SOURCE_OCR_READER,
+        ocr_reader_runtime={"pid": 4242, "status": "active"},
+    )
+
+    await agent.tick(shared)
+    status = await agent.query_status(shared)
+
+    assert local_calls
+    assert local_calls[0]["strategy_id"] == "config_escape"
+    assert agent._actuation is not None
+    assert agent._actuation["state"] == "awaiting_bridge"
+    assert status["agent_user_status"] == "acting"
+    assert status["error"] == ""
+    assert status["debug"]["screen_recovery_diagnostic"] == ""
+    assert fake_host.started == []
+
+
 @pytest.mark.plugin_unit
 def test_game_llm_agent_choice_advice_ignores_bare_numbers(tmp_path: Path) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
@@ -7878,6 +9372,56 @@ async def test_game_llm_agent_apply_mode_change_cancels_pending_retry(tmp_path: 
     assert agent._pending_strategy is None
     assert status["agent_user_status"] == "read_only"
     assert status["reason"] == "mode_read_only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_apply_mode_change_clears_stale_actuation_error(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    agent._set_hard_error("host actuation failed", retryable=False)
+    agent._pending_strategy = {"kind": "advance", "strategy_id": "advance_click"}
+
+    status = await agent.apply_mode_change(_shared_state(mode="companion"))
+
+    assert agent._hard_error == ""
+    assert agent._pending_strategy is None
+    assert status["agent_user_status"] == "read_only"
+    assert status["reason"] == "mode_read_only"
+    assert status["error"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_peek_status_clears_stale_read_only_error(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    agent._set_hard_error("host actuation failed", retryable=False)
+
+    status = await agent.peek_status(_shared_state(mode="companion"))
+
+    assert agent._hard_error == ""
+    assert status["agent_user_status"] == "read_only"
+    assert status["reason"] == "mode_read_only"
+    assert status["error"] == ""
 
 
 @pytest.mark.asyncio
@@ -9133,11 +10677,35 @@ async def test_game_llm_agent_holds_when_ocr_context_is_unavailable(
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("trigger_mode", "expected_message_parts", "unexpected_message_parts"),
+    [
+        (
+            "after_advance",
+            ["后台期间不会持续 OCR", "切回后会尝试重新采集"],
+            ["OCR 仍在后台读取"],
+        ),
+        (
+            "interval",
+            ["会尝试在后台读取", "取决于窗口可见性、非最小化状态和捕获后端"],
+            ["OCR 仍在后台读取"],
+        ),
+    ],
+)
 async def test_game_llm_agent_pauses_when_ocr_target_window_is_not_foreground(
     tmp_path: Path,
+    trigger_mode: str,
+    expected_message_parts: list[str],
+    unexpected_message_parts: list[str],
 ) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
-    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    ctx = _Ctx(
+        plugin_dir,
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True, "trigger_mode": trigger_mode},
+        ),
+    )
     plugin = GalgameBridgePlugin(ctx)
     fake_gateway = _FakeLLMGateway()
     fake_host = _FakeHostAdapter()
@@ -9174,6 +10742,7 @@ async def test_game_llm_agent_pauses_when_ocr_target_window_is_not_foreground(
             "target_is_foreground": False,
         },
     )
+    shared["ocr_reader_trigger_mode"] = trigger_mode
 
     await agent.tick(shared)
     status = await agent.query_status(shared)
@@ -9187,6 +10756,10 @@ async def test_game_llm_agent_pauses_when_ocr_target_window_is_not_foreground(
     assert status["agent_can_resume_by_button"] is False
     assert status["agent_can_resume_by_focus"] is True
     assert "切回游戏窗口后自动继续" in status["agent_pause_message"]
+    for message_part in expected_message_parts:
+        assert message_part in status["agent_pause_message"]
+    for message_part in unexpected_message_parts:
+        assert message_part not in status["agent_pause_message"]
     assert status["debug"]["target_window_not_foreground"] is True
     assert "已暂停 Agent 自动推进" in status["debug"]["target_window_diagnostic"]
 

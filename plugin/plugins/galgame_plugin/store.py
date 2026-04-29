@@ -16,6 +16,7 @@ from .models import (
     STORE_EVENTS_FILE_SIZE,
     STORE_LAST_ERROR,
     STORE_LAST_SEQ,
+    STORE_MEMORY_READER_TARGET,
     STORE_MODE,
     STORE_OCR_CAPTURE_PROFILES,
     STORE_OCR_WINDOW_TARGET,
@@ -240,6 +241,57 @@ class GalgameStore:
             return {}, warnings
         return normalized, warnings
 
+    @staticmethod
+    def _sanitize_memory_reader_target(raw_value: Any) -> tuple[dict[str, Any], list[str]]:
+        warnings: list[str] = []
+        if raw_value in ({}, None):
+            return {}, warnings
+        if not isinstance(raw_value, dict):
+            return {}, ["invalid memory_reader_target dropped: non-object"]
+
+        mode = str(raw_value.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "manual"}:
+            warnings.append("invalid memory_reader_target mode dropped: fallback to auto")
+            mode = "auto"
+
+        try:
+            pid = int(raw_value.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+            warnings.append("invalid memory_reader_target pid dropped: fallback to 0")
+        try:
+            create_time = float(raw_value.get("create_time") or 0.0)
+        except (TypeError, ValueError):
+            create_time = 0.0
+            warnings.append("invalid memory_reader_target create_time dropped: fallback to 0")
+
+        normalized = {
+            "mode": mode,
+            "process_key": str(raw_value.get("process_key") or "").strip(),
+            "process_name": str(raw_value.get("process_name") or "").strip(),
+            "exe_path": str(raw_value.get("exe_path") or "").strip(),
+            "pid": max(0, pid),
+            "engine": str(raw_value.get("engine") or raw_value.get("detected_engine") or "").strip().lower(),
+            "detected_engine": str(
+                raw_value.get("detected_engine") or raw_value.get("engine") or ""
+            ).strip().lower(),
+            "detection_reason": str(raw_value.get("detection_reason") or "").strip(),
+            "create_time": max(0.0, create_time),
+            "selected_at": str(raw_value.get("selected_at") or "").strip(),
+        }
+
+        if mode == "manual" and not any(
+            [
+                normalized["process_key"],
+                normalized["process_name"],
+                normalized["exe_path"],
+                normalized["pid"],
+            ]
+        ):
+            warnings.append("invalid memory_reader_target dropped: empty manual target")
+            return {}, warnings
+        return normalized, warnings
+
     def load(self) -> tuple[dict[str, Any], list[str]]:
         warnings: list[str] = []
         raw_mode = self._read(STORE_MODE, "")
@@ -294,6 +346,10 @@ class GalgameStore:
             self._read(STORE_OCR_WINDOW_TARGET, {})
         )
         warnings.extend(target_warnings)
+        memory_reader_target, memory_target_warnings = self._sanitize_memory_reader_target(
+            self._read(STORE_MEMORY_READER_TARGET, {})
+        )
+        warnings.extend(memory_target_warnings)
 
         restored = {
             STORE_BOUND_GAME_ID: self._read(STORE_BOUND_GAME_ID, ""),
@@ -308,6 +364,7 @@ class GalgameStore:
             STORE_LAST_ERROR: last_error,
             STORE_OCR_CAPTURE_PROFILES: ocr_capture_profiles,
             STORE_OCR_WINDOW_TARGET: ocr_window_target,
+            STORE_MEMORY_READER_TARGET: memory_reader_target,
         }
         if not isinstance(restored[STORE_BOUND_GAME_ID], str):
             warnings.append("invalid bound_game_id dropped: non-string")
@@ -376,6 +433,12 @@ class GalgameStore:
                 "selected_at": str(payload.get("selected_at") or ""),
             },
         )
+
+    def persist_memory_reader_target(self, target: dict[str, Any]) -> None:
+        payload, warnings = self._sanitize_memory_reader_target(target)
+        for warning in warnings:
+            self._logger.warning(warning)
+        self._write(STORE_MEMORY_READER_TARGET, payload)
 
     def clear_runtime(self) -> None:
         self.persist_runtime(
