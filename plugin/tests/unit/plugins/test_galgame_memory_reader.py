@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from plugin.plugins.galgame_plugin import memory_reader as galgame_memory_reader
 from plugin.plugins.galgame_plugin.memory_reader import (
     DetectedGameProcess,
     MemoryReaderBridgeWriter,
@@ -87,6 +90,38 @@ class _FakeTextractorHandle:
         return self.returncode
 
 
+class _FakePopenProcess:
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(b"")
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self) -> int:
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+class _CallableWinApi:
+    def __init__(self, func) -> None:
+        self._func = func
+        self.restype = None
+
+    def __call__(self, *args):
+        return self._func(*args)
+
+
 def _make_config(
     bridge_root: Path,
     *,
@@ -108,6 +143,67 @@ def _make_config(
             },
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_default_process_factory_uses_no_window_flag_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_popen(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _FakePopenProcess(*args, **kwargs)
+
+    monkeypatch.setattr(galgame_memory_reader.sys, "platform", "win32")
+    monkeypatch.setattr(
+        galgame_memory_reader.subprocess,
+        "CREATE_NO_WINDOW",
+        0x08000000,
+        raising=False,
+    )
+    monkeypatch.setattr(galgame_memory_reader.subprocess, "Popen", _fake_popen)
+
+    handle = await galgame_memory_reader._default_process_factory("TextractorCLI.exe")
+    await handle.terminate()
+    await handle.wait(timeout=0.1)
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["creationflags"] == 0x08000000
+
+
+def test_textractor_job_object_uses_kill_on_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class _Kernel32:
+        def __init__(self) -> None:
+            self.CreateJobObjectW = _CallableWinApi(lambda *_args: 456)
+            self.SetInformationJobObject = _CallableWinApi(self._set_info)
+            self.AssignProcessToJobObject = _CallableWinApi(self._assign)
+            self.CloseHandle = _CallableWinApi(lambda *args: calls.append(("close", args)) or 1)
+
+        def _set_info(self, *args):
+            calls.append(("set_info", args))
+            return 1
+
+        def _assign(self, *args):
+            calls.append(("assign", args))
+            return 1
+
+    process = SimpleNamespace(_handle=123)
+    monkeypatch.setattr(galgame_memory_reader.sys, "platform", "win32")
+    monkeypatch.setattr(
+        galgame_memory_reader.ctypes,
+        "windll",
+        SimpleNamespace(kernel32=_Kernel32()),
+        raising=False,
+    )
+
+    handle = galgame_memory_reader._create_kill_on_close_job_for_process(process)
+    assert handle == 456
+    assert [name for name, _args in calls] == ["set_info", "assign"]
 
 
 @pytest.mark.asyncio
@@ -307,6 +403,27 @@ def test_memory_reader_bridge_writer_emits_stable_bridge_schema_and_choice_ids(
     assert events[-1]["payload"]["choices"][0]["text"] == "去教室"
 
 
+def test_memory_line_id_collision_suffix_has_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(galgame_memory_reader, "_MEMORY_LINE_ID_MAX_COLLISION_SUFFIX", 2)
+    writer = MemoryReaderBridgeWriter(bridge_root=tmp_path)
+    text = "same normalized line"
+    normalized = galgame_memory_reader.normalize_text(text)
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+    widths = list(range(12, len(digest) + 1, 4))
+    if widths[-1] != len(digest):
+        widths.append(len(digest))
+    for width in widths:
+        writer._line_id_owner[f"mem:{digest[:width]}"] = "other"
+    for suffix in range(1, 3):
+        writer._line_id_owner[f"mem:{digest}#{suffix}"] = "other"
+
+    with pytest.raises(RuntimeError, match="collision limit"):
+        writer._line_id_for_text(text)
+
+
 @pytest.mark.asyncio
 async def test_memory_reader_manager_attaches_consumes_textractor_output_and_emits_heartbeat(
     tmp_path: Path,
@@ -371,6 +488,31 @@ async def test_memory_reader_manager_attaches_consumes_textractor_output_and_emi
 
     await manager.shutdown()
     assert handle.terminated is True
+
+
+@pytest.mark.asyncio
+async def test_textractor_stdout_reader_logs_regular_exception() -> None:
+    class _FailingStdout:
+        def readline(self):
+            raise RuntimeError("reader failed")
+
+    class _FakeProcess:
+        stdout = _FailingStdout()
+        stdin = None
+        returncode = 0
+
+    logger = _CapturingLogger()
+    handle = galgame_memory_reader._AsyncioTextractorHandle(
+        _FakeProcess(),
+        logger=logger,
+    )
+
+    assert await handle.readline(timeout=1.0) is None
+    assert any(
+        level == "warning"
+        and args[0] == "memory_reader Textractor stdout reader failed: {}"
+        for level, args in logger.messages
+    )
 
 
 @pytest.mark.asyncio
@@ -543,3 +685,27 @@ async def test_download_file_resumes_with_http_range(tmp_path: Path) -> None:
     assert result["resume_from"] == 4
     assert result["total_bytes"] == 10
     assert destination.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_download_file_rejects_sha256_mismatch(tmp_path: Path) -> None:
+    destination = tmp_path / "Textractor.zip"
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, content=b"bad archive")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    try:
+        with pytest.raises(RuntimeError, match="checksum mismatch"):
+            await _download_file(
+                client,
+                url="https://example.test/Textractor.zip",
+                destination=destination,
+                timeout_seconds=5.0,
+                expected_sha256="0" * 64,
+            )
+    finally:
+        await client.aclose()
+
+    assert not destination.exists()

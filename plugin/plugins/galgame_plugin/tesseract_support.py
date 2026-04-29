@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import os
 import shutil
@@ -17,11 +18,23 @@ from .memory_reader import is_windows_platform
 
 TESSERACT_EXECUTABLE = "tesseract.exe"
 DEFAULT_TESSERACT_LANGUAGES = "chi_sim+jpn+eng"
-DEFAULT_TESSDATA_BASE_URL = "https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main"
+DEFAULT_TESSDATA_COMMIT = "87416418657359cb625c412a48b6e1d6d41c29bd"
+DEFAULT_TESSDATA_BASE_URL = (
+    "https://cdn.jsdelivr.net/gh/tesseract-ocr/"
+    f"tessdata_fast@{DEFAULT_TESSDATA_COMMIT}"
+)
 DEFAULT_TESSERACT_INSTALLER_URL = (
     "https://ghproxy.com/https://github.com/UB-Mannheim/tesseract/"
     "releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
 )
+DEFAULT_TESSERACT_INSTALLER_SHA256 = (
+    "c885fff6998e0608ba4bb8ab51436e1c6775c2bafc2559a19b423e18678b60c9"
+)
+DEFAULT_TESSDATA_SHA256 = {
+    "chi_sim": "a5fcb6f0db1e1d6d8522f39db4e848f05984669172e584e8d76b6b3141e1f730",
+    "jpn": "1f5de9236d2e85f5fdf4b3c500f2d4926f8d9449f28f5394472d9e8d83b91b4d",
+    "eng": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+}
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
@@ -182,11 +195,22 @@ def inspect_tesseract_installation(
 
 def _default_install_manifest(languages: str) -> dict[str, Any]:
     required_languages = _required_languages(languages)
+    language_assets: list[dict[str, str]] = []
+    for language in required_languages:
+        asset = {
+            "name": f"{language}.traineddata",
+            "url": f"{DEFAULT_TESSDATA_BASE_URL}/{language}.traineddata",
+        }
+        sha256 = DEFAULT_TESSDATA_SHA256.get(language)
+        if sha256:
+            asset["sha256"] = sha256
+        language_assets.append(asset)
     return {
         "name": "Tesseract OCR for Windows",
         "installer": {
             "name": "tesseract-ocr-w64-setup-5.4.0.20240606.exe",
             "url": DEFAULT_TESSERACT_INSTALLER_URL,
+            "sha256": DEFAULT_TESSERACT_INSTALLER_SHA256,
             "silent_args": [
                 "/VERYSILENT",
                 "/SUPPRESSMSGBOXES",
@@ -194,13 +218,7 @@ def _default_install_manifest(languages: str) -> dict[str, Any]:
                 "/SP-",
             ],
         },
-        "languages": [
-            {
-                "name": f"{language}.traineddata",
-                "url": f"{DEFAULT_TESSDATA_BASE_URL}/{language}.traineddata",
-            }
-            for language in required_languages
-        ],
+        "languages": language_assets,
     }
 
 
@@ -254,6 +272,43 @@ def _extract_total_bytes(response: httpx.Response, *, resume_from: int) -> int:
     return 0
 
 
+def _normalize_sha256(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("sha256:"):
+        text = text.split(":", 1)[1].strip()
+    if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
+        return text
+    return ""
+
+
+def _asset_sha256(asset: dict[str, Any]) -> str:
+    for key in ("sha256", "digest", "checksum"):
+        digest = _normalize_sha256(asset.get(key))
+        if digest:
+            return digest
+    return ""
+
+
+def _verify_file_sha256(path: Path, expected_sha256: str) -> bool:
+    expected = _normalize_sha256(expected_sha256)
+    if not expected:
+        return False
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            hasher.update(chunk)
+    actual = hasher.hexdigest()
+    if actual != expected:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"downloaded file checksum mismatch for {path.name}: "
+            f"expected sha256 {expected}, got {actual}"
+        )
+    return True
+
+
 async def _download_file(
     client: httpx.AsyncClient,
     *,
@@ -267,6 +322,7 @@ async def _download_file(
     target_dir: str = "",
     asset_name: str = "",
     release_name: str = "",
+    expected_sha256: str = "",
 ) -> dict[str, int | bool]:
     async def _run_download(*, allow_resume: bool) -> dict[str, int | bool]:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -355,12 +411,16 @@ async def _download_file(
                         update_install_task_state(task_id, kind="tesseract", **chunk_progress)
                     await _emit_progress(progress_callback, chunk_progress)
 
-            return {
+            result = {
                 "downloaded_bytes": downloaded_bytes,
                 "total_bytes": total_bytes if total_bytes > 0 else downloaded_bytes,
                 "resume_from": resume_from,
                 "resumed": resumed,
+                "sha256_verified": False,
             }
+            if _normalize_sha256(expected_sha256):
+                result["sha256_verified"] = _verify_file_sha256(destination, expected_sha256)
+            return result
 
     return await _run_download(allow_resume=True)
 
@@ -541,6 +601,7 @@ async def install_tesseract(
                 target_dir=str(target_dir),
                 asset_name=installer_name,
                 release_name=release_name,
+                expected_sha256=_asset_sha256(installer_obj),
             )
 
             installing_progress = {
@@ -589,6 +650,7 @@ async def install_tesseract(
                     target_dir=str(target_dir),
                     asset_name=asset_name,
                     release_name=release_name,
+                    expected_sha256=_asset_sha256(language_asset),
                 )
 
             verifying_progress = {

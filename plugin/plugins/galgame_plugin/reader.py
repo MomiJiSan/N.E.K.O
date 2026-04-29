@@ -32,6 +32,8 @@ def expand_bridge_root(raw_path: str) -> Path:
         raise ValueError("bridge_root must be non-empty")
     if "://" in candidate:
         raise ValueError("bridge_root must be a local path")
+    if candidate.startswith(("\\\\", "//")):
+        raise ValueError("bridge_root must be a local path")
     expanded = os.path.expanduser(candidate)
     expanded = re.sub(
         r"%([^%]+)%",
@@ -39,7 +41,10 @@ def expand_bridge_root(raw_path: str) -> Path:
         expanded,
     )
     expanded = os.path.expandvars(expanded)
-    return Path(expanded)
+    path = Path(expanded)
+    if not path.is_absolute():
+        raise ValueError("bridge_root must be an absolute local path")
+    return path
 
 
 def normalize_text(value: str) -> str:
@@ -113,9 +118,13 @@ def tail_events_jsonl(
         return result
 
     result.file_size = file_size
-    if file_size == 0 or file_size < offset:
+    if file_size == 0:
         result.reset_detected = True
         result.line_buffer = b""
+        return result
+    if file_size < offset:
+        result.next_offset = offset
+        result.line_buffer = line_buffer
         return result
 
     try:

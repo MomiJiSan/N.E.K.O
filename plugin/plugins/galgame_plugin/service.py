@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
 import sys
@@ -26,6 +27,8 @@ from .models import (
     MODE_COMPANION,
     MODES,
     MODE_SILENT,
+    OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_STAGES,
     OCR_TRIGGER_MODE_INTERVAL,
     OCR_TRIGGER_MODE_AFTER_ADVANCE,
     OCR_TRIGGER_MODES,
@@ -44,6 +47,7 @@ from .models import (
     sanitize_choice,
     sanitize_metadata,
     sanitize_save_context,
+    sanitize_screen_ui_elements,
     sanitize_snapshot_state,
 )
 from .dxcam_support import inspect_dxcam_installation
@@ -62,6 +66,34 @@ from .textractor_support import (
 )
 
 _PERFORMANCE_PROCESS = None
+_PERFORMANCE_PROCESS_LOCK = threading.Lock()
+_INSTALL_INSPECT_CACHE_TTL_SECONDS = 2.0
+_INSTALL_INSPECT_CACHE_LOCK = threading.Lock()
+_INSTALL_INSPECT_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+
+
+def _cached_install_inspection(
+    key: tuple[Any, ...],
+    factory: Any,
+) -> dict[str, Any]:
+    now = time.monotonic()
+    with _INSTALL_INSPECT_CACHE_LOCK:
+        cached = _INSTALL_INSPECT_CACHE.get(key)
+        if cached is not None and now - cached[0] < _INSTALL_INSPECT_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1])
+    value = factory()
+    payload = copy.deepcopy(value if isinstance(value, dict) else {})
+    with _INSTALL_INSPECT_CACHE_LOCK:
+        _INSTALL_INSPECT_CACHE[key] = (now, payload)
+        if len(_INSTALL_INSPECT_CACHE) > 32:
+            for stale_key in list(_INSTALL_INSPECT_CACHE)[:-32]:
+                _INSTALL_INSPECT_CACHE.pop(stale_key, None)
+    return copy.deepcopy(payload)
+
+
+def clear_install_inspection_cache() -> None:
+    with _INSTALL_INSPECT_CACHE_LOCK:
+        _INSTALL_INSPECT_CACHE.clear()
 
 
 def _current_process_performance() -> dict[str, Any]:
@@ -79,44 +111,45 @@ def _current_process_performance() -> dict[str, Any]:
         }
 
     global _PERFORMANCE_PROCESS
-    try:
-        if _PERFORMANCE_PROCESS is None:
-            _PERFORMANCE_PROCESS = psutil.Process(os.getpid())
-            try:
-                _PERFORMANCE_PROCESS.cpu_percent(interval=None)
-            except Exception:
-                pass
-        process = _PERFORMANCE_PROCESS
-        with process.oneshot():
-            memory_info = process.memory_info()
-            try:
-                process_name = str(process.name() or "")
-            except Exception:
-                process_name = ""
+    with _PERFORMANCE_PROCESS_LOCK:
+        try:
+            if _PERFORMANCE_PROCESS is None:
+                _PERFORMANCE_PROCESS = psutil.Process(os.getpid())
+                try:
+                    _PERFORMANCE_PROCESS.cpu_percent(interval=None)
+                except Exception:
+                    pass
+            process = _PERFORMANCE_PROCESS
+            with process.oneshot():
+                memory_info = process.memory_info()
+                try:
+                    process_name = str(process.name() or "")
+                except Exception:
+                    process_name = ""
+                return {
+                    "available": True,
+                    "detail": "ok",
+                    "pid": int(process.pid),
+                    "process_name": process_name,
+                    "cpu_percent": round(float(process.cpu_percent(interval=None)), 2),
+                    "memory_mb": round(float(memory_info.rss) / (1024 * 1024), 2),
+                    "memory_percent": round(float(process.memory_percent()), 2),
+                    "thread_count": int(process.num_threads()),
+                    "sampled_at": time.time(),
+                }
+        except Exception as exc:
+            _PERFORMANCE_PROCESS = None
             return {
-                "available": True,
-                "detail": "ok",
-                "pid": int(process.pid),
-                "process_name": process_name,
-                "cpu_percent": round(float(process.cpu_percent(interval=None)), 2),
-                "memory_mb": round(float(memory_info.rss) / (1024 * 1024), 2),
-                "memory_percent": round(float(process.memory_percent()), 2),
-                "thread_count": int(process.num_threads()),
+                "available": False,
+                "detail": f"metrics_failed: {exc}",
+                "pid": os.getpid(),
+                "process_name": "",
+                "cpu_percent": 0.0,
+                "memory_mb": 0.0,
+                "memory_percent": 0.0,
+                "thread_count": threading.active_count(),
                 "sampled_at": time.time(),
             }
-    except Exception as exc:
-        _PERFORMANCE_PROCESS = None
-        return {
-            "available": False,
-            "detail": f"metrics_failed: {exc}",
-            "pid": os.getpid(),
-            "process_name": "",
-            "cpu_percent": 0.0,
-            "memory_mb": 0.0,
-            "memory_percent": 0.0,
-            "thread_count": threading.active_count(),
-            "sampled_at": time.time(),
-        }
 
 
 _OCR_OVERLAY_TEXT_GUARD_SUBSTRINGS = (
@@ -257,6 +290,148 @@ def _coerce_ocr_backend_selection(value: object, default: str = "auto") -> str:
     return default
 
 
+def _coerce_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, Iterable) and not isinstance(value, (dict, bytes, bytearray)):
+        items = list(value)
+    else:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        normalized = str(item or "").strip()
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def _sanitize_ocr_screen_template_regions(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    regions: list[dict[str, Any]] = []
+    for index, item in enumerate(value[:8]):
+        if not isinstance(item, dict):
+            continue
+        try:
+            left = float(item.get("left"))
+            top = float(item.get("top"))
+            right = float(item.get("right"))
+            bottom = float(item.get("bottom"))
+        except (TypeError, ValueError):
+            continue
+        left = max(0.0, min(left, 1.0))
+        top = max(0.0, min(top, 1.0))
+        right = max(0.0, min(right, 1.0))
+        bottom = max(0.0, min(bottom, 1.0))
+        if right <= left or bottom <= top:
+            continue
+        try:
+            min_overlap = float(item.get("min_overlap") or 0.35)
+        except (TypeError, ValueError):
+            min_overlap = 0.35
+        regions.append(
+            {
+                "id": str(item.get("id") or f"region-{index + 1}").strip()[:80],
+                "role": str(item.get("role") or item.get("kind") or "ui_region").strip()[:40],
+                "left": round(left, 4),
+                "top": round(top, 4),
+                "right": round(right, 4),
+                "bottom": round(bottom, 4),
+                "min_overlap": round(max(0.0, min(min_overlap, 1.0)), 3),
+            }
+        )
+    return regions
+
+
+def _sanitize_ocr_screen_templates(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    templates: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            continue
+        stage = str(item.get("stage") or item.get("screen_type") or "").strip().lower()
+        if stage not in OCR_CAPTURE_PROFILE_STAGES or stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+            continue
+        keywords = _coerce_string_list(item.get("keywords"))
+        exclude_keywords = _coerce_string_list(item.get("exclude_keywords"))
+        regions = _sanitize_ocr_screen_template_regions(item.get("regions"))
+        process_names = _coerce_string_list(item.get("process_names") or item.get("process_name"))
+        process_name_contains = _coerce_string_list(item.get("process_name_contains"))
+        window_title_contains = _coerce_string_list(item.get("window_title_contains"))
+        game_ids = _coerce_string_list(item.get("game_ids") or item.get("game_id"))
+        try:
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+        except (TypeError, ValueError):
+            width = 0
+            height = 0
+        if not any(
+            (
+                keywords,
+                regions,
+                process_names,
+                process_name_contains,
+                window_title_contains,
+                game_ids,
+                width > 0 and height > 0,
+            )
+        ):
+            continue
+        try:
+            priority = int(item.get("priority") or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        try:
+            min_keyword_hits = int(item.get("min_keyword_hits") or (1 if keywords else 0))
+        except (TypeError, ValueError):
+            min_keyword_hits = 1 if keywords else 0
+        template: dict[str, Any] = {
+            "id": str(item.get("id") or item.get("name") or f"template-{index + 1}").strip()[:80],
+            "stage": stage,
+            "priority": max(0, min(priority, 1000)),
+            "keywords": keywords,
+            "exclude_keywords": exclude_keywords,
+            "regions": regions,
+            "min_keyword_hits": max(0, min(min_keyword_hits, len(keywords) or min_keyword_hits)),
+            "process_names": process_names,
+            "process_name_contains": process_name_contains,
+            "window_title_contains": window_title_contains,
+            "game_ids": game_ids,
+        }
+        if width > 0 and height > 0:
+            template["width"] = width
+            template["height"] = height
+            try:
+                template["resolution_tolerance"] = max(
+                    0,
+                    min(int(item.get("resolution_tolerance") or 8), 200),
+                )
+            except (TypeError, ValueError):
+                template["resolution_tolerance"] = 8
+        match_without_keywords = item.get("match_without_keywords")
+        if isinstance(match_without_keywords, bool):
+            template["match_without_keywords"] = match_without_keywords
+        elif not keywords:
+            template["match_without_keywords"] = True
+        try:
+            min_region_hits = int(item.get("min_region_hits") or (1 if regions else 0))
+        except (TypeError, ValueError):
+            min_region_hits = 1 if regions else 0
+        if regions:
+            template["min_region_hits"] = max(0, min(min_region_hits, len(regions)))
+        templates.append(template)
+        if len(templates) >= 32:
+            break
+    return templates
+
+
 def _coerce_ocr_capture_backend(value: object, default: str = "auto") -> str:
     normalized = str(value or default).strip().lower()
     if normalized in {"auto", "dxcam", "imagegrab", "printwindow"}:
@@ -360,6 +535,10 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             llm_obj.get("llm_request_cache_ttl_seconds"), 2.0, minimum=0.0
         ),
         llm_target_entry_ref=str(llm_obj.get("target_entry_ref") or "").strip(),
+        llm_vision_enabled=_coerce_bool(llm_obj.get("vision_enabled"), False),
+        llm_vision_max_image_px=_coerce_int(
+            llm_obj.get("vision_max_image_px"), 768, minimum=64
+        ),
         reader_mode=_coerce_reader_mode(galgame_obj.get("reader_mode")),
         memory_reader_enabled=_coerce_bool(
             memory_reader_obj.get("enabled"),
@@ -435,6 +614,43 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             ocr_reader_obj.get("bottom_inset_ratio"),
             DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
             minimum=0.0,
+        ),
+        ocr_reader_screen_awareness_full_frame_ocr=_coerce_bool(
+            ocr_reader_obj.get("screen_awareness_full_frame_ocr"),
+            False,
+        ),
+        ocr_reader_screen_awareness_multi_region_ocr=_coerce_bool(
+            ocr_reader_obj.get("screen_awareness_multi_region_ocr"),
+            False,
+        ),
+        ocr_reader_screen_awareness_visual_rules=_coerce_bool(
+            ocr_reader_obj.get("screen_awareness_visual_rules"),
+            False,
+        ),
+        ocr_reader_screen_awareness_sample_collection_enabled=_coerce_bool(
+            ocr_reader_obj.get("screen_awareness_sample_collection_enabled"),
+            False,
+        ),
+        ocr_reader_screen_awareness_sample_dir=str(
+            ocr_reader_obj.get("screen_awareness_sample_dir") or ""
+        ).strip(),
+        ocr_reader_screen_awareness_model_enabled=_coerce_bool(
+            ocr_reader_obj.get("screen_awareness_model_enabled"),
+            False,
+        ),
+        ocr_reader_screen_awareness_model_path=str(
+            ocr_reader_obj.get("screen_awareness_model_path") or ""
+        ).strip(),
+        ocr_reader_screen_awareness_model_min_confidence=min(
+            0.99,
+            _coerce_float(
+                ocr_reader_obj.get("screen_awareness_model_min_confidence"),
+                0.55,
+                minimum=0.0,
+            ),
+        ),
+        ocr_reader_screen_templates=_sanitize_ocr_screen_templates(
+            ocr_reader_obj.get("screen_templates")
         ),
         rapidocr_enabled=_coerce_bool(
             rapidocr_obj.get("enabled"),
@@ -605,12 +821,6 @@ def choose_candidate(
             for item in candidates.values()
             if item.data_source == DATA_SOURCE_BRIDGE_SDK and _candidate_has_text(item)
         ]
-    if not preferred_candidates and normalized_reader_mode == READER_MODE_AUTO:
-        preferred_candidates = [
-            item
-            for item in candidates.values()
-            if item.data_source == DATA_SOURCE_BRIDGE_SDK and _candidate_has_text(item)
-        ]
         if not preferred_candidates:
             preferred_candidates = [
                 item
@@ -773,9 +983,27 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
     ocr_capture_diagnostic = _status_text(local_state.get("ocr_capture_diagnostic"))
     agent_pause_kind = _status_text(local_state.get("agent_pause_kind"))
     agent_user_status = _status_text(local_state.get("agent_user_status"))
+    rapidocr = local_state.get("rapidocr")
+    rapidocr_obj = rapidocr if isinstance(rapidocr, dict) else {}
+    should_offer_rapidocr_install = (
+        bool(local_state.get("rapidocr_enabled"))
+        and rapidocr_obj.get("installed") is False
+    )
+
+    def diagnosis(
+        severity: str,
+        title: str,
+        message: str,
+        actions: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        if should_offer_rapidocr_install and not any(
+            action.get("id") == "install_rapidocr" for action in actions
+        ):
+            actions = [_diagnosis_action("install_rapidocr", "一键安装 RapidOCR"), *actions]
+        return _primary_diagnosis(severity, title, message, actions)
 
     if last_error_message:
-        return _primary_diagnosis(
+        return diagnosis(
             "error",
             "插件运行出错",
             f"{last_error_message}。可以先刷新状态；如果仍然出现，请查看调试详情。",
@@ -786,7 +1014,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if detail == "memory_reader_window_minimized" or last_exclude_reason == "excluded_minimized_window":
-        return _primary_diagnosis(
+        return diagnosis(
             "warning",
             "游戏窗口已最小化",
             "检测到游戏窗口，但窗口已最小化，OCR 不能截图。请恢复游戏窗口后继续。",
@@ -797,7 +1025,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if context_state == "poll_not_running":
-        return _primary_diagnosis(
+        return diagnosis(
             "error",
             "OCR 轮询没有继续运行",
             ocr_capture_diagnostic or "OCR 轮询尚未完成首次截图，新台词不会继续刷新。",
@@ -808,7 +1036,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if context_state == "capture_failed" or last_capture_error:
-        return _primary_diagnosis(
+        return diagnosis(
             "error",
             "截图或文字识别失败",
             last_capture_error or "截图或识别后端返回错误，新台词不会更新。",
@@ -820,7 +1048,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if bool(runtime_obj.get("stale_capture_backend")) or context_state == "stale_capture_backend":
-        return _primary_diagnosis(
+        return diagnosis(
             "warning",
             "截图画面没有更新",
             "当前截图源可能停在旧画面。请切回游戏窗口，或切换截图方式后再试。",
@@ -836,7 +1064,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         or bool(local_state.get("ocr_capture_diagnostic_required"))
         or runtime_detail == "ocr_capture_diagnostic_required"
     ):
-        return _primary_diagnosis(
+        return diagnosis(
             "warning",
             "OCR 需要检查截图链路",
             ocr_capture_diagnostic or "OCR 截图或识别上下文不可用，请检查窗口、截图区域和截图方式。",
@@ -860,7 +1088,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
     if detail == "no_eligible_window" or (
         not has_effective_window and candidate_count == 0 and has_ocr_runtime_signal
     ):
-        return _primary_diagnosis(
+        return diagnosis(
             "warning",
             "没找到能识别的游戏窗口",
             "游戏可能未启动、被最小化，或当前窗口不是游戏。请确认游戏窗口可见后刷新。",
@@ -871,7 +1099,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if detail in {"foreground_window_needs_manual_confirmation", "auto_detect_needs_manual_fallback"}:
-        return _primary_diagnosis(
+        return diagnosis(
             "warning",
             "需要手动选择游戏窗口",
             "自动检测不够确定。手动选择一次可以避免识别到插件页面或其他窗口。",
@@ -887,7 +1115,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         or _line_text_from_status(effective_line_obj)
     )
     if observed_text and normalize_text(observed_text) != normalize_text(stable_text):
-        return _primary_diagnosis(
+        return diagnosis(
             "info",
             "刚读到新文字",
             "文字识别已经看到候选台词，正在确认这是不是同一句台词。",
@@ -897,7 +1125,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if agent_pause_kind == "window_not_foreground" or agent_user_status == "paused_window_not_foreground":
-        return _primary_diagnosis(
+        return diagnosis(
             "info",
             "游戏不在前台",
             "自动推进已暂停。切回游戏窗口后会继续，伴读信息仍会刷新。",
@@ -907,7 +1135,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if agent_pause_kind == "read_only" or agent_user_status == "read_only":
-        return _primary_diagnosis(
+        return diagnosis(
             "info",
             "当前是伴读模式",
             "会显示台词和建议，但不会自动点击。需要自动推进时请切换模式。",
@@ -926,7 +1154,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
             )
             if item
         )
-        return _primary_diagnosis(
+        return diagnosis(
             "ok",
             "正在识别台词",
             f"当前目标：{target}。已读到台词，页面会持续刷新。" if target else "已读到台词，页面会持续刷新。",
@@ -936,7 +1164,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         )
 
     summary = _status_text(local_state.get("summary"))
-    return _primary_diagnosis(
+    return diagnosis(
         "info",
         "等待游戏状态",
         summary or "暂时没有足够信息判断当前卡点。请先打开游戏，或刷新窗口列表。",
@@ -1049,6 +1277,28 @@ def apply_event_to_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> 
         next_snapshot["is_menu_open"] = bool(payload_obj.get("is_menu_open", next_snapshot["choices"]))
         next_snapshot["save_context"] = sanitize_save_context(payload_obj.get("save_context"))
         next_snapshot["stability"] = str(payload_obj.get("stability") or "")
+        next_snapshot["screen_type"] = str(payload_obj.get("screen_type") or "")
+        next_snapshot["screen_ui_elements"] = sanitize_screen_ui_elements(
+            payload_obj.get("screen_ui_elements")
+        )
+        try:
+            next_snapshot["screen_confidence"] = float(payload_obj.get("screen_confidence") or 0.0)
+        except (TypeError, ValueError):
+            next_snapshot["screen_confidence"] = 0.0
+        next_snapshot["screen_debug"] = sanitize_metadata(payload_obj.get("screen_debug"))
+        next_snapshot["ts"] = event_ts
+        return next_snapshot
+
+    if event_type == "screen_classified":
+        next_snapshot["screen_type"] = str(payload_obj.get("screen_type") or "")
+        next_snapshot["screen_ui_elements"] = sanitize_screen_ui_elements(
+            payload_obj.get("screen_ui_elements")
+        )
+        try:
+            next_snapshot["screen_confidence"] = float(payload_obj.get("screen_confidence") or 0.0)
+        except (TypeError, ValueError):
+            next_snapshot["screen_confidence"] = 0.0
+        next_snapshot["screen_debug"] = sanitize_metadata(payload_obj.get("screen_debug"))
         next_snapshot["ts"] = event_ts
         return next_snapshot
 
@@ -1262,22 +1512,50 @@ def build_status_payload(
             return value
         return json_copy(value)
 
-    dxcam = inspect_dxcam_installation()
-    textractor = inspect_textractor_installation(
-        configured_path=config.memory_reader_textractor_path,
-        install_target_dir_raw=config.memory_reader_install_target_dir,
+    dxcam = _cached_install_inspection(
+        ("dxcam",),
+        inspect_dxcam_installation,
     )
-    rapidocr = inspect_rapidocr_installation(
-        install_target_dir_raw=config.rapidocr_install_target_dir,
-        engine_type=config.rapidocr_engine_type,
-        lang_type=config.rapidocr_lang_type,
-        model_type=config.rapidocr_model_type,
-        ocr_version=config.rapidocr_ocr_version,
+    textractor = _cached_install_inspection(
+        (
+            "textractor",
+            config.memory_reader_textractor_path,
+            config.memory_reader_install_target_dir,
+        ),
+        lambda: inspect_textractor_installation(
+            configured_path=config.memory_reader_textractor_path,
+            install_target_dir_raw=config.memory_reader_install_target_dir,
+        ),
     )
-    tesseract = inspect_tesseract_installation(
-        configured_path=config.ocr_reader_tesseract_path,
-        install_target_dir_raw=config.ocr_reader_install_target_dir,
-        languages=config.ocr_reader_languages,
+    rapidocr = _cached_install_inspection(
+        (
+            "rapidocr",
+            config.rapidocr_install_target_dir,
+            config.rapidocr_engine_type,
+            config.rapidocr_lang_type,
+            config.rapidocr_model_type,
+            config.rapidocr_ocr_version,
+        ),
+        lambda: inspect_rapidocr_installation(
+            install_target_dir_raw=config.rapidocr_install_target_dir,
+            engine_type=config.rapidocr_engine_type,
+            lang_type=config.rapidocr_lang_type,
+            model_type=config.rapidocr_model_type,
+            ocr_version=config.rapidocr_ocr_version,
+        ),
+    )
+    tesseract = _cached_install_inspection(
+        (
+            "tesseract",
+            config.ocr_reader_tesseract_path,
+            config.ocr_reader_install_target_dir,
+            config.ocr_reader_languages,
+        ),
+        lambda: inspect_tesseract_installation(
+            configured_path=config.ocr_reader_tesseract_path,
+            install_target_dir_raw=config.ocr_reader_install_target_dir,
+            languages=config.ocr_reader_languages,
+        ),
     )
     ocr_runtime = copy_for_payload(state.ocr_reader_runtime)
     last_error = copy_for_payload(state.last_error)
@@ -1324,6 +1602,8 @@ def build_status_payload(
             "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
             "ocr_capture_diagnostic": ocr_capture_diagnostic,
             "ocr_reader_enabled": config.ocr_reader_enabled,
+            "rapidocr_enabled": config.rapidocr_enabled,
+            "rapidocr": rapidocr,
             "summary": summary,
         }
     )
@@ -1342,6 +1622,10 @@ def build_status_payload(
         "performance": _current_process_performance(),
         "memory_reader_runtime": copy_for_payload(state.memory_reader_runtime),
         "ocr_reader_runtime": ocr_runtime,
+        "screen_type": str(getattr(state, "screen_type", "") or ""),
+        "screen_ui_elements": copy_for_payload(getattr(state, "screen_ui_elements", [])),
+        "screen_confidence": float(getattr(state, "screen_confidence", 0.0) or 0.0),
+        "screen_debug": copy_for_payload(getattr(state, "screen_debug", {})),
         "effective_current_line": copy_for_payload(effective_current_line or {}),
         "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
         "ocr_capture_diagnostic": ocr_capture_diagnostic,
@@ -1356,6 +1640,22 @@ def build_status_payload(
         "ocr_capture_backend_selection": config.ocr_reader_capture_backend,
         "ocr_reader_poll_interval_seconds": config.ocr_reader_poll_interval_seconds,
         "ocr_reader_trigger_mode": config.ocr_reader_trigger_mode,
+        "llm_vision_enabled": config.llm_vision_enabled,
+        "llm_vision_max_image_px": config.llm_vision_max_image_px,
+        "ocr_screen_templates": copy_for_payload(config.ocr_reader_screen_templates),
+        "ocr_screen_template_count": len(config.ocr_reader_screen_templates),
+        "ocr_screen_awareness_full_frame_ocr": config.ocr_reader_screen_awareness_full_frame_ocr,
+        "ocr_screen_awareness_multi_region_ocr": config.ocr_reader_screen_awareness_multi_region_ocr,
+        "ocr_screen_awareness_visual_rules": config.ocr_reader_screen_awareness_visual_rules,
+        "ocr_screen_awareness_sample_collection_enabled": (
+            config.ocr_reader_screen_awareness_sample_collection_enabled
+        ),
+        "ocr_screen_awareness_sample_dir": config.ocr_reader_screen_awareness_sample_dir,
+        "ocr_screen_awareness_model_enabled": config.ocr_reader_screen_awareness_model_enabled,
+        "ocr_screen_awareness_model_path": config.ocr_reader_screen_awareness_model_path,
+        "ocr_screen_awareness_model_min_confidence": (
+            config.ocr_reader_screen_awareness_model_min_confidence
+        ),
         "rapidocr_enabled": config.rapidocr_enabled,
         "dxcam": dxcam,
         "rapidocr": rapidocr,
@@ -1428,6 +1728,16 @@ def build_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
         normalized.get("route_id", ""),
         bool(normalized.get("is_menu_open", False)),
         tuple(normalized.get("save_context", {}).items()),
+        normalized.get("screen_type", ""),
+        float(normalized.get("screen_confidence") or 0.0),
+        tuple(
+            (
+                str(item.get("text") or ""),
+                str(item.get("role") or ""),
+            )
+            for item in normalized.get("screen_ui_elements", [])
+        ),
+        repr(json_copy(normalized.get("screen_debug") or {})),
         choices,
     )
 

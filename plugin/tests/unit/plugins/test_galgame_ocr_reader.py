@@ -1,30 +1,62 @@
 from __future__ import annotations
 
+from dataclasses import fields
+import hashlib
+import json
 import sys
 import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
+from plugin.plugins.galgame_plugin import ocr_capture as galgame_ocr_capture
+from plugin.plugins.galgame_plugin import ocr_backends as galgame_ocr_backends
 from plugin.plugins.galgame_plugin import ocr_reader as galgame_ocr_reader
+from plugin.plugins.galgame_plugin import rapidocr_support as galgame_rapidocr_support
 from plugin.plugins.galgame_plugin.models import (
     DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO,
     DEFAULT_OCR_CAPTURE_TOP_RATIO,
+    OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+    OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+    OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
+    OCR_CAPTURE_PROFILE_STAGE_MENU,
+    OCR_CAPTURE_PROFILE_STAGE_MINIGAME,
+    OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+    OCR_CAPTURE_PROFILE_STAGE_TITLE,
+    OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
 )
 from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
     OcrCaptureProfile,
+    OcrExtractionResult,
     OcrReaderBridgeWriter,
     OcrReaderManager,
+    OcrReaderRuntime,
+    OcrTextBox,
     SelectedOcrBackendPlan,
     _rapidocr_text_from_output,
     _score_ocr_text,
 )
 from plugin.plugins.galgame_plugin.reader import read_session_json, tail_events_jsonl
+from plugin.plugins.galgame_plugin.screen_awareness_training import (
+    evaluate_screen_awareness_model,
+    train_screen_awareness_model,
+)
+from plugin.plugins.galgame_plugin.screen_classifier import (
+    ScreenClassification,
+    classify_screen_awareness_model,
+    classify_screen_from_ocr,
+    _layout_features,
+)
 from plugin.plugins.galgame_plugin.service import build_config
 from plugin.plugins.galgame_plugin.tesseract_support import (
     DEFAULT_TESSERACT_LANGUAGES,
+    _default_install_manifest,
+    _download_file as _download_tesseract_file,
     default_tesseract_install_target_raw,
     inspect_tesseract_installation,
     resolve_tesseract_install_target,
@@ -106,11 +138,23 @@ def _make_config(
     languages: str = DEFAULT_TESSERACT_LANGUAGES,
     rapidocr_enabled: bool = True,
     rapidocr_install_target_dir: str = "",
+    llm_vision_enabled: bool = False,
+    llm_vision_max_image_px: int = 768,
+    screen_templates: list[dict[str, object]] | None = None,
+    screen_awareness_sample_collection_enabled: bool = False,
+    screen_awareness_sample_dir: str = "",
+    screen_awareness_model_enabled: bool = False,
+    screen_awareness_model_path: str = "",
+    screen_awareness_model_min_confidence: float = 0.55,
 ) -> object:
     return build_config(
         {
             "galgame": {
                 "bridge_root": str(bridge_root),
+            },
+            "llm": {
+                "vision_enabled": llm_vision_enabled,
+                "vision_max_image_px": llm_vision_max_image_px,
             },
             "ocr_reader": {
                 "enabled": enabled,
@@ -120,6 +164,12 @@ def _make_config(
                 "poll_interval_seconds": poll_interval_seconds,
                 "no_text_takeover_after_seconds": no_text_takeover_after_seconds,
                 "languages": languages,
+                "screen_templates": list(screen_templates or []),
+                "screen_awareness_sample_collection_enabled": screen_awareness_sample_collection_enabled,
+                "screen_awareness_sample_dir": screen_awareness_sample_dir,
+                "screen_awareness_model_enabled": screen_awareness_model_enabled,
+                "screen_awareness_model_path": screen_awareness_model_path,
+                "screen_awareness_model_min_confidence": screen_awareness_model_min_confidence,
             },
             "rapidocr": {
                 "enabled": rapidocr_enabled,
@@ -158,6 +208,541 @@ def _window() -> list[DetectedGameWindow]:
             pid=4242,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("ocr_text", "expected_stage"),
+    [
+        ("Start Game\nContinue\nConfig\nExit", OCR_CAPTURE_PROFILE_STAGE_TITLE),
+        ("Save\nLoad\nPage 1\nSlot 01\nBack", OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD),
+        ("BGM Volume\nVoice Volume\nText Speed\nWindow Mode\nBack", OCR_CAPTURE_PROFILE_STAGE_CONFIG),
+        ("Gallery\nCG Mode\nScene Replay\nBack", OCR_CAPTURE_PROFILE_STAGE_GALLERY),
+        ("Mini Game\nScore\nCombo\nTime", OCR_CAPTURE_PROFILE_STAGE_MINIGAME),
+        ("Game Over\nRetry\nReturn to Title", OCR_CAPTURE_PROFILE_STAGE_GAME_OVER),
+        ("1. Save her.\n2. Leave.", OCR_CAPTURE_PROFILE_STAGE_MENU),
+        ("雪乃：今天也一起回家吧。", OCR_CAPTURE_PROFILE_STAGE_DIALOGUE),
+        ("", OCR_CAPTURE_PROFILE_STAGE_DEFAULT),
+    ],
+)
+def test_screen_classifier_recognizes_common_ocr_text(ocr_text: str, expected_stage: str) -> None:
+    classified = classify_screen_from_ocr(ocr_text)
+
+    assert classified.screen_type == expected_stage
+    if expected_stage == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+        assert classified.confidence == 0.0
+    else:
+        assert classified.confidence > 0.0
+
+
+def test_screen_classifier_prefers_matching_screen_template() -> None:
+    classified = classify_screen_from_ocr(
+        "Archive\nSpecial\nBack",
+        screen_templates=[
+            {
+                "id": "demo-gallery",
+                "stage": OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+                "process_names": ["DemoGame.exe"],
+                "keywords": ["Archive"],
+                "min_keyword_hits": 1,
+                "priority": 10,
+            }
+        ],
+        template_context={
+            "process_name": "DemoGame.exe",
+            "window_title": "Demo Window",
+            "width": 1280,
+            "height": 720,
+            "game_id": "demo",
+        },
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_GALLERY
+    assert classified.debug["reason"] == "screen_template"
+    assert classified.debug["template"]["id"] == "demo-gallery"
+
+
+def test_screen_classifier_matches_context_only_template_without_ocr_text() -> None:
+    classified = classify_screen_from_ocr(
+        "",
+        screen_templates=[
+            {
+                "id": "demo-title",
+                "stage": OCR_CAPTURE_PROFILE_STAGE_TITLE,
+                "process_names": ["DemoGame.exe"],
+                "width": 1280,
+                "height": 720,
+                "match_without_keywords": True,
+            }
+        ],
+        template_context={
+            "process_name": "DemoGame.exe",
+            "window_title": "Demo Window",
+            "width": 1280,
+            "height": 720,
+            "game_id": "demo",
+        },
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert classified.debug["reason"] == "screen_template"
+
+
+def test_screen_classifier_matches_template_region_against_ui_elements() -> None:
+    classified = classify_screen_from_ocr(
+        "Archive",
+        boxes=[
+            OcrTextBox(
+                text="Archive",
+                left=100.0,
+                top=100.0,
+                right=260.0,
+                bottom=150.0,
+            )
+        ],
+        bounds_metadata={
+            "source_size": {"width": 1000.0, "height": 500.0},
+            "capture_rect": {"left": 0.0, "top": 0.0, "right": 1000.0, "bottom": 500.0},
+        },
+        screen_templates=[
+            {
+                "id": "gallery-region",
+                "stage": OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+                "process_names": ["DemoGame.exe"],
+                "regions": [
+                    {
+                        "left": 0.08,
+                        "top": 0.16,
+                        "right": 0.30,
+                        "bottom": 0.34,
+                        "min_overlap": 0.4,
+                    }
+                ],
+                "min_region_hits": 1,
+            }
+        ],
+        template_context={"process_name": "DemoGame.exe"},
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_GALLERY
+    assert classified.debug["reason"] == "screen_template"
+    assert classified.debug["template"]["region_hits"] == 1
+
+
+def test_screen_awareness_model_predicts_from_visual_feature_prototype() -> None:
+    prediction = classify_screen_awareness_model(
+        {
+            "mean_luminance": 42.0,
+            "luminance_std": 8.0,
+            "texture_score": 3.0,
+        },
+        {
+            "prototypes": [
+                {
+                    "id": "dark-transition",
+                    "stage": OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+                    "features": {
+                        "mean_luminance": 40.0,
+                        "luminance_std": 10.0,
+                        "texture_score": 4.0,
+                    },
+                    "confidence": 0.9,
+                }
+            ]
+        },
+        min_confidence=0.55,
+    )
+
+    assert prediction is not None
+    assert prediction["stage"] == OCR_CAPTURE_PROFILE_STAGE_TRANSITION
+    assert prediction["confidence"] >= 0.55
+
+
+def test_screen_awareness_training_exports_model_and_evaluation_report(tmp_path: Path) -> None:
+    samples_path = tmp_path / "samples.jsonl"
+    output_path = tmp_path / "model.json"
+    report_path = tmp_path / "report.json"
+    records = [
+        {
+            "label": OCR_CAPTURE_PROFILE_STAGE_TITLE,
+            "visual_features": {"mean_luminance": 180 + index, "luminance_std": 45, "texture_score": 22},
+            "ocr_lines": ["Start", "Config"],
+            "screen_ui_elements": [{"text": "Start"}],
+        }
+        for index in range(3)
+    ] + [
+        {
+            "label": OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+            "visual_features": {"mean_luminance": 5 + index, "luminance_std": 2, "texture_score": 1},
+            "ocr_lines": [],
+            "screen_ui_elements": [],
+        }
+        for index in range(3)
+    ]
+    samples_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
+        encoding="utf-8",
+    )
+
+    trained = train_screen_awareness_model(
+        samples_path,
+        output_path,
+        validation_ratio=0.0,
+        min_samples_per_stage=2,
+    )
+    evaluated = evaluate_screen_awareness_model(
+        samples_path,
+        output_path,
+        report_path=report_path,
+    )
+
+    assert output_path.is_file()
+    assert report_path.is_file()
+    assert len(trained["model"]["prototypes"]) == 2
+    assert evaluated["evaluation"]["sample_count"] == 6
+    assert evaluated["evaluation"]["accuracy"] >= 0.8
+
+
+def test_screen_classifier_exports_limited_ui_elements_with_bounds() -> None:
+    boxes = [
+        OcrTextBox(
+            text=f"Start {index}",
+            left=index,
+            top=index + 1,
+            right=index + 20,
+            bottom=index + 10,
+        )
+        for index in range(12)
+    ]
+
+    classified = classify_screen_from_ocr(
+        "Start Game\nContinue\nConfig\nExit",
+        boxes=boxes,
+        bounds_metadata={
+            "bounds_coordinate_space": "capture",
+            "source_size": {"width": 1280.0, "height": 720.0},
+            "capture_rect": {"left": 0.0, "top": 0.0, "right": 1280.0, "bottom": 720.0},
+        },
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert len(classified.ui_elements) == 10
+    assert classified.ui_elements[0]["bounds"] == {
+        "left": 0.0,
+        "top": 1.0,
+        "right": 20.0,
+        "bottom": 10.0,
+    }
+    assert classified.ui_elements[0]["bounds_coordinate_space"] == "capture"
+    assert classified.ui_elements[0]["normalized_bounds"]["right"] == pytest.approx(20.0 / 1280.0)
+
+
+def test_layout_features_do_not_mix_normalized_and_raw_bounds() -> None:
+    layout = _layout_features(
+        [
+            {
+                "text": "Start",
+                "bounds": {"left": 100.0, "top": 100.0, "right": 220.0, "bottom": 140.0},
+                "normalized_bounds": {
+                    "left": 0.1,
+                    "top": 0.2,
+                    "right": 0.3,
+                    "bottom": 0.25,
+                },
+            },
+            {
+                "text": "Config",
+                "bounds": {"left": 110.0, "top": 180.0, "right": 230.0, "bottom": 220.0},
+            },
+            {
+                "text": "Exit",
+                "bounds": {"left": 120.0, "top": 260.0, "right": 240.0, "bottom": 300.0},
+            },
+        ]
+    )
+
+    assert layout["button_layout_score"] == 0.0
+
+    raw_layout = _layout_features(
+        [
+            {
+                "text": "Start",
+                "bounds": {"left": 100.0, "top": 100.0, "right": 220.0, "bottom": 140.0},
+            },
+            {
+                "text": "Config",
+                "bounds": {"left": 110.0, "top": 180.0, "right": 230.0, "bottom": 220.0},
+            },
+            {
+                "text": "Exit",
+                "bounds": {"left": 120.0, "top": 260.0, "right": 240.0, "bottom": 300.0},
+            },
+        ]
+    )
+
+    assert raw_layout["button_layout_score"] > 0.0
+
+
+def test_screen_classifier_merges_full_frame_ocr_regions() -> None:
+    boxes = [
+        OcrTextBox(
+            text="Start Game",
+            left=120.0,
+            top=220.0,
+            right=360.0,
+            bottom=260.0,
+            score=0.91,
+        )
+    ]
+
+    classified = classify_screen_from_ocr(
+        "",
+        ocr_regions=[
+            {
+                "source": "full_frame",
+                "text": "Start Game\nConfig\nExit",
+                "boxes": boxes,
+                "bounds_metadata": {
+                    "bounds_coordinate_space": "capture",
+                    "source_size": {"width": 1280.0, "height": 720.0},
+                    "capture_rect": {"left": 100.0, "top": 50.0, "right": 1380.0, "bottom": 770.0},
+                    "window_rect": {"left": 100.0, "top": 50.0, "right": 1380.0, "bottom": 770.0},
+                },
+            }
+        ],
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert classified.ui_elements[0]["text_source"] == "full_frame"
+    assert classified.ui_elements[0]["normalized_bounds"]["left"] == pytest.approx(120.0 / 1280.0)
+    assert classified.debug["sources"] == ["bottom_region", "full_frame"]
+
+
+def test_screen_classifier_detects_blank_visual_transition_without_ocr() -> None:
+    classified = classify_screen_from_ocr(
+        "",
+        visual_features={
+            "mean_luminance": 0.0,
+            "luminance_std": 0.0,
+            "texture_score": 0.0,
+        },
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_TRANSITION
+    assert classified.confidence >= 0.6
+    assert classified.debug["reason"] == "visual_blank_transition"
+
+
+def test_ocr_reader_manager_applies_screen_awareness_model_on_low_confidence(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    model_path = tmp_path / "screen-model.json"
+    model_path.write_text(
+        """
+        {
+          "prototypes": [
+            {
+              "id": "menu-dark",
+              "stage": "menu_stage",
+              "features": {
+                "mean_luminance": 80,
+                "luminance_std": 22,
+                "texture_score": 18
+              },
+              "confidence": 0.92
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            screen_awareness_model_enabled=True,
+            screen_awareness_model_path=str(model_path),
+            screen_awareness_model_min_confidence=0.55,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    extraction = OcrExtractionResult(
+        text="",
+        screen_visual_features={
+            "mean_luminance": 82.0,
+            "luminance_std": 21.0,
+            "texture_score": 17.0,
+        },
+    )
+
+    classified = manager._apply_screen_awareness_model(
+        extraction,
+        classification=ScreenClassification(),
+        target=_window()[0],
+    )
+
+    assert classified.screen_type == OCR_CAPTURE_PROFILE_STAGE_MENU
+    assert classified.debug["reason"] == "screen_awareness_model"
+    assert manager._screen_awareness_model_detail == "matched"
+
+
+def test_ocr_reader_manager_collects_desensitized_screen_awareness_sample(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    sample_dir = tmp_path / "samples"
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            screen_awareness_sample_collection_enabled=True,
+            screen_awareness_sample_dir=str(sample_dir),
+        ),
+        platform_fn=lambda: True,
+        window_scanner=_window,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+    extraction = OcrExtractionResult(
+        text="Start Game\nConfig",
+        screen_visual_features={"mean_luminance": 120.0},
+        screen_ocr_regions=[
+            {
+                "source": "full_frame",
+                "text": "Start Game\nConfig",
+                "ocr_confidence": 0.88,
+            }
+        ],
+    )
+
+    manager._collect_screen_awareness_sample(
+        extraction,
+        classification=ScreenClassification(
+            screen_type=OCR_CAPTURE_PROFILE_STAGE_TITLE,
+            confidence=0.8,
+            raw_ocr_text=["Start Game", "Config"],
+            debug={"reason": "title_keywords"},
+        ),
+        target=_window()[0],
+        now=3000.0,
+    )
+
+    sample_path = sample_dir / "samples.jsonl"
+    payload = sample_path.read_text(encoding="utf-8").strip()
+    assert '"screen_type":"title_stage"' in payload
+    assert '"visual_features":{"mean_luminance":120.0}' in payload
+    assert manager._screen_awareness_sample_count == 1
+
+
+def test_ocr_writer_emits_screen_classified_state_and_event(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    writer.start_session(_window()[0])
+    ui_elements = [
+        {
+            "element_id": f"button-{index}",
+            "text": f"Button {index}",
+            "bounds": {
+                "left": float(index),
+                "top": float(index + 1),
+                "right": float(index + 20),
+                "bottom": float(index + 10),
+            },
+        }
+        for index in range(12)
+    ]
+
+    assert writer.emit_screen_classified(
+        screen_type=OCR_CAPTURE_PROFILE_STAGE_TITLE,
+        confidence=0.86,
+        ui_elements=ui_elements,
+        raw_ocr_text=["Start Game", "Continue", "Config", "Exit"],
+        screen_debug={"reason": "title_keywords", "sources": ["full_frame"]},
+        ts="2026-04-29T03:00:00Z",
+    ) is True
+    assert writer.emit_screen_classified(
+        screen_type=OCR_CAPTURE_PROFILE_STAGE_TITLE,
+        confidence=0.86,
+        ui_elements=ui_elements,
+        raw_ocr_text=["Start Game", "Continue", "Config", "Exit"],
+        ts="2026-04-29T03:00:01Z",
+    ) is False
+
+    session = read_session_json(bridge_root / writer.game_id / "session.json")
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+
+    assert session.session is not None
+    assert session.session["state"]["screen_type"] == OCR_CAPTURE_PROFILE_STAGE_TITLE
+    assert session.session["state"]["screen_confidence"] == pytest.approx(0.86)
+    assert session.session["state"]["screen_debug"]["reason"] == "title_keywords"
+    assert len(session.session["state"]["screen_ui_elements"]) == 10
+    assert events[-1]["type"] == "screen_classified"
+    assert events[-1]["payload"]["screen_ui_elements"][0]["text"] == "Button 0"
+    assert events[-1]["payload"]["screen_debug"]["sources"] == ["full_frame"]
+
+
+def test_ocr_reader_manager_remembers_short_lived_vision_snapshot(tmp_path: Path) -> None:
+    from PIL import Image
+
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    clock = {"now": 1000.0}
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            llm_vision_enabled=True,
+            llm_vision_max_image_px=128,
+        ),
+        time_fn=lambda: clock["now"],
+        platform_fn=lambda: False,
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(),
+    )
+
+    manager._remember_vision_snapshot(
+        Image.new("RGB", (320, 160), color="white"),
+        source="full_frame",
+        now=clock["now"],
+    )
+    snapshot = manager.latest_vision_snapshot()
+
+    assert snapshot["vision_image_base64"].startswith("data:image/jpeg;base64,")
+    assert snapshot["width"] == 128
+    assert snapshot["height"] == 64
+    assert snapshot["byte_size"] > 0
+
+    clock["now"] += 9.0
+
+    assert manager.latest_vision_snapshot() == {}
+
+
+def test_ocr_writer_line_observed_includes_confidence_and_text_source(tmp_path: Path) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    writer = OcrReaderBridgeWriter(bridge_root=bridge_root, time_fn=lambda: 3000.0)
+    writer.start_session(_window()[0])
+
+    assert writer.emit_line_observed(
+        "雪乃：今天一起回家吗？",
+        ts="2026-04-29T03:00:00Z",
+        ocr_confidence=0.87,
+        text_source="bottom_region",
+    ) is True
+
+    events = _read_events(bridge_root / writer.game_id / "events.jsonl")
+    payload = events[-1]["payload"]
+    assert events[-1]["type"] == "line_observed"
+    assert payload["ocr_confidence"] == pytest.approx(0.87)
+    assert payload["speaker_confidence"] >= 0.9
+    assert payload["text_source"] == "bottom_region"
 
 
 def test_ocr_choices_emit_does_not_fall_through_to_dialogue(tmp_path: Path) -> None:
@@ -672,6 +1257,177 @@ def test_perceptual_hash_width_matches_requested_size() -> None:
 
     assert len(galgame_ocr_reader._perceptual_hash_image(image, size=4)) == 4
     assert len(galgame_ocr_reader._perceptual_hash_image(image, size=8)) == 16
+    assert len(galgame_ocr_capture._perceptual_hash_image(image, size=4)) == 4
+    assert len(galgame_ocr_capture._perceptual_hash_image(image, size=8)) == 16
+
+
+def test_ocr_compat_modules_reexport_reader_implementations() -> None:
+    assert galgame_ocr_capture.Win32CaptureBackend is galgame_ocr_reader.Win32CaptureBackend
+    assert galgame_ocr_capture._perceptual_hash_image is galgame_ocr_reader._perceptual_hash_image
+    assert galgame_ocr_capture.CAPTURE_BACKEND_AUTO == galgame_ocr_reader._CAPTURE_BACKEND_AUTO
+
+    assert galgame_ocr_backends.RapidOcrBackend is galgame_ocr_reader.RapidOcrBackend
+    assert galgame_ocr_backends.TesseractOcrBackend is galgame_ocr_reader.TesseractOcrBackend
+    assert galgame_ocr_backends._rapidocr_inference_lock() is galgame_ocr_reader._RAPIDOCR_INFERENCE_LOCK
+
+    assert galgame_ocr_capture.__getattr__("utc_now_iso") is galgame_ocr_reader.utc_now_iso
+    assert galgame_ocr_backends.__getattr__("_weighted_ocr_score") is galgame_ocr_reader._weighted_ocr_score
+    with pytest.raises(AttributeError):
+        galgame_ocr_capture.__getattr__("_missing_capture_symbol")
+    with pytest.raises(AttributeError):
+        galgame_ocr_backends.__getattr__("_missing_backend_symbol")
+
+    key = galgame_ocr_backends._rapidocr_runtime_cache_key(
+        install_target_dir_raw="compat-test",
+        engine_type="onnxruntime",
+        lang_type="japan",
+        model_type="mobile",
+        ocr_version="compat",
+    )
+    runtime = object()
+    now = time.monotonic()
+    galgame_ocr_backends._store_shared_rapidocr_runtime(key, runtime, now=now)
+
+    assert galgame_ocr_backends._shared_rapidocr_runtime(key, now=now) is runtime
+
+
+def test_ocr_line_id_collision_suffix_has_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(galgame_ocr_reader, "_OCR_LINE_ID_MAX_COLLISION_SUFFIX", 2)
+    writer = OcrReaderBridgeWriter(bridge_root=tmp_path)
+    text = "same normalized line"
+    normalized = galgame_ocr_reader.normalize_text(text)
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+    widths = list(range(12, len(digest) + 1, 4))
+    if widths[-1] != len(digest):
+        widths.append(len(digest))
+    for width in widths:
+        writer._line_id_owner[f"ocr:{digest[:width]}"] = "other"
+    for suffix in range(1, 3):
+        writer._line_id_owner[f"ocr:{digest}#{suffix}"] = "other"
+
+    with pytest.raises(RuntimeError, match="collision limit"):
+        writer._line_id_for_text(text)
+
+
+@pytest.mark.asyncio
+async def test_tesseract_download_file_verifies_sha256(tmp_path: Path) -> None:
+    content = b"tesseract payload"
+    destination = tmp_path / "tesseract.exe"
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            content=content,
+            headers={"Content-Length": str(len(content))},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    try:
+        result = await _download_tesseract_file(
+            client,
+            url="https://example.test/tesseract.exe",
+            destination=destination,
+            timeout_seconds=5.0,
+            expected_sha256=hashlib.sha256(content).hexdigest(),
+        )
+    finally:
+        await client.aclose()
+
+    assert result["sha256_verified"] is True
+    assert destination.read_bytes() == content
+
+
+def test_default_tesseract_install_manifest_includes_sha256() -> None:
+    manifest = _default_install_manifest(DEFAULT_TESSERACT_LANGUAGES)
+
+    assert manifest["installer"]["sha256"]
+    assert all(item.get("sha256") for item in manifest["languages"])
+    assert all("@main" not in item["url"] for item in manifest["languages"])
+
+
+def test_rapidocr_package_install_plan_includes_hash_args() -> None:
+    rapidocr_digest = "a" * 64
+    onnx_digest = "b" * 64
+
+    package_args, display_specs, require_hashes = (
+        galgame_rapidocr_support._rapidocr_package_install_plan(
+            [
+                {
+                    "name": "rapidocr",
+                    "spec": "rapidocr_onnxruntime==1.4.4",
+                    "sha256": rapidocr_digest,
+                },
+                {
+                    "name": "onnxruntime",
+                    "spec": "onnxruntime==1.17.3",
+                    "hashes": [f"sha256:{onnx_digest}"],
+                },
+            ]
+        )
+    )
+
+    assert display_specs == ["rapidocr_onnxruntime==1.4.4", "onnxruntime==1.17.3"]
+    assert package_args == [
+        "rapidocr_onnxruntime==1.4.4",
+        f"--hash=sha256:{rapidocr_digest}",
+        "onnxruntime==1.17.3",
+        f"--hash=sha256:{onnx_digest}",
+    ]
+    assert require_hashes is True
+
+
+def test_rapidocr_package_install_plan_rejects_partial_hash_manifest() -> None:
+    with pytest.raises(RuntimeError, match="sha256 hashes for every package"):
+        galgame_rapidocr_support._rapidocr_package_install_plan(
+            [
+                {
+                    "name": "rapidocr",
+                    "spec": "rapidocr_onnxruntime==1.4.4",
+                    "sha256": "a" * 64,
+                },
+                {
+                    "name": "onnxruntime",
+                    "spec": "onnxruntime==1.17.3",
+                },
+            ]
+        )
+
+
+def test_rapidocr_pip_install_uses_require_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    digest = "1" * 64
+
+    monkeypatch.setattr(
+        galgame_rapidocr_support,
+        "_ensure_pip_available",
+        lambda **kwargs: None,
+    )
+
+    def _capture_subprocess(command, *, timeout_seconds, env=None):
+        del timeout_seconds, env
+        commands.append(command)
+        return None
+
+    monkeypatch.setattr(galgame_rapidocr_support, "_run_subprocess", _capture_subprocess)
+
+    galgame_rapidocr_support._run_pip_install(
+        site_packages_dir=tmp_path / "runtime" / "site-packages",
+        packages=["rapidocr_onnxruntime==1.4.4", f"--hash=sha256:{digest}"],
+        timeout_seconds=5.0,
+        require_hashes=True,
+    )
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert command.index("--require-hashes") < command.index("rapidocr_onnxruntime==1.4.4")
+    assert command[-2:] == ["rapidocr_onnxruntime==1.4.4", f"--hash=sha256:{digest}"]
 
 
 def test_background_hash_excludes_bottom_dialogue_region() -> None:
@@ -763,6 +1519,36 @@ def test_win32_capture_backend_explicit_selection_falls_back_with_detail() -> No
     assert frame == "fallback-frame"
     assert backend.last_backend_kind == "dxcam"
     assert backend.last_backend_detail == "printwindow_unavailable_fallback"
+
+
+def test_dxcam_camera_creation_is_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    camera = object()
+    calls = 0
+
+    class _DxcamModule:
+        @staticmethod
+        def create(*, output_color: str):
+            nonlocal calls
+            assert output_color == "RGB"
+            calls += 1
+            time.sleep(0.05)
+            return camera
+
+    monkeypatch.setitem(sys.modules, "dxcam", _DxcamModule)
+    backend = galgame_ocr_reader.DxcamCaptureBackend()
+    results: list[object] = []
+
+    threads = [
+        threading.Thread(target=lambda: results.append(backend._camera_instance()))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert calls == 1
+    assert results == [camera, camera]
 
 
 def test_background_hash_scene_change_resets_no_text_counter_without_losing_scene(tmp_path: Path) -> None:
@@ -976,6 +1762,76 @@ def test_ocr_reader_starts_foreground_advance_monitor_for_real_runtime(
 
     assert started == [True]
     assert manager._runtime.foreground_advance_monitor_running is True
+
+
+def test_ocr_reader_runtime_groups_fields_and_keeps_flat_compatibility() -> None:
+    runtime = OcrReaderRuntime(
+        enabled=True,
+        status="active",
+        pid=1234,
+        capture_profile={"top_ratio": 0.5},
+        stable_ocr_repeat_count=2,
+        foreground_advance_consumed_count=4,
+        foreground_advance_matched_count=3,
+        foreground_advance_coalesced_count=2,
+        foreground_advance_last_event_age_seconds=0.25,
+    )
+
+    assert len(fields(OcrReaderRuntime)) == 9
+    assert runtime.status_state.enabled is True
+    assert runtime.enabled is True
+    assert runtime.window.pid == 1234
+    assert runtime.capture_profile == {"top_ratio": 0.5}
+    assert runtime.to_dict()["stable_ocr_repeat_count"] == 2
+    assert runtime.target.foreground_advance_coalesced_count == 2
+    assert runtime.to_dict()["foreground_advance_consumed_count"] == 4
+    assert runtime.to_dict()["foreground_advance_matched_count"] == 3
+    assert runtime.to_dict()["foreground_advance_coalesced_count"] == 2
+    assert runtime.to_dict()["foreground_advance_last_event_age_seconds"] == 0.25
+
+    restored = OcrReaderRuntime(**runtime.to_dict())
+
+    assert restored.foreground_advance_consumed_count == 4
+    assert restored.foreground_advance_matched_count == 3
+    assert restored.foreground_advance_coalesced_count == 2
+
+    runtime.status = "idle"
+
+    assert runtime.status_state.status == "idle"
+
+
+def test_ocr_reader_build_runtime_preserves_foreground_advance_diagnostics(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root, enabled=True),
+        platform_fn=lambda: False,
+        window_scanner=_window,
+    )
+    manager._runtime.foreground_advance_consumed_count = 4
+    manager._runtime.foreground_advance_matched_count = 3
+    manager._runtime.foreground_advance_coalesced_count = 2
+    manager._runtime.foreground_advance_first_event_ts = 100.0
+    manager._runtime.foreground_advance_last_event_ts = 100.2
+    manager._runtime.foreground_advance_detected_at = 100.5
+    manager._runtime.foreground_advance_last_event_age_seconds = 0.3
+
+    rebuilt = manager._build_runtime(
+        status="active",
+        detail="",
+        plan=SelectedOcrBackendPlan(),
+    )
+
+    assert rebuilt.foreground_advance_consumed_count == 4
+    assert rebuilt.foreground_advance_matched_count == 3
+    assert rebuilt.foreground_advance_coalesced_count == 2
+    assert rebuilt.foreground_advance_first_event_ts == 100.0
+    assert rebuilt.foreground_advance_last_event_ts == 100.2
+    assert rebuilt.foreground_advance_detected_at == 100.5
+    assert abs(rebuilt.foreground_advance_last_event_age_seconds - 0.3) < 1e-6
 
 
 @pytest.mark.asyncio

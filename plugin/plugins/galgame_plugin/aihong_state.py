@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import re
 
-from .models import OCR_CAPTURE_PROFILE_STAGE_DIALOGUE, OCR_CAPTURE_PROFILE_STAGE_MENU
+from .models import (
+    MENU_PREFIX_RE as _MENU_PREFIX_RE,
+    OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    OCR_CAPTURE_PROFILE_STAGE_MENU,
+)
 from .reader import normalize_text
 
 AIHONG_PROCESS_NAMES = frozenset({"thelamentinggeese.exe"})
@@ -47,7 +51,6 @@ AIHONG_MENU_DIALOGUE_MARKERS = (
 )
 
 _AIHONG_MENU_AMOUNT_RE = re.compile(r"^\s*\d+\s*两\S{0,3}\s*$")
-_MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
 _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
 
 

@@ -83,6 +83,31 @@ def registered_galgame_plugin_meta(galgame_plugin_dir: Path) -> Iterator[None]:
             state.plugins.update(plugins_backup)
 
 
+def _running_install_run(
+    run_id: str,
+    *,
+    entry_id: str,
+    stage: str,
+    message: str,
+    now: float | None = None,
+) -> RunRecord:
+    now = time.time() if now is None else now
+    return RunRecord(
+        run_id=run_id,
+        plugin_id="galgame_plugin",
+        entry_id=entry_id,
+        status="running",
+        created_at=now - 5,
+        updated_at=now,
+        started_at=now - 4,
+        finished_at=None,
+        stage=stage,
+        message=message,
+        error=None,
+        metrics={},
+    )
+
+
 @pytest.mark.asyncio
 async def test_galgame_plugin_ui_index_route_serves_static_dashboard(
     plugin_ui_async_client: AsyncClient,
@@ -312,6 +337,7 @@ async def test_galgame_plugin_textractor_install_status_route_reads_persisted_st
     plugin_ui_async_client: AsyncClient,
     registered_galgame_plugin_meta,
     galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_task_module.update_install_task_state(
         "run-textractor-2",
@@ -324,6 +350,17 @@ async def test_galgame_plugin_textractor_install_status_route_reads_persisted_st
         total_bytes=100,
         asset_name="Textractor-x64.zip",
     )
+
+    def _fake_get_run(run_id: str) -> RunRecord:
+        assert run_id == "run-textractor-2"
+        return _running_install_run(
+            run_id,
+            entry_id="galgame_install_textractor",
+            stage="downloading",
+            message="Downloading Textractor-x64.zip",
+        )
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "get_run", _fake_get_run)
 
     response = await plugin_ui_async_client.get(
         "/plugin/galgame_plugin/ui-api/textractor/install/run-textractor-2"
@@ -342,6 +379,7 @@ async def test_galgame_plugin_rapidocr_install_status_route_reads_persisted_stat
     plugin_ui_async_client: AsyncClient,
     registered_galgame_plugin_meta,
     galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_task_module.update_install_task_state(
         "run-rapidocr-2",
@@ -353,6 +391,17 @@ async def test_galgame_plugin_rapidocr_install_status_route_reads_persisted_stat
         progress=0.55,
         asset_name="rapidocr_onnxruntime, onnxruntime",
     )
+
+    def _fake_get_run(run_id: str) -> RunRecord:
+        assert run_id == "run-rapidocr-2"
+        return _running_install_run(
+            run_id,
+            entry_id="galgame_install_rapidocr",
+            stage="installing",
+            message="Installing rapidocr_onnxruntime",
+        )
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "get_run", _fake_get_run)
 
     response = await plugin_ui_async_client.get(
         "/plugin/galgame_plugin/ui-api/rapidocr/install/run-rapidocr-2"
@@ -370,6 +419,7 @@ async def test_galgame_plugin_tesseract_install_status_route_reads_persisted_sta
     plugin_ui_async_client: AsyncClient,
     registered_galgame_plugin_meta,
     galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_task_module.update_install_task_state(
         "run-tesseract-2",
@@ -383,6 +433,17 @@ async def test_galgame_plugin_tesseract_install_status_route_reads_persisted_sta
         total_bytes=100,
         asset_name="jpn.traineddata",
     )
+
+    def _fake_get_run(run_id: str) -> RunRecord:
+        assert run_id == "run-tesseract-2"
+        return _running_install_run(
+            run_id,
+            entry_id="galgame_install_tesseract",
+            stage="languages",
+            message="Downloading jpn.traineddata",
+        )
+
+    monkeypatch.setattr(plugin_ui_route_module.run_service, "get_run", _fake_get_run)
 
     response = await plugin_ui_async_client.get(
         "/plugin/galgame_plugin/ui-api/tesseract/install/run-tesseract-2"

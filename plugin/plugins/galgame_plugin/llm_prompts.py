@@ -3,9 +3,55 @@ from __future__ import annotations
 import json
 from typing import Any
 
+_PROMPT_CONTEXT_MAX_CHARS = 12000
+
 
 def _json_dump(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _compact_prompt_value(value: Any, *, list_limit: int, string_limit: int) -> Any:
+    if isinstance(value, str):
+        if len(value) <= string_limit:
+            return value
+        omitted = len(value) - string_limit
+        return f"{value[:string_limit]}\n...[truncated {omitted} chars]"
+    if isinstance(value, list):
+        items = value[-list_limit:] if len(value) > list_limit else value
+        return [
+            _compact_prompt_value(item, list_limit=list_limit, string_limit=string_limit)
+            for item in items
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key): _compact_prompt_value(item, list_limit=list_limit, string_limit=string_limit)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _context_json_for_prompt(context: dict[str, Any]) -> str:
+    raw = _json_dump(context)
+    if len(raw) <= _PROMPT_CONTEXT_MAX_CHARS:
+        return raw
+    for list_limit, string_limit in ((16, 1000), (8, 500), (4, 240)):
+        compact = _compact_prompt_value(
+            context,
+            list_limit=list_limit,
+            string_limit=string_limit,
+        )
+        if isinstance(compact, dict):
+            compact = {"_prompt_truncated": True, **compact}
+        rendered = _json_dump(compact)
+        if len(rendered) <= _PROMPT_CONTEXT_MAX_CHARS:
+            return rendered
+    excerpt = raw[: max(0, _PROMPT_CONTEXT_MAX_CHARS - 200)]
+    return _json_dump(
+        {
+            "_prompt_truncated": True,
+            "context_excerpt": f"{excerpt}\n...[truncated {len(raw) - len(excerpt)} chars]",
+        }
+    )
 
 
 _EXPLAIN_LINE_EXAMPLE = {
@@ -131,7 +177,7 @@ def build_prompt_messages(operation: str, context: dict[str, Any]) -> list[dict[
         _USER_PROMPT_PREFIXES[operation]
         + f"{_json_dump(_EXAMPLES[operation])}\n\n"
         + "context:\n"
-        + f"{_json_dump(context)}"
+        + _context_json_for_prompt(context)
     )
     return [
         {"role": "system", "content": system_prompt},

@@ -6,6 +6,12 @@ const DXCAM_INSTALL_URL = `${UI_API_BASE}/dxcam/install`;
 const TESSERACT_INSTALL_URL = `${UI_API_BASE}/tesseract/install`;
 const TEXTRACTOR_INSTALL_URL = `${UI_API_BASE}/textractor/install`;
 const INSTALL_TERMINAL_STATUSES = new Set(['completed', 'failed', 'canceled']);
+const SCROLL_BOTTOM_THRESHOLD = 8;
+const FLASH_AUTO_HIDE_MS = 4000;
+const SETTINGS_AUTOSAVE_DELAY_MS = 700;
+const PLUGIN_RUN_TIMEOUT_MS = 120000;
+const PLUGIN_RUN_INITIAL_POLL_MS = 250;
+const PLUGIN_RUN_MAX_POLL_MS = 2000;
 
 const INSTALL_UI = {
   rapidocr: {
@@ -91,6 +97,13 @@ const OCR_PROFILE_STAGE_LABELS_ZH = {
   default: '通用区域',
   dialogue_stage: '对白区',
   menu_stage: '菜单区',
+  title_stage: '标题/主菜单',
+  save_load_stage: '存读档',
+  config_stage: '设置',
+  transition_stage: '转场',
+  gallery_stage: '回想/鉴赏',
+  minigame_stage: '小游戏',
+  game_over_stage: 'Game Over',
 };
 const OCR_CAPTURE_SAVE_SCOPE_LABELS_ZH = {
   window_bucket: '当前窗口分辨率',
@@ -276,6 +289,7 @@ const AGENT_USER_STATUS_LABELS_ZH = {
   read_only: '只读伴读',
   paused_by_user: '用户待机',
   paused_window_not_foreground: '游戏窗口未前台',
+  screen_safety_pause: '安全暂停',
   ocr_unavailable: 'OCR 不可用',
   waiting_choice: '等待/处理选项',
   acting: '正在操作',
@@ -307,6 +321,13 @@ let autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
 let activeInstallTab = 'rapidocr';
 let settingsDirty = false;
 let settingsSaveInFlight = false;
+let settingsAutosaveTimer = null;
+let flashTimer = null;
+let flashToken = 0;
+let ocrScreenTemplatesUndoValue = '';
+let ocrRegionSnapshot = null;
+let ocrRegionSelection = null;
+let ocrRegionDragStart = null;
 
 const SETTINGS_CONTROL_IDS = new Set([
   'modeSelect',
@@ -315,6 +336,8 @@ const SETTINGS_CONTROL_IDS = new Set([
   'readerModeSelect',
   'ocrPollIntervalInput',
   'ocrTriggerModeSelect',
+  'llmVisionToggle',
+  'llmVisionMaxImagePxInput',
 ]);
 
 const latestInsights = {
@@ -404,9 +427,11 @@ async function exportRunResult(runId) {
 
 async function callPlugin(entryId, args = {}) {
   const runId = await createRun(entryId, args);
-  const deadline = Date.now() + 120000;
+  const deadline = Date.now() + PLUGIN_RUN_TIMEOUT_MS;
+  let pollDelay = PLUGIN_RUN_INITIAL_POLL_MS;
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, pollDelay));
+    pollDelay = Math.min(Math.round(pollDelay * 1.5), PLUGIN_RUN_MAX_POLL_MS);
     const pollResp = await fetch(`${RUNS_URL}/${runId}`);
     if (!pollResp.ok) {
       continue;
@@ -448,9 +473,61 @@ function escapeHtml(text) {
 
 function setFlash(message, type = 'info') {
   const node = document.getElementById('flashMessage');
+  flashToken += 1;
+  const token = flashToken;
+  if (flashTimer) {
+    clearTimeout(flashTimer);
+    flashTimer = null;
+  }
   node.hidden = !message;
   node.textContent = message || '';
   node.className = `flash-message ${type}`;
+  if (message && ['success', 'info'].includes(type)) {
+    flashTimer = window.setTimeout(() => {
+      if (flashToken !== token) {
+        return;
+      }
+      node.hidden = true;
+      node.textContent = '';
+      flashTimer = null;
+    }, FLASH_AUTO_HIDE_MS);
+  }
+}
+
+function updateSettingsDirtyHint(message = '') {
+  const hint = document.getElementById('settingsDirtyHint');
+  if (!hint) {
+    return;
+  }
+  if (settingsSaveInFlight) {
+    hint.hidden = false;
+    hint.textContent = message || '正在保存...';
+    return;
+  }
+  hint.hidden = !settingsDirty;
+  hint.textContent = message || '有未保存设置';
+}
+
+function shouldOfferRapidOcrInstall(status = {}) {
+  const rapidocr = status.rapidocr || {};
+  return Boolean(status.rapidocr_enabled) && rapidocr.installed !== true;
+}
+
+function withRapidOcrInstallAction(diagnosis, status = {}) {
+  if (!diagnosis || !shouldOfferRapidOcrInstall(status)) {
+    return diagnosis;
+  }
+  const actions = Array.isArray(diagnosis.actions) ? diagnosis.actions : [];
+  if (actions.some((action) => action && action.id === 'install_rapidocr')) {
+    return diagnosis;
+  }
+  return {
+    ...diagnosis,
+    actions: [
+      { id: 'install_rapidocr', label: '一键安装 RapidOCR' },
+      ...actions,
+    ],
+  };
 }
 
 function textValue(value) {
@@ -536,8 +613,9 @@ function normalizePrimaryDiagnosis(diagnosis) {
 function buildPrimaryDiagnosis(status = {}) {
   const backendDiagnosis = normalizePrimaryDiagnosis(status.primary_diagnosis);
   if (backendDiagnosis) {
-    return backendDiagnosis;
+    return withRapidOcrInstallAction(backendDiagnosis, status);
   }
+  const diagnose = (diagnosis) => withRapidOcrInstallAction(diagnosis, status);
 
   const runtime = status.ocr_reader_runtime || {};
   const detail = textValue(runtime.target_selection_detail);
@@ -562,7 +640,7 @@ function buildPrimaryDiagnosis(status = {}) {
   );
 
   if (lastError) {
-    return {
+    return diagnose({
       severity: 'error',
       title: '插件运行出错',
       body: `${lastError}。可以先刷新状态；如果仍然出现，请查看调试详情。`,
@@ -570,11 +648,11 @@ function buildPrimaryDiagnosis(status = {}) {
         { id: 'refresh_all', label: '刷新全部' },
         { id: 'debug_details', label: '查看调试详情' },
       ],
-    };
+    });
   }
 
   if (detail === 'memory_reader_window_minimized' || lastExcludeReason === 'excluded_minimized_window') {
-    return {
+    return diagnose({
       severity: 'warning',
       title: '游戏窗口最小化了',
       body: '检测到游戏，但窗口最小化，文字识别不能截图。请恢复游戏窗口后继续。',
@@ -582,11 +660,11 @@ function buildPrimaryDiagnosis(status = {}) {
         { id: 'refresh_ocr_windows', label: '我已恢复，刷新窗口' },
         { id: 'select_ocr_window', label: '选择游戏窗口' },
       ],
-    };
+    });
   }
 
   if (contextState === 'capture_failed' || lastCaptureError) {
-    return {
+    return diagnose({
       severity: 'error',
       title: '截图或文字识别失败',
       body: lastCaptureError || '截图或识别后端返回错误，新台词不会更新。',
@@ -595,11 +673,11 @@ function buildPrimaryDiagnosis(status = {}) {
         { id: 'capture_backend', label: '切换截图方式' },
         { id: 'debug_details', label: '查看调试详情' },
       ],
-    };
+    });
   }
 
   if (runtime.stale_capture_backend) {
-    return {
+    return diagnose({
       severity: 'warning',
       title: '截图画面没有更新',
       body: '当前截图源可能停在旧画面。请切回游戏窗口，或切换截图方式后再试。',
@@ -608,14 +686,14 @@ function buildPrimaryDiagnosis(status = {}) {
         { id: 'capture_backend', label: '切换 DXcam' },
         { id: 'refresh_ocr_windows', label: '刷新窗口' },
       ],
-    };
+    });
   }
 
   if (
     detail === 'no_eligible_window'
     || (!hasEffectiveWindow && candidateCount === 0 && hasOcrRuntimeSignal)
   ) {
-    return {
+    return diagnose({
       severity: 'warning',
       title: '没找到能识别的游戏窗口',
       body: '游戏可能未启动、被最小化，或当前窗口不是游戏。请确认游戏窗口可见后刷新。',
@@ -623,11 +701,11 @@ function buildPrimaryDiagnosis(status = {}) {
         { id: 'refresh_ocr_windows', label: '刷新窗口' },
         { id: 'select_ocr_window', label: '选择游戏窗口' },
       ],
-    };
+    });
   }
 
   if (detail === 'foreground_window_needs_manual_confirmation' || detail === 'auto_detect_needs_manual_fallback') {
-    return {
+    return diagnose({
       severity: 'warning',
       title: '需要手动选择游戏窗口',
       body: '自动检测不够确定。手动选择一次可以避免识别到插件页面或其他窗口。',
@@ -635,55 +713,55 @@ function buildPrimaryDiagnosis(status = {}) {
         { id: 'select_ocr_window', label: '选择游戏窗口' },
         { id: 'refresh_ocr_windows', label: '刷新窗口' },
       ],
-    };
+    });
   }
 
   if (observedKey && observedKey !== stableKey) {
-    return {
+    return diagnose({
       severity: 'info',
       title: '刚读到新文字',
       body: '文字识别已经看到候选台词，正在确认这是不是同一句台词。',
       actions: [
         { id: 'line_details', label: '查看识别详情' },
       ],
-    };
+    });
   }
 
   if (agentPauseKind === 'window_not_foreground' || agentUserStatus === 'paused_window_not_foreground') {
-    return {
+    return diagnose({
       severity: 'info',
       title: '游戏不在前台',
       body: '自动推进已暂停。切回游戏窗口后会继续，伴读信息仍会刷新。',
       actions: [
         { id: 'focus_game', label: '切回游戏窗口' },
       ],
-    };
+    });
   }
 
   if (agentPauseKind === 'read_only' || agentUserStatus === 'read_only') {
-    return {
+    return diagnose({
       severity: 'info',
       title: '当前是伴读模式',
       body: '会显示台词和建议，但不会自动点击。需要自动推进时请切换模式。',
       actions: [
         { id: 'choice_advisor', label: '切换到自动推进模式' },
       ],
-    };
+    });
   }
 
   if (effectiveText || stableText) {
     const target = formatOcrTargetForUser(status);
-    return {
+    return diagnose({
       severity: 'ok',
       title: '正在识别台词',
       body: target ? `当前目标：${target}。已读到台词，页面会持续刷新。` : '已读到台词，页面会持续刷新。',
       actions: [
         { id: 'refresh_all', label: '刷新全部' },
       ],
-    };
+    });
   }
 
-  return {
+  return diagnose({
     severity: 'info',
     title: '等待游戏状态',
     body: status.summary || '暂时没有足够信息判断当前卡点。请先打开游戏，或刷新窗口列表。',
@@ -691,7 +769,7 @@ function buildPrimaryDiagnosis(status = {}) {
       { id: 'refresh_all', label: '刷新全部' },
       { id: 'select_ocr_window', label: '选择游戏窗口' },
     ],
-  };
+  });
 }
 
 function renderPrimaryDiagnosis(status = {}) {
@@ -891,10 +969,6 @@ function buildOcrPipelineSteps(status = {}) {
   const stableKey = compactLineText(displayStable);
   const hasObservedMismatch = Boolean(observedKey && observedKey !== stableKey);
   const blockReason = formatStableBlockReason(runtime.stable_ocr_block_reason);
-  const targetName = [
-    textValue(runtime.effective_process_name || runtime.process_name),
-    textValue(runtime.effective_window_title || runtime.window_title),
-  ].filter(Boolean).join(' / ');
   const captureBackend = textValue(runtime.capture_backend_kind || status.ocr_capture_backend_selection || 'auto');
   const ocrBackend = textValue(runtime.backend_kind || status.ocr_backend_selection || 'auto');
 
@@ -902,7 +976,7 @@ function buildOcrPipelineSteps(status = {}) {
     key: 'window',
     state: 'info',
     title: '等待游戏窗口',
-    body: '请打开游戏，或点击“选择游戏窗口”。',
+    body: '等待目标窗口进入可识别状态。',
     meta: detail ? formatOcrWindowSelectionDetail(detail) : '',
   };
   if (detail === 'memory_reader_window_minimized' || lastExcludeReason === 'excluded_minimized_window') {
@@ -910,7 +984,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'window',
       state: 'warning',
       title: '游戏窗口最小化',
-      body: 'OCR 不能截取最小化窗口。',
+      body: '窗口阶段需要处理。',
       meta: formatOcrWindowReason(lastExcludeReason || 'excluded_minimized_window'),
     };
   } else if (textValue(runtime.effective_window_key)) {
@@ -918,7 +992,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'window',
       state: 'ok',
       title: '已确认游戏窗口',
-      body: targetName || '已找到可用 OCR 目标窗口。',
+      body: '窗口阶段正常。',
       meta: runtime.target_is_foreground ? '前台窗口' : '非前台窗口',
     };
   } else if (Number(runtime.candidate_count || 0) > 0) {
@@ -926,7 +1000,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'window',
       state: 'info',
       title: '发现候选窗口',
-      body: `发现 ${Number(runtime.candidate_count || 0)} 个候选窗口。`,
+      body: '窗口阶段等待确认。',
       meta: '需要时可手动选择',
     };
   } else if (detail === 'no_eligible_window' || Object.prototype.hasOwnProperty.call(runtime, 'candidate_count')) {
@@ -934,7 +1008,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'window',
       state: 'warning',
       title: '没有可识别窗口',
-      body: '游戏可能未启动、被最小化，或当前窗口不是游戏。',
+      body: '窗口阶段需要处理。',
       meta: formatOcrWindowSelectionDetail(detail),
     };
   }
@@ -943,7 +1017,7 @@ function buildOcrPipelineSteps(status = {}) {
     key: 'capture',
     state: 'info',
     title: '等待截图',
-    body: '确认窗口后才会截图。',
+    body: '截图阶段等待窗口确认。',
     meta: captureBackend,
   };
   if (contextState === 'capture_failed' || lastCaptureError) {
@@ -951,7 +1025,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'capture',
       state: 'error',
       title: '截图失败',
-      body: lastCaptureError || '截图后端返回错误。',
+      body: '截图阶段异常，处理入口在运行诊断。',
       meta: captureBackend,
     };
   } else if (runtime.stale_capture_backend) {
@@ -959,7 +1033,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'capture',
       state: 'warning',
       title: '截图画面未更新',
-      body: '截图源可能停在旧画面。',
+      body: '截图阶段需要处理。',
       meta: `${captureBackend}${runtime.consecutive_same_capture_frames ? ` | 连续 ${runtime.consecutive_same_capture_frames} 帧相同` : ''}`,
     };
   } else if (runtime.last_capture_completed_at || runtime.last_capture_image_hash || runtime.capture_backend_kind) {
@@ -967,7 +1041,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'capture',
       state: 'ok',
       title: '截图后端可用',
-      body: runtime.last_capture_completed_at ? `最近截图：${runtime.last_capture_completed_at}` : '截图方式已选择。',
+      body: '截图阶段正常。',
       meta: captureBackend,
     };
   }
@@ -976,7 +1050,7 @@ function buildOcrPipelineSteps(status = {}) {
     key: 'ocr',
     state: 'info',
     title: '等待文字识别',
-    body: '截图完成后会进入文字识别。',
+    body: '识别阶段等待截图输入。',
     meta: ocrBackend,
   };
   if (!status.ocr_reader_enabled) {
@@ -984,7 +1058,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'ocr',
       state: 'warning',
       title: 'OCR Reader 未启用',
-      body: '当前不会通过 OCR 读取台词。',
+      body: '识别阶段未启用。',
       meta: ocrBackend,
     };
   } else if (runtime.backend_detail === 'backend_unavailable' || runtime.detail === 'backend_unavailable') {
@@ -992,7 +1066,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'ocr',
       state: 'error',
       title: 'OCR 后端不可用',
-      body: '请安装 RapidOCR 或 Tesseract。',
+      body: '识别阶段异常，处理入口在运行诊断。',
       meta: ocrBackend,
     };
   } else if (runtime.backend_kind || rawText || observedText || displayStable) {
@@ -1000,7 +1074,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'ocr',
       state: 'ok',
       title: '文字识别可用',
-      body: rawText ? '最近已有 OCR 原文。' : 'OCR 后端已选定。',
+      body: '识别阶段正常。',
       meta: ocrBackend,
     };
   } else if (!rapidocr.installed && !tesseract.installed) {
@@ -1008,7 +1082,7 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'ocr',
       state: 'warning',
       title: 'OCR 组件可能缺失',
-      body: '建议优先安装 RapidOCR。',
+      body: '识别阶段需要处理。',
       meta: ocrBackend,
     };
   }
@@ -1018,14 +1092,14 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'observed',
       state: hasObservedMismatch ? 'warning' : 'ok',
       title: hasObservedMismatch ? '候选台词确认中' : '已读到候选台词',
-      body: observedText,
+      body: hasObservedMismatch ? '候选台词等待稳定确认。' : '候选台词读取正常。',
       meta: hasObservedMismatch ? (blockReason || '等待稳定确认') : '候选与已确认台词一致',
     }
     : {
       key: 'observed',
       state: rawText ? 'info' : 'warning',
       title: rawText ? '正在筛选 OCR 原文' : '还没有候选台词',
-      body: rawText || '等待 OCR 读到有效文字。',
+      body: rawText ? '候选阶段正在筛选。' : '候选阶段等待有效文字。',
       meta: blockReason || '',
     };
 
@@ -1034,14 +1108,14 @@ function buildOcrPipelineSteps(status = {}) {
       key: 'stable',
       state: 'ok',
       title: '已确认台词',
-      body: displayStable,
+      body: '确认阶段正常。',
       meta: status.effective_current_line?.source || runtime.last_stable_line?.source || '',
     }
     : {
       key: 'stable',
       state: observedText ? 'warning' : 'info',
       title: observedText ? '等待稳定确认' : '还没有已确认台词',
-      body: observedText ? '候选台词还没有进入正式上下文。' : '读到有效台词后会显示在这里。',
+      body: observedText ? '确认阶段等待稳定。' : '确认阶段等待候选台词。',
       meta: blockReason || '',
     };
 
@@ -1066,6 +1140,14 @@ function buildOcrPipelineSteps(status = {}) {
       state: 'warning',
       title: '游戏不在前台',
       body: status.agent_pause_message || '自动推进已暂停，切回游戏后继续。',
+      meta: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || '',
+    };
+  } else if (status.agent_pause_kind === 'screen_safety' || status.agent_user_status === 'screen_safety_pause') {
+    agentStep = {
+      key: 'agent',
+      state: 'warning',
+      title: '安全暂停',
+      body: status.agent_pause_message || '当前画面不适合自动推进。',
       meta: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || '',
     };
   } else if (status.agent_pause_kind === 'read_only' || status.agent_user_status === 'read_only') {
@@ -1318,7 +1400,12 @@ function renderAgentUserNotice(status = {}) {
   target.textContent = targetText ? `目标窗口：${targetText}` : '';
 
   node.className = 'agent-user-notice neutral';
-  if (pauseKind === 'window_not_foreground' || userStatus === 'paused_window_not_foreground') {
+  if (
+    pauseKind === 'window_not_foreground'
+    || pauseKind === 'screen_safety'
+    || userStatus === 'paused_window_not_foreground'
+    || userStatus === 'screen_safety_pause'
+  ) {
     node.classList.add('warning');
   } else if (pauseKind === 'ocr_unavailable' || userStatus === 'ocr_unavailable' || userStatus === 'error') {
     node.classList.add('error');
@@ -1527,6 +1614,27 @@ function scrollToBottom(node) {
   });
 }
 
+function isNearScrollBottom(node) {
+  if (!node) {
+    return true;
+  }
+  if (node.scrollHeight <= node.clientHeight + SCROLL_BOTTOM_THRESHOLD) {
+    return true;
+  }
+  return node.scrollTop + node.clientHeight >= node.scrollHeight - SCROLL_BOTTOM_THRESHOLD;
+}
+
+function renderPreservingScroll(node, render) {
+  if (!node) {
+    return;
+  }
+  const wasAtBottom = isNearScrollBottom(node);
+  render();
+  if (wasAtBottom) {
+    scrollToBottom(node);
+  }
+}
+
 function scrollAllRegionsToBottom(root = document) {
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
@@ -1707,26 +1815,54 @@ function buildSuggestFallback(sceneId = '', diagnostic = 'no visible choices') {
 
 function renderGrid(nodeId, rows) {
   const container = document.getElementById(nodeId);
-  container.innerHTML = rows.map((row) => `
+  renderPreservingScroll(container, () => {
+    container.innerHTML = renderDataRows(rows);
+  });
+}
+
+function renderDataRows(rows) {
+  return rows.map((row) => `
     <div class="data-row">
       <dt>${escapeHtml(FIELD_LABELS_ZH[row.label] || row.label)}</dt>
       <dd>${escapeHtml(row.value)}</dd>
     </div>
   `).join('');
-  scrollToBottom(container);
+}
+
+function renderStatusGrid(rows, debugRows) {
+  const container = document.getElementById('statusGrid');
+  const debugWasOpen = Boolean(container?.querySelector('.status-debug-panel')?.open);
+  renderPreservingScroll(container, () => {
+    container.innerHTML = `
+      <dl class="data-grid status-grid-primary">
+        ${renderDataRows(rows)}
+      </dl>
+      <details class="status-debug-panel"${debugWasOpen ? ' open' : ''}>
+        <summary>
+          <span>高级调试</span>
+          <small>${escapeHtml(String(debugRows.length))} 项内部状态</small>
+        </summary>
+        <dl class="data-grid">
+          ${renderDataRows(debugRows)}
+        </dl>
+      </details>
+    `;
+  });
 }
 
 function renderStackList(nodeId, items, formatter) {
   const node = document.getElementById(nodeId);
   if (!items.length) {
-    node.className = 'stack-list scroll-region empty-state';
-    node.textContent = '暂无数据';
-    scrollToBottom(node);
+    renderPreservingScroll(node, () => {
+      node.className = 'stack-list scroll-region empty-state';
+      node.textContent = '暂无数据';
+    });
     return;
   }
-  node.className = 'stack-list scroll-region';
-  node.innerHTML = items.map(formatter).join('');
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'stack-list scroll-region';
+    node.innerHTML = items.map(formatter).join('');
+  });
 }
 
 function isInstallTaskTerminal(state) {
@@ -2015,6 +2151,26 @@ function setInputValueIfIdle(node, value) {
   node.value = value;
 }
 
+function formatScreenTemplatesForInput(templates) {
+  const value = Array.isArray(templates) ? templates : [];
+  return JSON.stringify(value, null, 2);
+}
+
+function renderOcrScreenTemplates(status) {
+  const input = document.getElementById('ocrScreenTemplatesInput');
+  if (!input || document.activeElement === input) {
+    return;
+  }
+  input.value = formatScreenTemplatesForInput(status.ocr_screen_templates || []);
+}
+
+function setOcrScreenTemplatesUndoAvailable(available) {
+  const button = document.getElementById('ocrScreenTemplatesUndoBtn');
+  if (button) {
+    button.disabled = !available;
+  }
+}
+
 function profileValueForInputs(runtimeProfile) {
   const merged = {
     ...DEFAULT_CAPTURE_PROFILE,
@@ -2094,11 +2250,11 @@ function renderPluginUnavailable(error) {
   renderCurrentLineOverview({});
   renderOcrPipelinePanel({});
   renderInstallCompactSummary({});
-  renderGrid('statusGrid', [
+  renderStatusGrid([
     { label: 'connection_state', value: 'plugin_not_started' },
     { label: 'status', value: '插件尚未启动' },
     { label: 'last_error', value: message },
-  ]);
+  ], []);
   renderGrid('ocrRuntimeGrid', [
     { label: 'status', value: '插件尚未启动' },
   ]);
@@ -2319,6 +2475,11 @@ function renderStatus(status) {
     ocrPollIntervalInput.value = Number.isFinite(interval) ? interval.toFixed(1) : '2.0';
   }
   syncSettingsValue('ocrTriggerModeSelect', status.ocr_reader_trigger_mode || 'after_advance');
+  syncSettingsChecked('llmVisionToggle', Boolean(status.llm_vision_enabled));
+  const llmVisionMaxInput = document.getElementById('llmVisionMaxImagePxInput');
+  if (llmVisionMaxInput && !shouldPreserveSettingsControls()) {
+    llmVisionMaxInput.value = String(Number(status.llm_vision_max_image_px || 768));
+  }
 
   const memoryReaderRuntime = status.memory_reader_runtime || {};
   const ocrRuntime = status.ocr_reader_runtime || {};
@@ -2345,7 +2506,7 @@ function renderStatus(status) {
   renderOcrPipelinePanel(status);
   renderInstallCompactSummary(status);
 
-  renderGrid('statusGrid', [
+  const userStatusRows = [
     { label: 'connection_state', value: status.connection_state || '' },
     { label: 'active_data_source', value: status.active_data_source || '' },
     { label: 'reader_mode', value: READER_MODE_LABELS_ZH[status.reader_mode] || status.reader_mode || 'auto' },
@@ -2354,8 +2515,39 @@ function renderStatus(status) {
       label: 'agent_user_status',
       value: AGENT_USER_STATUS_LABELS_ZH[status.agent_user_status] || status.agent_user_status || '',
     },
-    { label: 'agent_pause_kind', value: status.agent_pause_kind || '' },
     { label: 'agent_pause_message', value: status.agent_pause_message || '' },
+    { label: 'push_notifications', value: String(Boolean(status.push_notifications)) },
+    { label: 'advance_speed', value: ADVANCE_SPEED_LABELS_ZH[status.advance_speed] || status.advance_speed || 'medium' },
+    { label: 'bound_game_id', value: status.bound_game_id || '(auto)' },
+    { label: 'available_game_ids', value: (status.available_game_ids || []).join(', ') || '(none)' },
+    { label: 'performance_cpu_percent', value: `${formatFixedNumber(performance.cpu_percent, 1)}%` },
+    { label: 'performance_memory_mb', value: `${formatFixedNumber(performance.memory_mb, 1)} MB` },
+    { label: 'ocr_reader_enabled', value: String(Boolean(status.ocr_reader_enabled)) },
+    { label: 'ocr_poll_interval_seconds', value: String(status.ocr_reader_poll_interval_seconds || '') },
+    { label: 'ocr_trigger_mode', value: formatOcrTriggerMode(status.ocr_reader_trigger_mode || 'after_advance') },
+    { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
+    { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
+    { label: 'ocr_context_state', value: ocrRuntime.ocr_context_state || '' },
+    { label: 'screen_type', value: status.screen_type || '' },
+    { label: 'screen_confidence', value: formatFixedNumber(status.screen_confidence, 2) },
+    { label: 'screen_ui_elements', value: String((status.screen_ui_elements || []).length || 0) },
+    { label: 'target_is_foreground', value: String(Boolean(ocrRuntime.target_is_foreground)) },
+    { label: 'effective_current_line', value: status.effective_current_line?.text || '' },
+    { label: 'ocr_reader_target', value: ocrTarget || '' },
+    { label: 'ocr_backend_selection', value: status.ocr_backend_selection || 'auto' },
+    { label: 'ocr_capture_backend_selection', value: status.ocr_capture_backend_selection || 'auto' },
+    { label: 'rapidocr_installed', value: String(Boolean(rapidocr.installed)) },
+    { label: 'dxcam_installed', value: String(Boolean(dxcam.installed)) },
+    { label: 'memory_reader_enabled', value: String(Boolean(status.memory_reader_enabled)) },
+    { label: 'memory_reader_status', value: memoryReaderRuntime.status || '' },
+    { label: 'memory_reader_process', value: memoryReaderProcess || '' },
+    { label: 'tesseract_installed', value: String(Boolean(tesseract.installed)) },
+    { label: 'tesseract_missing_languages', value: missingLanguages || '(none)' },
+    { label: 'textractor_installed', value: String(Boolean(textractor.installed)) },
+    { label: 'last_error', value: status.last_error?.message || '' },
+  ];
+  const debugStatusRows = [
+    { label: 'agent_pause_kind', value: status.agent_pause_kind || '' },
     { label: 'agent_can_resume_by_button', value: String(Boolean(status.agent_can_resume_by_button)) },
     { label: 'agent_can_resume_by_focus', value: String(Boolean(status.agent_can_resume_by_focus)) },
     { label: 'agent_status', value: status.agent_status || '' },
@@ -2364,56 +2556,44 @@ function renderStatus(status) {
     { label: 'agent_diagnostic', value: status.agent_diagnostic || '' },
     { label: 'inbound_queue_size', value: String(status.agent_inbound_queue_size || 0) },
     { label: 'outbound_queue_size', value: String(status.agent_outbound_queue_size || 0) },
-    { label: 'push_notifications', value: String(Boolean(status.push_notifications)) },
-    { label: 'advance_speed', value: ADVANCE_SPEED_LABELS_ZH[status.advance_speed] || status.advance_speed || 'medium' },
-    { label: 'bound_game_id', value: status.bound_game_id || '(auto)' },
     { label: 'active_session_id', value: status.active_session_id || '' },
     { label: 'last_seq', value: String(status.last_seq || 0) },
     { label: 'stream_reset_pending', value: String(Boolean(status.stream_reset_pending)) },
-    { label: 'available_game_ids', value: (status.available_game_ids || []).join(', ') || '(none)' },
-    { label: 'performance_cpu_percent', value: `${formatFixedNumber(performance.cpu_percent, 1)}%` },
-    { label: 'performance_memory_mb', value: `${formatFixedNumber(performance.memory_mb, 1)} MB` },
     { label: 'performance_memory_percent', value: `${formatFixedNumber(performance.memory_percent, 2)}%` },
     { label: 'performance_thread_count', value: String(performance.thread_count || 0) },
     { label: 'performance_process', value: performanceProcess || '' },
     { label: 'performance_detail', value: performance.detail || '' },
-    { label: 'ocr_reader_enabled', value: String(Boolean(status.ocr_reader_enabled)) },
-    { label: 'ocr_poll_interval_seconds', value: String(status.ocr_reader_poll_interval_seconds || '') },
-    { label: 'ocr_trigger_mode', value: formatOcrTriggerMode(status.ocr_reader_trigger_mode || 'after_advance') },
     { label: 'pending_ocr_advance_captures', value: String(status.pending_ocr_advance_captures || 0) },
     {
       label: 'pending_ocr_advance_capture_age_seconds',
       value: formatFixedNumber(status.pending_ocr_advance_capture_age_seconds, 1),
     },
     { label: 'last_ocr_advance_capture_reason', value: status.last_ocr_advance_capture_reason || '' },
-    { label: 'ocr_reader_status', value: ocrRuntime.status || '' },
-    { label: 'ocr_reader_detail', value: ocrRuntime.detail || '' },
-    { label: 'ocr_context_state', value: ocrRuntime.ocr_context_state || '' },
-    { label: 'target_is_foreground', value: String(Boolean(ocrRuntime.target_is_foreground)) },
-    { label: 'effective_current_line', value: status.effective_current_line?.text || '' },
     { label: 'ocr_capture_diagnostic_required', value: String(Boolean(status.ocr_capture_diagnostic_required)) },
     { label: 'ocr_capture_diagnostic', value: status.ocr_capture_diagnostic || '' },
-    { label: 'ocr_reader_target', value: ocrTarget || '' },
-    { label: 'ocr_backend_selection', value: status.ocr_backend_selection || 'auto' },
-    { label: 'ocr_capture_backend_selection', value: status.ocr_capture_backend_selection || 'auto' },
     { label: 'ocr_backend_kind', value: ocrRuntime.backend_kind || '' },
     { label: 'ocr_backend_detail', value: ocrRuntime.backend_detail || '' },
+    { label: 'screen_text_sources', value: (status.screen_debug?.sources || []).join(', ') || '' },
+    { label: 'screen_classify_reason', value: status.screen_debug?.reason || '' },
+    { label: 'screen_classify_layout', value: JSON.stringify(status.screen_debug?.layout || {}) },
+    { label: 'screen_classify_keywords', value: JSON.stringify(status.screen_debug?.keyword_hits || {}) },
+    { label: 'llm_vision_enabled', value: String(Boolean(status.llm_vision_enabled)) },
+    { label: 'llm_vision_max_image_px', value: String(status.llm_vision_max_image_px || 0) },
+    { label: 'ocr_screen_template_count', value: String(status.ocr_screen_template_count || 0) },
+    { label: 'vision_snapshot_available', value: String(Boolean(ocrRuntime.vision_snapshot_available)) },
+    { label: 'vision_snapshot_captured_at', value: ocrRuntime.vision_snapshot_captured_at || '' },
+    { label: 'vision_snapshot_byte_size', value: String(ocrRuntime.vision_snapshot_byte_size || 0) },
+    { label: 'ocr_screen_awareness_full_frame_ocr', value: String(Boolean(status.ocr_screen_awareness_full_frame_ocr)) },
+    { label: 'ocr_screen_awareness_multi_region_ocr', value: String(Boolean(status.ocr_screen_awareness_multi_region_ocr)) },
+    { label: 'ocr_screen_awareness_visual_rules', value: String(Boolean(status.ocr_screen_awareness_visual_rules)) },
     { label: 'rapidocr_enabled', value: String(Boolean(status.rapidocr_enabled)) },
-    { label: 'rapidocr_installed', value: String(Boolean(rapidocr.installed)) },
     { label: 'rapidocr_detail', value: rapidocr.detail || '' },
-    { label: 'dxcam_installed', value: String(Boolean(dxcam.installed)) },
     { label: 'dxcam_detail', value: dxcam.detail || '' },
-    { label: 'memory_reader_enabled', value: String(Boolean(status.memory_reader_enabled)) },
-    { label: 'memory_reader_status', value: memoryReaderRuntime.status || '' },
     { label: 'memory_reader_detail', value: memoryReaderRuntime.detail || '' },
-    { label: 'memory_reader_process', value: memoryReaderProcess || '' },
-    { label: 'tesseract_installed', value: String(Boolean(tesseract.installed)) },
     { label: 'tesseract_detail', value: tesseract.detail || '' },
-    { label: 'tesseract_missing_languages', value: missingLanguages || '(none)' },
-    { label: 'textractor_installed', value: String(Boolean(textractor.installed)) },
     { label: 'textractor_detail', value: textractor.detail || '' },
-    { label: 'last_error', value: status.last_error?.message || '' },
-  ]);
+  ];
+  renderStatusGrid(userStatusRows, debugStatusRows);
 
   renderOcrRuntime(status);
   renderAgentUserNotice(status);
@@ -2424,6 +2604,7 @@ function renderStatus(status) {
   renderTesseract(status);
   renderTextractor(status);
   renderOcrWindowTargetStatus(status);
+  renderOcrScreenTemplates(status);
   renderOcrProfile(status);
   renderGameBinding(status);
 }
@@ -2625,6 +2806,7 @@ function renderOcrRuntime(status) {
   const fromOcr = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'ocr', key, legacyKey);
   const fromTiming = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'timing', key, legacyKey);
   const fromAdvance = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'advance', key, legacyKey);
+  const fromProfile = (key, legacyKey = key) => readOcrRuntimeValue(runtime, 'profile', key, legacyKey);
   const windowTitle = fromWindow('title', 'window_title');
   const captureStage = fromCapture('stage', 'capture_stage');
   const captureProfile = fromCapture('profile', 'capture_profile');
@@ -2651,6 +2833,45 @@ function renderOcrRuntime(status) {
       value: OCR_CAPTURE_MATCH_SOURCE_LABELS_ZH[captureProfileMatchSource] || captureProfileMatchSource || '',
     },
     { label: 'capture_profile_bucket_key', value: fromCapture('profile_bucket_key', 'capture_profile_bucket_key') || '' },
+    {
+      label: 'recommended_capture_profile_stage',
+      value: OCR_PROFILE_STAGE_LABELS_ZH[fromProfile('recommended_capture_profile_stage')]
+        || fromProfile('recommended_capture_profile_stage')
+        || '',
+    },
+    {
+      label: 'recommended_capture_profile',
+      value: formatCaptureProfile(fromProfile('recommended_capture_profile')) || '',
+    },
+    {
+      label: 'recommended_capture_profile_process_name',
+      value: fromProfile('recommended_capture_profile_process_name') || '',
+    },
+    {
+      label: 'recommended_capture_profile_save_scope',
+      value: fromProfile('recommended_capture_profile_save_scope') || '',
+    },
+    { label: 'recommended_capture_profile_reason', value: fromProfile('recommended_capture_profile_reason') || '' },
+    {
+      label: 'recommended_capture_profile_confidence',
+      value: formatFixedNumber(fromProfile('recommended_capture_profile_confidence'), 2),
+    },
+    {
+      label: 'recommended_capture_profile_manual_present',
+      value: String(Boolean(fromProfile('recommended_capture_profile_manual_present'))),
+    },
+    {
+      label: 'capture_profile_auto_apply_enabled',
+      value: String(Boolean(fromCapture('capture_profile_auto_apply_enabled'))),
+    },
+    {
+      label: 'capture_profile_pending_rollback',
+      value: String(Boolean(fromCapture('capture_profile_pending_rollback'))),
+    },
+    {
+      label: 'capture_profile_last_rollback_reason',
+      value: fromCapture('capture_profile_last_rollback_reason') || '',
+    },
     { label: 'consecutive_no_text_polls', value: String(fromOcr('consecutive_no_text_polls') || 0) },
     { label: 'last_observed_at', value: fromOcr('last_observed_at') || '' },
     { label: 'last_capture_stage', value: OCR_PROFILE_STAGE_LABELS_ZH[lastCaptureStage] || lastCaptureStage || '' },
@@ -2662,6 +2883,28 @@ function renderOcrRuntime(status) {
     { label: 'capture_backend_kind', value: fromCapture('backend_kind', 'capture_backend_kind') || '' },
     { label: 'capture_backend_detail', value: fromCapture('backend_detail', 'capture_backend_detail') || '' },
     { label: 'last_capture_image_hash', value: fromCapture('last_image_hash', 'last_capture_image_hash') || '' },
+    { label: 'vision_snapshot_available', value: String(Boolean(fromCapture('vision_snapshot_available'))) },
+    { label: 'vision_snapshot_captured_at', value: fromCapture('vision_snapshot_captured_at') || '' },
+    { label: 'vision_snapshot_expires_at', value: fromCapture('vision_snapshot_expires_at') || '' },
+    { label: 'vision_snapshot_source', value: fromCapture('vision_snapshot_source') || '' },
+    { label: 'vision_snapshot_size', value: `${fromCapture('vision_snapshot_width') || 0}x${fromCapture('vision_snapshot_height') || 0}` },
+    { label: 'vision_snapshot_byte_size', value: String(fromCapture('vision_snapshot_byte_size') || 0) },
+    {
+      label: 'screen_awareness_sample_count',
+      value: String(fromCapture('screen_awareness_sample_count') || 0),
+    },
+    {
+      label: 'screen_awareness_model_detail',
+      value: fromCapture('screen_awareness_model_detail') || '',
+    },
+    {
+      label: 'screen_awareness_model_last_stage',
+      value: fromCapture('screen_awareness_model_last_stage') || '',
+    },
+    {
+      label: 'screen_awareness_model_last_confidence',
+      value: formatFixedNumber(fromCapture('screen_awareness_model_last_confidence'), 2),
+    },
     { label: 'consecutive_same_capture_frames', value: String(fromCapture('consecutive_same_frames', 'consecutive_same_capture_frames') || 0) },
     { label: 'stale_capture_backend', value: String(Boolean(fromCapture('stale_backend', 'stale_capture_backend'))) },
     { label: 'last_raw_ocr_text', value: fromOcr('last_raw_text', 'last_raw_ocr_text') || '' },
@@ -3363,6 +3606,9 @@ function renderOcrProfile(status) {
     resolveEditableCaptureProfile(status, currentProcessName, currentStage, currentSaveScope),
   );
   const autoRecalibrateButton = document.getElementById('ocrProfileAutoRecalibrateBtn');
+  const applyRecommendedButton = document.getElementById('ocrProfileApplyRecommendedBtn');
+  const rollbackButton = document.getElementById('ocrProfileRollbackBtn');
+  const autoApplyInput = document.getElementById('ocrProfileAutoApplyRecommendedInput');
   let autoRecalibrateReason = '';
   if (!Boolean(runtime.enabled)) {
     autoRecalibrateReason = 'OCR Reader 未启用';
@@ -3373,6 +3619,27 @@ function renderOcrProfile(status) {
   } else if (!runtime.process_name || !Number(runtime.width || 0) || !Number(runtime.height || 0)) {
     autoRecalibrateReason = '当前没有已附着的 OCR 目标窗口';
   }
+  const recommendedProfile = runtime.recommended_capture_profile
+    || runtime.profile?.recommended_capture_profile
+    || {};
+  const recommendedStage = runtime.recommended_capture_profile_stage
+    || runtime.profile?.recommended_capture_profile_stage
+    || '';
+  const recommendedReason = runtime.recommended_capture_profile_reason
+    || runtime.profile?.recommended_capture_profile_reason
+    || '';
+  const recommendedConfidence = runtime.recommended_capture_profile_confidence
+    || runtime.profile?.recommended_capture_profile_confidence
+    || 0;
+  const recommendedManualPresent = Boolean(
+    runtime.recommended_capture_profile_manual_present
+    || runtime.profile?.recommended_capture_profile_manual_present,
+  );
+  const recommendedHint = recommendedProfile && Object.keys(recommendedProfile).length
+    ? `建议校准: ${OCR_PROFILE_STAGE_LABELS_ZH[recommendedStage] || recommendedStage || '对白区'} ${formatCaptureProfile(recommendedProfile)} (${recommendedReason || 'auto'}, confidence=${formatFixedNumber(recommendedConfidence, 2)}, manual=${recommendedManualPresent ? 'yes' : 'no'})`
+    : '';
+  const rollbackReason = runtime.capture_profile_last_rollback_reason || '';
+  const pendingRollback = Boolean(runtime.capture_profile_pending_rollback);
 
   if (runtime.process_name) {
     hint.textContent = [
@@ -3388,6 +3655,9 @@ function renderOcrProfile(status) {
       runtime.capture_profile_bucket_key ? `命中桶: ${runtime.capture_profile_bucket_key}` : '',
       runtime.detail ? `状态: ${runtime.detail}` : '',
       runtime.takeover_reason ? `接管原因: ${runtime.takeover_reason}` : '',
+      recommendedHint,
+      pendingRollback ? `推荐回滚观察中: ${runtime.capture_profile_rollback_failure_count || 0}/2` : '',
+      rollbackReason ? `推荐回滚状态: ${rollbackReason}` : '',
       `自动重校准: ${autoRecalibrateReason || '可用'}`,
       isAihongProcessName(currentProcessName || runtime.process_name)
         ? '哀鸿支持按对白区 / 菜单区分别保存'
@@ -3411,6 +3681,22 @@ function renderOcrProfile(status) {
   setInputValueIfIdle(bottomInput, profileValues.bottom);
   autoRecalibrateButton.disabled = Boolean(autoRecalibrateReason);
   autoRecalibrateButton.title = autoRecalibrateReason || '使用当前附着窗口自动重校准对白区';
+  if (applyRecommendedButton) {
+    const applyBlocked = !recommendedProfile
+      || !Object.keys(recommendedProfile).length
+      || recommendedManualPresent;
+    applyRecommendedButton.disabled = applyBlocked;
+    applyRecommendedButton.title = recommendedManualPresent
+      ? '已有手动 profile，推荐不会自动覆盖；可直接手动保存校准。'
+      : (applyBlocked ? '当前没有可应用的推荐 profile' : '应用当前推荐 profile，并保留自动回滚点');
+  }
+  if (rollbackButton) {
+    rollbackButton.disabled = !pendingRollback;
+    rollbackButton.title = pendingRollback ? '回滚最近一次推荐 profile 应用' : '当前没有待回滚的推荐 profile';
+  }
+  if (autoApplyInput && document.activeElement !== autoApplyInput) {
+    autoApplyInput.checked = Boolean(runtime.capture_profile_auto_apply_enabled);
+  }
 }
 
 function renderSnapshot(snapshot) {
@@ -3470,49 +3756,52 @@ function renderHistory(history) {
 
 function renderExplain(payload) {
   const node = document.getElementById('explainPanel');
-  node.className = 'result-panel scroll-region';
-  node.innerHTML = `
-    <p class="list-kicker">${escapeHtml(payload.line_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
-    <h3>${escapeHtml(payload.speaker || '旁白')}</h3>
-    <p>${escapeHtml(payload.text || '')}</p>
-    <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || '暂无解释')}</p>
-    <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-  `;
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'result-panel scroll-region';
+    node.innerHTML = `
+      <p class="list-kicker">${escapeHtml(payload.line_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
+      <h3>${escapeHtml(payload.speaker || '旁白')}</h3>
+      <p>${escapeHtml(payload.text || '')}</p>
+      <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || '暂无解释')}</p>
+      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
+    `;
+  });
 }
 
 function renderSummary(payload) {
   const node = document.getElementById('summaryPanel');
-  node.className = 'result-panel scroll-region';
   const points = payload.key_points || [];
-  node.innerHTML = `
-    <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
-    <p class="result-main">${escapeHtml(payload.summary || payload.diagnostic || '暂无总结')}</p>
-    <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-    <div class="chip-row">
-      ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
-    </div>
-  `;
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'result-panel scroll-region';
+    node.innerHTML = `
+      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
+      <p class="result-main">${escapeHtml(payload.summary || payload.diagnostic || '暂无总结')}</p>
+      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
+      <div class="chip-row">
+        ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
+      </div>
+    `;
+  });
 }
 
 function renderSuggest(payload) {
   const node = document.getElementById('suggestPanel');
-  node.className = 'result-panel scroll-region';
   const choices = payload.choices || [];
-  node.innerHTML = `
-    <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
-    <div class="stack-list">
-      ${choices.length ? choices.map((item) => `
-        <article class="list-card compact">
-          <p class="list-kicker">rank ${escapeHtml(item.rank || 0)} · ${escapeHtml(item.choice_id || '')}</p>
-          <h3>${escapeHtml(item.text || '')}</h3>
-          <p>${escapeHtml(item.reason || '')}</p>
-        </article>
-      `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || '暂无建议')}</div>`}
-    </div>
-  `;
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'result-panel scroll-region';
+    node.innerHTML = `
+      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
+      <div class="stack-list">
+        ${choices.length ? choices.map((item) => `
+          <article class="list-card compact">
+            <p class="list-kicker">rank ${escapeHtml(item.rank || 0)} · ${escapeHtml(item.choice_id || '')}</p>
+            <h3>${escapeHtml(item.text || '')}</h3>
+            <p>${escapeHtml(item.reason || '')}</p>
+          </article>
+        `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || '暂无建议')}</div>`}
+      </div>
+    `;
+  });
 }
 
 function formatInsightMeta(payload) {
@@ -3526,8 +3815,9 @@ function formatInsightMeta(payload) {
 function renderAgentStatus(payload) {
   latestAgentStatus = payload || latestAgentStatus;
   const replyNode = document.getElementById('agentReplyText');
-  replyNode.textContent = latestAgentReply;
-  scrollToBottom(replyNode);
+  renderPreservingScroll(replyNode, () => {
+    replyNode.textContent = latestAgentReply;
+  });
   const memoryCounts = payload.memory_counts || {};
   renderGrid('agentStatusGrid', [
     {
@@ -3574,49 +3864,52 @@ function renderAgentStatus(payload) {
 
 function renderExplain(payload) {
   const node = document.getElementById('explainPanel');
-  node.className = 'result-panel scroll-region';
-  node.innerHTML = `
-    <p class="list-kicker">${escapeHtml(payload.line_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
-    <h3>${escapeHtml(payload.speaker || 'Narration')}</h3>
-    <p>${escapeHtml(payload.text || '')}</p>
-    <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || 'No explanation yet')}</p>
-    <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-  `;
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'result-panel scroll-region';
+    node.innerHTML = `
+      <p class="list-kicker">${escapeHtml(payload.line_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
+      <h3>${escapeHtml(payload.speaker || 'Narration')}</h3>
+      <p>${escapeHtml(payload.text || '')}</p>
+      <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || 'No explanation yet')}</p>
+      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
+    `;
+  });
 }
 
 function renderSummary(payload) {
   const node = document.getElementById('summaryPanel');
-  node.className = 'result-panel scroll-region';
   const points = payload.key_points || [];
-  node.innerHTML = `
-    <p class="list-kicker">${escapeHtml(payload.scene_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
-    <p class="result-main">${escapeHtml(payload.summary || payload.diagnostic || 'No summary yet')}</p>
-    <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-    <div class="chip-row">
-      ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
-    </div>
-  `;
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'result-panel scroll-region';
+    node.innerHTML = `
+      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
+      <p class="result-main">${escapeHtml(payload.summary || payload.diagnostic || 'No summary yet')}</p>
+      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
+      <div class="chip-row">
+        ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
+      </div>
+    `;
+  });
 }
 
 function renderSuggest(payload) {
   const node = document.getElementById('suggestPanel');
-  node.className = 'result-panel scroll-region';
   const choices = payload.choices || [];
-  node.innerHTML = `
-    <p class="list-kicker">${escapeHtml(payload.scene_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
-    <div class="stack-list">
-      ${choices.length ? choices.map((item) => `
-        <article class="list-card compact">
-          <p class="list-kicker">rank ${escapeHtml(item.rank || 0)} | ${escapeHtml(item.choice_id || '')}</p>
-          <h3>${escapeHtml(item.text || '')}</h3>
-          <p>${escapeHtml(item.reason || '')}</p>
-        </article>
-      `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || 'No suggestion yet')}</div>`}
-    </div>
-  `;
-  scrollToBottom(node);
+  renderPreservingScroll(node, () => {
+    node.className = 'result-panel scroll-region';
+    node.innerHTML = `
+      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
+      <div class="stack-list">
+        ${choices.length ? choices.map((item) => `
+          <article class="list-card compact">
+            <p class="list-kicker">rank ${escapeHtml(item.rank || 0)} | ${escapeHtml(item.choice_id || '')}</p>
+            <h3>${escapeHtml(item.text || '')}</h3>
+            <p>${escapeHtml(item.reason || '')}</p>
+          </article>
+        `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || 'No suggestion yet')}</div>`}
+      </div>
+    `;
+  });
 }
 
 async function refreshInsights(snapshot, { force = false, history = {}, status = {} } = {}) {
@@ -4071,7 +4364,28 @@ async function setOcrBackendSelection({ backendSelection = null, captureBackend 
   }
 }
 
-async function saveMode() {
+function clearSettingsAutosaveTimer() {
+  if (settingsAutosaveTimer) {
+    clearTimeout(settingsAutosaveTimer);
+    settingsAutosaveTimer = null;
+  }
+}
+
+function scheduleSettingsAutosave() {
+  clearSettingsAutosaveTimer();
+  settingsAutosaveTimer = window.setTimeout(() => {
+    settingsAutosaveTimer = null;
+    if (!settingsDirty || settingsSaveInFlight) {
+      return;
+    }
+    saveMode({ auto: true }).catch((error) => {
+      setFlash(error instanceof Error ? error.message : String(error), 'error');
+    });
+  }, SETTINGS_AUTOSAVE_DELAY_MS);
+}
+
+async function saveMode({ auto = false } = {}) {
+  clearSettingsAutosaveTimer();
   const mode = document.getElementById('modeSelect').value;
   const pushNotifications = document.getElementById('pushToggle').checked;
   const advanceSpeed = document.getElementById('advanceSpeedSelect').value || 'medium';
@@ -4079,6 +4393,9 @@ async function saveMode() {
   const ocrPollIntervalRaw = document.getElementById('ocrPollIntervalInput')?.value || '';
   const ocrPollInterval = Number(ocrPollIntervalRaw || 2);
   const ocrTriggerMode = document.getElementById('ocrTriggerModeSelect')?.value || 'after_advance';
+  const visionEnabled = Boolean(document.getElementById('llmVisionToggle')?.checked);
+  const visionMaxRaw = document.getElementById('llmVisionMaxImagePxInput')?.value || '';
+  const visionMaxImagePx = Number(visionMaxRaw || 768);
   if (!['auto', 'memory_reader', 'ocr_reader'].includes(readerMode)) {
     setFlash('文本读取模式无效。', 'error');
     return;
@@ -4091,9 +4408,14 @@ async function saveMode() {
     setFlash('OCR 触发方式无效。', 'error');
     return;
   }
+  if (!Number.isFinite(visionMaxImagePx) || visionMaxImagePx < 64 || visionMaxImagePx > 2048) {
+    setFlash('Vision 最大边长必须在 64 到 2048 之间。', 'error');
+    return;
+  }
   try {
     settingsSaveInFlight = true;
-    setFlash('正在保存设置...', 'info');
+    updateSettingsDirtyHint(auto ? '正在自动保存...' : '正在保存...');
+    setFlash(auto ? '正在自动保存设置...' : '正在保存设置...', 'info');
     await callPlugin('galgame_set_mode', {
       mode,
       push_notifications: pushNotifications,
@@ -4104,15 +4426,310 @@ async function saveMode() {
       poll_interval_seconds: ocrPollInterval,
       trigger_mode: ocrTriggerMode,
     });
-    setFlash('设置已保存', 'success');
+    await callPlugin('galgame_set_llm_vision', {
+      vision_enabled: visionEnabled,
+      vision_max_image_px: Math.round(visionMaxImagePx),
+    });
+    setFlash(auto ? '设置已自动保存' : '设置已保存', 'success');
     settingsDirty = false;
     settingsSaveInFlight = false;
+    updateSettingsDirtyHint();
     await refreshAll({ preserveFlash: true, forceInsights: true, forceRefresh: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
   } finally {
     settingsSaveInFlight = false;
+    updateSettingsDirtyHint();
   }
+}
+
+async function saveOcrScreenTemplates() {
+  const input = document.getElementById('ocrScreenTemplatesInput');
+  if (!input) {
+    return;
+  }
+  try {
+    const templates = readOcrScreenTemplatesInput();
+    setFlash('正在保存屏幕模板...', 'info');
+    const payload = await callPlugin('galgame_set_ocr_screen_templates', {
+      screen_templates: templates,
+    });
+    input.value = formatScreenTemplatesForInput(payload.screen_templates || []);
+    setFlash(payload.summary || '屏幕模板已保存', 'success');
+    await refreshAll({ preserveFlash: true, forceRefresh: true });
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+function readOcrScreenTemplatesInput() {
+  const input = document.getElementById('ocrScreenTemplatesInput');
+  let templates;
+  try {
+    templates = JSON.parse(input?.value || '[]');
+  } catch (error) {
+    throw new Error(error instanceof Error ? `模板 JSON 解析失败：${error.message}` : '模板 JSON 解析失败。');
+  }
+  if (!Array.isArray(templates)) {
+    throw new Error('模板 JSON 必须是数组。');
+  }
+  return templates;
+}
+
+async function buildOcrScreenTemplateDraft() {
+  const input = document.getElementById('ocrScreenTemplatesInput');
+  if (!input) {
+    return;
+  }
+  try {
+    const templates = readOcrScreenTemplatesInput();
+    const payload = await callPlugin('galgame_build_ocr_screen_template_draft', {});
+    if (!payload.template || typeof payload.template !== 'object') {
+      throw new Error('插件未返回可用模板草稿。');
+    }
+    ocrScreenTemplatesUndoValue = input.value;
+    setOcrScreenTemplatesUndoAvailable(true);
+    templates.push(payload.template);
+    input.value = formatScreenTemplatesForInput(templates);
+    setFlash(payload.summary || '已生成屏幕模板草稿，可编辑后保存。', 'success');
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+async function validateOcrScreenTemplates() {
+  try {
+    const templates = readOcrScreenTemplatesInput();
+    const payload = await callPlugin('galgame_validate_ocr_screen_templates', {
+      screen_templates: templates,
+    });
+    const classification = payload.classification || {};
+    const screenType = classification.screen_type || 'default';
+    const confidence = Number(classification.screen_confidence || 0).toFixed(2);
+    setFlash(payload.summary || `模板验证结果: ${screenType} (${confidence})`, 'success');
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+function undoOcrScreenTemplateDraft() {
+  const input = document.getElementById('ocrScreenTemplatesInput');
+  if (!input || !ocrScreenTemplatesUndoValue) {
+    return;
+  }
+  input.value = ocrScreenTemplatesUndoValue;
+  ocrScreenTemplatesUndoValue = '';
+  setOcrScreenTemplatesUndoAvailable(false);
+  setFlash('已撤销上一次模板草稿。', 'info');
+}
+
+function getOcrRegionNodes() {
+  return {
+    editor: document.getElementById('ocrRegionEditor'),
+    image: document.getElementById('ocrRegionImage'),
+    box: document.getElementById('ocrRegionSelectionBox'),
+    empty: document.getElementById('ocrRegionEmpty'),
+    hint: document.getElementById('ocrRegionHint'),
+    stage: document.getElementById('ocrRegionStageSelect'),
+  };
+}
+
+function clampRegionValue(value) {
+  return Math.max(0, Math.min(1, Number(value) || 0));
+}
+
+function normalizeOcrRegion(region) {
+  const left = clampRegionValue(Math.min(region.left, region.right));
+  const right = clampRegionValue(Math.max(region.left, region.right));
+  const top = clampRegionValue(Math.min(region.top, region.bottom));
+  const bottom = clampRegionValue(Math.max(region.top, region.bottom));
+  return { left, top, right, bottom };
+}
+
+function ocrRegionFromPointer(event) {
+  const { image } = getOcrRegionNodes();
+  if (!image || image.hidden) {
+    return null;
+  }
+  const imageRect = image.getBoundingClientRect();
+  if (!imageRect.width || !imageRect.height) {
+    return null;
+  }
+  return {
+    left: clampRegionValue((event.clientX - imageRect.left) / imageRect.width),
+    top: clampRegionValue((event.clientY - imageRect.top) / imageRect.height),
+  };
+}
+
+function renderOcrRegionSelection() {
+  const { editor, image, box, hint } = getOcrRegionNodes();
+  if (!editor || !image || !box) {
+    return;
+  }
+  if (!ocrRegionSelection) {
+    box.hidden = true;
+    if (hint) {
+      hint.textContent = ocrRegionSnapshot
+        ? '在截图上拖拽框选区域。'
+        : '加载最近 OCR 屏幕感知截图后，拖拽框选区域。';
+    }
+    return;
+  }
+  const region = normalizeOcrRegion(ocrRegionSelection);
+  const editorRect = editor.getBoundingClientRect();
+  const imageRect = image.getBoundingClientRect();
+  const leftPx = imageRect.left - editorRect.left + region.left * imageRect.width;
+  const topPx = imageRect.top - editorRect.top + region.top * imageRect.height;
+  const widthPx = Math.max(1, (region.right - region.left) * imageRect.width);
+  const heightPx = Math.max(1, (region.bottom - region.top) * imageRect.height);
+  box.hidden = false;
+  box.style.left = `${leftPx}px`;
+  box.style.top = `${topPx}px`;
+  box.style.width = `${widthPx}px`;
+  box.style.height = `${heightPx}px`;
+  if (hint) {
+    hint.textContent = `区域: left=${region.left.toFixed(3)}, top=${region.top.toFixed(3)}, right=${region.right.toFixed(3)}, bottom=${region.bottom.toFixed(3)}`;
+  }
+}
+
+async function loadOcrRegionSnapshot() {
+  const { image, empty, hint } = getOcrRegionNodes();
+  try {
+    const payload = await callPlugin('galgame_get_ocr_screen_awareness_snapshot', {});
+    const snapshot = payload.snapshot || {};
+    const imageBase64 = snapshot.vision_image_base64 || '';
+    if (!imageBase64) {
+      throw new Error('当前没有可用截图。请先开启 Vision，并等待 OCR 完成一次全画面感知。');
+    }
+    ocrRegionSnapshot = snapshot;
+    ocrRegionSelection = null;
+    if (image) {
+      image.hidden = false;
+      image.src = imageBase64;
+      image.onload = () => renderOcrRegionSelection();
+    }
+    if (empty) {
+      empty.hidden = true;
+    }
+    if (hint) {
+      hint.textContent = payload.summary || '截图已加载，可拖拽框选区域。';
+    }
+    renderOcrRegionSelection();
+    setFlash(payload.summary || 'OCR 屏幕感知截图已加载', 'success');
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+async function buildOcrRegionTemplateDraft() {
+  if (!ocrRegionSelection) {
+    setFlash('请先在截图上框选区域。', 'error');
+    return;
+  }
+  const input = document.getElementById('ocrScreenTemplatesInput');
+  const { stage } = getOcrRegionNodes();
+  if (!input) {
+    return;
+  }
+  try {
+    const templates = readOcrScreenTemplatesInput();
+    const selectedStage = stage?.value || 'dialogue_stage';
+    const payload = await callPlugin('galgame_build_ocr_screen_template_draft', {
+      stage: selectedStage,
+      region: {
+        role: selectedStage,
+        ...normalizeOcrRegion(ocrRegionSelection),
+      },
+    });
+    ocrScreenTemplatesUndoValue = input.value;
+    setOcrScreenTemplatesUndoAvailable(true);
+    templates.push(payload.template);
+    input.value = formatScreenTemplatesForInput(templates);
+    setFlash(payload.summary || '已根据框选区域生成模板草稿。', 'success');
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+function applyOcrRegionToCaptureProfileForm() {
+  if (!ocrRegionSelection) {
+    setFlash('请先在截图上框选区域。', 'error');
+    return;
+  }
+  const region = normalizeOcrRegion(ocrRegionSelection);
+  const { stage } = getOcrRegionNodes();
+  const profileStage = document.getElementById('ocrProfileStageSelect');
+  const leftInput = document.getElementById('ocrProfileLeftInput');
+  const rightInput = document.getElementById('ocrProfileRightInput');
+  const topInput = document.getElementById('ocrProfileTopInput');
+  const bottomInput = document.getElementById('ocrProfileBottomInput');
+  if (profileStage && stage?.value) {
+    profileStage.value = stage.value;
+  }
+  if (leftInput) {
+    leftInput.value = region.left.toFixed(2);
+  }
+  if (rightInput) {
+    rightInput.value = Math.max(0, 1 - region.right).toFixed(2);
+  }
+  if (topInput) {
+    topInput.value = region.top.toFixed(2);
+  }
+  if (bottomInput) {
+    bottomInput.value = Math.max(0, 1 - region.bottom).toFixed(2);
+  }
+  setFlash('已将框选区域套用到 OCR 截图校准表单，确认后可保存。', 'success');
+}
+
+function startOcrRegionDrag(event) {
+  if (event.button !== undefined && event.button !== 0) {
+    return;
+  }
+  const point = ocrRegionFromPointer(event);
+  if (!point) {
+    return;
+  }
+  ocrRegionDragStart = point;
+  ocrRegionSelection = {
+    left: point.left,
+    top: point.top,
+    right: point.left,
+    bottom: point.top,
+  };
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  renderOcrRegionSelection();
+}
+
+function moveOcrRegionDrag(event) {
+  if (!ocrRegionDragStart) {
+    return;
+  }
+  const point = ocrRegionFromPointer(event);
+  if (!point) {
+    return;
+  }
+  ocrRegionSelection = normalizeOcrRegion({
+    left: ocrRegionDragStart.left,
+    top: ocrRegionDragStart.top,
+    right: point.left,
+    bottom: point.top,
+  });
+  renderOcrRegionSelection();
+}
+
+function finishOcrRegionDrag(event) {
+  if (!ocrRegionDragStart) {
+    return;
+  }
+  event.currentTarget.releasePointerCapture?.(event.pointerId);
+  ocrRegionDragStart = null;
+  const region = ocrRegionSelection ? normalizeOcrRegion(ocrRegionSelection) : null;
+  if (!region || (region.right - region.left) * (region.bottom - region.top) < 0.0025) {
+    ocrRegionSelection = null;
+  } else {
+    ocrRegionSelection = region;
+  }
+  renderOcrRegionSelection();
 }
 
 async function bindGame(gameId = '') {
@@ -4256,6 +4873,33 @@ async function autoRecalibrateOcrDialogueProfile() {
     setFlash(sampleText ? `${summary} | ${sampleText}` : summary, 'success');
     const saveScopeSelect = document.getElementById('ocrProfileSaveScopeSelect');
     saveScopeSelect.value = 'window_bucket';
+    await refreshAll({ preserveFlash: true, forceInsights: true });
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+async function applyRecommendedOcrCaptureProfile() {
+  try {
+    const autoApplyInput = document.getElementById('ocrProfileAutoApplyRecommendedInput');
+    const payload = await callPlugin('galgame_apply_recommended_ocr_capture_profile', {
+      confirm: true,
+      enable_auto_apply: Boolean(autoApplyInput?.checked),
+      allow_manual_override: false,
+    });
+    setFlash(payload.summary || 'OCR 推荐截图校准已应用', 'success');
+    await refreshAll({ preserveFlash: true, forceInsights: true });
+  } catch (error) {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  }
+}
+
+async function rollbackOcrCaptureProfileRecommendation() {
+  try {
+    const payload = await callPlugin('galgame_rollback_ocr_capture_profile', {
+      confirm: true,
+    });
+    setFlash(payload.summary || 'OCR 推荐截图校准已回滚', 'success');
     await refreshAll({ preserveFlash: true, forceInsights: true });
   } catch (error) {
     setFlash(error instanceof Error ? error.message : String(error), 'error');
@@ -4424,6 +5068,9 @@ async function handleDiagnosisAction(action) {
     case 'recalibrate_ocr':
       await autoRecalibrateOcrDialogueProfile();
       break;
+    case 'install_rapidocr':
+      await installRapidOcr(false);
+      break;
     case 'capture_backend':
       revealCaptureBackendSettings();
       setFlash('已定位到截图方式设置。可以切换 DXcam、ImageGrab 或 PrintWindow。', 'info');
@@ -4459,6 +5106,7 @@ function switchInstallTab(tab) {
 
 async function initialize() {
   initializePanelFullscreenControls();
+  updateSettingsDirtyHint();
   switchInstallTab(activeInstallTab);
   try {
     localStorage.removeItem(`${PLUGIN_ID}:last_ui_state:v1`);
@@ -4533,6 +5181,27 @@ document.getElementById('firstRunGuide').addEventListener('click', (event) => {
 document.getElementById('saveModeBtn').addEventListener('click', () => {
   withButtonPending('saveModeBtn', '保存中...', saveMode).catch(() => {});
 });
+document.getElementById('ocrScreenTemplatesSaveBtn').addEventListener('click', () => {
+  withButtonPending('ocrScreenTemplatesSaveBtn', '保存中...', saveOcrScreenTemplates).catch(() => {});
+});
+document.getElementById('ocrScreenTemplatesDraftBtn').addEventListener('click', () => {
+  withButtonPending('ocrScreenTemplatesDraftBtn', '生成中...', buildOcrScreenTemplateDraft).catch(() => {});
+});
+document.getElementById('ocrScreenTemplatesValidateBtn').addEventListener('click', () => {
+  withButtonPending('ocrScreenTemplatesValidateBtn', '验证中...', validateOcrScreenTemplates).catch(() => {});
+});
+document.getElementById('ocrScreenTemplatesUndoBtn').addEventListener('click', undoOcrScreenTemplateDraft);
+document.getElementById('ocrRegionSnapshotBtn').addEventListener('click', () => {
+  withButtonPending('ocrRegionSnapshotBtn', '加载中...', loadOcrRegionSnapshot).catch(() => {});
+});
+document.getElementById('ocrRegionTemplateBtn').addEventListener('click', () => {
+  withButtonPending('ocrRegionTemplateBtn', '生成中...', buildOcrRegionTemplateDraft).catch(() => {});
+});
+document.getElementById('ocrRegionCaptureBtn').addEventListener('click', applyOcrRegionToCaptureProfileForm);
+document.getElementById('ocrRegionEditor').addEventListener('pointerdown', startOcrRegionDrag);
+document.getElementById('ocrRegionEditor').addEventListener('pointermove', moveOcrRegionDrag);
+document.getElementById('ocrRegionEditor').addEventListener('pointerup', finishOcrRegionDrag);
+document.getElementById('ocrRegionEditor').addEventListener('pointercancel', finishOcrRegionDrag);
 SETTINGS_CONTROL_IDS.forEach((id) => {
   const node = document.getElementById(id);
   if (!node) {
@@ -4541,6 +5210,10 @@ SETTINGS_CONTROL_IDS.forEach((id) => {
   const markDirty = () => {
     if (!settingsSaveInFlight) {
       settingsDirty = true;
+      updateSettingsDirtyHint();
+      if (node.tagName === 'SELECT') {
+        scheduleSettingsAutosave();
+      }
     }
   };
   node.addEventListener('input', markDirty);
@@ -4624,6 +5297,8 @@ document.addEventListener('keydown', (e) => {
 document.getElementById('ocrProfileSaveBtn').addEventListener('click', saveOcrCaptureProfile);
 document.getElementById('ocrProfileClearBtn').addEventListener('click', clearOcrCaptureProfile);
 document.getElementById('ocrProfileAutoRecalibrateBtn').addEventListener('click', autoRecalibrateOcrDialogueProfile);
+document.getElementById('ocrProfileApplyRecommendedBtn').addEventListener('click', applyRecommendedOcrCaptureProfile);
+document.getElementById('ocrProfileRollbackBtn').addEventListener('click', rollbackOcrCaptureProfileRecommendation);
 document.getElementById('ocrProfileStageSelect').addEventListener('change', () => {
   if (latestStatus) {
     renderOcrProfile(latestStatus);

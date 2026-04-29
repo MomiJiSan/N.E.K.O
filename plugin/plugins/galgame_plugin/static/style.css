@@ -513,6 +513,23 @@ h1 {
   gap: 12px;
 }
 
+.settings-save-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings-dirty-hint {
+  min-height: 28px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--warning-bg);
+  color: var(--warning);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .agent-grid {
   margin-top: 12px;
   grid-template-columns: 1.5fr auto auto;
@@ -655,22 +672,104 @@ h1 {
   gap: 10px;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.checkbox-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.compact-checkbox {
+  min-height: 36px;
+}
+
+.screen-region-editor {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.screen-region-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.screen-region-toolbar select {
+  min-width: 150px;
+}
+
+.screen-region-canvas {
+  position: relative;
+  overflow: hidden;
+  min-height: 180px;
+  max-height: 360px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(11, 18, 32, 0.04);
+  user-select: none;
+  touch-action: none;
+}
+
+.screen-region-canvas img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 360px;
+  object-fit: contain;
+}
+
+.screen-region-selection {
+  position: absolute;
+  border: 2px solid var(--accent);
+  background: rgba(54, 112, 255, 0.16);
+  box-shadow: 0 0 0 999px rgba(11, 18, 32, 0.18);
+  pointer-events: none;
+}
+
+.screen-region-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 input,
 select,
+textarea,
 button {
   font: inherit;
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.82);
   color: var(--ink);
+}
+
+textarea {
+  min-height: 118px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.field-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 button {
@@ -873,6 +972,10 @@ button.active {
   grid-column: 1 / -1;
 }
 
+.capture-profile-primary-actions {
+  grid-column: auto;
+}
+
 .locked-window-card {
   margin-top: 12px;
   padding: 16px;
@@ -1024,6 +1127,37 @@ button.active {
   align-items: start;
 }
 
+.dashboard-section-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dashboard-section-grid-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.dashboard-subsection {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  gap: 10px;
+}
+
+.dashboard-subtitle {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.dashboard-subsection > .scroll-region {
+  max-height: clamp(180px, 30vh, 340px);
+}
+
 .panel-full {
   grid-column: 1 / -1;
 }
@@ -1154,6 +1288,53 @@ details.panel-fullscreen #eventsList .list-card {
   display: grid;
   gap: 10px;
   min-width: 0;
+}
+
+.status-grid-panel {
+  display: grid;
+  gap: 14px;
+  max-height: clamp(180px, 30vh, 340px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  align-content: start;
+}
+
+.status-debug-panel {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.status-debug-panel > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.status-debug-panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+.status-debug-panel > summary::after {
+  content: "展开";
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.07);
+}
+
+.status-debug-panel[open] > summary {
+  margin-bottom: 10px;
+}
+
+.status-debug-panel[open] > summary::after {
+  content: "收起";
 }
 
 #snapshotGrid.scroll-region {
@@ -1496,9 +1677,16 @@ details.panel-fullscreen #eventsList .list-card {
     align-items: stretch;
   }
 
+  .panel-title-row.compact {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .control-grid,
   .agent-grid,
   .dashboard-grid,
+  .dashboard-section-grid,
+  .dashboard-section-grid-three,
   .capture-profile-grid,
   .first-run-guide,
   .first-run-steps,
@@ -1548,5 +1736,10 @@ details.panel-fullscreen #eventsList .list-card {
   .install-actions,
   .capture-profile-actions {
     justify-content: stretch;
+  }
+
+  .settings-save-row button,
+  .capture-profile-primary-actions button {
+    width: 100%;
   }
 }

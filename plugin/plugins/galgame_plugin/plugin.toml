@@ -3,7 +3,16 @@ id = "galgame_plugin"
 name = "Galgame游玩助手"
 description = "让猫娘陪伴你一起玩galgame"
 short_description = "Monitor galgame sessions, bridge data, memory-reader fallback, and the plugin UI."
-keywords = ["galgame", "bridge", "renpy", "visual novel", "game state", "剧情", "台词", "选项"]
+keywords = [
+    "galgame",
+    "bridge",
+    "renpy",
+    "visual novel",
+    "game state",
+    "剧情",
+    "台词",
+    "选项",
+]
 version = "0.5.0"
 type = "plugin"
 entry = "plugin.plugins.galgame_plugin:GalgamePlugin"
@@ -15,18 +24,14 @@ name = "N.E.K.O Team"
 recommended = ">=0.1.0,<0.2.0"
 supported = ">=0.1.0,<0.3.0"
 
+[plugin.store]
+enabled = true
+
 [plugin_runtime]
 enabled = true
 auto_start = false
 
-[plugin.store]
-enabled = true
-
 [galgame]
-# Leave empty to use the platform default bridge root.
-# Windows: %LOCALAPPDATA%/N.E.K.O/galgame-bridge
-# macOS: ~/Library/Application Support/N.E.K.O/galgame-bridge
-# Linux/other: XDG_DATA_HOME/N.E.K.O/galgame-bridge, or ~/.local/share/N.E.K.O/galgame-bridge
 bridge_root = ""
 active_poll_interval_seconds = 1
 idle_poll_interval_seconds = 3
@@ -45,36 +50,22 @@ reader_mode = "auto"
 llm_call_timeout_seconds = 15
 llm_max_in_flight = 2
 llm_request_cache_ttl_seconds = 2
-# Leave empty to use the built-in galgame_plugin LLM backend.
-# Set a plugin entry ref only for advanced development overrides.
 target_entry_ref = ""
+vision_enabled = false
+vision_max_image_px = 768
 
 [memory_reader]
-# Leave `enabled` unset to use platform defaults.
-# Windows: enabled by default and only takes over when Bridge SDK has no usable session.
-# macOS/Linux: disabled by default.
-# Leave `textractor_path` empty on Windows to auto-discover TextractorCLI.exe from PATH
-# or common install locations under LOCALAPPDATA / Program Files.
 textractor_path = ""
-# Leave empty to use the latest Textractor release metadata from GitHub.
 install_release_api_url = ""
-# Leave empty to use the platform default install directory.
-# Windows default: %LOCALAPPDATA%/Programs/Textractor
 install_target_dir = ""
-# Used by the one-click installer download and extraction flow.
 install_timeout_seconds = 60
 auto_detect = true
-# Hook codes to send to Textractor after attaching to a game process.
-# Each entry must be a valid /H code string, e.g. "/HQ14+3C@GameAssembly.dll#0x33A440".
-# These are needed for IL2CPP Unity games and other engines where default hooks fail.
-# Multiple codes can be listed; they will be sent sequentially after attach.
-hook_codes = ["/HQ14+3C@GameAssembly.dll#0x33A440"]
+hook_codes = [
+    "/HQ14+3C@GameAssembly.dll#0x33A440",
+]
 poll_interval_seconds = 1
 
 [ocr_reader]
-# Leave `enabled` unset to use platform defaults.
-# Windows: enabled by default as the current primary fallback when Bridge SDK has no usable session.
-# macOS/Linux: disabled by default.
 enabled = true
 backend_selection = "rapidocr"
 capture_backend = "dxcam"
@@ -83,13 +74,22 @@ install_manifest_url = ""
 install_target_dir = ""
 install_timeout_seconds = 60
 poll_interval_seconds = 1
-trigger_mode = "after_advance"
+trigger_mode = "interval"
 no_text_takeover_after_seconds = 30
 languages = "chi_sim+jpn+eng"
 left_inset_ratio = 0.05
 right_inset_ratio = 0.05
 top_ratio = 0.62
 bottom_inset_ratio = 0.08
+screen_awareness_full_frame_ocr = true
+screen_awareness_multi_region_ocr = true
+screen_awareness_visual_rules = true
+screen_awareness_sample_collection_enabled = false
+screen_awareness_sample_dir = ""
+screen_awareness_model_enabled = false
+screen_awareness_model_path = ""
+screen_awareness_model_min_confidence = 0.55
+screen_templates = []
 
 [rapidocr]
 enabled = true

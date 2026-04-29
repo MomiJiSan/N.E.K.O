@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from enum import Enum
 import json
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from plugin.sdk.shared.models import Err
 
@@ -20,6 +21,17 @@ from .service import (
 _EXPLAIN_EVIDENCE_TYPES = frozenset({"current_line", "history_line", "choice"})
 _KEY_POINT_TYPES = frozenset({"plot", "emotion", "decision", "reveal", "objective"})
 _LLM_RESPONSE_CACHE_MAX_ITEMS = 50
+_LLM_PROVIDER_BACKOFF_SECONDS = 2.0
+_LLM_PROVIDER_BACKOFF_CATEGORIES = frozenset({"busy", "gateway_unavailable", "timeout"})
+
+
+class PluginErrorCategory(str, Enum):
+    TIMEOUT = "timeout"
+    BUSY = "busy"
+    PROVIDER_REJECTED = "provider_rejected"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    ENTRY_UNAVAILABLE = "entry_unavailable"
+    INTERNAL_ERROR = "internal_error"
 
 
 def _json_payload_copy(value: Any) -> Any:
@@ -27,6 +39,34 @@ def _json_payload_copy(value: Any) -> Any:
         return json.loads(json.dumps(value, ensure_ascii=False))
     except (TypeError, ValueError):
         return json_copy(value)
+
+
+def _stable_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_json_value(value[key])
+            for key in sorted(value.keys(), key=lambda item: str(item))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_json_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized_items = [_stable_json_value(item) for item in value]
+        return sorted(
+            normalized_items,
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+        )
+    return {"__non_json_type__": f"{type(value).__module__}.{type(value).__qualname__}"}
+
+
+def _stable_json_fingerprint(value: Any) -> str:
+    return json.dumps(
+        _stable_json_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class LLMGateway:
@@ -39,6 +79,7 @@ class LLMGateway:
         self._lock: asyncio.Lock | None = None
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._provider_backoff: dict[tuple[str, str], tuple[float, str]] = {}
         self._active_calls = 0
 
     def update_config(self, config) -> None:
@@ -57,6 +98,7 @@ class LLMGateway:
         for task in self._inflight.values():
             self._cancel_foreign_task(task)
         self._inflight.clear()
+        self._provider_backoff.clear()
         self._active_calls = 0
 
     @staticmethod
@@ -80,6 +122,7 @@ class LLMGateway:
             tasks = list(self._inflight.values())
             self._inflight.clear()
             self._cache.clear()
+            self._provider_backoff.clear()
             self._active_calls = 0
         for task in tasks:
             task.cancel()
@@ -141,6 +184,7 @@ class LLMGateway:
     ) -> dict[str, Any]:
         self._ensure_loop_affinity()
         fingerprint = self._cache_fingerprint(operation, context)
+        provider_key = self._provider_backoff_key()
         now = time.monotonic()
         wait_task: asyncio.Task[dict[str, Any]] | None = None
 
@@ -151,6 +195,11 @@ class LLMGateway:
                 return _json_payload_copy(cached[1])
             if cached is not None:
                 self._cache.pop(fingerprint, None)
+
+            backoff = self._active_provider_backoff_locked(provider_key, now=now)
+            if backoff is not None:
+                _category, diagnostic = backoff
+                return degraded(diagnostic)
 
             in_flight = self._inflight.get(fingerprint)
             if in_flight is not None:
@@ -163,6 +212,7 @@ class LLMGateway:
                 wait_task = asyncio.create_task(
                     self._perform_call(
                         fingerprint=fingerprint,
+                        provider_key=provider_key,
                         operation=operation,
                         context=context,
                         validate=validate,
@@ -171,25 +221,20 @@ class LLMGateway:
                 )
                 self._inflight[fingerprint] = wait_task
 
-        return _json_payload_copy(await wait_task)
+        try:
+            return _json_payload_copy(await wait_task)
+        except asyncio.CancelledError:
+            return degraded("cancelled: llm request was cancelled")
 
     @staticmethod
     def _cache_fingerprint(operation: str, context: dict[str, Any]) -> str:
-        try:
-            normalized_context = json.dumps(
-                context,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        except (TypeError, ValueError):
-            normalized_context = repr(context)
-        return f"{operation}:{normalized_context}"
+        return f"{operation}:{_stable_json_fingerprint(context)}"
 
     async def _perform_call(
         self,
         *,
         fingerprint: str,
+        provider_key: str,
         operation: str,
         context: dict[str, Any],
         validate: Callable[[dict[str, Any]], dict[str, Any]],
@@ -204,6 +249,11 @@ class LLMGateway:
             )
             ttl = max(0.0, float(self._config.llm_request_cache_ttl_seconds))
             async with self._lock:
+                self._update_provider_backoff_locked(
+                    provider_key,
+                    result,
+                    now=time.monotonic(),
+                )
                 if ttl > 0:
                     self._cache[fingerprint] = (time.monotonic() + ttl, _json_payload_copy(result))
                     self._cache.move_to_end(fingerprint)
@@ -214,6 +264,64 @@ class LLMGateway:
             async with self._lock:
                 self._inflight.pop(fingerprint, None)
                 self._active_calls = max(0, self._active_calls - 1)
+
+    def _provider_backoff_key(self) -> str:
+        target_entry_ref = str(self._config.llm_target_entry_ref or "").strip()
+        return f"target:{target_entry_ref}" if target_entry_ref else "internal"
+
+    def _active_provider_backoff_locked(
+        self,
+        provider_key: str,
+        *,
+        now: float,
+    ) -> tuple[str, str] | None:
+        active: tuple[str, str, float] | None = None
+        expired_keys: list[tuple[str, str]] = []
+        for key, (expires_at, diagnostic) in self._provider_backoff.items():
+            key_provider, category = key
+            if expires_at <= now:
+                expired_keys.append(key)
+                continue
+            if key_provider != provider_key:
+                continue
+            if active is None or expires_at > active[2]:
+                active = (category, diagnostic, expires_at)
+        for key in expired_keys:
+            self._provider_backoff.pop(key, None)
+        if active is None:
+            return None
+        return active[0], active[1]
+
+    def _update_provider_backoff_locked(
+        self,
+        provider_key: str,
+        result: dict[str, Any],
+        *,
+        now: float,
+    ) -> None:
+        if not bool(result.get("degraded")):
+            self._clear_provider_backoff_locked(provider_key)
+            return
+        diagnostic = str(result.get("diagnostic") or "").strip()
+        category = self._provider_backoff_category(diagnostic)
+        if category is None:
+            return
+        self._provider_backoff[(provider_key, category)] = (
+            now + _LLM_PROVIDER_BACKOFF_SECONDS,
+            diagnostic or category,
+        )
+
+    def _clear_provider_backoff_locked(self, provider_key: str) -> None:
+        for key in list(self._provider_backoff):
+            if key[0] == provider_key:
+                self._provider_backoff.pop(key, None)
+
+    @staticmethod
+    def _provider_backoff_category(diagnostic: str) -> str | None:
+        category = str(diagnostic or "").split(":", 1)[0].strip()
+        if category in _LLM_PROVIDER_BACKOFF_CATEGORIES:
+            return category
+        return None
 
     async def _call_target(
         self,
@@ -292,11 +400,47 @@ class LLMGateway:
     @staticmethod
     def _normalize_plugin_error(error: object) -> str:
         message = str(error or "plugin call failed").strip() or "plugin call failed"
+        category = LLMGateway._classify_plugin_error(error, message=message)
+        if category == PluginErrorCategory.TIMEOUT:
+            return f"timeout: {message}"
+        if category == PluginErrorCategory.BUSY:
+            return "busy: provider rate limited"
+        if category == PluginErrorCategory.PROVIDER_REJECTED:
+            return "gateway_unavailable: provider rejected request"
+        if category == PluginErrorCategory.PROVIDER_UNAVAILABLE:
+            return "gateway_unavailable: provider unavailable"
+        if category == PluginErrorCategory.ENTRY_UNAVAILABLE:
+            return f"gateway_unavailable: {message}"
+        return f"internal_error: {message}"
+
+    @staticmethod
+    def _classify_plugin_error(error: object, *, message: str) -> PluginErrorCategory:
+        status_code = LLMGateway._error_attr(error, "status_code", "status", "code")
+        if status_code in {"408", "504"}:
+            return PluginErrorCategory.TIMEOUT
+        if status_code == "429":
+            return PluginErrorCategory.BUSY
+        if status_code in {"400", "401", "403"}:
+            return PluginErrorCategory.PROVIDER_REJECTED
+        if status_code in {"502", "503"}:
+            return PluginErrorCategory.PROVIDER_UNAVAILABLE
+        error_type = LLMGateway._error_attr(error, "type", "error_type", "kind")
+        normalized_type = error_type.lower().replace("-", "_").replace(" ", "_")
+        if normalized_type in {"timeout", "timed_out", "request_timeout"}:
+            return PluginErrorCategory.TIMEOUT
+        if normalized_type in {"rate_limit", "rate_limited", "too_many_requests"}:
+            return PluginErrorCategory.BUSY
+        if normalized_type in {"authentication_error", "permission_error", "invalid_request"}:
+            return PluginErrorCategory.PROVIDER_REJECTED
+        if normalized_type in {"service_unavailable", "network_error", "connection_error"}:
+            return PluginErrorCategory.PROVIDER_UNAVAILABLE
+        if normalized_type in {"not_found", "invalid_entry"}:
+            return PluginErrorCategory.ENTRY_UNAVAILABLE
         lowered = message.lower()
         if "timeout" in lowered:
-            return f"timeout: {message}"
+            return PluginErrorCategory.TIMEOUT
         if any(token in lowered for token in ("rate limit", "too many requests", "429")):
-            return "busy: provider rate limited"
+            return PluginErrorCategory.BUSY
         if any(
             token in lowered
             for token in (
@@ -312,7 +456,7 @@ class LLMGateway:
                 "permission denied",
             )
         ):
-            return "gateway_unavailable: provider rejected request"
+            return PluginErrorCategory.PROVIDER_REJECTED
         if any(
             token in lowered
             for token in (
@@ -328,10 +472,24 @@ class LLMGateway:
                 "overloaded",
             )
         ):
-            return "gateway_unavailable: provider unavailable"
+            return PluginErrorCategory.PROVIDER_UNAVAILABLE
         if "not found" in lowered or "invalid entry" in lowered:
-            return f"gateway_unavailable: {message}"
-        return f"internal_error: {message}"
+            return PluginErrorCategory.ENTRY_UNAVAILABLE
+        return PluginErrorCategory.INTERNAL_ERROR
+
+    @staticmethod
+    def _error_attr(error: object, *names: str) -> str:
+        if isinstance(error, Mapping):
+            for name in names:
+                value = error.get(name)
+                if value is not None:
+                    return str(value).strip()
+            return ""
+        for name in names:
+            value = getattr(error, name, None)
+            if value is not None:
+                return str(value).strip()
+        return ""
 
     @staticmethod
     def _validate_explain_result(raw: dict[str, Any]) -> dict[str, Any]:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
-from typing import Any
+from typing import Any, Protocol
 
 from plugin.sdk.plugin import SdkError
 
@@ -21,6 +22,16 @@ _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTA
 _JSON_CORRECTION_MAX_ATTEMPTS = 1
 _JSON_CORRECTION_BAD_OUTPUT_MAX_CHARS = 12000
 _JSON_CORRECTION_ERROR_MAX_CHARS = 600
+_LLM_CALL_MAX_ATTEMPTS = 3
+_LLM_CALL_RETRY_BASE_DELAY_SECONDS = 0.25
+
+
+class LoggerLike(Protocol):
+    def debug(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def warning(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def error(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 def _as_str(value: object, default: str = "") -> str:
@@ -46,24 +57,170 @@ def _bounded_prompt_text(value: object, *, max_chars: int) -> str:
     return f"{text[:max_chars]}\n...[truncated {omitted} chars]"
 
 
+def _api_key_cache_fingerprint(api_key: str) -> str:
+    if not api_key:
+        return ""
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
+def _model_supports_vision(model: str) -> bool:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-4.5",
+            "gpt-5",
+            "vision",
+            "vl",
+            "qwen2.5-vl",
+            "qwen-vl",
+            "gemini",
+            "claude-3",
+            "claude-4",
+        )
+    )
+
+
+def _message_has_image_content(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(item, dict) and item.get("type") == "image_url" for item in content)
+
+
+def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stripped: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            stripped.append(dict(message))
+            continue
+        text_parts = [
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        next_message = dict(message)
+        next_message["content"] = "\n".join(part for part in text_parts if part).strip()
+        stripped.append(next_message)
+    return stripped
+
+
+def _attach_vision_image_if_requested(
+    messages: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not bool(context.get("vision_enabled")):
+        return messages
+    image_base64 = str(
+        context.get("vision_image_base64") or context.get("screen_image_base64") or ""
+    ).strip()
+    if not image_base64:
+        return messages
+    image_url = (
+        image_base64
+        if image_base64.startswith("data:image/")
+        else f"data:image/png;base64,{image_base64}"
+    )
+    detail = str(context.get("vision_detail") or "low").strip().lower()
+    if detail not in {"low", "high", "auto"}:
+        detail = "low"
+    result = [dict(message) for message in messages]
+    for index in range(len(result) - 1, -1, -1):
+        if str(result[index].get("role") or "") != "user":
+            continue
+        result[index]["content"] = [
+            {"type": "text", "text": str(result[index].get("content") or "")},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": image_url,
+                    "detail": detail,
+                },
+            },
+        ]
+        return result
+    return result
+
+
 class GalgameLLMBackend:
-    def __init__(self, logger) -> None:
+    def __init__(self, logger: LoggerLike) -> None:
         self._logger = logger
         self._llm_cache: dict[tuple[Any, ...], ChatOpenAI] = {}
+        self._llm_cache_loop: asyncio.AbstractEventLoop | None = None
+        self._llm_cache_lock: asyncio.Lock | None = None
+
+    def _ensure_loop_affinity(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._llm_cache_loop is loop and self._llm_cache_lock is not None:
+            return
+        if self._llm_cache_loop is not None and self._llm_cache_loop is not loop:
+            self._drop_loop_bound_cache(previous_loop=self._llm_cache_loop)
+        self._llm_cache_loop = loop
         self._llm_cache_lock = asyncio.Lock()
 
+    def _cache_lock(self) -> asyncio.Lock:
+        self._ensure_loop_affinity()
+        assert self._llm_cache_lock is not None
+        return self._llm_cache_lock
+
+    def _drop_loop_bound_cache(
+        self,
+        *,
+        previous_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        llms = list(self._llm_cache.values())
+        self._llm_cache.clear()
+        if not llms:
+            return
+        if previous_loop.is_closed():
+            for llm in llms:
+                close = getattr(llm, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            return
+        for llm in llms:
+            try:
+                previous_loop.call_soon_threadsafe(
+                    lambda current=llm: previous_loop.create_task(
+                        self._close_llm_client(current, reason="loop switch")
+                    )
+                )
+            except RuntimeError:
+                close = getattr(llm, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+    async def _close_llm_client(self, llm: ChatOpenAI, *, reason: str) -> None:
+        try:
+            await llm.aclose()
+        except Exception as exc:
+            try:
+                self._logger.warning(
+                    "galgame LLM client close failed during {}: {}",
+                    reason,
+                    exc,
+                )
+            except Exception:
+                pass
+
     async def shutdown(self) -> None:
-        async with self._llm_cache_lock:
+        async with self._cache_lock():
             llms = list(self._llm_cache.values())
             self._llm_cache.clear()
         for llm in llms:
-            try:
-                await llm.aclose()
-            except Exception as exc:
-                try:
-                    self._logger.warning("galgame LLM client close failed: {}", exc)
-                except Exception:
-                    pass
+            await self._close_llm_client(llm, reason="shutdown")
 
     async def invoke(
         self,
@@ -82,7 +239,10 @@ class GalgameLLMBackend:
         operation: str,
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        messages = self._build_messages(operation, context)
+        messages = _attach_vision_image_if_requested(
+            self._build_messages(operation, context),
+            context,
+        )
         raw_text = await self._invoke_json_with_correction(
             operation=operation,
             messages=messages,
@@ -94,7 +254,7 @@ class GalgameLLMBackend:
         self,
         *,
         operation: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
     ) -> str:
         raw_text = await self._call_model(
             operation=operation,
@@ -132,12 +292,12 @@ class GalgameLLMBackend:
         self,
         *,
         operation: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         bad_output: object,
         parse_error: object,
         attempt: int,
         max_attempts: int,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if operation not in _ALLOWED_OPERATIONS:
             raise SdkError(f"unsupported operation: {operation!r}")
         bounded_bad_output = _bounded_prompt_text(
@@ -167,7 +327,7 @@ class GalgameLLMBackend:
         self,
         *,
         operation: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
     ) -> str:
         model_role = "agent" if operation == "agent_reply" else "summary"
         api_config = get_config_manager().get_model_api_config(model_role)
@@ -176,13 +336,15 @@ class GalgameLLMBackend:
         api_key = _as_str(api_config.get("api_key")).strip()
         if not base_url or not model:
             raise SdkError(f"missing configured {model_role} model")
+        if any(_message_has_image_content(message) for message in messages) and not _model_supports_vision(model):
+            messages = _strip_image_content(messages)
 
         temperature = 0.2 if operation == "agent_reply" else 0.0
         max_completion_tokens = 900 if operation == "agent_reply" else 1200
         cache_key = (
             model_role,
             base_url,
-            api_key,
+            _api_key_cache_fingerprint(api_key),
             model,
             temperature,
             max_completion_tokens,
@@ -195,13 +357,49 @@ class GalgameLLMBackend:
             temperature=temperature,
             max_completion_tokens=max_completion_tokens,
         )
-        set_call_type("agent" if model_role == "agent" else "summary")
+        return await self._invoke_llm_with_retry(
+            model_role=model_role,
+            llm=llm,
+            messages=messages,
+        )
+
+    async def _invoke_llm_with_retry(
+        self,
+        *,
+        model_role: str,
+        llm: ChatOpenAI,
+        messages: list[dict[str, Any]],
+    ) -> str:
         ainvoke = getattr(llm, "ainvoke", None)
-        if callable(ainvoke):
-            response = await ainvoke(messages)
-        else:
-            response = await asyncio.to_thread(llm.invoke, messages)
-        return _as_str(getattr(response, "content", ""), str(response))
+        last_exc: Exception | None = None
+        for attempt in range(_LLM_CALL_MAX_ATTEMPTS):
+            try:
+                set_call_type("agent" if model_role == "agent" else "summary")
+                if callable(ainvoke):
+                    response = await ainvoke(messages)
+                else:
+                    response = await asyncio.to_thread(llm.invoke, messages)
+                return _as_str(getattr(response, "content", ""), str(response))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= _LLM_CALL_MAX_ATTEMPTS - 1:
+                    raise
+                delay = _LLM_CALL_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+                try:
+                    self._logger.warning(
+                        "galgame LLM {} call failed; retrying {}/{} after {:.2f}s: {}",
+                        model_role,
+                        attempt + 1,
+                        _LLM_CALL_MAX_ATTEMPTS,
+                        delay,
+                        exc,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(delay)
+        raise last_exc or RuntimeError("galgame LLM call failed")
 
     async def _get_or_create_llm(
         self,
@@ -213,7 +411,7 @@ class GalgameLLMBackend:
         temperature: float,
         max_completion_tokens: int,
     ) -> ChatOpenAI:
-        async with self._llm_cache_lock:
+        async with self._cache_lock():
             cached = self._llm_cache.get(cache_key)
             if cached is not None:
                 return cached

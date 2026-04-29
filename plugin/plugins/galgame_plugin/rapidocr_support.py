@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator
@@ -28,6 +29,7 @@ DEFAULT_RAPIDOCR_PIP_SPEC = "rapidocr_onnxruntime"
 DEFAULT_ONNXRUNTIME_PIP_SPEC = "onnxruntime"
 _INSTALL_STATE_NAME = "install_state.json"
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+_RAPIDOCR_IMPORT_CONTEXT_LOCK = threading.RLock()
 
 
 def _expand_candidate_path(raw_path: str) -> Path:
@@ -100,6 +102,65 @@ def _default_install_manifest(
         "model_type": model_type,
         "ocr_version": ocr_version,
     }
+
+
+def _normalize_sha256(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("sha256:"):
+        text = text.split(":", 1)[1].strip()
+    if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
+        return text
+    return ""
+
+
+def _package_hash_args(package: dict[str, Any]) -> list[str]:
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for key in ("sha256", "digest", "checksum"):
+        digest = _normalize_sha256(package.get(key))
+        if digest and digest not in seen:
+            seen.add(digest)
+            hashes.append(f"--hash=sha256:{digest}")
+    hashes_obj = package.get("hashes")
+    if isinstance(hashes_obj, list):
+        for item in hashes_obj:
+            digest = _normalize_sha256(item)
+            if digest and digest not in seen:
+                seen.add(digest)
+                hashes.append(f"--hash=sha256:{digest}")
+    return hashes
+
+
+def _rapidocr_package_install_plan(
+    packages_obj: object,
+) -> tuple[list[str], list[str], bool]:
+    display_specs: list[str] = []
+    package_args: list[str] = []
+    package_hashes: list[list[str]] = []
+    if isinstance(packages_obj, list):
+        for item in packages_obj:
+            if not isinstance(item, dict):
+                continue
+            spec = str(item.get("spec") or "").strip()
+            if not spec:
+                continue
+            hashes = _package_hash_args(item)
+            display_specs.append(spec)
+            package_args.extend([spec, *hashes])
+            package_hashes.append(hashes)
+    if not display_specs:
+        return (
+            [DEFAULT_RAPIDOCR_PIP_SPEC, DEFAULT_ONNXRUNTIME_PIP_SPEC],
+            [DEFAULT_RAPIDOCR_PIP_SPEC, DEFAULT_ONNXRUNTIME_PIP_SPEC],
+            False,
+        )
+    has_any_hash = any(package_hashes)
+    if has_any_hash and not all(package_hashes):
+        raise RuntimeError(
+            "rapidocr install manifest must include sha256 hashes for every package "
+            "when package hashes are used"
+        )
+    return package_args, display_specs, has_any_hash
 
 
 def _localized_rapidocr_install_error(
@@ -248,52 +309,53 @@ def _rapidocr_import_context(
     site_packages_dir: Path,
     model_cache_dir: Path,
 ) -> Iterator[None]:
-    inserted = False
-    old_model_dir = os.environ.get("RAPIDOCR_MODEL_DIR")
-    old_model_home = os.environ.get("RAPIDOCR_MODEL_HOME")
-    dll_handles: list[Any] = []
-    if site_packages_dir:
-        site_packages_dir.mkdir(parents=True, exist_ok=True)
-        site_path = str(site_packages_dir)
-        if site_path not in sys.path:
-            sys.path.insert(0, site_path)
-            inserted = True
-        if hasattr(os, "add_dll_directory"):
-            for candidate in (
-                site_packages_dir,
-                site_packages_dir / "onnxruntime",
-                site_packages_dir / "onnxruntime" / "capi",
-            ):
-                if candidate.is_dir():
-                    try:
-                        dll_handles.append(os.add_dll_directory(str(candidate)))
-                    except OSError:
-                        continue
-    if model_cache_dir:
-        model_cache_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["RAPIDOCR_MODEL_DIR"] = str(model_cache_dir)
-        os.environ["RAPIDOCR_MODEL_HOME"] = str(model_cache_dir)
-    try:
-        yield
-    finally:
-        for handle in dll_handles:
-            try:
-                handle.close()
-            except Exception:
-                pass
-        if old_model_dir is None:
-            os.environ.pop("RAPIDOCR_MODEL_DIR", None)
-        else:
-            os.environ["RAPIDOCR_MODEL_DIR"] = old_model_dir
-        if old_model_home is None:
-            os.environ.pop("RAPIDOCR_MODEL_HOME", None)
-        else:
-            os.environ["RAPIDOCR_MODEL_HOME"] = old_model_home
-        if inserted:
-            try:
-                sys.path.remove(str(site_packages_dir))
-            except ValueError:
-                pass
+    with _RAPIDOCR_IMPORT_CONTEXT_LOCK:
+        inserted = False
+        old_model_dir = os.environ.get("RAPIDOCR_MODEL_DIR")
+        old_model_home = os.environ.get("RAPIDOCR_MODEL_HOME")
+        dll_handles: list[Any] = []
+        if site_packages_dir:
+            site_packages_dir.mkdir(parents=True, exist_ok=True)
+            site_path = str(site_packages_dir)
+            if site_path not in sys.path:
+                sys.path.insert(0, site_path)
+                inserted = True
+            if hasattr(os, "add_dll_directory"):
+                for candidate in (
+                    site_packages_dir,
+                    site_packages_dir / "onnxruntime",
+                    site_packages_dir / "onnxruntime" / "capi",
+                ):
+                    if candidate.is_dir():
+                        try:
+                            dll_handles.append(os.add_dll_directory(str(candidate)))
+                        except OSError:
+                            continue
+        if model_cache_dir:
+            model_cache_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["RAPIDOCR_MODEL_DIR"] = str(model_cache_dir)
+            os.environ["RAPIDOCR_MODEL_HOME"] = str(model_cache_dir)
+        try:
+            yield
+        finally:
+            for handle in dll_handles:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            if old_model_dir is None:
+                os.environ.pop("RAPIDOCR_MODEL_DIR", None)
+            else:
+                os.environ["RAPIDOCR_MODEL_DIR"] = old_model_dir
+            if old_model_home is None:
+                os.environ.pop("RAPIDOCR_MODEL_HOME", None)
+            else:
+                os.environ["RAPIDOCR_MODEL_HOME"] = old_model_home
+            if inserted:
+                try:
+                    sys.path.remove(str(site_packages_dir))
+                except ValueError:
+                    pass
 
 
 def _rapidocr_package_dir(raw_target_dir: str) -> Path:
@@ -550,6 +612,7 @@ def _run_pip_install(
     site_packages_dir: Path,
     packages: list[str],
     timeout_seconds: float,
+    require_hashes: bool = False,
 ) -> None:
     temp_root = site_packages_dir.parent / "tmp"
     env = _rapidocr_temp_env(temp_root=temp_root)
@@ -564,8 +627,10 @@ def _run_pip_install(
         "--no-warn-script-location",
         "--target",
         str(site_packages_dir),
-        *packages,
     ]
+    if require_hashes:
+        command.append("--require-hashes")
+    command.extend(packages)
     _run_subprocess(command, timeout_seconds=timeout_seconds, env=env)
 
 
@@ -670,6 +735,8 @@ async def install_rapidocr(
     client: httpx.AsyncClient | None = None
     current_phase = "metadata"
     package_specs: list[str] = []
+    package_install_args: list[str] = []
+    require_package_hashes = False
     install_succeeded = False
     if client_factory is None:
         client = httpx.AsyncClient(
@@ -693,14 +760,9 @@ async def install_rapidocr(
             client=client,
         )
         release_name = str(manifest.get("name") or "RapidOCR ONNXRuntime")
-        packages_obj = manifest.get("packages")
-        package_specs = [
-            str(item.get("spec") or "").strip()
-            for item in packages_obj
-            if isinstance(item, dict) and str(item.get("spec") or "").strip()
-        ] if isinstance(packages_obj, list) else []
-        if not package_specs:
-            package_specs = [DEFAULT_RAPIDOCR_PIP_SPEC, DEFAULT_ONNXRUNTIME_PIP_SPEC]
+        package_install_args, package_specs, require_package_hashes = (
+            _rapidocr_package_install_plan(manifest.get("packages"))
+        )
         asset_name = ", ".join(package_specs)
 
         runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -729,8 +791,9 @@ async def install_rapidocr(
         await asyncio.to_thread(
             _run_pip_install,
             site_packages_dir=site_packages_dir,
-            packages=package_specs,
+            packages=package_install_args,
             timeout_seconds=timeout_seconds,
+            require_hashes=require_package_hashes,
         )
 
         verifying_progress = {

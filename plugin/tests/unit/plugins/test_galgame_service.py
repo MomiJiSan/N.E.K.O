@@ -5,10 +5,16 @@ from types import SimpleNamespace
 import pytest
 
 from plugin.plugins.galgame_plugin import service as galgame_service
-from plugin.plugins.galgame_plugin.models import DATA_SOURCE_OCR_READER
+from plugin.plugins.galgame_plugin.models import (
+    DATA_SOURCE_BRIDGE_SDK,
+    DATA_SOURCE_MEMORY_READER,
+    DATA_SOURCE_OCR_READER,
+    SessionCandidate,
+)
 from plugin.plugins.galgame_plugin.service import (
     build_explain_context,
     build_summarize_context,
+    choose_candidate,
 )
 
 
@@ -69,6 +75,33 @@ def _patch_status_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(galgame_service, "_current_process_performance", lambda: {})
 
 
+def _candidate(
+    tmp_path,
+    *,
+    game_id: str,
+    data_source: str,
+    text: str = "",
+    choices: list[dict[str, object]] | None = None,
+    last_seq: int = 1,
+) -> SessionCandidate:
+    return SessionCandidate(
+        game_id=game_id,
+        session_path=tmp_path / game_id / "session.json",
+        events_path=tmp_path / game_id / "events.jsonl",
+        data_source=data_source,
+        session={
+            "session_id": f"session-{game_id}",
+            "started_at": "2026-04-29T00:00:00Z",
+            "last_seq": last_seq,
+            "state": {
+                "text": text,
+                "choices": list(choices or []),
+                "ts": "2026-04-29T00:00:01Z",
+            },
+        },
+    )
+
+
 def _status_state(**overrides: object) -> SimpleNamespace:
     values: dict[str, object] = {
         "current_connection_state": "active",
@@ -121,6 +154,44 @@ def test_service_explain_context_uses_history_when_snapshot_is_diagnostic() -> N
     assert context["text"] == "今天先回去吧。"
     assert context["evidence"]
     assert context["input_degraded"] is True
+
+
+def test_choose_candidate_auto_prefers_bridge_text_then_memory_text(tmp_path) -> None:
+    bridge = _candidate(
+        tmp_path,
+        game_id="bridge",
+        data_source=DATA_SOURCE_BRIDGE_SDK,
+        text="stable bridge text",
+        last_seq=1,
+    )
+    memory = _candidate(
+        tmp_path,
+        game_id="memory",
+        data_source=DATA_SOURCE_MEMORY_READER,
+        text="memory reader text",
+        last_seq=100,
+    )
+
+    assert choose_candidate(
+        {"bridge": bridge, "memory": memory},
+        bound_game_id="",
+        current_game_id="",
+        keep_current=False,
+    ) is bridge
+
+    empty_bridge = _candidate(
+        tmp_path,
+        game_id="empty-bridge",
+        data_source=DATA_SOURCE_BRIDGE_SDK,
+        text="",
+        last_seq=200,
+    )
+    assert choose_candidate(
+        {"empty-bridge": empty_bridge, "memory": memory},
+        bound_game_id="",
+        current_game_id="",
+        keep_current=False,
+    ) is memory
 
 
 def test_status_payload_snapshot_fast_path_skips_json_copy(monkeypatch: pytest.MonkeyPatch) -> None:

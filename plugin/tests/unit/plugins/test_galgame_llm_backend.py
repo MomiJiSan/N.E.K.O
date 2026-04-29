@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import tomllib
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from plugin.plugins.galgame_plugin import llm_backend as galgame_llm_backend
 from plugin.plugins.galgame_plugin.llm_backend import GalgameLLMBackend
 from plugin.sdk.plugin import SdkError
 
@@ -26,6 +28,14 @@ class _Logger:
 
     def exception(self, *args, **kwargs):
         return None
+
+
+def _run_in_new_loop(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 @pytest.mark.plugin_unit
@@ -71,6 +81,25 @@ def test_llm_backend_prompt_message_contracts_are_stable() -> None:
     )
 
 
+@pytest.mark.plugin_unit
+def test_llm_backend_cache_lock_rebinds_between_event_loops() -> None:
+    backend = GalgameLLMBackend(_Logger())
+    loops: list[asyncio.AbstractEventLoop | None] = []
+    locks: list[asyncio.Lock] = []
+
+    async def _lock_identity() -> None:
+        lock = backend._cache_lock()
+        async with lock:
+            loops.append(backend._llm_cache_loop)
+            locks.append(lock)
+
+    _run_in_new_loop(_lock_identity())
+    _run_in_new_loop(_lock_identity())
+
+    assert loops[0] is not loops[1]
+    assert locks[0] is not locks[1]
+
+
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
 async def test_llm_backend_json_correction_prompt_preserves_invalid_reply() -> None:
@@ -98,6 +127,186 @@ async def test_llm_backend_json_correction_prompt_preserves_invalid_reply() -> N
     assert calls[1][-2] == {"role": "assistant", "content": "not-json"}
     assert calls[1][-1]["role"] == "user"
     assert "JSON" in calls[1][-1]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_backend_cache_key_uses_api_key_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-test-secret"
+    captured: dict[str, object] = {}
+
+    class _Config:
+        def get_model_api_config(self, role: str) -> dict[str, str]:
+            assert role == "summary"
+            return {
+                "base_url": "https://llm.example.test",
+                "model": "demo-model",
+                "api_key": secret,
+            }
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            del messages
+            return type("Response", (), {"content": "{}"})()
+
+    async def _fake_get_or_create_llm(**kwargs):
+        captured.update(kwargs)
+        return _FakeLLM()
+
+    backend = GalgameLLMBackend(_Logger())
+    monkeypatch.setattr(galgame_llm_backend, "get_config_manager", lambda: _Config())
+    monkeypatch.setattr(backend, "_get_or_create_llm", _fake_get_or_create_llm)
+
+    result = await backend._call_model(
+        operation="explain_line",
+        messages=[{"role": "user", "content": "{}"}],
+    )
+
+    expected_fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
+    cache_key = captured["cache_key"]
+    assert result == "{}"
+    assert captured["api_key"] == secret
+    assert secret not in repr(cache_key)
+    assert f"sha256:{expected_fingerprint}" in cache_key
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_backend_retries_transient_model_call_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    class _Config:
+        def get_model_api_config(self, role: str) -> dict[str, str]:
+            assert role == "summary"
+            return {
+                "base_url": "https://llm.example.test",
+                "model": "demo-model",
+                "api_key": "sk-test",
+            }
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            nonlocal calls
+            del messages
+            calls += 1
+            if calls < 3:
+                raise TimeoutError(f"temporary failure {calls}")
+            return type("Response", (), {"content": '{"ok": true}'})()
+
+    async def _fake_get_or_create_llm(**kwargs):
+        del kwargs
+        return _FakeLLM()
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    backend = GalgameLLMBackend(_Logger())
+    monkeypatch.setattr(galgame_llm_backend, "get_config_manager", lambda: _Config())
+    monkeypatch.setattr(galgame_llm_backend.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(backend, "_get_or_create_llm", _fake_get_or_create_llm)
+
+    result = await backend._call_model(
+        operation="explain_line",
+        messages=[{"role": "user", "content": "{}"}],
+    )
+
+    assert result == '{"ok": true}'
+    assert calls == 3
+    assert sleeps == [0.25, 0.5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_backend_attaches_vision_image_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    class _Config:
+        def get_model_api_config(self, role: str) -> dict[str, str]:
+            assert role == "agent"
+            return {
+                "base_url": "https://llm.example.test",
+                "model": "gpt-4o-mini",
+                "api_key": "sk-test",
+            }
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            captured_messages.append(messages)
+            return type("Response", (), {"content": '{"reply": "ok"}'})()
+
+    async def _fake_get_or_create_llm(**kwargs):
+        del kwargs
+        return _FakeLLM()
+
+    backend = GalgameLLMBackend(_Logger())
+    monkeypatch.setattr(galgame_llm_backend, "get_config_manager", lambda: _Config())
+    monkeypatch.setattr(backend, "_get_or_create_llm", _fake_get_or_create_llm)
+
+    result = await backend.invoke(
+        operation="agent_reply",
+        context={
+            "prompt": "what is on screen?",
+            "public_context": {},
+            "vision_enabled": True,
+            "vision_image_base64": "abc123",
+        },
+    )
+
+    content = captured_messages[0][-1]["content"]
+    assert result["reply"] == "ok"
+    assert isinstance(content, list)
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"] == "data:image/png;base64,abc123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_llm_backend_strips_vision_image_for_non_vision_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    class _Config:
+        def get_model_api_config(self, role: str) -> dict[str, str]:
+            assert role == "summary"
+            return {
+                "base_url": "https://llm.example.test",
+                "model": "text-only-model",
+                "api_key": "sk-test",
+            }
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            captured_messages.append(messages)
+            return type("Response", (), {"content": "{}"})()
+
+    async def _fake_get_or_create_llm(**kwargs):
+        del kwargs
+        return _FakeLLM()
+
+    backend = GalgameLLMBackend(_Logger())
+    monkeypatch.setattr(galgame_llm_backend, "get_config_manager", lambda: _Config())
+    monkeypatch.setattr(backend, "_get_or_create_llm", _fake_get_or_create_llm)
+
+    result = await backend._call_model(
+        operation="explain_line",
+        messages=[
+            {"role": "user", "content": [
+                {"type": "text", "text": "context"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+        ],
+    )
+
+    assert result == "{}"
+    assert captured_messages[0][0]["content"] == "context"
 
 
 @pytest.mark.asyncio

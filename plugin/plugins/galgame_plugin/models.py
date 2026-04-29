@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, TypeAlias
 
 MODE_SILENT = "silent"
 MODE_COMPANION = "companion"
@@ -27,6 +28,8 @@ DATA_SOURCES = frozenset(
         DATA_SOURCE_OCR_READER,
     }
 )
+SharedStatePayload: TypeAlias = dict[str, Any]
+MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
 
 READER_MODE_AUTO = "auto"
 READER_MODE_MEMORY = DATA_SOURCE_MEMORY_READER
@@ -50,11 +53,25 @@ OCR_CAPTURE_PROFILE_RATIO_KEYS = (
 OCR_CAPTURE_PROFILE_STAGE_DEFAULT = "default"
 OCR_CAPTURE_PROFILE_STAGE_DIALOGUE = "dialogue_stage"
 OCR_CAPTURE_PROFILE_STAGE_MENU = "menu_stage"
+OCR_CAPTURE_PROFILE_STAGE_TITLE = "title_stage"
+OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD = "save_load_stage"
+OCR_CAPTURE_PROFILE_STAGE_CONFIG = "config_stage"
+OCR_CAPTURE_PROFILE_STAGE_TRANSITION = "transition_stage"
+OCR_CAPTURE_PROFILE_STAGE_GALLERY = "gallery_stage"
+OCR_CAPTURE_PROFILE_STAGE_MINIGAME = "minigame_stage"
+OCR_CAPTURE_PROFILE_STAGE_GAME_OVER = "game_over_stage"
 OCR_CAPTURE_PROFILE_STAGES = frozenset(
     {
         OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
         OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
         OCR_CAPTURE_PROFILE_STAGE_MENU,
+        OCR_CAPTURE_PROFILE_STAGE_TITLE,
+        OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+        OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+        OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+        OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+        OCR_CAPTURE_PROFILE_STAGE_MINIGAME,
+        OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
     }
 )
 OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY = "__window_buckets__"
@@ -126,14 +143,11 @@ def json_copy(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, list):
-        if all(item is None or isinstance(item, (str, int, float, bool)) for item in value):
-            return list(value)
+        return [json_copy(item) for item in value]
     elif isinstance(value, dict):
-        if all(
-            (item is None or isinstance(item, (str, int, float, bool)))
-            for item in value.values()
-        ):
-            return dict(value)
+        return {key: json_copy(item) for key, item in value.items()}
+    elif isinstance(value, tuple):
+        return tuple(json_copy(item) for item in value)
     return copy.deepcopy(value)
 
 
@@ -179,6 +193,15 @@ def _int(value: object, default: int = 0) -> int:
         return value
     try:
         return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
 
@@ -253,6 +276,87 @@ def sanitize_choice(value: object) -> dict[str, Any]:
     return choice
 
 
+def sanitize_screen_ui_element(value: object) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    element: dict[str, Any] = {
+        "text": _string(raw.get("text")),
+    }
+    element_id = _string(raw.get("element_id")).strip()
+    if element_id:
+        element["element_id"] = element_id
+    role = _string(raw.get("role")).strip()
+    if role:
+        element["role"] = role
+    sanitized_bounds = _sanitize_choice_bounds(raw.get("bounds"))
+    if sanitized_bounds:
+        element["bounds"] = sanitized_bounds
+    bounds_coordinate_space = _string(raw.get("bounds_coordinate_space")).strip()
+    if bounds_coordinate_space:
+        element["bounds_coordinate_space"] = bounds_coordinate_space
+    text_source = _string(raw.get("text_source") or raw.get("source")).strip()
+    if text_source:
+        element["text_source"] = text_source
+    source_size = raw.get("source_size")
+    if isinstance(source_size, dict):
+        try:
+            width = float(source_size.get("width"))  # type: ignore[arg-type]
+            height = float(source_size.get("height"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            width = 0.0
+            height = 0.0
+        if width > 0.0 and height > 0.0:
+            element["source_size"] = {"width": width, "height": height}
+    for rect_key in ("capture_rect", "window_rect"):
+        rect = raw.get(rect_key)
+        if not isinstance(rect, dict):
+            continue
+        sanitized_rect: dict[str, float] = {}
+        for key in ("left", "top", "right", "bottom"):
+            try:
+                sanitized_rect[key] = float(rect.get(key))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                sanitized_rect = {}
+                break
+        if (
+            sanitized_rect
+            and sanitized_rect["right"] > sanitized_rect["left"]
+            and sanitized_rect["bottom"] > sanitized_rect["top"]
+        ):
+            element[rect_key] = sanitized_rect
+    normalized_bounds = raw.get("normalized_bounds")
+    if isinstance(normalized_bounds, dict):
+        sanitized_normalized: dict[str, float] = {}
+        for key in ("left", "top", "right", "bottom"):
+            try:
+                value_float = float(normalized_bounds.get(key))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                sanitized_normalized = {}
+                break
+            sanitized_normalized[key] = max(0.0, min(value_float, 1.0))
+        if (
+            sanitized_normalized
+            and sanitized_normalized["right"] > sanitized_normalized["left"]
+            and sanitized_normalized["bottom"] > sanitized_normalized["top"]
+        ):
+            element["normalized_bounds"] = sanitized_normalized
+    if not element["text"] and "bounds" not in element:
+        return {}
+    return element
+
+
+def sanitize_screen_ui_elements(value: object, *, limit: int = 10) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    elements: list[dict[str, Any]] = []
+    for item in value:
+        sanitized = sanitize_screen_ui_element(item)
+        if sanitized:
+            elements.append(sanitized)
+        if len(elements) >= max(0, int(limit)):
+            break
+    return elements
+
+
 def sanitize_metadata(value: object) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     return {str(key): json_copy(item) for key, item in raw.items()}
@@ -276,6 +380,10 @@ def sanitize_snapshot_state(value: object) -> dict[str, Any]:
         "is_menu_open": _bool(raw.get("is_menu_open"), bool(choices)),
         "save_context": sanitize_save_context(raw.get("save_context")),
         "stability": _string(raw.get("stability")),
+        "screen_type": _string(raw.get("screen_type")),
+        "screen_ui_elements": sanitize_screen_ui_elements(raw.get("screen_ui_elements")),
+        "screen_confidence": _float(raw.get("screen_confidence"), 0.0),
+        "screen_debug": sanitize_metadata(raw.get("screen_debug")),
         "ts": _string(raw.get("ts")),
     }
 
@@ -332,56 +440,251 @@ def make_error(
     return payload
 
 
+class _ConfigFieldProxy:
+    def __init__(self, group_name: str, field_name: str) -> None:
+        self._group_name = group_name
+        self._field_name = field_name
+
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> Any:
+        if instance is None:
+            return self
+        return getattr(getattr(instance, self._group_name), self._field_name)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        setattr(getattr(instance, self._group_name), self._field_name, value)
+
+
 @dataclass(slots=True)
+class GalgameBridgeConfig:
+    bridge_root: Path = Path()
+    active_poll_interval_seconds: float = 1.0
+    idle_poll_interval_seconds: float = 3.0
+    stale_after_seconds: float = 15.0
+    default_mode: str = MODE_COMPANION
+    push_notifications: bool = True
+
+
+@dataclass(slots=True)
+class GalgameHistoryConfig:
+    history_events_limit: int = 500
+    history_lines_limit: int = 200
+    history_choices_limit: int = 50
+    dedupe_window_limit: int = 64
+    warmup_replay_bytes_limit: int = 65536
+    warmup_replay_events_limit: int = 50
+
+
+@dataclass(slots=True)
+class GalgameLLMConfig:
+    llm_call_timeout_seconds: float = 15.0
+    llm_max_in_flight: int = 2
+    llm_request_cache_ttl_seconds: float = 2.0
+    llm_target_entry_ref: str = ""
+    llm_vision_enabled: bool = False
+    llm_vision_max_image_px: int = 768
+
+
+@dataclass(slots=True)
+class GalgameReaderConfig:
+    reader_mode: str = READER_MODE_AUTO
+
+
+@dataclass(slots=True)
+class GalgameMemoryReaderConfig:
+    memory_reader_enabled: bool = False
+    memory_reader_textractor_path: str = ""
+    memory_reader_install_release_api_url: str = ""
+    memory_reader_install_target_dir: str = ""
+    memory_reader_install_timeout_seconds: float = 60.0
+    memory_reader_auto_detect: bool = True
+    memory_reader_hook_codes: list[str] = field(default_factory=list)
+    memory_reader_poll_interval_seconds: float = 1.0
+
+
+@dataclass(slots=True)
+class GalgameOcrReaderConfig:
+    ocr_reader_enabled: bool = False
+    ocr_reader_backend_selection: str = "auto"
+    ocr_reader_capture_backend: str = "auto"
+    ocr_reader_tesseract_path: str = ""
+    ocr_reader_install_manifest_url: str = ""
+    ocr_reader_install_target_dir: str = ""
+    ocr_reader_install_timeout_seconds: float = 300.0
+    ocr_reader_poll_interval_seconds: float = 2.0
+    ocr_reader_trigger_mode: str = OCR_TRIGGER_MODE_AFTER_ADVANCE
+    ocr_reader_no_text_takeover_after_seconds: float = 30.0
+    ocr_reader_languages: str = "chi_sim+jpn+eng"
+    ocr_reader_left_inset_ratio: float = DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO
+    ocr_reader_right_inset_ratio: float = DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO
+    ocr_reader_top_ratio: float = DEFAULT_OCR_CAPTURE_TOP_RATIO
+    ocr_reader_bottom_inset_ratio: float = DEFAULT_OCR_CAPTURE_BOTTOM_INSET_RATIO
+    ocr_reader_screen_awareness_full_frame_ocr: bool = False
+    ocr_reader_screen_awareness_multi_region_ocr: bool = False
+    ocr_reader_screen_awareness_visual_rules: bool = False
+    ocr_reader_screen_awareness_sample_collection_enabled: bool = False
+    ocr_reader_screen_awareness_sample_dir: str = ""
+    ocr_reader_screen_awareness_model_enabled: bool = False
+    ocr_reader_screen_awareness_model_path: str = ""
+    ocr_reader_screen_awareness_model_min_confidence: float = 0.55
+    ocr_reader_screen_templates: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class GalgameRapidOcrConfig:
+    rapidocr_enabled: bool = False
+    rapidocr_install_manifest_url: str = ""
+    rapidocr_install_target_dir: str = ""
+    rapidocr_install_timeout_seconds: float = 180.0
+    rapidocr_engine_type: str = "onnxruntime"
+    rapidocr_lang_type: str = "ch"
+    rapidocr_model_type: str = "mobile"
+    rapidocr_ocr_version: str = "PP-OCRv5"
+
+
+@dataclass(slots=True, init=False)
 class GalgameConfig:
-    bridge_root: Path
-    active_poll_interval_seconds: float
-    idle_poll_interval_seconds: float
-    stale_after_seconds: float
-    history_events_limit: int
-    history_lines_limit: int
-    history_choices_limit: int
-    dedupe_window_limit: int
-    warmup_replay_bytes_limit: int
-    warmup_replay_events_limit: int
-    default_mode: str
-    push_notifications: bool
-    llm_call_timeout_seconds: float
-    llm_max_in_flight: int
-    llm_request_cache_ttl_seconds: float
-    llm_target_entry_ref: str
-    reader_mode: str
-    memory_reader_enabled: bool
-    memory_reader_textractor_path: str
-    memory_reader_install_release_api_url: str
-    memory_reader_install_target_dir: str
-    memory_reader_install_timeout_seconds: float
-    memory_reader_auto_detect: bool
-    memory_reader_hook_codes: list[str]
-    memory_reader_poll_interval_seconds: float
-    ocr_reader_enabled: bool
-    ocr_reader_backend_selection: str
-    ocr_reader_capture_backend: str
-    ocr_reader_tesseract_path: str
-    ocr_reader_install_manifest_url: str
-    ocr_reader_install_target_dir: str
-    ocr_reader_install_timeout_seconds: float
-    ocr_reader_poll_interval_seconds: float
-    ocr_reader_trigger_mode: str
-    ocr_reader_no_text_takeover_after_seconds: float
-    ocr_reader_languages: str
-    ocr_reader_left_inset_ratio: float
-    ocr_reader_right_inset_ratio: float
-    ocr_reader_top_ratio: float
-    ocr_reader_bottom_inset_ratio: float
-    rapidocr_enabled: bool
-    rapidocr_install_manifest_url: str
-    rapidocr_install_target_dir: str
-    rapidocr_install_timeout_seconds: float
-    rapidocr_engine_type: str
-    rapidocr_lang_type: str
-    rapidocr_model_type: str
-    rapidocr_ocr_version: str
+    bridge: GalgameBridgeConfig
+    history: GalgameHistoryConfig
+    llm: GalgameLLMConfig
+    reader: GalgameReaderConfig
+    memory_reader: GalgameMemoryReaderConfig
+    ocr_reader: GalgameOcrReaderConfig
+    rapidocr: GalgameRapidOcrConfig
+
+    _FIELD_MAP: ClassVar[dict[str, tuple[str, str]]] = {
+        "bridge_root": ("bridge", "bridge_root"),
+        "active_poll_interval_seconds": ("bridge", "active_poll_interval_seconds"),
+        "idle_poll_interval_seconds": ("bridge", "idle_poll_interval_seconds"),
+        "stale_after_seconds": ("bridge", "stale_after_seconds"),
+        "default_mode": ("bridge", "default_mode"),
+        "push_notifications": ("bridge", "push_notifications"),
+        "history_events_limit": ("history", "history_events_limit"),
+        "history_lines_limit": ("history", "history_lines_limit"),
+        "history_choices_limit": ("history", "history_choices_limit"),
+        "dedupe_window_limit": ("history", "dedupe_window_limit"),
+        "warmup_replay_bytes_limit": ("history", "warmup_replay_bytes_limit"),
+        "warmup_replay_events_limit": ("history", "warmup_replay_events_limit"),
+        "llm_call_timeout_seconds": ("llm", "llm_call_timeout_seconds"),
+        "llm_max_in_flight": ("llm", "llm_max_in_flight"),
+        "llm_request_cache_ttl_seconds": ("llm", "llm_request_cache_ttl_seconds"),
+        "llm_target_entry_ref": ("llm", "llm_target_entry_ref"),
+        "llm_vision_enabled": ("llm", "llm_vision_enabled"),
+        "llm_vision_max_image_px": ("llm", "llm_vision_max_image_px"),
+        "reader_mode": ("reader", "reader_mode"),
+        "memory_reader_enabled": ("memory_reader", "memory_reader_enabled"),
+        "memory_reader_textractor_path": ("memory_reader", "memory_reader_textractor_path"),
+        "memory_reader_install_release_api_url": (
+            "memory_reader",
+            "memory_reader_install_release_api_url",
+        ),
+        "memory_reader_install_target_dir": ("memory_reader", "memory_reader_install_target_dir"),
+        "memory_reader_install_timeout_seconds": (
+            "memory_reader",
+            "memory_reader_install_timeout_seconds",
+        ),
+        "memory_reader_auto_detect": ("memory_reader", "memory_reader_auto_detect"),
+        "memory_reader_hook_codes": ("memory_reader", "memory_reader_hook_codes"),
+        "memory_reader_poll_interval_seconds": (
+            "memory_reader",
+            "memory_reader_poll_interval_seconds",
+        ),
+        "ocr_reader_enabled": ("ocr_reader", "ocr_reader_enabled"),
+        "ocr_reader_backend_selection": ("ocr_reader", "ocr_reader_backend_selection"),
+        "ocr_reader_capture_backend": ("ocr_reader", "ocr_reader_capture_backend"),
+        "ocr_reader_tesseract_path": ("ocr_reader", "ocr_reader_tesseract_path"),
+        "ocr_reader_install_manifest_url": ("ocr_reader", "ocr_reader_install_manifest_url"),
+        "ocr_reader_install_target_dir": ("ocr_reader", "ocr_reader_install_target_dir"),
+        "ocr_reader_install_timeout_seconds": (
+            "ocr_reader",
+            "ocr_reader_install_timeout_seconds",
+        ),
+        "ocr_reader_poll_interval_seconds": ("ocr_reader", "ocr_reader_poll_interval_seconds"),
+        "ocr_reader_trigger_mode": ("ocr_reader", "ocr_reader_trigger_mode"),
+        "ocr_reader_no_text_takeover_after_seconds": (
+            "ocr_reader",
+            "ocr_reader_no_text_takeover_after_seconds",
+        ),
+        "ocr_reader_languages": ("ocr_reader", "ocr_reader_languages"),
+        "ocr_reader_left_inset_ratio": ("ocr_reader", "ocr_reader_left_inset_ratio"),
+        "ocr_reader_right_inset_ratio": ("ocr_reader", "ocr_reader_right_inset_ratio"),
+        "ocr_reader_top_ratio": ("ocr_reader", "ocr_reader_top_ratio"),
+        "ocr_reader_bottom_inset_ratio": ("ocr_reader", "ocr_reader_bottom_inset_ratio"),
+        "ocr_reader_screen_awareness_full_frame_ocr": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_full_frame_ocr",
+        ),
+        "ocr_reader_screen_awareness_multi_region_ocr": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_multi_region_ocr",
+        ),
+        "ocr_reader_screen_awareness_visual_rules": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_visual_rules",
+        ),
+        "ocr_reader_screen_awareness_sample_collection_enabled": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_sample_collection_enabled",
+        ),
+        "ocr_reader_screen_awareness_sample_dir": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_sample_dir",
+        ),
+        "ocr_reader_screen_awareness_model_enabled": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_model_enabled",
+        ),
+        "ocr_reader_screen_awareness_model_path": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_model_path",
+        ),
+        "ocr_reader_screen_awareness_model_min_confidence": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_model_min_confidence",
+        ),
+        "ocr_reader_screen_templates": ("ocr_reader", "ocr_reader_screen_templates"),
+        "rapidocr_enabled": ("rapidocr", "rapidocr_enabled"),
+        "rapidocr_install_manifest_url": ("rapidocr", "rapidocr_install_manifest_url"),
+        "rapidocr_install_target_dir": ("rapidocr", "rapidocr_install_target_dir"),
+        "rapidocr_install_timeout_seconds": ("rapidocr", "rapidocr_install_timeout_seconds"),
+        "rapidocr_engine_type": ("rapidocr", "rapidocr_engine_type"),
+        "rapidocr_lang_type": ("rapidocr", "rapidocr_lang_type"),
+        "rapidocr_model_type": ("rapidocr", "rapidocr_model_type"),
+        "rapidocr_ocr_version": ("rapidocr", "rapidocr_ocr_version"),
+    }
+
+    def __init__(
+        self,
+        *,
+        bridge: GalgameBridgeConfig | None = None,
+        history: GalgameHistoryConfig | None = None,
+        llm: GalgameLLMConfig | None = None,
+        reader: GalgameReaderConfig | None = None,
+        memory_reader: GalgameMemoryReaderConfig | None = None,
+        ocr_reader: GalgameOcrReaderConfig | None = None,
+        rapidocr: GalgameRapidOcrConfig | None = None,
+        **legacy_fields: Any,
+    ) -> None:
+        self.bridge = bridge if bridge is not None else GalgameBridgeConfig()
+        self.history = history if history is not None else GalgameHistoryConfig()
+        self.llm = llm if llm is not None else GalgameLLMConfig()
+        self.reader = reader if reader is not None else GalgameReaderConfig()
+        self.memory_reader = (
+            memory_reader if memory_reader is not None else GalgameMemoryReaderConfig()
+        )
+        self.ocr_reader = ocr_reader if ocr_reader is not None else GalgameOcrReaderConfig()
+        self.rapidocr = rapidocr if rapidocr is not None else GalgameRapidOcrConfig()
+
+        for field_name in self._FIELD_MAP:
+            if field_name in legacy_fields:
+                setattr(self, field_name, legacy_fields.pop(field_name))
+        if legacy_fields:
+            unexpected = ", ".join(sorted(legacy_fields))
+            raise TypeError(f"unexpected GalgameConfig field(s): {unexpected}")
+
+
+for _field_name, (_group_name, _field_group_attr) in GalgameConfig._FIELD_MAP.items():
+    setattr(GalgameConfig, _field_name, _ConfigFieldProxy(_group_name, _field_group_attr))
+del _field_name, _group_name, _field_group_attr
 
 
 @dataclass(slots=True)

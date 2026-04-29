@@ -3,11 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Galgame 插件设置</title>
-  <link rel="stylesheet" href="./style.css?v=20260429-page-diagnosis-p1">
+  <link rel="stylesheet" href="./style.css?v=20260429-ux-review">
 </head>
 <body>
   <div class="page-shell">
@@ -15,7 +16,7 @@
       <div>
         <p class="eyebrow">N.E.K.O 二期</p>
         <h1>Galgame 插件设置</h1>
-        <p class="hero-copy">当前正式运行顺序固定为 Bridge SDK &gt; OCR Reader &gt; Memory Reader。OCR Reader 内部现已切换为 RapidOCR 主后端 + Tesseract 兼容兜底，这里会展示桥接状态、OCR 运行时、依赖安装、截图校准，以及游戏 Agent 的后台状态。</p>
+        <p class="hero-copy">自动识别游戏台词，翻译和推进选项。</p>
       </div>
       <div class="hero-actions">
         <button id="refreshBtn" class="primary">刷新全部</button>
@@ -118,7 +119,19 @@
                 <option value="interval">按间隔识别</option>
               </select>
             </label>
-            <button id="saveModeBtn" class="secondary">保存设置</button>
+            <label class="field checkbox-field">
+              <input id="llmVisionToggle" type="checkbox">
+              <span>LLM 视觉辅助</span>
+            </label>
+            <label class="field">
+              <span>Vision 最大边长</span>
+              <input id="llmVisionMaxImagePxInput" type="number" min="64" max="2048" step="32" placeholder="768">
+              <small class="field-note">低置信度时传图，会增加 token 成本并包含游戏画面。</small>
+            </label>
+            <div class="settings-save-row">
+              <button id="saveModeBtn" class="secondary">保存设置</button>
+              <span id="settingsDirtyHint" class="settings-dirty-hint" hidden>有未保存设置</span>
+            </div>
             <div class="inline-actions">
               <button id="standbyOnBtn" class="ghost">进入待机</button>
               <button id="standbyOffBtn" class="ghost">恢复活跃</button>
@@ -182,11 +195,62 @@
             </details>
           </div>
 
+          <div class="settings-subpanel screen-template-panel">
+            <div class="panel-title-row compact">
+              <div>
+                <h3>屏幕模板</h3>
+                <p class="section-copy">按进程、窗口标题或关键词覆盖通用屏幕分类；AiHong 专用逻辑仍优先。</p>
+              </div>
+              <div class="inline-actions">
+                <button id="ocrScreenTemplatesDraftBtn" class="secondary">生成草稿</button>
+                <button id="ocrScreenTemplatesValidateBtn" class="ghost">验证模板</button>
+                <button id="ocrScreenTemplatesUndoBtn" class="ghost" disabled>撤销草稿</button>
+                <button id="ocrScreenTemplatesSaveBtn" class="secondary">保存模板</button>
+              </div>
+            </div>
+            <label class="field">
+              <span>模板 JSON</span>
+              <textarea id="ocrScreenTemplatesInput" rows="5" spellcheck="false" placeholder='[{"id":"demo-gallery","stage":"gallery_stage","process_names":["game.exe"],"keywords":["Gallery","CG"],"min_keyword_hits":1}]'></textarea>
+            </label>
+            <div class="screen-region-editor">
+              <div class="screen-region-toolbar">
+                <select id="ocrRegionStageSelect" aria-label="区域阶段">
+                  <option value="dialogue_stage">对白区</option>
+                  <option value="menu_stage">菜单区</option>
+                  <option value="title_stage">标题/主菜单</option>
+                  <option value="save_load_stage">存读档</option>
+                  <option value="config_stage">设置</option>
+                  <option value="gallery_stage">回想/鉴赏</option>
+                  <option value="minigame_stage">小游戏</option>
+                  <option value="game_over_stage">Game Over</option>
+                </select>
+                <button id="ocrRegionSnapshotBtn" class="secondary">加载截图</button>
+                <button id="ocrRegionTemplateBtn" class="ghost">区域生成模板</button>
+                <button id="ocrRegionCaptureBtn" class="ghost">套用到裁剪</button>
+              </div>
+              <div id="ocrRegionEditor" class="screen-region-canvas" aria-label="OCR 区域编辑器">
+                <img id="ocrRegionImage" alt="" hidden>
+                <div id="ocrRegionSelectionBox" class="screen-region-selection" hidden></div>
+                <div id="ocrRegionEmpty" class="screen-region-empty">暂无截图</div>
+              </div>
+              <p id="ocrRegionHint" class="result-note">加载最近 OCR 屏幕感知截图后，拖拽框选区域。</p>
+            </div>
+          </div>
+
           <div class="settings-subpanel capture-profile-panel">
             <div class="panel-title-row compact">
               <div>
                 <h3>OCR 截图校准</h3>
                 <p class="section-copy">按进程名保存窗口裁剪比例。普通游戏保存"通用区域"即可；哀鸿可以分别保存"对白区 / 菜单区"，避免专用双阶段 OCR 范围被互相覆盖。</p>
+              </div>
+              <div class="capture-profile-actions capture-profile-primary-actions">
+                <label class="checkbox-line compact-checkbox">
+                  <input id="ocrProfileAutoApplyRecommendedInput" type="checkbox">
+                  <span>允许后续自动应用推荐</span>
+                </label>
+                <button id="ocrProfileApplyRecommendedBtn" class="secondary">应用推荐</button>
+                <button id="ocrProfileRollbackBtn" class="ghost">回滚推荐</button>
+                <button id="ocrProfileAutoRecalibrateBtn" class="primary">自动重新校准对白区</button>
               </div>
             </div>
             <p id="ocrProfileRuntimeHint" class="panel-subcopy">等待 OCR 目标进程信息。</p>
@@ -201,6 +265,13 @@
                   <option value="default">通用区域</option>
                   <option value="dialogue_stage">对白区</option>
                   <option value="menu_stage">菜单区</option>
+                  <option value="title_stage">标题/主菜单</option>
+                  <option value="save_load_stage">存读档</option>
+                  <option value="config_stage">设置</option>
+                  <option value="transition_stage">转场</option>
+                  <option value="gallery_stage">回想/鉴赏</option>
+                  <option value="minigame_stage">小游戏</option>
+                  <option value="game_over_stage">Game Over</option>
                 </select>
               </label>
               <label class="field">
@@ -229,7 +300,6 @@
               <div class="capture-profile-actions">
                 <button id="ocrProfileSaveBtn" class="secondary">保存校准</button>
                 <button id="ocrProfileClearBtn" class="ghost">清空校准</button>
-                <button id="ocrProfileAutoRecalibrateBtn" class="primary">自动重新校准对白区</button>
               </div>
             </div>
           </div>
@@ -373,14 +443,18 @@
     </section>
 
     <section class="dashboard-grid">
-      <details class="panel panel-scroll dashboard-module">
-        <summary><span>状态</span><small>连接、数据源、插件状态</small></summary>
-        <dl id="statusGrid" class="data-grid scroll-region"></dl>
-      </details>
-
-      <details class="panel panel-scroll dashboard-module">
-        <summary><span>OCR 运行时</span><small>截图、后端、调试字段</small></summary>
-        <dl id="ocrRuntimeGrid" class="data-grid scroll-region"></dl>
+      <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module" open>
+        <summary><span>运行状态</span><small>连接、数据源、OCR 运行时</small></summary>
+        <div class="dashboard-section-grid">
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">状态</h3>
+            <div id="statusGrid" class="status-grid-panel scroll-region"></div>
+          </section>
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">OCR 运行时</h3>
+            <dl id="ocrRuntimeGrid" class="data-grid scroll-region"></dl>
+          </section>
+        </div>
       </details>
 
       <details class="panel panel-scroll dashboard-module">
@@ -408,19 +482,22 @@
         </details>
       </details>
 
-      <details class="panel panel-scroll dashboard-module" open>
-        <summary><span>当前台词解释</span><small>解释 effective current line</small></summary>
-        <div id="explainPanel" class="result-panel scroll-region empty-state">暂无数据</div>
-      </details>
-
-      <details class="panel panel-scroll dashboard-module" open>
-        <summary><span>场景总结</span><small>stable 不足时使用 observed</small></summary>
-        <div id="summaryPanel" class="result-panel scroll-region empty-state">暂无数据</div>
-      </details>
-
-      <details class="panel panel-scroll dashboard-module" open>
-        <summary><span>当前选项建议</span><small>只在出现选项时工作</small></summary>
-        <div id="suggestPanel" class="result-panel scroll-region empty-state">暂无数据</div>
+      <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
+        <summary><span>AI 助手</span><small>台词解释、场景总结、选项建议</small></summary>
+        <div class="dashboard-section-grid dashboard-section-grid-three">
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">当前台词解释</h3>
+            <div id="explainPanel" class="result-panel scroll-region empty-state">暂无数据</div>
+          </section>
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">场景总结</h3>
+            <div id="summaryPanel" class="result-panel scroll-region empty-state">暂无数据</div>
+          </section>
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">当前选项建议</h3>
+            <div id="suggestPanel" class="result-panel scroll-region empty-state">暂无数据</div>
+          </section>
+        </div>
       </details>
 
       <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
@@ -428,23 +505,26 @@
         <div id="pushesList" class="stack-list scroll-region empty-state">暂无数据</div>
       </details>
 
-      <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module" open>
-        <summary><span>最近台词与 OCR 诊断</span><small>stable/observed 合并；无文本时显示阻塞点</small></summary>
-        <div id="linesList" class="stack-list scroll-region empty-state">暂无数据</div>
-      </details>
-
-      <details class="panel panel-scroll panel-scroll-wide dashboard-module" open>
-        <summary><span>最近选项</span><small>选项 OCR 与选择记录</small></summary>
-        <div id="choicesList" class="stack-list scroll-region empty-state">暂无数据</div>
-      </details>
-
-      <details class="panel panel-scroll panel-scroll-wide dashboard-module">
-        <summary><span>最近事件</span><small>底层事件与诊断</small></summary>
-        <div id="eventsList" class="stack-list scroll-region empty-state">暂无数据</div>
+      <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
+        <summary><span>历史记录</span><small>最近台词、选项、底层事件</small></summary>
+        <div class="dashboard-section-grid dashboard-section-grid-three">
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">最近台词与 OCR 诊断</h3>
+            <div id="linesList" class="stack-list scroll-region empty-state">暂无数据</div>
+          </section>
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">最近选项</h3>
+            <div id="choicesList" class="stack-list scroll-region empty-state">暂无数据</div>
+          </section>
+          <section class="dashboard-subsection">
+            <h3 class="dashboard-subtitle">最近事件</h3>
+            <div id="eventsList" class="stack-list scroll-region empty-state">暂无数据</div>
+          </section>
+        </div>
       </details>
     </section>
   </div>
 
-  <script src="./main.js?v=20260429-page-diagnosis-p1"></script>
+  <script src="./main.js?v=20260429-ux-review"></script>
 </body>
 </html>

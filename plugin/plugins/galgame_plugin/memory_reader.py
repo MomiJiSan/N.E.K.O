@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import ctypes
 import hashlib
 import json
+import logging
 import os
 import queue
 import shutil
 import subprocess
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -24,6 +28,7 @@ except ImportError:  # pragma: no cover - psutil is available in the project run
 from .models import (
     DATA_SOURCE_MEMORY_READER,
     GalgameConfig,
+    MENU_PREFIX_RE as _MENU_PREFIX_RE,
     sanitize_choice,
     sanitize_save_context,
 )
@@ -36,6 +41,7 @@ MEMORY_READER_UNKNOWN_SCENE = "mem:unknown_scene"
 MEMORY_READER_ROUTE_ID = ""
 MEMORY_READER_DEFAULT_ENGINE = "unknown"
 MEMORY_READER_MAX_HOOK_CACHE = 256
+_MEMORY_LINE_ID_MAX_COLLISION_SUFFIX = 10000
 TEXTRACTOR_EXECUTABLE = "TextractorCLI.exe"
 _EXCLUDED_PROCESS_NAMES = {
     "crashpad_handler",
@@ -45,10 +51,135 @@ _EXCLUDED_PROCESS_NAME_SUBSTRINGS = (
     "crashhandler",
     "crashreporter",
 )
-_MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
+_TEXTRACTOR_PROCESS_LOCK = threading.Lock()
+_TEXTRACTOR_PROCESSES: set[subprocess.Popen] = set()
+_TEXTRACTOR_JOB_HANDLES: dict[subprocess.Popen, int] = {}
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _track_textractor_process(process: subprocess.Popen) -> None:
+    with _TEXTRACTOR_PROCESS_LOCK:
+        _TEXTRACTOR_PROCESSES.add(process)
+        job_handle = _create_kill_on_close_job_for_process(process)
+        if job_handle:
+            _TEXTRACTOR_JOB_HANDLES[process] = job_handle
+
+
+def _untrack_textractor_process(process: subprocess.Popen) -> None:
+    job_handle = 0
+    with _TEXTRACTOR_PROCESS_LOCK:
+        _TEXTRACTOR_PROCESSES.discard(process)
+        job_handle = int(_TEXTRACTOR_JOB_HANDLES.pop(process, 0) or 0)
+    _close_windows_handle(job_handle)
+
+
+def _cleanup_tracked_textractor_processes() -> None:
+    with _TEXTRACTOR_PROCESS_LOCK:
+        processes = list(_TEXTRACTOR_PROCESSES)
+        _TEXTRACTOR_PROCESSES.clear()
+        job_handles = list(_TEXTRACTOR_JOB_HANDLES.values())
+        _TEXTRACTOR_JOB_HANDLES.clear()
+    for process in processes:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            continue
+    for job_handle in job_handles:
+        _close_windows_handle(int(job_handle or 0))
+
+
+def _close_windows_handle(handle: int) -> None:
+    if not handle or not sys.platform.startswith("win"):
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:
+        return
+
+
+def _create_kill_on_close_job_for_process(process: subprocess.Popen) -> int:
+    if not sys.platform.startswith("win"):
+        return 0
+    process_handle = int(getattr(process, "_handle", 0) or 0)
+    if not process_handle:
+        return 0
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        job_handle = int(kernel32.CreateJobObjectW(None, None) or 0)
+        if not job_handle:
+            return 0
+        info = _JobObjectExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = bool(
+            kernel32.SetInformationJobObject(
+                ctypes.c_void_p(job_handle),
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+        )
+        if not ok:
+            _close_windows_handle(job_handle)
+            return 0
+        if not kernel32.AssignProcessToJobObject(
+            ctypes.c_void_p(job_handle),
+            ctypes.c_void_p(process_handle),
+        ):
+            _close_windows_handle(job_handle)
+            return 0
+        return job_handle
+    except Exception:
+        try:
+            _close_windows_handle(int(locals().get("job_handle", 0) or 0))
+        except Exception:
+            pass
+        return 0
+
+
+atexit.register(_cleanup_tracked_textractor_processes)
 _SPEAKER_QUOTE_RE = re.compile(r"^\s*([^「」:：]{1,40})[「『](.+)[」』]\s*$")
 _SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
 _ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _decode_textractor_stdout_line(raw: bytes) -> str:
@@ -223,8 +354,9 @@ class _AsyncioTextractorHandle:
     pulls from that queue with a timeout via ``asyncio.to_thread``.
     """
 
-    def __init__(self, process: subprocess.Popen) -> None:
+    def __init__(self, process: subprocess.Popen, *, logger: Any | None = None) -> None:
         self._process = process
+        self._logger = logger
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._start_reader()
 
@@ -242,8 +374,23 @@ class _AsyncioTextractorHandle:
                     if not line:
                         continue
                     self._queue.put(line)
-            except Exception:
-                pass
+            except Exception as exc:
+                if self._logger is not None:
+                    try:
+                        self._logger.warning(
+                            "memory_reader Textractor stdout reader failed: {}",
+                            exc,
+                        )
+                    except Exception:
+                        _LOGGER.warning(
+                            "memory_reader Textractor stdout reader failed",
+                            exc_info=True,
+                        )
+                else:
+                    _LOGGER.warning(
+                        "memory_reader Textractor stdout reader failed",
+                        exc_info=True,
+                    )
             finally:
                 self._queue.put(None)  # sentinel for EOF
 
@@ -266,6 +413,9 @@ class _AsyncioTextractorHandle:
         return self._process.returncode
 
     async def terminate(self) -> None:
+        if self._process.returncode is not None:
+            _untrack_textractor_process(self._process)
+            return
         if self._process.stdin is not None and not self._process.stdin.closed:
             try:
                 self._process.stdin.close()
@@ -281,19 +431,33 @@ class _AsyncioTextractorHandle:
             if self._process.returncode is None:
                 self._process.kill()
                 await asyncio.to_thread(self._process.wait)
+        if self._process.returncode is not None:
+            _untrack_textractor_process(self._process)
         return self._process.returncode
 
 
-async def _default_process_factory(path: str) -> TextractorProcessHandle:
+async def _default_process_factory(
+    path: str,
+    *,
+    logger: Any | None = None,
+) -> TextractorProcessHandle:
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "bufsize": 0,
+    }
+    if sys.platform.startswith("win"):
+        create_no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        if create_no_window:
+            popen_kwargs["creationflags"] = create_no_window
     process = await asyncio.to_thread(
         subprocess.Popen,
         path,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0,
+        **popen_kwargs,
     )
-    return _AsyncioTextractorHandle(process)
+    _track_textractor_process(process)
+    return _AsyncioTextractorHandle(process, logger=logger)
 
 
 def _is_event_loop_binding_error(exc: BaseException) -> bool:
@@ -375,6 +539,11 @@ def _loaded_module_names(proc: Any) -> set[str]:
     try:
         mappings = proc.memory_maps(grouped=False)
     except Exception:
+        _LOGGER.debug(
+            "memory_reader process module scan skipped for pid=%s",
+            getattr(proc, "pid", ""),
+            exc_info=True,
+        )
         return names
     for item in mappings:
         path = getattr(item, "path", "") or ""
@@ -423,6 +592,11 @@ def _default_process_scanner() -> list[DetectedGameProcess]:
                 )
             )
         except Exception:
+            _LOGGER.debug(
+                "memory_reader process scan skipped for pid=%s",
+                getattr(proc, "pid", ""),
+                exc_info=True,
+            )
             continue
     detected.sort(key=lambda item: (-item.create_time, item.pid))
     return detected
@@ -450,6 +624,7 @@ class MemoryReaderBridgeWriter:
         self._state = self._initial_state("")
         self._text_to_line_id: dict[str, str] = {}
         self._line_id_owner: dict[str, str] = {}
+        self._io_lock = threading.RLock()
 
     @property
     def bridge_root(self) -> Path:
@@ -629,6 +804,8 @@ class MemoryReaderBridgeWriter:
             "route_id": self._state["route_id"],
         }
         self._append_event("session_ended", payload, ts=ts, update_snapshot=False)
+        self._text_to_line_id.clear()
+        self._line_id_owner.clear()
         return True
 
     def runtime(self) -> MemoryReaderRuntime:
@@ -701,18 +878,19 @@ class MemoryReaderBridgeWriter:
         }
 
     def _write_session_snapshot(self) -> None:
-        self._bridge_dir().mkdir(parents=True, exist_ok=True)
-        tmp_path = self._session_path().with_suffix(".json.tmp")
-        payload = json.dumps(
-            self._session_snapshot(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        with tmp_path.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, self._session_path())
+        with self._io_lock:
+            self._bridge_dir().mkdir(parents=True, exist_ok=True)
+            tmp_path = self._session_path().with_suffix(".json.tmp")
+            payload = json.dumps(
+                self._session_snapshot(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            with tmp_path.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self._session_path())
 
     def _append_event(
         self,
@@ -722,29 +900,30 @@ class MemoryReaderBridgeWriter:
         ts: str,
         update_snapshot: bool = True,
     ) -> None:
-        self._last_seq += 1
-        self._last_event_ts = ts
-        event = {
-            "protocol_version": 1,
-            "seq": self._last_seq,
-            "ts": ts,
-            "type": event_type,
-            "session_id": self._session_id,
-            "game_id": self._game_id,
-            "payload": payload,
-        }
-        with self._events_path().open("ab") as handle:
-            handle.write(
-                json.dumps(
-                    event,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                + b"\n"
-            )
-            handle.flush()
-        if update_snapshot:
-            self._write_session_snapshot()
+        with self._io_lock:
+            self._last_seq += 1
+            self._last_event_ts = ts
+            event = {
+                "protocol_version": 1,
+                "seq": self._last_seq,
+                "ts": ts,
+                "type": event_type,
+                "session_id": self._session_id,
+                "game_id": self._game_id,
+                "payload": payload,
+            }
+            with self._events_path().open("ab") as handle:
+                handle.write(
+                    json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                handle.flush()
+            if update_snapshot:
+                self._write_session_snapshot()
 
     def _line_id_for_text(self, text: str) -> str:
         normalized = normalize_text(text)
@@ -762,15 +941,17 @@ class MemoryReaderBridgeWriter:
                 self._line_id_owner[candidate] = normalized
                 self._text_to_line_id[normalized] = candidate
                 return candidate
-        suffix = 1
-        while True:
+        for suffix in range(1, _MEMORY_LINE_ID_MAX_COLLISION_SUFFIX + 1):
             candidate = f"mem:{digest}#{suffix}"
             owner = self._line_id_owner.get(candidate)
             if owner in {None, normalized}:
                 self._line_id_owner[candidate] = normalized
                 self._text_to_line_id[normalized] = candidate
                 return candidate
-            suffix += 1
+        raise RuntimeError(
+            "memory line_id collision limit exceeded "
+            f"after {_MEMORY_LINE_ID_MAX_COLLISION_SUFFIX} suffix attempts"
+        )
 
 
 class MemoryReaderManager:
@@ -787,7 +968,13 @@ class MemoryReaderManager:
     ) -> None:
         self._logger = logger
         self._config = config
-        self._process_factory = process_factory or _default_process_factory
+        if process_factory is None:
+            async def _process_factory_with_logger(path: str) -> TextractorProcessHandle:
+                return await _default_process_factory(path, logger=self._logger)
+
+            self._process_factory = _process_factory_with_logger
+        else:
+            self._process_factory = process_factory
         self._process_scanner = process_scanner or _default_process_scanner
         self._time_fn = time_fn or time.time
         self._platform_fn = platform_fn or is_windows_platform
@@ -801,19 +988,35 @@ class MemoryReaderManager:
         self._attach_started_at = 0.0
         self._backoff_until = 0.0
         self._restart_attempts = 0
-        self._last_hook_text: dict[str, str] = {}
+        self._last_hook_text: OrderedDict[str, str] = OrderedDict()
         self._last_hook_text_lock = threading.Lock()
+        self._config_update_lock = threading.RLock()
         self._last_heartbeat_at = 0.0
         self._last_no_text_warning_at = 0.0
 
     def update_config(self, config: GalgameConfig) -> None:
-        self._config = config
-        self._runtime.enabled = config.memory_reader_enabled
-        if self._writer.bridge_root != config.bridge_root:
+        with self._config_update_lock:
+            bridge_root_changed = self._writer.bridge_root != config.bridge_root
+            self._config = config
+            self._runtime.enabled = config.memory_reader_enabled
+            if not bridge_root_changed:
+                return
             self._writer = MemoryReaderBridgeWriter(
                 bridge_root=config.bridge_root,
                 time_fn=self._time_fn,
             )
+            self._runtime = MemoryReaderRuntime(
+                enabled=config.memory_reader_enabled,
+                status="idle",
+                detail="bridge_root_changed",
+            )
+            self._attached_process = None
+            self._attach_started_at = 0.0
+            self._backoff_until = 0.0
+            self._last_heartbeat_at = 0.0
+            self._last_no_text_warning_at = 0.0
+            with self._last_hook_text_lock:
+                self._last_hook_text.clear()
 
     async def shutdown(self) -> None:
         await self._stop_textractor()
@@ -1180,12 +1383,12 @@ class MemoryReaderManager:
             with self._last_hook_text_lock:
                 previous = self._last_hook_text.get(parsed_line.hook_id)
                 if previous == parsed_line.text:
+                    self._last_hook_text.move_to_end(parsed_line.hook_id)
                     continue
                 self._last_hook_text[parsed_line.hook_id] = parsed_line.text
+                self._last_hook_text.move_to_end(parsed_line.hook_id)
                 if len(self._last_hook_text) > MEMORY_READER_MAX_HOOK_CACHE:
-                    oldest_key = next(iter(self._last_hook_text), "")
-                    if oldest_key:
-                        self._last_hook_text.pop(oldest_key, None)
+                    self._last_hook_text.popitem(last=False)
             parsed.append(parsed_line)
         for line in logs[:8]:
             self._logger.debug("memory_reader Textractor log: {}", line)

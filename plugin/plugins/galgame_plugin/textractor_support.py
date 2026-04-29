@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import os
 import shutil
@@ -74,6 +75,43 @@ def _extract_total_bytes(response: httpx.Response, *, resume_from: int) -> int:
             return resume_from + length
         return length
     return 0
+
+
+def _normalize_sha256(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("sha256:"):
+        text = text.split(":", 1)[1].strip()
+    if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
+        return text
+    return ""
+
+
+def _asset_sha256(asset: dict[str, Any]) -> str:
+    for key in ("sha256", "digest", "checksum"):
+        digest = _normalize_sha256(asset.get(key))
+        if digest:
+            return digest
+    return ""
+
+
+def _verify_file_sha256(path: Path, expected_sha256: str) -> bool:
+    expected = _normalize_sha256(expected_sha256)
+    if not expected:
+        return False
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            hasher.update(chunk)
+    actual = hasher.hexdigest()
+    if actual != expected:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"downloaded file checksum mismatch for {path.name}: "
+            f"expected sha256 {expected}, got {actual}"
+        )
+    return True
 
 
 def default_textractor_install_target_raw() -> str:
@@ -153,6 +191,9 @@ def _candidate_assets(release_payload: dict[str, Any]) -> list[dict[str, str]]:
         if not name or not url or not name.lower().endswith(".zip"):
             continue
         entry = {"name": name, "url": url}
+        expected_sha256 = _asset_sha256(asset)
+        if expected_sha256:
+            entry["sha256"] = expected_sha256
         lowered = name.lower()
         if "source code" in lowered:
             continue
@@ -211,6 +252,7 @@ async def _download_file(
     release_name: str = "",
     asset_name: str = "",
     target_dir: str = "",
+    expected_sha256: str = "",
 ) -> dict[str, int | bool]:
     async def _run_download(*, allow_resume: bool) -> dict[str, int | bool]:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -299,12 +341,16 @@ async def _download_file(
                         update_install_task_state(task_id, **chunk_progress)
                     await _emit_progress(progress_callback, chunk_progress)
 
-            return {
+            result = {
                 "downloaded_bytes": downloaded_bytes,
                 "total_bytes": total_bytes if total_bytes > 0 else downloaded_bytes,
                 "resume_from": resume_from,
                 "resumed": resumed,
+                "sha256_verified": False,
             }
+            if _normalize_sha256(expected_sha256):
+                result["sha256_verified"] = _verify_file_sha256(destination, expected_sha256)
+            return result
 
     return await _run_download(allow_resume=True)
 
@@ -477,6 +523,7 @@ async def install_textractor(
                         release_name=release_name,
                         asset_name=asset_name,
                         target_dir=str(target_dir),
+                        expected_sha256=asset.get("sha256", ""),
                     )
                     download_progress = {
                         "status": "running",

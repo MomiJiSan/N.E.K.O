@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -10,6 +11,17 @@ try:
     from config import TOOL_SERVER_PORT as _TOOL_SERVER_PORT
 except Exception:
     _TOOL_SERVER_PORT = 48915
+
+_LOCAL_TOOL_SERVER_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _tls_verify_for_base_url(base_url: str) -> bool:
+    parsed = urlparse(str(base_url or ""))
+    host = str(parsed.hostname or "").strip().lower()
+    if host in _LOCAL_TOOL_SERVER_HOSTS:
+        return False
+    return True
+
 
 class HostAgentError(RuntimeError):
     pass
@@ -31,7 +43,10 @@ class HostAgentAdapter:
             timeout=5.0,
             proxy=None,
             trust_env=False,
-            transport=httpx.AsyncHTTPTransport(verify=False, retries=0),
+            transport=httpx.AsyncHTTPTransport(
+                verify=_tls_verify_for_base_url(self.base_url),
+                retries=0,
+            ),
         )
 
     async def _get_client(self) -> httpx.AsyncClient:

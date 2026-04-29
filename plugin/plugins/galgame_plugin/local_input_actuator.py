@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
 import threading
-import time
 from ctypes import wintypes
 from typing import Any
+
+from .models import SharedStatePayload
 
 
 VK_RETURN = 0x0D
@@ -63,6 +65,16 @@ TOKEN_QUERY = 0x0008
 TokenElevation = 20
 _LAST_FOCUS_WINDOW_DIAGNOSTIC = ""
 _LAST_FOCUS_WINDOW_DIAGNOSTIC_LOCK = threading.Lock()
+_WAIT_EVENT = threading.Event()
+_LOGGER = logging.getLogger(__name__)
+
+
+def _warn_input_exception(message: str, exc: Exception) -> None:
+    _LOGGER.warning("%s: %s", message, exc, exc_info=True)
+
+
+def _wait_seconds(delay: float) -> None:
+    _WAIT_EVENT.wait(max(0.0, float(delay or 0.0)))
 
 
 def _set_last_focus_window_diagnostic(value: str) -> None:
@@ -124,7 +136,7 @@ class INPUT(ctypes.Structure):
     )
 
 
-def _runtime_target(shared: dict[str, Any]) -> dict[str, Any]:
+def _runtime_target(shared: SharedStatePayload) -> dict[str, Any]:
     fallback: dict[str, Any] = {}
     for key in ("ocr_reader_runtime", "memory_reader_runtime"):
         runtime = shared.get(key)
@@ -221,7 +233,8 @@ def _window_text(hwnd: int) -> str:
     if win32gui is not None:
         try:
             return str(win32gui.GetWindowText(hwnd) or "")
-        except Exception:
+        except Exception as exc:
+            _warn_input_exception("local input window text lookup failed via pywin32", exc)
             return ""
     user32 = ctypes.windll.user32
     try:
@@ -231,7 +244,8 @@ def _window_text(hwnd: int) -> str:
         buffer = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buffer, length + 1)
         return str(buffer.value or "")
-    except Exception:
+    except Exception as exc:
+        _warn_input_exception("local input window text lookup failed via user32", exc)
         return ""
 
 
@@ -241,7 +255,8 @@ def _root_window_handle(hwnd: int) -> int:
     try:
         root = int(ctypes.windll.user32.GetAncestor(int(hwnd), 2))
         return root or int(hwnd)
-    except Exception:
+    except Exception as exc:
+        _warn_input_exception("local input root window lookup failed", exc)
         return int(hwnd)
 
 
@@ -252,7 +267,8 @@ def _window_process_id(hwnd: int) -> int:
         pid = wintypes.DWORD()
         ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
         return int(pid.value or 0)
-    except Exception:
+    except Exception as exc:
+        _warn_input_exception("local input window process lookup failed", exc)
         return 0
 
 
@@ -278,6 +294,7 @@ def _focus_window(hwnd: int) -> bool:
     try:
         user32.AllowSetForegroundWindow(-1)
     except Exception as exc:
+        _warn_input_exception("local input AllowSetForegroundWindow failed", exc)
         _set_last_focus_window_diagnostic(f"AllowSetForegroundWindow failed: {exc}")
     foreground = user32.GetForegroundWindow()
     current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
@@ -295,13 +312,14 @@ def _focus_window(hwnd: int) -> bool:
         user32.SetActiveWindow(hwnd)
         user32.SetFocus(hwnd)
     except Exception as exc:
+        _warn_input_exception("local input SetForegroundWindow sequence failed", exc)
         _set_last_focus_window_diagnostic(f"SetForegroundWindow failed: {exc}")
     finally:
         if attached_target:
             user32.AttachThreadInput(current_thread, target_thread, False)
         if attached_foreground:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
-    time.sleep(0.12)
+    _wait_seconds(0.12)
     try:
         focused = _foreground_matches_target_window(
             int(user32.GetForegroundWindow()),
@@ -315,6 +333,7 @@ def _focus_window(hwnd: int) -> bool:
             _set_last_focus_window_diagnostic("foreground window did not match target")
         return False
     except Exception as exc:
+        _warn_input_exception("local input foreground verification failed", exc)
         _set_last_focus_window_diagnostic(f"foreground verification failed: {exc}")
         return False
 
@@ -324,7 +343,8 @@ def _is_current_process_elevated() -> bool | None:
         return None
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
+    except Exception as exc:
+        _warn_input_exception("local input current elevation lookup failed", exc)
         return None
 
 
@@ -352,19 +372,20 @@ def _is_process_elevated(pid: int) -> bool | None:
         ):
             return None
         return bool(elevation.TokenIsElevated)
-    except Exception:
+    except Exception as exc:
+        _warn_input_exception("local input target elevation lookup failed", exc)
         return None
     finally:
         try:
             if token:
                 kernel32.CloseHandle(token)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_input_exception("local input token handle close failed", exc)
         try:
             if process:
                 kernel32.CloseHandle(process)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_input_exception("local input process handle close failed", exc)
 
 
 def _matching_input_safety_deny_marker(*values: str) -> str:
@@ -433,15 +454,15 @@ def _tap_key(hwnd: int, vk: int, *, count: int = 1, delay: float = 0.05) -> None
             user32.SendInput(len(inputs), ctypes.byref(inputs), ctypes.sizeof(INPUT))
         else:
             user32.keybd_event(vk, 0, 0, 0)
-            time.sleep(0.025)
+            _wait_seconds(0.025)
             user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(delay)
+        _wait_seconds(delay)
 
 
 def _click(hwnd: int, x: int, y: int) -> None:
     user32 = ctypes.windll.user32
     user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.04)
+    _wait_seconds(0.04)
     virt_x = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
     virt_y = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
     virt_w = max(user32.GetSystemMetrics(78) - 1, 1)  # SM_CXVIRTUALSCREEN
@@ -454,7 +475,7 @@ def _click(hwnd: int, x: int, y: int) -> None:
         INPUT(INPUT_MOUSE, INPUT_UNION(mi=MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_LEFTUP, 0, None))),
     )
     user32.SendInput(len(inputs), ctypes.byref(inputs), ctypes.sizeof(INPUT))
-    time.sleep(0.08)
+    _wait_seconds(0.08)
 
 
 def _client_screen_rect(hwnd: int) -> tuple[int, int, int, int]:
@@ -536,7 +557,7 @@ def _relative_point_forbidden_zone(relative_x: float, relative_y: float) -> str:
     return ""
 
 
-def _snapshot_has_visible_choices(shared: dict[str, Any]) -> bool:
+def _snapshot_has_visible_choices(shared: SharedStatePayload) -> bool:
     snapshot = shared.get("latest_snapshot")
     if not isinstance(snapshot, dict):
         return False
@@ -639,6 +660,27 @@ def _choose_bounds(actuation: dict[str, Any]) -> dict[str, float]:
     return {"left": left, "top": top, "right": right, "bottom": bottom}
 
 
+def _snapshot_screen_type(shared: SharedStatePayload) -> str:
+    snapshot = shared.get("latest_snapshot")
+    if isinstance(snapshot, dict):
+        screen_type = str(snapshot.get("screen_type") or "").strip()
+        if screen_type:
+            return screen_type
+    return str(shared.get("screen_type") or "").strip()
+
+
+def _recover_should_press_escape(shared: SharedStatePayload, actuation: dict[str, Any]) -> bool:
+    strategy_id = str(actuation.get("strategy_id") or "")
+    if strategy_id in {"save_load_escape", "config_escape", "gallery_escape", "game_over_escape"}:
+        return True
+    return _snapshot_screen_type(shared) in {
+        "save_load_stage",
+        "config_stage",
+        "gallery_stage",
+        "game_over_stage",
+    }
+
+
 def _resolve_choice_bounds_click_target(
     actuation: dict[str, Any],
     bounds: dict[str, float],
@@ -706,7 +748,7 @@ def _resolve_choice_bounds_click_target(
     }
 
 
-def _snapshot_text(shared: dict[str, Any]) -> str:
+def _snapshot_text(shared: SharedStatePayload) -> str:
     snapshot = shared.get("latest_snapshot")
     if not isinstance(snapshot, dict):
         return ""
@@ -717,7 +759,7 @@ def _snapshot_text(shared: dict[str, Any]) -> str:
     )
 
 
-def _looks_like_system_menu(shared: dict[str, Any]) -> bool:
+def _looks_like_system_menu(shared: SharedStatePayload) -> bool:
     text = _snapshot_text(shared)
     if not text:
         return False
@@ -725,7 +767,7 @@ def _looks_like_system_menu(shared: dict[str, Any]) -> bool:
 
 
 def perform_local_input_actuation(
-    shared: dict[str, Any],
+    shared: SharedStatePayload,
     actuation: dict[str, Any],
 ) -> dict[str, Any]:
     if sys.platform != "win32":
@@ -838,7 +880,7 @@ def perform_local_input_actuation(
         else:
             _tap_key(hwnd, VK_SPACE)
     elif kind == "recover":
-        if _looks_like_system_menu(shared):
+        if _recover_should_press_escape(shared, actuation) or _looks_like_system_menu(shared):
             _tap_key(hwnd, VK_ESCAPE)
     elif kind == "choose":
         choice_index = _choose_index(actuation)

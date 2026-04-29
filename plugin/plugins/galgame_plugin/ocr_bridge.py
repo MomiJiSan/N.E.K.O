@@ -10,8 +10,15 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from .models import DATA_SOURCE_OCR_READER
+from .models import (
+    DATA_SOURCE_OCR_READER,
+    OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+    OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    json_copy,
+    sanitize_screen_ui_elements,
+)
 from .reader import normalize_text
+from .screen_classifier import normalize_screen_type
 
 
 OCR_READER_VERSION = "0.1.0"
@@ -21,6 +28,22 @@ OCR_READER_UNKNOWN_SCENE = "ocr:unknown_scene"
 OCR_READER_ROUTE_ID = ""
 OCR_READER_DEFAULT_ENGINE = "unknown"
 _OCR_LINE_ID_MAX_COLLISION_SUFFIX = 10000
+_SPEAKER_QUOTE_RE = re.compile(
+    r"^\s*([^\u300c\u300d:\uff1a]{1,40})[\u300c\u300e](.+)[\u300d\u300f]\s*$"
+)
+_SPEAKER_COLON_RE = re.compile(r"^\s*([^:\uff1a]{1,40})[:\uff1a]\s*(.+\S)\s*$")
+_SPEAKER_BRACKET_RE = re.compile(r"^\s*[\u3010\[]([^\u3011\]]{1,40})[\u3011\]]\s*(.+\S)\s*$")
+_SPEAKER_PAREN_SUFFIX_RE = re.compile(r"^\s*([^\uff08\uff09()]{1,40})[\uff08(](.+\S)[\uff09)]\s*$")
+_SPEAKER_PAREN_PREFIX_RE = re.compile(r"^\s*[\uff08(]([^\uff09)]{1,40})[\uff09)]\s*(.+\S)\s*$")
+_NARRATION_QUOTE_RE = re.compile(r"^\s*[\u300c\u300e\u201c\"](.+\S)[\u300d\u300f\u201d\"]\s*$")
+_NARRATION_PAREN_RE = re.compile(r"^\s*[\uff08(]([^\uff09)]{1,40})[\uff09)]\s*$")
+
+
+def _bounded_confidence_or_zero(value: object) -> float:
+    try:
+        return round(max(0.0, min(float(value), 1.0)), 3)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -60,7 +83,7 @@ class OcrReaderBridgeWriter:
         self._state = self._initial_state("")
         self._text_to_line_id: dict[str, str] = {}
         self._line_id_owner: dict[str, str] = {}
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
     @property
     def bridge_root(self) -> Path:
@@ -129,11 +152,22 @@ class OcrReaderBridgeWriter:
                     "choices": self._state["choices"],
                     "save_context": self._state["save_context"],
                     "stability": self._state.get("stability", ""),
+                    "screen_type": self._state.get("screen_type", ""),
+                    "screen_ui_elements": self._state.get("screen_ui_elements", []),
+                    "screen_confidence": self._state.get("screen_confidence", 0.0),
+                    "screen_debug": json_copy(self._state.get("screen_debug") or {}),
                 },
                 ts=started_at,
             )
 
-    def emit_line(self, raw_text: str, *, ts: str) -> bool:
+    def emit_line(
+        self,
+        raw_text: str,
+        *,
+        ts: str,
+        ocr_confidence: float | None = None,
+        text_source: str = "",
+    ) -> bool:
         with self._lock:
             cleaned = raw_text.strip()
             if not cleaned or not self._session_id:
@@ -141,6 +175,7 @@ class OcrReaderBridgeWriter:
             speaker, text = self._split_speaker_text(cleaned)
             if not text:
                 return False
+            speaker_confidence = self._speaker_confidence(cleaned, speaker)
             line_id = self._line_id_for_text(text)
             self._state = {
                 **self._state,
@@ -165,12 +200,22 @@ class OcrReaderBridgeWriter:
                     "scene_id": self._state["scene_id"],
                     "route_id": self._state["route_id"],
                     "stability": "stable",
+                    "ocr_confidence": _bounded_confidence_or_zero(ocr_confidence),
+                    "speaker_confidence": speaker_confidence,
+                    "text_source": text_source or "bottom_region",
                 },
                 ts=ts,
             )
             return True
 
-    def emit_line_observed(self, raw_text: str, *, ts: str) -> bool:
+    def emit_line_observed(
+        self,
+        raw_text: str,
+        *,
+        ts: str,
+        ocr_confidence: float | None = None,
+        text_source: str = "",
+    ) -> bool:
         with self._lock:
             cleaned = raw_text.strip()
             if not cleaned or not self._session_id:
@@ -178,6 +223,7 @@ class OcrReaderBridgeWriter:
             speaker, text = self._split_speaker_text(cleaned)
             if not text:
                 return False
+            speaker_confidence = self._speaker_confidence(cleaned, speaker)
             normalized_text = normalize_text(text)
             current_text = str(self._state.get("text") or "")
             current_speaker = str(self._state.get("speaker") or "")
@@ -214,6 +260,9 @@ class OcrReaderBridgeWriter:
                     "scene_id": self._state["scene_id"],
                     "route_id": self._state["route_id"],
                     "stability": "tentative",
+                    "ocr_confidence": _bounded_confidence_or_zero(ocr_confidence),
+                    "speaker_confidence": speaker_confidence,
+                    "text_source": text_source or "bottom_region",
                 },
                 ts=ts,
             )
@@ -276,6 +325,77 @@ class OcrReaderBridgeWriter:
             )
             return True
 
+    def emit_screen_classified(
+        self,
+        *,
+        screen_type: str,
+        confidence: float,
+        ui_elements: list[dict[str, Any]] | None = None,
+        raw_ocr_text: list[str] | None = None,
+        screen_debug: dict[str, Any] | None = None,
+        ts: str,
+    ) -> bool:
+        with self._lock:
+            if not self._session_id:
+                return False
+            normalized_type = normalize_screen_type(screen_type)
+            if not normalized_type:
+                return False
+            elements = sanitize_screen_ui_elements(ui_elements or [], limit=10)
+            try:
+                normalized_confidence = round(max(0.0, min(float(confidence), 1.0)), 2)
+            except (TypeError, ValueError):
+                normalized_confidence = 0.0
+            raw_lines = [
+                str(line or "")[:120]
+                for line in list(raw_ocr_text or [])[:20]
+                if str(line or "").strip()
+            ]
+            current_type = str(self._state.get("screen_type") or "")
+            current_elements = sanitize_screen_ui_elements(
+                self._state.get("screen_ui_elements") or [], limit=10
+            )
+            try:
+                current_confidence = round(float(self._state.get("screen_confidence") or 0.0), 2)
+            except (TypeError, ValueError):
+                current_confidence = 0.0
+            if (
+                current_type == normalized_type
+                and current_elements == elements
+            ):
+                return False
+            if (
+                normalized_type in {OCR_CAPTURE_PROFILE_STAGE_DEFAULT, OCR_CAPTURE_PROFILE_STAGE_DIALOGUE}
+                and current_type == normalized_type
+                and abs(current_confidence - normalized_confidence) < 0.01
+            ):
+                return False
+            if not current_type and normalized_type == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+                return False
+            self._state = {
+                **self._state,
+                "screen_type": normalized_type,
+                "screen_ui_elements": elements,
+                "screen_confidence": normalized_confidence,
+                "screen_debug": json_copy(screen_debug or {}),
+                "ts": ts,
+            }
+            self._append_event(
+                "screen_classified",
+                {
+                    "screen_type": normalized_type,
+                    "screen_ui_elements": elements,
+                    "screen_confidence": normalized_confidence,
+                    "screen_debug": json_copy(screen_debug or {}),
+                    "raw_ocr_text": raw_lines,
+                    "scene_id": self._state["scene_id"],
+                    "line_id": self._state["line_id"],
+                    "route_id": self._state["route_id"],
+                },
+                ts=ts,
+            )
+            return True
+
     def emit_heartbeat(self, *, ts: str) -> bool:
         with self._lock:
             if not self._session_id:
@@ -319,35 +439,18 @@ class OcrReaderBridgeWriter:
         background_hash: str = "",
     ) -> bool:
         with self._lock:
-            if not self._session_id or not scene_id:
-                return False
-            if str(self._state.get("scene_id") or "") == scene_id:
-                return False
-            self._state = {
-                **self._state,
-                "scene_id": scene_id,
-                "choices": [],
-                "is_menu_open": False,
-                "stability": "",
-                "ts": ts,
-            }
-            self._append_event(
-                "scene_changed",
-                {
-                    "scene_id": scene_id,
-                    "route_id": self._state["route_id"],
-                    "reason": reason,
-                    "background_hash": background_hash,
-                },
+            return self._emit_scene_changed_unlocked(
+                scene_id=scene_id,
                 ts=ts,
+                reason=reason,
+                background_hash=background_hash,
             )
-            return True
 
     def advance_visual_scene(self, *, ts: str, background_hash: str = "") -> str:
         with self._lock:
             self._scene_index += 1
             scene_id = f"ocr:{self._game_id or 'unknown'}:scene-{self._scene_index:04d}"
-            self.emit_scene_changed(
+            self._emit_scene_changed_unlocked(
                 scene_id=scene_id,
                 ts=ts,
                 reason="background_changed",
@@ -365,6 +468,8 @@ class OcrReaderBridgeWriter:
                 "route_id": self._state["route_id"],
             }
             self._append_event("session_ended", payload, ts=ts, update_snapshot=False)
+            self._text_to_line_id.clear()
+            self._line_id_owner.clear()
             return True
 
     def runtime(self) -> Any:
@@ -395,6 +500,10 @@ class OcrReaderBridgeWriter:
             "is_menu_open": False,
             "save_context": {"kind": "unknown", "slot_id": "", "display_name": ""},
             "stability": "",
+            "screen_type": "",
+            "screen_ui_elements": [],
+            "screen_confidence": 0.0,
+            "screen_debug": {},
             "ts": ts,
         }
 
@@ -441,6 +550,12 @@ class OcrReaderBridgeWriter:
                 "is_menu_open": bool(self._state.get("is_menu_open", False)),
                 "save_context": dict(self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""})),
                 "stability": str(self._state.get("stability") or ""),
+                "screen_type": str(self._state.get("screen_type") or ""),
+                "screen_ui_elements": sanitize_screen_ui_elements(
+                    self._state.get("screen_ui_elements") or [], limit=10
+                ),
+                "screen_confidence": float(self._state.get("screen_confidence") or 0.0),
+                "screen_debug": json_copy(self._state.get("screen_debug") or {}),
                 "ts": str(self._state.get("ts") or self._started_at),
             },
         }
@@ -467,30 +582,61 @@ class OcrReaderBridgeWriter:
         ts: str,
         update_snapshot: bool = True,
     ) -> None:
-        with self._lock:
-            self._last_seq += 1
-            self._last_event_ts = ts
-            event = {
-                "protocol_version": 1,
-                "seq": self._last_seq,
-                "ts": ts,
-                "type": event_type,
-                "session_id": self._session_id,
-                "game_id": self._game_id,
-                "payload": payload,
-            }
-            with self._events_path().open("ab") as handle:
-                handle.write(
-                    json.dumps(
-                        event,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    + b"\n"
-                )
-                handle.flush()
-            if update_snapshot:
-                self._write_session_snapshot()
+        self._last_seq += 1
+        self._last_event_ts = ts
+        event = {
+            "protocol_version": 1,
+            "seq": self._last_seq,
+            "ts": ts,
+            "type": event_type,
+            "session_id": self._session_id,
+            "game_id": self._game_id,
+            "payload": payload,
+        }
+        with self._events_path().open("ab") as handle:
+            handle.write(
+                json.dumps(
+                    event,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            handle.flush()
+        if update_snapshot:
+            self._write_session_snapshot()
+
+    def _emit_scene_changed_unlocked(
+        self,
+        *,
+        scene_id: str,
+        ts: str,
+        reason: str,
+        background_hash: str = "",
+    ) -> bool:
+        if not self._session_id or not scene_id:
+            return False
+        if str(self._state.get("scene_id") or "") == scene_id:
+            return False
+        self._state = {
+            **self._state,
+            "scene_id": scene_id,
+            "choices": [],
+            "is_menu_open": False,
+            "stability": "",
+            "ts": ts,
+        }
+        self._append_event(
+            "scene_changed",
+            {
+                "scene_id": scene_id,
+                "route_id": self._state["route_id"],
+                "reason": reason,
+                "background_hash": background_hash,
+            },
+            ts=ts,
+        )
+        return True
 
     def _line_id_for_text(self, text: str) -> str:
         normalized = normalize_text(text)
@@ -519,12 +665,41 @@ class OcrReaderBridgeWriter:
 
     @staticmethod
     def _split_speaker_text(raw_text: str) -> tuple[str, str]:
-        speaker_quote_re = re.compile(r"^\s*([^\u300c\u300d:\uff1a]{1,40})[\u300c\u300e](.+)[\u300d\u300f]\s*$")
-        speaker_colon_re = re.compile(r"^\s*([^:\uff1a]{1,40})[:\uff1a]\s*(.+\S)\s*$")
-        match = speaker_quote_re.match(raw_text)
+        match = _SPEAKER_BRACKET_RE.match(raw_text)
         if match is not None:
             return match.group(1).strip(), match.group(2).strip()
-        match = speaker_colon_re.match(raw_text)
+        match = _SPEAKER_PAREN_PREFIX_RE.match(raw_text)
         if match is not None:
             return match.group(1).strip(), match.group(2).strip()
+        match = _SPEAKER_QUOTE_RE.match(raw_text)
+        if match is not None:
+            return match.group(1).strip(), match.group(2).strip()
+        match = _SPEAKER_COLON_RE.match(raw_text)
+        if match is not None:
+            return match.group(1).strip(), match.group(2).strip()
+        match = _SPEAKER_PAREN_SUFFIX_RE.match(raw_text)
+        if match is not None:
+            return match.group(1).strip(), match.group(2).strip()
+        match = _NARRATION_QUOTE_RE.match(raw_text)
+        if match is not None:
+            return "", match.group(1).strip()
+        match = _NARRATION_PAREN_RE.match(raw_text)
+        if match is not None:
+            return "", match.group(1).strip()
         return "", raw_text.strip()
+
+    @staticmethod
+    def _speaker_confidence(raw_text: str, speaker: str) -> float:
+        if not speaker:
+            return 0.0
+        if _SPEAKER_BRACKET_RE.match(raw_text) is not None:
+            return 0.96
+        if _SPEAKER_QUOTE_RE.match(raw_text) is not None:
+            return 0.94
+        if _SPEAKER_COLON_RE.match(raw_text) is not None:
+            return 0.94
+        if _SPEAKER_PAREN_PREFIX_RE.match(raw_text) is not None:
+            return 0.84
+        if _SPEAKER_PAREN_SUFFIX_RE.match(raw_text) is not None:
+            return 0.80
+        return 0.65

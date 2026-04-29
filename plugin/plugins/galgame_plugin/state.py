@@ -22,6 +22,10 @@ class GalgameSharedState:
     history_lines: list[dict[str, Any]] = field(default_factory=list)
     history_observed_lines: list[dict[str, Any]] = field(default_factory=list)
     history_choices: list[dict[str, Any]] = field(default_factory=list)
+    screen_type: str = ""
+    screen_ui_elements: list[dict[str, Any]] = field(default_factory=list)
+    screen_confidence: float = 0.0
+    screen_debug: dict[str, Any] = field(default_factory=dict)
     dedupe_window: list[dict[str, str]] = field(default_factory=list)
     line_buffer: bytes = b""
     stream_reset_pending: bool = False

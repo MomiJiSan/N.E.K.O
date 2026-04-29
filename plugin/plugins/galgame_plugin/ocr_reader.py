@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 import hashlib
+import io
 import json
+import logging
 import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, ClassVar, Iterable, Protocol
 from uuid import uuid4
 
 from .models import (
@@ -29,6 +34,10 @@ from .models import (
     DEFAULT_OCR_CAPTURE_RIGHT_INSET_RATIO,
     DEFAULT_OCR_CAPTURE_TOP_RATIO,
     GalgameConfig,
+    MENU_PREFIX_RE as _MENU_PREFIX_RE,
+    OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+    OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+    OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
     OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_ASPECT_NEAREST,
     OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUCKET_EXACT,
     OCR_CAPTURE_PROFILE_MATCH_SOURCE_BUILTIN_PRESET,
@@ -37,11 +46,17 @@ from .models import (
     OCR_CAPTURE_PROFILE_RATIO_KEYS,
     OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
     OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+    OCR_CAPTURE_PROFILE_STAGE_MINIGAME,
     OCR_CAPTURE_PROFILE_STAGE_MENU,
+    OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+    OCR_CAPTURE_PROFILE_STAGE_TITLE,
+    OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
     OCR_CAPTURE_PROFILE_WINDOW_BUCKETS_KEY,
     OCR_TRIGGER_MODE_AFTER_ADVANCE,
     build_ocr_capture_profile_bucket_key,
     compute_ocr_window_aspect_ratio,
+    json_copy,
+    sanitize_screen_ui_elements,
     parse_ocr_capture_profile_bucket_key,
 )
 from .aihong_state import (
@@ -62,7 +77,21 @@ from .rapidocr_support import (
     load_rapidocr_runtime,
 )
 from .reader import normalize_text
+from .screen_classifier import (
+    ScreenClassification,
+    classify_screen_awareness_model,
+    classify_screen_from_ocr,
+    normalize_screen_type,
+)
+from .screen_classifier import analyze_screen_visual_features
 from .tesseract_support import inspect_tesseract_installation, resolve_tesseract_path
+
+try:
+    from PIL import Image as _PIL_IMAGE_MODULE
+
+    _PIL_RESAMPLING = getattr(_PIL_IMAGE_MODULE, "Resampling", None)
+except ImportError:  # pragma: no cover - optional in non-visual test environments.
+    _PIL_RESAMPLING = None
 
 try:
     import psutil
@@ -75,8 +104,20 @@ OCR_READER_GAME_ID_PREFIX = "ocr-"
 OCR_READER_UNKNOWN_SCENE = "ocr:unknown_scene"
 OCR_READER_ROUTE_ID = ""
 OCR_READER_DEFAULT_ENGINE = "unknown"
+_OCR_LINE_ID_MAX_COLLISION_SUFFIX = 10000
+_LOGGER = logging.getLogger(__name__)
+_VISION_SNAPSHOT_TTL_SECONDS = 8.0
+_VISION_SNAPSHOT_JPEG_QUALITY = 72
 
-_MENU_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[\.\)\]:：]\s+)(.+\S)\s*$")
+_SPEAKER_QUOTE_RE = re.compile(
+    r"^\s*([^\u300c\u300d:\uff1a]{1,40})[\u300c\u300e](.+)[\u300d\u300f]\s*$"
+)
+_SPEAKER_COLON_RE = re.compile(r"^\s*([^:\uff1a]{1,40})[:\uff1a]\s*(.+\S)\s*$")
+_SPEAKER_BRACKET_RE = re.compile(r"^\s*[\u3010\[]([^\u3011\]]{1,40})[\u3011\]]\s*(.+\S)\s*$")
+_SPEAKER_PAREN_SUFFIX_RE = re.compile(r"^\s*([^\uff08\uff09()]{1,40})[\uff08(](.+\S)[\uff09)]\s*$")
+_SPEAKER_PAREN_PREFIX_RE = re.compile(r"^\s*[\uff08(]([^\uff09)]{1,40})[\uff09)]\s*(.+\S)\s*$")
+_NARRATION_QUOTE_RE = re.compile(r"^\s*[\u300c\u300e\u201c\"](.+\S)[\u300d\u300f\u201d\"]\s*$")
+_NARRATION_PAREN_RE = re.compile(r"^\s*[\uff08(]([^\uff09)]{1,40})[\uff09)]\s*$")
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _KANA_CHAR_RE = re.compile(r"[\u3040-\u30ff]")
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
@@ -549,6 +590,27 @@ def _extraction_choice_bounds_metadata(extraction: "OcrExtractionResult") -> dic
     return metadata
 
 
+def _frame_choice_bounds_metadata(frame: Any, *, text_source: str = "") -> dict[str, Any]:
+    info = getattr(frame, "info", {}) if frame is not None else {}
+    metadata: dict[str, Any] = {}
+    if isinstance(info, dict):
+        bounds_coordinate_space = str(info.get("galgame_bounds_coordinate_space") or "")
+        if bounds_coordinate_space:
+            metadata["bounds_coordinate_space"] = bounds_coordinate_space
+        source_size = info.get("galgame_source_size")
+        if isinstance(source_size, dict):
+            metadata["source_size"] = dict(source_size)
+        capture_rect = info.get("galgame_capture_rect")
+        if isinstance(capture_rect, dict):
+            metadata["capture_rect"] = dict(capture_rect)
+        window_rect = info.get("galgame_window_rect")
+        if isinstance(window_rect, dict):
+            metadata["window_rect"] = dict(window_rect)
+    if text_source:
+        metadata["text_source"] = text_source
+    return metadata
+
+
 @dataclass(slots=True)
 class OcrCaptureProfile:
     left_inset_ratio: float = DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO
@@ -663,6 +725,7 @@ def _perceptual_hash_image(frame: Any, *, size: int = _BACKGROUND_SCENE_HASH_SIZ
         width = max(1, (size * size + 3) // 4)
         return f"{int(bits, 2):0{width}x}"
     except Exception:
+        _LOGGER.debug("ocr_reader perceptual hash failed", exc_info=True)
         return ""
 
 
@@ -723,6 +786,29 @@ def _weighted_ocr_score(scores: Iterable[tuple[float, int]]) -> float:
     return weighted_sum / total_weight
 
 
+def _average_ocr_box_confidence(boxes: Iterable[Any]) -> float:
+    scores: list[tuple[float, int]] = []
+    for box in list(boxes or []):
+        try:
+            score = float(getattr(box, "score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        if score <= 0.0:
+            continue
+        text = str(getattr(box, "text", "") or "")
+        scores.append((score, _ocr_score_weight(text)))
+    if not scores:
+        return 0.0
+    return round(max(0.0, min(_weighted_ocr_score(scores), 1.0)), 3)
+
+
+def _bounded_confidence_or_zero(value: object) -> float:
+    try:
+        return round(max(0.0, min(float(value), 1.0)), 3)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass(slots=True)
 class _RapidOcrToken:
     text: str
@@ -741,6 +827,7 @@ class OcrTextBox:
     top: float
     right: float
     bottom: float
+    score: float = 0.0
 
     def to_dict(self) -> dict[str, float | str]:
         return {
@@ -749,6 +836,7 @@ class OcrTextBox:
             "top": self.top,
             "right": self.right,
             "bottom": self.bottom,
+            "score": self.score,
         }
 
 
@@ -821,10 +909,7 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
         if not bucket:
             line_buckets.pop(int(entry["bucket"]), None)
 
-    def _refresh_line_entry(entry: dict[str, Any]) -> None:
-        tokens_for_line = entry["tokens"]
-        top = min(item.top for item in tokens_for_line)
-        bottom = max(item.bottom for item in tokens_for_line)
+    def _refresh_line_entry(entry: dict[str, Any], *, top: float, bottom: float) -> float:
         center = (top + bottom) / 2.0
         new_bucket = _bucket_key(center)
         if new_bucket != int(entry["bucket"]):
@@ -834,15 +919,13 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
         entry["top"] = top
         entry["bottom"] = bottom
         entry["center"] = center
+        return max(1.0, bottom - top)
 
+    max_line_height = max(1.0, tokens[0].height)
     for token in tokens:
         token_center = (token.top + token.bottom) / 2.0
         best_entry: dict[str, Any] | None = None
         best_distance = float("inf")
-        max_line_height = max(
-            (float(entry["bottom"]) - float(entry["top"]) for entry in line_entries),
-            default=token.height,
-        )
         search_radius = max(2, int(max(max_line_height, token.height) / bucket_size) + 2)
         candidate_entries: list[dict[str, Any]] = []
         token_bucket = _bucket_key(token_center)
@@ -859,7 +942,12 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
                 best_distance = distance
         if best_entry is not None:
             best_entry["tokens"].append(token)
-            _refresh_line_entry(best_entry)
+            line_height = _refresh_line_entry(
+                best_entry,
+                top=min(float(best_entry["top"]), token.top),
+                bottom=max(float(best_entry["bottom"]), token.bottom),
+            )
+            max_line_height = max(max_line_height, line_height)
         else:
             entry = {
                 "tokens": [token],
@@ -870,6 +958,7 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
             }
             line_entries.append(entry)
             _add_line_bucket(entry)
+            max_line_height = max(max_line_height, token.height)
     rendered_lines: list[str] = []
     line_results: list[tuple[str, float, OcrTextBox]] = []
     lines = [list(entry["tokens"]) for entry in line_entries]
@@ -893,6 +982,7 @@ def _rapidocr_lines_from_output(raw_output: Any) -> list[tuple[str, float, OcrTe
                     top=min(item.top for item in line),
                     right=max(item.right for item in line),
                     bottom=max(item.bottom for item in line),
+                    score=line_score,
                 ),
             )
         )
@@ -1314,25 +1404,64 @@ class OcrWindowTarget:
         )
 
 
+class _RuntimeFieldProxy:
+    def __init__(self, group_name: str, field_name: str) -> None:
+        self._group_name = group_name
+        self._field_name = field_name
+
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> Any:
+        if instance is None:
+            return self
+        return getattr(getattr(instance, self._group_name), self._field_name)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        setattr(getattr(instance, self._group_name), self._field_name, value)
+
+
 @dataclass(slots=True)
-class OcrReaderRuntime:
+class OcrReaderStatusRuntime:
     enabled: bool = False
     status: str = "disabled"
     detail: str = ""
+
+
+@dataclass(slots=True)
+class OcrReaderWindowRuntime:
     process_name: str = ""
     pid: int = 0
     window_title: str = ""
     width: int = 0
     height: int = 0
     aspect_ratio: float = 0.0
+
+
+@dataclass(slots=True)
+class OcrReaderSessionRuntime:
     game_id: str = ""
     session_id: str = ""
     last_seq: int = 0
     last_event_ts: str = ""
+
+
+@dataclass(slots=True)
+class OcrReaderProfileRuntime:
     capture_stage: str = ""
     capture_profile: dict[str, float] = field(default_factory=dict)
     capture_profile_match_source: str = ""
     capture_profile_bucket_key: str = ""
+    recommended_capture_profile: dict[str, Any] = field(default_factory=dict)
+    recommended_capture_profile_process_name: str = ""
+    recommended_capture_profile_stage: str = ""
+    recommended_capture_profile_save_scope: str = ""
+    recommended_capture_profile_reason: str = ""
+    recommended_capture_profile_confidence: float = 0.0
+    recommended_capture_profile_sample_text: str = ""
+    recommended_capture_profile_bucket_key: str = ""
+    recommended_capture_profile_manual_present: bool = False
+
+
+@dataclass(slots=True)
+class OcrReaderBackendRuntime:
     tesseract_path: str = ""
     languages: str = ""
     takeover_reason: str = ""
@@ -1340,6 +1469,12 @@ class OcrReaderRuntime:
     backend_detail: str = ""
     backend_path: str = ""
     backend_model: str = ""
+    capture_backend_kind: str = ""
+    capture_backend_detail: str = ""
+
+
+@dataclass(slots=True)
+class OcrReaderTargetRuntime:
     target_selection_mode: str = "auto"
     target_selection_detail: str = ""
     effective_window_key: str = ""
@@ -1351,30 +1486,6 @@ class OcrReaderRuntime:
     candidate_count: int = 0
     excluded_candidate_count: int = 0
     last_exclude_reason: str = ""
-    consecutive_no_text_polls: int = 0
-    last_observed_at: str = ""
-    last_capture_profile: dict[str, float] = field(default_factory=dict)
-    last_capture_stage: str = ""
-    ocr_capture_diagnostic_required: bool = False
-    ocr_context_state: str = ""
-    last_capture_attempt_at: str = ""
-    last_capture_completed_at: str = ""
-    last_capture_error: str = ""
-    last_raw_ocr_text: str = ""
-    last_observed_line: dict[str, Any] = field(default_factory=dict)
-    last_stable_line: dict[str, Any] = field(default_factory=dict)
-    stable_ocr_last_raw_text: str = ""
-    stable_ocr_repeat_count: int = 0
-    stable_ocr_stable_text: str = ""
-    stable_ocr_block_reason: str = ""
-    capture_backend_kind: str = ""
-    capture_backend_detail: str = ""
-    last_capture_image_hash: str = ""
-    last_capture_source_size: dict[str, float] = field(default_factory=dict)
-    last_capture_rect: dict[str, float] = field(default_factory=dict)
-    last_capture_window_rect: dict[str, float] = field(default_factory=dict)
-    consecutive_same_capture_frames: int = 0
-    stale_capture_backend: bool = False
     foreground_refresh_at: str = ""
     foreground_refresh_detail: str = ""
     foreground_hwnd: int = 0
@@ -1386,6 +1497,43 @@ class OcrReaderRuntime:
     foreground_advance_last_delta: int = 0
     foreground_advance_last_matched: bool = False
     foreground_advance_last_match_reason: str = ""
+    foreground_advance_consumed_count: int = 0
+    foreground_advance_matched_count: int = 0
+    foreground_advance_coalesced_count: int = 0
+    foreground_advance_first_event_ts: float = 0.0
+    foreground_advance_last_event_ts: float = 0.0
+    foreground_advance_detected_at: float = 0.0
+    foreground_advance_last_event_age_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class OcrReaderObservationRuntime:
+    consecutive_no_text_polls: int = 0
+    last_observed_at: str = ""
+    ocr_capture_diagnostic_required: bool = False
+    ocr_context_state: str = ""
+    last_raw_ocr_text: str = ""
+    last_observed_line: dict[str, Any] = field(default_factory=dict)
+    last_stable_line: dict[str, Any] = field(default_factory=dict)
+    stable_ocr_last_raw_text: str = ""
+    stable_ocr_repeat_count: int = 0
+    stable_ocr_stable_text: str = ""
+    stable_ocr_block_reason: str = ""
+
+
+@dataclass(slots=True)
+class OcrReaderCaptureRuntime:
+    last_capture_profile: dict[str, float] = field(default_factory=dict)
+    last_capture_stage: str = ""
+    last_capture_attempt_at: str = ""
+    last_capture_completed_at: str = ""
+    last_capture_error: str = ""
+    last_capture_image_hash: str = ""
+    last_capture_source_size: dict[str, float] = field(default_factory=dict)
+    last_capture_rect: dict[str, float] = field(default_factory=dict)
+    last_capture_window_rect: dict[str, float] = field(default_factory=dict)
+    consecutive_same_capture_frames: int = 0
+    stale_capture_backend: bool = False
     last_capture_total_duration_seconds: float = 0.0
     last_capture_frame_duration_seconds: float = 0.0
     last_capture_background_duration_seconds: float = 0.0
@@ -1394,10 +1542,248 @@ class OcrReaderRuntime:
     last_backend_plan_duration_seconds: float = 0.0
     last_window_scan_duration_seconds: float = 0.0
     last_capture_background_hash_skipped: bool = False
+    vision_snapshot_available: bool = False
+    vision_snapshot_captured_at: str = ""
+    vision_snapshot_expires_at: str = ""
+    vision_snapshot_source: str = ""
+    vision_snapshot_width: int = 0
+    vision_snapshot_height: int = 0
+    vision_snapshot_byte_size: int = 0
+    screen_awareness_sample_collection_enabled: bool = False
+    screen_awareness_sample_count: int = 0
+    screen_awareness_sample_last_path: str = ""
+    screen_awareness_sample_last_error: str = ""
+    screen_awareness_model_enabled: bool = False
+    screen_awareness_model_available: bool = False
+    screen_awareness_model_path: str = ""
+    screen_awareness_model_detail: str = ""
+    screen_awareness_model_last_stage: str = ""
+    screen_awareness_model_last_confidence: float = 0.0
+    screen_awareness_model_last_latency_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class OcrReaderPollRuntime:
     last_poll_started_at: str = ""
     last_poll_completed_at: str = ""
     last_poll_duration_seconds: float = 0.0
     last_poll_emitted_event: bool = False
+
+
+@dataclass(slots=True, init=False)
+class OcrReaderRuntime:
+    status_state: OcrReaderStatusRuntime
+    window: OcrReaderWindowRuntime
+    session: OcrReaderSessionRuntime
+    profile: OcrReaderProfileRuntime
+    backend: OcrReaderBackendRuntime
+    target: OcrReaderTargetRuntime
+    observation: OcrReaderObservationRuntime
+    capture: OcrReaderCaptureRuntime
+    poll: OcrReaderPollRuntime
+
+    _FIELD_MAP: ClassVar[dict[str, tuple[str, str]]] = {
+        "enabled": ("status_state", "enabled"),
+        "status": ("status_state", "status"),
+        "detail": ("status_state", "detail"),
+        "process_name": ("window", "process_name"),
+        "pid": ("window", "pid"),
+        "window_title": ("window", "window_title"),
+        "width": ("window", "width"),
+        "height": ("window", "height"),
+        "aspect_ratio": ("window", "aspect_ratio"),
+        "game_id": ("session", "game_id"),
+        "session_id": ("session", "session_id"),
+        "last_seq": ("session", "last_seq"),
+        "last_event_ts": ("session", "last_event_ts"),
+        "capture_stage": ("profile", "capture_stage"),
+        "capture_profile": ("profile", "capture_profile"),
+        "capture_profile_match_source": ("profile", "capture_profile_match_source"),
+        "capture_profile_bucket_key": ("profile", "capture_profile_bucket_key"),
+        "recommended_capture_profile": ("profile", "recommended_capture_profile"),
+        "recommended_capture_profile_process_name": (
+            "profile",
+            "recommended_capture_profile_process_name",
+        ),
+        "recommended_capture_profile_stage": ("profile", "recommended_capture_profile_stage"),
+        "recommended_capture_profile_save_scope": (
+            "profile",
+            "recommended_capture_profile_save_scope",
+        ),
+        "recommended_capture_profile_reason": ("profile", "recommended_capture_profile_reason"),
+        "recommended_capture_profile_confidence": (
+            "profile",
+            "recommended_capture_profile_confidence",
+        ),
+        "recommended_capture_profile_sample_text": (
+            "profile",
+            "recommended_capture_profile_sample_text",
+        ),
+        "recommended_capture_profile_bucket_key": (
+            "profile",
+            "recommended_capture_profile_bucket_key",
+        ),
+        "recommended_capture_profile_manual_present": (
+            "profile",
+            "recommended_capture_profile_manual_present",
+        ),
+        "tesseract_path": ("backend", "tesseract_path"),
+        "languages": ("backend", "languages"),
+        "takeover_reason": ("backend", "takeover_reason"),
+        "backend_kind": ("backend", "backend_kind"),
+        "backend_detail": ("backend", "backend_detail"),
+        "backend_path": ("backend", "backend_path"),
+        "backend_model": ("backend", "backend_model"),
+        "target_selection_mode": ("target", "target_selection_mode"),
+        "target_selection_detail": ("target", "target_selection_detail"),
+        "effective_window_key": ("target", "effective_window_key"),
+        "effective_window_title": ("target", "effective_window_title"),
+        "effective_process_name": ("target", "effective_process_name"),
+        "target_is_foreground": ("target", "target_is_foreground"),
+        "manual_target": ("target", "manual_target"),
+        "locked_target": ("target", "locked_target"),
+        "candidate_count": ("target", "candidate_count"),
+        "excluded_candidate_count": ("target", "excluded_candidate_count"),
+        "last_exclude_reason": ("target", "last_exclude_reason"),
+        "consecutive_no_text_polls": ("observation", "consecutive_no_text_polls"),
+        "last_observed_at": ("observation", "last_observed_at"),
+        "last_capture_profile": ("capture", "last_capture_profile"),
+        "last_capture_stage": ("capture", "last_capture_stage"),
+        "ocr_capture_diagnostic_required": ("observation", "ocr_capture_diagnostic_required"),
+        "ocr_context_state": ("observation", "ocr_context_state"),
+        "last_capture_attempt_at": ("capture", "last_capture_attempt_at"),
+        "last_capture_completed_at": ("capture", "last_capture_completed_at"),
+        "last_capture_error": ("capture", "last_capture_error"),
+        "last_raw_ocr_text": ("observation", "last_raw_ocr_text"),
+        "last_observed_line": ("observation", "last_observed_line"),
+        "last_stable_line": ("observation", "last_stable_line"),
+        "stable_ocr_last_raw_text": ("observation", "stable_ocr_last_raw_text"),
+        "stable_ocr_repeat_count": ("observation", "stable_ocr_repeat_count"),
+        "stable_ocr_stable_text": ("observation", "stable_ocr_stable_text"),
+        "stable_ocr_block_reason": ("observation", "stable_ocr_block_reason"),
+        "capture_backend_kind": ("backend", "capture_backend_kind"),
+        "capture_backend_detail": ("backend", "capture_backend_detail"),
+        "last_capture_image_hash": ("capture", "last_capture_image_hash"),
+        "last_capture_source_size": ("capture", "last_capture_source_size"),
+        "last_capture_rect": ("capture", "last_capture_rect"),
+        "last_capture_window_rect": ("capture", "last_capture_window_rect"),
+        "consecutive_same_capture_frames": ("capture", "consecutive_same_capture_frames"),
+        "stale_capture_backend": ("capture", "stale_capture_backend"),
+        "foreground_refresh_at": ("target", "foreground_refresh_at"),
+        "foreground_refresh_detail": ("target", "foreground_refresh_detail"),
+        "foreground_hwnd": ("target", "foreground_hwnd"),
+        "target_hwnd": ("target", "target_hwnd"),
+        "foreground_advance_monitor_running": ("target", "foreground_advance_monitor_running"),
+        "foreground_advance_last_seq": ("target", "foreground_advance_last_seq"),
+        "foreground_advance_consumed_seq": ("target", "foreground_advance_consumed_seq"),
+        "foreground_advance_last_kind": ("target", "foreground_advance_last_kind"),
+        "foreground_advance_last_delta": ("target", "foreground_advance_last_delta"),
+        "foreground_advance_last_matched": ("target", "foreground_advance_last_matched"),
+        "foreground_advance_last_match_reason": (
+            "target",
+            "foreground_advance_last_match_reason",
+        ),
+        "foreground_advance_consumed_count": ("target", "foreground_advance_consumed_count"),
+        "foreground_advance_matched_count": ("target", "foreground_advance_matched_count"),
+        "foreground_advance_coalesced_count": ("target", "foreground_advance_coalesced_count"),
+        "foreground_advance_first_event_ts": ("target", "foreground_advance_first_event_ts"),
+        "foreground_advance_last_event_ts": ("target", "foreground_advance_last_event_ts"),
+        "foreground_advance_detected_at": ("target", "foreground_advance_detected_at"),
+        "foreground_advance_last_event_age_seconds": (
+            "target",
+            "foreground_advance_last_event_age_seconds",
+        ),
+        "last_capture_total_duration_seconds": (
+            "capture",
+            "last_capture_total_duration_seconds",
+        ),
+        "last_capture_frame_duration_seconds": (
+            "capture",
+            "last_capture_frame_duration_seconds",
+        ),
+        "last_capture_background_duration_seconds": (
+            "capture",
+            "last_capture_background_duration_seconds",
+        ),
+        "last_capture_image_hash_duration_seconds": (
+            "capture",
+            "last_capture_image_hash_duration_seconds",
+        ),
+        "last_ocr_extract_duration_seconds": ("capture", "last_ocr_extract_duration_seconds"),
+        "last_backend_plan_duration_seconds": (
+            "capture",
+            "last_backend_plan_duration_seconds",
+        ),
+        "last_window_scan_duration_seconds": ("capture", "last_window_scan_duration_seconds"),
+        "last_capture_background_hash_skipped": (
+            "capture",
+            "last_capture_background_hash_skipped",
+        ),
+        "vision_snapshot_available": ("capture", "vision_snapshot_available"),
+        "vision_snapshot_captured_at": ("capture", "vision_snapshot_captured_at"),
+        "vision_snapshot_expires_at": ("capture", "vision_snapshot_expires_at"),
+        "vision_snapshot_source": ("capture", "vision_snapshot_source"),
+        "vision_snapshot_width": ("capture", "vision_snapshot_width"),
+        "vision_snapshot_height": ("capture", "vision_snapshot_height"),
+        "vision_snapshot_byte_size": ("capture", "vision_snapshot_byte_size"),
+        "screen_awareness_sample_collection_enabled": (
+            "capture",
+            "screen_awareness_sample_collection_enabled",
+        ),
+        "screen_awareness_sample_count": ("capture", "screen_awareness_sample_count"),
+        "screen_awareness_sample_last_path": ("capture", "screen_awareness_sample_last_path"),
+        "screen_awareness_sample_last_error": ("capture", "screen_awareness_sample_last_error"),
+        "screen_awareness_model_enabled": ("capture", "screen_awareness_model_enabled"),
+        "screen_awareness_model_available": ("capture", "screen_awareness_model_available"),
+        "screen_awareness_model_path": ("capture", "screen_awareness_model_path"),
+        "screen_awareness_model_detail": ("capture", "screen_awareness_model_detail"),
+        "screen_awareness_model_last_stage": ("capture", "screen_awareness_model_last_stage"),
+        "screen_awareness_model_last_confidence": (
+            "capture",
+            "screen_awareness_model_last_confidence",
+        ),
+        "screen_awareness_model_last_latency_seconds": (
+            "capture",
+            "screen_awareness_model_last_latency_seconds",
+        ),
+        "last_poll_started_at": ("poll", "last_poll_started_at"),
+        "last_poll_completed_at": ("poll", "last_poll_completed_at"),
+        "last_poll_duration_seconds": ("poll", "last_poll_duration_seconds"),
+        "last_poll_emitted_event": ("poll", "last_poll_emitted_event"),
+    }
+
+    def __init__(
+        self,
+        *,
+        status_state: OcrReaderStatusRuntime | None = None,
+        window: OcrReaderWindowRuntime | None = None,
+        session: OcrReaderSessionRuntime | None = None,
+        profile: OcrReaderProfileRuntime | None = None,
+        backend: OcrReaderBackendRuntime | None = None,
+        target: OcrReaderTargetRuntime | None = None,
+        observation: OcrReaderObservationRuntime | None = None,
+        capture: OcrReaderCaptureRuntime | None = None,
+        poll: OcrReaderPollRuntime | None = None,
+        **legacy_fields: Any,
+    ) -> None:
+        self.status_state = status_state if status_state is not None else OcrReaderStatusRuntime()
+        self.window = window if window is not None else OcrReaderWindowRuntime()
+        self.session = session if session is not None else OcrReaderSessionRuntime()
+        self.profile = profile if profile is not None else OcrReaderProfileRuntime()
+        self.backend = backend if backend is not None else OcrReaderBackendRuntime()
+        self.target = target if target is not None else OcrReaderTargetRuntime()
+        self.observation = (
+            observation if observation is not None else OcrReaderObservationRuntime()
+        )
+        self.capture = capture if capture is not None else OcrReaderCaptureRuntime()
+        self.poll = poll if poll is not None else OcrReaderPollRuntime()
+
+        for field_name in self._FIELD_MAP:
+            if field_name in legacy_fields:
+                setattr(self, field_name, legacy_fields.pop(field_name))
+        if legacy_fields:
+            unexpected = ", ".join(sorted(legacy_fields))
+            raise TypeError(f"unexpected OcrReaderRuntime field(s): {unexpected}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1418,6 +1804,15 @@ class OcrReaderRuntime:
             "capture_profile": dict(self.capture_profile),
             "capture_profile_match_source": self.capture_profile_match_source,
             "capture_profile_bucket_key": self.capture_profile_bucket_key,
+            "recommended_capture_profile": dict(self.recommended_capture_profile),
+            "recommended_capture_profile_process_name": self.recommended_capture_profile_process_name,
+            "recommended_capture_profile_stage": self.recommended_capture_profile_stage,
+            "recommended_capture_profile_save_scope": self.recommended_capture_profile_save_scope,
+            "recommended_capture_profile_reason": self.recommended_capture_profile_reason,
+            "recommended_capture_profile_confidence": self.recommended_capture_profile_confidence,
+            "recommended_capture_profile_sample_text": self.recommended_capture_profile_sample_text,
+            "recommended_capture_profile_bucket_key": self.recommended_capture_profile_bucket_key,
+            "recommended_capture_profile_manual_present": self.recommended_capture_profile_manual_present,
             "tesseract_path": self.tesseract_path,
             "languages": self.languages,
             "takeover_reason": self.takeover_reason,
@@ -1471,6 +1866,15 @@ class OcrReaderRuntime:
             "foreground_advance_last_delta": self.foreground_advance_last_delta,
             "foreground_advance_last_matched": self.foreground_advance_last_matched,
             "foreground_advance_last_match_reason": self.foreground_advance_last_match_reason,
+            "foreground_advance_consumed_count": self.foreground_advance_consumed_count,
+            "foreground_advance_matched_count": self.foreground_advance_matched_count,
+            "foreground_advance_coalesced_count": self.foreground_advance_coalesced_count,
+            "foreground_advance_first_event_ts": self.foreground_advance_first_event_ts,
+            "foreground_advance_last_event_ts": self.foreground_advance_last_event_ts,
+            "foreground_advance_detected_at": self.foreground_advance_detected_at,
+            "foreground_advance_last_event_age_seconds": (
+                self.foreground_advance_last_event_age_seconds
+            ),
             "last_capture_total_duration_seconds": self.last_capture_total_duration_seconds,
             "last_capture_frame_duration_seconds": self.last_capture_frame_duration_seconds,
             "last_capture_background_duration_seconds": self.last_capture_background_duration_seconds,
@@ -1479,11 +1883,45 @@ class OcrReaderRuntime:
             "last_backend_plan_duration_seconds": self.last_backend_plan_duration_seconds,
             "last_window_scan_duration_seconds": self.last_window_scan_duration_seconds,
             "last_capture_background_hash_skipped": self.last_capture_background_hash_skipped,
+            "vision_snapshot_available": self.vision_snapshot_available,
+            "vision_snapshot_captured_at": self.vision_snapshot_captured_at,
+            "vision_snapshot_expires_at": self.vision_snapshot_expires_at,
+            "vision_snapshot_source": self.vision_snapshot_source,
+            "vision_snapshot_width": self.vision_snapshot_width,
+            "vision_snapshot_height": self.vision_snapshot_height,
+            "vision_snapshot_byte_size": self.vision_snapshot_byte_size,
+            "screen_awareness_sample_collection_enabled": (
+                self.screen_awareness_sample_collection_enabled
+            ),
+            "screen_awareness_sample_count": self.screen_awareness_sample_count,
+            "screen_awareness_sample_last_path": self.screen_awareness_sample_last_path,
+            "screen_awareness_sample_last_error": self.screen_awareness_sample_last_error,
+            "screen_awareness_model_enabled": self.screen_awareness_model_enabled,
+            "screen_awareness_model_available": self.screen_awareness_model_available,
+            "screen_awareness_model_path": self.screen_awareness_model_path,
+            "screen_awareness_model_detail": self.screen_awareness_model_detail,
+            "screen_awareness_model_last_stage": self.screen_awareness_model_last_stage,
+            "screen_awareness_model_last_confidence": self.screen_awareness_model_last_confidence,
+            "screen_awareness_model_last_latency_seconds": (
+                self.screen_awareness_model_last_latency_seconds
+            ),
             "last_poll_started_at": self.last_poll_started_at,
             "last_poll_completed_at": self.last_poll_completed_at,
             "last_poll_duration_seconds": self.last_poll_duration_seconds,
             "last_poll_emitted_event": self.last_poll_emitted_event,
         }
+
+
+for _runtime_field_name, (
+    _runtime_group_name,
+    _runtime_group_attr,
+) in OcrReaderRuntime._FIELD_MAP.items():
+    setattr(
+        OcrReaderRuntime,
+        _runtime_field_name,
+        _RuntimeFieldProxy(_runtime_group_name, _runtime_group_attr),
+    )
+del _runtime_field_name, _runtime_group_name, _runtime_group_attr
 
 
 @dataclass(slots=True)
@@ -1541,6 +1979,34 @@ class OcrExtractionResult:
     capture_image_hash: str = ""
     background_hash: str = ""
     timing: dict[str, float | bool] = field(default_factory=dict)
+    screen_ocr_regions: list[dict[str, Any]] = field(default_factory=list)
+    screen_visual_features: dict[str, Any] = field(default_factory=dict)
+    ocr_confidence: float = 0.0
+    text_source: str = "bottom_region"
+
+
+@dataclass(slots=True)
+class _TickPreflightResult:
+    result: OcrReaderTickResult
+    backend_plan: SelectedOcrBackendPlan = field(default_factory=SelectedOcrBackendPlan)
+    backend_plan_duration: float = 0.0
+    should_return: bool = False
+
+
+@dataclass(slots=True)
+class _TickTargetContext:
+    result: OcrReaderTickResult
+    target: DetectedGameWindow | None = None
+    selection: WindowSelectionResult = field(default_factory=WindowSelectionResult)
+    profile: OcrCaptureProfile = field(default_factory=OcrCaptureProfile)
+    capture_profile_selection: ResolvedOcrCaptureSelection = field(
+        default_factory=ResolvedOcrCaptureSelection
+    )
+    legacy_geometryless_auto_target: bool = False
+    aihong_two_stage_enabled: bool = False
+    window_scan_duration: float = 0.0
+    now: float = 0.0
+    should_return: bool = False
 
 
 class CaptureBackend(Protocol):
@@ -1594,7 +2060,10 @@ def _run_with_thread_dpi_awareness(fn: Callable[[], tuple[int, int, int, int]]) 
             try:
                 set_context(old_context)
             except Exception:
-                pass
+                _LOGGER.warning(
+                    "ocr_reader failed to restore thread DPI awareness context",
+                    exc_info=True,
+                )
 
 
 def _target_client_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]:
@@ -1814,6 +2283,7 @@ class DxcamCaptureBackend:
     def __init__(self, *, logger=None) -> None:
         self._logger = logger
         self._camera = None
+        self._camera_lock = threading.RLock()
         self._last_create_error = ""
         self._consecutive_failures = 0
         self._last_failure_time = 0.0
@@ -1829,65 +2299,68 @@ class DxcamCaptureBackend:
         return f"{target.process_name}({target.pid}) {target.title}"
 
     def _camera_instance(self):
-        if self._camera is not None:
-            return self._camera
-        import dxcam
-
-        last_exc = None
-        for _attempt in range(3):
-            try:
-                self._camera = dxcam.create(output_color="RGB")
-            except Exception as exc:
-                last_exc = exc
-                self._last_create_error = str(exc)
-                time.sleep(0.5)
-                continue
+        with self._camera_lock:
             if self._camera is not None:
                 return self._camera
-            time.sleep(0.5)
-        if last_exc is not None:
-            raise RuntimeError(f"dxcam_create_failed: {last_exc}") from last_exc
-        raise RuntimeError("dxcam_create_failed: returned None after retries")
+            import dxcam
+
+            last_exc = None
+            for _attempt in range(3):
+                try:
+                    self._camera = dxcam.create(output_color="RGB")
+                except Exception as exc:
+                    last_exc = exc
+                    self._last_create_error = str(exc)
+                    time.sleep(0.5)
+                    continue
+                if self._camera is not None:
+                    return self._camera
+                time.sleep(0.5)
+            if last_exc is not None:
+                raise RuntimeError(f"dxcam_create_failed: {last_exc}") from last_exc
+            raise RuntimeError("dxcam_create_failed: returned None after retries")
 
     def _reset_camera(self) -> None:
-        camera = self._camera
-        self._camera = None
-        stop = getattr(camera, "stop", None)
-        if callable(stop):
-            try:
-                stop()
-            except Exception:
-                pass
+        with self._camera_lock:
+            camera = self._camera
+            self._camera = None
+            stop = getattr(camera, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    pass
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         from PIL import Image
 
         _require_visible_capture_target(target, backend_kind=self.kind)
-        now = time.monotonic()
-        if (
-            self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES
-            and now - self._last_failure_time < self._FAILURE_COOLDOWN_SECONDS
-        ):
-            raise RuntimeError(
-                f"dxcam rate limited after {self._consecutive_failures} consecutive failures"
-            )
         rect = _target_window_rect(target)
         frame = None
-        for attempt in range(_DXCAM_GRAB_RETRY_ATTEMPTS + 1):
-            camera = self._camera_instance()
-            frame = camera.grab(region=rect)
-            if frame is not None:
-                self._consecutive_failures = 0
-                break
-            self._reset_camera()
-            self._consecutive_failures += 1
-            self._last_failure_time = time.monotonic()
-            if attempt < _DXCAM_GRAB_RETRY_ATTEMPTS:
-                time.sleep(_DXCAM_GRAB_RETRY_DELAY_SECONDS)
-        if frame is None:
-            raise RuntimeError(
-                f"dxcam_grab_returned_none_after_{_DXCAM_GRAB_RETRY_ATTEMPTS + 1}_attempts"
-            )
+        with self._camera_lock:
+            now = time.monotonic()
+            if (
+                self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES
+                and now - self._last_failure_time < self._FAILURE_COOLDOWN_SECONDS
+            ):
+                raise RuntimeError(
+                    f"dxcam rate limited after {self._consecutive_failures} consecutive failures"
+                )
+            for attempt in range(_DXCAM_GRAB_RETRY_ATTEMPTS + 1):
+                camera = self._camera_instance()
+                frame = camera.grab(region=rect)
+                if frame is not None:
+                    self._consecutive_failures = 0
+                    break
+                self._reset_camera()
+                self._consecutive_failures += 1
+                self._last_failure_time = time.monotonic()
+                if attempt < _DXCAM_GRAB_RETRY_ATTEMPTS:
+                    time.sleep(_DXCAM_GRAB_RETRY_DELAY_SECONDS)
+            if frame is None:
+                raise RuntimeError(
+                    f"dxcam_grab_returned_none_after_{_DXCAM_GRAB_RETRY_ATTEMPTS + 1}_attempts"
+                )
         image = Image.fromarray(frame).convert("RGB")
         return _crop_window_image(
             image,
@@ -1903,9 +2376,25 @@ class Win32CaptureBackend:
         self._logger = logger
         self.selection = str(selection or _CAPTURE_BACKEND_AUTO).strip().lower()
         self._backends = self._build_backends()
-        self.last_backend_kind = ""
-        self.last_backend_detail = ""
+        self._last_backend_lock = threading.RLock()
+        self._last_backend_kind = ""
+        self._last_backend_detail = ""
         self._logged_fallback_details: set[str] = set()
+
+    @property
+    def last_backend_kind(self) -> str:
+        with self._last_backend_lock:
+            return self._last_backend_kind
+
+    @property
+    def last_backend_detail(self) -> str:
+        with self._last_backend_lock:
+            return self._last_backend_detail
+
+    def _set_last_backend(self, *, kind: str, detail: str) -> None:
+        with self._last_backend_lock:
+            self._last_backend_kind = kind
+            self._last_backend_detail = detail
 
     def _build_backends(self) -> list[CaptureBackend]:
         imagegrab = ImageGrabCaptureBackend(logger=self._logger)
@@ -1939,7 +2428,6 @@ class Win32CaptureBackend:
                 continue
             try:
                 frame = backend.capture_frame(target, profile)
-                self.last_backend_kind = kind
                 frame_info = getattr(frame, "info", None)
                 frame_backend_detail = (
                     str(frame_info.get("galgame_capture_backend_detail") or "")
@@ -1954,7 +2442,7 @@ class Win32CaptureBackend:
                     and any(error.startswith(f"{selected_kind}_failed:") for error in errors)
                     else ""
                 )
-                self.last_backend_detail = fallback_detail or frame_backend_detail or (
+                last_backend_detail = fallback_detail or frame_backend_detail or (
                     "dxcam_unavailable_fallback"
                     if kind != _CAPTURE_BACKEND_DXCAM and "dxcam_unavailable" in errors
                     else "dxcam_failed_fallback"
@@ -1962,9 +2450,10 @@ class Win32CaptureBackend:
                     and any(error.startswith("dxcam_failed:") for error in errors)
                     else "selected"
                 )
+                self._set_last_backend(kind=kind, detail=last_backend_detail)
                 if isinstance(frame_info, dict):
                     frame_info["galgame_capture_backend_kind"] = kind
-                    frame_info["galgame_capture_backend_detail"] = self.last_backend_detail
+                    frame_info["galgame_capture_backend_detail"] = last_backend_detail
                 if fallback_detail:
                     self._warn_fallback_once(selected_kind, kind, fallback_detail)
                 return frame
@@ -2188,8 +2677,10 @@ class RapidOcrBackend:
                 top=box.top / scale_y,
                 right=box.right / scale_x,
                 bottom=box.bottom / scale_y,
+                score=float(score),
             )
             for _text, _score, box in lines
+            for score in (_score,)
         ]
         return "\n".join(text for text, _score, _box in lines), boxes
 
@@ -2353,6 +2844,23 @@ class _MouseWheelEvent:
     foreground_hwnd: int
     point_hwnd: int = 0
     kind: str = "wheel"
+
+
+@dataclass(slots=True)
+class ForegroundAdvanceConsumeResult:
+    triggered: bool = False
+    matched_count: int = 0
+    consumed_count: int = 0
+    first_event_ts: float = 0.0
+    last_event_ts: float = 0.0
+    detected_at: float = 0.0
+    last_event_age_seconds: float = 0.0
+    last_kind: str = ""
+    last_delta: int = 0
+    last_matched: bool = False
+    last_match_reason: str = ""
+    coalesced: bool = False
+    coalesced_count: int = 0
 
 
 @dataclass(slots=True)
@@ -2727,6 +3235,15 @@ def _window_sort_key(candidate: DetectedGameWindow) -> tuple[int, int, float, st
     )
 
 
+def _locked_ocr_writer_method(method):
+    @wraps(method)
+    def _wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return _wrapper
+
+
 class OcrReaderBridgeWriter:
     def __init__(
         self,
@@ -2736,6 +3253,7 @@ class OcrReaderBridgeWriter:
         time_fn: Callable[[], float] | None = None,
         logger: Any | None = None,
     ) -> None:
+        self._lock = threading.Lock()
         self._bridge_root = bridge_root
         self._version = version
         self._time_fn = time_fn or time.time
@@ -2760,24 +3278,30 @@ class OcrReaderBridgeWriter:
 
     @property
     def game_id(self) -> str:
-        return self._game_id
+        with self._lock:
+            return self._game_id
 
     @property
     def session_id(self) -> str:
-        return self._session_id
+        with self._lock:
+            return self._session_id
 
     @property
     def engine(self) -> str:
-        return self._engine
+        with self._lock:
+            return self._engine
 
     @property
     def last_seq(self) -> int:
-        return self._last_seq
+        with self._lock:
+            return self._last_seq
 
     @property
     def last_event_ts(self) -> str:
-        return self._last_event_ts
+        with self._lock:
+            return self._last_event_ts
 
+    @_locked_ocr_writer_method
     def start_session(self, window: DetectedGameWindow) -> None:
         started_at = utc_now_iso(self._time_fn())
         self._game_id = _ocr_game_id_from_process(window.process_name or window.title)
@@ -2814,16 +3338,22 @@ class OcrReaderBridgeWriter:
                 "choices": self._state["choices"],
                 "save_context": self._state["save_context"],
                 "stability": self._state.get("stability", ""),
+                "screen_type": self._state.get("screen_type", ""),
+                "screen_ui_elements": self._state.get("screen_ui_elements", []),
+                "screen_confidence": self._state.get("screen_confidence", 0.0),
+                "screen_debug": json_copy(self._state.get("screen_debug") or {}),
             },
             ts=started_at,
         )
 
+    @_locked_ocr_writer_method
     def keep_unknown_scene_until_visual_scene(self) -> None:
         self._keep_unknown_scene_until_visual_scene = True
         if self._state:
             self._state["scene_id"] = OCR_READER_UNKNOWN_SCENE
             self._write_session_snapshot()
 
+    @_locked_ocr_writer_method
     def discard_session(self) -> None:
         game_id = self._game_id
         if game_id:
@@ -2843,13 +3373,22 @@ class OcrReaderBridgeWriter:
         self._text_to_line_id.clear()
         self._line_id_owner.clear()
 
-    def emit_line(self, raw_text: str, *, ts: str) -> bool:
+    @_locked_ocr_writer_method
+    def emit_line(
+        self,
+        raw_text: str,
+        *,
+        ts: str,
+        ocr_confidence: float | None = None,
+        text_source: str = "",
+    ) -> bool:
         cleaned = raw_text.strip()
         if not cleaned or not self._session_id:
             return False
         speaker, text = self._split_speaker_text(cleaned)
         if not text:
             return False
+        speaker_confidence = self._speaker_confidence(cleaned, speaker)
         line_id = self._line_id_for_text(text)
         self._state = {
             **self._state,
@@ -2874,18 +3413,30 @@ class OcrReaderBridgeWriter:
                 "scene_id": self._state["scene_id"],
                 "route_id": self._state["route_id"],
                 "stability": "stable",
+                "ocr_confidence": _bounded_confidence_or_zero(ocr_confidence),
+                "speaker_confidence": speaker_confidence,
+                "text_source": text_source or "bottom_region",
             },
             ts=ts,
         )
         return True
 
-    def emit_line_observed(self, raw_text: str, *, ts: str) -> bool:
+    @_locked_ocr_writer_method
+    def emit_line_observed(
+        self,
+        raw_text: str,
+        *,
+        ts: str,
+        ocr_confidence: float | None = None,
+        text_source: str = "",
+    ) -> bool:
         cleaned = raw_text.strip()
         if not cleaned or not self._session_id:
             return False
         speaker, text = self._split_speaker_text(cleaned)
         if not text:
             return False
+        speaker_confidence = self._speaker_confidence(cleaned, speaker)
         normalized_text = normalize_text(text)
         current_text = str(self._state.get("text") or "")
         current_speaker = str(self._state.get("speaker") or "")
@@ -2922,11 +3473,15 @@ class OcrReaderBridgeWriter:
                 "scene_id": self._state["scene_id"],
                 "route_id": self._state["route_id"],
                 "stability": "tentative",
+                "ocr_confidence": _bounded_confidence_or_zero(ocr_confidence),
+                "speaker_confidence": speaker_confidence,
+                "text_source": text_source or "bottom_region",
             },
             ts=ts,
         )
         return True
 
+    @_locked_ocr_writer_method
     def emit_choices(
         self,
         choices: list[str],
@@ -2983,6 +3538,78 @@ class OcrReaderBridgeWriter:
         )
         return True
 
+    @_locked_ocr_writer_method
+    def emit_screen_classified(
+        self,
+        *,
+        screen_type: str,
+        confidence: float,
+        ui_elements: list[dict[str, Any]] | None = None,
+        raw_ocr_text: list[str] | None = None,
+        screen_debug: dict[str, Any] | None = None,
+        ts: str,
+    ) -> bool:
+        if not self._session_id:
+            return False
+        normalized_type = normalize_screen_type(screen_type)
+        if not normalized_type:
+            return False
+        elements = sanitize_screen_ui_elements(ui_elements or [], limit=10)
+        try:
+            normalized_confidence = round(max(0.0, min(float(confidence), 1.0)), 2)
+        except (TypeError, ValueError):
+            normalized_confidence = 0.0
+        raw_lines = [
+            str(line or "")[:120]
+            for line in list(raw_ocr_text or [])[:20]
+            if str(line or "").strip()
+        ]
+        current_type = str(self._state.get("screen_type") or "")
+        current_elements = sanitize_screen_ui_elements(
+            self._state.get("screen_ui_elements") or [], limit=10
+        )
+        try:
+            current_confidence = round(float(self._state.get("screen_confidence") or 0.0), 2)
+        except (TypeError, ValueError):
+            current_confidence = 0.0
+        if (
+            current_type == normalized_type
+            and current_elements == elements
+        ):
+            return False
+        if (
+            normalized_type in {OCR_CAPTURE_PROFILE_STAGE_DEFAULT, OCR_CAPTURE_PROFILE_STAGE_DIALOGUE}
+            and current_type == normalized_type
+            and abs(current_confidence - normalized_confidence) < 0.01
+        ):
+            return False
+        if not current_type and normalized_type == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+            return False
+        self._state = {
+            **self._state,
+            "screen_type": normalized_type,
+            "screen_ui_elements": elements,
+            "screen_confidence": normalized_confidence,
+            "screen_debug": json_copy(screen_debug or {}),
+            "ts": ts,
+        }
+        self._append_event(
+            "screen_classified",
+            {
+                "screen_type": normalized_type,
+                "screen_ui_elements": elements,
+                "screen_confidence": normalized_confidence,
+                "screen_debug": json_copy(screen_debug or {}),
+                "raw_ocr_text": raw_lines,
+                "scene_id": self._state["scene_id"],
+                "line_id": self._state["line_id"],
+                "route_id": self._state["route_id"],
+            },
+            ts=ts,
+        )
+        return True
+
+    @_locked_ocr_writer_method
     def emit_heartbeat(self, *, ts: str) -> bool:
         if not self._session_id:
             return False
@@ -3000,6 +3627,7 @@ class OcrReaderBridgeWriter:
         )
         return True
 
+    @_locked_ocr_writer_method
     def emit_error(self, message: str, *, ts: str, details: dict[str, Any] | None = None) -> bool:
         if not self._session_id:
             return False
@@ -3015,7 +3643,23 @@ class OcrReaderBridgeWriter:
         self._append_event("error", payload, ts=ts, update_snapshot=False)
         return True
 
+    @_locked_ocr_writer_method
     def emit_scene_changed(
+        self,
+        *,
+        scene_id: str,
+        ts: str,
+        reason: str,
+        background_hash: str = "",
+    ) -> bool:
+        return self._emit_scene_changed_unlocked(
+            scene_id=scene_id,
+            ts=ts,
+            reason=reason,
+            background_hash=background_hash,
+        )
+
+    def _emit_scene_changed_unlocked(
         self,
         *,
         scene_id: str,
@@ -3048,10 +3692,11 @@ class OcrReaderBridgeWriter:
         )
         return True
 
+    @_locked_ocr_writer_method
     def advance_visual_scene(self, *, ts: str, background_hash: str = "") -> str:
         self._scene_index += 1
         scene_id = f"ocr:{self._game_id or 'unknown'}:scene-{self._scene_index:04d}"
-        self.emit_scene_changed(
+        self._emit_scene_changed_unlocked(
             scene_id=scene_id,
             ts=ts,
             reason="background_changed",
@@ -3059,6 +3704,7 @@ class OcrReaderBridgeWriter:
         )
         return scene_id
 
+    @_locked_ocr_writer_method
     def end_session(self, *, ts: str) -> bool:
         if not self._session_id:
             return False
@@ -3068,8 +3714,11 @@ class OcrReaderBridgeWriter:
             "route_id": self._state["route_id"],
         }
         self._append_event("session_ended", payload, ts=ts, update_snapshot=False)
+        self._text_to_line_id.clear()
+        self._line_id_owner.clear()
         return True
 
+    @_locked_ocr_writer_method
     def runtime(self) -> OcrReaderRuntime:
         return OcrReaderRuntime(
             enabled=True,
@@ -3095,6 +3744,10 @@ class OcrReaderBridgeWriter:
             "is_menu_open": False,
             "save_context": {"kind": "unknown", "slot_id": "", "display_name": ""},
             "stability": "",
+            "screen_type": "",
+            "screen_ui_elements": [],
+            "screen_confidence": 0.0,
+            "screen_debug": {},
             "ts": ts,
         }
 
@@ -3143,27 +3796,50 @@ class OcrReaderBridgeWriter:
                 "is_menu_open": bool(self._state.get("is_menu_open", False)),
                 "save_context": dict(self._state.get("save_context", {"kind": "unknown", "slot_id": "", "display_name": ""})),
                 "stability": str(self._state.get("stability") or ""),
+                "screen_type": str(self._state.get("screen_type") or ""),
+                "screen_ui_elements": sanitize_screen_ui_elements(
+                    self._state.get("screen_ui_elements") or [], limit=10
+                ),
+                "screen_confidence": float(self._state.get("screen_confidence") or 0.0),
+                "screen_debug": json_copy(self._state.get("screen_debug") or {}),
                 "ts": str(self._state.get("ts") or self._started_at),
             },
         }
 
     def _write_session_snapshot(self) -> None:
-        tmp_path = self._session_path().with_suffix(".json.tmp")
+        session_path = self._session_path()
+        tmp_fd: int | None = None
+        tmp_path: Path | None = None
         try:
-            self._bridge_dir().mkdir(parents=True, exist_ok=True)
+            bridge_dir = self._bridge_dir()
+            bridge_dir.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
                 self._session_snapshot(),
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
-            with tmp_path.open("wb") as handle:
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{session_path.name}.",
+                suffix=".tmp",
+                dir=str(bridge_dir),
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(tmp_fd, "wb") as handle:
+                tmp_fd = None
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_path, self._session_path())
+            os.replace(tmp_path, session_path)
+            tmp_path = None
         except Exception as exc:
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except Exception:
+                    pass
             try:
-                tmp_path.unlink(missing_ok=True)
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
             if self._logger is not None:
@@ -3180,6 +3856,7 @@ class OcrReaderBridgeWriter:
         ts: str,
         update_snapshot: bool = True,
     ) -> None:
+        assert self._lock.locked(), "_append_event must be called under _lock"
         self._last_seq += 1
         self._last_event_ts = ts
         event = {
@@ -3221,27 +3898,58 @@ class OcrReaderBridgeWriter:
                 self._line_id_owner[candidate] = normalized
                 self._text_to_line_id[normalized] = candidate
                 return candidate
-        suffix = 1
-        while True:
+        for suffix in range(1, _OCR_LINE_ID_MAX_COLLISION_SUFFIX + 1):
             candidate = f"ocr:{digest}#{suffix}"
             owner = self._line_id_owner.get(candidate)
             if owner in {None, normalized}:
                 self._line_id_owner[candidate] = normalized
                 self._text_to_line_id[normalized] = candidate
                 return candidate
-            suffix += 1
+        raise RuntimeError(
+            "ocr line_id collision limit exceeded "
+            f"after {_OCR_LINE_ID_MAX_COLLISION_SUFFIX} suffix attempts"
+        )
 
     @staticmethod
     def _split_speaker_text(raw_text: str) -> tuple[str, str]:
-        _SPEAKER_QUOTE_RE = re.compile(r"^\s*([^「」:：]{1,40})[「『](.+)[」』]\s*$")
-        _SPEAKER_COLON_RE = re.compile(r"^\s*([^:：]{1,40})[:：]\s*(.+\S)\s*$")
+        match = _SPEAKER_BRACKET_RE.match(raw_text)
+        if match is not None:
+            return match.group(1).strip(), match.group(2).strip()
+        match = _SPEAKER_PAREN_PREFIX_RE.match(raw_text)
+        if match is not None:
+            return match.group(1).strip(), match.group(2).strip()
         match = _SPEAKER_QUOTE_RE.match(raw_text)
         if match is not None:
             return match.group(1).strip(), match.group(2).strip()
         match = _SPEAKER_COLON_RE.match(raw_text)
         if match is not None:
             return match.group(1).strip(), match.group(2).strip()
+        match = _SPEAKER_PAREN_SUFFIX_RE.match(raw_text)
+        if match is not None:
+            return match.group(1).strip(), match.group(2).strip()
+        match = _NARRATION_QUOTE_RE.match(raw_text)
+        if match is not None:
+            return "", match.group(1).strip()
+        match = _NARRATION_PAREN_RE.match(raw_text)
+        if match is not None:
+            return "", match.group(1).strip()
         return "", raw_text.strip()
+
+    @staticmethod
+    def _speaker_confidence(raw_text: str, speaker: str) -> float:
+        if not speaker:
+            return 0.0
+        if _SPEAKER_BRACKET_RE.match(raw_text) is not None:
+            return 0.96
+        if _SPEAKER_QUOTE_RE.match(raw_text) is not None:
+            return 0.94
+        if _SPEAKER_COLON_RE.match(raw_text) is not None:
+            return 0.94
+        if _SPEAKER_PAREN_PREFIX_RE.match(raw_text) is not None:
+            return 0.84
+        if _SPEAKER_PAREN_SUFFIX_RE.match(raw_text) is not None:
+            return 0.80
+        return 0.65
 
 
 class OcrReaderManager:
@@ -3312,6 +4020,23 @@ class OcrReaderManager:
         self._pending_background_change_count = 0
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
+        self._recommended_capture_profile = {}
+        self._clear_vision_snapshot()
+        self._last_screen_classification_type = ""
+        self._last_screen_classification_streak = 0
+        self._last_screen_awareness_capture_at = 0.0
+        self._screen_awareness_sample_count = 0
+        self._screen_awareness_sample_last_path = ""
+        self._screen_awareness_sample_last_error = ""
+        self._screen_awareness_model_cache_key: tuple[str, float] | None = None
+        self._screen_awareness_model_payload: dict[str, Any] | None = None
+        self._screen_awareness_model_detail = "disabled"
+        self._screen_awareness_model_last_stage = ""
+        self._screen_awareness_model_last_confidence = 0.0
+        self._screen_awareness_model_last_latency_seconds = 0.0
+        self._latest_vision_snapshot: dict[str, Any] = {}
+        self._latest_vision_snapshot_base64 = ""
+        self._recommended_capture_profile: dict[str, Any] = {}
         self._wheel_monitor = _MouseWheelMonitor(
             time_fn=self._time_fn,
             logger=self._logger,
@@ -3353,6 +4078,8 @@ class OcrReaderManager:
     def update_config(self, config: GalgameConfig) -> None:
         self._config = config
         self._runtime.enabled = config.ocr_reader_enabled
+        if not bool(config.llm_vision_enabled):
+            self._clear_vision_snapshot()
         backend_plan_key = self._backend_plan_config_key(config)
         if self._backend_plan_cache_key != backend_plan_key:
             self._backend_plan_cache_key = None
@@ -3694,7 +4421,7 @@ class OcrReaderManager:
                         return candidate, f"event_{source}_{reason}"
         return None, "event_background"
 
-    def consume_foreground_advance_input(self) -> bool:
+    def consume_foreground_advance_inputs(self) -> ForegroundAdvanceConsumeResult:
         self._wheel_monitor.ensure_running()
         self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
         self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
@@ -3703,7 +4430,7 @@ class OcrReaderManager:
         self._runtime.foreground_advance_monitor_running = self._wheel_monitor.is_running()
         self._runtime.foreground_advance_last_seq = self._wheel_monitor.last_seq()
         if not events:
-            return False
+            return ForegroundAdvanceConsumeResult()
         target, _detail = self._foreground_refresh_target()
         if target is None:
             target = self._attached_window
@@ -3728,13 +4455,16 @@ class OcrReaderManager:
         if target is None:
             target, _detail = self._target_from_foreground_advance_events(events)
         if target is None:
-            return False
+            return ForegroundAdvanceConsumeResult()
         triggered = False
         max_seq = self._last_consumed_wheel_seq
         last_kind = ""
         last_delta = 0
         last_matched = False
         last_match_reason = ""
+        matched_count = 0
+        first_event_ts = float(getattr(events[0], "ts", 0.0) or 0.0)
+        last_event_ts = float(getattr(events[-1], "ts", 0.0) or 0.0)
         for event in events:
             max_seq = max(max_seq, int(event.seq or 0))
             last_kind = str(event.kind or "")
@@ -3757,6 +4487,7 @@ class OcrReaderManager:
             )
             if is_target_foreground or is_target_under_pointer:
                 triggered = True
+                matched_count += 1
                 last_matched = True
                 last_match_reason = (
                     f"foreground_{foreground_reason}"
@@ -3772,13 +4503,42 @@ class OcrReaderManager:
         self._runtime.foreground_advance_last_delta = last_delta
         self._runtime.foreground_advance_last_matched = last_matched
         self._runtime.foreground_advance_last_match_reason = last_match_reason
+        detected_at = self._time_fn()
+        last_event_age_seconds = (
+            max(0.0, detected_at - last_event_ts) if last_event_ts > 0.0 else 0.0
+        )
+        coalesced_count = max(0, matched_count - 1)
+        self._runtime.foreground_advance_consumed_count = len(events)
+        self._runtime.foreground_advance_matched_count = matched_count
+        self._runtime.foreground_advance_coalesced_count = coalesced_count
+        self._runtime.foreground_advance_first_event_ts = first_event_ts
+        self._runtime.foreground_advance_last_event_ts = last_event_ts
+        self._runtime.foreground_advance_detected_at = detected_at
+        self._runtime.foreground_advance_last_event_age_seconds = last_event_age_seconds
         if triggered:
             self._remember_locked_target(target)
             self._foreground_advance_stable_until = max(
                 float(self._foreground_advance_stable_until or 0.0),
-                self._time_fn() + _FOREGROUND_ADVANCE_STABLE_GRACE_SECONDS,
+                detected_at + _FOREGROUND_ADVANCE_STABLE_GRACE_SECONDS,
             )
-        return triggered
+        return ForegroundAdvanceConsumeResult(
+            triggered=triggered,
+            matched_count=matched_count,
+            consumed_count=len(events),
+            first_event_ts=first_event_ts,
+            last_event_ts=last_event_ts,
+            detected_at=detected_at,
+            last_event_age_seconds=last_event_age_seconds,
+            last_kind=last_kind,
+            last_delta=last_delta,
+            last_matched=last_matched,
+            last_match_reason=last_match_reason,
+            coalesced=coalesced_count > 0,
+            coalesced_count=coalesced_count,
+        )
+
+    def consume_foreground_advance_input(self) -> bool:
+        return self.consume_foreground_advance_inputs().triggered
 
     def consume_foreground_wheel_down(self) -> bool:
         return self.consume_foreground_advance_input()
@@ -3876,6 +4636,25 @@ class OcrReaderManager:
                 )
                 for candidate in excluded_windows
             ]
+        return payload
+
+    def latest_vision_snapshot(self) -> dict[str, Any]:
+        if not bool(self._config.llm_vision_enabled):
+            return {}
+        snapshot = dict(self._latest_vision_snapshot or {})
+        image_base64 = str(self._latest_vision_snapshot_base64 or "")
+        if not snapshot or not image_base64:
+            return {}
+        now = self._time_fn()
+        if now >= float(snapshot.get("expires_at_monotonic") or 0.0):
+            self._clear_vision_snapshot()
+            return {}
+        payload = {
+            key: json_copy(value)
+            for key, value in snapshot.items()
+            if key != "expires_at_monotonic"
+        }
+        payload["vision_image_base64"] = image_base64
         return payload
 
     def resolve_manual_window_target(self, window_key: str) -> dict[str, Any]:
@@ -4024,9 +4803,10 @@ class OcrReaderManager:
             raise ValueError("当前平台不是 Windows，无法自动重校准对白区")
         if not self._capture_backend.is_available():
             raise ValueError("当前截图后端不可用，无法自动重校准对白区")
-        target = self._attached_window
-        if target is None:
+        attached_target = self._attached_window
+        if attached_target is None:
             raise ValueError("当前没有已附着的 OCR 目标窗口，无法自动重校准对白区")
+        target = replace(attached_target)
         process_name = str(target.process_name or "").strip()
         if not process_name:
             raise ValueError("当前 OCR 目标缺少进程名，无法自动重校准对白区")
@@ -4061,10 +4841,12 @@ class OcrReaderManager:
 
         image_width = int(image_size[0])
         image_height = int(image_size[1])
-        if target.width <= 0:
-            target.width = image_width
-        if target.height <= 0:
-            target.height = image_height
+        if target.width <= 0 or target.height <= 0:
+            target = replace(
+                target,
+                width=target.width if target.width > 0 else image_width,
+                height=target.height if target.height > 0 else image_height,
+            )
 
         base_selection = self._capture_profile_selection_for_target(
             target,
@@ -4400,6 +5182,8 @@ class OcrReaderManager:
         state: _StableOcrTextState | None = None,
         emit_observed: bool = True,
         repeat_threshold: int | None = None,
+        ocr_confidence: float | None = None,
+        text_source: str = "bottom_region",
     ) -> bool:
         cleaned_text = _clean_ocr_dialogue_text(raw_text)
         if (
@@ -4409,7 +5193,12 @@ class OcrReaderManager:
         ):
             return False
         self._last_raw_ocr_text = str(raw_text or "")
-        if emit_observed and self._writer.emit_line_observed(cleaned_text, ts=utc_now_iso(now)):
+        if emit_observed and self._writer.emit_line_observed(
+            cleaned_text,
+            ts=utc_now_iso(now),
+            ocr_confidence=ocr_confidence,
+            text_source=text_source,
+        ):
             self._last_observed_line = self._line_payload_from_writer(stability="tentative")
         tracker = state or self._default_ocr_state
         effective_repeat_threshold = (
@@ -4434,7 +5223,12 @@ class OcrReaderManager:
             return False
         self._commit_pending_visual_scene(now=now)
         emitted_text = tracker.stable_text or cleaned_text
-        emitted = self._writer.emit_line(emitted_text, ts=utc_now_iso(now))
+        emitted = self._writer.emit_line(
+            emitted_text,
+            ts=utc_now_iso(now),
+            ocr_confidence=ocr_confidence,
+            text_source=text_source,
+        )
         if emitted:
             stable_line = self._line_payload_from_writer(stability="stable")
             self._last_stable_line = stable_line
@@ -4578,6 +5372,9 @@ class OcrReaderManager:
         )
         try:
             return await asyncio.wait_for(
+                # ThreadPoolExecutor work cannot be interrupted once running.
+                # Shield keeps the worker future alive after timeout so cleanup
+                # can observe completion and reuse the executor state safely.
                 asyncio.shield(asyncio.wrap_future(future)),
                 timeout=timeout_seconds,
             )
@@ -4711,24 +5508,19 @@ class OcrReaderManager:
             self._writer.end_session(ts=utc_now_iso(self._time_fn()))
         self._attached_window = None
 
-    async def tick(
+    async def _tick_preflight(
         self,
         *,
+        now: float,
         bridge_sdk_available: bool,
         memory_reader_runtime: dict[str, Any],
-    ) -> OcrReaderTickResult:
-        now = self._time_fn()
-        poll_started_at = now
-        backend_plan_duration = 0.0
-        window_scan_duration = 0.0
-        result = OcrReaderTickResult(runtime=self._runtime.to_dict())
-        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
-
+        result: OcrReaderTickResult,
+    ) -> _TickPreflightResult:
         if not self._config.ocr_reader_enabled:
             self._runtime = OcrReaderRuntime(enabled=False, status="disabled", detail="disabled_by_config")
             await self._end_session_if_needed(now)
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickPreflightResult(result=result, should_return=True)
 
         if not self._platform_fn():
             self._runtime = self._build_runtime(
@@ -4739,7 +5531,7 @@ class OcrReaderManager:
             await self._end_session_if_needed(now)
             result.warnings.append("ocr_reader is Windows-only")
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickPreflightResult(result=result, should_return=True)
 
         backend_plan_started_at = self._time_fn()
         backend_plan = await asyncio.to_thread(self._resolve_backend_plan)
@@ -4753,7 +5545,12 @@ class OcrReaderManager:
             await self._end_session_if_needed(now)
             result.warnings.extend(self._backend_unavailable_warnings(backend_plan))
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickPreflightResult(
+                result=result,
+                backend_plan=backend_plan,
+                backend_plan_duration=backend_plan_duration,
+                should_return=True,
+            )
 
         if bridge_sdk_available:
             self._runtime = self._build_runtime(
@@ -4763,7 +5560,12 @@ class OcrReaderManager:
             )
             await self._end_session_if_needed(now)
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickPreflightResult(
+                result=result,
+                backend_plan=backend_plan,
+                backend_plan_duration=backend_plan_duration,
+                should_return=True,
+            )
 
         memory_reader_has_text = str(memory_reader_runtime.get("detail") or "") == "receiving_text"
         if memory_reader_has_text:
@@ -4774,7 +5576,12 @@ class OcrReaderManager:
                 plan=backend_plan,
             )
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickPreflightResult(
+                result=result,
+                backend_plan=backend_plan,
+                backend_plan_duration=backend_plan_duration,
+                should_return=True,
+            )
 
         if self._last_memory_reader_text_at > 0:
             elapsed = now - self._last_memory_reader_text_at
@@ -4786,7 +5593,12 @@ class OcrReaderManager:
                     plan=backend_plan,
                 )
                 result.runtime = self._runtime.to_dict()
-                return result
+                return _TickPreflightResult(
+                    result=result,
+                    backend_plan=backend_plan,
+                    backend_plan_duration=backend_plan_duration,
+                    should_return=True,
+                )
 
         if not self._capture_backend.is_available():
             self._runtime = self._build_runtime(
@@ -4798,8 +5610,27 @@ class OcrReaderManager:
             await self._end_session_if_needed(now)
             result.warnings.append("ocr_reader capture backend is not available")
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickPreflightResult(
+                result=result,
+                backend_plan=backend_plan,
+                backend_plan_duration=backend_plan_duration,
+                should_return=True,
+            )
 
+        return _TickPreflightResult(
+            result=result,
+            backend_plan=backend_plan,
+            backend_plan_duration=backend_plan_duration,
+        )
+
+    async def _prepare_tick_target_context(
+        self,
+        *,
+        now: float,
+        backend_plan: SelectedOcrBackendPlan,
+        memory_reader_runtime: dict[str, Any],
+        result: OcrReaderTickResult,
+    ) -> _TickTargetContext:
         foreground_hwnd_for_scan = _foreground_window_handle()
         force_window_scan = (
             self._last_selection.selection_detail == "locked_target_unavailable"
@@ -4835,7 +5666,13 @@ class OcrReaderManager:
             )
             await self._end_session_if_needed(now)
             result.runtime = self._runtime.to_dict()
-            return result
+            return _TickTargetContext(
+                result=result,
+                selection=selection,
+                window_scan_duration=window_scan_duration,
+                now=now,
+                should_return=True,
+            )
 
         legacy_geometryless_auto_target = (
             selection.selection_detail == "single_geometryless_candidate"
@@ -4902,13 +5739,195 @@ class OcrReaderManager:
             self._attached_window = target
         self._remember_locked_target(target)
 
+        return _TickTargetContext(
+            result=result,
+            target=target,
+            selection=selection,
+            profile=profile,
+            capture_profile_selection=capture_profile_selection,
+            legacy_geometryless_auto_target=legacy_geometryless_auto_target,
+            aihong_two_stage_enabled=aihong_two_stage_enabled,
+            window_scan_duration=window_scan_duration,
+            now=now,
+        )
+
+    def _finalize_tick_result(
+        self,
+        *,
+        result: OcrReaderTickResult,
+        now: float,
+        poll_started_at: float,
+        backend_plan: SelectedOcrBackendPlan,
+        active_backend: OcrBackendDescriptor,
+        backend_detail_override: str,
+        target: DetectedGameWindow,
+        aihong_two_stage_enabled: bool,
+        runtime_profile: OcrCaptureProfile,
+        runtime_capture_profile_selection: ResolvedOcrCaptureSelection,
+        selection: WindowSelectionResult,
+        emitted: bool,
+        guard_blocked: bool,
+        screen_classification: ScreenClassification,
+        screen_event_emitted: bool,
+        capture_attempted: bool,
+        capture_completed: bool,
+        capture_error: bool,
+        text_event_seq_before_capture: int,
+        foreground_advance_stable_grace_active: bool,
+    ) -> OcrReaderTickResult:
+        if (
+            self._pending_visual_scene_hash
+            and self._pending_visual_scene_at > 0
+            and now - self._pending_visual_scene_at > 5.0
+        ):
+            self._commit_pending_visual_scene(now=now)
+
+        status = self._runtime.status
+        detail = self._runtime.detail
+        observed_or_stable_emitted = int(self._writer.last_seq or 0) > text_event_seq_before_capture
+        known_screen_classified = self._screen_classification_is_known(screen_classification)
+
+        if emitted:
+            if foreground_advance_stable_grace_active:
+                self._foreground_advance_stable_until = 0.0
+            result.stable_event_emitted = True
+            result.should_rescan = True
+            self._mark_observed_progress(now=now)
+            self._last_heartbeat_at = now
+            status = "active"
+            detail = "receiving_text"
+        elif observed_or_stable_emitted:
+            result.should_rescan = True
+            self._mark_observed_progress(now=now)
+            self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            detail = "receiving_observed_text"
+        elif guard_blocked:
+            if status == "starting":
+                status = "active"
+            detail = "self_ui_guard_blocked"
+        elif capture_error:
+            if status == "starting":
+                status = "active"
+            detail = "capture_failed"
+        elif screen_event_emitted or known_screen_classified:
+            self._consecutive_no_text_polls = 0
+            if status == "starting":
+                status = "active"
+            detail = "screen_classified"
+        elif capture_completed:
+            self._mark_no_text_poll()
+            if self._writer.session_id and now - self._last_heartbeat_at >= float(
+                self._config.ocr_reader_poll_interval_seconds
+            ):
+                if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+                    result.should_rescan = True
+                    self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            detail = (
+                "ocr_capture_diagnostic_required"
+                if self._ocr_capture_diagnostic_required()
+                else "attached_no_text_yet"
+            )
+        elif capture_attempted:
+            if status == "starting":
+                status = "active"
+            detail = "capture_failed"
+        elif self._writer.session_id and now - self._last_heartbeat_at >= float(
+            self._config.ocr_reader_poll_interval_seconds
+        ):
+            if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
+                result.should_rescan = True
+                self._last_heartbeat_at = now
+            if status == "starting":
+                status = "active"
+            if detail == "starting_capture":
+                detail = "attached_no_text_yet"
+
+        self._runtime = self._build_runtime(
+            status=status,
+            detail=detail,
+            plan=backend_plan,
+            active_backend=active_backend,
+            backend_detail_override=backend_detail_override,
+            target=target,
+            capture_stage=(
+                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            ),
+            capture_profile=runtime_profile.to_dict(),
+            capture_profile_selection=runtime_capture_profile_selection,
+            selection=selection,
+            game_id=self._writer.game_id,
+            session_id=self._writer.session_id,
+            last_seq=self._writer.last_seq,
+            last_event_ts=self._writer.last_event_ts,
+        )
+        poll_completed_at = self._time_fn()
+        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+        self._runtime.last_poll_completed_at = utc_now_iso(poll_completed_at)
+        self._runtime.last_poll_duration_seconds = max(0.0, poll_completed_at - poll_started_at)
+        self._runtime.last_poll_emitted_event = bool(
+            emitted or observed_or_stable_emitted or screen_event_emitted
+        )
+        result.runtime = self._runtime.to_dict()
+        return result
+
+    async def tick(
+        self,
+        *,
+        bridge_sdk_available: bool,
+        memory_reader_runtime: dict[str, Any],
+    ) -> OcrReaderTickResult:
+        now = self._time_fn()
+        poll_started_at = now
+        backend_plan_duration = 0.0
+        window_scan_duration = 0.0
+        result = OcrReaderTickResult(runtime=self._runtime.to_dict())
+        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+
+        preflight = await self._tick_preflight(
+            now=now,
+            bridge_sdk_available=bridge_sdk_available,
+            memory_reader_runtime=memory_reader_runtime,
+            result=result,
+        )
+        if preflight.should_return:
+            return preflight.result
+        result = preflight.result
+        backend_plan = preflight.backend_plan
+        backend_plan_duration = preflight.backend_plan_duration
+
+        target_context = await self._prepare_tick_target_context(
+            now=now,
+            backend_plan=backend_plan,
+            memory_reader_runtime=memory_reader_runtime,
+            result=result,
+        )
+        if target_context.should_return:
+            return target_context.result
+        result = target_context.result
+        target = target_context.target
+        assert target is not None
+        selection = target_context.selection
+        profile = target_context.profile
+        capture_profile_selection = target_context.capture_profile_selection
+        legacy_geometryless_auto_target = target_context.legacy_geometryless_auto_target
+        aihong_two_stage_enabled = target_context.aihong_two_stage_enabled
+        window_scan_duration = target_context.window_scan_duration
+        now = target_context.now
+
         emitted = False
         guard_blocked = False
+        screen_classification = ScreenClassification()
+        screen_event_emitted = False
         active_backend = backend_plan.primary
         backend_detail_override = ""
         runtime_profile = profile
         runtime_capture_profile_selection = capture_profile_selection
         event_seq_before_capture = int(self._writer.last_seq or 0)
+        text_event_seq_before_capture = event_seq_before_capture
         after_advance_trigger_mode = (
             str(self._config.ocr_reader_trigger_mode or "").strip().lower()
             == OCR_TRIGGER_MODE_AFTER_ADVANCE
@@ -4991,7 +6010,18 @@ class OcrReaderManager:
                 ):
                     self._writer.discard_session()
             else:
-                if aihong_two_stage_enabled:
+                screen_classification, screen_event_emitted = self._emit_screen_classification_from_extraction(
+                    extraction,
+                    target=target,
+                    now=now,
+                )
+                if screen_event_emitted:
+                    result.should_rescan = True
+                text_event_seq_before_capture = int(self._writer.last_seq or 0)
+                if self._should_skip_dialogue_for_screen_classification(screen_classification):
+                    self._default_ocr_state.reset()
+                    self._reset_aihong_menu_state()
+                elif aihong_two_stage_enabled:
                     if self._aihong_stage == _AIHONG_MENU_STAGE:
                         menu_result = self._consume_aihong_menu_stage_text(
                             extraction.text,
@@ -5005,13 +6035,14 @@ class OcrReaderManager:
                             self._aihong_menu_missing_polls = 0
                         else:
                             self._aihong_menu_missing_polls += 1
-                            self._aihong_menu_ocr_state.reset()
                             if (
                                 extraction.text
                                 and not _looks_like_noise_ocr_text(extraction.text)
                             ):
+                                self._aihong_menu_ocr_state.reset()
                                 self._reset_aihong_menu_state()
                             elif self._aihong_menu_missing_polls >= 2:
+                                self._aihong_menu_ocr_state.reset()
                                 self._reset_aihong_menu_state()
                     else:
                         dialogue_menu_choices = _coerce_aihong_menu_choices(
@@ -5048,6 +6079,8 @@ class OcrReaderManager:
                                     allow_choices=False,
                                     emit_observed=emit_observed_lines,
                                     line_repeat_threshold=line_repeat_threshold,
+                                    ocr_confidence=extraction.ocr_confidence,
+                                    text_source=extraction.text_source,
                                 )
                             )
                         if (
@@ -5100,6 +6133,8 @@ class OcrReaderManager:
                                         allow_choices=False,
                                         emit_observed=emit_observed_lines,
                                         line_repeat_threshold=line_repeat_threshold,
+                                        ocr_confidence=followup_extraction.ocr_confidence,
+                                        text_source=followup_extraction.text_source,
                                     )
                                 )
                                 if dialogue_emitted:
@@ -5197,7 +6232,11 @@ class OcrReaderManager:
                                         runtime_profile = menu_profile
                                         runtime_capture_profile_selection = menu_profile_selection
                                     else:
-                                        self._aihong_menu_ocr_state.reset()
+                                        if (
+                                            menu_extraction.text
+                                            and not _looks_like_noise_ocr_text(menu_extraction.text)
+                                        ):
+                                            self._aihong_menu_ocr_state.reset()
                                     if menu_result.emitted_kind == "choices":
                                         emitted = True
                                         self._aihong_stage = _AIHONG_MENU_STAGE
@@ -5213,6 +6252,8 @@ class OcrReaderManager:
                             now=now,
                             emit_observed=emit_observed_lines,
                             line_repeat_threshold=line_repeat_threshold,
+                            ocr_confidence=extraction.ocr_confidence,
+                            text_source=extraction.text_source,
                         )
                     )
                     if (
@@ -5261,6 +6302,8 @@ class OcrReaderManager:
                                     now=followup_now,
                                     emit_observed=emit_observed_lines,
                                     line_repeat_threshold=line_repeat_threshold,
+                                    ocr_confidence=followup_extraction.ocr_confidence,
+                                    text_source=followup_extraction.text_source,
                                 )
                             )
                             if emitted:
@@ -5274,97 +6317,28 @@ class OcrReaderManager:
                 self._writer.discard_session()
             result.warnings.append(f"ocr_reader capture failed: {exc}")
 
-        # Timeout-based fallback: commit pending visual scene if waiting too long
-        if (
-            self._pending_visual_scene_hash
-            and self._pending_visual_scene_at > 0
-            and now - self._pending_visual_scene_at > 5.0
-        ):
-            self._commit_pending_visual_scene(now=now)
-
-        status = self._runtime.status
-        detail = self._runtime.detail
-        observed_or_stable_emitted = int(self._writer.last_seq or 0) > event_seq_before_capture
-
-        if emitted:
-            if foreground_advance_stable_grace_active:
-                self._foreground_advance_stable_until = 0.0
-            result.stable_event_emitted = True
-            result.should_rescan = True
-            self._mark_observed_progress(now=now)
-            self._last_heartbeat_at = now
-            status = "active"
-            detail = "receiving_text"
-        elif observed_or_stable_emitted:
-            result.should_rescan = True
-            self._mark_observed_progress(now=now)
-            self._last_heartbeat_at = now
-            if status == "starting":
-                status = "active"
-            detail = "receiving_observed_text"
-        elif guard_blocked:
-            if status == "starting":
-                status = "active"
-            detail = "self_ui_guard_blocked"
-        elif capture_error:
-            if status == "starting":
-                status = "active"
-            detail = "capture_failed"
-        elif capture_completed:
-            self._mark_no_text_poll()
-            if self._writer.session_id and now - self._last_heartbeat_at >= float(
-                self._config.ocr_reader_poll_interval_seconds
-            ):
-                if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
-                    result.should_rescan = True
-                    self._last_heartbeat_at = now
-            if status == "starting":
-                status = "active"
-            detail = (
-                "ocr_capture_diagnostic_required"
-                if self._ocr_capture_diagnostic_required()
-                else "attached_no_text_yet"
-            )
-        elif capture_attempted:
-            if status == "starting":
-                status = "active"
-            detail = "capture_failed"
-        elif self._writer.session_id and now - self._last_heartbeat_at >= float(
-            self._config.ocr_reader_poll_interval_seconds
-        ):
-            if self._writer.emit_heartbeat(ts=utc_now_iso(now)):
-                result.should_rescan = True
-                self._last_heartbeat_at = now
-            if status == "starting":
-                status = "active"
-            if detail == "starting_capture":
-                detail = "attached_no_text_yet"
-
-        self._runtime = self._build_runtime(
-            status=status,
-            detail=detail,
-            plan=backend_plan,
+        return self._finalize_tick_result(
+            result=result,
+            now=now,
+            poll_started_at=poll_started_at,
+            backend_plan=backend_plan,
             active_backend=active_backend,
             backend_detail_override=backend_detail_override,
             target=target,
-            capture_stage=(
-                self._aihong_stage if aihong_two_stage_enabled else OCR_CAPTURE_PROFILE_STAGE_DEFAULT
-            ),
-            capture_profile=runtime_profile.to_dict(),
-            capture_profile_selection=runtime_capture_profile_selection,
+            aihong_two_stage_enabled=aihong_two_stage_enabled,
+            runtime_profile=runtime_profile,
+            runtime_capture_profile_selection=runtime_capture_profile_selection,
             selection=selection,
-            game_id=self._writer.game_id,
-            session_id=self._writer.session_id,
-            last_seq=self._writer.last_seq,
-            last_event_ts=self._writer.last_event_ts,
+            emitted=emitted,
+            guard_blocked=guard_blocked,
+            screen_classification=screen_classification,
+            screen_event_emitted=screen_event_emitted,
+            capture_attempted=capture_attempted,
+            capture_completed=capture_completed,
+            capture_error=capture_error,
+            text_event_seq_before_capture=text_event_seq_before_capture,
+            foreground_advance_stable_grace_active=foreground_advance_stable_grace_active,
         )
-        poll_completed_at = self._time_fn()
-        self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
-        self._runtime.last_poll_completed_at = utc_now_iso(poll_completed_at)
-        self._runtime.last_poll_duration_seconds = max(0.0, poll_completed_at - poll_started_at)
-        self._runtime.last_poll_emitted_event = bool(emitted or observed_or_stable_emitted)
-        result.runtime = self._runtime.to_dict()
-        return result
 
     def _configured_backend_selection(self) -> str:
         selection = str(self._config.ocr_reader_backend_selection or "auto").strip().lower()
@@ -5616,6 +6590,8 @@ class OcrReaderManager:
             else int(self._writer.last_seq or self._runtime.last_seq)
         )
         capture_timing = dict(self._last_capture_timing)
+        vision_snapshot = self._vision_snapshot_runtime_status()
+        recommendation = dict(self._recommended_capture_profile or {})
 
         def _timing_float(key: str, fallback: float) -> float:
             if key in capture_timing:
@@ -5660,6 +6636,17 @@ class OcrReaderManager:
                     else self._runtime.capture_profile_bucket_key
                 )
                 or ""
+            ),
+            recommended_capture_profile=dict(recommendation.get("capture_profile") or {}),
+            recommended_capture_profile_process_name=str(recommendation.get("process_name") or ""),
+            recommended_capture_profile_stage=str(recommendation.get("stage") or ""),
+            recommended_capture_profile_save_scope=str(recommendation.get("save_scope") or ""),
+            recommended_capture_profile_reason=str(recommendation.get("reason") or ""),
+            recommended_capture_profile_confidence=float(recommendation.get("confidence") or 0.0),
+            recommended_capture_profile_sample_text=str(recommendation.get("sample_text") or ""),
+            recommended_capture_profile_bucket_key=str(recommendation.get("bucket_key") or ""),
+            recommended_capture_profile_manual_present=bool(
+                recommendation.get("manual_profile_present")
             ),
             tesseract_path=self._resolved_tesseract_path(),
             languages=self._config.ocr_reader_languages,
@@ -5751,6 +6738,27 @@ class OcrReaderManager:
             foreground_advance_last_match_reason=str(
                 self._runtime.foreground_advance_last_match_reason or ""
             ),
+            foreground_advance_consumed_count=int(
+                self._runtime.foreground_advance_consumed_count or 0
+            ),
+            foreground_advance_matched_count=int(
+                self._runtime.foreground_advance_matched_count or 0
+            ),
+            foreground_advance_coalesced_count=int(
+                self._runtime.foreground_advance_coalesced_count or 0
+            ),
+            foreground_advance_first_event_ts=float(
+                self._runtime.foreground_advance_first_event_ts or 0.0
+            ),
+            foreground_advance_last_event_ts=float(
+                self._runtime.foreground_advance_last_event_ts or 0.0
+            ),
+            foreground_advance_detected_at=float(
+                self._runtime.foreground_advance_detected_at or 0.0
+            ),
+            foreground_advance_last_event_age_seconds=float(
+                self._runtime.foreground_advance_last_event_age_seconds or 0.0
+            ),
             last_capture_total_duration_seconds=float(
                 _timing_float(
                     "total_duration_seconds",
@@ -5798,6 +6806,34 @@ class OcrReaderManager:
                 if "background_hash_skipped" in capture_timing
                 else bool(self._runtime.last_capture_background_hash_skipped)
             ),
+            vision_snapshot_available=bool(vision_snapshot.get("available")),
+            vision_snapshot_captured_at=str(vision_snapshot.get("captured_at") or ""),
+            vision_snapshot_expires_at=str(vision_snapshot.get("expires_at") or ""),
+            vision_snapshot_source=str(vision_snapshot.get("source") or ""),
+            vision_snapshot_width=int(vision_snapshot.get("width") or 0),
+            vision_snapshot_height=int(vision_snapshot.get("height") or 0),
+            vision_snapshot_byte_size=int(vision_snapshot.get("byte_size") or 0),
+            screen_awareness_sample_collection_enabled=bool(
+                self._config.ocr_reader_screen_awareness_sample_collection_enabled
+            ),
+            screen_awareness_sample_count=int(self._screen_awareness_sample_count or 0),
+            screen_awareness_sample_last_path=str(self._screen_awareness_sample_last_path or ""),
+            screen_awareness_sample_last_error=str(self._screen_awareness_sample_last_error or ""),
+            screen_awareness_model_enabled=bool(
+                self._config.ocr_reader_screen_awareness_model_enabled
+            ),
+            screen_awareness_model_available=self._screen_awareness_model_payload is not None,
+            screen_awareness_model_path=str(
+                self._config.ocr_reader_screen_awareness_model_path or ""
+            ),
+            screen_awareness_model_detail=str(self._screen_awareness_model_detail or ""),
+            screen_awareness_model_last_stage=str(self._screen_awareness_model_last_stage or ""),
+            screen_awareness_model_last_confidence=float(
+                self._screen_awareness_model_last_confidence or 0.0
+            ),
+            screen_awareness_model_last_latency_seconds=float(
+                self._screen_awareness_model_last_latency_seconds or 0.0
+            ),
         )
 
     def _extract_text_from_image(
@@ -5824,6 +6860,7 @@ class OcrReaderManager:
                 text=self._ocr_backend.extract_text(image),
                 backend=resolved_plan.primary,
                 backend_detail=resolved_plan.primary.detail or "custom_backend",
+                text_source="bottom_region",
             )
         descriptors = [resolved_plan.primary]
         if resolved_plan.fallback.available:
@@ -5870,6 +6907,8 @@ class OcrReaderManager:
                     ),
                     warnings=warnings,
                     boxes=list(boxes),
+                    ocr_confidence=_average_ocr_box_confidence(boxes),
+                    text_source="bottom_region",
                 )
             except Exception as exc:
                 last_error = exc
@@ -5879,6 +6918,237 @@ class OcrReaderManager:
         if last_error is not None:
             raise last_error
         return OcrExtractionResult(backend=resolved_plan.primary, warnings=warnings)
+
+    @staticmethod
+    def _full_window_profile() -> OcrCaptureProfile:
+        return OcrCaptureProfile(
+            left_inset_ratio=0.0,
+            right_inset_ratio=0.0,
+            top_ratio=0.0,
+            bottom_inset_ratio=0.0,
+        )
+
+    @staticmethod
+    def _top_region_profile() -> OcrCaptureProfile:
+        return OcrCaptureProfile(
+            left_inset_ratio=0.02,
+            right_inset_ratio=0.02,
+            top_ratio=0.0,
+            bottom_inset_ratio=0.55,
+        )
+
+    @staticmethod
+    def _menu_region_profile() -> OcrCaptureProfile:
+        return OcrCaptureProfile(
+            left_inset_ratio=0.08,
+            right_inset_ratio=0.08,
+            top_ratio=0.18,
+            bottom_inset_ratio=0.08,
+        )
+
+    @staticmethod
+    def _capture_profile_key(profile: OcrCaptureProfile) -> tuple[float, float, float, float]:
+        return (
+            round(float(profile.left_inset_ratio), 4),
+            round(float(profile.right_inset_ratio), 4),
+            round(float(profile.top_ratio), 4),
+            round(float(profile.bottom_inset_ratio), 4),
+        )
+
+    def _clear_vision_snapshot(self) -> None:
+        self._latest_vision_snapshot = {}
+        self._latest_vision_snapshot_base64 = ""
+
+    def _vision_snapshot_runtime_status(self) -> dict[str, Any]:
+        snapshot = dict(self._latest_vision_snapshot or {})
+        if not snapshot or not self._latest_vision_snapshot_base64:
+            return {
+                "available": False,
+                "captured_at": "",
+                "expires_at": "",
+                "source": "",
+                "width": 0,
+                "height": 0,
+                "byte_size": 0,
+            }
+        if self._time_fn() >= float(snapshot.get("expires_at_monotonic") or 0.0):
+            self._clear_vision_snapshot()
+            return {
+                "available": False,
+                "captured_at": "",
+                "expires_at": "",
+                "source": "",
+                "width": 0,
+                "height": 0,
+                "byte_size": 0,
+            }
+        return {
+            "available": True,
+            "captured_at": str(snapshot.get("captured_at") or ""),
+            "expires_at": str(snapshot.get("expires_at") or ""),
+            "source": str(snapshot.get("source") or ""),
+            "width": int(snapshot.get("width") or 0),
+            "height": int(snapshot.get("height") or 0),
+            "byte_size": int(snapshot.get("byte_size") or 0),
+        }
+
+    def _remember_vision_snapshot(
+        self,
+        frame: Any,
+        *,
+        source: str,
+        now: float,
+    ) -> None:
+        if not bool(self._config.llm_vision_enabled):
+            self._clear_vision_snapshot()
+            return
+        if frame is None or not hasattr(frame, "save"):
+            return
+        try:
+            image = frame.convert("RGB") if hasattr(frame, "convert") else frame
+            max_px = max(64, int(self._config.llm_vision_max_image_px or 768))
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return
+            scale = min(1.0, float(max_px) / float(max(width, height)))
+            if scale < 1.0:
+                next_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                image = image.resize(
+                    next_size,
+                    _PIL_RESAMPLING.LANCZOS if _PIL_RESAMPLING is not None else 1,
+                )
+                width, height = image.size
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=_VISION_SNAPSHOT_JPEG_QUALITY, optimize=True)
+            raw = buffer.getvalue()
+            if not raw:
+                return
+            expires_at = now + _VISION_SNAPSHOT_TTL_SECONDS
+            self._latest_vision_snapshot_base64 = (
+                "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+            )
+            self._latest_vision_snapshot = {
+                "captured_at": utc_now_iso(now),
+                "expires_at": utc_now_iso(expires_at),
+                "expires_at_monotonic": expires_at,
+                "source": source,
+                "width": int(width),
+                "height": int(height),
+                "byte_size": len(raw),
+                "ttl_seconds": _VISION_SNAPSHOT_TTL_SECONDS,
+            }
+        except Exception as exc:
+            self._logger.debug("ocr_reader vision snapshot encoding skipped: {}", exc)
+
+    def _should_attempt_screen_awareness_regions(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        now: float,
+    ) -> bool:
+        if (
+            not bool(self._config.ocr_reader_screen_awareness_full_frame_ocr)
+            and not bool(self._config.ocr_reader_screen_awareness_multi_region_ocr)
+            and not bool(self._config.llm_vision_enabled)
+        ):
+            return False
+        text = str(extraction.text or "").strip()
+        if text and _looks_like_ocr_dialogue_text(text):
+            return False
+        if now - float(self._last_screen_awareness_capture_at or 0.0) < 0.75 and text:
+            return False
+        return True
+
+    def _augment_extraction_with_screen_awareness(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        target: DetectedGameWindow,
+        primary_profile: OcrCaptureProfile,
+        plan: SelectedOcrBackendPlan,
+        now: float,
+    ) -> None:
+        if not self._should_attempt_screen_awareness_regions(extraction, now=now):
+            return
+        capture_duration = 0.0
+        ocr_duration = 0.0
+        regions: list[dict[str, Any]] = []
+        visual_features: dict[str, Any] = {}
+        seen_profiles = {self._capture_profile_key(primary_profile)}
+
+        requests: list[tuple[str, OcrCaptureProfile, bool, bool]] = []
+        full_profile = self._full_window_profile()
+        if self._capture_profile_key(full_profile) not in seen_profiles and (
+            bool(self._config.ocr_reader_screen_awareness_full_frame_ocr)
+            or bool(self._config.ocr_reader_screen_awareness_visual_rules)
+            or bool(self._config.llm_vision_enabled)
+        ):
+            requests.append(
+                (
+                    "full_frame",
+                    full_profile,
+                    bool(self._config.ocr_reader_screen_awareness_full_frame_ocr),
+                    True,
+                )
+            )
+            seen_profiles.add(self._capture_profile_key(full_profile))
+        if bool(self._config.ocr_reader_screen_awareness_multi_region_ocr):
+            for source, profile in (
+                ("menu_region", self._menu_region_profile()),
+                ("top_region", self._top_region_profile()),
+            ):
+                key = self._capture_profile_key(profile)
+                if key in seen_profiles:
+                    continue
+                requests.append((source, profile, True, False))
+                seen_profiles.add(key)
+
+        for source, profile, extract_text, collect_visual in requests:
+            try:
+                capture_started_at = self._time_fn()
+                frame = self._capture_backend.capture_frame(target, profile)
+                capture_duration += max(0.0, self._time_fn() - capture_started_at)
+                metadata = _frame_choice_bounds_metadata(frame, text_source=source)
+                if source == "full_frame":
+                    self._remember_vision_snapshot(frame, source=source, now=now)
+                if collect_visual and bool(self._config.ocr_reader_screen_awareness_visual_rules):
+                    visual_features.update(
+                        analyze_screen_visual_features(
+                            frame,
+                            boxes=[],
+                            bounds_metadata=metadata,
+                        )
+                    )
+                if not extract_text:
+                    continue
+                ocr_started_at = self._time_fn()
+                region_extraction = self._extract_text_from_image(frame, plan=plan)
+                ocr_duration += max(0.0, self._time_fn() - ocr_started_at)
+                region_extraction.text_source = source
+                regions.append(
+                    {
+                        "source": source,
+                        "text": region_extraction.text,
+                        "boxes": list(region_extraction.boxes),
+                        "bounds_metadata": metadata,
+                        "ocr_confidence": region_extraction.ocr_confidence,
+                    }
+                )
+                extraction.warnings.extend(region_extraction.warnings)
+            except Exception as exc:
+                extraction.warnings.append(f"screen awareness {source} skipped: {exc}")
+                try:
+                    self._logger.debug("ocr_reader screen awareness {} skipped: {}", source, exc)
+                except Exception:
+                    pass
+
+        if regions or visual_features:
+            self._last_screen_awareness_capture_at = now
+        extraction.screen_ocr_regions = regions
+        extraction.screen_visual_features = visual_features
+        extraction.timing["screen_awareness_capture_duration_seconds"] = capture_duration
+        extraction.timing["screen_awareness_ocr_duration_seconds"] = ocr_duration
+        extraction.timing["screen_awareness_region_count"] = float(len(regions))
 
     def _capture_and_extract_text(
         self,
@@ -5971,7 +7241,439 @@ class OcrReaderManager:
             extraction.capture_backend_detail = str(
                 getattr(self._capture_backend, "last_backend_detail", "") or ""
             )
+        self._augment_extraction_with_screen_awareness(
+            extraction,
+            target=target,
+            primary_profile=profile,
+            plan=plan,
+            now=started_at,
+        )
+        extraction.timing["total_duration_seconds"] = max(0.0, self._time_fn() - started_at)
         return extraction
+
+    def _emit_screen_classification_from_extraction(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        target: DetectedGameWindow,
+        now: float,
+    ) -> tuple[ScreenClassification, bool]:
+        classification = classify_screen_from_ocr(
+            extraction.text,
+            boxes=extraction.boxes,
+            bounds_metadata=_extraction_choice_bounds_metadata(extraction),
+            ocr_regions=extraction.screen_ocr_regions,
+            visual_features=extraction.screen_visual_features,
+            screen_templates=self._screen_templates_for_target(target),
+            template_context=self._screen_template_context(target),
+        )
+        classification = self._apply_screen_awareness_model(
+            extraction,
+            classification=classification,
+            target=target,
+        )
+        classification = self._apply_screen_classification_stability(classification)
+        self._update_capture_profile_recommendation(
+            extraction,
+            classification=classification,
+            target=target,
+            now=now,
+        )
+        self._collect_screen_awareness_sample(
+            extraction,
+            classification=classification,
+            target=target,
+            now=now,
+        )
+        if classification.screen_type in {
+            OCR_CAPTURE_PROFILE_STAGE_DEFAULT,
+            OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        }:
+            return classification, False
+        emitted = self._writer.emit_screen_classified(
+            screen_type=classification.screen_type,
+            confidence=classification.confidence,
+            ui_elements=classification.ui_elements,
+            raw_ocr_text=classification.raw_ocr_text,
+            screen_debug=classification.debug,
+            ts=utc_now_iso(now),
+        )
+        return classification, emitted
+
+    def _apply_screen_awareness_model(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        classification: ScreenClassification,
+        target: DetectedGameWindow,
+    ) -> ScreenClassification:
+        self._screen_awareness_model_last_stage = ""
+        self._screen_awareness_model_last_confidence = 0.0
+        self._screen_awareness_model_last_latency_seconds = 0.0
+        if not bool(self._config.ocr_reader_screen_awareness_model_enabled):
+            self._screen_awareness_model_detail = "disabled"
+            return classification
+        if _matches_aihong_target(target):
+            self._screen_awareness_model_detail = "skipped_aihong_target"
+            return classification
+        if (
+            classification.screen_type != OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            and float(classification.confidence or 0.0) >= 0.45
+        ):
+            self._screen_awareness_model_detail = "skipped_high_confidence_rule"
+            return classification
+        features = self._screen_awareness_model_features(extraction, classification)
+        if not features:
+            self._screen_awareness_model_detail = "no_features"
+            return classification
+        model_payload = self._load_screen_awareness_model()
+        if model_payload is None:
+            return classification
+
+        started_at = self._time_fn()
+        prediction = classify_screen_awareness_model(
+            features,
+            model_payload,
+            min_confidence=float(
+                self._config.ocr_reader_screen_awareness_model_min_confidence or 0.55
+            ),
+        )
+        self._screen_awareness_model_last_latency_seconds = max(
+            0.0,
+            self._time_fn() - started_at,
+        )
+        if prediction is None:
+            self._screen_awareness_model_detail = "no_match"
+            return classification
+        self._screen_awareness_model_last_stage = str(prediction.get("stage") or "")
+        self._screen_awareness_model_last_confidence = float(prediction.get("confidence") or 0.0)
+        if (
+            classification.screen_type != OCR_CAPTURE_PROFILE_STAGE_DEFAULT
+            and self._screen_awareness_model_last_confidence
+            <= float(classification.confidence or 0.0) + 0.04
+        ):
+            self._screen_awareness_model_detail = "rule_confidence_wins"
+            return classification
+        result_debug = dict(classification.debug)
+        result_debug["reason"] = "screen_awareness_model"
+        result_debug["model"] = json_copy(prediction)
+        self._screen_awareness_model_detail = "matched"
+        return ScreenClassification(
+            screen_type=str(prediction.get("stage") or OCR_CAPTURE_PROFILE_STAGE_DEFAULT),
+            confidence=round(
+                max(0.0, min(float(prediction.get("confidence") or 0.0), 0.99)),
+                2,
+            ),
+            ui_elements=list(classification.ui_elements),
+            raw_ocr_text=list(classification.raw_ocr_text),
+            debug=result_debug,
+        )
+
+    def _screen_awareness_model_features(
+        self,
+        extraction: OcrExtractionResult,
+        classification: ScreenClassification,
+    ) -> dict[str, Any]:
+        features = dict(extraction.screen_visual_features or {})
+        debug = classification.debug if isinstance(classification.debug, dict) else {}
+        layout = debug.get("layout")
+        if isinstance(layout, dict):
+            for key, value in layout.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    features[str(key)] = float(value)
+        features["line_count"] = len(classification.raw_ocr_text)
+        features["ui_element_count"] = len(classification.ui_elements)
+        return {
+            key: value
+            for key, value in features.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+
+    def _screen_awareness_model_path(self) -> Path | None:
+        raw = str(self._config.ocr_reader_screen_awareness_model_path or "").strip()
+        if not raw:
+            self._screen_awareness_model_detail = "model_path_empty"
+            return None
+        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not path.is_absolute():
+            path = Path(self._config.bridge_root) / path
+        return path
+
+    def _load_screen_awareness_model(self) -> dict[str, Any] | None:
+        path = self._screen_awareness_model_path()
+        if path is None:
+            self._screen_awareness_model_payload = None
+            self._screen_awareness_model_cache_key = None
+            return None
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            self._screen_awareness_model_detail = f"model_unavailable: {exc}"
+            self._screen_awareness_model_payload = None
+            self._screen_awareness_model_cache_key = None
+            return None
+        cache_key = (str(path), float(stat.st_mtime))
+        if (
+            self._screen_awareness_model_cache_key == cache_key
+            and self._screen_awareness_model_payload is not None
+        ):
+            return self._screen_awareness_model_payload
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            self._screen_awareness_model_detail = f"model_load_failed: {exc}"
+            self._screen_awareness_model_payload = None
+            self._screen_awareness_model_cache_key = None
+            return None
+        if not isinstance(payload, dict):
+            self._screen_awareness_model_detail = "model_payload_not_object"
+            self._screen_awareness_model_payload = None
+            self._screen_awareness_model_cache_key = None
+            return None
+        prototypes = payload.get("prototypes") or payload.get("labels") or []
+        prototype_count = len(prototypes) if isinstance(prototypes, list) else 0
+        if prototype_count <= 0:
+            self._screen_awareness_model_detail = "model_has_no_prototypes"
+            self._screen_awareness_model_payload = None
+            self._screen_awareness_model_cache_key = None
+            return None
+        self._screen_awareness_model_payload = payload
+        self._screen_awareness_model_cache_key = cache_key
+        self._screen_awareness_model_detail = f"loaded:{prototype_count}"
+        return payload
+
+    def _screen_awareness_sample_file_path(self) -> Path:
+        raw = str(self._config.ocr_reader_screen_awareness_sample_dir or "").strip()
+        sample_dir = (
+            Path(os.path.expandvars(os.path.expanduser(raw)))
+            if raw
+            else Path(self._config.bridge_root) / "_screen_awareness_samples"
+        )
+        if not sample_dir.is_absolute():
+            sample_dir = Path(self._config.bridge_root) / sample_dir
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        return sample_dir / "samples.jsonl"
+
+    def _collect_screen_awareness_sample(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        classification: ScreenClassification,
+        target: DetectedGameWindow,
+        now: float,
+    ) -> None:
+        if not bool(self._config.ocr_reader_screen_awareness_sample_collection_enabled):
+            self._screen_awareness_sample_last_error = ""
+            return
+        try:
+            sample_path = self._screen_awareness_sample_file_path()
+            regions: list[dict[str, Any]] = []
+            for region in list(extraction.screen_ocr_regions or [])[:8]:
+                if not isinstance(region, dict):
+                    continue
+                region_text = str(region.get("text") or "")
+                regions.append(
+                    {
+                        "source": str(region.get("source") or ""),
+                        "ocr_lines": _stripped_ocr_lines(region_text)[:20],
+                        "ocr_confidence": float(region.get("ocr_confidence") or 0.0),
+                        "bounds_metadata": json_copy(region.get("bounds_metadata") or {}),
+                    }
+                )
+            record = {
+                "version": 1,
+                "sampled_at": utc_now_iso(now),
+                "process_name": str(target.process_name or ""),
+                "window_title": str(target.title or ""),
+                "width": int(target.width or 0),
+                "height": int(target.height or 0),
+                "ocr_lines": _stripped_ocr_lines(extraction.text)[:20],
+                "ocr_regions": regions,
+                "visual_features": json_copy(extraction.screen_visual_features or {}),
+                "screen_type": str(classification.screen_type or ""),
+                "screen_confidence": float(classification.confidence or 0.0),
+                "screen_reason": str((classification.debug or {}).get("reason") or ""),
+                "screen_ui_elements": json_copy(classification.ui_elements[:10]),
+            }
+            with sample_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self._screen_awareness_sample_count += 1
+            self._screen_awareness_sample_last_path = str(sample_path)
+            self._screen_awareness_sample_last_error = ""
+        except Exception as exc:
+            self._screen_awareness_sample_last_error = str(exc)
+            try:
+                self._logger.debug("ocr_reader screen awareness sample skipped: {}", exc)
+            except Exception:
+                pass
+
+    def _screen_templates_for_target(self, target: DetectedGameWindow) -> list[dict[str, Any]]:
+        if _matches_aihong_target(target):
+            return []
+        templates = self._config.ocr_reader_screen_templates
+        return list(templates or []) if isinstance(templates, list) else []
+
+    def _screen_template_context(self, target: DetectedGameWindow) -> dict[str, Any]:
+        return {
+            "process_name": str(target.process_name or ""),
+            "window_title": str(target.title or ""),
+            "width": int(target.width or 0),
+            "height": int(target.height or 0),
+            "game_id": str(self._writer.game_id or ""),
+        }
+
+    def _update_capture_profile_recommendation(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        classification: ScreenClassification,
+        target: DetectedGameWindow,
+        now: float,
+    ) -> None:
+        if (
+            classification.screen_type not in {OCR_CAPTURE_PROFILE_STAGE_DEFAULT, OCR_CAPTURE_PROFILE_STAGE_DIALOGUE}
+            and classification.confidence >= 0.5
+        ):
+            self._recommended_capture_profile = {}
+            return
+        if (
+            classification.screen_type != OCR_CAPTURE_PROFILE_STAGE_DIALOGUE
+            or classification.confidence < 0.55
+            or not str(extraction.text or "").strip()
+        ):
+            return
+        bounds: list[dict[str, float]] = []
+        for element in classification.ui_elements:
+            normalized = element.get("normalized_bounds")
+            if not isinstance(normalized, dict):
+                continue
+            try:
+                left = float(normalized.get("left"))
+                top = float(normalized.get("top"))
+                right = float(normalized.get("right"))
+                bottom = float(normalized.get("bottom"))
+            except (TypeError, ValueError):
+                continue
+            if right <= left or bottom <= top:
+                continue
+            bounds.append({"left": left, "top": top, "right": right, "bottom": bottom})
+        if not bounds:
+            return
+
+        min_top = max(0.0, min(item["top"] for item in bounds))
+        max_bottom = min(1.0, max(item["bottom"] for item in bounds))
+        text_height = max_bottom - min_top
+        if text_height <= 0.02:
+            return
+        current_selection = self._capture_profile_selection_for_target(
+            target,
+            stage=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+        )
+        current_profile = current_selection.profile
+        top_ratio = round(max(0.0, min_top - 0.08), 2)
+        bottom_inset_ratio = round(max(0.0, 1.0 - max_bottom - 0.08), 2)
+        if 1.0 - top_ratio - bottom_inset_ratio < 0.16:
+            top_ratio = round(max(0.0, 1.0 - bottom_inset_ratio - 0.16), 2)
+        if top_ratio + bottom_inset_ratio >= 0.98:
+            return
+        candidate_profile = OcrCaptureProfile(
+            left_inset_ratio=current_profile.left_inset_ratio,
+            right_inset_ratio=current_profile.right_inset_ratio,
+            top_ratio=top_ratio,
+            bottom_inset_ratio=bottom_inset_ratio,
+        )
+        current_payload = current_profile.to_dict()
+        candidate_payload = candidate_profile.to_dict()
+        delta = sum(
+            abs(float(candidate_payload[key]) - float(current_payload.get(key, 0.0)))
+            for key in OCR_CAPTURE_PROFILE_RATIO_KEYS
+        )
+        if delta < 0.06:
+            return
+        bucket_key = (
+            build_ocr_capture_profile_bucket_key(int(target.width or 0), int(target.height or 0)).lower()
+            if int(target.width or 0) > 0 and int(target.height or 0) > 0
+            else ""
+        )
+        sample_text = " ".join(_stripped_ocr_lines(extraction.text))[:120]
+        self._recommended_capture_profile = {
+            "process_name": str(target.process_name or ""),
+            "stage": OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+            "save_scope": "window_bucket",
+            "bucket_key": bucket_key,
+            "capture_profile": candidate_payload,
+            "current_capture_profile": current_payload,
+            "confidence": min(0.95, max(0.0, float(classification.confidence))),
+            "reason": "dialogue_text_bounds_offset",
+            "sample_text": sample_text,
+            "manual_profile_present": self._has_manual_capture_profile(target),
+            "created_at": utc_now_iso(now),
+        }
+
+    def _apply_screen_classification_stability(
+        self,
+        classification: ScreenClassification,
+    ) -> ScreenClassification:
+        screen_type = str(classification.screen_type or "")
+        if not screen_type or screen_type == OCR_CAPTURE_PROFILE_STAGE_DEFAULT:
+            self._last_screen_classification_type = screen_type
+            self._last_screen_classification_streak = 0
+            return classification
+        if screen_type == self._last_screen_classification_type:
+            self._last_screen_classification_streak += 1
+        else:
+            self._last_screen_classification_type = screen_type
+            self._last_screen_classification_streak = 1
+        bonus = min(max(self._last_screen_classification_streak - 1, 0) * 0.04, 0.12)
+        if bonus <= 0.0:
+            classification.debug = {
+                **dict(classification.debug or {}),
+                "stability_streak": self._last_screen_classification_streak,
+                "stability_bonus": 0.0,
+            }
+            return classification
+        classification.confidence = round(
+            max(0.0, min(float(classification.confidence or 0.0) + bonus, 0.99)),
+            2,
+        )
+        classification.debug = {
+            **dict(classification.debug or {}),
+            "stability_streak": self._last_screen_classification_streak,
+            "stability_bonus": round(bonus, 2),
+        }
+        return classification
+
+    @staticmethod
+    def _should_skip_dialogue_for_screen_classification(
+        classification: ScreenClassification,
+    ) -> bool:
+        if float(classification.confidence or 0.0) < 0.5:
+            return False
+        return classification.screen_type in {
+            OCR_CAPTURE_PROFILE_STAGE_TITLE,
+            OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+            OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+            OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+            OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+            OCR_CAPTURE_PROFILE_STAGE_MINIGAME,
+            OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
+        }
+
+    @staticmethod
+    def _screen_classification_is_known(classification: ScreenClassification) -> bool:
+        if float(classification.confidence or 0.0) < 0.45:
+            return False
+        return classification.screen_type in {
+            OCR_CAPTURE_PROFILE_STAGE_TITLE,
+            OCR_CAPTURE_PROFILE_STAGE_SAVE_LOAD,
+            OCR_CAPTURE_PROFILE_STAGE_CONFIG,
+            OCR_CAPTURE_PROFILE_STAGE_MENU,
+            OCR_CAPTURE_PROFILE_STAGE_TRANSITION,
+            OCR_CAPTURE_PROFILE_STAGE_GALLERY,
+            OCR_CAPTURE_PROFILE_STAGE_MINIGAME,
+            OCR_CAPTURE_PROFILE_STAGE_GAME_OVER,
+        }
 
     def _select_target_window(
         self,
@@ -6157,6 +7859,8 @@ class OcrReaderManager:
         allow_plain_text_choices: bool = False,
         emit_observed: bool = True,
         line_repeat_threshold: int | None = None,
+        ocr_confidence: float | None = None,
+        text_source: str = "bottom_region",
     ) -> bool:
         tracker = state or self._default_ocr_state
         lines = _stripped_ocr_lines(raw_text)
@@ -6179,6 +7883,8 @@ class OcrReaderManager:
             state=tracker,
             emit_observed=emit_observed,
             repeat_threshold=line_repeat_threshold,
+            ocr_confidence=ocr_confidence,
+            text_source=text_source,
         )
 
     async def _end_session_if_needed(self, now: float) -> None:
