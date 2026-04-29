@@ -1772,11 +1772,266 @@ details.panel-scroll-wide[open] {
     grid-template-columns: 1fr 1fr;
   }
 
+  .onboarding-steps {
+    grid-template-columns: 1fr;
+  }
+
   .first-run-actions {
     grid-column: 1 / -1;
     justify-content: flex-start;
   }
 }
+
+/* ========== Onboarding mode ========== */
+
+body.onboarding-active #mainView {
+  display: none;
+}
+
+body:not(.onboarding-active) #onboardingView {
+  display: none;
+}
+
+.onboarding-view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 48px);
+}
+
+.onboarding-card {
+  width: min(640px, calc(100vw - 32px));
+  padding: 48px 36px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  text-align: center;
+}
+
+.onboarding-header {
+  margin-bottom: 32px;
+}
+
+.onboarding-header h1 {
+  font-size: clamp(28px, 5vw, 42px);
+  line-height: 1.1;
+}
+
+.onboarding-subtitle {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 16px;
+}
+
+.onboarding-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.onboarding-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.onboarding-skip {
+  display: inline-block;
+  font-size: 13px;
+}
+
+/* ========== Mode / Speed switch ========== */
+
+.hero-right {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.hero-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.hero-title {
+  font-size: clamp(24px, 4vw, 36px);
+  line-height: 1;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.mode-switch,
+.speed-switch {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(31, 42, 51, 0.06);
+}
+
+.mode-btn,
+.speed-btn {
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  border: none;
+  cursor: pointer;
+  transition: background 150ms ease, color 150ms ease;
+}
+
+.mode-btn:hover,
+.speed-btn:hover {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.mode-btn.active,
+.speed-btn.active {
+  background: #fff;
+  color: var(--brand-strong);
+  box-shadow: 0 2px 8px rgba(31, 42, 51, 0.1);
+}
+
+.speed-switch {
+  display: none;
+}
+
+.hero.mode-auto .speed-switch {
+  display: flex;
+}
+
+/* ========== Diagnosis compact ========== */
+
+.primary-diagnosis.compact #primaryDiagnosisBody,
+.primary-diagnosis.compact #primaryDiagnosisActions {
+  display: none;
+}
+
+/* ========== Effective line display ========== */
+
+.current-line-effective {
+  padding: 18px 20px;
+  border: 1px solid rgba(14, 138, 124, 0.18);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.92);
+  font-size: 18px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  transition: opacity 0.15s ease;
+}
+
+/* ========== Observed lines collapsible ========== */
+
+.observed-lines-collapse {
+  margin-top: 8px;
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+
+.observed-lines-collapse summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.observed-lines-collapse summary::before {
+  content: "▶";
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+.observed-lines-collapse[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.observed-lines-collapse summary::-webkit-details-marker {
+  display: none;
+}
+
+.observed-lines-content {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.observed-line-item {
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(31, 42, 51, 0.04);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ========== Suggest panel in main view ========== */
+
+.suggest-panel-section {
+  margin-bottom: 18px;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 12px 32px rgba(23, 37, 43, 0.08);
+}
+
+.suggest-panel-head {
+  margin-bottom: 12px;
+}
+
+.suggest-panel-section .result-panel {
+  max-height: none;
+}
+
+/* ========== Advanced settings toggle ========== */
+
+.advanced-toggle-row {
+  display: flex;
+  justify-content: center;
+  margin: 18px 0;
+}
+
+.advanced-toggle-btn {
+  font-size: 14px;
+  padding: 10px 24px;
+}
+
+#advancedSettings {
+  display: none;
+}
+
+#advancedSettings.open {
+  display: block;
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ========== Responsive ========== */
 
 @media (max-width: 900px) {
   .hero {
@@ -1808,6 +2063,19 @@ details.panel-scroll-wide[open] {
   .current-line-head,
   .ocr-pipeline-head {
     align-items: stretch;
+    flex-direction: column;
+  }
+
+  .hero-right {
+    align-items: stretch;
+  }
+
+  .hero-controls {
+    align-items: stretch;
+  }
+
+  .mode-switch,
+  .speed-switch {
     flex-direction: column;
   }
 

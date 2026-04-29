@@ -143,7 +143,12 @@ _USER_PROMPT_PREFIXES = {
         "1. summary 用 1-3 句概括当前场景的剧情推进。\n"
         "2. key_points.type 只能是 plot / emotion / decision / reveal / objective。\n"
         "3. key_points 只允许引用 context 中能支持的事实。\n"
-        "4. 输出必须匹配这个 JSON 结构：\n"
+        "4. stable_lines 是已确认剧情事实，应作为主要依据。\n"
+        "5. observed_lines 是 OCR 候选，只能作为“可能刚出现的台词”，不得写成确定事实。\n"
+        "6. recent_choices 是玩家已确认选择；如存在，应优先产出 decision 或 objective 类型 key_point。\n"
+        "7. 尽量说明当前情绪、玩家选择影响、当前目标或待解决问题。\n"
+        "8. scene_summary_seed 是本地保守摘要，可参考但不要逐字复述。\n"
+        "9. 输出必须匹配这个 JSON 结构：\n"
     ),
     "suggest_choice": (
         "任务：对当前可见选项给出推荐顺位。\n"

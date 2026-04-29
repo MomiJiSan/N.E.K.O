@@ -199,6 +199,7 @@ _SELF_UI_GUARD_SUBSTRINGS = (
     "-pycache_",
     "codex_tmp",
     "documents\\code\\n.e.k.o",
+    "d:\\work\\code\\n.e.k.o",
     "rapidocr",
     "tesseract",
     "ocr compatibility fallback",
@@ -230,6 +231,9 @@ _SELF_UI_GUARD_SUBSTRINGS = (
     "plugin.plugins.galgame_plugin",
     "uv run python",
     "launcher.py",
+    "visual studio code",
+    "code.exe",
+    "windows terminal",
     "powershell",
     "ps c:",
 )
@@ -268,6 +272,9 @@ _DIALOGUE_LINE_MARKERS = (":", "：", "「", "」")
 _OCR_DIALOGUE_STRONG_PUNCTUATION_RE = re.compile(r"[。！？!?…]|——|「|」|『|』|“|”")
 _OCR_DIALOGUE_WEAK_PUNCTUATION_RE = re.compile(r"[，,、：:]")
 _OCR_TRAILING_GARBAGE_AFTER_SENTENCE_RE = re.compile(r"([。！？!?…」』”\]］])\s*[号口日曰益]\s*$")
+_OCR_TRAILING_ORPHAN_AFTER_SENTENCE_RE = re.compile(
+    r"([。！？!?…」』”\]］])\s*[义人入丁七十廿卜丿丨丶]\s*$"
+)
 _OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE = re.compile(
     r"([\]］）】」』”])\s*[^。！？!?…，,、：:；;「」『』“”\[\]［］【】（）()]{1,4}\s*$"
 )
@@ -281,9 +288,20 @@ _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS = 0.18
 _OCR_CAPTURE_TIMEOUT_SECONDS = 12.0
 _FOREGROUND_ADVANCE_STABLE_GRACE_SECONDS = 2.0
 _CAPTURE_BACKEND_AUTO = "auto"
+_CAPTURE_BACKEND_SMART = "smart"
 _CAPTURE_BACKEND_DXCAM = "dxcam"
 _CAPTURE_BACKEND_IMAGEGRAB = "imagegrab"
 _CAPTURE_BACKEND_PRINTWINDOW = "printwindow"
+_SCREEN_AWARENESS_LATENCY_MODE_OFF = "off"
+_SCREEN_AWARENESS_LATENCY_MODE_BALANCED = "balanced"
+_SCREEN_AWARENESS_LATENCY_MODE_FULL = "full"
+_SCREEN_AWARENESS_LATENCY_MODE_AGGRESSIVE = "aggressive"
+_SCREEN_AWARENESS_LATENCY_MODES = {
+    _SCREEN_AWARENESS_LATENCY_MODE_OFF,
+    _SCREEN_AWARENESS_LATENCY_MODE_BALANCED,
+    _SCREEN_AWARENESS_LATENCY_MODE_FULL,
+    _SCREEN_AWARENESS_LATENCY_MODE_AGGRESSIVE,
+}
 _DXCAM_GRAB_RETRY_ATTEMPTS = 2
 _DXCAM_GRAB_RETRY_DELAY_SECONDS = 0.05
 _STALE_CAPTURE_FRAME_THRESHOLD = 3
@@ -296,11 +314,13 @@ _OCR_PREPARE_UPSCALE_SOURCE_LONG_EDGE = 900
 _OCR_PREPARE_TARGET_LONG_EDGE = 1400
 _OCR_PREPARE_MAX_LONG_EDGE = 1600
 _BACKGROUND_HASH_MIN_INTERVAL_SECONDS = 1.0
+_BACKGROUND_HASH_DIALOGUE_SAMPLE_INTERVAL_SECONDS = 2.0
 _BACKGROUND_HASH_BOTTOM_INSET_RATIO = 0.45
 _BACKEND_PLAN_CACHE_TTL_SECONDS = 5.0
 _BACKGROUND_SCENE_HASH_SIZE = 8
 _BACKGROUND_SCENE_CHANGE_DISTANCE = 18
 _BACKGROUND_SCENE_CHANGE_CONFIRM_POLLS = 2
+_BACKGROUND_CAPTURE_BACKEND_PAUSE_SECONDS = 5.0
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -437,6 +457,8 @@ def _clean_ocr_dialogue_text(text: str) -> str:
         return ""
     cleaned = normalized
     cleaned = _OCR_TRAILING_GARBAGE_AFTER_SENTENCE_RE.sub(r"\1", cleaned).strip()
+    if _significant_char_count(cleaned) >= 10:
+        cleaned = _OCR_TRAILING_ORPHAN_AFTER_SENTENCE_RE.sub(r"\1", cleaned).strip()
     cleaned = _OCR_TRAILING_GARBAGE_AFTER_BRACKET_RE.sub(r"\1", cleaned).strip()
     cleaned = _OCR_TRAILING_GARBAGE_AFTER_DASH_RE.sub(r"\1", cleaned).strip()
     return cleaned
@@ -1540,6 +1562,10 @@ class OcrReaderObservationRuntime:
     ocr_capture_diagnostic_required: bool = False
     ocr_context_state: str = ""
     last_raw_ocr_text: str = ""
+    last_rejected_ocr_text: str = ""
+    last_rejected_ocr_reason: str = ""
+    last_rejected_ocr_at: str = ""
+    last_rejected_capture_backend: str = ""
     last_observed_line: dict[str, Any] = field(default_factory=dict)
     last_stable_line: dict[str, Any] = field(default_factory=dict)
     stable_ocr_last_raw_text: str = ""
@@ -1587,6 +1613,11 @@ class OcrReaderCaptureRuntime:
     screen_awareness_model_last_stage: str = ""
     screen_awareness_model_last_confidence: float = 0.0
     screen_awareness_model_last_latency_seconds: float = 0.0
+    screen_awareness_last_skip_reason: str = ""
+    screen_awareness_last_region_count: int = 0
+    screen_awareness_last_capture_duration_seconds: float = 0.0
+    screen_awareness_last_ocr_duration_seconds: float = 0.0
+    scene_ordering_diagnostic: str = "none"
 
 
 @dataclass(slots=True)
@@ -1682,6 +1713,13 @@ class OcrReaderRuntime:
         "last_capture_completed_at": ("capture", "last_capture_completed_at"),
         "last_capture_error": ("capture", "last_capture_error"),
         "last_raw_ocr_text": ("observation", "last_raw_ocr_text"),
+        "last_rejected_ocr_text": ("observation", "last_rejected_ocr_text"),
+        "last_rejected_ocr_reason": ("observation", "last_rejected_ocr_reason"),
+        "last_rejected_ocr_at": ("observation", "last_rejected_ocr_at"),
+        "last_rejected_capture_backend": (
+            "observation",
+            "last_rejected_capture_backend",
+        ),
         "last_observed_line": ("observation", "last_observed_line"),
         "last_stable_line": ("observation", "last_stable_line"),
         "stable_ocr_last_raw_text": ("observation", "stable_ocr_last_raw_text"),
@@ -1746,6 +1784,23 @@ class OcrReaderRuntime:
             "capture",
             "last_capture_background_hash_skipped",
         ),
+        "screen_awareness_last_skip_reason": (
+            "capture",
+            "screen_awareness_last_skip_reason",
+        ),
+        "screen_awareness_last_region_count": (
+            "capture",
+            "screen_awareness_last_region_count",
+        ),
+        "screen_awareness_last_capture_duration_seconds": (
+            "capture",
+            "screen_awareness_last_capture_duration_seconds",
+        ),
+        "screen_awareness_last_ocr_duration_seconds": (
+            "capture",
+            "screen_awareness_last_ocr_duration_seconds",
+        ),
+        "scene_ordering_diagnostic": ("capture", "scene_ordering_diagnostic"),
         "vision_snapshot_available": ("capture", "vision_snapshot_available"),
         "vision_snapshot_captured_at": ("capture", "vision_snapshot_captured_at"),
         "vision_snapshot_expires_at": ("capture", "vision_snapshot_expires_at"),
@@ -1868,6 +1923,10 @@ class OcrReaderRuntime:
             "last_capture_completed_at": self.last_capture_completed_at,
             "last_capture_error": self.last_capture_error,
             "last_raw_ocr_text": self.last_raw_ocr_text,
+            "last_rejected_ocr_text": self.last_rejected_ocr_text,
+            "last_rejected_ocr_reason": self.last_rejected_ocr_reason,
+            "last_rejected_ocr_at": self.last_rejected_ocr_at,
+            "last_rejected_capture_backend": self.last_rejected_capture_backend,
             "last_observed_line": dict(self.last_observed_line),
             "last_stable_line": dict(self.last_stable_line),
             "stable_ocr_last_raw_text": self.stable_ocr_last_raw_text,
@@ -1910,6 +1969,15 @@ class OcrReaderRuntime:
             "last_backend_plan_duration_seconds": self.last_backend_plan_duration_seconds,
             "last_window_scan_duration_seconds": self.last_window_scan_duration_seconds,
             "last_capture_background_hash_skipped": self.last_capture_background_hash_skipped,
+            "screen_awareness_last_skip_reason": self.screen_awareness_last_skip_reason,
+            "screen_awareness_last_region_count": self.screen_awareness_last_region_count,
+            "screen_awareness_last_capture_duration_seconds": (
+                self.screen_awareness_last_capture_duration_seconds
+            ),
+            "screen_awareness_last_ocr_duration_seconds": (
+                self.screen_awareness_last_ocr_duration_seconds
+            ),
+            "scene_ordering_diagnostic": self.scene_ordering_diagnostic,
             "vision_snapshot_available": self.vision_snapshot_available,
             "vision_snapshot_captured_at": self.vision_snapshot_captured_at,
             "vision_snapshot_expires_at": self.vision_snapshot_expires_at,
@@ -2005,7 +2073,7 @@ class OcrExtractionResult:
     capture_backend_detail: str = ""
     capture_image_hash: str = ""
     background_hash: str = ""
-    timing: dict[str, float | bool] = field(default_factory=dict)
+    timing: dict[str, Any] = field(default_factory=dict)
     screen_ocr_regions: list[dict[str, Any]] = field(default_factory=list)
     screen_visual_features: dict[str, Any] = field(default_factory=dict)
     ocr_confidence: float = 0.0
@@ -2402,6 +2470,17 @@ class Win32CaptureBackend:
     def __init__(self, *, logger=None, selection: str = _CAPTURE_BACKEND_AUTO) -> None:
         self._logger = logger
         self.selection = str(selection or _CAPTURE_BACKEND_AUTO).strip().lower()
+        if self.selection not in {
+            _CAPTURE_BACKEND_AUTO,
+            _CAPTURE_BACKEND_SMART,
+            _CAPTURE_BACKEND_DXCAM,
+            _CAPTURE_BACKEND_IMAGEGRAB,
+            _CAPTURE_BACKEND_PRINTWINDOW,
+        }:
+            self.selection = _CAPTURE_BACKEND_AUTO
+        self._imagegrab_backend = ImageGrabCaptureBackend(logger=self._logger)
+        self._printwindow_backend = PrintWindowCaptureBackend(logger=self._logger)
+        self._dxcam_backend = DxcamCaptureBackend(logger=self._logger)
         self._backends = self._build_backends()
         self._last_backend_lock = threading.RLock()
         self._last_backend_kind = ""
@@ -2424,16 +2503,24 @@ class Win32CaptureBackend:
             self._last_backend_detail = detail
 
     def _build_backends(self) -> list[CaptureBackend]:
-        imagegrab = ImageGrabCaptureBackend(logger=self._logger)
-        printwindow = PrintWindowCaptureBackend(logger=self._logger)
-        dxcam = DxcamCaptureBackend(logger=self._logger)
         if self.selection == _CAPTURE_BACKEND_DXCAM:
-            return [dxcam, imagegrab, printwindow]
+            return [self._dxcam_backend, self._imagegrab_backend, self._printwindow_backend]
         if self.selection == _CAPTURE_BACKEND_IMAGEGRAB:
-            return [imagegrab, dxcam, printwindow]
+            return [self._imagegrab_backend, self._dxcam_backend, self._printwindow_backend]
         if self.selection == _CAPTURE_BACKEND_PRINTWINDOW:
-            return [printwindow, dxcam, imagegrab]
-        return [dxcam, imagegrab, printwindow]
+            return [self._printwindow_backend, self._dxcam_backend, self._imagegrab_backend]
+        if self.selection == _CAPTURE_BACKEND_SMART:
+            return [self._printwindow_backend, self._dxcam_backend, self._imagegrab_backend]
+        return [self._dxcam_backend, self._imagegrab_backend, self._printwindow_backend]
+
+    def _ordered_backends_for_target(self, target: DetectedGameWindow) -> list[CaptureBackend]:
+        if self.selection != _CAPTURE_BACKEND_SMART:
+            return list(self._backends)
+        if bool(getattr(target, "is_minimized", False)):
+            raise RuntimeError("smart: target_window_minimized_for_capture")
+        if bool(getattr(target, "is_foreground", False)):
+            return [self._dxcam_backend, self._imagegrab_backend, self._printwindow_backend]
+        return [self._printwindow_backend]
 
     def is_available(self) -> bool:
         return any(backend.is_available() for backend in self._backends)
@@ -2443,12 +2530,13 @@ class Win32CaptureBackend:
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         errors: list[str] = []
+        backends = self._ordered_backends_for_target(target)
         selected_kind = (
-            str(getattr(self._backends[0], "kind", self.selection))
-            if self._backends
+            str(getattr(backends[0], "kind", self.selection))
+            if backends
             else self.selection
         )
-        for backend in self._backends:
+        for backend in backends:
             kind = str(getattr(backend, "kind", backend.__class__.__name__))
             if not backend.is_available():
                 errors.append(f"{kind}_unavailable")
@@ -2497,6 +2585,14 @@ class Win32CaptureBackend:
                 ):
                     raise
                 continue
+        if self.selection == _CAPTURE_BACKEND_SMART and not bool(
+            getattr(target, "is_foreground", False)
+        ):
+            self._set_last_backend(kind=_CAPTURE_BACKEND_SMART, detail="background_requires_printwindow")
+            raise RuntimeError(
+                "smart: background_capture_requires_printwindow"
+                + (f": {'; '.join(errors)}" if errors else "")
+            )
         if self.selection != _CAPTURE_BACKEND_AUTO:
             raise RuntimeError(
                 f"{self.selection}: capture_backend_unavailable"
@@ -4106,13 +4202,17 @@ class OcrReaderManager:
         self._last_capture_completed_at = ""
         self._last_capture_error = ""
         self._last_raw_ocr_text = ""
+        self._last_rejected_ocr_text = ""
+        self._last_rejected_ocr_reason = ""
+        self._last_rejected_ocr_at = ""
+        self._last_rejected_capture_backend = ""
         self._last_observed_line: dict[str, Any] = {}
         self._last_stable_line: dict[str, Any] = {}
         self._last_capture_image_hash = ""
         self._last_capture_source_size: dict[str, float] = {}
         self._last_capture_rect: dict[str, float] = {}
         self._last_capture_window_rect: dict[str, float] = {}
-        self._last_capture_timing: dict[str, float | bool] = {}
+        self._last_capture_timing: dict[str, Any] = {}
         self._consecutive_same_capture_frames = 0
         self._stale_capture_backend = False
         self._last_background_hash = ""
@@ -4121,6 +4221,10 @@ class OcrReaderManager:
         self._pending_background_change_count = 0
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
+        self._pending_visual_scene_commit_diagnostic = ""
+        self._scene_ordering_diagnostic = "none"
+        self._background_capture_pause_until = 0.0
+        self._background_capture_pause_reason = ""
         self._recommended_capture_profile = {}
         self._clear_vision_snapshot()
         self._last_screen_classification_type = ""
@@ -4262,12 +4366,22 @@ class OcrReaderManager:
         self._last_capture_timing = {}
         self._consecutive_same_capture_frames = 0
         self._stale_capture_backend = False
+        self._last_rejected_ocr_text = ""
+        self._last_rejected_ocr_reason = ""
+        self._last_rejected_ocr_at = ""
+        self._last_rejected_capture_backend = ""
         self._runtime.last_capture_error = ""
         self._runtime.last_capture_image_hash = ""
         self._runtime.consecutive_same_capture_frames = 0
         self._runtime.stale_capture_backend = False
         self._runtime.consecutive_no_text_polls = 0
         self._runtime.ocr_capture_diagnostic_required = False
+        self._runtime.last_rejected_ocr_text = ""
+        self._runtime.last_rejected_ocr_reason = ""
+        self._runtime.last_rejected_ocr_at = ""
+        self._runtime.last_rejected_capture_backend = ""
+        self._background_capture_pause_until = 0.0
+        self._background_capture_pause_reason = ""
         if self._runtime.ocr_context_state in {
             "capture_failed",
             "diagnostic_required",
@@ -4368,9 +4482,9 @@ class OcrReaderManager:
         self._last_capture_attempt_at = utc_now_iso(now)
         self._last_capture_error = ""
 
-    def _record_capture_completed(self, *, now: float, raw_text: str, image_hash: str = "") -> None:
+    def _record_capture_completed(self, *, now: float, raw_text: str = "", image_hash: str = "") -> None:
+        del raw_text
         self._last_capture_completed_at = utc_now_iso(now)
-        self._last_raw_ocr_text = str(raw_text or "")
         self._last_capture_error = ""
         if image_hash:
             if image_hash == self._last_capture_image_hash:
@@ -4381,6 +4495,56 @@ class OcrReaderManager:
             self._stale_capture_backend = (
                 self._consecutive_same_capture_frames >= _STALE_CAPTURE_FRAME_THRESHOLD
             )
+
+    def _record_accepted_ocr_text(self, raw_text: str) -> None:
+        self._last_raw_ocr_text = str(raw_text or "")
+
+    def _record_rejected_ocr_text(
+        self,
+        raw_text: str,
+        *,
+        reason: str,
+        now: float,
+        capture_backend_kind: str = "",
+    ) -> None:
+        self._last_rejected_ocr_text = str(raw_text or "")
+        self._last_rejected_ocr_reason = str(reason or "")
+        self._last_rejected_ocr_at = utc_now_iso(now)
+        self._last_rejected_capture_backend = str(capture_backend_kind or "")
+
+    def _background_capture_pause_error(
+        self,
+        target: DetectedGameWindow,
+        *,
+        now: float,
+    ) -> RuntimeError | None:
+        if bool(getattr(target, "is_foreground", False)):
+            self._background_capture_pause_until = 0.0
+            self._background_capture_pause_reason = ""
+            return None
+        if self._background_capture_pause_until <= 0.0:
+            return None
+        if now >= self._background_capture_pause_until:
+            self._background_capture_pause_until = 0.0
+            self._background_capture_pause_reason = ""
+            return None
+        reason = self._background_capture_pause_reason or "recent_invalid_background_frame"
+        remaining = max(0.0, self._background_capture_pause_until - now)
+        return RuntimeError(
+            f"backend_not_suitable_for_background: {reason}; paused {remaining:.1f}s"
+        )
+
+    def _pause_background_capture_backend(
+        self,
+        *,
+        reason: str,
+        now: float,
+    ) -> None:
+        self._background_capture_pause_until = max(
+            self._background_capture_pause_until,
+            now + _BACKGROUND_CAPTURE_BACKEND_PAUSE_SECONDS,
+        )
+        self._background_capture_pause_reason = str(reason or "invalid_background_frame")
 
     def _record_capture_geometry(self, extraction: OcrExtractionResult) -> None:
         self._last_capture_source_size = dict(extraction.source_size or {})
@@ -4407,6 +4571,28 @@ class OcrReaderManager:
             return hashlib.sha1(repr(frame).encode("utf-8", "ignore")).hexdigest()[:16]
         except Exception:
             return ""
+
+    @staticmethod
+    def _capture_quality_detail(frame: Any) -> str:
+        if frame is None or not hasattr(frame, "convert"):
+            return ""
+        try:
+            from PIL import Image, ImageStat
+
+            resampling = getattr(Image, "Resampling", Image)
+            image = frame.convert("L").resize((32, 32), resampling.BILINEAR)
+            extrema = image.getextrema()
+            if not isinstance(extrema, tuple) or len(extrema) != 2:
+                return ""
+            if int(extrema[1]) - int(extrema[0]) <= 2:
+                return "blank_frame"
+            stat = ImageStat.Stat(image)
+            stddev = float((stat.stddev or [0.0])[0] or 0.0)
+            if stddev < 3.0:
+                return "low_information_frame"
+        except Exception:
+            return ""
+        return ""
 
     @staticmethod
     def _background_capture_profile() -> OcrCaptureProfile:
@@ -4475,19 +4661,70 @@ class OcrReaderManager:
             )
         )
 
-    def _commit_pending_visual_scene(self, *, now: float) -> bool:
+    def _set_scene_ordering_diagnostic(self, value: str) -> None:
+        diagnostic = str(value or "").strip() or "none"
+        self._scene_ordering_diagnostic = diagnostic
+        try:
+            self._runtime.scene_ordering_diagnostic = diagnostic
+        except Exception:
+            pass
+
+    def _commit_pending_visual_scene(
+        self,
+        *,
+        now: float,
+        diagnostic: str = "",
+    ) -> bool:
         background_hash = str(self._pending_visual_scene_hash or "")
         if not background_hash:
             return False
         scene_at = float(self._pending_visual_scene_at or now)
+        commit_diagnostic = str(
+            self._pending_visual_scene_commit_diagnostic or diagnostic or ""
+        )
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
-        return bool(
+        self._pending_visual_scene_commit_diagnostic = ""
+        committed = bool(
             self._writer.advance_visual_scene(
                 ts=utc_now_iso(scene_at if scene_at > 0 else now),
                 background_hash=background_hash,
             )
         )
+        if committed and commit_diagnostic:
+            self._set_scene_ordering_diagnostic(commit_diagnostic)
+        return committed
+
+    def _observe_followup_background_hash(
+        self,
+        extraction: OcrExtractionResult,
+        *,
+        now: float,
+        confirm_polls: int,
+        defer_scene_emit: bool,
+    ) -> bool:
+        background_hash = str(extraction.background_hash or "")
+        if not background_hash:
+            return False
+        pending_before = str(self._pending_visual_scene_hash or "")
+        emitted = self._observe_background_hash(
+            background_hash,
+            now=now,
+            confirm_polls=confirm_polls,
+            defer_scene_emit=defer_scene_emit,
+        )
+        if emitted:
+            self._set_scene_ordering_diagnostic(
+                "followup_background_hash_scene_committed"
+            )
+            return True
+        pending_after = str(self._pending_visual_scene_hash or "")
+        if pending_after and pending_after != pending_before:
+            self._pending_visual_scene_commit_diagnostic = (
+                "followup_background_hash_scene_committed"
+            )
+            self._set_scene_ordering_diagnostic("followup_background_hash_scene_pending")
+        return False
 
     def _line_payload_from_writer(self, *, stability: str) -> dict[str, Any]:
         state = getattr(self._writer, "_state", {})
@@ -4950,6 +5187,19 @@ class OcrReaderManager:
         self._runtime.last_raw_ocr_text = str(
             self._last_raw_ocr_text or self._runtime.last_raw_ocr_text
         )
+        self._runtime.last_rejected_ocr_text = str(
+            self._last_rejected_ocr_text or self._runtime.last_rejected_ocr_text
+        )
+        self._runtime.last_rejected_ocr_reason = str(
+            self._last_rejected_ocr_reason or self._runtime.last_rejected_ocr_reason
+        )
+        self._runtime.last_rejected_ocr_at = str(
+            self._last_rejected_ocr_at or self._runtime.last_rejected_ocr_at
+        )
+        self._runtime.last_rejected_capture_backend = str(
+            self._last_rejected_capture_backend
+            or self._runtime.last_rejected_capture_backend
+        )
         self._runtime.last_observed_line = dict(
             self._last_observed_line or self._runtime.last_observed_line
         )
@@ -5332,6 +5582,10 @@ class OcrReaderManager:
         self._pending_background_change_count = 0
         self._pending_visual_scene_hash = ""
         self._pending_visual_scene_at = 0.0
+        self._pending_visual_scene_commit_diagnostic = ""
+        self._scene_ordering_diagnostic = "none"
+        self._background_capture_pause_until = 0.0
+        self._background_capture_pause_reason = ""
 
     def _reset_aihong_menu_state(self) -> None:
         was_menu_state = (
@@ -5407,6 +5661,11 @@ class OcrReaderManager:
         ):
             return False
         self._last_raw_ocr_text = str(raw_text or "")
+        if emit_observed and self._pending_visual_scene_hash:
+            self._commit_pending_visual_scene(
+                now=now,
+                diagnostic="pending_scene_committed_before_observed",
+            )
         if emit_observed and self._writer.emit_line_observed(
             cleaned_text,
             ts=utc_now_iso(now),
@@ -5435,7 +5694,10 @@ class OcrReaderManager:
             repeat_threshold=effective_repeat_threshold,
         ):
             return False
-        self._commit_pending_visual_scene(now=now)
+        self._commit_pending_visual_scene(
+            now=now,
+            diagnostic="pending_scene_committed_before_stable",
+        )
         emitted_text = tracker.stable_text or cleaned_text
         emitted = self._writer.emit_line(
             emitted_text,
@@ -5610,6 +5872,8 @@ class OcrReaderManager:
         backend_plan: SelectedOcrBackendPlan,
         *,
         elapsed_since_capture: float = 0.0,
+        collect_background_hash: bool = True,
+        allow_separate_background_capture: bool = True,
     ) -> OcrExtractionResult:
         remaining = _OCR_FOLLOWUP_CONFIRM_DELAY_SECONDS - elapsed_since_capture
         if remaining > 0:
@@ -5618,6 +5882,8 @@ class OcrReaderManager:
             target,
             profile,
             backend_plan,
+            collect_background_hash=collect_background_hash,
+            allow_separate_background_capture=allow_separate_background_capture,
         )
 
     def _consume_aihong_menu_stage_text(
@@ -6103,6 +6369,8 @@ class OcrReaderManager:
         window_scan_duration = 0.0
         result = OcrReaderTickResult(runtime=self._runtime.to_dict())
         self._runtime.last_poll_started_at = utc_now_iso(poll_started_at)
+        self._scene_ordering_diagnostic = "none"
+        self._runtime.scene_ordering_diagnostic = "none"
 
         preflight = await self._tick_preflight(
             now=now,
@@ -6153,17 +6421,30 @@ class OcrReaderManager:
             after_advance_trigger_mode
             and float(self._foreground_advance_stable_until or 0.0) >= now
         )
+        high_confidence_interval_capture = (
+            not after_advance_trigger_mode
+            and not legacy_geometryless_auto_target
+            and str(selection.selection_detail or "")
+            in {
+                "foreground_window",
+                "single_confident_candidate",
+                "single_configured_profile_candidate",
+            }
+        )
         emit_observed_lines = self._should_emit_observed_lines_for_capture(
             after_advance_trigger_mode=after_advance_trigger_mode
         )
         line_repeat_threshold = (
             1
             if (
-                after_advance_trigger_mode
-                and (
-                    foreground_advance_stable_grace_active
-                    or not legacy_geometryless_auto_target
+                (
+                    after_advance_trigger_mode
+                    and (
+                        foreground_advance_stable_grace_active
+                        or not legacy_geometryless_auto_target
+                    )
                 )
+                or high_confidence_interval_capture
             )
             else None
         )
@@ -6189,6 +6470,9 @@ class OcrReaderManager:
         try:
             capture_attempted = True
             self._record_capture_attempt(now=now)
+            pause_error = self._background_capture_pause_error(target, now=now)
+            if pause_error is not None:
+                raise pause_error
             extraction = await self._capture_and_extract_text_with_timeout(
                 target,
                 profile,
@@ -6204,20 +6488,43 @@ class OcrReaderManager:
                 image_hash=extraction.capture_image_hash,
             )
             self._record_capture_geometry(extraction)
-            if self._observe_background_hash(
+            self._capture_backend_kind = extraction.capture_backend_kind
+            self._capture_backend_detail = extraction.capture_backend_detail
+            active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
+            backend_detail_override = extraction.backend_detail
+            result.warnings.extend(extraction.warnings)
+            if bool(extraction.timing.get("background_capture_backend_unsuitable")):
+                reason = str(
+                    extraction.timing.get("capture_quality_detail")
+                    or extraction.capture_backend_detail
+                    or "invalid_background_frame"
+                )
+                capture_error = True
+                self._pause_background_capture_backend(reason=reason, now=now)
+                self._record_capture_error(
+                    now=now,
+                    error=RuntimeError(f"backend_not_suitable_for_background: {reason}"),
+                )
+                result.warnings.append(
+                    f"ocr_reader background capture backend not suitable: {reason}"
+                )
+            elif self._observe_background_hash(
                 extraction.background_hash,
                 now=now,
                 confirm_polls=background_confirm_polls,
                 defer_scene_emit=after_advance_trigger_mode,
             ):
                 result.should_rescan = True
-            self._capture_backend_kind = extraction.capture_backend_kind
-            self._capture_backend_detail = extraction.capture_backend_detail
-            active_backend = extraction.backend if extraction.backend.kind else backend_plan.primary
-            backend_detail_override = extraction.backend_detail
-            result.warnings.extend(extraction.warnings)
-            if extraction.text and _looks_like_self_ui_text(extraction.text):
+            if capture_error:
+                pass
+            elif extraction.text and _looks_like_self_ui_text(extraction.text):
                 guard_blocked = True
+                self._record_rejected_ocr_text(
+                    extraction.text,
+                    reason="self_ui_guard",
+                    now=now,
+                    capture_backend_kind=extraction.capture_backend_kind,
+                )
                 result.warnings.append("ocr_reader ignored text that looks like the N.E.K.O plugin UI")
                 self._default_ocr_state.reset()
                 self._reset_aihong_menu_state()
@@ -6227,6 +6534,7 @@ class OcrReaderManager:
                 ):
                     self._writer.discard_session()
             else:
+                self._record_accepted_ocr_text(extraction.text)
                 screen_classification, screen_event_emitted = self._emit_screen_classification_from_extraction(
                     extraction,
                     target=target,
@@ -6314,6 +6622,8 @@ class OcrReaderManager:
                                 profile,
                                 backend_plan,
                                 elapsed_since_capture=extraction.timing.get("total_duration_seconds", 0.0),
+                                collect_background_hash=True,
+                                allow_separate_background_capture=not after_advance_trigger_mode,
                             )
                             self._last_capture_timing.update(followup_extraction.timing)
                             self._record_capture_completed(
@@ -6335,13 +6645,27 @@ class OcrReaderManager:
                             result.warnings.extend(followup_extraction.warnings)
                             if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
                                 guard_blocked = True
+                                self._record_rejected_ocr_text(
+                                    followup_extraction.text,
+                                    reason="self_ui_guard",
+                                    now=self._time_fn(),
+                                    capture_backend_kind=followup_extraction.capture_backend_kind,
+                                )
                                 self._default_ocr_state.reset()
                                 self._reset_aihong_menu_state()
                                 result.warnings.append(
                                     "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                 )
                             else:
+                                self._record_accepted_ocr_text(followup_extraction.text)
                                 followup_now = self._time_fn()
+                                if self._observe_followup_background_hash(
+                                    followup_extraction,
+                                    now=followup_now,
+                                    confirm_polls=background_confirm_polls,
+                                    defer_scene_emit=after_advance_trigger_mode,
+                                ):
+                                    result.should_rescan = True
                                 dialogue_emitted = bool(
                                     self._consume_ocr_text(
                                         followup_extraction.text,
@@ -6429,12 +6753,19 @@ class OcrReaderManager:
                                 result.warnings.extend(menu_extraction.warnings)
                                 if menu_extraction.text and _looks_like_self_ui_text(menu_extraction.text):
                                     guard_blocked = True
+                                    self._record_rejected_ocr_text(
+                                        menu_extraction.text,
+                                        reason="self_ui_guard",
+                                        now=self._time_fn(),
+                                        capture_backend_kind=menu_extraction.capture_backend_kind,
+                                    )
                                     self._default_ocr_state.reset()
                                     self._reset_aihong_menu_state()
                                     result.warnings.append(
                                         "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                                     )
                                 else:
+                                    self._record_accepted_ocr_text(menu_extraction.text)
                                     menu_result = self._consume_aihong_menu_stage_text(
                                         menu_extraction.text,
                                         now=now,
@@ -6485,6 +6816,8 @@ class OcrReaderManager:
                             profile,
                             backend_plan,
                             elapsed_since_capture=extraction.timing.get("total_duration_seconds", 0.0),
+                            collect_background_hash=True,
+                            allow_separate_background_capture=not after_advance_trigger_mode,
                         )
                         self._last_capture_timing.update(followup_extraction.timing)
                         self._record_capture_completed(
@@ -6506,13 +6839,27 @@ class OcrReaderManager:
                         result.warnings.extend(followup_extraction.warnings)
                         if followup_extraction.text and _looks_like_self_ui_text(followup_extraction.text):
                             guard_blocked = True
+                            self._record_rejected_ocr_text(
+                                followup_extraction.text,
+                                reason="self_ui_guard",
+                                now=self._time_fn(),
+                                capture_backend_kind=followup_extraction.capture_backend_kind,
+                            )
                             self._default_ocr_state.reset()
                             self._reset_aihong_menu_state()
                             result.warnings.append(
                                 "ocr_reader ignored text that looks like the N.E.K.O plugin UI"
                             )
                         else:
+                            self._record_accepted_ocr_text(followup_extraction.text)
                             followup_now = self._time_fn()
+                            if self._observe_followup_background_hash(
+                                followup_extraction,
+                                now=followup_now,
+                                confirm_polls=background_confirm_polls,
+                                defer_scene_emit=after_advance_trigger_mode,
+                            ):
+                                result.should_rescan = True
                             emitted = bool(
                                 self._consume_ocr_text(
                                     followup_extraction.text,
@@ -6906,6 +7253,19 @@ class OcrReaderManager:
             ),
             last_capture_error=str(self._last_capture_error or self._runtime.last_capture_error),
             last_raw_ocr_text=str(self._last_raw_ocr_text or self._runtime.last_raw_ocr_text),
+            last_rejected_ocr_text=str(
+                self._last_rejected_ocr_text or self._runtime.last_rejected_ocr_text
+            ),
+            last_rejected_ocr_reason=str(
+                self._last_rejected_ocr_reason or self._runtime.last_rejected_ocr_reason
+            ),
+            last_rejected_ocr_at=str(
+                self._last_rejected_ocr_at or self._runtime.last_rejected_ocr_at
+            ),
+            last_rejected_capture_backend=str(
+                self._last_rejected_capture_backend
+                or self._runtime.last_rejected_capture_backend
+            ),
             last_observed_line=dict(self._last_observed_line or self._runtime.last_observed_line),
             last_stable_line=dict(self._last_stable_line or self._runtime.last_stable_line),
             stable_ocr_last_raw_text=str(self._default_ocr_state.last_raw_text or ""),
@@ -7030,6 +7390,39 @@ class OcrReaderManager:
                 bool(capture_timing["background_hash_skipped"])
                 if "background_hash_skipped" in capture_timing
                 else bool(self._runtime.last_capture_background_hash_skipped)
+            ),
+            screen_awareness_last_skip_reason=str(
+                capture_timing.get("screen_awareness_skip_reason")
+                or self._runtime.screen_awareness_last_skip_reason
+            ),
+            screen_awareness_last_region_count=max(
+                0,
+                int(
+                    float(
+                        capture_timing.get(
+                            "screen_awareness_region_count",
+                            self._runtime.screen_awareness_last_region_count,
+                        )
+                        or 0
+                    )
+                ),
+            ),
+            screen_awareness_last_capture_duration_seconds=float(
+                _timing_float(
+                    "screen_awareness_capture_duration_seconds",
+                    self._runtime.screen_awareness_last_capture_duration_seconds,
+                )
+            ),
+            screen_awareness_last_ocr_duration_seconds=float(
+                _timing_float(
+                    "screen_awareness_ocr_duration_seconds",
+                    self._runtime.screen_awareness_last_ocr_duration_seconds,
+                )
+            ),
+            scene_ordering_diagnostic=str(
+                self._scene_ordering_diagnostic
+                or self._runtime.scene_ordering_diagnostic
+                or "none"
             ),
             vision_snapshot_available=bool(vision_snapshot.get("available")),
             vision_snapshot_captured_at=str(vision_snapshot.get("captured_at") or ""),
@@ -7265,24 +7658,71 @@ class OcrReaderManager:
         except Exception as exc:
             self._logger.debug("ocr_reader vision snapshot encoding skipped: {}", exc)
 
-    def _should_attempt_screen_awareness_regions(
+    def _screen_awareness_latency_mode(self) -> str:
+        mode = str(
+            getattr(
+                self._config,
+                "ocr_reader_screen_awareness_latency_mode",
+                _SCREEN_AWARENESS_LATENCY_MODE_BALANCED,
+            )
+            or _SCREEN_AWARENESS_LATENCY_MODE_BALANCED
+        ).strip().lower()
+        if mode == _SCREEN_AWARENESS_LATENCY_MODE_AGGRESSIVE:
+            return _SCREEN_AWARENESS_LATENCY_MODE_FULL
+        if mode not in _SCREEN_AWARENESS_LATENCY_MODES:
+            return _SCREEN_AWARENESS_LATENCY_MODE_BALANCED
+        return mode
+
+    def _screen_awareness_skip_reason(
         self,
         extraction: OcrExtractionResult,
         *,
         now: float,
-    ) -> bool:
+    ) -> str:
         if (
             not bool(self._config.ocr_reader_screen_awareness_full_frame_ocr)
             and not bool(self._config.ocr_reader_screen_awareness_multi_region_ocr)
+            and not bool(self._config.ocr_reader_screen_awareness_visual_rules)
             and not bool(self._config.llm_vision_enabled)
         ):
-            return False
+            return "disabled"
+        mode = self._screen_awareness_latency_mode()
+        if mode == _SCREEN_AWARENESS_LATENCY_MODE_OFF:
+            return "latency_mode_off"
         text = str(extraction.text or "").strip()
+        if text and _looks_like_self_ui_text(text):
+            return "rejected_primary_text"
         if text and _looks_like_ocr_dialogue_text(text):
-            return False
-        if now - float(self._last_screen_awareness_capture_at or 0.0) < 0.75 and text:
-            return False
-        return True
+            return "primary_dialogue"
+        if mode != _SCREEN_AWARENESS_LATENCY_MODE_FULL:
+            minimum_interval = max(
+                0.0,
+                float(
+                    getattr(
+                        self._config,
+                        "ocr_reader_screen_awareness_min_interval_seconds",
+                        2.0,
+                    )
+                    or 0.0
+                ),
+            )
+            if (
+                self._last_screen_awareness_capture_at > 0.0
+                and now - float(self._last_screen_awareness_capture_at or 0.0)
+                < minimum_interval
+            ):
+                return "min_interval"
+            if not text and int(self._consecutive_no_text_polls or 0) < 1:
+                return "waiting_for_consecutive_no_text"
+            if (
+                text
+                and not _looks_like_game_overlay_text(text)
+                and not _looks_like_ocr_dialogue_text(text)
+            ):
+                return "primary_non_dialogue_text"
+        elif now - float(self._last_screen_awareness_capture_at or 0.0) < 0.75 and text:
+            return "min_interval"
+        return ""
 
     def _augment_extraction_with_screen_awareness(
         self,
@@ -7293,8 +7733,16 @@ class OcrReaderManager:
         plan: SelectedOcrBackendPlan,
         now: float,
     ) -> None:
-        if not self._should_attempt_screen_awareness_regions(extraction, now=now):
+        skip_reason = self._screen_awareness_skip_reason(extraction, now=now)
+        if skip_reason:
+            extraction.timing["screen_awareness_skipped"] = True
+            extraction.timing["screen_awareness_skip_reason"] = skip_reason
+            extraction.timing["screen_awareness_region_count"] = 0.0
+            extraction.timing["screen_awareness_capture_duration_seconds"] = 0.0
+            extraction.timing["screen_awareness_ocr_duration_seconds"] = 0.0
             return
+        extraction.timing["screen_awareness_skipped"] = False
+        extraction.timing["screen_awareness_skip_reason"] = ""
         capture_duration = 0.0
         ocr_duration = 0.0
         regions: list[dict[str, Any]] = []
@@ -7400,11 +7848,31 @@ class OcrReaderManager:
             background_hash = embedded_background_hash
             background_hash_skipped = False
             self._last_background_hash_capture_at = started_at
-        elif (
+        hash_started_at = self._time_fn()
+        capture_hash = self._capture_image_hash(frame)
+        capture_hash_duration = max(0.0, self._time_fn() - hash_started_at)
+        ocr_started_at = self._time_fn()
+        extraction = self._extract_text_from_image(frame, plan=plan)
+        ocr_duration = max(0.0, self._time_fn() - ocr_started_at)
+        primary_text = str(extraction.text or "").strip()
+        primary_text_is_dialogue = bool(
+            primary_text and _looks_like_ocr_dialogue_text(primary_text)
+        )
+        background_hash_interval = (
+            _BACKGROUND_HASH_DIALOGUE_SAMPLE_INTERVAL_SECONDS
+            if primary_text_is_dialogue
+            else _BACKGROUND_HASH_MIN_INTERVAL_SECONDS
+        )
+        last_background_hash_capture_at = float(self._last_background_hash_capture_at or 0.0)
+        if primary_text_is_dialogue and last_background_hash_capture_at <= 0.0:
+            self._last_background_hash_capture_at = started_at
+            last_background_hash_capture_at = started_at
+        if (
             collect_background_hash
+            and not embedded_background_hash
             and allow_separate_background_capture
-            and started_at - float(self._last_background_hash_capture_at or 0.0)
-            >= _BACKGROUND_HASH_MIN_INTERVAL_SECONDS
+            and not (primary_text and _looks_like_self_ui_text(primary_text))
+            and started_at - last_background_hash_capture_at >= background_hash_interval
         ):
             try:
                 background_started_at = self._time_fn()
@@ -7418,12 +7886,6 @@ class OcrReaderManager:
                 self._last_background_hash_capture_at = started_at
             except Exception as exc:
                 self._logger.debug("ocr_reader background scene hash skipped: {}", exc)
-        hash_started_at = self._time_fn()
-        capture_hash = self._capture_image_hash(frame)
-        capture_hash_duration = max(0.0, self._time_fn() - hash_started_at)
-        ocr_started_at = self._time_fn()
-        extraction = self._extract_text_from_image(frame, plan=plan)
-        ocr_duration = max(0.0, self._time_fn() - ocr_started_at)
         extraction.capture_image_hash = capture_hash
         extraction.background_hash = background_hash
         extraction.timing = {
@@ -7466,6 +7928,32 @@ class OcrReaderManager:
             extraction.capture_backend_detail = str(
                 getattr(self._capture_backend, "last_backend_detail", "") or ""
             )
+        capture_quality_detail = self._capture_quality_detail(frame)
+        if (
+            extraction.capture_backend_kind == _CAPTURE_BACKEND_PRINTWINDOW
+            and capture_quality_detail
+        ):
+            extraction.warnings.append(f"printwindow capture quality: {capture_quality_detail}")
+            if extraction.capture_backend_detail in {"", "selected"}:
+                extraction.capture_backend_detail = capture_quality_detail
+            extraction.timing["capture_quality_detail"] = capture_quality_detail
+            if (
+                not bool(getattr(target, "is_foreground", False))
+                and not str(extraction.text or "").strip()
+            ):
+                extraction.warnings.append(
+                    f"backend_not_suitable_for_background: {capture_quality_detail}"
+                )
+                extraction.capture_backend_detail = "backend_not_suitable_for_background"
+                extraction.timing["background_capture_backend_unsuitable"] = True
+        if extraction.text and _looks_like_self_ui_text(extraction.text):
+            extraction.timing["screen_awareness_skipped"] = True
+            extraction.timing["screen_awareness_skip_reason"] = "rejected_primary_text"
+            extraction.timing["screen_awareness_region_count"] = 0.0
+            extraction.timing["screen_awareness_capture_duration_seconds"] = 0.0
+            extraction.timing["screen_awareness_ocr_duration_seconds"] = 0.0
+            extraction.timing["total_duration_seconds"] = max(0.0, self._time_fn() - started_at)
+            return extraction
         self._augment_extraction_with_screen_awareness(
             extraction,
             target=target,

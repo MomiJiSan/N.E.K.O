@@ -132,7 +132,8 @@ const AIHONG_CAPTURE_PRESETS = {
 };
 
 const AUTO_REFRESH_IDLE_INTERVAL_MS = 5000;
-const AUTO_REFRESH_ACTIVE_INTERVAL_MS = 2000;
+const AUTO_REFRESH_ACTIVE_INTERVAL_MS = 1000;
+const AUTO_REFRESH_URGENT_INTERVAL_MS = 500;
 const AUTO_REFRESH_INTERVAL_MS = AUTO_REFRESH_ACTIVE_INTERVAL_MS;
 const FOCUS_PAUSE_REFRESH_INTERVAL_MS = 1000;
 const ERROR_REFRESH_INTERVAL_MS = 10000;
@@ -163,6 +164,22 @@ const FIELD_LABELS_ZH = {
   ocr_poll_interval_seconds: 'OCR 识别间隔',
   ocr_trigger_mode: 'OCR 触发方式',
   ocr_trigger_mode_effective: 'OCR 实际触发方式',
+  ocr_reader_fast_loop_enabled: 'OCR Fast Loop 已启用',
+  ocr_fast_loop_running: 'OCR Fast Loop 运行中',
+  ocr_fast_loop_inflight_seconds: 'OCR Fast Loop 本轮耗时',
+  ocr_fast_loop_last_duration_seconds: 'OCR Fast Loop 上轮耗时',
+  ocr_fast_loop_iteration_count: 'OCR Fast Loop 轮次',
+  ocr_poll_latency_sample_count: 'OCR poll 样本数',
+  ocr_poll_duration_p50_seconds: 'OCR poll P50',
+  ocr_poll_duration_p95_seconds: 'OCR poll P95',
+  bridge_poll_latency_sample_count: 'Bridge poll 样本数',
+  bridge_poll_duration_p50_seconds: 'Bridge poll P50',
+  bridge_poll_duration_p95_seconds: 'Bridge poll P95',
+  ocr_auto_degrade_reason: 'OCR 自动降级原因',
+  ocr_auto_degrade_at: 'OCR 自动降级时间',
+  ocr_auto_degrade_count: 'OCR 自动降级次数',
+  candidate_age_seconds: '候选台词等待',
+  stable_confirm_wait_seconds: '稳定确认等待',
   ocr_reader_allowed: 'OCR Reader 允许轮询',
   ocr_reader_allowed_block_reason: 'OCR Reader 禁用原因',
   ocr_tick_allowed: 'OCR 本轮执行',
@@ -179,6 +196,8 @@ const FIELD_LABELS_ZH = {
   ocr_background_polling: 'OCR 后台轮询',
   ocr_foreground_resume_pending: 'OCR 等待前台恢复',
   ocr_capture_backend_blocked: 'OCR 截图后端受阻',
+  ocr_screen_awareness_latency_mode: '画面感知延迟模式',
+  ocr_screen_awareness_min_interval_seconds: '画面感知最小间隔',
   ocr_backend_kind: 'OCR 后端类型',
   ocr_backend_detail: 'OCR 后端详情',
   rapidocr_enabled: 'RapidOCR 已启用',
@@ -220,6 +239,14 @@ const FIELD_LABELS_ZH = {
   last_capture_image_hash: '最近截图 Hash',
   consecutive_same_capture_frames: '连续相同截图',
   stale_capture_backend: '截图源未更新',
+  last_rejected_ocr_text: '最近拒绝 OCR 文本',
+  last_rejected_ocr_reason: '最近拒绝原因',
+  last_rejected_ocr_at: '最近拒绝时间',
+  last_rejected_capture_backend: '拒绝截图后端',
+  screen_awareness_last_skip_reason: '画面感知跳过原因',
+  screen_awareness_last_region_count: '画面感知区域数',
+  screen_awareness_last_capture_duration_seconds: '画面感知截图耗时',
+  screen_awareness_last_ocr_duration_seconds: '画面感知 OCR 耗时',
   backend_kind: '后端类型',
   backend_detail: '后端详情',
   backend_path: '后端路径',
@@ -331,6 +358,7 @@ const READER_MODE_LABELS_ZH = {
 let latestAgentReply = '暂无交互';
 let latestAgentStatus = null;
 let latestStatus = null;
+let latestSnapshotData = null;
 let latestMemoryProcessSnapshot = null;
 let latestOcrWindowSnapshot = null;
 let refreshInFlight = null;
@@ -364,10 +392,6 @@ const SETTINGS_CONTROL_IDS = new Set([
 ]);
 
 const latestInsights = {
-  explainKey: '',
-  explainPayload: null,
-  summaryKey: '',
-  summaryPayload: null,
   suggestKey: '',
   suggestPayload: null,
 };
@@ -571,15 +595,43 @@ function lineText(line = {}) {
   return textValue(line && typeof line === 'object' ? line.text : '');
 }
 
+function lineStability(line = {}) {
+  return textValue(line && typeof line === 'object' ? line.stability : '').toLowerCase();
+}
+
+function isStableLine(line = {}) {
+  if (!line || typeof line !== 'object') {
+    return false;
+  }
+  const stability = lineStability(line);
+  if (stability) {
+    return stability === 'stable';
+  }
+  const source = textValue(line.source).toLowerCase();
+  return source === 'stable' || source === 'history';
+}
+
 function compactLineText(value) {
   return textValue(value).replace(/\s+/g, '');
 }
 
 function getCurrentLineTexts(status = {}) {
   const runtime = status.ocr_reader_runtime || {};
-  const effectiveText = lineText(status.effective_current_line);
-  const stableText = lineText(runtime.last_stable_line) || effectiveText;
-  const observedText = lineText(runtime.last_observed_line);
+  const effectiveLine = (
+    status.effective_current_line && typeof status.effective_current_line === 'object'
+      ? status.effective_current_line
+      : {}
+  );
+  const observedLine = (
+    runtime.last_observed_line && typeof runtime.last_observed_line === 'object'
+      ? runtime.last_observed_line
+      : {}
+  );
+  const stableText = lineText(runtime.last_stable_line)
+    || (isStableLine(effectiveLine) ? lineText(effectiveLine) : '');
+  const effectiveText = lineText(effectiveLine);
+  const observedText = lineText(observedLine)
+    || (!isStableLine(effectiveLine) ? effectiveText : '');
   const rawText = textValue(runtime.last_raw_ocr_text);
   return {
     rawText,
@@ -709,6 +761,7 @@ function buildPrimaryDiagnosis(status = {}) {
   const contextState = textValue(status.ocr_context_state || runtime.ocr_context_state);
   const lastExcludeReason = textValue(runtime.last_exclude_reason);
   const lastCaptureError = textValue(runtime.last_capture_error);
+  const lastRejectedReason = textValue(runtime.last_rejected_ocr_reason);
   const lastError = textValue(status.last_error && status.last_error.message);
   const agentPauseKind = textValue(status.agent_pause_kind);
   const agentUserStatus = textValue(status.agent_user_status);
@@ -1028,9 +1081,13 @@ function renderFirstRunGuide(status = {}) {
   }
   const steps = buildFirstRunSteps(status);
   const allDone = steps.every((step) => step.done);
-  node.hidden = allDone;
-  if (allDone) {
+  const readyToStart = steps.slice(0, 3).every((step) => step.done);
+  node.hidden = allDone || readyToStart;
+  if (allDone || readyToStart) {
     stepsNode.replaceChildren();
+    document.body.classList.remove('onboarding-active');
+    const onboardingView = document.getElementById('onboardingView');
+    if (onboardingView) { onboardingView.hidden = true; }
     return;
   }
   const firstIncompleteIndex = steps.findIndex((step) => !step.done);
@@ -1047,6 +1104,28 @@ function renderFirstRunGuide(status = {}) {
       </article>
     `;
   }).join('');
+
+  const onboardingSteps = document.getElementById('onboardingSteps');
+  const onboardingActions = document.getElementById('onboardingActions');
+  if (onboardingSteps) {
+    onboardingSteps.innerHTML = stepsNode.innerHTML;
+  }
+  if (onboardingActions) {
+    const firstIncomplete = steps[firstIncompleteIndex];
+    const actions = [];
+    if (firstIncompleteIndex === 1) {
+      actions.push('<button class="primary" data-first-run-action="install_rapidocr">一键安装 RapidOCR</button>');
+    }
+    if (!steps[2].done) {
+      actions.push('<button class="primary" data-first-run-action="select_ocr_window">选择游戏窗口</button>');
+      actions.push('<button class="secondary" data-first-run-action="refresh_ocr_windows">刷新窗口</button>');
+    }
+    if (!steps[3].done && steps[2].done) {
+      actions.push('<button class="primary" data-first-run-action="choice_advisor">开始自动识别</button>');
+      actions.push('<button class="secondary" data-first-run-action="refresh_all">刷新状态</button>');
+    }
+    onboardingActions.innerHTML = actions.join('');
+  }
 }
 
 function renderCurrentLineOverview(status = {}) {
@@ -1059,8 +1138,8 @@ function renderCurrentLineOverview(status = {}) {
   const statusChip = document.getElementById('currentLineOverviewStatus');
   const hint = document.getElementById('currentLineOverviewHint');
   const grid = document.getElementById('currentLineOverviewGrid');
-  const { rawText, observedText, stableText, effectiveText } = getCurrentLineTexts(status);
-  const displayStable = stableText || effectiveText;
+  const { rawText, observedText, stableText } = getCurrentLineTexts(status);
+  const displayStable = stableText;
   const observedKey = compactLineText(observedText);
   const stableKey = compactLineText(displayStable);
   const hasMismatch = Boolean(observedKey && observedKey !== stableKey);
@@ -1078,7 +1157,7 @@ function renderCurrentLineOverview(status = {}) {
     title.textContent = '已确认当前台词';
     statusChip.textContent = '已确认';
     statusChip.classList.add('active');
-    hint.textContent = '这句台词已经进入正式上下文，解释、总结和建议会以它为基础更新。';
+    hint.textContent = '这句台词已经进入正式上下文，后续建议会以它为基础更新。';
   } else if (rawText || observedText) {
     title.textContent = '正在筛选识别结果';
     statusChip.textContent = '筛选中';
@@ -1114,6 +1193,37 @@ function renderCurrentLineOverview(status = {}) {
       <p>${escapeHtml(row.value || row.empty)}</p>
     </article>
   `).join('');
+
+  const effectiveEl = document.getElementById('currentLineEffectiveText');
+  const observedCollapse = document.getElementById('observedLinesCollapse');
+  const observedContent = document.getElementById('observedLinesContent');
+
+  if (effectiveEl) {
+    const effectiveText = displayStable || observedText || rawText;
+    if (effectiveText) {
+      effectiveEl.textContent = effectiveText;
+      effectiveEl.hidden = false;
+    } else {
+      effectiveEl.hidden = true;
+    }
+  }
+
+  if (observedCollapse && observedContent) {
+    const hasObserved = observedText && observedText !== displayStable;
+    const hasRaw = rawText && rawText !== observedText && rawText !== displayStable;
+    const observedLines = [];
+    if (hasObserved) { observedLines.push(observedText); }
+    if (hasRaw) { observedLines.push(rawText); }
+
+    if (observedLines.length > 0 && displayStable) {
+      observedCollapse.hidden = false;
+      observedContent.innerHTML = observedLines.map((text) =>
+        `<div class="observed-line-item">${escapeHtml(text)}</div>`
+      ).join('');
+    } else {
+      observedCollapse.hidden = true;
+    }
+  }
 }
 
 function pipelineStateLabel(state) {
@@ -1134,8 +1244,9 @@ function buildOcrPipelineSteps(status = {}) {
   const contextState = textValue(status.ocr_context_state || runtime.ocr_context_state);
   const lastExcludeReason = textValue(runtime.last_exclude_reason);
   const lastCaptureError = textValue(runtime.last_capture_error);
-  const { rawText, observedText, stableText, effectiveText } = getCurrentLineTexts(status);
-  const displayStable = stableText || effectiveText;
+  const lastRejectedReason = textValue(runtime.last_rejected_ocr_reason);
+  const { rawText, observedText, stableText } = getCurrentLineTexts(status);
+  const displayStable = stableText;
   const observedKey = compactLineText(observedText);
   const stableKey = compactLineText(displayStable);
   const hasObservedMismatch = Boolean(observedKey && observedKey !== stableKey);
@@ -1253,6 +1364,14 @@ function buildOcrPipelineSteps(status = {}) {
       title: 'OCR 后端不可用',
       body: '识别阶段异常，处理入口在运行诊断。',
       meta: ocrBackend,
+    };
+  } else if (runtime.detail === 'self_ui_guard_blocked' || lastRejectedReason) {
+    ocrStep = {
+      key: 'ocr',
+      state: 'warning',
+      title: 'OCR 已拒绝非游戏文本',
+      body: '识别阶段已执行但没有写入新台词。',
+      meta: lastRejectedReason || ocrBackend,
     };
   } else if (emitBlockReason) {
     ocrStep = {
@@ -1612,25 +1731,13 @@ function renderAgentUserNotice(status = {}) {
   }
 }
 
-function buildExplainFallback(lineId = '', diagnostic = 'missing line_id') {
-  return {
-    degraded: true,
-    line_id: lineId,
-    speaker: '',
-    text: '',
-    explanation: '',
-    evidence: [],
-    diagnostic,
-  };
-}
-
 function buildOcrMissingLineDiagnostic(status = {}) {
   const runtime = status.ocr_reader_runtime || {};
   const rapidocr = status.rapidocr || {};
   const parts = [
     status.ocr_capture_diagnostic_required
       ? 'OCR 截图区/窗口目标可能异常'
-      : 'OCR 尚未读到可解释台词',
+      : 'OCR 尚未读到可用台词',
   ];
   if (status.ocr_capture_diagnostic) {
     parts.push(status.ocr_capture_diagnostic);
@@ -1714,6 +1821,12 @@ function buildOcrMissingLineDiagnostic(status = {}) {
   }
   if (runtime.last_raw_ocr_text) {
     parts.push(`last_raw=${String(runtime.last_raw_ocr_text).slice(0, 80)}`);
+  }
+  if (runtime.last_rejected_ocr_reason) {
+    parts.push(`rejected=${runtime.last_rejected_ocr_reason}`);
+  }
+  if (runtime.last_rejected_ocr_text) {
+    parts.push(`last_rejected=${String(runtime.last_rejected_ocr_text).slice(0, 80)}`);
   }
   return parts.join(' | ');
 }
@@ -1992,18 +2105,6 @@ function latestHistoryLine(history = {}) {
   return lines.length ? lines[lines.length - 1] : null;
 }
 
-function sceneSummaryKey(sceneId = '', history = {}, fallbackLine = {}) {
-  const stableLines = Array.isArray(history.stable_lines) ? history.stable_lines : [];
-  const observedLines = Array.isArray(history.observed_lines) ? history.observed_lines : [];
-  const latestLine = latestHistoryLine(history) || fallbackLine || {};
-  return [
-    sceneId || 'missing-scene',
-    stableLines.length,
-    observedLines.length,
-    lineKey(latestLine),
-  ].join('::');
-}
-
 function effectiveCurrentLine(snapshot = {}, history = {}, status = {}) {
   const state = snapshot.snapshot || {};
   if (state.line_id && state.text) {
@@ -2016,16 +2117,6 @@ function effectiveCurrentLine(snapshot = {}, history = {}, status = {}) {
     return { ...status.effective_current_line };
   }
   return latestHistoryLine(history) || {};
-}
-
-function buildSummaryFallback(sceneId = '', diagnostic = 'missing scene_id') {
-  return {
-    degraded: true,
-    scene_id: sceneId,
-    summary: '',
-    key_points: [],
-    diagnostic,
-  };
 }
 
 function buildSuggestFallback(sceneId = '', diagnostic = 'no visible choices') {
@@ -2702,6 +2793,16 @@ function renderStatus(status) {
   syncSettingsValue('modeSelect', status.mode || 'companion');
   syncSettingsChecked('pushToggle', Boolean(status.push_notifications));
   syncSettingsValue('advanceSpeedSelect', status.advance_speed || 'medium');
+
+  const currentMode = status.mode || 'companion';
+  document.querySelectorAll('#modeSwitch .mode-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.mode === currentMode);
+  });
+  const currentSpeed = status.advance_speed || 'medium';
+  document.querySelectorAll('#speedSwitch .speed-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.speed === currentSpeed);
+  });
+  document.querySelector('.hero').classList.toggle('mode-auto', currentMode === 'choice_advisor');
   syncSettingsValue('readerModeSelect', status.reader_mode || 'auto');
   const ocrPollIntervalInput = document.getElementById('ocrPollIntervalInput');
   if (ocrPollIntervalInput && !shouldPreserveSettingsControls()) {
@@ -2766,6 +2867,18 @@ function renderStatus(status) {
   renderOcrPipelinePanel(status);
   renderInstallCompactSummary(status);
 
+  const diagnosisEl = document.getElementById('primaryDiagnosisPanel');
+  if (diagnosisEl) {
+    diagnosisEl.classList.toggle('compact', status.primary_diagnosis_level === 'ok');
+  }
+
+  const suggestSection = document.getElementById('suggestPanelSection');
+  const suggestPanel = document.getElementById('suggestPanel');
+  if (suggestSection && suggestPanel) {
+    const hasContent = suggestPanel.textContent.trim() && suggestPanel.textContent.trim() !== '暂无数据';
+    suggestSection.hidden = !hasContent;
+  }
+
   const userStatusRows = [
     { label: 'connection_state', value: status.connection_state || '' },
     { label: 'active_data_source', value: status.active_data_source || '' },
@@ -2808,6 +2921,7 @@ function renderStatus(status) {
     { label: 'ocr_reader_target', value: ocrTarget || '' },
     { label: 'ocr_backend_selection', value: status.ocr_backend_selection || 'auto' },
     { label: 'ocr_capture_backend_selection', value: status.ocr_capture_backend_selection || 'auto' },
+    { label: 'ocr_reader_fast_loop_enabled', value: String(Boolean(status.ocr_reader_fast_loop_enabled)) },
     { label: 'rapidocr_installed', value: String(Boolean(rapidocr.installed)) },
     { label: 'dxcam_installed', value: String(Boolean(dxcam.installed)) },
     { label: 'memory_reader_enabled', value: String(Boolean(status.memory_reader_enabled)) },
@@ -2848,6 +2962,19 @@ function renderStatus(status) {
     { label: 'ocr_capture_diagnostic_required', value: String(Boolean(status.ocr_capture_diagnostic_required)) },
     { label: 'ocr_capture_diagnostic', value: status.ocr_capture_diagnostic || '' },
     { label: 'ocr_last_tick_decision_at', value: ocrLastTickDecisionAt },
+    { label: 'ocr_fast_loop_running', value: String(Boolean(status.ocr_fast_loop_running)) },
+    { label: 'ocr_fast_loop_last_duration_seconds', value: formatFixedNumber(status.ocr_fast_loop_last_duration_seconds, 2) },
+    { label: 'ocr_fast_loop_iteration_count', value: String(status.ocr_fast_loop_iteration_count || 0) },
+    { label: 'ocr_poll_latency_sample_count', value: String(status.ocr_poll_latency_sample_count || 0) },
+    { label: 'ocr_poll_duration_p50_seconds', value: formatFixedNumber(status.ocr_poll_duration_p50_seconds, 2) },
+    { label: 'ocr_poll_duration_p95_seconds', value: formatFixedNumber(status.ocr_poll_duration_p95_seconds, 2) },
+    { label: 'bridge_poll_latency_sample_count', value: String(status.bridge_poll_latency_sample_count || 0) },
+    { label: 'bridge_poll_duration_p50_seconds', value: formatFixedNumber(status.bridge_poll_duration_p50_seconds, 2) },
+    { label: 'bridge_poll_duration_p95_seconds', value: formatFixedNumber(status.bridge_poll_duration_p95_seconds, 2) },
+    { label: 'ocr_auto_degrade_count', value: String(status.ocr_auto_degrade_count || 0) },
+    { label: 'ocr_auto_degrade_reason', value: status.ocr_auto_degrade_reason || '' },
+    { label: 'candidate_age_seconds', value: formatFixedNumber(status.candidate_age_seconds, 1) },
+    { label: 'stable_confirm_wait_seconds', value: formatFixedNumber(status.stable_confirm_wait_seconds, 1) },
     { label: 'ocr_backend_kind', value: ocrRuntime.backend_kind || '' },
     { label: 'ocr_backend_detail', value: ocrRuntime.backend_detail || '' },
     { label: 'screen_text_sources', value: (status.screen_debug?.sources || []).join(', ') || '' },
@@ -2863,6 +2990,11 @@ function renderStatus(status) {
     { label: 'ocr_screen_awareness_full_frame_ocr', value: String(Boolean(status.ocr_screen_awareness_full_frame_ocr)) },
     { label: 'ocr_screen_awareness_multi_region_ocr', value: String(Boolean(status.ocr_screen_awareness_multi_region_ocr)) },
     { label: 'ocr_screen_awareness_visual_rules', value: String(Boolean(status.ocr_screen_awareness_visual_rules)) },
+    { label: 'ocr_screen_awareness_latency_mode', value: status.ocr_screen_awareness_latency_mode || '' },
+    {
+      label: 'ocr_screen_awareness_min_interval_seconds',
+      value: formatFixedNumber(status.ocr_screen_awareness_min_interval_seconds, 1),
+    },
     { label: 'rapidocr_enabled', value: String(Boolean(status.rapidocr_enabled)) },
     { label: 'rapidocr_detail', value: rapidocr.detail || '' },
     { label: 'dxcam_detail', value: dxcam.detail || '' },
@@ -3181,6 +3313,24 @@ function renderOcrRuntime(status) {
     { label: 'ocr_waiting_for_advance', value: String(Boolean(runtime.ocr_waiting_for_advance)) },
     { label: 'ocr_waiting_for_advance_reason', value: formatOcrTickBlockReason(runtime.ocr_waiting_for_advance_reason) },
     { label: 'ocr_last_tick_decision_at', value: runtime.ocr_last_tick_decision_at || '' },
+    { label: 'ocr_fast_loop_running', value: String(Boolean(status.ocr_fast_loop_running)) },
+    {
+      label: 'ocr_fast_loop_inflight_seconds',
+      value: formatOcrRuntimeSeconds(status.ocr_fast_loop_inflight_seconds),
+    },
+    {
+      label: 'ocr_fast_loop_last_duration_seconds',
+      value: formatOcrRuntimeSeconds(status.ocr_fast_loop_last_duration_seconds),
+    },
+    { label: 'ocr_fast_loop_iteration_count', value: String(status.ocr_fast_loop_iteration_count || 0) },
+    { label: 'ocr_poll_duration_p50_seconds', value: formatOcrRuntimeSeconds(status.ocr_poll_duration_p50_seconds) },
+    { label: 'ocr_poll_duration_p95_seconds', value: formatOcrRuntimeSeconds(status.ocr_poll_duration_p95_seconds) },
+    { label: 'bridge_poll_duration_p50_seconds', value: formatOcrRuntimeSeconds(status.bridge_poll_duration_p50_seconds) },
+    { label: 'bridge_poll_duration_p95_seconds', value: formatOcrRuntimeSeconds(status.bridge_poll_duration_p95_seconds) },
+    { label: 'ocr_auto_degrade_reason', value: status.ocr_auto_degrade_reason || '' },
+    { label: 'ocr_auto_degrade_at', value: status.ocr_auto_degrade_at || '' },
+    { label: 'candidate_age_seconds', value: formatOcrRuntimeSeconds(status.candidate_age_seconds) },
+    { label: 'stable_confirm_wait_seconds', value: formatOcrRuntimeSeconds(status.stable_confirm_wait_seconds) },
     { label: 'display_source_not_ocr_reason', value: runtime.display_source_not_ocr_reason || '' },
     { label: 'last_capture_attempt_at', value: fromOcr('last_capture_attempt_at') || '' },
     { label: 'last_capture_completed_at', value: fromOcr('last_capture_completed_at') || '' },
@@ -3213,6 +3363,23 @@ function renderOcrRuntime(status) {
     { label: 'consecutive_same_capture_frames', value: String(fromCapture('consecutive_same_frames', 'consecutive_same_capture_frames') || 0) },
     { label: 'stale_capture_backend', value: String(Boolean(fromCapture('stale_backend', 'stale_capture_backend'))) },
     { label: 'last_raw_ocr_text', value: fromOcr('last_raw_text', 'last_raw_ocr_text') || '' },
+    { label: 'last_rejected_ocr_text', value: fromOcr('last_rejected_text', 'last_rejected_ocr_text') || '' },
+    { label: 'last_rejected_ocr_reason', value: fromOcr('last_rejected_reason', 'last_rejected_ocr_reason') || '' },
+    { label: 'last_rejected_ocr_at', value: fromOcr('last_rejected_at', 'last_rejected_ocr_at') || '' },
+    { label: 'last_rejected_capture_backend', value: fromOcr('last_rejected_capture_backend') || '' },
+    { label: 'screen_awareness_last_skip_reason', value: fromCapture('screen_awareness_last_skip_reason') || '' },
+    {
+      label: 'screen_awareness_last_region_count',
+      value: String(fromCapture('screen_awareness_last_region_count') || 0),
+    },
+    {
+      label: 'screen_awareness_last_capture_duration_seconds',
+      value: formatOcrRuntimeSeconds(fromCapture('screen_awareness_last_capture_duration_seconds')),
+    },
+    {
+      label: 'screen_awareness_last_ocr_duration_seconds',
+      value: formatOcrRuntimeSeconds(fromCapture('screen_awareness_last_ocr_duration_seconds')),
+    },
     { label: 'last_observed_line', value: fromOcr('last_observed_line')?.text || '' },
     { label: 'last_stable_line', value: fromOcr('last_stable_line')?.text || '' },
     { label: 'ocr_capture_diagnostic_required', value: String(Boolean(fromCapture('diagnostic_required', 'ocr_capture_diagnostic_required'))) },
@@ -3768,6 +3935,11 @@ function renderDxcam(status) {
       ? 'DXcam 已选择，等待下一次 OCR 截图确认'
       : '未知'
   );
+  configureUseButton('smartCaptureUseBtn', {
+    active: selectedCaptureBackend === 'smart',
+    text: selectedCaptureBackend === 'smart' ? '正在使用 Smart' : '使用 Smart',
+    title: '前台优先 DXcam，后台只尝试 PrintWindow，避免读到被遮挡的可见屏幕像素',
+  });
   configureUseButton('dxcamUseBtn', {
     active: selectedCaptureBackend === 'dxcam',
     disabled: !installed,
@@ -3777,7 +3949,7 @@ function renderDxcam(status) {
   configureUseButton('captureBackendAutoBtn', {
     active: selectedCaptureBackend === 'auto',
     text: selectedCaptureBackend === 'auto' ? '截图自动选择中' : '截图自动',
-    title: '按 DXcam 优先、ImageGrab/PrintWindow 兜底自动选择截图后端',
+    title: '兼容旧策略：按 DXcam 优先、ImageGrab/PrintWindow 兜底自动选择截图后端',
   });
   configureUseButton('imagegrabUseBtn', {
     active: selectedCaptureBackend === 'imagegrab',
@@ -4215,56 +4387,6 @@ function renderHistory(history) {
   `);
 }
 
-function renderExplain(payload) {
-  const node = document.getElementById('explainPanel');
-  renderPreservingScroll(node, () => {
-    node.className = 'result-panel scroll-region';
-    node.innerHTML = `
-      <p class="list-kicker">${escapeHtml(payload.line_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
-      <h3>${escapeHtml(payload.speaker || '旁白')}</h3>
-      <p>${escapeHtml(payload.text || '')}</p>
-      <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || '暂无解释')}</p>
-      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-    `;
-  });
-}
-
-function renderSummary(payload) {
-  const node = document.getElementById('summaryPanel');
-  const points = payload.key_points || [];
-  renderPreservingScroll(node, () => {
-    node.className = 'result-panel scroll-region';
-    node.innerHTML = `
-      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
-      <p class="result-main">${escapeHtml(payload.summary || payload.diagnostic || '暂无总结')}</p>
-      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-      <div class="chip-row">
-        ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
-      </div>
-    `;
-  });
-}
-
-function renderSuggest(payload) {
-  const node = document.getElementById('suggestPanel');
-  const choices = payload.choices || [];
-  renderPreservingScroll(node, () => {
-    node.className = 'result-panel scroll-region';
-    node.innerHTML = `
-      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} · degraded=${escapeHtml(Boolean(payload.degraded))}</p>
-      <div class="stack-list">
-        ${choices.length ? choices.map((item) => `
-          <article class="list-card compact">
-            <p class="list-kicker">rank ${escapeHtml(item.rank || 0)} · ${escapeHtml(item.choice_id || '')}</p>
-            <h3>${escapeHtml(item.text || '')}</h3>
-            <p>${escapeHtml(item.reason || '')}</p>
-          </article>
-        `).join('') : `<div class="empty-inline">${escapeHtml(payload.diagnostic || '暂无建议')}</div>`}
-      </div>
-    `;
-  });
-}
-
 function formatInsightMeta(payload) {
   const inputSource = payload.input_source || (latestStatus && latestStatus.active_data_source) || 'unknown';
   const semantic = payload.semantic_granularity
@@ -4323,36 +4445,6 @@ function renderAgentStatus(payload) {
   `);
 }
 
-function renderExplain(payload) {
-  const node = document.getElementById('explainPanel');
-  renderPreservingScroll(node, () => {
-    node.className = 'result-panel scroll-region';
-    node.innerHTML = `
-      <p class="list-kicker">${escapeHtml(payload.line_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
-      <h3>${escapeHtml(payload.speaker || 'Narration')}</h3>
-      <p>${escapeHtml(payload.text || '')}</p>
-      <p class="result-main">${escapeHtml(payload.explanation || payload.diagnostic || 'No explanation yet')}</p>
-      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-    `;
-  });
-}
-
-function renderSummary(payload) {
-  const node = document.getElementById('summaryPanel');
-  const points = payload.key_points || [];
-  renderPreservingScroll(node, () => {
-    node.className = 'result-panel scroll-region';
-    node.innerHTML = `
-      <p class="list-kicker">${escapeHtml(payload.scene_id || '')} | ${escapeHtml(formatInsightMeta(payload))}</p>
-      <p class="result-main">${escapeHtml(payload.summary || payload.diagnostic || 'No summary yet')}</p>
-      <p class="result-note">${escapeHtml(payload.diagnostic || '')}</p>
-      <div class="chip-row">
-        ${points.map((item) => `<span class="chip">${escapeHtml(item.type || '')}: ${escapeHtml(item.text || '')}</span>`).join('')}
-      </div>
-    `;
-  });
-}
-
 function renderSuggest(payload) {
   const node = document.getElementById('suggestPanel');
   const choices = payload.choices || [];
@@ -4371,24 +4463,21 @@ function renderSuggest(payload) {
       </div>
     `;
   });
+  const mirror = document.getElementById('suggestPanelMirror');
+  if (mirror && node) {
+    mirror.innerHTML = node.innerHTML;
+    mirror.className = node.className;
+  }
 }
 
 async function refreshInsights(snapshot, { force = false, history = {}, status = {} } = {}) {
   const mode = String(status.mode || '').trim();
   if (mode === 'silent') {
-    const diagnostic = '静默模式：不自动解释、总结或建议。';
-    const explain = buildExplainFallback('', diagnostic);
-    const summary = buildSummaryFallback('', diagnostic);
+    const diagnostic = '静默模式：不自动生成建议。';
     const suggest = buildSuggestFallback('', diagnostic);
-    latestInsights.explainKey = 'silent';
-    latestInsights.explainPayload = explain;
-    latestInsights.summaryKey = 'silent';
-    latestInsights.summaryPayload = summary;
     latestInsights.suggestKey = 'silent';
     latestInsights.suggestPayload = suggest;
     const scrollState = captureRefreshScrollState();
-    renderExplain(explain);
-    renderSummary(summary);
     renderSuggest(suggest);
     restoreRefreshScrollState(scrollState);
     return;
@@ -4396,36 +4485,13 @@ async function refreshInsights(snapshot, { force = false, history = {}, status =
 
   const state = snapshot.snapshot || {};
   const fallbackLine = effectiveCurrentLine(snapshot, history, status);
-  const currentLineId = state.line_id || fallbackLine.line_id || '';
   const currentSceneId = state.scene_id || fallbackLine.scene_id || '';
   const choices = Array.isArray(state.choices) ? state.choices : [];
   const visibleChoiceMenu = Boolean(state.is_menu_open) && choices.length > 0;
   const hasChoices = mode === 'choice_advisor' && visibleChoiceMenu;
-  const explainKey = currentLineId || 'missing-line';
-  const summaryKey = sceneSummaryKey(currentSceneId, history, fallbackLine);
   const suggestKey = hasChoices
     ? `${currentSceneId}::${choices.map((item) => `${item.choice_id || ''}:${item.text || ''}`).join('|')}`
     : `${currentSceneId}::no-choices`;
-
-  const explainPromise = currentLineId
-    ? (force || latestInsights.explainKey !== explainKey || !latestInsights.explainPayload)
-      ? safeCall(
-        'galgame_explain_line',
-        { line_id: currentLineId },
-        buildExplainFallback(currentLineId),
-      )
-      : Promise.resolve(latestInsights.explainPayload)
-    : Promise.resolve(buildExplainFallback('', buildOcrMissingLineDiagnostic(status)));
-
-  const summaryPromise = currentSceneId
-    ? (force || latestInsights.summaryKey !== summaryKey || !latestInsights.summaryPayload)
-      ? safeCall(
-        'galgame_summarize_scene',
-        { scene_id: currentSceneId },
-        buildSummaryFallback(currentSceneId),
-      )
-      : Promise.resolve(latestInsights.summaryPayload)
-    : Promise.resolve(buildSummaryFallback('', 'missing scene_id'));
 
   const suggestPromise = hasChoices
     ? (force || latestInsights.suggestKey !== suggestKey || !latestInsights.suggestPayload)
@@ -4440,31 +4506,18 @@ async function refreshInsights(snapshot, { force = false, history = {}, status =
       visibleChoiceMenu ? '伴读模式：不自动生成选项建议。' : 'no visible choices',
     ));
 
-  const [explain, summary, suggest] = await Promise.all([
-    explainPromise,
-    summaryPromise,
-    suggestPromise,
-  ]);
+  const suggest = await suggestPromise;
 
-  latestInsights.explainKey = explainKey;
-  latestInsights.explainPayload = explain;
-  latestInsights.summaryKey = summaryKey;
-  latestInsights.summaryPayload = summary;
   latestInsights.suggestKey = suggestKey;
   latestInsights.suggestPayload = suggest;
 
   const scrollState = captureRefreshScrollState();
-  renderExplain(explain);
-  renderSummary(summary);
   renderSuggest(suggest);
   restoreRefreshScrollState(scrollState);
 }
 
-function renderInsightsPending(message = '解释、总结和选项建议正在后台刷新...') {
-  const payload = buildExplainFallback('', message);
+function renderInsightsPending(message = '选项建议正在后台刷新...') {
   const scrollState = captureRefreshScrollState();
-  renderExplain(payload);
-  renderSummary(buildSummaryFallback('', message));
   renderSuggest(buildSuggestFallback('', message));
   restoreRefreshScrollState(scrollState);
 }
@@ -4496,10 +4549,22 @@ function desiredAutoRefreshInterval(status = latestStatus) {
   }
   const runtime = status.ocr_reader_runtime || {};
   const { observedText, stableText, effectiveText } = getCurrentLineTexts(status);
+  const runtimeState = textValue(runtime.status);
+  const contextState = textValue(status.ocr_context_state || runtime.ocr_context_state);
+  if (
+    status.bridge_poll_running === true
+    || status.ocr_fast_loop_running === true
+    || ['starting', 'active', 'running'].includes(runtimeState)
+    || ['capture_pending', 'observed'].includes(contextState)
+    || runtime.stable_ocr_block_reason === 'waiting_for_repeat'
+    || Number(status.pending_ocr_advance_captures || 0) > 0
+  ) {
+    return AUTO_REFRESH_URGENT_INTERVAL_MS;
+  }
   if (
     status.connection_state === 'active'
-    || runtime.status === 'active'
-    || runtime.status === 'running'
+    || runtimeState === 'active'
+    || runtimeState === 'running'
     || observedText
     || stableText
     || effectiveText
@@ -4674,6 +4739,7 @@ async function refreshAll(options = {}) {
       ]);
       const scrollState = captureRefreshScrollState();
       const agentStatus = status.agent || buildAgentStatusFromStatus(status);
+      latestSnapshotData = snapshot;
       renderStatus(status);
       renderSnapshot(snapshot);
       renderHistory(history);
@@ -4709,7 +4775,7 @@ async function refreshAll(options = {}) {
           })
         ));
       }
-      if (showInsightPending && !latestInsights.explainPayload) {
+      if (showInsightPending && !latestInsights.suggestPayload) {
         renderInsightsPending();
       }
       if (insightMode !== 'none') {
@@ -5721,16 +5787,24 @@ async function initialize() {
   initializePanelFullscreenControls();
   updateSettingsDirtyHint();
   switchInstallTab(activeInstallTab);
+
+  const skipOnboarding = localStorage.getItem('galgame_skip_onboarding') === '1';
+  if (!skipOnboarding) {
+    document.body.classList.add('onboarding-active');
+    const onboardingView = document.getElementById('onboardingView');
+    if (onboardingView) { onboardingView.hidden = false; }
+  }
+
   try {
     localStorage.removeItem(`${PLUGIN_ID}:last_ui_state:v1`);
   } catch (error) {
     console.warn('[galgame_plugin ui] clear cached state failed', error);
   }
-  renderInsightsPending('等待首轮状态刷新；解释、总结和选项建议会在后台更新。');
+  renderInsightsPending('等待首轮状态刷新；选项建议会在后台更新。');
   setFlash('正在加载插件状态...', 'info');
   const loaded = await refreshAll({ forceInsights: false, showInsightPending: true });
   if (loaded) {
-    setFlash('插件状态已加载；解释/总结、窗口列表和依赖状态正在后台更新。', 'success');
+    setFlash('插件状态已加载；窗口列表、依赖状态和选项建议正在后台更新。', 'success');
   }
   runBackgroundTask('refresh Memory Reader processes', () => (
     refreshMemoryProcessTargetsIfNeeded({
@@ -5776,7 +5850,7 @@ document.getElementById('refreshBtn').addEventListener('click', async () => {
     if (loaded) {
       setFlash(
         windowsLoaded
-          ? '状态和窗口列表已刷新；解释/总结在后台更新。'
+          ? '状态和窗口列表已刷新；选项建议在后台更新。'
           : '状态已刷新；窗口列表刷新失败，请稍后重试。',
         windowsLoaded ? 'success' : 'warning',
       );
@@ -5868,6 +5942,7 @@ document.getElementById('textractorInstallBtn').addEventListener('click', () => 
 document.getElementById('rapidocrUseBtn').addEventListener('click', () => setOcrBackendSelection({ backendSelection: 'rapidocr' }));
 document.getElementById('ocrBackendAutoBtn').addEventListener('click', () => setOcrBackendSelection({ backendSelection: 'auto' }));
 document.getElementById('tesseractUseBtn').addEventListener('click', () => setOcrBackendSelection({ backendSelection: 'tesseract' }));
+document.getElementById('smartCaptureUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'smart' }));
 document.getElementById('dxcamUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'dxcam' }));
 document.getElementById('captureBackendAutoBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'auto' }));
 document.getElementById('imagegrabUseBtn').addEventListener('click', () => setOcrBackendSelection({ captureBackend: 'imagegrab' }));
@@ -5975,6 +6050,60 @@ document.querySelectorAll('.install-tab').forEach((btn) => {
     }
   });
 });
+
+document.querySelectorAll('#modeSwitch .mode-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const mode = btn.dataset.mode;
+    const select = document.getElementById('modeSelect');
+    if (select && mode) {
+      select.value = mode;
+      select.dispatchEvent(new Event('change'));
+      saveMode().catch(() => {});
+    }
+  });
+});
+
+document.querySelectorAll('#speedSwitch .speed-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const speed = btn.dataset.speed;
+    const select = document.getElementById('advanceSpeedSelect');
+    if (select && speed) {
+      select.value = speed;
+      select.dispatchEvent(new Event('change'));
+      saveMode().catch(() => {});
+    }
+  });
+});
+
+document.querySelectorAll('[data-skip-onboarding]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    localStorage.setItem('galgame_skip_onboarding', '1');
+    document.body.classList.remove('onboarding-active');
+  });
+});
+
+document.getElementById('onboardingView').addEventListener('click', (event) => {
+  const target = eventElement(event.target);
+  const button = target ? target.closest('[data-first-run-action]') : null;
+  if (!button) {
+    return;
+  }
+  const action = button.getAttribute('data-first-run-action') || '';
+  withButtonPending(button, '处理中...', () => handleDiagnosisAction(action)).catch((error) => {
+    setFlash(error instanceof Error ? error.message : String(error), 'error');
+  });
+});
+
+const advancedToggleBtn = document.getElementById('advancedToggleBtn');
+if (advancedToggleBtn) {
+  advancedToggleBtn.addEventListener('click', () => {
+    const el = document.getElementById('advancedSettings');
+    if (el) {
+      el.classList.toggle('open');
+      advancedToggleBtn.textContent = el.classList.contains('open') ? '收起高级设置' : '高级设置';
+    }
+  });
+}
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {

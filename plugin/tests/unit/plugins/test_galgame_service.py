@@ -188,6 +188,38 @@ def test_service_summarize_context_filters_overlay_diagnostics() -> None:
     assert "ocr_reader_source" in context["degraded_reasons"]
 
 
+def test_service_summarize_context_seed_keeps_observed_lines_tentative() -> None:
+    state = _local_state()
+    state["history_lines"] = []
+    state["latest_snapshot"] = {
+        "speaker": "雪乃",
+        "text": "也许我并不讨厌这样。",
+        "line_id": "ocr:line-observed",
+        "scene_id": "ocr:game:scene-0001",
+        "route_id": "ocr",
+        "stability": "tentative",
+        "choices": [],
+        "is_menu_open": False,
+    }
+    state["history_observed_lines"] = [
+        {
+            "speaker": "雪乃",
+            "text": "也许我并不讨厌这样。",
+            "line_id": "ocr:line-observed",
+            "scene_id": "ocr:game:scene-0001",
+            "route_id": "ocr",
+            "stability": "tentative",
+        }
+    ]
+
+    context = build_summarize_context(state, scene_id="ocr:game:scene-0001")
+
+    assert context["stable_lines"] == []
+    assert context["observed_lines"][0]["text"] == "也许我并不讨厌这样。"
+    assert "也许我并不讨厌这样。" not in context["scene_summary_seed"]
+    assert "暂时没有足够台词上下文" in context["scene_summary_seed"]
+
+
 def test_service_explain_context_uses_history_when_snapshot_is_diagnostic() -> None:
     context = build_explain_context(_local_state(), line_id="ocr:line-stable")
 

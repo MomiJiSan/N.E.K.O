@@ -345,6 +345,13 @@ class GameLLMAgent:
     _CHOICE_ADVICE_WAIT_TIMEOUT_SECONDS = 20.0
     _OBSERVE_SUMMARY_TIMEOUT_SECONDS = 2.0
     _SUMMARY_SEEN_LINE_KEYS_LIMIT = 512
+    _KEY_POINT_LABELS = {
+        "plot": "剧情推进",
+        "emotion": "人物情绪",
+        "decision": "玩家选择",
+        "reveal": "新揭示",
+        "objective": "当前目标",
+    }
     _DIALOGUE_ADVANCE_VARIANTS = (
         {
             "id": "advance_enter",
@@ -458,6 +465,8 @@ class GameLLMAgent:
         self._observed_session_id = ""
         self._observed_scene_id = ""
         self._observed_choice_marker = ""
+        self._observed_context_boundary: dict[str, str] = {}
+        self._observed_context_boundary_key = ""
         self._observed_virtual_mouse_runtime_key = ""
         self._ocr_no_observed_advance_count = 0
         self._ocr_last_progress_seq = 0
@@ -617,6 +626,8 @@ class GameLLMAgent:
             self._observed_session_id = ""
             self._observed_scene_id = ""
             self._observed_choice_marker = ""
+            self._observed_context_boundary = {}
+            self._observed_context_boundary_key = ""
             self._observed_virtual_mouse_runtime_key = ""
             self._ocr_no_observed_advance_count = 0
             self._ocr_last_progress_seq = 0
@@ -3061,7 +3072,7 @@ class GameLLMAgent:
             summary_seed = build_local_scene_summary(
                 scene_id=scene_id,
                 route_id=route_id,
-                lines=summary_context["recent_lines"],
+                lines=summary_context["stable_lines"],
                 selected_choices=summary_context["recent_choices"],
                 snapshot=snapshot,
             )
@@ -3179,6 +3190,128 @@ class GameLLMAgent:
             "last_scene_change_at": 0.0,
             "summary_seed": "",
         }
+
+    @staticmethod
+    def _selected_choice_marker(selected: dict[str, Any] | None) -> str:
+        if selected is None:
+            return ""
+        return (
+            f"{str(selected.get('ts') or '')}:"
+            f"{str(selected.get('choice_id') or '')}:"
+            f"{str(selected.get('scene_id') or '')}"
+        )
+
+    @staticmethod
+    def _context_boundary_key(boundary: dict[str, str]) -> str:
+        if not boundary:
+            return ""
+        return json.dumps(boundary, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _remember_context_boundary(self, boundary: dict[str, str]) -> None:
+        self._observed_context_boundary = dict(boundary)
+        self._observed_context_boundary_key = self._context_boundary_key(boundary)
+
+    def _build_context_boundary(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        selected_marker: str,
+        now: float,
+    ) -> dict[str, str]:
+        save_context = snapshot.get("save_context") if isinstance(snapshot.get("save_context"), dict) else {}
+        save_kind = str(save_context.get("kind") or "")
+        save_slot = str(save_context.get("slot_id") or "")
+        save_name = str(save_context.get("display_name") or "")
+        screen_type = str(snapshot.get("screen_type") or "").strip()
+        try:
+            screen_confidence = float(snapshot.get("screen_confidence") or 0.0)
+        except (TypeError, ValueError):
+            screen_confidence = 0.0
+        if screen_type == OCR_CAPTURE_PROFILE_STAGE_DEFAULT or screen_confidence < 0.45:
+            screen_type_key = ""
+        else:
+            screen_type_key = screen_type
+        stage = self._classify_scene_stage(snapshot, now=now, scene_changed=False)
+        if (
+            stage == "scene_transition"
+            and screen_type_key != OCR_CAPTURE_PROFILE_STAGE_TRANSITION
+            and save_kind not in {"load", "rollback"}
+        ):
+            stage = "unknown"
+        return {
+            "scene_id": str(snapshot.get("scene_id") or ""),
+            "route_id": str(snapshot.get("route_id") or ""),
+            "stage": stage,
+            "screen_type": screen_type_key,
+            "save_kind": save_kind,
+            "save_marker": f"{save_kind}:{save_slot}:{save_name}",
+            "choice_marker": selected_marker,
+        }
+
+    @staticmethod
+    def _context_boundary_trigger(
+        previous: dict[str, str],
+        current: dict[str, str],
+    ) -> str:
+        if not previous:
+            return ""
+        if current.get("scene_id") != previous.get("scene_id") or current.get("route_id") != previous.get("route_id"):
+            return "scene_changed"
+        if current.get("choice_marker") and current.get("choice_marker") != previous.get("choice_marker"):
+            return "choice_selected"
+        if (
+            current.get("save_marker") != previous.get("save_marker")
+            and (current.get("save_kind") in {"load", "rollback"} or previous.get("save_kind") in {"load", "rollback"})
+        ):
+            return "save_context_changed"
+        if current.get("stage") != previous.get("stage"):
+            return "screen_stage_changed"
+        if current.get("screen_type") != previous.get("screen_type"):
+            return "screen_type_changed"
+        if current.get("save_marker") != previous.get("save_marker"):
+            return "save_context_changed"
+        return "context_boundary_changed"
+
+    def _maybe_schedule_context_boundary_summary(
+        self,
+        shared: dict[str, Any],
+        *,
+        session_id: str,
+        snapshot: dict[str, Any],
+        boundary: dict[str, str],
+    ) -> None:
+        scene_id = str(boundary.get("scene_id") or "")
+        if not scene_id:
+            self._remember_context_boundary(boundary)
+            return
+        previous = dict(self._observed_context_boundary)
+        boundary_key = self._context_boundary_key(boundary)
+        if not self._observed_context_boundary_key:
+            self._remember_context_boundary(boundary)
+            return
+        if boundary_key == self._observed_context_boundary_key:
+            return
+        trigger = self._context_boundary_trigger(previous, boundary)
+        self._remember_context_boundary(boundary)
+        if not trigger or trigger == "scene_changed" or not self._should_push_scene(shared):
+            return
+        route_id = str(boundary.get("route_id") or snapshot.get("route_id") or "")
+        context = build_summarize_context(shared, scene_id=scene_id)
+        self._schedule_scene_summary_task(
+            shared=shared,
+            session_id=session_id,
+            scene_id=scene_id,
+            route_id=route_id,
+            snapshot=snapshot,
+            context=context,
+            trigger=trigger,
+            metadata={
+                "context_type": "galgame_scene_context",
+                "trigger": trigger,
+                "context_boundary": json_copy(boundary),
+            },
+            update_scene_memory=False,
+        )
 
     def _record_failure(self, *, kind: str, strategy_id: str, reason: str, scene_id: str) -> None:
         self._append_bounded(
@@ -3583,6 +3716,14 @@ class GameLLMAgent:
         snapshot = sanitize_snapshot_state(shared.get("latest_snapshot", {}))
         session_id = str(shared.get("active_session_id") or "")
         virtual_mouse_runtime_key = self._virtual_mouse_runtime_key(shared)
+        selected = latest_selected_choice(shared.get("history_choices", []))
+        selected_marker = self._selected_choice_marker(selected)
+        now = time.monotonic()
+        context_boundary = self._build_context_boundary(
+            snapshot,
+            selected_marker=selected_marker,
+            now=now,
+        )
         if session_id != self._observed_session_id:
             self._cancel_summary_tasks()
             await self._reset_runtime_state(cancel_host_task=True, clear_retry=True)
@@ -3598,6 +3739,7 @@ class GameLLMAgent:
             self._observed_choice_marker = ""
             self._observed_scene_id = str(snapshot.get("scene_id") or "")
             self._observed_session_id = session_id
+            self._remember_context_boundary(context_boundary)
             self._observed_virtual_mouse_runtime_key = virtual_mouse_runtime_key
             self._clear_ocr_capture_diagnostic()
             self._ocr_last_progress_seq = self._latest_ocr_progress_seq(shared)
@@ -3616,7 +3758,8 @@ class GameLLMAgent:
 
         current_scene_id = str(snapshot.get("scene_id") or "")
         current_route_id = str(snapshot.get("route_id") or "")
-        if current_scene_id and current_scene_id != self._observed_scene_id:
+        scene_changed = current_scene_id and current_scene_id != self._observed_scene_id
+        if scene_changed:
             if not allow_agent_side_effects:
                 return
             context = build_summarize_context(shared, scene_id=current_scene_id)
@@ -3653,19 +3796,22 @@ class GameLLMAgent:
                 )
             self._observed_scene_id = current_scene_id
             self._scene_tracker.reset_summary(scene_id=current_scene_id)
+            self._remember_context_boundary(context_boundary)
 
         if allow_agent_side_effects:
+            if not scene_changed:
+                self._maybe_schedule_context_boundary_summary(
+                    shared,
+                    session_id=session_id,
+                    snapshot=snapshot,
+                    boundary=context_boundary,
+                )
             await self._maybe_push_periodic_scene_summary(shared, snapshot=snapshot)
 
-        selected = latest_selected_choice(shared.get("history_choices", []))
         if selected is not None:
             if not allow_agent_side_effects:
                 return
-            marker = (
-                f"{str(selected.get('ts') or '')}:"
-                f"{str(selected.get('choice_id') or '')}:"
-                f"{str(selected.get('scene_id') or '')}"
-            )
+            marker = selected_marker
             if marker and marker != self._observed_choice_marker:
                 choice_id = str(selected.get("choice_id") or "")
                 choice_text = str(selected.get("text") or "")
@@ -3707,7 +3853,7 @@ class GameLLMAgent:
         return self._build_scene_context_fallback(
             scene_id=scene_id,
             route_id=route_id or str(context.get("route_id") or ""),
-            lines=list(context.get("recent_lines") or []),
+            lines=list(context.get("stable_lines") or []),
             selected_choices=list(context.get("recent_choices") or []),
             snapshot=snapshot,
         )
@@ -3788,13 +3934,22 @@ class GameLLMAgent:
                 snapshot=snapshot,
             )
         except Exception as exc:
-            summary = self._build_local_scene_summary_from_context(
-                context,
+            plain_summary = self._build_scene_context_fallback(
                 scene_id=scene_id,
                 route_id=route_id,
+                lines=list(context.get("stable_lines") or []),
+                selected_choices=list(context.get("recent_choices") or []),
+                snapshot=snapshot,
+            )
+            summary = self._format_scene_context_for_cat(
+                summary=plain_summary,
+                key_points=[],
+                context=context,
                 snapshot=snapshot,
             )
             summary_meta = {
+                "scene_summary": plain_summary,
+                "key_points": [],
                 "summary_source": "local_context",
                 "summary_degraded": True,
                 "summary_diagnostic": str(exc),
@@ -3814,7 +3969,7 @@ class GameLLMAgent:
                 self._replace_scene_memory_summary(
                     scene_id=scene_id,
                     route_id=route_id,
-                    summary=summary,
+                    summary=str(summary_meta.get("scene_summary") or summary),
                 )
             push_metadata = dict(metadata)
             push_metadata.update(summary_meta)
@@ -3823,7 +3978,7 @@ class GameLLMAgent:
             self._push_agent_message(
                 shared,
                 kind="scene_summary",
-                content=f"游戏上下文（请猫娘自然回应）：{summary}",
+                content=f"游戏上下文（请猫娘自然回应）：\n{summary}",
                 scene_id=scene_id,
                 route_id=route_id,
                 metadata=push_metadata,
@@ -3852,7 +4007,7 @@ class GameLLMAgent:
             self._scene_tracker.reset_summary(scene_id=scene_id)
 
         context = build_summarize_context(shared, scene_id=scene_id)
-        scene_lines = list(context.get("recent_lines") or [])
+        scene_lines = list(context.get("stable_lines") or [])
         new_line_count = 0
         for line in scene_lines:
             if not isinstance(line, dict) or not str(line.get("text") or "").strip():
@@ -3911,6 +4066,7 @@ class GameLLMAgent:
         snapshot: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
         summary = ""
+        key_points: list[dict[str, Any]] = []
         meta: dict[str, Any] = {"summary_source": "local_context"}
         if self._llm_gateway is not None:
             try:
@@ -3920,6 +4076,8 @@ class GameLLMAgent:
                 )
                 payload_degraded = bool(payload.get("degraded"))
                 summary = "" if payload_degraded else str(payload.get("summary") or "").strip()
+                if not payload_degraded:
+                    key_points = self._normalize_scene_key_points(payload.get("key_points"))
                 meta = {
                     "summary_source": "local_context" if payload_degraded else "llm",
                     "summary_degraded": payload_degraded,
@@ -3932,13 +4090,143 @@ class GameLLMAgent:
                     "summary_diagnostic": str(exc),
                 }
         if not summary:
-            summary = self._build_local_scene_summary_from_context(
-                context,
+            summary = self._build_scene_context_fallback(
                 scene_id=scene_id,
                 route_id=route_id,
+                lines=list(context.get("stable_lines") or []),
+                selected_choices=list(context.get("recent_choices") or []),
                 snapshot=snapshot,
             )
-        return summary, meta
+        formatted = self._format_scene_context_for_cat(
+            summary=summary,
+            key_points=key_points,
+            context=context,
+            snapshot=snapshot,
+        )
+        meta["scene_summary"] = summary
+        meta["key_points"] = json_copy(key_points)
+        return formatted, meta
+
+    @classmethod
+    def _normalize_scene_key_points(cls, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip()
+            text = str(item.get("text") or "").strip()
+            if item_type not in cls._KEY_POINT_LABELS or not text:
+                continue
+            normalized.append(
+                {
+                    "type": item_type,
+                    "text": text,
+                    "line_id": str(item.get("line_id") or ""),
+                    "speaker": str(item.get("speaker") or ""),
+                    "scene_id": str(item.get("scene_id") or ""),
+                    "route_id": str(item.get("route_id") or ""),
+                }
+            )
+        return normalized[:8]
+
+    @staticmethod
+    def _format_scene_line(line: dict[str, Any]) -> str:
+        speaker = str(line.get("speaker") or "旁白").strip() or "旁白"
+        text = str(line.get("text") or "").strip()
+        if not text:
+            return ""
+        return f"{speaker}：「{text[:120]}」"
+
+    @staticmethod
+    def _format_choice_text(choice: dict[str, Any]) -> str:
+        text = str(choice.get("text") or "").strip()
+        if not text:
+            return ""
+        return text[:120]
+
+    @classmethod
+    def _format_scene_context_for_cat(
+        cls,
+        *,
+        summary: str,
+        key_points: list[dict[str, Any]],
+        context: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> str:
+        stable_lines = [
+            item for item in list(context.get("stable_lines") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        observed_lines = [
+            item for item in list(context.get("observed_lines") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        choices = [
+            item for item in list(context.get("recent_choices") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+
+        parts: list[str] = ["当前场景：", str(summary or "").strip() or "暂时没有足够剧情上下文。"]
+
+        parts.append("")
+        parts.append("最近关键台词：")
+        stable_preview = [cls._format_scene_line(line) for line in stable_lines[-5:]]
+        stable_preview = [line for line in stable_preview if line]
+        if stable_preview:
+            parts.extend(f"- {line}" for line in stable_preview)
+        else:
+            current_text = str(snapshot.get("text") or "").strip()
+            if current_text and not observed_lines:
+                speaker = str(snapshot.get("speaker") or "旁白").strip() or "旁白"
+                parts.append(f"- {speaker}：「{current_text[:120]}」")
+            else:
+                parts.append("- 台词仍在确认中，暂不作为确定剧情事实。")
+
+        observed_preview = [cls._format_scene_line(line) for line in observed_lines[-3:]]
+        observed_preview = [line for line in observed_preview if line]
+        if observed_preview:
+            parts.append("")
+            parts.append("待确认候选：")
+            parts.extend(f"- {line}（OCR 候选，尚未稳定确认）" for line in observed_preview)
+
+        parts.append("")
+        parts.append("最近选项：")
+        choice_preview = [cls._format_choice_text(choice) for choice in choices[-3:]]
+        choice_preview = [choice for choice in choice_preview if choice]
+        if choice_preview:
+            parts.extend(f"- {choice}" for choice in choice_preview)
+        else:
+            parts.append("- 暂无已确认选项。")
+
+        parts.append("")
+        parts.append("关键变化：")
+        if key_points:
+            for point in key_points[:6]:
+                label = cls._KEY_POINT_LABELS.get(str(point.get("type") or ""), "剧情线索")
+                text = str(point.get("text") or "").strip()
+                if text:
+                    parts.append(f"- {label}：{text[:160]}")
+        else:
+            parts.append("- 暂无额外结构化关键点；请基于当前场景和稳定台词自然回应。")
+
+        focus_points = [
+            str(point.get("text") or "").strip()
+            for point in key_points
+            if str(point.get("type") or "") in {"emotion", "decision", "reveal", "objective"}
+            and str(point.get("text") or "").strip()
+        ][:3]
+        parts.append("")
+        parts.append("当前可关注点：")
+        if focus_points:
+            parts.extend(f"- {text[:160]}" for text in focus_points)
+        elif stable_preview:
+            parts.append("- 可以自然评论角色当前的情绪、选择或处境。")
+        else:
+            parts.append("- 可以说明台词仍在确认中，先轻描淡写地陪伴观察。")
+
+        return "\n".join(parts).strip()
 
     @staticmethod
     def _build_scene_context_fallback(

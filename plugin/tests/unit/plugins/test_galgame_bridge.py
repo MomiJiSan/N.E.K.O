@@ -668,6 +668,27 @@ class _FakeBackgroundHashCaptureBackend:
         return _FakeBackgroundHashFrame(self.hashes.pop(0))
 
 
+class _FakePrintWindowBlankCaptureBackend:
+    def __init__(self) -> None:
+        self.capture_calls = 0
+
+    def is_available(self) -> bool:
+        return True
+
+    def describe_target(self, target: DetectedGameWindow) -> str:
+        return f"{target.process_name}:{target.pid}"
+
+    def capture_frame(self, target: DetectedGameWindow, profile):
+        del target, profile
+        from PIL import Image
+
+        self.capture_calls += 1
+        frame = Image.new("RGB", (24, 24), (0, 0, 0))
+        frame.info["galgame_capture_backend_kind"] = "printwindow"
+        frame.info["galgame_capture_backend_detail"] = "selected"
+        return frame
+
+
 class _FakeOcrBackend:
     def __init__(self, texts: list[str] | None = None) -> None:
         self._texts = list(texts or [])
@@ -682,6 +703,36 @@ class _FakeOcrBackend:
         if len(self._texts) == 1:
             return self._texts[0]
         return self._texts.pop(0)
+
+
+class _NoopMemoryReaderManager:
+    def __init__(self, *args, **kwargs) -> None:
+        del args, kwargs
+        self.target: dict[str, object] = {}
+
+    def update_process_target(self, target: dict[str, object]) -> None:
+        self.target = dict(target or {})
+
+    def current_process_target(self) -> dict[str, object]:
+        return dict(self.target)
+
+    def update_config(self, config) -> None:
+        del config
+
+    async def tick(self, **kwargs) -> SimpleNamespace:
+        del kwargs
+        return SimpleNamespace(
+            warnings=[],
+            should_rescan=False,
+            runtime={
+                "enabled": True,
+                "status": "disabled",
+                "detail": "test_noop_memory_reader",
+            },
+        )
+
+    async def shutdown(self) -> None:
+        return None
 
 
 class _FakeAdvanceInputMonitor:
@@ -4600,7 +4651,17 @@ async def test_ocr_reader_auto_detects_foreground_window_before_manual_fallback(
     capture_backend = _FakeCaptureBackend()
     manager = OcrReaderManager(
         logger=_Logger(),
-        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        config=build_config(
+            _make_effective_config(
+                bridge_root,
+                ocr_reader={
+                    "enabled": True,
+                    "screen_awareness_full_frame_ocr": True,
+                    "screen_awareness_multi_region_ocr": True,
+                    "screen_awareness_visual_rules": True,
+                },
+            )
+        ),
         platform_fn=lambda: True,
         window_scanner=lambda: [target],
         capture_backend=capture_backend,
@@ -4683,6 +4744,10 @@ async def test_ocr_reader_ignores_chinese_plugin_ui_text(
 
     assert capture_backend.capture_calls == 1
     assert manager._writer.last_seq == 0
+    assert result.runtime["last_raw_ocr_text"] == ""
+    assert result.runtime["last_rejected_ocr_text"] == "运行控制 模式静默 静默进入待机恢复活跃"
+    assert result.runtime["last_rejected_ocr_reason"] == "self_ui_guard"
+    assert result.runtime["screen_awareness_last_skip_reason"] == "rejected_primary_text"
     assert any("N.E.K.O plugin UI" in warning for warning in result.warnings)
 
 
@@ -4698,13 +4763,21 @@ def test_ocr_reader_capture_backend_config_is_sanitized(tmp_path: Path) -> None:
     )
     assert config.ocr_reader_capture_backend == "dxcam"
 
+    smart_config = build_config(
+        _make_effective_config(
+            bridge_root,
+            ocr_reader={"enabled": True, "capture_backend": "smart"},
+        )
+    )
+    assert smart_config.ocr_reader_capture_backend == "smart"
+
     fallback_config = build_config(
         _make_effective_config(
             bridge_root,
             ocr_reader={"enabled": True, "capture_backend": "unknown"},
         )
     )
-    assert fallback_config.ocr_reader_capture_backend == "auto"
+    assert fallback_config.ocr_reader_capture_backend == "smart"
 
 
 @pytest.mark.plugin_unit
@@ -4720,6 +4793,129 @@ def test_win32_capture_backend_selection_orders_dxcam_first_for_auto() -> None:
 
     printwindow_backend = galgame_ocr_reader.Win32CaptureBackend(selection="printwindow")
     assert [item.kind for item in printwindow_backend._backends] == ["printwindow", "dxcam", "imagegrab"]
+
+
+@pytest.mark.plugin_unit
+def test_win32_capture_backend_smart_uses_target_aware_order() -> None:
+    backend = galgame_ocr_reader.Win32CaptureBackend(selection="smart")
+    foreground = DetectedGameWindow(
+        hwnd=1,
+        title="Demo",
+        process_name="DemoGame.exe",
+        pid=100,
+        is_foreground=True,
+    )
+    background = DetectedGameWindow(
+        hwnd=2,
+        title="Demo",
+        process_name="DemoGame.exe",
+        pid=101,
+        is_foreground=False,
+    )
+
+    assert [item.kind for item in backend._ordered_backends_for_target(foreground)] == [
+        "dxcam",
+        "imagegrab",
+        "printwindow",
+    ]
+    assert [item.kind for item in backend._ordered_backends_for_target(background)] == [
+        "printwindow"
+    ]
+
+
+@pytest.mark.plugin_unit
+def test_ocr_stability_ignores_whitelisted_trailing_orphan_only() -> None:
+    clean = galgame_ocr_reader._clean_ocr_dialogue_text("三年前初患此病，我便将人视作走兽。")
+    orphan = galgame_ocr_reader._clean_ocr_dialogue_text("三年前初患此病，我便将人视作走兽。义")
+    assert orphan == clean
+    assert galgame_ocr_reader._ocr_stability_key(orphan) == galgame_ocr_reader._ocr_stability_key(clean)
+    assert not galgame_ocr_reader._ocr_stability_keys_match(
+        galgame_ocr_reader._ocr_stability_key("我喜欢你"),
+        galgame_ocr_reader._ocr_stability_key("我喜欢他"),
+    )
+
+
+@pytest.mark.plugin_unit
+def test_ocr_poll_latency_samples_auto_degrade_full_screen_awareness(tmp_path: Path) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    cfg = _make_effective_config(
+        bridge_root,
+        ocr_reader={
+            "enabled": True,
+            "screen_awareness_latency_mode": "full",
+        },
+    )
+    plugin = GalgameBridgePlugin(_Ctx(plugin_dir, cfg))
+    plugin._cfg = build_config(cfg)
+    applied_modes: list[str] = []
+    plugin._ocr_reader_manager = SimpleNamespace(
+        update_config=lambda config: applied_modes.append(
+            config.ocr_reader_screen_awareness_latency_mode
+        )
+    )
+
+    for duration in (3.2, 3.4, 3.6, 4.0, 5.0):
+        plugin._record_ocr_poll_duration({"last_poll_duration_seconds": duration})
+
+    status = plugin._bridge_poll_debug_payload()
+    assert plugin._cfg.ocr_reader_screen_awareness_latency_mode == "balanced"
+    assert applied_modes == ["balanced"]
+    assert status["ocr_poll_latency_sample_count"] == 5
+    assert status["ocr_poll_duration_p95_seconds"] > 3.0
+    assert status["ocr_auto_degrade_count"] == 1
+    assert "full->balanced" in status["ocr_auto_degrade_reason"]
+
+
+@pytest.mark.plugin_unit
+def test_primary_diagnosis_warns_when_ocr_candidate_waits_too_long() -> None:
+    diagnosis = galgame_service.build_primary_diagnosis(
+        {
+            "ocr_reader_runtime": {
+                "stable_ocr_block_reason": "waiting_for_repeat",
+            },
+            "candidate_age_seconds": 9.5,
+        }
+    )
+
+    assert diagnosis["severity"] == "warning"
+    assert diagnosis["title"] == "OCR 候选台词确认过慢"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_ocr_reader_pauses_background_printwindow_after_blank_frame(
+    tmp_path: Path,
+) -> None:
+    _plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    target = DetectedGameWindow(
+        hwnd=333,
+        title="Background Demo",
+        process_name="DemoGame.exe",
+        pid=3333,
+        width=1280,
+        height=720,
+        is_foreground=False,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=build_config(_make_effective_config(bridge_root, ocr_reader={"enabled": True})),
+        time_fn=lambda: 1710000000.0,
+        platform_fn=lambda: True,
+        window_scanner=lambda: [target],
+        capture_backend=_FakePrintWindowBlankCaptureBackend(),
+        ocr_backend=_FakeOcrBackend([""]),
+        writer=OcrReaderBridgeWriter(
+            bridge_root=bridge_root,
+            time_fn=lambda: 1710000000.0,
+        ),
+    )
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["detail"] == "capture_failed"
+    assert result.runtime["ocr_context_state"] == "capture_failed"
+    assert "backend_not_suitable_for_background" in result.runtime["last_capture_error"]
+    assert result.runtime["capture_backend_detail"] == "backend_not_suitable_for_background"
 
 
 @pytest.mark.plugin_unit
@@ -5145,6 +5341,7 @@ async def test_poll_bridge_persists_rebound_ocr_window_target(tmp_path: Path) ->
 @pytest.mark.plugin_unit
 async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_are_missing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     install_root = tmp_path / "Tesseract"
@@ -5163,6 +5360,7 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
         },
     )
     ctx = _Ctx(plugin_dir, cfg)
+    monkeypatch.setattr(galgame_plugin_module, "MemoryReaderManager", _NoopMemoryReaderManager)
     plugin = GalgameBridgePlugin(ctx)
     await plugin.startup()
     clock = {"now": 1710000000.0}
@@ -5214,6 +5412,7 @@ async def test_ocr_reader_fallback_activates_when_bridge_sdk_and_memory_reader_a
 @pytest.mark.plugin_unit
 async def test_auto_reader_interval_ocr_takes_over_from_stale_memory_snapshot(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
     install_root = tmp_path / "Tesseract"
@@ -5234,6 +5433,12 @@ async def test_auto_reader_interval_ocr_takes_over_from_stale_memory_snapshot(
     )
     memory_game_id = "mem-stale"
     memory_session_id = "mem-session"
+
+    ctx = _Ctx(plugin_dir, cfg)
+    monkeypatch.setattr(galgame_plugin_module, "MemoryReaderManager", _NoopMemoryReaderManager)
+    plugin = GalgameBridgePlugin(ctx)
+    await plugin.startup()
+    plugin._start_background_bridge_poll = lambda: False
     _create_game_dir(
         bridge_root,
         game_id=memory_game_id,
@@ -5250,11 +5455,6 @@ async def test_auto_reader_interval_ocr_takes_over_from_stale_memory_snapshot(
         ),
         events=[],
     )
-
-    ctx = _Ctx(plugin_dir, cfg)
-    plugin = GalgameBridgePlugin(ctx)
-    await plugin.startup()
-    plugin._start_background_bridge_poll = lambda: False
     plugin._memory_reader_manager = SimpleNamespace(
         update_config=lambda config: None,
         tick=lambda **kwargs: asyncio.sleep(
@@ -5266,8 +5466,8 @@ async def test_auto_reader_interval_ocr_takes_over_from_stale_memory_snapshot(
                     "enabled": True,
                     "status": "active",
                     "detail": "attached_idle_after_text",
-                    "process_name": "RenPy Demo.exe",
-                    "pid": 4242,
+                    "process_name": "DemoGame.exe",
+                    "pid": 5252,
                     "engine": "renpy",
                     "game_id": memory_game_id,
                     "session_id": memory_session_id,
@@ -11323,6 +11523,409 @@ async def test_game_llm_agent_pushes_scene_summary_after_eight_lines(
     assert ctx.pushed_messages[-1]["metadata"]["context_type"] == "galgame_scene_context"
     status = await agent.query_status(shared)
     assert status["scene_summary_line_interval"] == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_pushes_context_summary_when_stage_changes_without_scene_change(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    stable_lines = [
+        {
+            "line_id": "line-1",
+            "speaker": "雪乃",
+            "text": "先听我说完。",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "stability": "stable",
+            "ts": "2026-04-21T08:33:01Z",
+        }
+    ]
+
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(
+                speaker="雪乃",
+                text="先听我说完。",
+                scene_id="scene-a",
+                line_id="line-1",
+                screen_type=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+                screen_confidence=0.9,
+                ts="2026-04-21T08:33:01Z",
+            ),
+            history_lines=stable_lines,
+        )
+    )
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(
+                speaker="",
+                text="",
+                choices=[
+                    {"choice_id": "choice-1", "text": "陪她走", "index": 0},
+                    {"choice_id": "choice-2", "text": "先回家", "index": 1},
+                ],
+                scene_id="scene-a",
+                line_id="",
+                is_menu_open=True,
+                screen_type=OCR_CAPTURE_PROFILE_STAGE_DIALOGUE,
+                screen_confidence=0.9,
+                ts="2026-04-21T08:33:02Z",
+            ),
+            history_lines=stable_lines,
+        )
+    )
+    await _drain_agent_summary_tasks(agent)
+
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "scene_summary"
+    assert ctx.pushed_messages[-1]["metadata"]["trigger"] == "screen_stage_changed"
+    assert ctx.pushed_messages[-1]["metadata"]["context_boundary"]["scene_id"] == "scene-a"
+    assert ctx.pushed_messages[-1]["metadata"]["context_boundary"]["stage"] == "choice_menu"
+    assert agent._observed_scene_id == "scene-a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_pushes_context_summary_when_choice_selected_without_scene_change(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    stable_lines = [
+        {
+            "line_id": "line-1",
+            "speaker": "雪乃",
+            "text": "你要怎么做？",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "stability": "stable",
+            "ts": "2026-04-21T08:34:01Z",
+        }
+    ]
+    selected_choice = {
+        "choice_id": "choice-1",
+        "text": "陪雪乃回家",
+        "line_id": "line-1",
+        "scene_id": "scene-a",
+        "route_id": "",
+        "index": 0,
+        "action": "selected",
+        "ts": "2026-04-21T08:34:02Z",
+    }
+
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(
+                speaker="雪乃",
+                text="你要怎么做？",
+                scene_id="scene-a",
+                line_id="line-1",
+                ts="2026-04-21T08:34:01Z",
+            ),
+            history_lines=stable_lines,
+        )
+    )
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(
+                speaker="雪乃",
+                text="那就走吧。",
+                scene_id="scene-a",
+                line_id="line-2",
+                ts="2026-04-21T08:34:03Z",
+            ),
+            history_lines=stable_lines,
+            history_choices=[selected_choice],
+        )
+    )
+    await _drain_agent_summary_tasks(agent)
+
+    content = ctx.pushed_messages[-1]["content"]
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "scene_summary"
+    assert ctx.pushed_messages[-1]["metadata"]["trigger"] == "choice_selected"
+    assert ctx.pushed_messages[-1]["metadata"]["context_boundary"]["choice_marker"]
+    assert "- 陪雪乃回家" in content
+    assert agent._observed_scene_id == "scene-a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_pushes_context_summary_when_save_context_changes_without_scene_change(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    stable_lines = [
+        {
+            "line_id": "line-1",
+            "speaker": "雪乃",
+            "text": "刚才的话还算数吗？",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "stability": "stable",
+            "ts": "2026-04-21T08:35:01Z",
+        }
+    ]
+    load_snapshot = _session_state(
+        speaker="雪乃",
+        text="刚才的话还算数吗？",
+        scene_id="scene-a",
+        line_id="line-1",
+        ts="2026-04-21T08:35:02Z",
+    )
+    load_snapshot["save_context"] = {
+        "kind": "load",
+        "slot_id": "slot-2",
+        "display_name": "读档 2",
+    }
+
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(
+                speaker="雪乃",
+                text="刚才的话还算数吗？",
+                scene_id="scene-a",
+                line_id="line-1",
+                ts="2026-04-21T08:35:01Z",
+            ),
+            history_lines=stable_lines,
+        )
+    )
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=load_snapshot,
+            history_lines=stable_lines,
+        )
+    )
+    await _drain_agent_summary_tasks(agent)
+
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "scene_summary"
+    assert ctx.pushed_messages[-1]["metadata"]["trigger"] == "save_context_changed"
+    assert ctx.pushed_messages[-1]["metadata"]["context_boundary"]["save_kind"] == "load"
+    assert agent._observed_scene_id == "scene-a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_observed_lines_do_not_trigger_line_count_scene_summary(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    observed_lines = [
+        {
+            "line_id": f"observed-{index}",
+            "speaker": "雪乃",
+            "text": f"候选台词 {index}",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "stability": "tentative",
+            "ts": f"2026-04-21T08:36:{index:02d}Z",
+        }
+        for index in range(1, 9)
+    ]
+
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(scene_id="scene-a", line_id="", text=""),
+        )
+    )
+    await agent.tick(
+        _shared_state(
+            mode="companion",
+            snapshot=_session_state(scene_id="scene-a", line_id="", text=""),
+            history_observed_lines=observed_lines,
+        )
+    )
+    await _drain_agent_summary_tasks(agent)
+
+    assert ctx.pushed_messages == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_scene_summary_push_formats_key_points_and_stable_lines(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    fake_gateway = _FakeLLMGateway(
+        summarize_payload={
+            "degraded": False,
+            "summary": "雪乃和主角在放学后对话，雪乃表面冷淡但没有拒绝关心。",
+            "key_points": [
+                {"type": "emotion", "text": "雪乃嘴上冷淡，但情绪上已经开始动摇。"},
+                {"type": "decision", "text": "玩家刚选择继续陪在雪乃身边。"},
+                {"type": "objective", "text": "当前目标是确认雪乃是否愿意接受帮助。"},
+            ],
+            "diagnostic": "",
+        }
+    )
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=fake_gateway,
+        host_adapter=_FakeHostAdapter(),
+    )
+    stable_lines = [
+        {
+            "line_id": f"line-{index}",
+            "speaker": "雪乃" if index % 2 else "主角",
+            "text": f"稳定台词 {index}",
+            "scene_id": "scene-a",
+            "route_id": "",
+            "ts": f"2026-04-21T08:33:{index:02d}Z",
+        }
+        for index in range(1, 9)
+    ]
+    shared = _shared_state(
+        mode="companion",
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="稳定台词 8",
+            scene_id="scene-a",
+            line_id="line-8",
+            ts="2026-04-21T08:33:08Z",
+        ),
+        history_lines=stable_lines,
+        history_observed_lines=[
+            {
+                "line_id": "observed-1",
+                "speaker": "雪乃",
+                "text": "也许我还想再确认一下。",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "stability": "tentative",
+                "ts": "2026-04-21T08:33:09Z",
+            }
+        ],
+        history_choices=[
+            {
+                "choice_id": "choice-1",
+                "text": "陪雪乃回家",
+                "scene_id": "scene-a",
+                "route_id": "",
+                "action": "selected",
+                "ts": "2026-04-21T08:32:00Z",
+            }
+        ],
+    )
+
+    await agent.tick(shared)
+    await agent.tick(shared)
+    await _drain_agent_summary_tasks(agent)
+
+    content = ctx.pushed_messages[-1]["content"]
+    assert "当前场景：" in content
+    assert "最近关键台词：" in content
+    assert "最近选项：" in content
+    assert "- 陪雪乃回家" in content
+    assert "关键变化：" in content
+    assert "人物情绪：雪乃嘴上冷淡" in content
+    assert "玩家选择：玩家刚选择继续陪在雪乃身边" in content
+    assert "当前目标：当前目标是确认雪乃是否愿意接受帮助" in content
+    assert "当前可关注点：" in content
+    assert "待确认候选：" in content
+    assert "雪乃：「也许我还想再确认一下。」（OCR 候选，尚未稳定确认）" in content
+    assert "也许我还想再确认一下。" not in content.split("待确认候选：", 1)[0]
+    assert ctx.pushed_messages[-1]["metadata"]["summary_source"] == "llm"
+    assert ctx.pushed_messages[-1]["metadata"]["scene_summary"] == (
+        "雪乃和主角在放学后对话，雪乃表面冷淡但没有拒绝关心。"
+    )
+    assert ctx.pushed_messages[-1]["metadata"]["key_points"][0]["type"] == "emotion"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
+async def test_game_llm_agent_scene_summary_fallback_marks_observed_as_tentative(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    context = build_summarize_context(
+        _shared_state(
+            snapshot=_session_state(
+                speaker="",
+                text="",
+                scene_id="scene-a",
+                line_id="",
+            ),
+            history_lines=[],
+            history_observed_lines=[
+                {
+                    "line_id": "observed-1",
+                    "speaker": "雪乃",
+                    "text": "也许我并不讨厌这样。",
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                    "stability": "tentative",
+                    "ts": "2026-04-21T08:33:09Z",
+                }
+            ],
+        ),
+        scene_id="scene-a",
+    )
+
+    content, meta = await agent._summarize_scene_context_for_cat(
+        context,
+        scene_id="scene-a",
+        route_id="",
+        snapshot=context["current_snapshot"],
+    )
+
+    assert meta["summary_source"] == "local_context"
+    assert "当前场景：" in content
+    assert "暂时没有足够台词上下文" in content
+    assert "最近关键台词：" in content
+    assert "台词仍在确认中，暂不作为确定剧情事实" in content
+    assert "待确认候选：" in content
+    assert "雪乃：「也许我并不讨厌这样。」（OCR 候选，尚未稳定确认）" in content
+    assert "也许我并不讨厌这样。" not in content.split("待确认候选：", 1)[0]
 
 
 @pytest.mark.asyncio

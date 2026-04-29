@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import calendar
 import os
 import re
 import sys
@@ -448,9 +449,18 @@ def _sanitize_ocr_screen_templates(value: object) -> list[dict[str, Any]]:
     return templates
 
 
-def _coerce_ocr_capture_backend(value: object, default: str = "auto") -> str:
+def _coerce_ocr_capture_backend(value: object, default: str = "smart") -> str:
     normalized = str(value or default).strip().lower()
-    if normalized in {"auto", "dxcam", "imagegrab", "printwindow"}:
+    if normalized in {"auto", "smart", "dxcam", "imagegrab", "printwindow"}:
+        return normalized
+    return default
+
+
+def _coerce_screen_awareness_latency_mode(value: object, default: str = "balanced") -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized == "aggressive":
+        return "full"
+    if normalized in {"off", "balanced", "full"}:
         return normalized
     return default
 
@@ -593,7 +603,7 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ocr_reader_backend_selection_explicit="backend_selection" in ocr_reader_obj,
         ocr_reader_capture_backend=_coerce_ocr_capture_backend(
             ocr_reader_obj.get("capture_backend"),
-            "auto",
+            "smart",
         ),
         ocr_reader_capture_backend_explicit="capture_backend" in ocr_reader_obj,
         ocr_reader_tesseract_path=str(ocr_reader_obj.get("tesseract_path") or ""),
@@ -611,6 +621,10 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ),
         ocr_reader_trigger_mode=_coerce_ocr_trigger_mode(
             ocr_reader_obj.get("trigger_mode"),
+        ),
+        ocr_reader_fast_loop_enabled=_coerce_bool(
+            ocr_reader_obj.get("fast_loop_enabled"),
+            False,
         ),
         ocr_reader_no_text_takeover_after_seconds=_coerce_float(
             ocr_reader_obj.get("no_text_takeover_after_seconds"), 30.0, minimum=0.0
@@ -647,6 +661,15 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
         ocr_reader_screen_awareness_visual_rules=_coerce_bool(
             ocr_reader_obj.get("screen_awareness_visual_rules"),
             False,
+        ),
+        ocr_reader_screen_awareness_latency_mode=_coerce_screen_awareness_latency_mode(
+            ocr_reader_obj.get("screen_awareness_latency_mode"),
+            "balanced",
+        ),
+        ocr_reader_screen_awareness_min_interval_seconds=_coerce_float(
+            ocr_reader_obj.get("screen_awareness_min_interval_seconds"),
+            2.0,
+            minimum=0.0,
         ),
         ocr_reader_screen_awareness_sample_collection_enabled=_coerce_bool(
             ocr_reader_obj.get("screen_awareness_sample_collection_enabled"),
@@ -982,6 +1005,18 @@ def _status_int(value: Any) -> int:
         return 0
 
 
+def _utc_iso_age_seconds(value: Any) -> float:
+    text = _status_text(value)
+    if not text:
+        return 0.0
+    try:
+        parsed = time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+        timestamp = calendar.timegm(parsed)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return max(0.0, time.time() - timestamp)
+
+
 def _line_text_from_status(value: Any) -> str:
     if not isinstance(value, dict):
         return ""
@@ -1096,8 +1131,15 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
     ocr_emit_block_reason = _status_text(
         local_state.get("ocr_emit_block_reason") or runtime_obj.get("ocr_emit_block_reason")
     )
+    stable_block_reason = _status_text(runtime_obj.get("stable_ocr_block_reason"))
+    try:
+        candidate_age_seconds = float(local_state.get("candidate_age_seconds") or 0.0)
+    except (TypeError, ValueError):
+        candidate_age_seconds = 0.0
     last_exclude_reason = _status_text(runtime_obj.get("last_exclude_reason"))
     last_capture_error = _status_text(runtime_obj.get("last_capture_error"))
+    last_rejected_reason = _status_text(runtime_obj.get("last_rejected_ocr_reason"))
+    last_rejected_text = _status_text(runtime_obj.get("last_rejected_ocr_text"))
     last_error_message = _status_text(last_error_obj.get("message"))
     ocr_capture_diagnostic = _status_text(local_state.get("ocr_capture_diagnostic"))
     agent_pause_kind = _status_text(local_state.get("agent_pause_kind"))
@@ -1156,6 +1198,23 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
             ocr_capture_diagnostic or "OCR 轮询尚未完成首次截图，新台词不会继续刷新。",
             [
                 _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if runtime_detail == "self_ui_guard_blocked" or last_rejected_reason == "self_ui_guard":
+        preview = f"最近拒绝文本：{last_rejected_text[:80]}。" if last_rejected_text else ""
+        return diagnosis(
+            "warning",
+            "OCR 抓到了非游戏画面",
+            (
+                f"{preview}OCR 已拒绝该文本并跳过扩展画面识别。"
+                "请确认游戏窗口在前台或切换到 Smart/PrintWindow 截图方式。"
+            ),
+            [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+                _diagnosis_action("capture_backend", "切换截图方式"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
                 _diagnosis_action("debug_details", "查看调试详情"),
             ],
         )
@@ -1253,6 +1312,20 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
             f"当前轮询门控原因：{ocr_tick_block_reason}。",
             [
                 _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if stable_block_reason == "waiting_for_repeat" and candidate_age_seconds > 8.0:
+        return diagnosis(
+            "warning",
+            "OCR 候选台词确认过慢",
+            (
+                f"候选台词已经等待 {candidate_age_seconds:.1f}s，"
+                "通常表示下一轮 OCR 没有及时跑起来，或两轮识别结果不稳定。"
+            ),
+            [
+                _diagnosis_action("line_details", "查看识别详情"),
                 _diagnosis_action("debug_details", "查看调试详情"),
             ],
         )
@@ -1799,6 +1872,12 @@ def build_status_payload(
                 "last_error": last_error,
             }
         )
+    candidate_age_seconds = _utc_iso_age_seconds(ocr_runtime_obj.get("last_observed_at"))
+    stable_confirm_wait_seconds = (
+        candidate_age_seconds
+        if str(ocr_runtime_obj.get("stable_ocr_block_reason") or "") == "waiting_for_repeat"
+        else 0.0
+    )
     local_state = {
         "latest_snapshot": copy_for_payload(state.latest_snapshot),
         "history_observed_lines": copy_for_payload(state.history_observed_lines),
@@ -1833,6 +1912,8 @@ def build_status_payload(
             "ocr_context_state": ocr_runtime_obj.get("ocr_context_state", ""),
             "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
             "ocr_capture_diagnostic": ocr_capture_diagnostic,
+            "candidate_age_seconds": candidate_age_seconds,
+            "stable_confirm_wait_seconds": stable_confirm_wait_seconds,
             "ocr_tick_block_reason": str(ocr_runtime_obj.get("ocr_tick_block_reason") or ""),
             "ocr_emit_block_reason": str(ocr_runtime_obj.get("ocr_emit_block_reason") or ""),
             "ocr_reader_enabled": config.ocr_reader_enabled,
@@ -1867,6 +1948,8 @@ def build_status_payload(
         "effective_current_line": copy_for_payload(effective_current_line or {}),
         "ocr_capture_diagnostic_required": ocr_capture_diagnostic_required,
         "ocr_capture_diagnostic": ocr_capture_diagnostic,
+        "candidate_age_seconds": candidate_age_seconds,
+        "stable_confirm_wait_seconds": stable_confirm_wait_seconds,
         "ocr_tick_allowed": bool(ocr_runtime_obj.get("ocr_tick_allowed")),
         "ocr_tick_block_reason": str(ocr_runtime_obj.get("ocr_tick_block_reason") or ""),
         "ocr_emit_block_reason": str(ocr_runtime_obj.get("ocr_emit_block_reason") or ""),
@@ -1908,6 +1991,7 @@ def build_status_payload(
         "ocr_capture_backend_selection": config.ocr_reader_capture_backend,
         "ocr_reader_poll_interval_seconds": config.ocr_reader_poll_interval_seconds,
         "ocr_reader_trigger_mode": config.ocr_reader_trigger_mode,
+        "ocr_reader_fast_loop_enabled": config.ocr_reader_fast_loop_enabled,
         "llm_vision_enabled": config.llm_vision_enabled,
         "llm_vision_max_image_px": config.llm_vision_max_image_px,
         "ocr_screen_templates": copy_for_payload(config.ocr_reader_screen_templates),
@@ -1915,6 +1999,10 @@ def build_status_payload(
         "ocr_screen_awareness_full_frame_ocr": config.ocr_reader_screen_awareness_full_frame_ocr,
         "ocr_screen_awareness_multi_region_ocr": config.ocr_reader_screen_awareness_multi_region_ocr,
         "ocr_screen_awareness_visual_rules": config.ocr_reader_screen_awareness_visual_rules,
+        "ocr_screen_awareness_latency_mode": config.ocr_reader_screen_awareness_latency_mode,
+        "ocr_screen_awareness_min_interval_seconds": (
+            config.ocr_reader_screen_awareness_min_interval_seconds
+        ),
         "ocr_screen_awareness_sample_collection_enabled": (
             config.ocr_reader_screen_awareness_sample_collection_enabled
         ),
@@ -2332,6 +2420,38 @@ def build_local_scene_summary(
     return summary
 
 
+def _snapshot_for_stable_summary_seed(
+    local_state: dict[str, Any],
+    snapshot: dict[str, Any],
+    stable_lines: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if str(local_state.get("active_data_source") or "") != DATA_SOURCE_OCR_READER:
+        return snapshot
+    if str(snapshot.get("stability") or "") == "stable":
+        return snapshot
+    snapshot_line_id = str(snapshot.get("line_id") or "")
+    snapshot_text = str(snapshot.get("text") or "")
+    snapshot_speaker = str(snapshot.get("speaker") or "")
+    for line in stable_lines:
+        if not isinstance(line, dict):
+            continue
+        line_id = str(line.get("line_id") or "")
+        if snapshot_line_id and line_id and snapshot_line_id == line_id:
+            return snapshot
+        if (
+            snapshot_text
+            and snapshot_text == str(line.get("text") or "")
+            and snapshot_speaker == str(line.get("speaker") or "")
+        ):
+            return snapshot
+    seed_snapshot = dict(snapshot)
+    seed_snapshot["speaker"] = ""
+    seed_snapshot["text"] = ""
+    seed_snapshot["line_id"] = ""
+    seed_snapshot["stability"] = ""
+    return seed_snapshot
+
+
 def build_explain_context(local_state: dict[str, Any], *, line_id: str) -> dict[str, Any]:
     snapshot = sanitize_snapshot_state(local_state.get("latest_snapshot", {}))
     effective_line = resolve_effective_current_line(local_state)
@@ -2473,9 +2593,9 @@ def build_summarize_context(
         "scene_summary_seed": build_local_scene_summary(
             scene_id=effective_scene_id,
             route_id=route_id,
-            lines=scene_lines,
+            lines=stable_lines,
             selected_choices=selected_choices,
-            snapshot=snapshot,
+            snapshot=_snapshot_for_stable_summary_seed(local_state, snapshot, stable_lines),
         ),
         "input_source": input_source,
         "input_degraded": input_degraded,

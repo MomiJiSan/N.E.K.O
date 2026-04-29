@@ -510,7 +510,7 @@ class GalgameOcrReaderConfig:
     ocr_reader_enabled_explicit: bool = False
     ocr_reader_backend_selection: str = "auto"
     ocr_reader_backend_selection_explicit: bool = False
-    ocr_reader_capture_backend: str = "auto"
+    ocr_reader_capture_backend: str = "smart"
     ocr_reader_capture_backend_explicit: bool = False
     ocr_reader_tesseract_path: str = ""
     ocr_reader_install_manifest_url: str = ""
@@ -518,6 +518,7 @@ class GalgameOcrReaderConfig:
     ocr_reader_install_timeout_seconds: float = 300.0
     ocr_reader_poll_interval_seconds: float = 2.0
     ocr_reader_trigger_mode: str = OCR_TRIGGER_MODE_INTERVAL
+    ocr_reader_fast_loop_enabled: bool = False
     ocr_reader_no_text_takeover_after_seconds: float = 30.0
     ocr_reader_languages: str = "chi_sim+jpn+eng"
     ocr_reader_left_inset_ratio: float = DEFAULT_OCR_CAPTURE_LEFT_INSET_RATIO
@@ -527,6 +528,8 @@ class GalgameOcrReaderConfig:
     ocr_reader_screen_awareness_full_frame_ocr: bool = False
     ocr_reader_screen_awareness_multi_region_ocr: bool = False
     ocr_reader_screen_awareness_visual_rules: bool = False
+    ocr_reader_screen_awareness_latency_mode: str = "balanced"
+    ocr_reader_screen_awareness_min_interval_seconds: float = 2.0
     ocr_reader_screen_awareness_sample_collection_enabled: bool = False
     ocr_reader_screen_awareness_sample_dir: str = ""
     ocr_reader_screen_awareness_model_enabled: bool = False
@@ -620,6 +623,7 @@ class GalgameConfig:
         ),
         "ocr_reader_poll_interval_seconds": ("ocr_reader", "ocr_reader_poll_interval_seconds"),
         "ocr_reader_trigger_mode": ("ocr_reader", "ocr_reader_trigger_mode"),
+        "ocr_reader_fast_loop_enabled": ("ocr_reader", "ocr_reader_fast_loop_enabled"),
         "ocr_reader_no_text_takeover_after_seconds": (
             "ocr_reader",
             "ocr_reader_no_text_takeover_after_seconds",
@@ -640,6 +644,14 @@ class GalgameConfig:
         "ocr_reader_screen_awareness_visual_rules": (
             "ocr_reader",
             "ocr_reader_screen_awareness_visual_rules",
+        ),
+        "ocr_reader_screen_awareness_latency_mode": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_latency_mode",
+        ),
+        "ocr_reader_screen_awareness_min_interval_seconds": (
+            "ocr_reader",
+            "ocr_reader_screen_awareness_min_interval_seconds",
         ),
         "ocr_reader_screen_awareness_sample_collection_enabled": (
             "ocr_reader",
