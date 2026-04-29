@@ -7922,6 +7922,39 @@ class OcrReaderManager:
         preferred_process_name = str(
             (memory_reader_runtime or {}).get("process_name") or ""
         ).strip().lower()
+        memory_reader_status = str((memory_reader_runtime or {}).get("status") or "")
+        prefer_memory_reader_window = (
+            getattr(self._config, "reader_mode", READER_MODE_AUTO) == READER_MODE_AUTO
+            and memory_reader_status in {"attaching", "active"}
+            and (preferred_pid > 0 or bool(preferred_process_name))
+        )
+
+        def _matches_memory_reader_target(candidate: DetectedGameWindow) -> bool:
+            if preferred_pid > 0 and candidate.pid == preferred_pid:
+                return True
+            return (
+                bool(preferred_process_name)
+                and str(candidate.process_name or "").strip().lower() == preferred_process_name
+            )
+
+        manual_target_overridden_by_memory_reader = False
+
+        def _manual_target_allowed(candidate: DetectedGameWindow) -> bool:
+            nonlocal manual_target_overridden_by_memory_reader
+            if not prefer_memory_reader_window:
+                return True
+            if _matches_memory_reader_target(candidate):
+                return True
+            manual_target_overridden_by_memory_reader = True
+            selection.selection_detail = "manual_target_overridden_by_memory_reader"
+            return False
+
+        def _clear_overridden_manual_target() -> None:
+            if not manual_target_overridden_by_memory_reader:
+                return
+            self._manual_target = OcrWindowTarget()
+            selection.selection_mode = "auto"
+            selection.manual_target = self._manual_target
 
         def _memory_reader_minimized_window() -> DetectedGameWindow | None:
             if preferred_pid <= 0 and not preferred_process_name:
@@ -7968,7 +8001,13 @@ class OcrReaderManager:
 
         if self._manual_target.is_manual():
             for candidate in windows:
-                if self._manual_target.matches_exact(candidate) or self._manual_target.matches_hwnd(candidate):
+                if (
+                    (
+                        self._manual_target.matches_exact(candidate)
+                        or self._manual_target.matches_hwnd(candidate)
+                    )
+                    and _manual_target_allowed(candidate)
+                ):
                     resolved_target = self._manual_target.resolved_for(candidate)
                     self._manual_target = resolved_target
                     selection.target = candidate
@@ -7977,7 +8016,7 @@ class OcrReaderManager:
                     selection.selected_by_manual = True
                     return selection
             for candidate in windows:
-                if self._manual_target.matches_signature(candidate):
+                if self._manual_target.matches_signature(candidate) and _manual_target_allowed(candidate):
                     resolved_target = self._manual_target.resolved_for(candidate)
                     self._manual_target = resolved_target
                     selection.target = candidate
@@ -7985,25 +8024,40 @@ class OcrReaderManager:
                     selection.manual_target = resolved_target
                     selection.selected_by_manual = True
                     return selection
-            selection.selection_detail = "manual_target_unavailable_fallback_to_auto"
+            if not manual_target_overridden_by_memory_reader:
+                selection.selection_detail = "manual_target_unavailable_fallback_to_auto"
 
         if preferred_pid > 0:
             for candidate in windows:
                 if candidate.pid == preferred_pid:
                     selection.target = candidate
-                    if selection.selection_mode == "auto":
+                    if manual_target_overridden_by_memory_reader:
+                        _clear_overridden_manual_target()
+                        selection.selection_detail = "manual_target_overridden_by_memory_reader_pid"
+                    elif selection.selection_mode == "auto":
                         selection.selection_detail = "memory_reader_pid"
                     return selection
         if preferred_process_name:
             for candidate in windows:
                 if str(candidate.process_name or "").strip().lower() == preferred_process_name:
                     selection.target = candidate
-                    if selection.selection_mode == "auto":
+                    if manual_target_overridden_by_memory_reader:
+                        _clear_overridden_manual_target()
+                        selection.selection_detail = "manual_target_overridden_by_memory_reader_process"
+                    elif selection.selection_mode == "auto":
                         selection.selection_detail = "memory_reader_process"
                     return selection
         minimized_window = _memory_reader_minimized_window()
         if minimized_window is not None:
             return _use_memory_reader_minimized_diagnostic(minimized_window)
+        if prefer_memory_reader_window:
+            _clear_overridden_manual_target()
+            selection.selection_detail = (
+                "manual_target_overridden_by_memory_reader_unavailable"
+                if manual_target_overridden_by_memory_reader
+                else "memory_reader_target_unavailable"
+            )
+            return selection
         if self._attached_window is not None:
             for candidate in windows:
                 if candidate.hwnd == self._attached_window.hwnd:

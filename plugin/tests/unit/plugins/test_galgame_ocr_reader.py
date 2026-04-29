@@ -32,6 +32,7 @@ from plugin.plugins.galgame_plugin.models import (
     OCR_TRIGGER_MODE_AFTER_ADVANCE,
     OCR_TRIGGER_MODE_INTERVAL,
     READER_MODE_AUTO,
+    READER_MODE_OCR,
 )
 from plugin.plugins.galgame_plugin.ocr_reader import (
     DetectedGameWindow,
@@ -3668,6 +3669,196 @@ async def test_ocr_reader_manager_prefers_manual_target_and_rebinds_by_signature
     assert result.runtime["manual_target"]["pid"] == rebound_window.pid
     assert manager.current_window_target()["window_key"] == rebound_window.window_key
     assert manager.current_window_target()["pid"] == rebound_window.pid
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_auto_prefers_memory_reader_target_over_stale_manual_target(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    stale_manual_window = DetectedGameWindow(
+        hwnd=777,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=19224,
+    )
+    current_memory_window = DetectedGameWindow(
+        hwnd=888,
+        title="Senren Banka",
+        process_name="SenrenBanka.exe",
+        pid=34284,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            reader_mode=READER_MODE_AUTO,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [stale_manual_window, current_memory_window],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager.update_window_target(
+        {
+            "mode": "manual",
+            "window_key": stale_manual_window.window_key,
+            "process_name": stale_manual_window.process_name,
+            "normalized_title": stale_manual_window.normalized_title,
+            "pid": stale_manual_window.pid,
+            "last_known_hwnd": stale_manual_window.hwnd,
+            "selected_at": "2026-04-29T09:50:58Z",
+        }
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={
+            "status": "active",
+            "pid": current_memory_window.pid,
+            "process_name": current_memory_window.process_name,
+            "last_text_recent": False,
+        },
+    )
+
+    assert capture_backend.capture_calls[0][0] == current_memory_window.hwnd
+    assert result.runtime["process_name"] == current_memory_window.process_name
+    assert result.runtime["target_selection_mode"] == "auto"
+    assert (
+        result.runtime["target_selection_detail"]
+        == "manual_target_overridden_by_memory_reader_pid"
+    )
+    assert manager.current_window_target()["mode"] == "auto"
+    assert manager.current_window_target()["window_key"] == ""
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_auto_does_not_fall_back_to_stale_manual_when_memory_target_missing(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    stale_manual_window = DetectedGameWindow(
+        hwnd=777,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=19224,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            reader_mode=READER_MODE_AUTO,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [stale_manual_window],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager.update_window_target(
+        {
+            "mode": "manual",
+            "window_key": stale_manual_window.window_key,
+            "process_name": stale_manual_window.process_name,
+            "normalized_title": stale_manual_window.normalized_title,
+            "pid": stale_manual_window.pid,
+            "last_known_hwnd": stale_manual_window.hwnd,
+            "selected_at": "2026-04-29T09:50:58Z",
+        }
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={
+            "status": "active",
+            "pid": 34284,
+            "process_name": "SenrenBanka.exe",
+            "last_text_recent": False,
+        },
+    )
+
+    assert capture_backend.capture_calls == []
+    assert result.runtime["status"] == "idle"
+    assert result.runtime["detail"] == "waiting_for_valid_window"
+    assert (
+        result.runtime["target_selection_detail"]
+        == "manual_target_overridden_by_memory_reader_unavailable"
+    )
+    assert manager.current_window_target()["mode"] == "auto"
+    assert manager.current_window_target()["window_key"] == ""
+
+
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_ocr_mode_keeps_manual_target_over_memory_reader_runtime(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    install_root = tmp_path / "Tesseract"
+    _install_fake_tesseract(install_root)
+    manual_window = DetectedGameWindow(
+        hwnd=777,
+        title="TheLamentingGeese",
+        process_name="TheLamentingGeese.exe",
+        pid=19224,
+    )
+    memory_window = DetectedGameWindow(
+        hwnd=888,
+        title="Senren Banka",
+        process_name="SenrenBanka.exe",
+        pid=34284,
+    )
+    capture_backend = _FakeCaptureBackend()
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(
+            bridge_root,
+            enabled=True,
+            install_target_dir=str(install_root),
+            reader_mode=READER_MODE_OCR,
+        ),
+        platform_fn=lambda: True,
+        window_scanner=lambda: [manual_window, memory_window],
+        capture_backend=capture_backend,
+        ocr_backend=_FakeOcrBackend(),
+    )
+    manager.update_window_target(
+        {
+            "mode": "manual",
+            "window_key": manual_window.window_key,
+            "process_name": manual_window.process_name,
+            "normalized_title": manual_window.normalized_title,
+            "pid": manual_window.pid,
+            "last_known_hwnd": manual_window.hwnd,
+            "selected_at": "2026-04-29T09:50:58Z",
+        }
+    )
+
+    result = await manager.tick(
+        bridge_sdk_available=False,
+        memory_reader_runtime={
+            "status": "active",
+            "pid": memory_window.pid,
+            "process_name": memory_window.process_name,
+            "last_text_recent": False,
+        },
+    )
+
+    assert capture_backend.capture_calls[0][0] == manual_window.hwnd
+    assert result.runtime["process_name"] == manual_window.process_name
+    assert result.runtime["target_selection_mode"] == "manual"
+    assert result.runtime["target_selection_detail"] == "manual_target_exact"
 
 
 @pytest.mark.asyncio
