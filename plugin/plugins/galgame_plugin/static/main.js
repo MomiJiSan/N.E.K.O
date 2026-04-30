@@ -2559,7 +2559,7 @@ function renderInstallTaskState(kind) {
 function renderPluginUnavailable(error) {
   latestStatus = null;
   const message = error instanceof Error ? error.message : String(error || '插件尚未启动');
-  document.getElementById('summaryText').textContent = '插件尚未启动';
+  renderStatusSummaryFallback('插件未启动', message);
   renderPrimaryDiagnosis({
     connection_state: 'plugin_not_started',
     last_error: { message },
@@ -2789,7 +2789,7 @@ async function restoreTesseractInstallState() {
 
 function renderStatus(status) {
   latestStatus = status;
-  document.getElementById('summaryText').textContent = buildStatusSummaryText(status);
+  renderStatusSummary(status);
   syncSettingsValue('modeSelect', status.mode || 'companion');
   syncSettingsChecked('pushToggle', Boolean(status.push_notifications));
   syncSettingsValue('advanceSpeedSelect', status.advance_speed || 'medium');
@@ -2802,7 +2802,8 @@ function renderStatus(status) {
   document.querySelectorAll('#speedSwitch .speed-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.speed === currentSpeed);
   });
-  document.querySelector('.hero').classList.toggle('mode-auto', currentMode === 'choice_advisor');
+  const headerBar = document.querySelector('.console-header-bar');
+  headerBar?.classList.toggle('mode-auto', currentMode === 'choice_advisor');
   syncSettingsValue('readerModeSelect', status.reader_mode || 'auto');
   const ocrPollIntervalInput = document.getElementById('ocrPollIntervalInput');
   if (ocrPollIntervalInput && !shouldPreserveSettingsControls()) {
@@ -3130,9 +3131,29 @@ function formatDataSourceZh(value) {
   return DATA_SOURCE_LABELS_ZH[normalized] || normalized || '未知来源';
 }
 
-function buildStatusSummaryText(status) {
+function summaryToneForConnectionState(value) {
+  const normalized = textValue(value);
+  if (normalized === 'active') {
+    return 'active';
+  }
+  if (normalized === 'error') {
+    return 'error';
+  }
+  if (['disconnected', 'inactive', 'stale'].includes(normalized)) {
+    return 'warning';
+  }
+  return 'neutral';
+}
+
+function buildStatusSummaryModel(status) {
   if (!status || typeof status !== 'object') {
-    return '无摘要';
+    return {
+      primaryTags: [
+        { label: '状态', value: '等待刷新', tone: 'neutral' },
+      ],
+      detailItems: [],
+      detailToggleText: '',
+    };
   }
 
   const source = String(status.active_data_source || '').trim();
@@ -3145,48 +3166,131 @@ function buildStatusSummaryText(status) {
     ? status.last_error.message.trim()
     : '';
 
-  let prefix = '';
-  if (source === 'ocr_reader' && sessionId) {
-    prefix = '已通过 OCR 读取连接（降级模式）';
-  } else if (source === 'memory_reader' && sessionId) {
-    prefix = '已通过内存读取连接（降级模式）';
-  } else if (source === 'bridge_sdk' && sessionId) {
-    prefix = '已通过 Bridge SDK 连接';
-  } else if (status.connection_state === 'stale') {
-    prefix = '当前桥接快照已过期';
-  } else if (status.connection_state === 'active') {
-    prefix = '当前桥接链路运行中';
-  } else {
-    prefix = `当前数据源：${formatDataSourceZh(source)}`;
-  }
-
-  const parts = [
-    `状态：${connectionState}`,
-    `模式：${mode}`,
+  const primaryTags = [
+    { label: '数据源', value: formatDataSourceZh(source), tone: source ? 'active' : 'neutral' },
+    { label: '状态', value: connectionState, tone: summaryToneForConnectionState(status.connection_state) },
+    { label: '模式', value: mode, tone: 'info' },
   ];
 
   if (boundGameId) {
-    parts.push(`绑定：${boundGameId}`);
+    primaryTags.push({ label: '绑定', value: boundGameId, tone: 'active' });
   }
   if (sessionId) {
-    parts.push(`会话：${sessionId}`);
+    primaryTags.push({ label: '会话', value: sessionId, tone: 'neutral' });
   }
-  parts.push(`最新序号：${lastSeq}`);
+  primaryTags.push({ label: '序号', value: lastSeq, tone: 'neutral' });
+
+  const detailItems = [];
 
   if (warningMessage) {
-    parts.push(`告警：${warningMessage}`);
+    detailItems.push({ label: '告警', value: warningMessage, tone: 'warning' });
   }
   if (status.ocr_capture_diagnostic_required) {
-    parts.push(`OCR诊断：${status.ocr_context_state || ocrRuntimeState(status) || '截图区/窗口目标可能异常'}`);
+    detailItems.push({
+      label: 'OCR',
+      value: status.ocr_context_state || ocrRuntimeState(status) || '截图区/窗口目标可能异常',
+      tone: 'warning',
+    });
   }
   if (status.agent_diagnostic_required || status.agent_reason) {
     const agentText = status.agent_diagnostic || status.agent_reason || status.agent_status || '';
     if (agentText) {
-      parts.push(`Agent：${agentText}`);
+      detailItems.push({ label: 'Agent', value: agentText, tone: 'info' });
     }
   }
 
-  return `${prefix}｜${parts.join('｜')}`;
+  return {
+    primaryTags,
+    detailItems,
+    detailToggleText: detailItems.length ? `告警与诊断 ${detailItems.length}` : '',
+  };
+}
+
+function summaryModelToText(model) {
+  if (!model || typeof model !== 'object') {
+    return '无摘要';
+  }
+  const primary = Array.isArray(model.primaryTags)
+    ? model.primaryTags
+      .map((item) => `${textValue(item.label)}：${textValue(item.value)}`)
+      .filter(Boolean)
+      .join('｜')
+    : '';
+  const detail = Array.isArray(model.detailItems)
+    ? model.detailItems
+      .map((item) => `${textValue(item.label)}：${textValue(item.value)}`)
+      .filter(Boolean)
+      .join('｜')
+    : '';
+  return [primary, detail].filter(Boolean).join('｜') || '无摘要';
+}
+
+function renderStatusSummaryModel(model) {
+  const root = document.getElementById('summaryText');
+  if (!root) {
+    return;
+  }
+  const primaryNode = document.getElementById('summaryPrimaryTags');
+  const detailsNode = document.getElementById('summaryWarningDetails');
+  const toggleTextNode = document.getElementById('summaryWarningToggleText');
+  const listNode = document.getElementById('summaryWarningList');
+
+  if (!primaryNode || !detailsNode || !toggleTextNode || !listNode) {
+    root.textContent = summaryModelToText(model);
+    return;
+  }
+
+  const primaryTags = Array.isArray(model?.primaryTags) ? model.primaryTags : [];
+  const detailItems = Array.isArray(model?.detailItems) ? model.detailItems : [];
+  primaryNode.innerHTML = primaryTags.map((item) => `
+    <span class="summary-tag ${escapeHtml(item.tone || 'neutral')}">
+      <span class="summary-tag-label">${escapeHtml(item.label || '')}</span>
+      <span class="summary-tag-value">${escapeHtml(item.value || '')}</span>
+    </span>
+  `).join('');
+
+  if (!detailItems.length) {
+    detailsNode.hidden = true;
+    detailsNode.open = false;
+    detailsNode.dataset.signature = '';
+    toggleTextNode.textContent = '查看告警';
+    listNode.innerHTML = '';
+    return;
+  }
+
+  const signature = JSON.stringify(detailItems);
+  const previousSignature = detailsNode.dataset.signature || '';
+  const wasOpen = detailsNode.open;
+  detailsNode.hidden = false;
+  detailsNode.dataset.signature = signature;
+  toggleTextNode.textContent = model.detailToggleText || `告警与诊断 ${detailItems.length}`;
+  listNode.innerHTML = detailItems.map((item) => `
+    <div class="summary-warning-item ${escapeHtml(item.tone || 'warning')}">
+      <span class="summary-warning-item-label">${escapeHtml(item.label || '')}</span>
+      <span class="summary-warning-item-value">${escapeHtml(item.value || '')}</span>
+    </div>
+  `).join('');
+  detailsNode.open = signature === previousSignature ? wasOpen : false;
+}
+
+function renderStatusSummary(status) {
+  renderStatusSummaryModel(buildStatusSummaryModel(status));
+}
+
+function renderStatusSummaryFallback(title, detail = '') {
+  renderStatusSummaryModel({
+    primaryTags: [
+      { label: '状态', value: title || '等待刷新', tone: 'warning' },
+    ],
+    detailItems: detail
+      ? [{ label: '详情', value: detail, tone: 'warning' }]
+      : [],
+    detailToggleText: detail ? '查看详情' : '',
+  });
+}
+
+function buildStatusSummaryText(status) {
+  return summaryModelToText(buildStatusSummaryModel(status));
 }
 
 function ocrRuntimeState(status) {

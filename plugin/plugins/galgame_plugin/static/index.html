@@ -7,13 +7,313 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <title>Galgame 游玩助手</title>
-  <link rel="stylesheet" href="./style.css?v=20260429-restructure">
+  <title>Galgame 游玩助手控制台</title>
+  <link rel="stylesheet" href="./style.css?v=20260430-scrollbar-restore">
+  <style>
+    :root {
+      --console-bg: #f8fafc;
+      --console-surface: #ffffff;
+      --console-border: #e2e8f0;
+      --console-border-hover: #cbd5e1;
+      --console-text-main: #0f172a;
+      --console-text-muted: #64748b;
+      --console-radius: 12px;
+      --console-radius-sm: 8px;
+      --console-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+      --console-shadow-sm: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+      --console-primary: #3b82f6;
+      --console-ring: rgba(59, 130, 246, 0.4);
+    }
+
+    body {
+      background-color: var(--console-bg);
+      background-image: radial-gradient(var(--console-border) 1px, transparent 1px);
+      background-size: 24px 24px;
+      color: var(--console-text-main);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    .console-header-bar {
+      position: sticky;
+      top: 0;
+      z-index: 120;
+      isolation: isolate;
+      background: #ffffff;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+      border-bottom: 1px solid var(--console-border);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+      padding: 16px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .console-header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .console-header-title {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: -0.025em;
+      background: linear-gradient(135deg, #0f172a 0%, #334155 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin: 0;
+      white-space: nowrap;
+    }
+
+    .console-main-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 24px;
+      padding: 24px 32px;
+      max-width: 1600px;
+      margin: 0 auto;
+      align-items: start;
+    }
+
+    @media (min-width: 1100px) {
+      .console-main-grid {
+        grid-template-columns: minmax(0, 2fr) minmax(340px, 1fr);
+      }
+    }
+
+    .console-col {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-width: 0;
+    }
+
+    .console-panel {
+      background: var(--console-surface);
+      border: 1px solid var(--console-border);
+      border-radius: var(--console-radius);
+      padding: 24px;
+      box-shadow: var(--console-shadow-sm);
+      transition: box-shadow 0.2s ease, transform 0.2s ease;
+    }
+
+    .console-panel:hover {
+      box-shadow: var(--console-shadow);
+    }
+
+    .console-panel.panel,
+    .console-panel.info,
+    .console-panel.primary-diagnosis {
+      margin-bottom: 0;
+    }
+
+    .console-section-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--console-text-main);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--console-border);
+    }
+
+    .target-card {
+      background: #f8fafc;
+      border: 1px solid var(--console-border);
+      border-radius: var(--console-radius-sm);
+      padding: 16px;
+      margin-bottom: 16px;
+      transition: border-color 0.2s ease;
+    }
+
+    .target-card:hover {
+      border-color: var(--console-border-hover);
+    }
+
+    .target-card:last-child {
+      margin-bottom: 0;
+    }
+
+    .target-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .target-card-title {
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--console-text-main);
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .target-card-title::before {
+      content: "";
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--console-primary);
+      flex: none;
+    }
+
+    .compact-field {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 0;
+      border-bottom: 1px dashed var(--console-border);
+    }
+
+    .compact-field:last-child {
+      border-bottom: none;
+    }
+
+    .compact-field span {
+      font-size: 13px;
+      color: var(--console-text-muted);
+      font-weight: 500;
+      flex: 1;
+    }
+
+    .console-input,
+    .compact-field select,
+    .compact-field input[type="number"],
+    .compact-field input[type="text"],
+    input[type="text"],
+    textarea {
+      padding: 8px 12px;
+      border: 1px solid var(--console-border);
+      border-radius: var(--console-radius-sm);
+      font-size: 13px;
+      color: var(--console-text-main);
+      background: var(--console-surface);
+      transition: all 0.2s ease;
+      outline: none;
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.02);
+    }
+
+    .console-input:focus,
+    .compact-field select:focus,
+    .compact-field input:focus,
+    input[type="text"]:focus,
+    textarea:focus {
+      border-color: var(--console-primary);
+      box-shadow: 0 0 0 3px var(--console-ring);
+    }
+
+    .btn-row-sm {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .btn-row-sm button {
+      flex: 1;
+    }
+
+    .console-btn-mini {
+      padding: 4px 10px !important;
+      font-size: 12px !important;
+      border-radius: 6px !important;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 600 !important;
+    }
+
+    button.primary,
+    button.secondary,
+    button.ghost {
+      border-radius: var(--console-radius-sm) !important;
+      transition: all 0.2s ease !important;
+    }
+
+    button.primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 6px -1px rgba(59, 130, 246, 0.4);
+    }
+
+    details summary {
+      cursor: pointer;
+      outline: none;
+      font-weight: 600;
+    }
+
+    details[open] summary {
+      margin-bottom: 12px;
+    }
+
+    #advancedSettings {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 0 32px 40px;
+    }
+
+    .adv-grid-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+      gap: 24px;
+    }
+
+    .result-note {
+      color: var(--console-text-muted);
+      font-size: 12px;
+      margin-top: 4px;
+      line-height: 1.5;
+    }
+
+    .highlight-text {
+      font-weight: 700;
+      color: var(--console-primary);
+    }
+
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 10px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+
+    @media (max-width: 1099px) {
+      .console-header-bar {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .console-header-left,
+      .hero-right {
+        width: 100%;
+      }
+    }
+  </style>
 </head>
 <body>
   <div class="page-shell">
 
-    <!-- ========== 阶段 A: 引导模式 ========== -->
     <div id="onboardingView" class="onboarding-view" hidden>
       <div class="onboarding-card">
         <div class="onboarding-header">
@@ -27,24 +327,35 @@
       </div>
     </div>
 
-    <!-- ========== 阶段 B/C: 主界面 + 高级设置 ========== -->
     <div id="mainView">
-
-      <header class="hero">
-        <div>
-          <h1 class="hero-title">Galgame 游玩助手</h1>
-          <span id="summaryText" class="summary-pill">等待首次刷新</span>
+      <header class="console-header-bar">
+        <div class="console-header-left">
+          <h1 class="console-header-title">助手控制台</h1>
+          <div id="summaryText" class="summary-pill">
+            <div id="summaryPrimaryTags" class="summary-primary-tags">
+              <span class="summary-tag neutral">
+                <span class="summary-tag-label">状态</span>
+                <span class="summary-tag-value">等待刷新</span>
+              </span>
+            </div>
+            <details id="summaryWarningDetails" class="summary-warning-details" hidden>
+              <summary id="summaryWarningToggle" class="summary-warning-toggle">
+                <span id="summaryWarningToggleText">查看告警</span>
+              </summary>
+              <div id="summaryWarningList" class="summary-warning-list"></div>
+            </details>
+          </div>
         </div>
         <div class="hero-right">
           <div class="hero-controls">
             <div class="mode-switch" id="modeSwitch">
               <button class="mode-btn" data-mode="silent">静默</button>
-              <button class="mode-btn active" data-mode="companion">伴读</button>
+              <button class="mode-btn" data-mode="companion">伴读</button>
               <button class="mode-btn" data-mode="choice_advisor">自动推进</button>
             </div>
             <div class="speed-switch" id="speedSwitch">
               <button class="speed-btn" data-speed="slow">慢</button>
-              <button class="speed-btn active" data-speed="medium">中等</button>
+              <button class="speed-btn" data-speed="medium">中等</button>
               <button class="speed-btn" data-speed="fast">快速</button>
             </div>
             <select id="modeSelect" hidden>
@@ -59,450 +370,414 @@
             </select>
           </div>
           <div class="hero-actions">
-            <button id="refreshBtn" class="primary">刷新全部</button>
+            <button id="refreshBtn" class="primary">刷新全局状态</button>
           </div>
         </div>
       </header>
 
-      <section id="primaryDiagnosisPanel" class="primary-diagnosis info" aria-live="polite">
-        <div class="primary-diagnosis-copy">
-          <p id="primaryDiagnosisKicker" class="list-kicker">运行诊断</p>
-          <h2 id="primaryDiagnosisTitle">等待插件状态</h2>
-          <p id="primaryDiagnosisBody">状态加载后，这里会显示当前能不能识别台词以及下一步操作。</p>
-        </div>
-        <div id="primaryDiagnosisActions" class="primary-diagnosis-actions"></div>
-      </section>
+      <div class="console-main-grid">
+        <div class="console-col console-col-main">
+          <section id="primaryDiagnosisPanel" class="primary-diagnosis info console-panel" aria-live="polite">
+            <div class="primary-diagnosis-copy">
+              <p id="primaryDiagnosisKicker" class="list-kicker">系统状态诊断</p>
+              <h2 id="primaryDiagnosisTitle">等待插件状态</h2>
+              <p id="primaryDiagnosisBody">状态加载后，这里会显示当前能不能识别台词以及下一步操作。</p>
+            </div>
+            <div id="primaryDiagnosisActions" class="primary-diagnosis-actions"></div>
+          </section>
 
-      <section id="currentLineOverview" class="current-line-overview">
-        <div class="current-line-head">
-          <div>
-            <p class="list-kicker">当前台词</p>
-            <h2 id="currentLineOverviewTitle">等待识别结果</h2>
+          <div id="agentUserNotice" class="agent-user-notice neutral console-panel" hidden>
+            <div>
+              <p class="list-kicker">Agent 状态</p>
+              <h3 id="agentUserNoticeTitle">等待状态刷新</h3>
+              <p id="agentUserNoticeBody" class="agent-user-notice-body"></p>
+              <p id="agentUserNoticeTarget" class="result-note"></p>
+            </div>
           </div>
-          <span id="currentLineOverviewStatus" class="status-chip">等待刷新</span>
-        </div>
-        <p id="currentLineOverviewHint" class="result-note">识别到文字后，这里会区分刚读到的候选台词和已确认台词。</p>
-        <div id="currentLineEffectiveText" class="current-line-effective" hidden></div>
-        <details id="observedLinesCollapse" class="observed-lines-collapse" hidden>
-          <summary class="observed-lines-summary">观察行</summary>
-          <div id="observedLinesContent" class="observed-lines-content"></div>
-        </details>
-        <div id="currentLineOverviewGrid" class="current-line-grid"></div>
-      </section>
 
-      <section id="suggestPanelSection" class="suggest-panel-section" hidden>
-        <div class="suggest-panel-head">
-          <p class="list-kicker">选项建议</p>
-        </div>
-        <div id="suggestPanel" class="result-panel">暂无数据</div>
-      </section>
+          <section id="currentLineOverview" class="current-line-overview console-panel">
+            <div class="current-line-head">
+              <div>
+                <p class="list-kicker">实机台词捕获</p>
+                <h2 id="currentLineOverviewTitle">等待识别结果</h2>
+              </div>
+              <span id="currentLineOverviewStatus" class="status-chip">等待刷新</span>
+            </div>
+            <p id="currentLineOverviewHint" class="result-note">识别到文字后，这里会区分刚读到的候选台词和已确认台词。</p>
+            <div id="currentLineEffectiveText" class="current-line-effective" hidden></div>
+            <details id="observedLinesCollapse" class="observed-lines-collapse" hidden>
+              <summary class="observed-lines-summary">查看底层观察行</summary>
+              <div id="observedLinesContent" class="observed-lines-content"></div>
+            </details>
+            <div id="currentLineOverviewGrid" class="current-line-grid"></div>
+          </section>
 
-      <div class="advanced-toggle-row">
-        <button id="advancedToggleBtn" class="ghost advanced-toggle-btn">高级设置</button>
+          <section id="suggestPanelSection" class="suggest-panel-section console-panel" hidden>
+            <div class="suggest-panel-head">
+              <p class="list-kicker">AI 选项建议</p>
+            </div>
+            <div id="suggestPanel" class="result-panel">暂无数据</div>
+          </section>
+
+          <section class="console-panel">
+            <details id="dependencyModule" class="settings-module" open>
+              <summary>
+                <span>系统依赖安装状态</span>
+                <small id="installCompactSummary">OCR 识别依赖与内存读取依赖分开管理</small>
+              </summary>
+              <div class="module-body install-stack">
+                <section class="install-module install-module-ocr">
+                  <div class="install-module-head">
+                    <div>
+                      <p class="list-kicker">视觉核心</p>
+                      <h3>OCR Reader 依赖</h3>
+                    </div>
+                  </div>
+                  <div class="install-tabs">
+                    <button class="install-tab active" data-install-tab="rapidocr">RapidOCR</button>
+                    <button class="install-tab" data-install-tab="dxcam">DXcam</button>
+                    <button class="install-tab" data-install-tab="tesseract">Tesseract</button>
+                  </div>
+                  <div class="install-panels install-panels-ocr">
+                    <div id="rapidocrPrompt" class="install-banner install-banner-rapidocr" hidden>
+                      <div class="install-copy">
+                        <p id="rapidocrPromptKicker" class="list-kicker">OCR 主后端</p>
+                        <h3 id="rapidocrPromptTitle">正在检测 RapidOCR</h3>
+                        <p id="rapidocrPromptBody">插件隔离的 RapidOCR 运行时检测结果会显示在这里。</p>
+                        <p id="rapidocrPathText" class="result-note"></p>
+                        <div id="rapidocrInstallState" class="install-task-card" hidden>
+                          <div class="install-task-head">
+                            <p id="rapidocrInstallStatusText" class="install-task-status">等待安装任务</p>
+                            <p id="rapidocrInstallPercent" class="install-task-percent">0%</p>
+                          </div>
+                          <div class="install-task-bar"><div id="rapidocrInstallBar" class="install-task-bar-fill"></div></div>
+                          <p id="rapidocrInstallMessage" class="result-note"></p>
+                          <p id="rapidocrInstallDetail" class="result-note"></p>
+                        </div>
+                      </div>
+                      <div class="install-actions">
+                        <button id="rapidocrUseBtn" class="secondary">使用 RapidOCR</button>
+                        <button id="ocrBackendAutoBtn" class="ghost">自动决策</button>
+                        <button id="rapidocrInstallBtn" class="primary">一键安装</button>
+                      </div>
+                    </div>
+
+                    <div id="dxcamPrompt" class="install-banner install-banner-dxcam" hidden>
+                      <div class="install-copy">
+                        <p id="dxcamPromptKicker" class="list-kicker">截图依赖</p>
+                        <h3 id="dxcamPromptTitle">正在检测 DXcam</h3>
+                        <p id="dxcamPromptBody">用于更可靠地截取前台游戏画面。</p>
+                        <p id="dxcamPathText" class="result-note"></p>
+                        <div id="dxcamInstallState" class="install-task-card" hidden>
+                          <div class="install-task-head">
+                            <p id="dxcamInstallStatusText" class="install-task-status">等待安装</p>
+                            <p id="dxcamInstallPercent" class="install-task-percent">0%</p>
+                          </div>
+                          <div class="install-task-bar"><div id="dxcamInstallBar" class="install-task-bar-fill"></div></div>
+                          <p id="dxcamInstallMessage" class="result-note"></p>
+                          <p id="dxcamInstallDetail" class="result-note"></p>
+                        </div>
+                      </div>
+                      <div class="install-actions" style="flex-wrap: wrap; gap: 8px;">
+                        <button id="smartCaptureUseBtn" class="secondary">使用 Smart</button>
+                        <button id="dxcamUseBtn" class="secondary">使用 DXcam</button>
+                        <button id="captureBackendAutoBtn" class="ghost">自动</button>
+                        <button id="imagegrabUseBtn" class="ghost">ImageGrab</button>
+                        <button id="printwindowUseBtn" class="ghost">PrintWindow</button>
+                        <button id="dxcamInstallBtn" class="primary">一键安装</button>
+                      </div>
+                    </div>
+
+                    <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
+                      <div class="install-copy">
+                        <p id="tesseractPromptKicker" class="list-kicker">兼容兜底</p>
+                        <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
+                        <p id="tesseractPromptBody">兜底检测结果会显示在这里。</p>
+                        <p id="tesseractPathText" class="result-note"></p>
+                        <div id="tesseractInstallState" class="install-task-card" hidden>
+                          <div class="install-task-head">
+                            <p id="tesseractInstallStatusText" class="install-task-status">等待任务</p>
+                            <p id="tesseractInstallPercent" class="install-task-percent">0%</p>
+                          </div>
+                          <div class="install-task-bar"><div id="tesseractInstallBar" class="install-task-bar-fill"></div></div>
+                          <p id="tesseractInstallMessage" class="result-note"></p>
+                          <p id="tesseractInstallDetail" class="result-note"></p>
+                        </div>
+                      </div>
+                      <div class="install-actions">
+                        <button id="tesseractUseBtn" class="secondary">使用 Tesseract</button>
+                        <button id="tesseractInstallBtn" class="primary">一键安装</button>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="install-module install-module-memory">
+                  <div class="install-module-head">
+                    <div>
+                      <p class="list-kicker">内存核心</p>
+                      <h3>Memory Reader</h3>
+                    </div>
+                  </div>
+                  <div class="install-panels install-panels-memory">
+                    <div id="textractorPrompt" class="install-banner install-banner-textractor">
+                      <div class="install-copy">
+                        <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
+                        <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
+                        <p id="textractorPromptBody">保留为实验性兜底，不再是首发主线。</p>
+                        <p id="textractorPathText" class="result-note"></p>
+                        <div id="textractorInstallState" class="install-task-card" hidden>
+                          <div class="install-task-head">
+                            <p id="textractorInstallStatusText" class="install-task-status">等待任务</p>
+                            <p id="textractorInstallPercent" class="install-task-percent">0%</p>
+                          </div>
+                          <div class="install-task-bar"><div id="textractorInstallBar" class="install-task-bar-fill"></div></div>
+                          <p id="textractorInstallMessage" class="result-note"></p>
+                          <p id="textractorInstallDetail" class="result-note"></p>
+                        </div>
+                      </div>
+                      <div class="install-actions">
+                        <button id="textractorInstallBtn" class="secondary">一键安装 Textractor</button>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </details>
+          </section>
+        </div>
+
+        <div class="console-col console-col-side">
+          <section class="console-panel">
+            <div class="console-section-title">连接目标配置</div>
+
+            <div class="target-card game-binding-panel">
+              <div class="target-card-header">
+                <h3 class="target-card-title">逻辑绑定 (Game ID)</h3>
+                <button id="clearBindBtn" class="ghost console-btn-mini">恢复自动</button>
+              </div>
+              <div>
+                <span id="currentBoundGameId" class="highlight-text">等待刷新</span>
+                <p id="currentBoundGameDetail" class="result-note">刷新后显示当前绑定目标。</p>
+              </div>
+              <div id="availableGameIds" class="binding-chip-row empty-inline" style="font-size: 12px; margin-top: 8px;">等待刷新</div>
+            </div>
+
+            <div id="ocrWindowPanel" class="target-card">
+              <div class="target-card-header">
+                <h3 class="target-card-title">视觉捕获 (Window)</h3>
+                <div style="display: flex; gap: 4px;">
+                  <button id="ocrWindowRefreshBtn" class="ghost console-btn-mini">刷新</button>
+                  <button id="ocrWindowAutoBtn" class="ghost console-btn-mini">清除</button>
+                </div>
+              </div>
+              <p id="ocrWindowTargetModeText" class="result-note"></p>
+              <div id="ocrLockedWindowCard" class="locked-window-card" style="padding: 12px; margin: 12px 0; background: var(--console-surface); border-radius: 6px; border: 1px dashed var(--console-border);">
+                <div class="locked-window-empty" style="font-size: 12px; color: var(--console-text-muted); text-align: center;">暂无锁定窗口</div>
+              </div>
+              <button id="ocrWindowSelectBtn" class="primary" style="width: 100%; font-size: 13px; padding: 8px;">选择识别窗口</button>
+              <details class="excluded-window-panel" style="margin-top: 12px;">
+                <summary style="font-size: 12px; color: var(--console-text-muted);">查看排除窗口与原因</summary>
+                <div id="ocrExcludedWindowList" class="stack-list scroll-region empty-state" style="max-height: 150px; margin-top: 8px;">暂无排除窗口</div>
+              </details>
+              <p id="ocrWindowRuntimeHint" class="panel-subcopy" hidden></p>
+            </div>
+
+            <div class="target-card memory-target-panel">
+              <div class="target-card-header">
+                <h3 class="target-card-title">内存读取 (Process)</h3>
+                <div style="display: flex; gap: 4px;">
+                  <button id="memoryProcessRefreshBtn" class="ghost console-btn-mini">刷新</button>
+                  <button id="memoryProcessAutoBtn" class="ghost console-btn-mini">清除</button>
+                </div>
+              </div>
+              <p id="memoryReaderTargetModeText" class="result-note"></p>
+              <div id="memoryLockedProcessCard" class="locked-window-card" style="padding: 12px; margin: 12px 0; background: var(--console-surface); border-radius: 6px; border: 1px dashed var(--console-border);">
+                <div class="locked-window-empty" style="font-size: 12px; color: var(--console-text-muted); text-align: center;">暂无锁定进程</div>
+              </div>
+              <button id="memoryProcessSelectBtn" class="primary" style="width: 100%; font-size: 13px; padding: 8px;">选择进程</button>
+              <p id="memoryReaderRuntimeHint" class="panel-subcopy" hidden></p>
+            </div>
+          </section>
+
+          <section class="console-panel">
+            <div class="console-section-title">
+              运行参数设定
+              <span id="settingsDirtyHint" class="settings-dirty-hint" hidden style="font-size: 12px; color: #ef4444; background: #fee2e2; padding: 2px 6px; border-radius: 4px;">未保存</span>
+            </div>
+
+            <label class="compact-field">
+              <span>推送系统通知</span>
+              <input id="pushToggle" type="checkbox" style="accent-color: var(--console-primary); width: 16px; height: 16px;">
+            </label>
+
+            <label class="compact-field">
+              <span>读取模式</span>
+              <select id="readerModeSelect">
+                <option value="auto" selected>自动 (内存优先)</option>
+                <option value="memory_reader">强制内存</option>
+                <option value="ocr_reader">强制 OCR</option>
+              </select>
+            </label>
+
+            <label class="compact-field">
+              <span>OCR 触发方式</span>
+              <select id="ocrTriggerModeSelect">
+                <option value="after_advance">点击对白后</option>
+                <option value="interval" selected>按间隔轮询</option>
+              </select>
+            </label>
+
+            <label class="compact-field">
+              <span>轮询间隔 (秒)</span>
+              <input id="ocrPollIntervalInput" type="number" min="0.5" max="10" step="0.1" placeholder="2.0" style="width: 70px; text-align: center;">
+            </label>
+
+            <label class="compact-field">
+              <span>LLM 视觉辅助</span>
+              <input id="llmVisionToggle" type="checkbox" style="accent-color: var(--console-primary); width: 16px; height: 16px;">
+            </label>
+
+            <label class="compact-field">
+              <span>Vision 分辨率上限</span>
+              <input id="llmVisionMaxImagePxInput" type="number" min="64" max="2048" step="32" placeholder="768" style="width: 70px; text-align: center;">
+            </label>
+
+            <div class="btn-row-sm">
+              <button id="saveModeBtn" class="secondary">保存参数</button>
+            </div>
+            <div class="btn-row-sm" style="margin-top: 8px;">
+              <button id="standbyOnBtn" class="ghost">强制待机</button>
+              <button id="standbyOffBtn" class="ghost">恢复活跃</button>
+            </div>
+          </section>
+        </div>
       </div>
 
-      <!-- ========== 阶段 C: 高级设置 ========== -->
+      <div class="console-main-grid" style="padding-top: 0; padding-bottom: 12px;">
+        <button id="advancedToggleBtn" class="ghost advanced-toggle-btn" style="width: 100%; border: 1px dashed var(--console-border); background: var(--console-surface); padding: 12px; border-radius: var(--console-radius-sm); color: var(--console-text-muted);">
+          展开高级设置与调试日志
+        </button>
+      </div>
+
       <div id="advancedSettings">
-
-        <section id="ocrPipelinePanel" class="ocr-pipeline-panel">
-          <div class="ocr-pipeline-head">
+        <section id="ocrPipelinePanel" class="ocr-pipeline-panel console-panel">
+          <div class="ocr-pipeline-head" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--console-border); padding-bottom: 12px;">
             <div>
-              <p class="list-kicker">OCR 链路</p>
-              <h2>窗口、截图、识别、台词确认</h2>
+              <p class="list-kicker" style="color: var(--console-text-muted); font-size: 12px; text-transform: uppercase; margin-bottom: 4px;">链路监控</p>
+              <h2 style="margin: 0; font-size: 18px; color: var(--console-text-main);">OCR Pipeline</h2>
             </div>
-            <span id="ocrPipelineSummary" class="status-chip">等待刷新</span>
+            <span id="ocrPipelineSummary" class="status-chip" style="background: var(--console-bg); padding: 4px 10px; border-radius: 12px; font-size: 12px; border: 1px solid var(--console-border);">等待刷新</span>
           </div>
-          <div id="ocrPipelineSteps" class="ocr-pipeline-steps"></div>
+          <div id="ocrPipelineSteps" class="ocr-pipeline-steps" style="margin-top: 16px;"></div>
         </section>
 
-        <section id="ocrWindowPanel" class="panel panel-controls">
-          <div class="panel-title-row">
-            <div>
-              <p class="list-kicker">窗口选择</p>
-              <h2>OCR 目标窗口</h2>
-            </div>
-            <div class="capture-profile-actions">
-              <button id="ocrWindowRefreshBtn" class="secondary">刷新窗口</button>
-              <button id="ocrWindowAutoBtn" class="ghost">清除锁定</button>
-            </div>
-          </div>
-          <p id="ocrWindowTargetModeText" class="result-note"></p>
-          <p id="ocrWindowRuntimeHint" class="panel-subcopy">等待 OCR 窗口候选列表。</p>
-
-          <div id="ocrLockedWindowCard" class="locked-window-card">
-            <div class="locked-window-empty">暂无锁定的窗口，请点击下方按钮选择。</div>
-          </div>
-
-          <div class="window-target-actions">
-            <button id="ocrWindowSelectBtn" class="primary">选择识别窗口</button>
-          </div>
-
-          <details class="excluded-window-panel">
-            <summary>查看排除窗口与原因</summary>
-            <div id="ocrExcludedWindowList" class="stack-list scroll-region empty-state">暂无排除窗口</div>
-          </details>
-        </section>
-
-        <section class="panel panel-controls">
-          <div class="panel-title-row">
-            <h2>插件设置</h2>
-          </div>
-          <details class="settings-module">
-            <summary>
-              <span>运行控制</span>
-              <small>Agent 暂停/恢复、读取模式、触发方式</small>
-            </summary>
-            <div class="module-body">
-              <div class="control-grid">
-                <label class="field checkbox-field">
-                  <input id="pushToggle" type="checkbox">
-                  <span>推送通知</span>
-                </label>
-                <label class="field">
-                  <span>文本读取模式</span>
-                  <select id="readerModeSelect">
-                    <option value="auto" selected>自动（内存有新文本优先，停更后 OCR 接管）</option>
-                    <option value="memory_reader">内存读取</option>
-                    <option value="ocr_reader">OCR</option>
-                  </select>
-                </label>
-                <label class="field">
-                  <span>OCR/DXcam 识别间隔（秒）</span>
-                  <input id="ocrPollIntervalInput" type="number" min="0.5" max="10" step="0.1" placeholder="2.0">
-                </label>
-                <label class="field">
-                  <span>OCR 触发方式</span>
-                  <select id="ocrTriggerModeSelect">
-                    <option value="after_advance">点击对白后识别</option>
-                    <option value="interval" selected>按间隔识别</option>
-                  </select>
-                </label>
-                <label class="field checkbox-field">
-                  <input id="llmVisionToggle" type="checkbox">
-                  <span>LLM 视觉辅助</span>
-                </label>
-                <label class="field">
-                  <span>Vision 最大边长</span>
-                  <input id="llmVisionMaxImagePxInput" type="number" min="64" max="2048" step="32" placeholder="768">
-                  <small class="field-note">低置信度时传图，会增加 token 成本并包含游戏画面。</small>
-                </label>
-                <div class="settings-save-row">
-                  <button id="saveModeBtn" class="secondary">保存设置</button>
-                  <span id="settingsDirtyHint" class="settings-dirty-hint" hidden>有未保存设置</span>
-                </div>
-                <div class="inline-actions">
-                  <button id="standbyOnBtn" class="ghost">进入待机</button>
-                  <button id="standbyOffBtn" class="ghost">恢复活跃</button>
-                </div>
+        <div class="adv-grid-row">
+          <div class="console-panel screen-template-panel">
+            <div class="panel-title-row compact" style="margin-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-start;">
+              <div>
+                <h3 style="margin: 0; font-size: 16px; color: var(--console-text-main);">屏幕模板映射</h3>
+                <p class="section-copy" style="font-size: 12px; color: var(--console-text-muted); margin-top: 4px;">按进程/标题覆盖通用屏幕分类</p>
               </div>
+              <div class="inline-actions" style="display: flex; gap: 6px;">
+                <button id="ocrScreenTemplatesDraftBtn" class="secondary console-btn-mini">生草稿</button>
+                <button id="ocrScreenTemplatesValidateBtn" class="ghost console-btn-mini">验证</button>
+                <button id="ocrScreenTemplatesUndoBtn" class="ghost console-btn-mini" disabled>撤销</button>
+                <button id="ocrScreenTemplatesSaveBtn" class="primary console-btn-mini">保存</button>
+              </div>
+            </div>
 
-              <div id="agentUserNotice" class="agent-user-notice neutral" hidden>
-                <div>
-                  <p class="list-kicker">Agent 状态</p>
-                  <h3 id="agentUserNoticeTitle">等待状态刷新</h3>
-                  <p id="agentUserNoticeBody" class="agent-user-notice-body"></p>
-                  <p id="agentUserNoticeTarget" class="result-note"></p>
+            <textarea id="ocrScreenTemplatesInput" rows="4" spellcheck="false" placeholder='[]' style="width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; margin-bottom: 16px; resize: vertical;"></textarea>
+
+            <div class="screen-region-editor" style="border: 1px solid var(--console-border); border-radius: var(--console-radius-sm); background: var(--console-bg); overflow: hidden;">
+              <div class="screen-region-toolbar" style="padding: 10px; border-bottom: 1px solid var(--console-border); background: var(--console-surface); display: flex; gap: 8px; align-items: center;">
+                <select id="ocrRegionStageSelect" aria-label="区域阶段" style="font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--console-border);">
+                  <option value="dialogue_stage">对白区</option>
+                  <option value="menu_stage">菜单区</option>
+                  <option value="title_stage">标题/主菜单</option>
+                  <option value="save_load_stage">存读档</option>
+                  <option value="config_stage">设置</option>
+                  <option value="gallery_stage">回想/鉴赏</option>
+                  <option value="minigame_stage">小游戏</option>
+                  <option value="game_over_stage">Game Over</option>
+                </select>
+                <button id="ocrRegionSnapshotBtn" class="secondary console-btn-mini">加载截图</button>
+                <button id="ocrRegionTemplateBtn" class="ghost console-btn-mini">转模板</button>
+                <button id="ocrRegionCaptureBtn" class="ghost console-btn-mini">套用到裁剪</button>
+              </div>
+              <div id="ocrRegionEditor" class="screen-region-canvas" aria-label="OCR 区域编辑器" style="min-height: 200px; position: relative; display: flex; align-items: center; justify-content: center;">
+                <img id="ocrRegionImage" alt="" hidden style="max-width: 100%; height: auto;">
+                <div id="ocrRegionSelectionBox" class="screen-region-selection" hidden style="position: absolute; border: 2px dashed var(--console-primary); background: rgba(59, 130, 246, 0.2);"></div>
+                <div id="ocrRegionEmpty" class="screen-region-empty" style="color: var(--console-text-muted); font-size: 13px;">暂无截图</div>
+              </div>
+              <p id="ocrRegionHint" class="result-note" style="padding: 10px; margin: 0; background: var(--console-surface); border-top: 1px solid var(--console-border); text-align: center;">加载最近 OCR 屏幕感知截图后，拖拽框选区域。</p>
+            </div>
+          </div>
+
+          <div class="console-panel capture-profile-panel">
+            <div class="panel-title-row compact" style="margin-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-start;">
+              <div>
+                <h3 style="margin: 0; font-size: 16px; color: var(--console-text-main);">OCR 截图区域校准</h3>
+                <p class="section-copy" style="font-size: 12px; color: var(--console-text-muted); margin-top: 4px;">按进程保存窗口裁剪比例</p>
+              </div>
+              <div class="capture-profile-actions" style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
+                <button id="ocrProfileAutoRecalibrateBtn" class="primary console-btn-mini">自动校准对白区</button>
+                <div style="display: flex; gap: 6px;">
+                  <button id="ocrProfileApplyRecommendedBtn" class="secondary console-btn-mini">应用推荐</button>
+                  <button id="ocrProfileRollbackBtn" class="ghost console-btn-mini">回滚</button>
                 </div>
               </div>
             </div>
-          </details>
+            <p id="ocrProfileRuntimeHint" class="panel-subcopy" style="font-size: 12px; margin-bottom: 16px; color: var(--console-text-muted); padding: 8px; background: var(--console-bg); border-radius: 6px;">等待目标进程信息。</p>
 
-          <details class="settings-module">
-            <summary>
-              <span>游戏识别</span>
-              <small>游戏目标、OCR 目标窗口、截图校准</small>
-            </summary>
-            <div class="module-body">
-              <div class="game-binding-panel">
-                <div class="binding-summary">
-                  <div>
-                    <p class="list-kicker">游戏目标</p>
-                    <h3 id="currentBoundGameId">自动选择游戏窗口</h3>
-                    <p id="currentBoundGameDetail" class="binding-detail">插件会优先选择当前可用目标。</p>
-                  </div>
-                  <button id="clearBindBtn" class="ghost">恢复自动</button>
-                </div>
-                <div id="availableGameIds" class="binding-chip-row empty-inline">等待刷新可用游戏 ID</div>
-              </div>
+            <div class="capture-profile-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <label class="field" style="grid-column: 1 / -1;">
+                <span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">进程名</span>
+                <input id="ocrProfileProcessInput" type="text" placeholder="例如 game.exe" style="width: 100%;">
+              </label>
+              <label class="field">
+                <span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">配置阶段</span>
+                <select id="ocrProfileStageSelect" style="width: 100%;">
+                  <option value="default">通用区域</option>
+                  <option value="dialogue_stage">对白区</option>
+                  <option value="menu_stage">菜单区</option>
+                  <option value="title_stage">标题/主菜单</option>
+                  <option value="save_load_stage">存读档</option>
+                  <option value="config_stage">设置</option>
+                  <option value="transition_stage">转场</option>
+                  <option value="gallery_stage">回想/鉴赏</option>
+                  <option value="minigame_stage">小游戏</option>
+                  <option value="game_over_stage">Game Over</option>
+                </select>
+              </label>
+              <label class="field">
+                <span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">保存范围</span>
+                <select id="ocrProfileSaveScopeSelect" style="width: 100%;">
+                  <option value="window_bucket">当前窗口分辨率</option>
+                  <option value="process_fallback">进程通用回退</option>
+                </select>
+              </label>
+              <label class="field"><span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">左侧裁剪</span><input id="ocrProfileLeftInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05" style="width: 100%;"></label>
+              <label class="field"><span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">右侧裁剪</span><input id="ocrProfileRightInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05" style="width: 100%;"></label>
+              <label class="field"><span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">顶部起始</span><input id="ocrProfileTopInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.62" style="width: 100%;"></label>
+              <label class="field"><span style="font-size: 12px; display: block; margin-bottom: 4px; font-weight: 500; color: var(--console-text-muted);">底部裁剪</span><input id="ocrProfileBottomInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.08" style="width: 100%;"></label>
+            </div>
 
-              <div class="settings-subpanel memory-target-panel">
-                <div class="panel-title-row compact">
-                  <div>
-                    <h3>Memory Reader 目标进程</h3>
-                    <p class="section-copy">自动识别失败时可手动锁定游戏进程；进程重启后会按 exe 路径和进程名重新绑定。</p>
-                  </div>
-                  <div class="capture-profile-actions">
-                    <button id="memoryProcessRefreshBtn" class="secondary">刷新进程</button>
-                    <button id="memoryProcessAutoBtn" class="ghost">清除锁定</button>
-                  </div>
-                </div>
-                <p id="memoryReaderTargetModeText" class="result-note"></p>
-                <p id="memoryReaderRuntimeHint" class="panel-subcopy">等待 Memory Reader 进程候选列表。</p>
-
-                <div id="memoryLockedProcessCard" class="locked-window-card">
-                  <div class="locked-window-empty">暂无锁定的 Memory Reader 进程，请点击下方按钮选择。</div>
-                </div>
-
-                <div class="window-target-actions">
-                  <button id="memoryProcessSelectBtn" class="primary">选择进程</button>
-                </div>
-              </div>
-
-              <div class="settings-subpanel screen-template-panel">
-                <div class="panel-title-row compact">
-                  <div>
-                    <h3>屏幕模板</h3>
-                    <p class="section-copy">按进程、窗口标题或关键词覆盖通用屏幕分类；AiHong 专用逻辑仍优先。</p>
-                  </div>
-                  <div class="inline-actions">
-                    <button id="ocrScreenTemplatesDraftBtn" class="secondary">生成草稿</button>
-                    <button id="ocrScreenTemplatesValidateBtn" class="ghost">验证模板</button>
-                    <button id="ocrScreenTemplatesUndoBtn" class="ghost" disabled>撤销草稿</button>
-                    <button id="ocrScreenTemplatesSaveBtn" class="secondary">保存模板</button>
-                  </div>
-                </div>
-                <label class="field">
-                  <span>模板 JSON</span>
-                  <textarea id="ocrScreenTemplatesInput" rows="5" spellcheck="false" placeholder='[{"id":"demo-gallery","stage":"gallery_stage","process_names":["game.exe"],"keywords":["Gallery","CG"],"min_keyword_hits":1}]'></textarea>
-                </label>
-                <div class="screen-region-editor">
-                  <div class="screen-region-toolbar">
-                    <select id="ocrRegionStageSelect" aria-label="区域阶段">
-                      <option value="dialogue_stage">对白区</option>
-                      <option value="menu_stage">菜单区</option>
-                      <option value="title_stage">标题/主菜单</option>
-                      <option value="save_load_stage">存读档</option>
-                      <option value="config_stage">设置</option>
-                      <option value="gallery_stage">回想/鉴赏</option>
-                      <option value="minigame_stage">小游戏</option>
-                      <option value="game_over_stage">Game Over</option>
-                    </select>
-                    <button id="ocrRegionSnapshotBtn" class="secondary">加载截图</button>
-                    <button id="ocrRegionTemplateBtn" class="ghost">区域生成模板</button>
-                    <button id="ocrRegionCaptureBtn" class="ghost">套用到裁剪</button>
-                  </div>
-                  <div id="ocrRegionEditor" class="screen-region-canvas" aria-label="OCR 区域编辑器">
-                    <img id="ocrRegionImage" alt="" hidden>
-                    <div id="ocrRegionSelectionBox" class="screen-region-selection" hidden></div>
-                    <div id="ocrRegionEmpty" class="screen-region-empty">暂无截图</div>
-                  </div>
-                  <p id="ocrRegionHint" class="result-note">加载最近 OCR 屏幕感知截图后，拖拽框选区域。</p>
-                </div>
-              </div>
-
-              <div class="settings-subpanel capture-profile-panel">
-                <div class="panel-title-row compact">
-                  <div>
-                    <h3>OCR 截图校准</h3>
-                    <p class="section-copy">按进程名保存窗口裁剪比例。普通游戏保存"通用区域"即可；哀鸿可以分别保存"对白区 / 菜单区"，避免专用双阶段 OCR 范围被互相覆盖。</p>
-                  </div>
-                  <div class="capture-profile-actions capture-profile-primary-actions">
-                    <label class="checkbox-line compact-checkbox">
-                      <input id="ocrProfileAutoApplyRecommendedInput" type="checkbox">
-                      <span>允许后续自动应用推荐</span>
-                    </label>
-                    <button id="ocrProfileApplyRecommendedBtn" class="secondary">应用推荐</button>
-                    <button id="ocrProfileRollbackBtn" class="ghost">回滚推荐</button>
-                    <button id="ocrProfileAutoRecalibrateBtn" class="primary">自动重新校准对白区</button>
-                  </div>
-                </div>
-                <p id="ocrProfileRuntimeHint" class="panel-subcopy">等待 OCR 目标进程信息。</p>
-                <div class="capture-profile-grid">
-                  <label class="field">
-                    <span>进程名</span>
-                    <input id="ocrProfileProcessInput" type="text" placeholder="例如 game.exe">
-                  </label>
-                  <label class="field">
-                    <span>配置阶段</span>
-                    <select id="ocrProfileStageSelect">
-                      <option value="default">通用区域</option>
-                      <option value="dialogue_stage">对白区</option>
-                      <option value="menu_stage">菜单区</option>
-                      <option value="title_stage">标题/主菜单</option>
-                      <option value="save_load_stage">存读档</option>
-                      <option value="config_stage">设置</option>
-                      <option value="transition_stage">转场</option>
-                      <option value="gallery_stage">回想/鉴赏</option>
-                      <option value="minigame_stage">小游戏</option>
-                      <option value="game_over_stage">Game Over</option>
-                    </select>
-                  </label>
-                  <label class="field">
-                    <span>保存范围</span>
-                    <select id="ocrProfileSaveScopeSelect">
-                      <option value="window_bucket">当前窗口分辨率</option>
-                      <option value="process_fallback">进程通用回退</option>
-                    </select>
-                  </label>
-                  <label class="field">
-                    <span>左侧裁剪比例</span>
-                    <input id="ocrProfileLeftInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
-                  </label>
-                  <label class="field">
-                    <span>右侧裁剪比例</span>
-                    <input id="ocrProfileRightInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.05">
-                  </label>
-                  <label class="field">
-                    <span>顶部起始比例</span>
-                    <input id="ocrProfileTopInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.62">
-                  </label>
-                  <label class="field">
-                    <span>底部裁剪比例</span>
-                    <input id="ocrProfileBottomInput" type="number" min="0" max="0.99" step="0.01" placeholder="0.08">
-                  </label>
-                  <div class="capture-profile-actions">
-                    <button id="ocrProfileSaveBtn" class="secondary">保存校准</button>
-                    <button id="ocrProfileClearBtn" class="ghost">清空校准</button>
-                  </div>
-                </div>
+            <div style="display: flex; justify-content: space-between; margin-top: 20px; align-items: center; border-top: 1px solid var(--console-border); padding-top: 16px;">
+              <label class="checkbox-line compact-checkbox" style="font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                <input id="ocrProfileAutoApplyRecommendedInput" type="checkbox" style="accent-color: var(--console-primary); width: 16px; height: 16px;"> 允许自动应用推荐
+              </label>
+              <div style="display: flex; gap: 8px;">
+                <button id="ocrProfileClearBtn" class="ghost" style="padding: 6px 14px; font-size: 13px;">清空</button>
+                <button id="ocrProfileSaveBtn" class="secondary" style="padding: 6px 14px; font-size: 13px;">保存校准</button>
               </div>
             </div>
-          </details>
-        </section>
-
-        <section class="panel">
-          <div class="panel-title-row">
-            <h2>依赖安装</h2>
           </div>
-          <details id="dependencyModule" class="settings-module">
-            <summary>
-              <span>依赖安装</span>
-              <small id="installCompactSummary">OCR 识别依赖与内存读取依赖分开管理</small>
-            </summary>
-            <div class="module-body install-stack">
-              <section class="install-module install-module-ocr">
-                <div class="install-module-head">
-                  <div>
-                    <p class="list-kicker">OCR 识别模块</p>
-                    <h3>OCR Reader 依赖</h3>
-                  </div>
-                  <p class="install-module-summary">RapidOCR 是主识别后端，DXcam 负责稳定截图，Tesseract 仅作为兼容兜底。</p>
-                </div>
-                <div class="install-tabs">
-                  <button class="install-tab active" data-install-tab="rapidocr">RapidOCR</button>
-                  <button class="install-tab" data-install-tab="dxcam">DXcam</button>
-                  <button class="install-tab" data-install-tab="tesseract">Tesseract</button>
-                </div>
-                <div class="install-panels install-panels-ocr">
-              <div id="rapidocrPrompt" class="install-banner install-banner-rapidocr" hidden>
-                <div class="install-copy">
-                  <p id="rapidocrPromptKicker" class="list-kicker">OCR 主后端</p>
-                  <h3 id="rapidocrPromptTitle">正在检测 RapidOCR</h3>
-                  <p id="rapidocrPromptBody">插件隔离的 RapidOCR 运行时检测结果会显示在这里。</p>
-                  <p id="rapidocrPathText" class="result-note"></p>
-                  <div id="rapidocrInstallState" class="install-task-card" hidden>
-                    <div class="install-task-head">
-                      <p id="rapidocrInstallStatusText" class="install-task-status">等待安装任务</p>
-                      <p id="rapidocrInstallPercent" class="install-task-percent">0%</p>
-                    </div>
-                    <div class="install-task-bar">
-                      <div id="rapidocrInstallBar" class="install-task-bar-fill"></div>
-                    </div>
-                    <p id="rapidocrInstallMessage" class="result-note"></p>
-                    <p id="rapidocrInstallDetail" class="result-note"></p>
-                  </div>
-                </div>
-                <div class="install-actions">
-                  <button id="rapidocrUseBtn" class="secondary">使用 RapidOCR</button>
-                  <button id="ocrBackendAutoBtn" class="ghost">OCR 自动</button>
-                  <button id="rapidocrInstallBtn" class="primary">一键安装 RapidOCR</button>
-                </div>
-              </div>
-
-              <div id="dxcamPrompt" class="install-banner install-banner-dxcam" hidden>
-                <div class="install-copy">
-                  <p id="dxcamPromptKicker" class="list-kicker">截图依赖</p>
-                  <h3 id="dxcamPromptTitle">正在检测 DXcam</h3>
-                  <p id="dxcamPromptBody">DXcam 用于更可靠地截取前台游戏画面，降低被插件页面遮挡或旧帧影响的概率。</p>
-                  <p id="dxcamPathText" class="result-note"></p>
-                  <div id="dxcamInstallState" class="install-task-card" hidden>
-                    <div class="install-task-head">
-                      <p id="dxcamInstallStatusText" class="install-task-status">等待安装任务</p>
-                      <p id="dxcamInstallPercent" class="install-task-percent">0%</p>
-                    </div>
-                    <div class="install-task-bar">
-                      <div id="dxcamInstallBar" class="install-task-bar-fill"></div>
-                    </div>
-                    <p id="dxcamInstallMessage" class="result-note"></p>
-                    <p id="dxcamInstallDetail" class="result-note"></p>
-                  </div>
-                </div>
-                <div class="install-actions">
-                  <button id="smartCaptureUseBtn" class="secondary">使用 Smart</button>
-                  <button id="dxcamUseBtn" class="secondary">使用 DXcam</button>
-                  <button id="captureBackendAutoBtn" class="ghost">截图自动</button>
-                  <button id="imagegrabUseBtn" class="ghost">使用 ImageGrab</button>
-                  <button id="printwindowUseBtn" class="ghost">使用 PrintWindow</button>
-                  <button id="dxcamInstallBtn" class="primary">一键安装 DXcam</button>
-                </div>
-              </div>
-
-              <div id="tesseractPrompt" class="install-banner install-banner-tesseract" hidden>
-                <div class="install-copy">
-                  <p id="tesseractPromptKicker" class="list-kicker">OCR 兼容兜底</p>
-                  <h3 id="tesseractPromptTitle">正在检测 Tesseract</h3>
-                  <p id="tesseractPromptBody">本地 Tesseract 与 `chi_sim+jpn+eng` 语言包的兼容兜底检测结果会显示在这里。</p>
-                  <p id="tesseractPathText" class="result-note"></p>
-                  <div id="tesseractInstallState" class="install-task-card" hidden>
-                    <div class="install-task-head">
-                      <p id="tesseractInstallStatusText" class="install-task-status">等待安装任务</p>
-                      <p id="tesseractInstallPercent" class="install-task-percent">0%</p>
-                    </div>
-                    <div class="install-task-bar">
-                      <div id="tesseractInstallBar" class="install-task-bar-fill"></div>
-                    </div>
-                    <p id="tesseractInstallMessage" class="result-note"></p>
-                    <p id="tesseractInstallDetail" class="result-note"></p>
-                  </div>
-                </div>
-                <div class="install-actions">
-                  <button id="tesseractUseBtn" class="secondary">使用 Tesseract</button>
-                  <button id="tesseractInstallBtn" class="primary">一键安装 Tesseract</button>
-                </div>
-              </div>
-                </div>
-              </section>
-
-              <section class="install-module install-module-memory">
-                <div class="install-module-head">
-                  <div>
-                    <p class="list-kicker">内存读取模块</p>
-                    <h3>Memory Reader 依赖</h3>
-                  </div>
-                  <p class="install-module-summary">Textractor 只服务于内存读取兜底路径，不影响 OCR 截图识别链路。</p>
-                </div>
-                <div class="install-panels install-panels-memory">
-              <div id="textractorPrompt" class="install-banner install-banner-textractor">
-                <div class="install-copy">
-                  <p id="textractorPromptKicker" class="list-kicker">实验性兜底</p>
-                  <h3 id="textractorPromptTitle">正在检测 Textractor</h3>
-                  <p id="textractorPromptBody">Textractor 仍保留为 Memory Reader 的实验性兜底，不再是当前首发主线。</p>
-                  <p id="textractorPathText" class="result-note"></p>
-                  <div id="textractorInstallState" class="install-task-card" hidden>
-                    <div class="install-task-head">
-                      <p id="textractorInstallStatusText" class="install-task-status">等待安装任务</p>
-                      <p id="textractorInstallPercent" class="install-task-percent">0%</p>
-                    </div>
-                    <div class="install-task-bar">
-                      <div id="textractorInstallBar" class="install-task-bar-fill"></div>
-                    </div>
-                    <p id="textractorInstallMessage" class="result-note"></p>
-                    <p id="textractorInstallDetail" class="result-note"></p>
-                  </div>
-                </div>
-                <div class="install-actions">
-                  <button id="textractorInstallBtn" class="secondary">一键安装 Textractor</button>
-                </div>
-              </div>
-                </div>
-              </section>
-            </div>
-          </details>
-        </section>
+        </div>
 
         <section class="dashboard-grid">
           <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
-            <summary><span>运行状态</span><small>连接、数据源、OCR 运行时</small></summary>
+            <summary><span>数据源连接状态</span><small>连接、数据源、OCR 运行时</small></summary>
             <div class="dashboard-section-grid">
               <section class="dashboard-subsection">
                 <h3 class="dashboard-subtitle">状态</h3>
@@ -516,47 +791,43 @@
           </details>
 
           <details class="panel panel-scroll dashboard-module">
-            <summary><span>当前快照</span><small>当前台词、选项、菜单状态</small></summary>
+            <summary><span>系统当前快照</span><small>当前台词、选项、菜单状态</small></summary>
             <dl id="snapshotGrid" class="data-grid scroll-region"></dl>
           </details>
 
           <details class="panel panel-scroll dashboard-module">
-            <summary><span>游戏 Agent 状态</span><small>用户级状态和调试输入</small></summary>
+            <summary><span>Agent 交互底座</span><small>用户级状态和调试输入</small></summary>
             <dl id="agentStatusGrid" class="data-grid scroll-region"></dl>
             <div class="reply-box">
-              <h3>游戏 Agent 最近响应</h3>
+              <h3 style="font-size: 14px; margin-bottom: 8px; color: var(--console-text-main);">游戏 Agent 最近响应</h3>
               <p id="agentReplyText" class="reply-text-scroll">暂无交互</p>
             </div>
-            <details class="agent-debug-tools">
-              <summary>Agent 调试输入</summary>
-              <div class="control-grid agent-grid">
-                <label class="field grow">
-                  <span>给游戏 Agent 的文本</span>
-                  <input id="agentPromptInput" type="text" placeholder="例如：现在在讲什么？">
-                </label>
-                <button id="queryContextBtn" class="secondary">查询上下文</button>
-                <button id="sendMessageBtn" class="secondary">发送消息</button>
+            <details class="agent-debug-tools" style="margin-top: 16px; background: var(--console-bg); padding: 12px; border-radius: var(--console-radius-sm); border: 1px solid var(--console-border);">
+              <summary style="font-size: 13px; color: var(--console-text-main);">手动发送调试指令</summary>
+              <div class="control-grid agent-grid" style="display: flex; gap: 8px; margin-top: 12px;">
+                <input id="agentPromptInput" type="text" placeholder="例如：现在在讲什么？" style="flex: 1;">
+                <button id="queryContextBtn" class="secondary console-btn-mini">查询上下文</button>
+                <button id="sendMessageBtn" class="primary console-btn-mini">发送消息</button>
               </div>
             </details>
           </details>
 
           <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
-            <summary><span>AI 助手</span><small>选项建议</small></summary>
+            <summary><span>AI 选项辅助镜像</span><small>选项建议底层数据</small></summary>
             <div class="dashboard-section-grid">
               <section class="dashboard-subsection">
-                <h3 class="dashboard-subtitle">选项建议</h3>
                 <div id="suggestPanelMirror" class="result-panel scroll-region empty-state">暂无数据</div>
               </section>
             </div>
           </details>
 
           <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
-            <summary><span>游戏 Agent 推送记录</span><small>排队给猫娘侧的消息</small></summary>
+            <summary><span>推送队列表</span><small>排队给猫娘侧的消息</small></summary>
             <div id="pushesList" class="stack-list scroll-region empty-state">暂无数据</div>
           </details>
 
           <details class="panel panel-full panel-scroll panel-scroll-wide dashboard-module">
-            <summary><span>历史记录</span><small>最近台词、选项、底层事件</small></summary>
+            <summary><span>时序历史记录</span><small>最近台词、选项、底层事件</small></summary>
             <div class="dashboard-section-grid dashboard-section-grid-three">
               <section class="dashboard-subsection">
                 <h3 class="dashboard-subtitle">最近台词与 OCR 诊断</h3>
@@ -573,8 +844,7 @@
             </div>
           </details>
         </section>
-
-      </div><!-- /advancedSettings -->
+      </div>
 
       <div id="memoryProcessModal" class="modal" hidden>
         <div class="modal-overlay"></div>
@@ -603,16 +873,13 @@
       </div>
 
       <div id="flashMessage" class="flash-message" hidden></div>
+    </div>
 
-    </div><!-- /mainView -->
-
-    <!-- 隐藏的 firstRunGuide 供现有 JS 引用 -->
     <section id="firstRunGuide" hidden>
       <div id="firstRunSteps" class="first-run-steps"></div>
     </section>
-
   </div>
 
-  <script src="./main.js?v=20260429-restructure"></script>
+  <script src="./main.js?v=20260430-console-header-fix"></script>
 </body>
 </html>

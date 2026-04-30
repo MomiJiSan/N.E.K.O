@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -118,19 +119,55 @@ async def test_galgame_plugin_ui_index_route_serves_static_dashboard(
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
-    assert "<title>Galgame 插件设置</title>" in response.text
-    assert "N.E.K.O 二期" in response.text
+    assert "<title>Galgame 游玩助手控制台</title>" in response.text
+    assert "助手控制台" in response.text
     assert "RapidOCR" in response.text
-    assert "依赖安装" in response.text
+    assert "系统依赖安装状态" in response.text
     assert "DXcam" in response.text
-    assert "一键安装 Tesseract" in response.text
+    assert "一键安装" in response.text
     assert "Textractor" in response.text
-    assert "OCR 截图校准" in response.text
+    assert "OCR 截图区域校准" in response.text
     assert 'id="primaryDiagnosisPanel"' in response.text
     assert 'id="firstRunGuide"' in response.text
     assert 'id="currentLineOverview"' in response.text
     assert 'id="ocrPipelinePanel"' in response.text
     assert 'id="installCompactSummary"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_index_route_exposes_console_layout_contract(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/")
+
+    assert response.status_code == 200
+    assert "<title>Galgame 游玩助手控制台</title>" in response.text
+    assert 'class="console-header-bar"' in response.text
+    assert 'class="console-header-bar hero"' not in response.text
+    assert 'class="console-main-grid"' in response.text
+    assert 'class="console-panel"' in response.text
+    assert 'id="agentUserNotice"' in response.text
+    assert 'id="memoryLockedProcessCard"' in response.text
+    assert 'id="ocrLockedWindowCard"' in response.text
+    assert 'id="statusGrid"' in response.text
+    assert 'id="suggestPanelMirror"' in response.text
+    assert 'id="ocrRegionEditor"' in response.text
+    assert 'id="advancedToggleBtn"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_index_route_exposes_summary_tag_contract(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/")
+
+    assert response.status_code == 200
+    assert 'id="summaryText"' in response.text
+    assert 'id="summaryPrimaryTags"' in response.text
+    assert 'id="summaryWarningDetails"' in response.text
+    assert 'id="summaryWarningList"' in response.text
 
 
 @pytest.mark.asyncio
@@ -154,8 +191,7 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
     assert "restoreTesseractInstallState" in response.text
     assert "session.json" not in response.text
     assert "events.jsonl" not in response.text
-    assert "galgame_explain_line" in response.text
-    assert "galgame_summarize_scene" in response.text
+    assert "galgame_suggest_choice" in response.text
     assert "galgame_get_status" in response.text
     assert "galgame_get_snapshot" in response.text
     assert "galgame_get_history" in response.text
@@ -175,6 +211,8 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
     assert "renderOcrPipelinePanel" in response.text
     assert "renderInstallCompactSummary" in response.text
     assert "excluded_non_game_process" in response.text
+    assert "document.querySelector('.console-header-bar')" in response.text
+    assert "document.querySelector('.hero')" not in response.text
     assert "rapidocr" in response.text
     assert "dxcam" in response.text
     assert "tesseract" in response.text
@@ -192,6 +230,119 @@ async def test_galgame_plugin_ui_script_contains_mac_diagnostic_codes(
     assert "screen_recording_permission_denied" in response.text
     assert "accessibility_permission_denied" in response.text
     assert "mac_window_capture_unavailable" in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_style_keeps_regular_details_panels_in_internal_scroll(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/style.css")
+
+    assert response.status_code == 200
+    assert "details[open]:not(.panel-fullscreen)" in response.text
+    assert "overflow: auto;" in response.text
+    assert "scrollbar-gutter: stable;" in response.text
+    assert "position: sticky;" in response.text
+    assert "top: 0;" in response.text
+    assert """.panel-scroll {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: clamp(320px, 48vh, 560px);
+  overflow: auto;
+}""" in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_style_gives_dashboard_summary_opaque_separation(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/style.css")
+
+    assert response.status_code == 200
+    assert """.dashboard-module > summary {
+  margin-bottom: 14px;
+  background: #fffcf7;
+  border-radius: 14px;
+  position: relative;
+  z-index: 1;
+  padding: 18px 22px 14px;
+  border-bottom: 1px dashed var(--line);
+}""" in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_style_panel_scroll_wide_keeps_height_clamp(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/style.css")
+
+    assert response.status_code == 200
+    assert """.panel-scroll-wide {
+  max-height: clamp(360px, 58vh, 680px);
+}""" in response.text
+    assert """details.panel-scroll-wide[open] {
+  max-height: clamp(360px, 58vh, 680px);
+}""" in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_index_route_uses_opaque_sticky_header(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/")
+
+    assert response.status_code == 200
+    assert ".console-header-bar {" in response.text
+    assert "background: #ffffff;" in response.text
+    assert "backdrop-filter: none;" in response.text
+    assert "-webkit-backdrop-filter: none;" in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_index_route_does_not_inline_force_advanced_settings_open(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/")
+
+    assert response.status_code == 200
+    match = re.search(r"#advancedSettings\s*\{(?P<body>.*?)\n\s*\}", response.text, re.S)
+    assert match is not None
+    assert "display: flex;" not in match.group("body")
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_style_only_shows_advanced_settings_when_open(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/style.css")
+
+    assert response.status_code == 200
+    assert "#advancedSettings {\n  display: none;\n}" in response.text
+    assert """#advancedSettings.open {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  animation: fadeIn 0.15s ease;
+}""" in response.text
+
+
+@pytest.mark.asyncio
+async def test_galgame_plugin_ui_style_uses_console_header_for_mode_auto_speed_toggle(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/style.css")
+
+    assert response.status_code == 200
+    assert ".console-header-bar.mode-auto .speed-switch {" in response.text
+    assert ".hero.mode-auto .speed-switch {" not in response.text
 
 
 @pytest.mark.asyncio
