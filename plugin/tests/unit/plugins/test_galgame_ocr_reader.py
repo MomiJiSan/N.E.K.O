@@ -2354,7 +2354,9 @@ def test_mouse_monitor_stop_joins_and_clears_exited_thread() -> None:
     assert monitor._thread is None
 
 
-def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping() -> None:
+def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _StuckThread:
         def __init__(self) -> None:
             self.join_calls: list[float] = []
@@ -2369,13 +2371,10 @@ def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping() -> None:
     thread = _StuckThread()
     monitor._thread = thread
     monitor._stop.set()
-    original_os_name = galgame_ocr_reader.os.name
 
-    try:
-        galgame_ocr_reader.os.name = "nt"
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(galgame_ocr_reader.os, "name", "nt")
         started = monitor.start()
-    finally:
-        galgame_ocr_reader.os.name = original_os_name
 
     assert started is False
     assert thread.join_calls == [0.25]
