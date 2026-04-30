@@ -220,6 +220,107 @@ def _window() -> list[DetectedGameWindow]:
     ]
 
 
+@pytest.mark.asyncio
+async def test_ocr_reader_manager_mac_preflight_reports_screen_recording_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+
+    monkeypatch.setattr(
+        galgame_ocr_reader,
+        "inspect_macos_permissions",
+        lambda: {
+            "screen_recording": {
+                "granted": False,
+                "detail": "screen_recording_permission_denied",
+            },
+            "accessibility": {
+                "granted": True,
+                "detail": "granted",
+            },
+        },
+    )
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root, reader_mode=READER_MODE_AUTO),
+        platform_fn=lambda: True,
+        platform_name_fn=lambda: "darwin",
+        window_scanner=lambda: _window(),
+        ocr_backend=_FakeOcrBackend(["第一句台词"]),
+    )
+
+    result = await manager.tick(bridge_sdk_available=False, memory_reader_runtime={})
+
+    assert result.runtime["detail"] == "screen_recording_permission_denied"
+    assert manager.current_window_target()["mode"] == "auto"
+
+
+def test_ocr_reader_manager_uses_mac_capture_backend_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+
+    capture_instances: list[object] = []
+
+    class _MacBackend(_FakeCaptureBackend):
+        def __init__(self, *, logger=None, selection="smart") -> None:
+            del logger, selection
+            super().__init__()
+            capture_instances.append(self)
+
+    monkeypatch.setattr(
+        galgame_ocr_reader,
+        "MacNativeWindowCaptureBackend",
+        _MacBackend,
+    )
+
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        platform_fn=lambda: True,
+        platform_name_fn=lambda: "darwin",
+        ocr_backend=_FakeOcrBackend(["第一句台词"]),
+    )
+
+    assert capture_instances
+    assert manager._capture_backend is capture_instances[0]
+
+
+def test_ocr_reader_manager_mac_window_key_can_be_manually_locked(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    candidate = DetectedGameWindow(
+        hwnd=901,
+        title="Episode 1",
+        process_name="SteamGame",
+        pid=4242,
+        width=1280,
+        height=720,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        platform_fn=lambda: True,
+        platform_name_fn=lambda: "darwin",
+        window_scanner=lambda: [candidate],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["第一句台词"]),
+    )
+
+    resolved = manager.resolve_manual_window_target(candidate.window_key)
+    manager.update_window_target(resolved)
+
+    assert manager.current_window_target()["mode"] == "manual"
+    assert manager.current_window_target()["window_key"] == candidate.window_key
+
+
 @pytest.mark.parametrize(
     ("ocr_text", "expected_stage"),
     [
@@ -2253,9 +2354,7 @@ def test_mouse_monitor_stop_joins_and_clears_exited_thread() -> None:
     assert monitor._thread is None
 
 
-def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping() -> None:
     class _StuckThread:
         def __init__(self) -> None:
             self.join_calls: list[float] = []
@@ -2270,9 +2369,15 @@ def test_mouse_monitor_start_does_not_reuse_thread_that_is_stopping(
     thread = _StuckThread()
     monitor._thread = thread
     monitor._stop.set()
-    monkeypatch.setattr(galgame_ocr_reader.os, "name", "nt")
+    original_os_name = galgame_ocr_reader.os.name
 
-    assert monitor.start() is False
+    try:
+        galgame_ocr_reader.os.name = "nt"
+        started = monitor.start()
+    finally:
+        galgame_ocr_reader.os.name = original_os_name
+
+    assert started is False
     assert thread.join_calls == [0.25]
 
 
@@ -2636,6 +2741,7 @@ def test_inspect_tesseract_installation_reports_custom_install_target(tmp_path: 
         configured_path="",
         install_target_dir_raw=str(install_root),
         languages=DEFAULT_TESSERACT_LANGUAGES,
+        platform_fn=lambda: True,
     )
 
     assert status["installed"] is True
@@ -2645,7 +2751,14 @@ def test_inspect_tesseract_installation_reports_custom_install_target(tmp_path: 
     assert status["missing_languages"] == []
 
 
-def test_tesseract_default_install_target_matches_neko_programs_root() -> None:
+def test_tesseract_default_install_target_matches_neko_programs_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "plugin.plugins.galgame_plugin.tesseract_support.is_windows_platform",
+        lambda: True,
+    )
+
     raw_target = default_tesseract_install_target_raw()
 
     assert raw_target == "%LOCALAPPDATA%/Programs/N.E.K.O/Tesseract-OCR"

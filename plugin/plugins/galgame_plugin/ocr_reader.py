@@ -78,6 +78,9 @@ from .rapidocr_support import (
     inspect_rapidocr_installation,
     load_rapidocr_runtime,
 )
+from .mac_capture_support import MacNativeWindowCaptureBackend
+from .mac_permissions_support import inspect_macos_permissions
+from .mac_window_support import list_native_candidate_windows
 from .reader import normalize_text
 from .screen_classifier import (
     ScreenClassification,
@@ -2882,6 +2885,48 @@ def _default_window_scanner() -> list[DetectedGameWindow]:
     return results
 
 
+def _default_mac_window_scanner() -> list[DetectedGameWindow]:
+    results: list[DetectedGameWindow] = []
+    for record in list_native_candidate_windows():
+        width = max(0, int(record.get("width") or 0))
+        height = max(0, int(record.get("height") or 0))
+        area = max(0, int(record.get("area") or (width * height)))
+        candidate = DetectedGameWindow(
+            hwnd=max(0, int(record.get("hwnd") or 0)),
+            title=str(record.get("title") or ""),
+            process_name=str(record.get("process_name") or "").strip(),
+            pid=max(0, int(record.get("pid") or 0)),
+            class_name=str(record.get("class_name") or "CGWindow"),
+            exe_path=str(record.get("exe_path") or ""),
+            width=width,
+            height=height,
+            area=area,
+            is_foreground=bool(record.get("is_foreground")),
+            is_minimized=bool(record.get("is_minimized")),
+            score=float(area or 1),
+        )
+        results.append(_classify_window_candidate(candidate))
+    results.sort(key=_window_sort_key, reverse=True)
+    return results
+
+
+def _platform_name() -> str:
+    return sys.platform
+
+
+def _is_windows_platform_name(platform_name: str) -> bool:
+    return str(platform_name or "").strip().lower().startswith("win")
+
+
+def _is_darwin_platform_name(platform_name: str) -> bool:
+    return str(platform_name or "").strip().lower() == "darwin"
+
+
+def _is_supported_ocr_platform(platform_name: str | None = None) -> bool:
+    normalized = _platform_name() if platform_name is None else str(platform_name or "")
+    return _is_windows_platform_name(normalized) or _is_darwin_platform_name(normalized)
+
+
 def _is_windows_platform() -> bool:
     return os.name == "nt"
 
@@ -4154,6 +4199,7 @@ class OcrReaderManager:
         config: GalgameConfig,
         time_fn: Callable[[], float] | None = None,
         platform_fn: Callable[[], bool] | None = None,
+        platform_name_fn: Callable[[], str] | None = None,
         window_scanner: Callable[[], list[DetectedGameWindow]] | None = None,
         capture_backend: CaptureBackend | None = None,
         ocr_backend: OcrBackend | None = None,
@@ -4162,13 +4208,13 @@ class OcrReaderManager:
         self._logger = logger
         self._config = config
         self._time_fn = time_fn or time.time
-        self._platform_fn = platform_fn or _is_windows_platform
-        self._window_scanner = window_scanner or _default_window_scanner
+        self._platform_fn = platform_fn or _is_supported_ocr_platform
+        self._platform_fn_explicit = platform_fn is not None
+        self._platform_name_fn = platform_name_fn or _platform_name
+        self._platform_name_fn_explicit = platform_name_fn is not None
+        self._window_scanner = window_scanner or self._default_window_scanner_for_platform()
         self._custom_capture_backend = capture_backend is not None
-        self._capture_backend = capture_backend or Win32CaptureBackend(
-            logger=logger,
-            selection=config.ocr_reader_capture_backend,
-        )
+        self._capture_backend = capture_backend or self._create_default_capture_backend()
         self._ocr_backend = ocr_backend
         self._custom_ocr_backend = ocr_backend is not None
         self._writer = writer or OcrReaderBridgeWriter(
@@ -4269,10 +4315,47 @@ class OcrReaderManager:
         self._window_inventory_cache: list[DetectedGameWindow] = []
         self._start_rapidocr_warmup_if_configured()
 
+    def _current_platform_name(self) -> str:
+        if self._platform_fn_explicit and not self._platform_name_fn_explicit:
+            return "win32"
+        try:
+            return str(self._platform_name_fn() or "").strip().lower()
+        except Exception:
+            return ""
+
+    def _current_platform_is_supported(self) -> bool:
+        return bool(self._platform_fn()) and _is_supported_ocr_platform(self._current_platform_name())
+
+    def _current_platform_is_darwin(self) -> bool:
+        return _is_darwin_platform_name(self._current_platform_name())
+
+    def _current_platform_is_windows(self) -> bool:
+        return _is_windows_platform_name(self._current_platform_name())
+
+    def _default_window_scanner_for_platform(self) -> Callable[[], list[DetectedGameWindow]]:
+        if self._current_platform_is_darwin():
+            return _default_mac_window_scanner
+        return _default_window_scanner
+
+    def _create_default_capture_backend(self) -> CaptureBackend:
+        if self._current_platform_is_darwin():
+            return MacNativeWindowCaptureBackend(
+                logger=self._logger,
+                selection=self._config.ocr_reader_capture_backend,
+            )
+        return Win32CaptureBackend(
+            logger=self._logger,
+            selection=self._config.ocr_reader_capture_backend,
+        )
+
     def _foreground_advance_monitor_enabled(self) -> bool:
         return (
             bool(self._config.ocr_reader_enabled)
-            and self._platform_fn()
+            and self._current_platform_is_supported()
+            and (
+                self._current_platform_is_windows()
+                or (self._platform_fn_explicit and not self._platform_name_fn_explicit)
+            )
             and getattr(self._config, "reader_mode", READER_MODE_AUTO) != READER_MODE_MEMORY
             and self._config.ocr_reader_trigger_mode == OCR_TRIGGER_MODE_AFTER_ADVANCE
         )
@@ -4402,10 +4485,7 @@ class OcrReaderManager:
         if not self._custom_capture_backend:
             current_selection = str(getattr(self._capture_backend, "selection", "") or "")
             if current_selection != config.ocr_reader_capture_backend:
-                self._capture_backend = Win32CaptureBackend(
-                    logger=self._logger,
-                    selection=config.ocr_reader_capture_backend,
-                )
+                self._capture_backend = self._create_default_capture_backend()
                 self._capture_backend_kind = str(
                     getattr(self._capture_backend, "selection", "custom")
                 )
@@ -4797,7 +4877,7 @@ class OcrReaderManager:
         return self._manual_target.to_dict()
 
     def refresh_foreground_state(self) -> dict[str, Any]:
-        if not self._config.ocr_reader_enabled or not self._platform_fn():
+        if not self._config.ocr_reader_enabled or not self._current_platform_is_supported():
             return self._runtime.to_dict()
         foreground_hwnd = _foreground_window_handle()
         target, detail = self._foreground_refresh_target()
@@ -5973,7 +6053,7 @@ class OcrReaderManager:
         *,
         force: bool = False,
     ) -> tuple[list[DetectedGameWindow], list[DetectedGameWindow]]:
-        if not self._platform_fn():
+        if not self._current_platform_is_supported():
             self._last_detected_windows = []
             self._last_eligible_windows = []
             self._last_excluded_windows = []
@@ -6002,16 +6082,33 @@ class OcrReaderManager:
             result.runtime = self._runtime.to_dict()
             return _TickPreflightResult(result=result, should_return=True)
 
-        if not self._platform_fn():
+        if not self._current_platform_is_supported():
             self._runtime = self._build_runtime(
                 status="idle",
                 detail="unsupported_platform",
                 plan=SelectedOcrBackendPlan(),
             )
             await self._end_session_if_needed(now)
-            result.warnings.append("ocr_reader is Windows-only")
+            result.warnings.append("ocr_reader platform is not supported")
             result.runtime = self._runtime.to_dict()
             return _TickPreflightResult(result=result, should_return=True)
+
+        if self._current_platform_is_darwin():
+            permissions = inspect_macos_permissions()
+            screen_recording = permissions.get("screen_recording")
+            screen_recording = screen_recording if isinstance(screen_recording, dict) else {}
+            if not bool(screen_recording.get("granted")):
+                self._runtime = self._build_runtime(
+                    status="idle",
+                    detail=str(
+                        screen_recording.get("detail")
+                        or "screen_recording_permission_denied"
+                    ),
+                    plan=SelectedOcrBackendPlan(),
+                )
+                await self._end_session_if_needed(now)
+                result.runtime = self._runtime.to_dict()
+                return _TickPreflightResult(result=result, should_return=True)
 
         backend_plan_started_at = self._time_fn()
         backend_plan = await asyncio.to_thread(self._resolve_backend_plan)
@@ -7018,6 +7115,7 @@ class OcrReaderManager:
             configured_path=self._config.ocr_reader_tesseract_path,
             install_target_dir_raw=self._config.ocr_reader_install_target_dir,
             languages=self._config.ocr_reader_languages,
+            platform_fn=self._current_platform_is_windows,
         )
         rapidocr_inspection = inspect_rapidocr_installation(
             install_target_dir_raw=self._config.rapidocr_install_target_dir,
