@@ -1202,6 +1202,30 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
             ],
         )
 
+    if runtime_detail == "screen_recording_permission_denied":
+        return diagnosis(
+            "error",
+            "macOS 未授予屏幕录制权限",
+            "OCR 无法读取游戏窗口画面。请在系统设置中授予屏幕录制权限后刷新状态，必要时重新选择 OCR 窗口。",
+            [
+                _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
+    if runtime_detail == "accessibility_permission_denied":
+        return diagnosis(
+            "warning",
+            "macOS 未授予辅助功能权限",
+            "OCR 暂时无法稳定确认目标游戏窗口。请在系统设置中授予辅助功能权限后刷新状态，必要时重新选择 OCR 窗口。",
+            [
+                _diagnosis_action("refresh_all", "刷新全部"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+        )
+
     if runtime_detail == "self_ui_guard_blocked" or last_rejected_reason == "self_ui_guard":
         preview = f"最近拒绝文本：{last_rejected_text[:80]}。" if last_rejected_text else ""
         return diagnosis(

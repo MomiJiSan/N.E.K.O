@@ -3614,6 +3614,7 @@ function formatOcrWindowReason(reason) {
     excluded_small_or_hidden_window: '已排除过小或不可用窗口',
     excluded_minimized_window: '游戏窗口已最小化，OCR 不能截图，请恢复窗口',
     excluded_non_game_process: '非游戏进程，已忽略',
+    mac_window_capture_unavailable: 'macOS 当前不能直接读取这个窗口，请检查系统权限或改用其他窗口',
   };
   return mapping[reason] || reason || 'unknown';
 }
@@ -3630,6 +3631,9 @@ function formatOcrWindowSelectionDetail(detail) {
     foreground_window_needs_manual_confirmation: '当前前台窗口不像游戏，请手动选择游戏窗口',
     no_eligible_window: '当前没有可用游戏窗口',
     memory_reader_window_minimized: '游戏窗口已最小化，OCR 不能截图，请恢复窗口',
+    screen_recording_permission_denied: 'macOS 未授予屏幕录制权限，请先在系统设置中允许截图',
+    accessibility_permission_denied: 'macOS 未授予辅助功能权限，请先在系统设置中允许窗口访问',
+    mac_window_capture_unavailable: 'macOS 当前不能直接读取这个窗口，请重新选择游戏窗口或检查权限',
     memory_reader_pid: '优先沿用 Memory Reader 命中的 PID',
     memory_reader_process: '优先沿用 Memory Reader 命中的进程',
     manual_target_overridden_by_memory_reader: 'Memory Reader 目标与 OCR 手动目标不一致，已优先使用 Memory Reader',

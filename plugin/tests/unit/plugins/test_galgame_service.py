@@ -403,6 +403,68 @@ def test_status_payload_primary_diagnosis_reports_capture_failure(
     }
 
 
+def test_status_payload_primary_diagnosis_reports_screen_recording_permission_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = galgame_service.build_config({})
+    state = _status_state(
+        ocr_reader_runtime={
+            "status": "running",
+            "detail": "screen_recording_permission_denied",
+        },
+    )
+    _patch_status_dependencies(monkeypatch)
+
+    payload = galgame_service.build_status_payload(
+        state,
+        config=config,
+        state_is_snapshot=True,
+    )
+
+    diagnosis = payload["primary_diagnosis"]
+    assert diagnosis["severity"] == "error"
+    assert diagnosis["title"] == "macOS 未授予屏幕录制权限"
+    assert {"refresh_all", "select_ocr_window", "debug_details"} <= {
+        action["id"] for action in diagnosis["actions"]
+    }
+
+
+def test_status_payload_keeps_memory_reader_runtime_shape_when_mac_ocr_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = galgame_service.build_config({})
+    memory_reader_runtime = {
+        "status": "attached",
+        "process_name": "Game.app",
+        "selection": {
+            "pid": 4242,
+            "engine": "kirikiri",
+        },
+    }
+    state = _status_state(
+        memory_reader_runtime=memory_reader_runtime,
+        ocr_reader_runtime={
+            "status": "running",
+            "detail": "accessibility_permission_denied",
+        },
+    )
+    _patch_status_dependencies(monkeypatch)
+
+    payload = galgame_service.build_status_payload(
+        state,
+        config=config,
+        state_is_snapshot=True,
+    )
+
+    assert payload["memory_reader_runtime"] == memory_reader_runtime
+    diagnosis = payload["primary_diagnosis"]
+    assert diagnosis["severity"] == "warning"
+    assert diagnosis["title"] == "macOS 未授予辅助功能权限"
+    assert {"refresh_all", "select_ocr_window", "debug_details"} <= {
+        action["id"] for action in diagnosis["actions"]
+    }
+
+
 def test_status_payload_exposes_interval_background_polling_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

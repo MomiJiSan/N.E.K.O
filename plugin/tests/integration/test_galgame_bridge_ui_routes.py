@@ -182,6 +182,19 @@ async def test_galgame_plugin_ui_script_uses_runs_and_install_ui_api(
 
 
 @pytest.mark.asyncio
+async def test_galgame_plugin_ui_script_contains_mac_diagnostic_codes(
+    plugin_ui_async_client: AsyncClient,
+    registered_galgame_plugin_meta,
+) -> None:
+    response = await plugin_ui_async_client.get("/plugin/galgame_plugin/ui/main.js")
+
+    assert response.status_code == 200
+    assert "screen_recording_permission_denied" in response.text
+    assert "accessibility_permission_denied" in response.text
+    assert "mac_window_capture_unavailable" in response.text
+
+
+@pytest.mark.asyncio
 async def test_galgame_plugin_ui_info_reports_registered_assets(
     plugin_ui_async_client: AsyncClient,
     registered_galgame_plugin_meta,
