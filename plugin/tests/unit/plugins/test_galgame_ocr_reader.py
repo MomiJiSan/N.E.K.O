@@ -321,6 +321,49 @@ def test_ocr_reader_manager_mac_window_key_can_be_manually_locked(
     assert manager.current_window_target()["window_key"] == candidate.window_key
 
 
+def test_ocr_reader_manager_mac_foreground_candidate_stays_prioritized(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir()
+    background = DetectedGameWindow(
+        hwnd=901,
+        title="Background Episode",
+        process_name="SteamGame",
+        pid=4242,
+        width=1920,
+        height=1080,
+        area=1920 * 1080,
+        is_foreground=False,
+    )
+    foreground = DetectedGameWindow(
+        hwnd=902,
+        title="Foreground Episode",
+        process_name="SteamGame",
+        pid=4243,
+        width=1280,
+        height=720,
+        area=1280 * 720,
+        is_foreground=True,
+    )
+    manager = OcrReaderManager(
+        logger=_Logger(),
+        config=_make_config(bridge_root),
+        platform_fn=lambda: True,
+        platform_name_fn=lambda: "darwin",
+        window_scanner=lambda: [background, foreground],
+        capture_backend=_FakeCaptureBackend(),
+        ocr_backend=_FakeOcrBackend(["第一句台词"]),
+    )
+
+    snapshot = manager.list_windows_snapshot(force=True)
+
+    assert snapshot["windows"][0]["window_key"] == foreground.window_key
+    assert snapshot["windows"][0]["is_foreground"] is True
+    assert snapshot["windows"][1]["window_key"] == background.window_key
+    assert snapshot["windows"][1]["is_foreground"] is False
+
+
 @pytest.mark.parametrize(
     ("ocr_text", "expected_stage"),
     [

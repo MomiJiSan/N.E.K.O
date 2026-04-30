@@ -6010,7 +6010,8 @@ class OcrReaderManager:
         self,
         windows: list[DetectedGameWindow],
     ) -> tuple[list[DetectedGameWindow], list[DetectedGameWindow]]:
-        foreground_hwnd = _foreground_window_handle()
+        use_helper_foreground = self._current_platform_is_darwin()
+        foreground_hwnd = 0 if use_helper_foreground else _foreground_window_handle()
         prepared: list[DetectedGameWindow] = []
         for window in windows:
             candidate = replace(window)
@@ -6022,8 +6023,11 @@ class OcrReaderManager:
             candidate.hwnd = max(0, int(candidate.hwnd or 0))
             candidate.area = max(0, int(candidate.area or 0))
             candidate.is_minimized = bool(candidate.is_minimized)
-            foreground_match, _ = _foreground_matches_target(foreground_hwnd, candidate)
-            candidate.is_foreground = foreground_match
+            if use_helper_foreground:
+                candidate.is_foreground = bool(candidate.is_foreground)
+            else:
+                foreground_match, _ = _foreground_matches_target(foreground_hwnd, candidate)
+                candidate.is_foreground = foreground_match
             candidate.score = float(max(candidate.area, 1))
             candidate = _classify_window_candidate(candidate)
             prepared.append(candidate)
