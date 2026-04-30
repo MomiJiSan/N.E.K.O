@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 
 def _preflight_screen_capture_access() -> bool:
-    from Quartz import CGPreflightScreenCaptureAccess
+    quartz = importlib.import_module("Quartz")
 
-    return bool(CGPreflightScreenCaptureAccess())
+    return bool(quartz.CGPreflightScreenCaptureAccess())
 
 
 def _is_process_trusted() -> bool:
-    from ApplicationServices import AXIsProcessTrusted
+    application_services = importlib.import_module("ApplicationServices")
 
-    return bool(AXIsProcessTrusted())
+    return bool(application_services.AXIsProcessTrusted())
 
 
 def _status_payload(*, granted: bool, detail: str) -> dict[str, Any]:
