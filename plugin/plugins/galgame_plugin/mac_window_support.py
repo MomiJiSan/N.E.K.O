@@ -23,9 +23,16 @@ def _frontmost_pid() -> int:
 
 
 def list_native_candidate_windows() -> list[dict[str, Any]]:
-    frontmost_pid = _frontmost_pid()
+    try:
+        frontmost_pid = _frontmost_pid()
+    except Exception:
+        frontmost_pid = 0
+    try:
+        records = _window_records()
+    except Exception:
+        return []
     results: list[dict[str, Any]] = []
-    for record in _window_records():
+    for record in records:
         bounds = dict(record.get("kCGWindowBounds") or {})
         width = int(bounds.get("Width") or 0)
         height = int(bounds.get("Height") or 0)
