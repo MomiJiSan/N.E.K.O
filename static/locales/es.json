@@ -4212,9 +4212,108 @@
             "drawCalls": "Draw calls"
         }
     },
-    "basketball": {
-        "title": "Desafío de baloncesto",
-        "modeSwitcher": "Modo de baloncesto",
+    "soccer": {
+        "exitGame": {
+            "button": "Salir del juego",
+            "ending": "Finalizando la ronda…",
+            "ended": "Juego terminado, volviendo…",
+            "endingDefault": "Terminando este partido…",
+            "endedDefault": "Partido terminado. Cierra esta página. Para volver a jugar, ábrela de nuevo."
+        },
+        "startScreen": {
+            "readyToStart": "Listo — haz clic para empezar",
+            "ready": "Listo",
+            "startButton": "Iniciar"
+        },
+        "startTutorial": {
+            "title": "Cómo jugar",
+            "move": "Mueve el ratón para guiar al jugador.",
+            "charge": "Cerca del balón, mantén clic izquierdo para cargar y suelta para disparar.",
+            "range": "El disparo solo se activa a {{distance}} o menos del balón.",
+            "reset": "Pulsa R para reiniciar el balón y las posiciones.",
+            "ai": "El ánimo y la dificultad de NEKO cambian según el partido."
+        },
+        "hint": {
+            "controls": "Ratón = guiar al jugador · Mantén clic izquierdo = cargar, suelta = disparo (se activa a ≤{{distance}} del balón) · R = reset",
+            "aiMood": "El ánimo y la dificultad de NEKO cambian según el partido"
+        },
+        "debugControls": {
+            "bounds": "Activar límites (regla de fuera)",
+            "voiceOutput": "Reproducir líneas LLM (voz del proyecto)",
+            "voiceButton": "Voz de depuración",
+            "voicePlaceholder": "Depuración: escribe la transcripción final y pulsa Enter",
+            "send": "Enviar",
+            "voiceStatusHidden": "STT de depuración: oculto"
+        },
+        "debug": {
+            "mouse": "ratón: {{x}}, {{y}}",
+            "playerCenter": "centro jugador: {{x}}, {{y}}",
+            "aiCenter": "centro IA: {{x}}, {{y}}  modo: {{mode}}",
+            "state": "ronda: {{round}}  dificultad: {{difficulty}}  ánimo: {{mood}}  carga: {{charge}}%",
+            "ball": "balón: ({{x}}, {{y}})  velocidad={{speed}}",
+            "event": "{{age}}s  {{label}}  @({{x}},{{y}})  v=({{vx}},{{vy}})",
+            "roundCenter": "Ronda {{round}}"
+        },
+        "moods": {
+            "calm": "tranquila",
+            "happy": "feliz",
+            "angry": "enfadada",
+            "relaxed": "relajada",
+            "sad": "triste",
+            "surprised": "sorprendida"
+        },
+        "difficulties": {
+            "max": "máxima",
+            "lv2": "nivel 2",
+            "lv3": "nivel 3",
+            "lv4": "nivel 4"
+        },
+        "aiModes": {
+            "attack": "ataque",
+            "defend": "defensa",
+            "clear": "despeje"
+        },
+        "debugEvents": {
+            "player-kick": "disparo del jugador",
+            "ai-kick": "disparo de la IA",
+            "unstick": "balón liberado"
+        },
+        "loading": {
+            "beginStartDefault": "Analizando contexto de inicio…",
+            "initializingMiniGame": "Inicializando minijuego de fútbol…",
+            "assetsDone": "Modelo cargado",
+            "assetsFailed": "Error al inicializar el modelo, continuando",
+            "routeDone": "Contexto de inicio listo",
+            "routeFallback": "Contexto de inicio usando valores predeterminados locales",
+            "routeFailed": "Falló la solicitud del contexto de inicio, continuando"
+        },
+        "voiceStatus": {
+            "routeEnded": "Ruta del juego finalizada — recarga la página para volver a conectar",
+            "unsupported": "Este navegador no admite la transcripción de voz del juego. Usa la entrada de texto del chat principal por ahora.",
+            "listening": "STT del juego: escuchando al jugador",
+            "error": "STT del juego: {{code}}",
+            "startFailed": "STT del juego: error al iniciar. Usa la entrada de texto del chat principal por ahora.",
+            "handoverInProgress": "STT del juego: la entrada de voz principal está tomando el control",
+            "waitingForHandover": "STT del juego: esperando que la entrada de voz principal tome el control",
+            "received": "Voz del jugador recibida: {{text}}",
+            "debugSubmitted": "STT de depuración enviado: {{text}}",
+            "debugListening": "STT de depuración: escuchando al jugador…",
+            "debugIdle": "STT de depuración: en espera",
+            "debugUnsupported": "Este navegador no admite el STT de depuración. Usa el cuadro de texto de depuración.",
+            "recognitionError": "Error de reconocimiento de voz: {{code}}"
+        },
+        "debugButton": {
+            "holdToSubmit": "Suelta para enviar",
+            "idle": "Voz de depuración"
+        },
+        "memoryOption": {
+            "label": "Guardar este partido en la memoria (desactivado por defecto)",
+            "hint": "Cuando está desactivado, las entradas del jugador, las respuestas directas de NEKO, las reacciones a eventos, el resumen del partido y las conversaciones posteriores no se guardan ni se consultan en la memoria."
+        }
+    },
+    "badminton": {
+        "title": "Desafío de bádminton",
+        "modeSwitcher": "Modo de bádminton",
         "mode": {
             "spectator": "Práctica libre",
             "shooter": "Desafío de tiro",
@@ -4323,16 +4422,15 @@
             "current": "Tema: {{theme}}",
             "changed": "Tema {{theme}}",
             "labels": {
-                "default": "Gimnasio",
-                "sunset": "Cancha al atardecer",
-                "night": "Luces nocturnas"
+                "default": "Cancha de bádminton",
+                "miami": "Atardecer en Miami"
             }
         },
         "court": {
-            "restrictedArc": "Zona restringida",
-            "freeThrowLine": "Tiro libre",
-            "threePointLine": "Triple",
-            "midCourtLine": "Media cancha"
+            "netFront": "Frente de red",
+            "serviceLine": "Línea de saque",
+            "backCourt": "Fondo de cancha",
+            "baseline": "Línea de fondo"
         },
         "close": "Cerrar",
         "audio": {
@@ -4383,36 +4481,16 @@
             "release": "¡Suelta para tirar!"
         },
         "shot": {
-            "swish": "Limpia",
-            "bank": "Tablero",
-            "rim_in": "Entró en aro",
-            "rim_out": "Salió del aro",
-            "air_ball": "Air ball",
             "unknown": "Desconocido",
-            "attempt": "#{{index}} {{distance}} {{type}}"
+            "attempt": "#{{index}} {{distance}} {{type}}",
+            "line_in": "Limpia",
+            "net_touch": "Tablero",
+            "zone_in": "Entró en aro",
+            "out": "Salió del aro",
+            "net": "A la red"
         },
         "lines": {
             "default": {
-                "swish": [
-                    "¡Limpia!",
-                    "¡Limpia!"
-                ],
-                "bank": [
-                    "También cuenta con tablero.",
-                    "También cuenta con tablero."
-                ],
-                "rim_in": [
-                    "Entró rebotando.",
-                    "Entró rebotando."
-                ],
-                "rim_out": [
-                    "Por poco.",
-                    "Por poco."
-                ],
-                "air_ball": [
-                    "El aro está al otro lado.",
-                    "El aro está al otro lado."
-                ],
                 "shot_missed": [
                     "Todavía hay oportunidad.",
                     "Todavía hay oportunidad."
@@ -4448,29 +4526,29 @@
                 "streak_20": [
                     "¿Veinte seguidas? Increíble.",
                     "¿Veinte seguidas? Increíble."
+                ],
+                "line_in": [
+                    "¡Limpia!",
+                    "¡Limpia!"
+                ],
+                "net_touch": [
+                    "También cuenta con tablero.",
+                    "También cuenta con tablero."
+                ],
+                "zone_in": [
+                    "Entró rebotando.",
+                    "Entró rebotando."
+                ],
+                "out": [
+                    "Por poco.",
+                    "Por poco."
+                ],
+                "net": [
+                    "El aro está al otro lado.",
+                    "El aro está al otro lado."
                 ]
             },
             "shooter": {
-                "swish": [
-                    "¡Limpia!",
-                    "¡Limpia!"
-                ],
-                "bank": [
-                    "También cuenta con tablero.",
-                    "También cuenta con tablero."
-                ],
-                "rim_in": [
-                    "Entró rebotando.",
-                    "Entró rebotando."
-                ],
-                "rim_out": [
-                    "Por poco.",
-                    "Por poco."
-                ],
-                "air_ball": [
-                    "El aro está al otro lado.",
-                    "El aro está al otro lado."
-                ],
                 "shot_missed": [
                     "Todavía hay oportunidad.",
                     "Todavía hay oportunidad."
@@ -4506,29 +4584,29 @@
                 "streak_20": [
                     "¿Veinte seguidas? Increíble.",
                     "¿Veinte seguidas? Increíble."
-                ]
-            },
-            "duel": {
-                "swish": [
+                ],
+                "line_in": [
                     "¡Limpia!",
                     "¡Limpia!"
                 ],
-                "bank": [
+                "net_touch": [
                     "También cuenta con tablero.",
                     "También cuenta con tablero."
                 ],
-                "rim_in": [
+                "zone_in": [
                     "Entró rebotando.",
                     "Entró rebotando."
                 ],
-                "rim_out": [
+                "out": [
                     "Por poco.",
                     "Por poco."
                 ],
-                "air_ball": [
+                "net": [
                     "El aro está al otro lado.",
                     "El aro está al otro lado."
-                ],
+                ]
+            },
+            "duel": {
                 "shot_missed": [
                     "Todavía hay oportunidad.",
                     "Todavía hay oportunidad."
@@ -4566,7 +4644,27 @@
                     "¿Veinte seguidas? Increíble."
                 ],
                 "clutch": "...Este tiene que entrar.",
-                "excuse": "Ay, el brazo está algo cansado."
+                "excuse": "Ay, el brazo está algo cansado.",
+                "line_in": [
+                    "¡Limpia!",
+                    "¡Limpia!"
+                ],
+                "net_touch": [
+                    "También cuenta con tablero.",
+                    "También cuenta con tablero."
+                ],
+                "zone_in": [
+                    "Entró rebotando.",
+                    "Entró rebotando."
+                ],
+                "out": [
+                    "Por poco.",
+                    "Por poco."
+                ],
+                "net": [
+                    "El aro está al otro lado.",
+                    "El aro está al otro lado."
+                ]
             },
             "fallback": [
                 "Otra vez."
@@ -4591,114 +4689,15 @@
                 "lateNight": "¿Sigues tirando tan tarde?",
                 "xmas": "Ya están las campanas, ¿y aún quieres tirar?",
                 "newYear": "¡Feliz Año Nuevo!",
-                "swish3": "¿Estás usando trucos?",
-                "swish5": "...Tengo que revisar el aro.",
-                "airball3": "...Quizá toma un descanso."
+                "lineIn3": "¿Estás usando trucos?",
+                "lineIn5": "...Tengo que revisar el aro.",
+                "net3": "...Quizá toma un descanso."
             }
         },
         "mood": {
             "happySuffix": " ♪",
             "sadPrefix": "...",
             "surprisedPrefix": "¿Eh?! "
-        }
-    },
-    "soccer": {
-        "exitGame": {
-            "button": "Salir del juego",
-            "ending": "Finalizando la ronda…",
-            "ended": "Juego terminado, volviendo…",
-            "endingDefault": "Terminando este partido…",
-            "endedDefault": "Partido terminado. Cierra esta página. Para volver a jugar, ábrela de nuevo."
-        },
-        "startScreen": {
-            "readyToStart": "Listo — haz clic para empezar",
-            "ready": "Listo",
-            "startButton": "Iniciar"
-        },
-        "startTutorial": {
-            "title": "Cómo jugar",
-            "move": "Mueve el ratón para guiar al jugador.",
-            "charge": "Cerca del balón, mantén clic izquierdo para cargar y suelta para disparar.",
-            "range": "El disparo solo se activa a {{distance}} o menos del balón.",
-            "reset": "Pulsa R para reiniciar el balón y las posiciones.",
-            "ai": "El ánimo y la dificultad de NEKO cambian según el partido."
-        },
-        "hint": {
-            "controls": "Ratón = guiar al jugador · Mantén clic izquierdo = cargar, suelta = disparo (se activa a ≤{{distance}} del balón) · R = reset",
-            "aiMood": "El ánimo y la dificultad de NEKO cambian según el partido"
-        },
-        "debugControls": {
-            "bounds": "Activar límites (regla de fuera)",
-            "voiceOutput": "Reproducir líneas LLM (voz del proyecto)",
-            "voiceButton": "Voz de depuración",
-            "voicePlaceholder": "Depuración: escribe la transcripción final y pulsa Enter",
-            "send": "Enviar",
-            "voiceStatusHidden": "STT de depuración: oculto"
-        },
-        "debug": {
-            "mouse": "ratón: {{x}}, {{y}}",
-            "playerCenter": "centro jugador: {{x}}, {{y}}",
-            "aiCenter": "centro IA: {{x}}, {{y}}  modo: {{mode}}",
-            "state": "ronda: {{round}}  dificultad: {{difficulty}}  ánimo: {{mood}}  carga: {{charge}}%",
-            "ball": "balón: ({{x}}, {{y}})  velocidad={{speed}}",
-            "event": "{{age}}s  {{label}}  @({{x}},{{y}})  v=({{vx}},{{vy}})",
-            "roundCenter": "Ronda {{round}}"
-        },
-        "moods": {
-            "calm": "tranquila",
-            "happy": "feliz",
-            "angry": "enfadada",
-            "relaxed": "relajada",
-            "sad": "triste",
-            "surprised": "sorprendida"
-        },
-        "difficulties": {
-            "max": "máxima",
-            "lv2": "nivel 2",
-            "lv3": "nivel 3",
-            "lv4": "nivel 4"
-        },
-        "aiModes": {
-            "attack": "ataque",
-            "defend": "defensa",
-            "clear": "despeje"
-        },
-        "debugEvents": {
-            "player-kick": "disparo del jugador",
-            "ai-kick": "disparo de la IA",
-            "unstick": "balón liberado"
-        },
-        "loading": {
-            "beginStartDefault": "Analizando contexto de inicio…",
-            "initializingMiniGame": "Inicializando minijuego de fútbol…",
-            "assetsDone": "Modelo cargado",
-            "assetsFailed": "Error al inicializar el modelo, continuando",
-            "routeDone": "Contexto de inicio listo",
-            "routeFallback": "Contexto de inicio usando valores predeterminados locales",
-            "routeFailed": "Falló la solicitud del contexto de inicio, continuando"
-        },
-        "voiceStatus": {
-            "routeEnded": "Ruta del juego finalizada — recarga la página para volver a conectar",
-            "unsupported": "Este navegador no admite la transcripción de voz del juego. Usa la entrada de texto del chat principal por ahora.",
-            "listening": "STT del juego: escuchando al jugador",
-            "error": "STT del juego: {{code}}",
-            "startFailed": "STT del juego: error al iniciar. Usa la entrada de texto del chat principal por ahora.",
-            "handoverInProgress": "STT del juego: la entrada de voz principal está tomando el control",
-            "waitingForHandover": "STT del juego: esperando que la entrada de voz principal tome el control",
-            "received": "Voz del jugador recibida: {{text}}",
-            "debugSubmitted": "STT de depuración enviado: {{text}}",
-            "debugListening": "STT de depuración: escuchando al jugador…",
-            "debugIdle": "STT de depuración: en espera",
-            "debugUnsupported": "Este navegador no admite el STT de depuración. Usa el cuadro de texto de depuración.",
-            "recognitionError": "Error de reconocimiento de voz: {{code}}"
-        },
-        "debugButton": {
-            "holdToSubmit": "Suelta para enviar",
-            "idle": "Voz de depuración"
-        },
-        "memoryOption": {
-            "label": "Guardar este partido en la memoria (desactivado por defecto)",
-            "hint": "Cuando está desactivado, las entradas del jugador, las respuestas directas de NEKO, las reacciones a eventos, el resumen del partido y las conversaciones posteriores no se guardan ni se consultan en la memoria."
         }
     }
 }

@@ -2335,7 +2335,7 @@ def _mini_game_launch_url(game_type: str, lanlan_name: str, session_id: str) -> 
         "lanlan_name": lanlan_name,
         "session_id": session_id,
     }
-    if game_type == "basketball":
+    if game_type == "badminton":
         query["mode"] = "duel"
     separator = "&" if "?" in url_template else "?"
     return f"{url_template}{separator}{_urlencode(query)}"
