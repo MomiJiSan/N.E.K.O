@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TFT Insight</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111318;
+      --panel: #1a1e25;
+      --panel-2: #222832;
+      --text: #edf1f7;
+      --muted: #9ba7b8;
+      --line: #313946;
+      --accent: #55c2a3;
+      --warn: #d6a84f;
+      --bad: #e06c75;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 20px; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: 0; }
+    button, select {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      min-height: 36px;
+      padding: 0 12px;
+      font: inherit;
+    }
+    button { cursor: pointer; white-space: nowrap; }
+    button.primary { background: var(--accent); color: #07110e; border-color: transparent; font-weight: 700; }
+    button:disabled { opacity: .55; cursor: default; }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto auto auto auto;
+      gap: 10px;
+      align-items: center;
+      margin: 18px 0;
+    }
+    .grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 14px; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-width: 0;
+    }
+    h2 { margin: 0 0 10px; font-size: 15px; font-weight: 650; color: #d7deea; }
+    .metric-row, .status-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .metric {
+      background: #151922;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      min-height: 64px;
+      overflow-wrap: anywhere;
+    }
+    .label { color: var(--muted); font-size: 12px; }
+    .value { margin-top: 4px; font-size: 18px; font-weight: 700; }
+    .list { display: grid; gap: 8px; }
+    .insight {
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+      padding: 10px;
+      background: #151922;
+    }
+    .insight-title { font-weight: 700; margin-bottom: 4px; }
+    .insight-detail { color: var(--muted); overflow-wrap: anywhere; }
+    .empty { color: var(--muted); padding: 18px 0; }
+    .bad { color: var(--bad); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .preview {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+      background: #0b0d11;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    @media (max-width: 860px) {
+      .toolbar, .grid, .metric-row, .status-row { grid-template-columns: 1fr; }
+      header { align-items: flex-start; flex-direction: column; }
+      button, select { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>TFT Insight</h1>
+      <div class="label">Teamfight Tactics</div>
+    </div>
+    <div id="runtimeStatus" class="label mono">idle</div>
+  </header>
+
+  <div class="toolbar">
+    <select id="sourceSelect"></select>
+    <button id="refreshSourcesBtn">刷新来源</button>
+    <button id="onceBtn">分析一次</button>
+    <button id="toggleBtn" class="primary">开始</button>
+    <button id="saveBtn">保存复盘点</button>
+  </div>
+
+  <div class="grid">
+    <section>
+      <h2>当前状态</h2>
+      <div class="metric-row">
+        <div class="metric"><div class="label">阶段</div><div id="stageValue" class="value">-</div></div>
+        <div class="metric"><div class="label">等级</div><div id="levelValue" class="value">-</div></div>
+        <div class="metric"><div class="label">金币</div><div id="goldValue" class="value">-</div></div>
+        <div class="metric"><div class="label">帧数</div><div id="frameValue" class="value">0</div></div>
+      </div>
+      <div class="status-row">
+        <div class="metric"><div class="label">当前羁绊</div><div id="traitsValue" class="value">-</div></div>
+        <div class="metric"><div class="label">接近激活</div><div id="gapsValue" class="value">-</div></div>
+        <div class="metric"><div class="label">装备倾向</div><div id="itemsValue" class="value">-</div></div>
+        <div class="metric"><div class="label">阵容方向</div><div id="directionValue" class="value">-</div></div>
+      </div>
+      <div id="insights" class="list"><div class="empty">等待截图分析</div></div>
+    </section>
+
+    <section>
+      <h2>截图预览</h2>
+      <img id="preview" class="preview" alt="">
+      <div id="diagnostics" class="label" style="margin-top:10px;">未开始</div>
+    </section>
+  </div>
+</main>
+
+<script>
+const pluginId = 'game_companion';
+let timer = null;
+let enabled = false;
+let lastDataUrl = null;
+
+function baseUrl() { return window.location.origin; }
+function $(id) { return document.getElementById(id); }
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function readJsonResponse(resp, label) {
+  if (!resp.ok) throw new Error(label + ' failed: HTTP ' + resp.status);
+  return resp.json();
+}
+
+function unwrapPluginResponse(exported) {
+  const items = Array.isArray(exported.items) ? exported.items : [];
+  const item = items.find(x => x && x.label === 'trigger_response')
+    || items.find(x => x && x.type === 'json')
+    || items[0];
+  const json = item && item.json ? item.json : exported;
+  if (json && json.success === true) {
+    return json.data !== undefined ? json.data : json.plugin_response || json;
+  }
+  if (json && json.plugin_response) return json.plugin_response;
+  return json;
+}
+
+async function callPlugin(entryId, args) {
+  const resp = await fetch(baseUrl() + '/runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plugin_id: pluginId, entry_id: entryId, args: args || {} })
+  });
+  const run = await readJsonResponse(resp, 'run create');
+  const runId = run.run_id || run.id;
+  if (!runId) throw new Error('run create did not return run_id');
+
+  for (let i = 0; i < 80; i++) {
+    await delay(120);
+    const stateResp = await fetch(baseUrl() + '/runs/' + encodeURIComponent(runId));
+    const state = await readJsonResponse(stateResp, 'run status');
+    if (state.status === 'succeeded') {
+      const exportResp = await fetch(baseUrl() + '/runs/' + encodeURIComponent(runId) + '/export');
+      return unwrapPluginResponse(await readJsonResponse(exportResp, 'run export'));
+    }
+    if (state.status === 'failed' || state.status === 'timeout') {
+      throw new Error('run ' + state.status);
+    }
+  }
+  throw new Error('run polling timeout');
+}
+
+async function refreshSources() {
+  const api = window.electronDesktopCapturer;
+  const select = $('sourceSelect');
+  select.innerHTML = '';
+  if (!api || !api.getSources) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '当前窗口没有 Electron 截图 API';
+    select.appendChild(opt);
+    return;
+  }
+  const sources = await api.getSources({ types: ['window', 'screen'], thumbnailSize: { width: 360, height: 200 } });
+  for (const source of sources || []) {
+    const opt = document.createElement('option');
+    opt.value = source.id;
+    opt.textContent = source.name || source.id;
+    select.appendChild(opt);
+  }
+  if (!select.options.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '未发现可截图来源';
+    select.appendChild(opt);
+  }
+}
+
+async function captureOnce() {
+  const api = window.electronDesktopCapturer;
+  if (!api) throw new Error('Electron capture API unavailable');
+  const sourceId = $('sourceSelect').value || null;
+  const capture = api.captureSourceWithoutNeko || api.captureSourceAsDataUrl;
+  if (!capture) throw new Error('Electron capture API unavailable');
+  const shot = await capture(sourceId);
+  if (!shot || !shot.success) throw new Error((shot && shot.error) || 'capture failed');
+  lastDataUrl = shot.dataUrl;
+  $('preview').src = lastDataUrl;
+  return shot;
+}
+
+async function analyzeOnce() {
+  $('runtimeStatus').textContent = 'capturing';
+  const shot = await captureOnce();
+  $('runtimeStatus').textContent = 'analyzing';
+  const payload = await callPlugin('game_companion_ingest_frame', {
+    profile_id: 'tft',
+    image_data_url: shot.dataUrl
+  });
+  render(payload);
+  $('runtimeStatus').textContent = enabled ? 'running' : 'idle';
+}
+
+function render(payload) {
+  const realtime = payload.realtime || {};
+  const result = realtime.stable_result || payload.result || {};
+  const state = result.state || {};
+  const diagnostics = result.diagnostics || {};
+  $('stageValue').textContent = state.stage || '-';
+  $('levelValue').textContent = state.level == null ? '-' : state.level;
+  $('goldValue').textContent = state.gold == null ? '-' : state.gold;
+  $('frameValue').textContent = realtime.frame_count || 0;
+
+  const analysis = diagnostics.analysis || {};
+  $('traitsValue').textContent = (analysis.active_traits || []).slice(0, 2).map(x => x.trait || x.trait_id).join(', ') || '-';
+  $('gapsValue').textContent = (analysis.trait_gaps || []).slice(0, 2).map(x => (x.trait || x.trait_id) + ' -' + (x.gap || x.needed)).join(', ') || '-';
+  $('itemsValue').textContent = ((analysis.item_direction || {}).direction) || '-';
+  const direction = (result.insights || []).find(x => x.type === 'composition_direction');
+  $('directionValue').textContent = direction ? (direction.title || '-') : '-';
+
+  const list = $('insights');
+  list.innerHTML = '';
+  const insights = result.insights || [];
+  if (!insights.length) {
+    list.innerHTML = '<div class="empty">暂无稳定洞察</div>';
+  } else {
+    for (const insight of insights.slice(0, 6)) {
+      const node = document.createElement('div');
+      node.className = 'insight';
+      node.innerHTML = '<div class="insight-title"></div><div class="insight-detail"></div>';
+      node.children[0].textContent = insight.title || insight.type;
+      node.children[1].textContent = insight.detail || '';
+      list.appendChild(node);
+    }
+  }
+
+  const warnings = diagnostics.warnings || [];
+  $('diagnostics').textContent = warnings.length ? warnings.map(w => w.code || w.message || String(w)).join(', ') : 'ok';
+}
+
+async function setEnabled(next) {
+  enabled = next;
+  $('toggleBtn').textContent = enabled ? '停止' : '开始';
+  await callPlugin('game_companion_realtime_configure', { enabled, profile_id: 'tft', interval_seconds: 2 });
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  if (enabled) {
+    await analyzeOnce().catch(showError);
+    timer = setInterval(() => analyzeOnce().catch(showError), 2000);
+  }
+}
+
+async function saveSnapshot() {
+  const result = await callPlugin('game_companion_save_review_snapshot', { note: 'TFT Insight UI' });
+  $('runtimeStatus').textContent = result && result.saved ? 'snapshot saved' : 'save skipped';
+}
+
+function showError(error) {
+  $('runtimeStatus').textContent = 'error';
+  $('diagnostics').innerHTML = '<span class="bad"></span>';
+  $('diagnostics').firstChild.textContent = String(error && error.message ? error.message : error);
+}
+
+$('refreshSourcesBtn').addEventListener('click', () => refreshSources().catch(showError));
+$('onceBtn').addEventListener('click', () => analyzeOnce().catch(showError));
+$('toggleBtn').addEventListener('click', () => setEnabled(!enabled).catch(showError));
+$('saveBtn').addEventListener('click', () => saveSnapshot().catch(showError));
+
+refreshSources().catch(showError);
+callPlugin('game_companion_realtime_status').then(status => {
+  enabled = !!status.enabled;
+  $('toggleBtn').textContent = enabled ? '停止' : '开始';
+}).catch(() => {});
+</script>
+</body>
+</html>
