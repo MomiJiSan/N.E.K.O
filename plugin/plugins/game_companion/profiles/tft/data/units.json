@@ -1,0 +1,17 @@
+[
+  {
+    "id": "unit_a",
+    "name": "Unit A",
+    "traits": ["mage", "backline"]
+  },
+  {
+    "id": "unit_b",
+    "name": "Unit B",
+    "traits": ["mage", "frontline"]
+  },
+  {
+    "id": "unit_c",
+    "name": "Unit C",
+    "traits": ["guardian", "frontline"]
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "id": "mage",
+    "name": "Mage",
+    "thresholds": [2, 4, 6]
+  },
+  {
+    "id": "guardian",
+    "name": "Guardian",
+    "thresholds": [2, 4, 6]
+  },
+  {
+    "id": "frontline",
+    "name": "Frontline",
+    "thresholds": [2, 4]
+  },
+  {
+    "id": "backline",
+    "name": "Backline",
+    "thresholds": [2, 4]
+  }
+]

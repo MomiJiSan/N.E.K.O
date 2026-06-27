@@ -1,0 +1,22 @@
+[
+  {
+    "id": "needlessly_large_rod",
+    "name": "Needlessly Large Rod",
+    "tags": ["ap"]
+  },
+  {
+    "id": "tear_of_the_goddess",
+    "name": "Tear of the Goddess",
+    "tags": ["mana", "ap"]
+  },
+  {
+    "id": "recurve_bow",
+    "name": "Recurve Bow",
+    "tags": ["ad", "attack_speed"]
+  },
+  {
+    "id": "chain_vest",
+    "name": "Chain Vest",
+    "tags": ["tank"]
+  }
+]
