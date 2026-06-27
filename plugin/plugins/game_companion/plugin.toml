@@ -1,0 +1,26 @@
+[plugin]
+id = "game_companion"
+name = "Game Companion"
+description = "Multi-game companion host for screen understanding, safe game profiles, and NEKO game context."
+short_description = "Shared host for TFT-focused game vision, with generic and galgame migration placeholders."
+keywords = ["game", "companion", "vision", "ocr", "tft", "galgame"]
+version = "0.1.0"
+entry = "plugin.plugins.game_companion:GameCompanionPlugin"
+
+[plugin.author]
+name = "N.E.K.O Team"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[plugin.store]
+enabled = true
+
+[game_companion]
+default_profile = "generic"
+enable_legacy_galgame_bridge = false
