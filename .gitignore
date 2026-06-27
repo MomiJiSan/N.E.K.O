@@ -216,3 +216,6 @@ tests/testbench/docs/dev_note.txt
 
 # yui-origin Live2D 模型源码打包在 assets/yui-origin.tar.gz；build_frontend 解压到此
 /static/yui-origin/
+
+# Local TFT layout calibration screenshots/crops/reports.
+plugin/plugins/game_companion/.local_calibration/

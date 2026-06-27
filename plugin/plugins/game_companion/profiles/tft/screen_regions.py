@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 from typing import Mapping
@@ -9,6 +10,18 @@ from PIL import Image
 
 BBox = tuple[int, int, int, int]
 RatioBBox = tuple[float, float, float, float]
+Recognizer = str
+
+LAYOUT_NORMAL_SHOP = "normal_shop"
+LAYOUT_COMBAT = "combat"
+LAYOUT_AUGMENT_SELECT = "augment_select"
+LAYOUT_SPECIAL = "special"
+LAYOUT_STATES = (
+    LAYOUT_NORMAL_SHOP,
+    LAYOUT_COMBAT,
+    LAYOUT_AUGMENT_SELECT,
+    LAYOUT_SPECIAL,
+)
 
 
 class UnsupportedAspectRatioError(ValueError):
@@ -16,10 +29,33 @@ class UnsupportedAspectRatioError(ValueError):
 
 
 @dataclass(frozen=True)
+class TFTLayoutProfile:
+    key: str
+    display_name: str
+    description: str
+    primary_regions: tuple[str, ...]
+    deep_recognition: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "display_name": self.display_name,
+            "description": self.description,
+            "primary_regions": list(self.primary_regions),
+            "deep_recognition": self.deep_recognition,
+        }
+
+
+@dataclass(frozen=True)
 class ScreenRegion:
     key: str
     display_name: str
     ratio_bbox: RatioBBox
+    layout: str = LAYOUT_NORMAL_SHOP
+    priority: int = 100
+    purpose: str = "observe"
+    recognizers: tuple[Recognizer, ...] = ()
+    active_layouts: tuple[str, ...] = (LAYOUT_NORMAL_SHOP,)
 
     def bbox_for(self, width: int, height: int) -> BBox:
         left, top, right, bottom = self.ratio_bbox
@@ -29,6 +65,19 @@ class ScreenRegion:
             int(round(right * width)),
             int(round(bottom * height)),
         )
+
+    def metadata_for(self, width: int, height: int) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "display_name": self.display_name,
+            "layout": self.layout,
+            "priority": self.priority,
+            "purpose": self.purpose,
+            "recognizers": list(self.recognizers),
+            "active_layouts": list(self.active_layouts),
+            "bbox": list(self.bbox_for(width, height)),
+            "ratio_bbox": list(self.ratio_bbox),
+        }
 
 
 def _ratio_box(left: int, top: int, right: int, bottom: int) -> RatioBBox:
@@ -43,23 +92,178 @@ SHOP_SLOT_KEYS = (
     "shop_slot_5",
 )
 
+LEGACY_GROUPED_REGION_KEYS = (
+    "shop",
+    "bench",
+    "board",
+    "equipment",
+    "gold",
+    "level",
+    "stage",
+    "round",
+    "augments",
+    "traits_panel",
+)
+
+EXTENDED_GROUPED_REGION_KEYS = (
+    "items_area",
+    "level_exp",
+    "players_panel",
+    "shop_odds",
+    "refresh_button",
+    "buy_xp_button",
+    "notifications",
+)
+
+
+TFT_LAYOUT_PROFILES: dict[str, TFTLayoutProfile] = {
+    LAYOUT_NORMAL_SHOP: TFTLayoutProfile(
+        key=LAYOUT_NORMAL_SHOP,
+        display_name="Normal shop",
+        description=(
+            "Preparation-phase PC 16:9 layout with the shop open. This is the "
+            "MVP layout for stage, economy, shop, bench, traits, items, and board observation."
+        ),
+        primary_regions=(
+            "stage",
+            "round",
+            "gold",
+            "level",
+            "level_exp",
+            "shop",
+            "shop_slots",
+            "shop_odds",
+            "refresh_button",
+            "buy_xp_button",
+            "bench",
+            "traits_panel",
+            "items_area",
+            "equipment",
+            "board",
+            "players_panel",
+        ),
+    ),
+    LAYOUT_COMBAT: TFTLayoutProfile(
+        key=LAYOUT_COMBAT,
+        display_name="Combat",
+        description=(
+            "Combat layout. The shop may remain visible, but board units, item holders, "
+            "and player state become more important than shop OCR."
+        ),
+        primary_regions=("stage", "round", "board", "items_area", "equipment", "traits_panel", "players_panel"),
+    ),
+    LAYOUT_AUGMENT_SELECT: TFTLayoutProfile(
+        key=LAYOUT_AUGMENT_SELECT,
+        display_name="Augment select",
+        description="Augment selection overlay. It should be detected and handled separately from normal shop analysis.",
+        primary_regions=("stage", "round", "augments", "notifications"),
+    ),
+    LAYOUT_SPECIAL: TFTLayoutProfile(
+        key=LAYOUT_SPECIAL,
+        display_name="Special",
+        description="Carousel, PvE, encounter, or set-specific selection screens. First pass only detects these states.",
+        primary_regions=("stage", "round", "board", "notifications"),
+        deep_recognition=False,
+    ),
+}
+
 
 REGION_DEFINITIONS: tuple[ScreenRegion, ...] = (
-    ScreenRegion("shop", "Shop row", _ratio_box(470, 800, 1422, 1054)),
-    ScreenRegion("shop_slot_1", "Shop slot 1", _ratio_box(474, 806, 650, 1048)),
-    ScreenRegion("shop_slot_2", "Shop slot 2", _ratio_box(666, 806, 842, 1048)),
-    ScreenRegion("shop_slot_3", "Shop slot 3", _ratio_box(858, 806, 1034, 1048)),
-    ScreenRegion("shop_slot_4", "Shop slot 4", _ratio_box(1050, 806, 1226, 1048)),
-    ScreenRegion("shop_slot_5", "Shop slot 5", _ratio_box(1242, 806, 1418, 1048)),
-    ScreenRegion("bench", "Bench", _ratio_box(462, 665, 1458, 784)),
-    ScreenRegion("board", "Board", _ratio_box(360, 185, 1560, 735)),
-    ScreenRegion("equipment", "Equipment area", _ratio_box(240, 620, 455, 815)),
-    ScreenRegion("gold", "Gold", _ratio_box(820, 760, 930, 805)),
-    ScreenRegion("level", "Level", _ratio_box(898, 708, 1022, 765)),
-    ScreenRegion("stage", "Stage", _ratio_box(870, 18, 1050, 64)),
-    ScreenRegion("round", "Round", _ratio_box(870, 18, 1050, 64)),
-    ScreenRegion("augments", "Augments", _ratio_box(1565, 105, 1900, 540)),
-    ScreenRegion("traits_panel", "Traits panel", _ratio_box(0, 120, 315, 690)),
+    ScreenRegion(
+        "stage",
+        "Stage",
+        _ratio_box(870, 18, 1050, 64),
+        priority=1,
+        purpose="round_state",
+        recognizers=("ocr",),
+        active_layouts=LAYOUT_STATES,
+    ),
+    ScreenRegion(
+        "round",
+        "Round",
+        _ratio_box(870, 18, 1050, 64),
+        priority=1,
+        purpose="round_state",
+        recognizers=("ocr",),
+        active_layouts=LAYOUT_STATES,
+    ),
+    ScreenRegion("gold", "Gold", _ratio_box(820, 760, 930, 805), priority=2, purpose="economy", recognizers=("ocr",)),
+    ScreenRegion("level", "Level", _ratio_box(898, 708, 1022, 765), priority=3, purpose="economy", recognizers=("ocr",)),
+    ScreenRegion("level_exp", "Level and XP", _ratio_box(760, 706, 1048, 790), priority=3, purpose="economy", recognizers=("ocr",)),
+    ScreenRegion("shop", "Shop row", _ratio_box(470, 800, 1422, 1054), priority=4, purpose="shop", recognizers=("template_hash", "ocr")),
+    ScreenRegion("shop_slot_1", "Shop slot 1", _ratio_box(474, 806, 650, 1048), priority=4, purpose="unit_recognition", recognizers=("template_hash", "ocr")),
+    ScreenRegion("shop_slot_2", "Shop slot 2", _ratio_box(666, 806, 842, 1048), priority=4, purpose="unit_recognition", recognizers=("template_hash", "ocr")),
+    ScreenRegion("shop_slot_3", "Shop slot 3", _ratio_box(858, 806, 1034, 1048), priority=4, purpose="unit_recognition", recognizers=("template_hash", "ocr")),
+    ScreenRegion("shop_slot_4", "Shop slot 4", _ratio_box(1050, 806, 1226, 1048), priority=4, purpose="unit_recognition", recognizers=("template_hash", "ocr")),
+    ScreenRegion("shop_slot_5", "Shop slot 5", _ratio_box(1242, 806, 1418, 1048), priority=4, purpose="unit_recognition", recognizers=("template_hash", "ocr")),
+    ScreenRegion("shop_odds", "Shop odds", _ratio_box(1420, 798, 1688, 855), priority=4, purpose="shop_odds", recognizers=("ocr",)),
+    ScreenRegion("refresh_button", "Refresh button", _ratio_box(242, 824, 418, 894), priority=9, purpose="ui_context", recognizers=("ocr",)),
+    ScreenRegion("buy_xp_button", "Buy XP button", _ratio_box(242, 904, 418, 974), priority=9, purpose="ui_context", recognizers=("ocr",)),
+    ScreenRegion("bench", "Bench", _ratio_box(462, 665, 1458, 784), priority=5, purpose="bench_units", recognizers=("template_hash",)),
+    ScreenRegion(
+        "traits_panel",
+        "Traits panel",
+        _ratio_box(0, 120, 315, 690),
+        priority=6,
+        purpose="traits",
+        recognizers=("ocr", "template_hash"),
+        active_layouts=(LAYOUT_NORMAL_SHOP, LAYOUT_COMBAT),
+    ),
+    ScreenRegion(
+        "items_area",
+        "Items area",
+        _ratio_box(220, 610, 462, 824),
+        priority=7,
+        purpose="items",
+        recognizers=("template_hash",),
+        active_layouts=(LAYOUT_NORMAL_SHOP, LAYOUT_COMBAT),
+    ),
+    ScreenRegion(
+        "equipment",
+        "Equipment area",
+        _ratio_box(240, 620, 455, 815),
+        priority=7,
+        purpose="items",
+        recognizers=("template_hash",),
+        active_layouts=(LAYOUT_NORMAL_SHOP, LAYOUT_COMBAT),
+    ),
+    ScreenRegion(
+        "board",
+        "Board",
+        _ratio_box(360, 185, 1560, 735),
+        priority=8,
+        purpose="board_units",
+        recognizers=("template_hash",),
+        active_layouts=(LAYOUT_NORMAL_SHOP, LAYOUT_COMBAT, LAYOUT_SPECIAL),
+    ),
+    ScreenRegion(
+        "players_panel",
+        "Players panel",
+        _ratio_box(1600, 160, 1918, 760),
+        priority=9,
+        purpose="players",
+        recognizers=("ocr",),
+        active_layouts=(LAYOUT_NORMAL_SHOP, LAYOUT_COMBAT),
+    ),
+    ScreenRegion(
+        "notifications",
+        "Notifications",
+        _ratio_box(650, 96, 1270, 220),
+        priority=10,
+        purpose="state_detection",
+        recognizers=("ocr",),
+        active_layouts=(LAYOUT_COMBAT, LAYOUT_AUGMENT_SELECT, LAYOUT_SPECIAL),
+    ),
+    ScreenRegion(
+        "augments",
+        "Augments",
+        _ratio_box(1565, 105, 1900, 540),
+        layout=LAYOUT_AUGMENT_SELECT,
+        priority=1,
+        purpose="augment_text",
+        recognizers=("ocr",),
+        active_layouts=(LAYOUT_AUGMENT_SELECT,),
+    ),
 )
 
 
@@ -80,6 +284,36 @@ def screen_region_bboxes(width: int, height: int) -> dict[str, BBox]:
     return {region.key: region.bbox_for(width, height) for region in REGION_DEFINITIONS}
 
 
+def screen_region_metadata(width: int, height: int) -> dict[str, dict[str, Any]]:
+    ensure_16_9(width, height)
+    return {region.key: region.metadata_for(width, height) for region in REGION_DEFINITIONS}
+
+
+def screen_region_definitions(*, layout: str | None = None) -> tuple[ScreenRegion, ...]:
+    if layout is None:
+        return REGION_DEFINITIONS
+    normalized = str(layout or "").strip().lower()
+    if normalized in TFT_LAYOUT_PROFILES:
+        definitions = {region.key: region for region in REGION_DEFINITIONS}
+        return tuple(definitions[key] for key in _layout_region_keys(normalized) if key in definitions)
+    return tuple(region for region in REGION_DEFINITIONS if region.layout == normalized)
+
+
+def layout_profile(layout: str = LAYOUT_NORMAL_SHOP) -> TFTLayoutProfile:
+    normalized = str(layout or "").strip().lower()
+    try:
+        return TFT_LAYOUT_PROFILES[normalized]
+    except KeyError as exc:
+        available = ", ".join(sorted(TFT_LAYOUT_PROFILES))
+        raise KeyError(f"unknown TFT layout {layout!r}; available: {available}") from exc
+
+
+def layout_region_bboxes(width: int, height: int, layout: str = LAYOUT_NORMAL_SHOP) -> dict[str, BBox]:
+    ensure_16_9(width, height)
+    regions = screen_region_bboxes(width, height)
+    return {key: regions[key] for key in _layout_region_keys(layout) if key in regions}
+
+
 def screen_region_bbox(width: int, height: int, key: str) -> BBox:
     regions = screen_region_bboxes(width, height)
     try:
@@ -94,20 +328,38 @@ def shop_slot_bboxes(width: int, height: int) -> dict[str, BBox]:
     return {key: regions[key] for key in SHOP_SLOT_KEYS}
 
 
-def grouped_screen_region_bboxes(width: int, height: int) -> dict[str, BBox | Mapping[str, BBox]]:
+def grouped_screen_region_bboxes(
+    width: int,
+    height: int,
+    *,
+    include_extended: bool = True,
+) -> dict[str, BBox | Mapping[str, BBox]]:
     regions = screen_region_bboxes(width, height)
-    return {
+    grouped: dict[str, BBox | Mapping[str, BBox]] = {
         "shop_slots": {key: regions[key] for key in SHOP_SLOT_KEYS},
-        "shop": regions["shop"],
-        "bench": regions["bench"],
-        "board": regions["board"],
-        "equipment": regions["equipment"],
-        "gold": regions["gold"],
-        "level": regions["level"],
-        "stage": regions["stage"],
-        "round": regions["round"],
-        "augments": regions["augments"],
-        "traits_panel": regions["traits_panel"],
+    }
+    grouped.update({key: regions[key] for key in LEGACY_GROUPED_REGION_KEYS})
+    if include_extended:
+        grouped.update({key: regions[key] for key in EXTENDED_GROUPED_REGION_KEYS})
+    return grouped
+
+
+def semantic_screen_region_bboxes(width: int, height: int) -> dict[str, BBox | Mapping[str, BBox]]:
+    return grouped_screen_region_bboxes(width, height, include_extended=True)
+
+
+def grouped_screen_region_metadata(width: int, height: int) -> dict[str, Any]:
+    metadata = screen_region_metadata(width, height)
+    return {
+        "layout_profiles": {key: profile.to_dict() for key, profile in TFT_LAYOUT_PROFILES.items()},
+        "regions": metadata,
+        "groups": {
+            "shop_slots": [metadata[key] for key in SHOP_SLOT_KEYS],
+            "normal_shop": _metadata_for_layout(metadata, LAYOUT_NORMAL_SHOP),
+            "combat": _metadata_for_layout(metadata, LAYOUT_COMBAT),
+            "augment_select": _metadata_for_layout(metadata, LAYOUT_AUGMENT_SELECT),
+            "special": _metadata_for_layout(metadata, LAYOUT_SPECIAL),
+        },
     }
 
 
@@ -115,20 +367,47 @@ def save_debug_crops(
     image_path: str | Path,
     output_dir: str | Path,
     *,
+    layout: str | None = None,
     grouped: bool = True,
+    include_extended: bool = True,
+    semantic_filenames: bool = True,
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     saved: dict[str, str] = {}
+    metadata: dict[str, dict[str, Any]] = {}
     with Image.open(Path(image_path).expanduser()) as image:
         image.load()
         width, height = image.size
-        regions = grouped_screen_region_bboxes(width, height) if grouped else screen_region_bboxes(width, height)
+        normalized_layout = _normalize_layout(layout)
+        if normalized_layout:
+            regions = layout_region_bboxes(width, height, normalized_layout)
+        else:
+            regions = (
+                grouped_screen_region_bboxes(width, height, include_extended=include_extended)
+                if grouped
+                else screen_region_bboxes(width, height)
+            )
+        region_metadata = screen_region_metadata(width, height)
         for key, bbox in _iter_crop_boxes(regions):
-            crop_path = output_path / f"{key}.png"
+            region_meta = region_metadata.get(key, {"layout": LAYOUT_NORMAL_SHOP, "priority": 99, "bbox": list(bbox)})
+            crop_meta = {**region_meta, "capture_layout": normalized_layout}
+            filename = _debug_crop_filename(key, crop_meta) if semantic_filenames else f"{key}.png"
+            crop_path = output_path / filename
             image.crop(bbox).save(crop_path)
             saved[key] = str(crop_path.resolve())
-    return {"output_dir": str(output_path.resolve()), "crops": saved}
+            metadata[key] = {**crop_meta, "crop_path": str(crop_path.resolve())}
+    payload = {
+        "output_dir": str(output_path.resolve()),
+        "capture_layout": normalized_layout,
+        "crops": saved,
+        "metadata": metadata,
+        "layout_profiles": {key: profile.to_dict() for key, profile in TFT_LAYOUT_PROFILES.items()},
+    }
+    metadata_path = output_path / "metadata.json"
+    metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload["metadata_path"] = str(metadata_path.resolve())
+    return payload
 
 
 def _iter_crop_boxes(regions: Mapping[str, Any]):
@@ -138,6 +417,37 @@ def _iter_crop_boxes(regions: Mapping[str, Any]):
                 yield child_key, child_value
         else:
             yield key, value
+
+
+def _debug_crop_filename(key: str, metadata: Mapping[str, Any]) -> str:
+    layout = str(metadata.get("capture_layout") or metadata.get("layout") or LAYOUT_NORMAL_SHOP)
+    priority = int(metadata.get("priority") or 99)
+    return f"{layout}__p{priority:02d}__{key}.png"
+
+
+def _layout_region_keys(layout: str) -> tuple[str, ...]:
+    keys: list[str] = []
+    normalized = layout_profile(layout).key
+    for key in layout_profile(normalized).primary_regions:
+        if key == "shop_slots":
+            keys.extend(SHOP_SLOT_KEYS)
+        else:
+            keys.append(key)
+    for region in REGION_DEFINITIONS:
+        if normalized in region.active_layouts:
+            keys.append(region.key)
+    return tuple(dict.fromkeys(keys))
+
+
+def _metadata_for_layout(metadata: Mapping[str, dict[str, Any]], layout: str) -> list[dict[str, Any]]:
+    return [metadata[key] for key in _layout_region_keys(layout) if key in metadata]
+
+
+def _normalize_layout(layout: str | None) -> str | None:
+    if layout is None:
+        return None
+    normalized = str(layout or "").strip().lower()
+    return normalized if normalized in TFT_LAYOUT_PROFILES else None
 
 
 # Compatibility aliases for downstream workers while the analyzer shape settles.

@@ -24,6 +24,7 @@ def analyze_offline_image(
     image_path: str | Path,
     *,
     debug_crops_dir: str | Path | None = None,
+    debug_crops_layout: str | None = None,
 ) -> dict[str, Any]:
     normalized_profile_id = _normalize_profile_id(profile_id)
     profile = _get_builtin_profile(normalized_profile_id)
@@ -61,7 +62,7 @@ def analyze_offline_image(
         recognition_result = recognize_shop_units(image.path, raw_regions)
         if debug_crops_dir:
             try:
-                debug_crops = save_debug_crops(image.path, debug_crops_dir)
+                debug_crops = save_debug_crops(image.path, debug_crops_dir, layout=debug_crops_layout)
             except Exception as exc:
                 warnings.append({"code": "debug_crops_failed", "message": str(exc)})
         regions = _json_safe_bboxes(raw_regions)
@@ -121,8 +122,9 @@ def analyze_frame(
     image_path: str | Path,
     *,
     debug_crops_dir: str | Path | None = None,
+    debug_crops_layout: str | None = None,
 ) -> dict[str, Any]:
-    return analyze_offline_image(profile_id, image_path, debug_crops_dir=debug_crops_dir)
+    return analyze_offline_image(profile_id, image_path, debug_crops_dir=debug_crops_dir, debug_crops_layout=debug_crops_layout)
 
 
 def analyze_frame_data_url(profile_id: str, image_data_url: str) -> dict[str, Any]:

@@ -17,8 +17,15 @@ from plugin.plugins.game_companion.profiles.tft.insights import (
 )
 from plugin.plugins.game_companion.profiles.tft.recognition import recognize_shop_units
 from plugin.plugins.game_companion.profiles.tft.screen_regions import (
+    LAYOUT_AUGMENT_SELECT,
+    LAYOUT_NORMAL_SHOP,
+    LAYOUT_SPECIAL,
+    LAYOUT_STATES,
+    SHOP_SLOT_KEYS,
     UnsupportedAspectRatioError,
+    grouped_screen_region_metadata,
     grouped_screen_region_bboxes,
+    save_debug_crops,
 )
 from plugin.plugins.game_companion.profiles.tft.state_parser import parse_tft_state
 from plugin.plugins.game_companion.safety.models import (
@@ -155,17 +162,92 @@ def test_tft_regions_for_1920x1080() -> None:
         "shop",
         "bench",
         "board",
+        "buy_xp_button",
         "equipment",
         "gold",
+        "items_area",
         "level",
+        "level_exp",
+        "notifications",
+        "players_panel",
         "stage",
         "round",
         "augments",
+        "refresh_button",
+        "shop_odds",
         "traits_panel",
     }
     assert len(regions["shop_slots"]) == 5
     assert regions["shop"] == (470, 800, 1422, 1054)
     assert regions["gold"] == (820, 760, 930, 805)
+
+
+def test_tft_layout_metadata_covers_all_layout_states() -> None:
+    payload = grouped_screen_region_metadata(1920, 1080)
+
+    assert set(payload["layout_profiles"]) == set(LAYOUT_STATES)
+    assert set(payload["groups"]) >= {*LAYOUT_STATES, "shop_slots"}
+    for layout in LAYOUT_STATES:
+        profile = payload["layout_profiles"][layout]
+        group = payload["groups"][layout]
+        expected_keys = []
+        for key in profile["primary_regions"]:
+            if key == "shop_slots":
+                expected_keys.extend(SHOP_SLOT_KEYS)
+            elif key in payload["regions"]:
+                expected_keys.append(key)
+        for key, region in payload["regions"].items():
+            if layout in region["active_layouts"]:
+                expected_keys.append(key)
+        expected_keys = list(dict.fromkeys(expected_keys))
+        assert profile["key"] == layout
+        assert group
+        assert [region["key"] for region in group] == expected_keys
+        assert all(region["bbox"] for region in group)
+
+    assert payload["layout_profiles"][LAYOUT_NORMAL_SHOP]["deep_recognition"] is True
+    assert payload["layout_profiles"][LAYOUT_SPECIAL]["deep_recognition"] is False
+
+
+def test_tft_region_metadata_includes_layout_purpose_and_recognizers() -> None:
+    payload = grouped_screen_region_metadata(1920, 1080)
+
+    gold = payload["regions"]["gold"]
+    assert gold["display_name"] == "Gold"
+    assert gold["layout"] == LAYOUT_NORMAL_SHOP
+    assert gold["priority"] == 2
+    assert gold["purpose"] == "economy"
+    assert gold["recognizers"] == ["ocr"]
+    assert gold["bbox"] == [820, 760, 930, 805]
+    assert gold["ratio_bbox"] == [820 / 1920, 760 / 1080, 930 / 1920, 805 / 1080]
+
+    augments = payload["regions"]["augments"]
+    assert augments["layout"] == LAYOUT_AUGMENT_SELECT
+    assert augments["priority"] == 1
+    assert augments["purpose"] == "augment_text"
+    assert augments["recognizers"] == ["ocr"]
+
+    assert [region["key"] for region in payload["groups"]["shop_slots"]] == list(SHOP_SLOT_KEYS)
+
+
+def test_tft_regions_scale_to_other_16_9_resolutions() -> None:
+    width, height = 1280, 720
+    regions = grouped_screen_region_bboxes(width, height)
+
+    shop_left, shop_top, shop_right, shop_bottom = regions["shop"]
+    assert 0.24 * width <= shop_left <= 0.25 * width
+    assert 0.74 * height <= shop_top <= 0.75 * height
+    assert 0.74 * width <= shop_right <= 0.75 * width
+    assert 0.97 * height <= shop_bottom <= 0.98 * height
+
+    board_left, board_top, board_right, board_bottom = regions["board"]
+    assert 0.18 * width <= board_left <= 0.19 * width
+    assert 0.17 * height <= board_top <= 0.18 * height
+    assert 0.81 * width <= board_right <= 0.82 * width
+    assert 0.68 * height <= board_bottom <= 0.69 * height
+
+    assert regions["gold"] == (547, 507, 620, 537)
+    assert regions["shop_slots"]["shop_slot_1"] == (316, 537, 433, 699)
 
 
 def test_tft_regions_reject_non_16_9() -> None:
@@ -205,6 +287,54 @@ def test_analyze_frame_reads_tft_image(tmp_path: Path) -> None:
         "no_templates",
         "imagehash_unavailable",
     }
+
+
+def test_analyze_frame_debug_crops_include_expected_names_and_metadata(tmp_path: Path) -> None:
+    screenshot = tmp_path / "tft.png"
+    Image.new("RGB", (1920, 1080), color=(10, 20, 30)).save(screenshot)
+
+    payload = analyze_frame("tft", screenshot, debug_crops_dir=tmp_path / "debug_crops")
+
+    debug_crops = payload["diagnostics"]["debug_crops"]
+    assert payload["success"] is True
+    assert debug_crops is not None
+    assert set(debug_crops["layout_profiles"]) == set(LAYOUT_STATES)
+    assert Path(debug_crops["output_dir"]).is_dir()
+
+    expected_names = {
+        "gold": "normal_shop__p02__gold.png",
+        "shop_slot_1": "normal_shop__p04__shop_slot_1.png",
+        "board": "normal_shop__p08__board.png",
+        "augments": "augment_select__p01__augments.png",
+    }
+    expected_regions = grouped_screen_region_bboxes(1920, 1080)
+    for key, filename in expected_names.items():
+        crop_path = Path(debug_crops["crops"][key])
+        metadata = debug_crops["metadata"][key]
+        expected_bbox = expected_regions["shop_slots"][key] if key.startswith("shop_slot_") else expected_regions[key]
+        assert crop_path.name == filename
+        assert crop_path.exists()
+        assert metadata["crop_path"] == str(crop_path.resolve())
+        assert metadata["bbox"] == list(expected_bbox)
+        with Image.open(crop_path) as crop:
+            left, top, right, bottom = metadata["bbox"]
+            assert crop.size == (right - left, bottom - top)
+
+    assert debug_crops["metadata"]["augments"]["layout"] == LAYOUT_AUGMENT_SELECT
+    assert debug_crops["metadata"]["gold"]["purpose"] == "economy"
+
+
+def test_save_debug_crops_flattens_grouped_regions_with_metadata(tmp_path: Path) -> None:
+    screenshot = tmp_path / "tft.png"
+    Image.new("RGB", (1920, 1080), color=(10, 20, 30)).save(screenshot)
+
+    payload = save_debug_crops(screenshot, tmp_path / "crops")
+
+    assert set(payload["layout_profiles"]) == set(LAYOUT_STATES)
+    assert Path(payload["crops"]["shop_slot_5"]).name == "normal_shop__p04__shop_slot_5.png"
+    assert payload["metadata"]["shop_slot_5"]["bbox"] == [1242, 806, 1418, 1048]
+    assert payload["metadata"]["shop_slot_5"]["recognizers"] == ["template_hash", "ocr"]
+    assert payload["metadata"]["augments"]["crop_path"] == payload["crops"]["augments"]
 
 
 def test_analyze_frame_reports_unknown_profile(tmp_path: Path) -> None:
