@@ -20,7 +20,7 @@ from ..profiles.tft.screen_regions import (
 
 MANIFEST_SCHEMA_VERSION = 1
 CROP_ACCEPTANCE_THRESHOLD = 0.9
-ANNOTATION_STATUSES = ("unchecked", "pass", "fail", "needs_adjustment")
+ANNOTATION_STATUSES = ("unchecked", "pass", "fail", "needs_adjustment", "not_applicable")
 CRITICAL_CALIBRATION_CHECKS = (
     "stage_round_clean",
     "gold_clean",
@@ -51,6 +51,7 @@ CALIBRATION_CHECKS = (
     ("bench_complete", "Bench crop covers all bench positions without swallowing shop cards."),
     ("traits_panel_aligned", "Traits panel crop is aligned and not shifted into the board."),
     ("items_area_reasonable", "Items/equipment crop captures loose items without overfitting board skin."),
+    ("augments_complete", "Augment crop captures all visible augment choices and text."),
 )
 
 CALIBRATION_CHECK_REGIONS = {
@@ -61,7 +62,31 @@ CALIBRATION_CHECK_REGIONS = {
     "bench_complete": ("bench",),
     "traits_panel_aligned": ("traits_panel",),
     "items_area_reasonable": ("equipment", "items_area"),
+    "augments_complete": ("augments",),
 }
+
+
+def _manual_check_status_for_layout(check_id: str, layout: Any) -> str:
+    normalized_layout = str(layout or "").strip().lower()
+    if not normalized_layout or normalized_layout not in LAYOUT_STATES:
+        return "unchecked"
+    return "unchecked" if _calibration_check_applies_to_layout(check_id, normalized_layout) else "not_applicable"
+
+
+def _calibration_check_applies_to_layout(check_id: str, layout: str) -> bool:
+    metadata = grouped_screen_region_metadata(1920, 1080)
+    regions = metadata.get("regions") if isinstance(metadata.get("regions"), Mapping) else {}
+    groups = metadata.get("groups") if isinstance(metadata.get("groups"), Mapping) else {}
+    for region_key in CALIBRATION_CHECK_REGIONS.get(check_id, ()):
+        region_meta = regions.get(region_key)
+        if isinstance(region_meta, Mapping) and layout in region_meta.get("active_layouts", ()):
+            return True
+        group_meta = groups.get(region_key)
+        if isinstance(group_meta, Iterable) and not isinstance(group_meta, (str, bytes)):
+            for item in group_meta:
+                if isinstance(item, Mapping) and layout in item.get("active_layouts", ()):
+                    return True
+    return False
 
 
 def init_tft_layout_calibration_workspace(
@@ -1365,6 +1390,8 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
     fail_count = sum(item["statuses"]["fail"] for item in check_summaries)
     adjustment_count = sum(item["statuses"]["needs_adjustment"] for item in check_summaries)
     unchecked_count = sum(item["statuses"]["unchecked"] for item in check_summaries)
+    not_applicable_count = sum(item["statuses"]["not_applicable"] for item in check_summaries)
+    applicable_total_checks = total_checks - not_applicable_count
     successful_screenshots = sum(1 for screenshot in screenshots if isinstance(screenshot, Mapping) and screenshot.get("success"))
     calibration_ready_screenshots = sum(
         1 for screenshot in screenshots if isinstance(screenshot, Mapping) and screenshot.get("calibration_ready")
@@ -1377,10 +1404,12 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
     crop_acceptance = _crop_acceptance_summary(
         screenshots=[screenshot for screenshot in screenshots if isinstance(screenshot, Mapping)],
         total_checks=total_checks,
+        applicable_total_checks=applicable_total_checks,
         pass_count=pass_count,
         fail_count=fail_count,
         adjustment_count=adjustment_count,
         unchecked_count=unchecked_count,
+        not_applicable_count=not_applicable_count,
     )
     layout_acceptance = _layout_acceptance_summary([screenshot for screenshot in screenshots if isinstance(screenshot, Mapping)])
     critical_acceptance = _critical_acceptance_summary([screenshot for screenshot in screenshots if isinstance(screenshot, Mapping)])
@@ -1413,6 +1442,7 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
             "fail": fail_count,
             "needs_adjustment": adjustment_count,
             "unchecked": unchecked_count,
+            "not_applicable": not_applicable_count,
         },
         "crop_acceptance": crop_acceptance,
         "layout_acceptance": layout_acceptance,
@@ -1431,16 +1461,19 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
 
 def _layout_acceptance_summary(screenshots: list[Mapping[str, Any]]) -> dict[str, Any]:
     layouts: dict[str, dict[str, Any]] = {
-        layout: {"total_checks": 0, "passes": 0, "unchecked": 0, "undocumented_misses": []}
+        layout: {"total_checks": 0, "passes": 0, "unchecked": 0, "not_applicable": 0, "undocumented_misses": []}
         for layout in LAYOUT_STATES
     }
-    unknown = {"total_checks": 0, "passes": 0, "unchecked": 0, "undocumented_misses": []}
+    unknown = {"total_checks": 0, "passes": 0, "unchecked": 0, "not_applicable": 0, "undocumented_misses": []}
     for screenshot in screenshots:
         layout = screenshot.get("expected_layout")
         bucket = layouts.get(str(layout), unknown)
         label = _screenshot_label(screenshot)
         for check in _manual_checks_for_screenshot(screenshot):
             status = str(check.get("status") or "unchecked").strip().lower()
+            if status == "not_applicable":
+                bucket["not_applicable"] += 1
+                continue
             bucket["total_checks"] += 1
             if status == "pass":
                 bucket["passes"] += 1
@@ -1489,6 +1522,8 @@ def _critical_acceptance_summary(screenshots: list[Mapping[str, Any]]) -> dict[s
             status = str(check.get("status") or "unchecked").strip().lower()
             if status == "pass":
                 statuses[check_id]["passes"] += 1
+            elif status == "not_applicable":
+                continue
             elif status == "unchecked":
                 statuses[check_id]["unchecked"] += 1
             elif status in {"fail", "needs_adjustment"}:
@@ -1512,12 +1547,14 @@ def _acceptance_bucket(bucket: Mapping[str, Any]) -> dict[str, Any]:
     total_checks = int(bucket.get("total_checks") or 0)
     passes = int(bucket.get("passes") or 0)
     unchecked = int(bucket.get("unchecked") or 0)
+    not_applicable = int(bucket.get("not_applicable") or 0)
     pass_rate = passes / total_checks if total_checks else 0.0
     undocumented_misses = list(bucket.get("undocumented_misses") or [])
     return {
         "total_checks": total_checks,
         "passes": passes,
         "unchecked": unchecked,
+        "not_applicable": not_applicable,
         "pass_rate": pass_rate,
         "pass_percent": round(pass_rate * 100, 2),
         "misses_documented": not undocumented_misses,
@@ -1535,26 +1572,31 @@ def _crop_acceptance_summary(
     *,
     screenshots: list[Mapping[str, Any]],
     total_checks: int,
+    applicable_total_checks: int,
     pass_count: int,
     fail_count: int,
     adjustment_count: int,
     unchecked_count: int,
+    not_applicable_count: int,
 ) -> dict[str, Any]:
-    pass_rate = pass_count / total_checks if total_checks else 0.0
+    pass_rate = pass_count / applicable_total_checks if applicable_total_checks else 0.0
     undocumented_misses = _undocumented_misses(screenshots)
     misses = fail_count + adjustment_count
     return {
         "threshold": CROP_ACCEPTANCE_THRESHOLD,
+        "total_checks": total_checks,
+        "applicable_checks": applicable_total_checks,
         "pass_rate": pass_rate,
         "pass_percent": round(pass_rate * 100, 2),
         "passes": pass_count,
         "misses": misses,
         "unchecked": unchecked_count,
-        "review_complete": total_checks > 0 and unchecked_count == 0,
+        "not_applicable": not_applicable_count,
+        "review_complete": applicable_total_checks > 0 and unchecked_count == 0,
         "misses_documented": not undocumented_misses,
         "undocumented_misses": undocumented_misses,
         "meets_acceptance": bool(
-            total_checks > 0
+            applicable_total_checks > 0
             and unchecked_count == 0
             and pass_rate >= CROP_ACCEPTANCE_THRESHOLD
             and not undocumented_misses
@@ -1643,7 +1685,12 @@ def _screenshot_payload(
         "regions": analysis.get("regions") or {},
         "debug_crops": debug_crops or {},
         "manual_checks": [
-            {"id": check_id, "label": label, "status": "unchecked", "note": ""}
+            {
+                "id": check_id,
+                "label": label,
+                "status": _manual_check_status_for_layout(check_id, sample.get("expected_layout")),
+                "note": "",
+            }
             for check_id, label in CALIBRATION_CHECKS
         ],
     }
@@ -1683,7 +1730,12 @@ def _screenshot_error_payload(
         "regions": {},
         "debug_crops": {},
         "manual_checks": [
-            {"id": check_id, "label": label, "status": "unchecked", "note": ""}
+            {
+                "id": check_id,
+                "label": label,
+                "status": _manual_check_status_for_layout(check_id, sample.get("expected_layout")),
+                "note": "",
+            }
             for check_id, label in CALIBRATION_CHECKS
         ],
     }

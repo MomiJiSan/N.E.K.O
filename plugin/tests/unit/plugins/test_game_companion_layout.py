@@ -273,6 +273,54 @@ def test_layout_calibration_first_pass_roi_does_not_require_special_sample(tmp_p
     assert summary["ready_for_recognition"] is True
 
 
+def test_layout_calibration_ignores_layout_specific_not_applicable_checks(tmp_path: Path) -> None:
+    samples = []
+    layouts = [
+        LAYOUT_NORMAL_SHOP,
+        LAYOUT_NORMAL_SHOP,
+        LAYOUT_COMBAT,
+        LAYOUT_COMBAT,
+        LAYOUT_AUGMENT_SELECT,
+    ]
+    tags_by_index = {
+        1: ["shop_open", "shop_five_units", "bench_units"],
+        3: ["items_visible"],
+        5: ["traits_panel_expanded"],
+    }
+    for index, layout in enumerate(layouts, start=1):
+        screenshot = tmp_path / f"{index}_{layout}.png"
+        Image.new("RGB", (1920, 1080), color=(index * 20, 30, 40)).save(screenshot)
+        samples.append(
+            {
+                "image_path": str(screenshot),
+                "expected_layout": layout,
+                "tags": tags_by_index.get(index, []),
+            }
+        )
+    report = build_tft_layout_calibration_report([], tmp_path / "calibration", samples=samples)
+
+    combat_checks = {check["id"]: check["status"] for check in report["screenshots"][2]["manual_checks"]}
+    augment_checks = {check["id"]: check["status"] for check in report["screenshots"][4]["manual_checks"]}
+    assert combat_checks["shop_slots_complete"] == "not_applicable"
+    assert combat_checks["gold_clean"] == "not_applicable"
+    assert augment_checks["shop_slots_complete"] == "not_applicable"
+    assert augment_checks["augments_complete"] == "unchecked"
+
+    for screenshot in report["screenshots"]:
+        for check in screenshot["manual_checks"]:
+            if check["status"] != "not_applicable":
+                check["status"] = "pass"
+    summary = summarize_tft_layout_calibration_report(report)
+
+    assert summary["status_counts"]["not_applicable"] > 0
+    assert summary["crop_acceptance"]["not_applicable"] > 0
+    assert summary["crop_acceptance"]["meets_acceptance"] is True
+    assert summary["layout_acceptance"]["layouts"][LAYOUT_COMBAT]["meets_acceptance"] is True
+    assert summary["layout_acceptance"]["layouts"][LAYOUT_AUGMENT_SELECT]["meets_acceptance"] is True
+    assert summary["critical_acceptance"]["blocking_checks"] == []
+    assert summary["ready_for_recognition"] is True
+
+
 def test_layout_calibration_crop_acceptance_allows_documented_90_percent_pass_rate(tmp_path: Path) -> None:
     samples = []
     layouts = [

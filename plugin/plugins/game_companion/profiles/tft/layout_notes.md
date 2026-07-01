@@ -229,18 +229,21 @@ the common states without manually timing screenshots.
   documented with a concrete follow-up box adjustment.
 
 `game_companion_summarize_layout_calibration` exposes this as
-`crop_acceptance`: all checks must be reviewed, at least 90% must be marked
-`pass`, and any `fail` / `needs_adjustment` checks must include a note. Only then
-can `ready_for_recognition` become true, assuming sample coverage and screenshot
-readiness also pass.
+`crop_acceptance`: all applicable checks must be reviewed, at least 90% of
+applicable checks must be marked `pass`, and any `fail` / `needs_adjustment`
+checks must include a note. Checks that do not apply to the screenshot layout are
+marked `not_applicable` and do not count against pass rate or readiness. Only
+then can `ready_for_recognition` become true, assuming sample coverage and
+screenshot readiness also pass.
 
 The final gate is intentionally stricter than the global 90% number:
 
 - `layout_acceptance`: every expected layout state represented in the batch must
   meet the same review and pass-rate requirements.
-- `critical_acceptance`: `stage_round_clean`, `gold_clean`, `level_exp_clean`,
-  and `shop_slots_complete` must all pass. These regions feed phase-5 OCR and
-  shop recognition, so they are not allowed to be accepted as known misses.
+- `critical_acceptance`: applicable `stage_round_clean`, `gold_clean`,
+  `level_exp_clean`, and `shop_slots_complete` checks must all pass. These
+  regions feed phase-5 OCR and shop recognition, so they are not allowed to be
+  accepted as known misses on layouts where the regions are visible.
 
 Structured calibration batches can pass `samples` instead of plain
 `image_paths`. Each sample may include:
