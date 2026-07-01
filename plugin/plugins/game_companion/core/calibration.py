@@ -10,7 +10,13 @@ from typing import Any
 from PIL import Image, ImageStat
 
 from .frame_analyzer import analyze_frame
-from ..profiles.tft.screen_regions import LAYOUT_STATES, grouped_screen_region_metadata
+from ..profiles.tft.screen_regions import (
+    LAYOUT_AUGMENT_SELECT,
+    LAYOUT_COMBAT,
+    LAYOUT_NORMAL_SHOP,
+    LAYOUT_STATES,
+    grouped_screen_region_metadata,
+)
 
 MANIFEST_SCHEMA_VERSION = 1
 CROP_ACCEPTANCE_THRESHOLD = 0.9
@@ -28,7 +34,13 @@ RECOMMENDED_SAMPLE_TAGS = (
     "traits_panel_expanded",
     "items_visible",
 )
+FIRST_PASS_LAYOUT_STATES = (
+    LAYOUT_NORMAL_SHOP,
+    LAYOUT_COMBAT,
+    LAYOUT_AUGMENT_SELECT,
+)
 SUPPORTED_SCREENSHOT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
 DEFAULT_LOCAL_CALIBRATION_DIR = Path(__file__).resolve().parents[1] / ".local_calibration"
 
 CALIBRATION_CHECKS = (
@@ -81,7 +93,7 @@ def init_tft_layout_calibration_workspace(
         "readme_path": str(readme_path.resolve()),
         "manifest": manifest,
         "next_steps": [
-            "Put 5-10 real TFT screenshots in input_dir.",
+            "Put 5-10 real TFT screenshots in input_dir or extract frames from a local recording.",
             "Run game_companion_prepare_layout_calibration_manifest or edit samples_manifest.json.",
             "Run game_companion_calibrate_layout with samples_manifest_path and output_dir.",
         ],
@@ -141,6 +153,105 @@ def capture_tft_layout_calibration_screenshot(
         "next_steps": [
             "Inspect the captured image before using it for calibration.",
             "Run game_companion_prepare_layout_calibration_manifest after collecting 5-10 samples.",
+        ],
+    }
+
+
+def extract_tft_layout_calibration_video_frames(
+    video_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    samples_manifest_path: str | Path | None = None,
+    frame_indices: Iterable[int] | None = None,
+    max_frames: int = 8,
+    expected_layout: str | None = None,
+    tags: Iterable[str] | None = None,
+    label: str | None = None,
+    frame_reader: Any | None = None,
+) -> dict[str, Any]:
+    video = Path(video_path).expanduser()
+    if not video.is_file():
+        raise FileNotFoundError(f"calibration video was not found: {video}")
+    if video.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+        raise ValueError(f"unsupported calibration video extension: {video.suffix}")
+
+    output_path = Path(output_dir).expanduser() if output_dir else DEFAULT_LOCAL_CALIBRATION_DIR / "input"
+    output_path.mkdir(parents=True, exist_ok=True)
+    normalized_layout = _normalize_expected_layout(expected_layout)
+    normalized_tags = _normalize_tags(tags)
+    selected_indices = _normalize_frame_indices(frame_indices)
+    frame_limit = max(1, min(60, int(max_frames or 8)))
+    reader = frame_reader or _read_video_frames
+    raw_frames = list(reader(video, frame_indices=selected_indices, max_frames=frame_limit))
+    if not raw_frames:
+        raise ValueError("no frames extracted from calibration video")
+
+    frames: list[dict[str, Any]] = []
+    for ordinal, raw_frame in enumerate(raw_frames, start=1):
+        frame = _normalize_video_frame(raw_frame, ordinal)
+        image = frame["image"]
+        if not isinstance(image, Image.Image):
+            raise OSError(f"video frame #{ordinal} did not decode to a PIL image")
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGB")
+        filename = _video_frame_filename(
+            video,
+            ordinal=ordinal,
+            frame_index=frame["frame_index"],
+            timestamp_seconds=frame["timestamp_seconds"],
+            expected_layout=normalized_layout,
+            tags=normalized_tags,
+            label=label,
+        )
+        image_path = output_path / filename
+        image.save(image_path)
+        metadata = _image_manifest_metadata(image_path)
+        diagnostics = _capture_image_diagnostics(image)
+        warnings = _video_frame_warnings(metadata, diagnostics)
+        source = _video_frame_source(
+            video,
+            frame=frame,
+            ordinal=ordinal,
+            expected_layout=normalized_layout,
+            tags=normalized_tags,
+            label=label,
+        )
+        frames.append(
+            {
+                "ordinal": ordinal,
+                "frame_index": frame["frame_index"],
+                "timestamp_seconds": frame["timestamp_seconds"],
+                "image_path": str(image_path.resolve()),
+                "expected_layout": normalized_layout,
+                "tags": normalized_tags,
+                "metadata": metadata,
+                "diagnostics": diagnostics,
+                "source": source,
+                "warnings": warnings,
+            }
+        )
+
+    manifest = build_tft_layout_sample_manifest(output_path, samples_manifest_path)
+    manifest = _attach_video_frame_sources_to_manifest(manifest, frames)
+    return {
+        "type": "tft_layout_calibration_video_frames",
+        "video_path": str(video.resolve()),
+        "output_dir": str(output_path.resolve()),
+        "samples_manifest_path": manifest.get("manifest_path"),
+        "requested_frame_indices": selected_indices,
+        "max_frames": frame_limit,
+        "frame_count": len(frames),
+        "frames": frames,
+        "manifest": manifest,
+        "warnings": [
+            warning
+            for frame in frames
+            for warning in frame.get("warnings", [])
+        ],
+        "next_steps": [
+            "Review extracted frames and remove blurry or duplicate screenshots.",
+            "Edit samples_manifest.json labels/tags if automatic inference is incomplete.",
+            "Run game_companion_calibrate_layout with samples_manifest_path and output_dir.",
         ],
     }
 
@@ -223,6 +334,7 @@ def build_tft_layout_calibration_status(
         "input_dir": input_status,
         "samples_manifest": manifest_status,
         "report": report_status,
+        "video_decoders": _video_decoder_status(),
         "next_steps": _status_next_steps(input_status, manifest_status, report_status),
     }
 
@@ -254,6 +366,7 @@ def build_tft_layout_calibration_report(
                 image_path=image_path,
                 debug_crops_dir=crop_dir,
                 debug_crops_layout=sample.get("expected_layout"),
+                source_context=sample.get("source") if isinstance(sample.get("source"), Mapping) else None,
             )
             screenshots.append(_screenshot_payload(index, image_path, crop_dir, analysis, sample))
         except OSError as exc:
@@ -432,6 +545,8 @@ This directory is local-only and should not be committed.
 
 1. Put 5-10 real TFT screenshots in:
    `{input_dir.resolve()}`
+   Or extract frames from a local recording with:
+   `game_companion_extract_layout_calibration_video_frames`
 2. Generate or edit:
    `{manifest_path.resolve()}`
 3. Make sure samples cover:
@@ -517,8 +632,8 @@ def _status_next_steps(
             return ["Replace undecodable screenshot files, then check calibration status again."]
         if not summary.get("has_recommended_sample_count"):
             return ["Collect 5-10 TFT screenshots before running layout calibration."]
-        if not summary.get("has_layout_state_coverage") or not summary.get("has_recommended_tag_coverage"):
-            return ["Edit samples_manifest.json to cover all layout states and recommended tags."]
+        if not summary.get("has_first_pass_layout_coverage") or not summary.get("has_recommended_tag_coverage"):
+            return ["Edit samples_manifest.json to cover normal_shop, combat, augment_select, and recommended tags."]
         return ["Run game_companion_calibrate_layout with samples_manifest_path."]
     if input_status and input_status.get("exists"):
         if not input_status.get("sample_count"):
@@ -555,6 +670,383 @@ def _grab_primary_screen() -> Image.Image:
         return ImageGrab.grab(all_screens=False)
     except TypeError:
         return ImageGrab.grab()
+
+
+def _read_video_frames(
+    video_path: Path,
+    *,
+    frame_indices: list[int],
+    max_frames: int,
+) -> list[dict[str, Any]]:
+    errors: list[str] = []
+    try:
+        return _read_video_frames_with_cv2(video_path, frame_indices=frame_indices, max_frames=max_frames)
+    except (ImportError, OSError) as exc:
+        errors.append(str(exc))
+    try:
+        return _read_video_frames_with_pyav(video_path, frame_indices=frame_indices, max_frames=max_frames)
+    except ImportError as exc:
+        errors.append(str(exc))
+    except OSError as exc:
+        errors.append(str(exc))
+    raise OSError("could not extract frames with OpenCV or PyAV: " + " | ".join(errors))
+
+
+def _video_decoder_status() -> dict[str, Any]:
+    opencv = _import_status("cv2")
+    pyav = _import_status("av")
+    preferred = "opencv" if opencv["available"] else "pyav" if pyav["available"] else None
+    return {
+        "available": bool(opencv["available"] or pyav["available"]),
+        "preferred": preferred,
+        "opencv": opencv,
+        "pyav": pyav,
+    }
+
+
+def _import_status(module_name: str) -> dict[str, Any]:
+    try:
+        module = __import__(module_name)
+    except Exception as exc:
+        return {
+            "available": False,
+            "module": module_name,
+            "error": type(exc).__name__,
+        }
+    return {
+        "available": True,
+        "module": module_name,
+        "version": str(getattr(module, "__version__", "unknown")),
+    }
+
+
+def _read_video_frames_with_cv2(
+    video_path: Path,
+    *,
+    frame_indices: list[int],
+    max_frames: int,
+) -> list[dict[str, Any]]:
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise OSError("OpenCV cv2 is required to extract frames from video files") from exc
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise OSError(f"video file could not be opened: {video_path}")
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        targets = frame_indices or _select_video_frame_indices(frame_count, max_frames)
+        frames: list[dict[str, Any]] = []
+        for frame_index in targets:
+            if frame_index >= 0:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            timestamp = (float(frame_index) / fps) if fps > 0 else None
+            frames.append(
+                {
+                    "frame_index": int(frame_index),
+                    "timestamp_seconds": timestamp,
+                    "image": Image.fromarray(rgb_frame),
+                }
+            )
+        return frames
+    finally:
+        capture.release()
+
+
+def _read_video_frames_with_pyav(
+    video_path: Path,
+    *,
+    frame_indices: list[int],
+    max_frames: int,
+) -> list[dict[str, Any]]:
+    try:
+        import av  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError("PyAV av is required when OpenCV cv2 is unavailable") from exc
+
+    try:
+        container = av.open(str(video_path))
+    except Exception as exc:
+        raise OSError(f"video file could not be opened with PyAV: {video_path}") from exc
+    try:
+        stream = _pyav_video_stream(container)
+        stream_frame_count = int(getattr(stream, "frames", 0) or 0)
+        targets = frame_indices or _select_video_frame_indices(stream_frame_count, max_frames)
+        if _pyav_can_seek(container) and targets:
+            return _read_video_frames_with_pyav_seek(container, stream, targets)
+        target_set = set(targets)
+        frames: list[dict[str, Any]] = []
+        for decoded_index, frame in enumerate(container.decode(video=0)):
+            if target_set and decoded_index not in target_set:
+                if decoded_index > max(target_set):
+                    break
+                continue
+            image = frame.to_image()
+            frames.append(
+                {
+                    "frame_index": decoded_index,
+                    "timestamp_seconds": _pyav_timestamp_seconds(frame, stream),
+                    "image": image,
+                }
+            )
+            if len(frames) >= len(targets):
+                break
+        return frames
+    except Exception as exc:
+        if isinstance(exc, OSError):
+            raise
+        raise OSError(f"video frames could not be decoded with PyAV: {video_path}") from exc
+    finally:
+        close = getattr(container, "close", None)
+        if callable(close):
+            close()
+
+
+def _read_video_frames_with_pyav_seek(container: Any, stream: Any, targets: list[int]) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for target in targets:
+        seek = getattr(container, "seek")
+        seek(_pyav_seek_offset_for_frame(stream, target), stream=stream, any_frame=False, backward=True)
+        for fallback_offset, frame in enumerate(container.decode(video=0)):
+            frame_index = _pyav_frame_index(frame, stream, fallback_index=target + fallback_offset)
+            if frame_index < target:
+                continue
+            if frame_index in seen:
+                continue
+            seen.add(frame_index)
+            frames.append(
+                {
+                    "frame_index": frame_index,
+                    "timestamp_seconds": _pyav_timestamp_seconds(frame, stream),
+                    "image": frame.to_image(),
+                }
+            )
+            break
+    return frames
+
+
+def _pyav_can_seek(container: Any) -> bool:
+    return callable(getattr(container, "seek", None))
+
+
+def _pyav_seek_offset_for_frame(stream: Any, frame_index: int) -> int:
+    average_rate = getattr(stream, "average_rate", None)
+    time_base = getattr(stream, "time_base", None)
+    if average_rate and time_base:
+        try:
+            seconds = float(frame_index) / float(average_rate)
+            return max(0, int(seconds / float(time_base)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return max(0, int(frame_index))
+
+
+def _pyav_frame_index(frame: Any, stream: Any, *, fallback_index: int) -> int:
+    pts = getattr(frame, "pts", None)
+    time_base = getattr(stream, "time_base", None)
+    average_rate = getattr(stream, "average_rate", None)
+    if pts is not None and time_base is not None and average_rate:
+        try:
+            return max(0, int(round(float(pts * time_base) * float(average_rate))))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    if pts is not None:
+        try:
+            return max(0, int(pts))
+        except (TypeError, ValueError):
+            pass
+    return int(fallback_index)
+
+
+def _pyav_video_stream(container: Any) -> Any:
+    streams = getattr(container, "streams", None)
+    video_streams = getattr(streams, "video", None)
+    if video_streams:
+        return video_streams[0]
+    if streams is not None:
+        for stream in streams:
+            if getattr(stream, "type", None) == "video":
+                return stream
+    raise OSError("video file does not contain a video stream")
+
+
+def _pyav_timestamp_seconds(frame: Any, stream: Any) -> float | None:
+    pts = getattr(frame, "pts", None)
+    time_base = getattr(stream, "time_base", None)
+    if pts is None or time_base is None:
+        return None
+    return float(pts * time_base)
+
+
+def _select_video_frame_indices(frame_count: int, max_frames: int) -> list[int]:
+    if frame_count <= 0:
+        return list(range(max_frames))
+    selected_count = max(1, min(max_frames, frame_count))
+    if selected_count == 1:
+        return [0]
+    last = max(frame_count - 1, 0)
+    return sorted({round(index * last / (selected_count - 1)) for index in range(selected_count)})
+
+
+def _normalize_frame_indices(frame_indices: Iterable[int] | None) -> list[int]:
+    if frame_indices is None:
+        return []
+    normalized: list[int] = []
+    for value in frame_indices:
+        try:
+            frame_index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if frame_index >= 0 and frame_index not in normalized:
+            normalized.append(frame_index)
+    return normalized
+
+
+def _normalize_video_frame(raw_frame: Any, ordinal: int) -> dict[str, Any]:
+    if isinstance(raw_frame, Image.Image):
+        return {"frame_index": ordinal - 1, "timestamp_seconds": None, "image": raw_frame}
+    if isinstance(raw_frame, Mapping):
+        image = raw_frame.get("image") or raw_frame.get("frame")
+        frame_index = raw_frame["frame_index"] if "frame_index" in raw_frame else raw_frame.get("index", ordinal - 1)
+        timestamp = raw_frame["timestamp_seconds"] if "timestamp_seconds" in raw_frame else raw_frame.get("timestamp")
+        return {
+            "frame_index": int(frame_index),
+            "timestamp_seconds": _optional_float(timestamp),
+            "image": image,
+        }
+    if isinstance(raw_frame, tuple) and len(raw_frame) == 3:
+        frame_index, timestamp_seconds, image = raw_frame
+        return {
+            "frame_index": int(frame_index),
+            "timestamp_seconds": _optional_float(timestamp_seconds),
+            "image": image,
+        }
+    raise OSError(f"video frame #{ordinal} has an unsupported payload shape")
+
+
+def _video_frame_source(
+    video_path: Path,
+    *,
+    frame: Mapping[str, Any],
+    ordinal: int,
+    expected_layout: str | None = None,
+    tags: list[str] | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    source = {
+        "type": "video_frame",
+        "profile_id": "tft",
+        "video_path": str(video_path.resolve()),
+        "ordinal": int(ordinal),
+        "frame_index": int(frame["frame_index"]),
+        "timestamp_seconds": frame.get("timestamp_seconds"),
+    }
+    if expected_layout:
+        source["expected_layout"] = expected_layout
+    if tags:
+        source["tags"] = list(tags)
+    if label:
+        source["label"] = str(label)
+    return source
+
+
+def _attach_video_frame_sources_to_manifest(manifest: dict[str, Any], frames: list[dict[str, Any]]) -> dict[str, Any]:
+    source_by_image_path = {
+        str(Path(str(frame.get("image_path"))).expanduser().resolve()): dict(frame["source"])
+        for frame in frames
+        if frame.get("image_path") and isinstance(frame.get("source"), Mapping)
+    }
+    if not source_by_image_path:
+        return manifest
+
+    changed = False
+    samples = manifest.get("samples")
+    if isinstance(samples, list):
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            image_path = sample.get("image_path")
+            if not image_path:
+                continue
+            source = source_by_image_path.get(str(Path(str(image_path)).expanduser().resolve()))
+            if source:
+                sample["source"] = source
+                changed = True
+
+    manifest_path = manifest.get("manifest_path")
+    if changed and manifest_path:
+        Path(str(manifest_path)).expanduser().write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return manifest
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _video_frame_warnings(metadata: Mapping[str, Any], diagnostics: Mapping[str, Any]) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+    if not _is_supported_16_9(metadata.get("width"), metadata.get("height")):
+        warnings.append(
+            {
+                "code": "unsupported_aspect_ratio",
+                "message": f"TFT calibration expects 16:9 frames; got {metadata.get('width')}x{metadata.get('height')}.",
+            }
+        )
+    if diagnostics.get("looks_black"):
+        warnings.append(
+            {
+                "code": "possible_black_frame",
+                "message": "Extracted frame is almost black. Check recording source or pick another timestamp.",
+            }
+        )
+    return warnings
+
+
+def _video_frame_filename(
+    video_path: Path,
+    *,
+    ordinal: int,
+    frame_index: int,
+    timestamp_seconds: float | None,
+    expected_layout: str | None,
+    tags: Iterable[str],
+    label: str | None,
+) -> str:
+    parts = ["tft", "video", expected_layout or "sample", _safe_token(label or video_path.stem)]
+    for tag in tags:
+        safe_tag = _safe_token(tag)
+        if safe_tag and safe_tag not in parts:
+            parts.append(safe_tag)
+    parts.append(f"f{int(frame_index):06d}")
+    if timestamp_seconds is not None:
+        millis = max(0, int(round(timestamp_seconds * 1000)))
+        parts.append(f"t{millis:08d}ms")
+    parts.append(f"{ordinal:02d}")
+    return f"{'_'.join(part for part in parts if part)}.png"
 
 
 def _capture_filename(
@@ -619,7 +1111,7 @@ def _resolve_manifest_sample(sample: Mapping[str, Any], base_dir: Path, index: i
     if image_path.suffix.lower() not in SUPPORTED_SCREENSHOT_EXTENSIONS:
         raise ValueError(f"unsupported calibration sample extension for {image_path}")
     expected_layout = _normalize_expected_layout(sample.get("expected_layout") or sample.get("layout"))
-    return {
+    resolved_sample = {
         "id": str(sample.get("id") or image_path.stem),
         "image_path": image_path.expanduser(),
         "relative_path": str(relative_path_value or image_path.name),
@@ -635,6 +1127,40 @@ def _resolve_manifest_sample(sample: Mapping[str, Any], base_dir: Path, index: i
         "skip_reason": str(sample.get("skip_reason") or ""),
         "needs_manual_label": expected_layout is None or not _normalize_tags(sample.get("tags")),
     }
+    source = _normalize_manifest_sample_source(sample.get("source"))
+    if source:
+        resolved_sample["source"] = source
+    return resolved_sample
+
+
+def _normalize_manifest_sample_source(source: Any) -> dict[str, Any]:
+    if not isinstance(source, Mapping):
+        return {}
+    source_type = str(source.get("type") or "").strip()
+    if not source_type:
+        return {}
+    normalized: dict[str, Any] = {"type": source_type}
+    for key in ("profile_id", "video_path"):
+        value = source.get(key)
+        if value is not None and str(value).strip():
+            normalized[key] = str(value)
+    expected_layout = _normalize_expected_layout(source.get("expected_layout") or source.get("layout"))
+    if expected_layout:
+        normalized["expected_layout"] = expected_layout
+    tags = _normalize_tags(source.get("tags"))
+    if tags:
+        normalized["tags"] = tags
+    for key in ("label", "note"):
+        value = source.get(key)
+        if value is not None and str(value).strip():
+            normalized[key] = str(value)
+    for key in ("ordinal", "frame_index"):
+        value = _optional_int(source.get(key))
+        if value is not None:
+            normalized[key] = value
+    if "timestamp_seconds" in source:
+        normalized["timestamp_seconds"] = _optional_float(source.get("timestamp_seconds"))
+    return normalized
 
 
 def _infer_expected_layout(name: str) -> str | None:
@@ -750,24 +1276,26 @@ def _normalize_sample_specs(
             raise ValueError(f"unsupported calibration sample extension for {image_path}")
         expected_layout = _normalize_expected_layout(sample.get("expected_layout") or sample.get("layout"))
         tags = _normalize_tags(sample.get("tags"))
-        specs.append(
-            {
-                "id": str(sample.get("id") or Path(str(image_path)).stem),
-                "image_path": Path(str(image_path)).expanduser(),
-                "relative_path": str(sample.get("relative_path") or ""),
-                "file_size": sample.get("file_size"),
-                "width": sample.get("width"),
-                "height": sample.get("height"),
-                "aspect_ratio": sample.get("aspect_ratio"),
-                "expected_layout": expected_layout,
-                "tags": tags,
-                "label": str(sample.get("label") or ""),
-                "note": str(sample.get("note") or ""),
-                "include": True,
-                "skip_reason": str(sample.get("skip_reason") or ""),
-                "needs_manual_label": expected_layout is None or not tags,
-            }
-        )
+        spec = {
+            "id": str(sample.get("id") or Path(str(image_path)).stem),
+            "image_path": Path(str(image_path)).expanduser(),
+            "relative_path": str(sample.get("relative_path") or ""),
+            "file_size": sample.get("file_size"),
+            "width": sample.get("width"),
+            "height": sample.get("height"),
+            "aspect_ratio": sample.get("aspect_ratio"),
+            "expected_layout": expected_layout,
+            "tags": tags,
+            "label": str(sample.get("label") or ""),
+            "note": str(sample.get("note") or ""),
+            "include": True,
+            "skip_reason": str(sample.get("skip_reason") or ""),
+            "needs_manual_label": expected_layout is None or not tags,
+        }
+        source = _normalize_manifest_sample_source(sample.get("source"))
+        if source:
+            spec["source"] = source
+        specs.append(spec)
     if not specs:
         raise ValueError("empty calibration samples")
     return specs
@@ -844,6 +1372,7 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
     coverage = _coverage_summary([screenshot for screenshot in screenshots if isinstance(screenshot, dict)])
     has_recommended_sample_count = 5 <= len(screenshots) <= 10
     has_layout_state_coverage = not coverage["missing_layouts"]
+    has_first_pass_layout_coverage = not coverage["missing_first_pass_layouts"]
     has_recommended_tag_coverage = not coverage["missing_tags"]
     crop_acceptance = _crop_acceptance_summary(
         screenshots=[screenshot for screenshot in screenshots if isinstance(screenshot, Mapping)],
@@ -856,17 +1385,18 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
     layout_acceptance = _layout_acceptance_summary([screenshot for screenshot in screenshots if isinstance(screenshot, Mapping)])
     critical_acceptance = _critical_acceptance_summary([screenshot for screenshot in screenshots if isinstance(screenshot, Mapping)])
     ready_for_region_tuning = bool(fail_count or adjustment_count)
-    ready_for_recognition = bool(
+    ready_for_first_pass_roi = bool(
         screenshots
         and has_recommended_sample_count
         and calibration_ready_screenshots == len(screenshots)
-        and has_layout_state_coverage
+        and has_first_pass_layout_coverage
         and has_recommended_tag_coverage
         and total_checks > 0
         and crop_acceptance["meets_acceptance"]
-        and layout_acceptance["meets_acceptance"]
+        and layout_acceptance["meets_first_pass_acceptance"]
         and critical_acceptance["meets_acceptance"]
     )
+    ready_for_recognition = ready_for_first_pass_roi
     return {
         "type": "tft_layout_calibration_annotation_summary",
         "screenshots": len(screenshots),
@@ -875,6 +1405,7 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
         "has_recommended_sample_count": has_recommended_sample_count,
         "coverage": coverage,
         "has_layout_state_coverage": has_layout_state_coverage,
+        "has_first_pass_layout_coverage": has_first_pass_layout_coverage,
         "has_recommended_tag_coverage": has_recommended_tag_coverage,
         "total_checks": total_checks,
         "status_counts": {
@@ -893,6 +1424,7 @@ def summarize_tft_layout_calibration_report(report_or_path: Mapping[str, Any] | 
             for region, checks in sorted(failed_regions.items())
         ],
         "ready_for_region_tuning": ready_for_region_tuning,
+        "ready_for_first_pass_roi": ready_for_first_pass_roi,
         "ready_for_recognition": ready_for_recognition,
     }
 
@@ -927,12 +1459,19 @@ def _layout_acceptance_summary(screenshots: list[Mapping[str, Any]]) -> dict[str
         for layout, result in layout_results.items()
         if result["total_checks"] == 0 or not result["meets_acceptance"]
     ]
+    missing_or_failed_first_pass = [
+        layout
+        for layout in FIRST_PASS_LAYOUT_STATES
+        if layout_results[layout]["total_checks"] == 0 or not layout_results[layout]["meets_acceptance"]
+    ]
     return {
         "threshold": CROP_ACCEPTANCE_THRESHOLD,
         "layouts": layout_results,
         "unknown": _acceptance_bucket(unknown),
         "missing_or_failed_layouts": missing_or_failed,
+        "missing_or_failed_first_pass_layouts": missing_or_failed_first_pass,
         "meets_acceptance": not missing_or_failed,
+        "meets_first_pass_acceptance": not missing_or_failed_first_pass,
     }
 
 
@@ -1076,6 +1615,7 @@ def _screenshot_payload(
 ) -> dict[str, Any]:
     debug_crops = analysis.get("diagnostics", {}).get("debug_crops") if isinstance(analysis.get("diagnostics"), Mapping) else None
     source = analysis.get("source") if isinstance(analysis.get("source"), Mapping) else {}
+    sample_source = sample.get("source") if isinstance(sample.get("source"), Mapping) else {}
     warnings = analysis.get("diagnostics", {}).get("warnings") if isinstance(analysis.get("diagnostics"), Mapping) else []
     readiness = _calibration_readiness(analysis, debug_crops, warnings)
     return {
@@ -1099,6 +1639,7 @@ def _screenshot_payload(
         "error": analysis.get("error"),
         "warnings": warnings if isinstance(warnings, list) else [],
         "source": source,
+        "sample_source": dict(sample_source),
         "regions": analysis.get("regions") or {},
         "debug_crops": debug_crops or {},
         "manual_checks": [
@@ -1138,6 +1679,7 @@ def _screenshot_error_payload(
         "error": {"code": code, "message": message},
         "warnings": [],
         "source": {},
+        "sample_source": dict(sample.get("source")) if isinstance(sample.get("source"), Mapping) else {},
         "regions": {},
         "debug_crops": {},
         "manual_checks": [
@@ -1213,6 +1755,7 @@ def _summary(screenshots: list[dict[str, Any]]) -> dict[str, Any]:
         "has_recommended_sample_count": 5 <= len(screenshots) <= 10,
         "coverage": coverage,
         "has_layout_state_coverage": not coverage["missing_layouts"],
+        "has_first_pass_layout_coverage": not coverage["missing_first_pass_layouts"],
         "has_recommended_tag_coverage": not coverage["missing_tags"],
     }
 
@@ -1237,6 +1780,12 @@ def _coverage_summary(screenshots: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "layout_counts": layout_counts,
         "missing_layouts": [layout for layout, count in layout_counts.items() if count == 0],
+        "first_pass_layouts": list(FIRST_PASS_LAYOUT_STATES),
+        "missing_first_pass_layouts": [
+            layout
+            for layout in FIRST_PASS_LAYOUT_STATES
+            if layout_counts[layout] == 0
+        ],
         "unknown_layouts": unknown_layouts,
         "tag_counts": tag_counts,
         "missing_tags": [tag for tag, count in tag_counts.items() if count == 0],

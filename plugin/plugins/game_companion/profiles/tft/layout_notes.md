@@ -190,7 +190,9 @@ Layout-specific priority notes:
 ## Real Screenshot Calibration Checklist
 
 Collect screenshots at native 1920x1080 first, then repeat at at least one other
-16:9 resolution such as 2560x1440 or 1366x768 to verify ratio scaling.
+16:9 resolution such as 2560x1440 or 1366x768 to verify ratio scaling. Recording
+one full match and extracting still frames is usually the easiest way to cover
+the common states without manually timing screenshots.
 
 - Capture at least three `normal_shop` screenshots: early game, mid game, and
   late game with different shop costs and bench occupancy.
@@ -198,8 +200,10 @@ Collect screenshots at native 1920x1080 first, then repeat at at least one other
   center and one with the shop visible or partially visible.
 - Capture at least three `augment_select` screenshots: silver, gold, and prismatic
   choices if available; include reroll state if the current set supports it.
-- Capture at least three `special` screenshots: carousel, PvE/reward, and one
-  set-specific encounter or portal/selection screen.
+- Capture `special` screenshots when they naturally appear: carousel,
+  PvE/reward, and one set-specific encounter or portal/selection screen are good
+  examples. Treat this as recommended coverage for later refinement, not as a
+  blocker for the first normal-shop / combat / augment calibration pass.
 - For each screenshot, save debug crops from `save_debug_crops()` and check that
   every crop contains the intended UI element with 4-12 px of safe padding where
   possible.
@@ -262,6 +266,34 @@ It scans common image extensions, writes an editable `samples_manifest.json`, an
 infers `expected_layout` / `tags` from filenames when possible. Manually fix any
 missing labels in the manifest, then pass `samples_manifest_path` into
 `game_companion_calibrate_layout`.
+
+For a local match recording, run
+`game_companion_extract_layout_calibration_video_frames` with the recording path
+and the workspace `input` directory. The extractor writes PNG frames, generates
+or refreshes `samples_manifest.json`, and preserves the same manifest/report
+flow as manual screenshots. The runtime tries OpenCV first and falls back to
+PyAV so video extraction can work in the default development environment without
+adding a hard moviepy or ffmpeg dependency. Video-derived samples keep
+`source.type=video_frame` metadata in the manifest so a bad crop can be traced
+back to its original recording, frame index, and timestamp.
+
+Current local calibration status:
+
+- The first curated real-video batch lives in
+  `.local_calibration/video_20260701_114754_firstpass_v2/`.
+- The current ROI review output is `report_roi_v4/`, regenerated after tuning
+  `stage` / `round`, `gold`, `shop_odds`, `bench`, `items_area`, and
+  `equipment` against the local recording.
+- The batch covers the first-pass layouts: 5 `normal_shop`, 2 `combat`, and 2
+  `augment_select` samples. `special` remains recommended but non-blocking for
+  this pass.
+- Do not run phase-5 OCR/template recognition work from this batch until the
+  `report_roi_v4` manual checks have been reviewed and the critical checks pass.
+
+When a video-frame `source.expected_layout` is set to `special`, the offline TFT
+analyzer uses the special layout hint and skips deep shop/unit recognition. This
+keeps carousel, reward, portal, and other uncommon screens from producing normal
+shop conclusions while still preserving broad context crops.
 
 Use `game_companion_layout_calibration_status` as a read-only preflight check
 before each step. It can inspect an input screenshot directory, an editable

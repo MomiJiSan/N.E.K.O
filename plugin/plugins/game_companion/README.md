@@ -1,0 +1,152 @@
+# Game Companion
+
+Game Companion is a local-only plugin host for read-only game context. The
+current branch focuses on Teamfight Tactics (TFT) screen understanding while
+keeping the shared profile and safety model reusable for later games.
+
+## Current Scope
+
+- Register built-in `generic`, `galgame`, and `tft` profiles.
+- Return a unified read-only `vision` JSON payload for analyzed frames while
+  preserving the existing top-level compatibility fields.
+- Analyze generic screenshots with basic metadata, content hash, and image
+  quality diagnostics.
+- Track realtime frame hash changes so repeated generic/TFT frames can be
+  skipped or debounced without storing raw screenshot content.
+- Analyze local TFT screenshots with fixed 16:9 region maps.
+- Extract TFT calibration frames from a local match recording into the local
+  calibration workspace.
+- Plan VLM fallback requests for low-confidence frames or explicit user
+  inspection requests without executing external model calls by default.
+- Prepare local VLM input payloads from cropped UI regions with optional
+  redaction boxes; this does not execute a model call and blocks planned
+  full-frame payloads when desensitization proof is missing. Normal analyzer
+  JSON records only a preparation summary, never the prepared base64 payloads.
+- Provide a disabled-by-default VLM provider abstraction. Provider results can
+  merge scene, objects, UI, insights, and suggestions into the unified vision
+  schema, but they do not control gameplay and raw provider payloads are not
+  retained in normal JSON.
+- Expose a local classifier/detector adapter contract with async-safe execution
+  hooks, sanitized backend outputs, and a default backend registry.
+- Provide an optional ONNX classifier backend factory for local screen
+  classification. It supports injected sessions for tests and ONNX Runtime when
+  installed, plus a disabled-by-default manifest config shape for model path,
+  label map path, model name, and input size. Startup/config-change hooks can
+  register it as the default local classifier backend when the config is enabled
+  and complete. No model file is bundled or enabled by default in this branch.
+- Save debug crops for layout calibration.
+- Track realtime TFT frame ingestion state.
+- Save review snapshots and build training prompts from analyzed frames.
+- Generate a local TFT layout calibration workspace, manifest, JSON report, and
+  HTML crop review page.
+- Report local video decoder availability from
+  `game_companion_layout_calibration_status` so long recordings can be checked
+  before extraction. OpenCV is preferred when available; PyAV remains the
+  fallback decoder.
+- Queue sanitized summary-only NEKO/Yui context packets in plugin-local storage
+  for a later non-interrupting consumer.
+- Enforce profile capability checks at runtime for frame analysis, realtime
+  ingestion, screen capture, calibration, realtime configuration, and NEKO/Yui
+  context packet creation so TYPE_D profiles stay read-only even if a future
+  entrypoint is added.
+- Sanitize source-context metadata, analyzer error payloads, local backend
+  outputs, NEKO/Yui packet strings, and review snapshot source digests so raw
+  image data URLs, base64 payloads, debug crop paths, and local screenshot paths
+  do not leak through normal JSON outputs.
+
+The plugin is intentionally read-only. It observes screenshots or captured
+frames and does not automate gameplay input.
+
+The `vision.diagnostics.vlm_fallback` field is a local plan, not an executed
+network call. It records when a future vision model pass would be useful, keeps
+`privacy.external_model_calls=false`, and requires desensitization for TYPE_D
+game frames before any later external call is enabled.
+
+## TFT Calibration Workflow
+
+The next practical step is to collect real TFT visual samples. Recording one
+full match and extracting still frames is preferred over manually timing many
+screenshots.
+
+Recommended first-pass samples:
+
+- `normal_shop`: shop open, board visible, gold/level/shop/bench/traits/items
+  visible.
+- `combat`: board in combat, with normal UI still visible.
+- `augment_select`: augment choice overlay visible.
+
+`special` is a catch-all for uncommon non-standard states such as carousel,
+reward, encounter, portal, or set-specific choice screens. It is useful when
+available, but it should not block the first normal-shop/combat/augment
+calibration pass.
+
+Use 16:9 captures, preferably 1920x1080 for the first pass. Avoid overlays such
+as webcam, subtitles, OBS status panels, or cropped game windows.
+
+Default local workspace:
+
+```text
+plugin/plugins/game_companion/.local_calibration/
+```
+
+Typical sequence:
+
+```text
+1. Run game_companion_layout_calibration_status and check video_decoders.
+2. Put screenshots in .local_calibration/input, or run
+   game_companion_extract_layout_calibration_video_frames on a local recording.
+3. Run game_companion_prepare_layout_calibration_manifest if the manifest was
+   not already generated by video extraction.
+4. Review and edit samples_manifest.json labels/tags.
+5. Run game_companion_calibrate_layout.
+6. Open output/index.html and mark crop checks pass/fail.
+7. Use the report to tune screen_regions.py if crops are shifted.
+```
+
+Video extraction accepts local `.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`, and
+`.m4v` files. It uses OpenCV when available and falls back to PyAV; tests keep
+the reader injectable so unit coverage does not depend on real video codecs.
+Extracted samples keep `source.type=video_frame` provenance in
+`samples_manifest.json`, including the original video path, frame index, and
+timestamp when available.
+
+The first real-video pass from a local TFT recording is stored under
+`.local_calibration/video_20260701_114754_firstpass_v2/`. It contains 9 curated
+samples: 5 `normal_shop`, 2 `combat`, and 2 `augment_select`.
+`report_roi_v4/` is the current crop report generated from the tuned ROI boxes.
+It is ready for manual crop review, but it is not yet ready for recognition
+because the HTML manual checks have not been marked pass/fail.
+
+The local calibration workspace is ignored by git and should not be committed.
+
+## Known Gaps
+
+- The first real TFT recording sample set exists, but ROI boxes should not be
+  treated as calibrated for live play until `report_roi_v4` has been manually
+  reviewed and the critical checks pass.
+- Video extraction selects explicit or evenly spaced frames; it does not yet
+  auto-classify a full match into shop/combat/augment samples.
+- `special` samples are recommended but not required for first-pass ROI
+  readiness.
+- VLM fallback still does not call an external vision model by default. The
+  local crop/redact input preparer and provider result merge contract exist, but
+  no concrete external provider is enabled in this branch. Any future model call
+  must consume the prepared payload result and keep TYPE_D full-frame sends
+  blocked unless redaction has been applied.
+- Local classifier support has an ONNX backend factory, label-map config loader,
+  and startup/config-change registration. No classifier model artifact or
+  detector backend is bundled yet.
+- NEKO/Yui context packets are sanitized summaries and can be queued locally.
+  No main-chat consumer or game-memory sink is connected here; those future
+  consumers must read only dequeued sanitized packets and must not persist raw
+  `source`, `vision`, OCR-region, or debug-crop fields.
+
+## Verification
+
+Focused branch checks:
+
+```bash
+uv run pytest -c plugin/tests/pytest.ini plugin/tests/unit/plugins/test_game_companion_entrypoints.py plugin/tests/unit/plugins/test_game_companion_insights.py plugin/tests/unit/plugins/test_game_companion_layout.py plugin/tests/unit/plugins/test_game_companion_realtime.py plugin/tests/unit/plugins/test_game_companion_recognition.py plugin/tests/unit/plugins/test_game_companion_scaffold.py plugin/tests/unit/plugins/test_game_companion_tft_state.py plugin/tests/unit/plugins/test_game_companion_vision.py -q
+uv run ruff check plugin/plugins/game_companion
+uv run python -m plugin.neko_plugin_cli.cli check plugin/plugins/game_companion
+```

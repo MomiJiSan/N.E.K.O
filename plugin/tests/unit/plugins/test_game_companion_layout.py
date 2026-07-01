@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from fractions import Fraction
 import json
 from pathlib import Path
+import sys
+import types
 
 from PIL import Image
 
@@ -10,7 +13,9 @@ from plugin.plugins.game_companion.core.calibration import (
     build_tft_layout_calibration_status,
     build_tft_layout_sample_manifest,
     capture_tft_layout_calibration_screenshot,
+    extract_tft_layout_calibration_video_frames,
     init_tft_layout_calibration_workspace,
+    load_tft_layout_sample_manifest,
     summarize_tft_layout_calibration_report,
     update_tft_layout_calibration_check,
     update_tft_layout_calibration_checks,
@@ -226,6 +231,45 @@ def test_layout_calibration_samples_track_layout_and_tag_coverage(tmp_path: Path
 
     assert summary["has_layout_state_coverage"] is True
     assert summary["has_recommended_tag_coverage"] is True
+    assert summary["ready_for_recognition"] is True
+
+
+def test_layout_calibration_first_pass_roi_does_not_require_special_sample(tmp_path: Path) -> None:
+    samples = []
+    layouts = [
+        LAYOUT_NORMAL_SHOP,
+        LAYOUT_NORMAL_SHOP,
+        LAYOUT_COMBAT,
+        LAYOUT_COMBAT,
+        LAYOUT_AUGMENT_SELECT,
+    ]
+    tags_by_index = {
+        1: ["shop_open", "shop_five_units", "bench_units"],
+        3: ["items_visible"],
+        5: ["traits_panel_expanded"],
+    }
+    for index, layout in enumerate(layouts, start=1):
+        screenshot = tmp_path / f"{index}_{layout}.png"
+        Image.new("RGB", (1920, 1080), color=(index * 20, 30, 40)).save(screenshot)
+        samples.append(
+            {
+                "image_path": str(screenshot),
+                "expected_layout": layout,
+                "tags": tags_by_index.get(index, []),
+            }
+        )
+    report = build_tft_layout_calibration_report([], tmp_path / "calibration", samples=samples)
+
+    for screenshot in report["screenshots"]:
+        for check in screenshot["manual_checks"]:
+            check["status"] = "pass"
+    summary = summarize_tft_layout_calibration_report(report)
+
+    assert summary["coverage"]["missing_layouts"] == [LAYOUT_SPECIAL]
+    assert summary["coverage"]["missing_first_pass_layouts"] == []
+    assert summary["has_layout_state_coverage"] is False
+    assert summary["has_first_pass_layout_coverage"] is True
+    assert summary["ready_for_first_pass_roi"] is True
     assert summary["ready_for_recognition"] is True
 
 
@@ -477,6 +521,222 @@ def test_layout_calibration_capture_warns_on_black_or_non_16_9_sample(tmp_path: 
     assert capture["diagnostics"]["looks_black"] is True
 
 
+def test_layout_calibration_video_extraction_writes_frames_and_manifest(tmp_path: Path) -> None:
+    video_path = tmp_path / "match.mp4"
+    output_dir = tmp_path / "frames"
+    manifest_path = tmp_path / "samples_manifest.json"
+    video_path.write_bytes(b"fake video placeholder")
+
+    def fake_reader(_video_path: Path, **_: object):
+        return [
+            {"frame_index": 10, "timestamp_seconds": 1.25, "image": Image.new("RGB", (1920, 1080), color=(20, 30, 40))},
+            {"frame_index": 200, "timestamp_seconds": 25.0, "image": Image.new("RGB", (1920, 1080), color=(40, 30, 20))},
+        ]
+
+    payload = extract_tft_layout_calibration_video_frames(
+        video_path,
+        output_dir=output_dir,
+        samples_manifest_path=manifest_path,
+        expected_layout=LAYOUT_NORMAL_SHOP,
+        tags=["shop_open", "shop_five_units"],
+        label="shop open",
+        frame_reader=fake_reader,
+    )
+
+    assert payload["type"] == "tft_layout_calibration_video_frames"
+    assert payload["video_path"] == str(video_path.resolve())
+    assert payload["output_dir"] == str(output_dir.resolve())
+    assert payload["frame_count"] == 2
+    assert Path(payload["frames"][0]["image_path"]).is_file()
+    assert payload["frames"][0]["frame_index"] == 10
+    assert payload["frames"][0]["timestamp_seconds"] == 1.25
+    assert payload["frames"][0]["expected_layout"] == LAYOUT_NORMAL_SHOP
+    assert payload["frames"][0]["tags"] == ["shop_open", "shop_five_units"]
+    assert payload["frames"][0]["source"] == {
+        "type": "video_frame",
+        "profile_id": "tft",
+        "video_path": str(video_path.resolve()),
+        "ordinal": 1,
+        "frame_index": 10,
+        "timestamp_seconds": 1.25,
+        "expected_layout": LAYOUT_NORMAL_SHOP,
+        "tags": ["shop_open", "shop_five_units"],
+        "label": "shop open",
+    }
+    assert payload["frames"][0]["warnings"] == []
+    assert payload["manifest"]["manifest_path"] == str(manifest_path.resolve())
+    assert payload["manifest"]["summary"]["total"] == 2
+    assert payload["manifest"]["samples"][0]["expected_layout"] == LAYOUT_NORMAL_SHOP
+    assert "shop_five_units" in payload["manifest"]["samples"][0]["tags"]
+    assert payload["manifest"]["samples"][0]["source"]["type"] == "video_frame"
+    assert payload["manifest"]["samples"][0]["source"]["frame_index"] == 10
+    assert payload["manifest"]["samples"][0]["source"]["timestamp_seconds"] == 1.25
+    loaded_samples = load_tft_layout_sample_manifest(manifest_path)
+    assert loaded_samples[0]["source"] == payload["manifest"]["samples"][0]["source"]
+    report = build_tft_layout_calibration_report([], tmp_path / "calibration", samples_manifest_path=manifest_path)
+    assert report["screenshots"][0]["sample_source"] == payload["manifest"]["samples"][0]["source"]
+    assert report["screenshots"][0]["source"]["origin"] == {
+        **payload["manifest"]["samples"][0]["source"],
+        "video_path": "[redacted_path]",
+    }
+    assert "game_companion_calibrate_layout" in payload["next_steps"][-1]
+
+
+def test_layout_calibration_video_extraction_reports_frame_quality(tmp_path: Path) -> None:
+    video_path = tmp_path / "match.mp4"
+    video_path.write_bytes(b"fake video placeholder")
+
+    def fake_reader(_video_path: Path, **_: object):
+        return [{"frame_index": 1, "timestamp_seconds": 0.1, "image": Image.new("RGB", (1024, 768), color=(0, 0, 0))}]
+
+    payload = extract_tft_layout_calibration_video_frames(video_path, output_dir=tmp_path / "frames", frame_reader=fake_reader)
+
+    warning_codes = {warning["code"] for warning in payload["frames"][0]["warnings"]}
+    assert warning_codes == {"unsupported_aspect_ratio", "possible_black_frame"}
+    assert payload["manifest"]["samples"][0]["needs_manual_label"] is True
+
+
+def test_layout_calibration_video_extraction_uses_pyav_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    video_path = tmp_path / "match.mp4"
+    video_path.write_bytes(b"fake video placeholder")
+
+    class _FakeFrame:
+        def __init__(self, index: int) -> None:
+            self.pts = index * 10
+
+        def to_image(self) -> Image.Image:
+            return Image.new("RGB", (1920, 1080), color=(20 + self.pts, 30, 40))
+
+    class _FakeStream:
+        type = "video"
+        frames = 2
+        time_base = Fraction(1, 100)
+
+    class _FakeStreams:
+        video = [_FakeStream()]
+
+        def __iter__(self):
+            return iter(self.video)
+
+    class _FakeContainer:
+        streams = _FakeStreams()
+
+        def decode(self, video: int = 0):
+            assert video == 0
+            yield _FakeFrame(0)
+            yield _FakeFrame(1)
+
+        def close(self) -> None:
+            pass
+
+    fake_av = types.ModuleType("av")
+    fake_av.open = lambda _path: _FakeContainer()
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+
+    payload = extract_tft_layout_calibration_video_frames(
+        video_path,
+        output_dir=tmp_path / "frames",
+        max_frames=2,
+    )
+
+    assert payload["frame_count"] == 2
+    assert payload["frames"][0]["frame_index"] == 0
+    assert payload["frames"][0]["timestamp_seconds"] == 0.0
+    assert payload["manifest"]["samples"][0]["source"]["timestamp_seconds"] == 0.0
+    assert payload["frames"][1]["frame_index"] == 1
+    assert payload["frames"][1]["timestamp_seconds"] == 0.1
+    assert payload["manifest"]["summary"]["total"] == 2
+
+
+def test_layout_calibration_pyav_reader_seeks_to_explicit_frame_indices(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    video_path = tmp_path / "match.mp4"
+    video_path.write_bytes(b"fake video placeholder")
+    seeks: list[int] = []
+    decoded_windows: list[int] = []
+
+    class _FakeFrame:
+        def __init__(self, index: int) -> None:
+            self.pts = index
+
+        def to_image(self) -> Image.Image:
+            return Image.new("RGB", (1920, 1080), color=(20, 30, 40))
+
+    class _FakeStream:
+        type = "video"
+        frames = 100_000
+        time_base = Fraction(1, 60)
+
+    class _FakeStreams:
+        video = [_FakeStream()]
+
+        def __iter__(self):
+            return iter(self.video)
+
+    class _FakeContainer:
+        streams = _FakeStreams()
+
+        def __init__(self) -> None:
+            self.current = 0
+
+        def seek(self, offset: int, *, stream: object, any_frame: bool = False, backward: bool = True) -> None:
+            assert stream is self.streams.video[0]
+            assert backward is True
+            seeks.append(offset)
+            self.current = int(offset)
+
+        def decode(self, video: int = 0):
+            assert video == 0
+            start = self.current
+            decoded_windows.append(start)
+            for index in range(start, start + 3):
+                yield _FakeFrame(index)
+
+        def close(self) -> None:
+            pass
+
+    fake_av = types.ModuleType("av")
+    fake_av.open = lambda _path: _FakeContainer()
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+
+    payload = extract_tft_layout_calibration_video_frames(
+        video_path,
+        output_dir=tmp_path / "frames",
+        frame_indices=[0, 50_000, 90_000],
+        max_frames=3,
+    )
+
+    assert [frame["frame_index"] for frame in payload["frames"]] == [0, 50_000, 90_000]
+    assert decoded_windows == [0, 50_000, 90_000]
+    assert seeks == [0, 50_000, 90_000]
+
+
+def test_layout_calibration_video_extraction_rejects_missing_or_unsupported_video(tmp_path: Path) -> None:
+    try:
+        extract_tft_layout_calibration_video_frames(tmp_path / "missing.mp4", output_dir=tmp_path / "frames")
+    except FileNotFoundError as exc:
+        assert "calibration video was not found" in str(exc)
+    else:
+        raise AssertionError("missing video should fail")
+
+    unsupported = tmp_path / "match.txt"
+    unsupported.write_text("not a video", encoding="utf-8")
+
+    try:
+        extract_tft_layout_calibration_video_frames(unsupported, output_dir=tmp_path / "frames")
+    except ValueError as exc:
+        assert "unsupported calibration video extension" in str(exc)
+    else:
+        raise AssertionError("unsupported video extension should fail")
+
+
 def test_layout_calibration_status_reports_next_steps(tmp_path: Path) -> None:
     empty_dir = tmp_path / "empty"
     input_dir = tmp_path / "input"
@@ -495,6 +755,23 @@ def test_layout_calibration_status_reports_next_steps(tmp_path: Path) -> None:
     assert input_status["next_steps"] == ["Review or write samples_manifest.json, then run game_companion_calibrate_layout."]
     assert missing_status["samples_manifest"]["valid"] is False
     assert missing_status["samples_manifest"]["error"]["code"] == "samples_manifest_not_found"
+
+
+def test_layout_calibration_status_reports_video_decoder_preflight() -> None:
+    status = build_tft_layout_calibration_status()
+    decoders = status["video_decoders"]
+
+    assert set(decoders) == {"available", "preferred", "opencv", "pyav"}
+    assert isinstance(decoders["available"], bool)
+    assert decoders["preferred"] in {"opencv", "pyav", None}
+    assert isinstance(decoders["opencv"]["available"], bool)
+    assert isinstance(decoders["pyav"]["available"], bool)
+    if decoders["opencv"]["available"]:
+        assert decoders["preferred"] == "opencv"
+    elif decoders["pyav"]["available"]:
+        assert decoders["preferred"] == "pyav"
+    else:
+        assert decoders["preferred"] is None
 
 
 def test_layout_calibration_manifest_rejects_invalid_samples(tmp_path: Path) -> None:

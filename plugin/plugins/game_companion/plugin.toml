@@ -24,3 +24,10 @@ enabled = true
 [game_companion]
 default_profile = "generic"
 enable_legacy_galgame_bridge = false
+
+[game_companion.local_vision]
+classifier_enabled = false
+classifier_model_path = ""
+classifier_labels_path = ""
+classifier_model_name = "onnx_screen_classifier"
+classifier_input_size = [224, 224]

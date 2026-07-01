@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from plugin.sdk.plugin import (
@@ -16,22 +17,30 @@ from .core.calibration import (
     build_tft_layout_calibration_status,
     build_tft_layout_sample_manifest,
     capture_tft_layout_calibration_screenshot,
+    extract_tft_layout_calibration_video_frames,
     init_tft_layout_calibration_workspace,
     summarize_tft_layout_calibration_report,
     update_tft_layout_calibration_check,
     update_tft_layout_calibration_checks,
 )
 from .core.frame_analyzer import analyze_frame, analyze_frame_data_url
+from .core.local_vision import LocalVisionBackend, reset_default_local_vision_backend, set_default_local_vision_backend
+from .core.onnx_local_vision import create_onnx_classifier_backend, load_onnx_classifier_config
 from .core.profile_registry import ProfileRegistry
 from .core.realtime import RealtimeInsightSession
 from .core.replay import (
     append_snapshot,
+    build_neko_context_packet,
     build_snapshot,
     build_training_prompt,
     clear_snapshots,
+    dequeue_neko_context_packet,
+    enqueue_neko_context_packet,
+    list_neko_context_queue,
     load_snapshots,
 )
 from .profiles import builtin_profiles
+from .safety import Capability, capability_error_response, evaluate_profile_capability
 
 
 @neko_plugin
@@ -51,6 +60,7 @@ class GameCompanionPlugin(NekoPluginBase):
     @lifecycle(id="startup")
     async def startup(self, **_: Any):
         cfg = await self._load_config()
+        self._configure_local_vision_backend(cfg)
         requested = str(cfg.get("default_profile") or "generic").strip() or "generic"
         if self._profiles.has(requested):
             self._active_profile_id = requested
@@ -65,11 +75,13 @@ class GameCompanionPlugin(NekoPluginBase):
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_: Any):
+        reset_default_local_vision_backend()
         return Ok({"status": "stopped"})
 
     @lifecycle(id="config_change")
     async def config_change(self, **_: Any):
         cfg = await self._load_config()
+        self._configure_local_vision_backend(cfg)
         requested = str(cfg.get("default_profile") or self._active_profile_id).strip()
         if requested and self._profiles.has(requested):
             self._active_profile_id = requested
@@ -83,6 +95,33 @@ class GameCompanionPlugin(NekoPluginBase):
             return {}
         section = data.get("game_companion", {}) if isinstance(data, dict) else {}
         return section if isinstance(section, dict) else {}
+
+    def _configure_local_vision_backend(self, cfg: dict[str, Any], *, session_factory: Any | None = None) -> dict[str, str]:
+        local_vision_cfg = cfg.get("local_vision") if isinstance(cfg.get("local_vision"), dict) else {}
+        classifier_cfg = {
+            "enabled": bool(local_vision_cfg.get("classifier_enabled")),
+            "model_path": local_vision_cfg.get("classifier_model_path"),
+            "labels_path": local_vision_cfg.get("classifier_labels_path"),
+            "model_name": local_vision_cfg.get("classifier_model_name"),
+            "input_size": local_vision_cfg.get("classifier_input_size"),
+            "normalize_imagenet": local_vision_cfg.get("classifier_normalize_imagenet", True),
+        }
+        config = load_onnx_classifier_config(classifier_cfg, base_dir=self._plugin_base_dir())
+        if config is None:
+            reset_default_local_vision_backend()
+            return {
+                "classifier": "disabled" if not classifier_cfg["enabled"] else "not_configured",
+                "detector": "not_configured",
+            }
+        classifier = create_onnx_classifier_backend(config, session_factory=session_factory)
+        set_default_local_vision_backend(LocalVisionBackend(classifier=classifier))
+        return {"classifier": "registered", "detector": "not_configured"}
+
+    def _plugin_base_dir(self) -> str:
+        config_path = getattr(getattr(self, "ctx", None), "config_path", None)
+        if config_path:
+            return str(Path(str(config_path)).expanduser().resolve().parent)
+        return str(Path(__file__).resolve().parent)
 
     def _ensure_runtime_state(self) -> None:
         if not hasattr(self, "_realtime"):
@@ -98,6 +137,21 @@ class GameCompanionPlugin(NekoPluginBase):
             "profiles": [profile.to_dict() for profile in self._profiles.list()],
             "realtime": self._realtime.to_dict(),
         }
+
+    def _require_capability(self, profile_id: str, capability: Capability | str) -> dict[str, Any] | None:
+        normalized = str(profile_id or self._active_profile_id or "generic").strip().lower()
+        profile = self._profiles.get(normalized)
+        decision = evaluate_profile_capability(profile, capability, profile_id=normalized)
+        if decision["allowed"]:
+            return None
+        return capability_error_response(decision)
+
+    def _profile_id_for_payload(self, payload: dict[str, Any] | None = None, fallback: str | None = None) -> str:
+        if isinstance(payload, dict):
+            candidate = str(payload.get("profile") or payload.get("profile_id") or "").strip().lower()
+            if candidate:
+                return candidate
+        return str(fallback or self._active_profile_id or "generic").strip().lower()
 
     @plugin_entry(
         id="game_companion_status",
@@ -153,7 +207,7 @@ class GameCompanionPlugin(NekoPluginBase):
             "properties": {
                 "profile_id": {
                     "type": "string",
-                    "description": "Profile id. Phase 1 supports tft.",
+                    "description": "Profile id. Supports generic and tft offline analysis.",
                 },
                 "image_path": {
                     "type": "string",
@@ -163,12 +217,39 @@ class GameCompanionPlugin(NekoPluginBase):
                     "type": "string",
                     "description": "Optional directory where TFT region crops should be saved for calibration.",
                 },
+                "vlm_requested": {
+                    "type": "boolean",
+                    "description": "Plan a vision-model fallback because the user explicitly asked for semantic screen understanding.",
+                },
+                "source_context": {
+                    "type": "object",
+                    "description": "Optional provenance metadata, for example a video_frame origin with frame_index and timestamp_seconds.",
+                },
             },
             "required": ["profile_id", "image_path"],
         },
     )
-    def analyze_frame_entry(self, profile_id: str, image_path: str, debug_crops_dir: str | None = None, **_: Any):
-        return Ok(analyze_frame(profile_id=profile_id, image_path=image_path, debug_crops_dir=debug_crops_dir))
+    def analyze_frame_entry(
+        self,
+        profile_id: str,
+        image_path: str,
+        debug_crops_dir: str | None = None,
+        vlm_requested: bool = False,
+        source_context: dict[str, Any] | None = None,
+        **_: Any,
+    ):
+        capability_error = self._require_capability(profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
+        return Ok(
+            analyze_frame(
+                profile_id=profile_id,
+                image_path=image_path,
+                debug_crops_dir=debug_crops_dir,
+                vlm_requested=bool(vlm_requested),
+                source_context=source_context,
+            )
+        )
 
     @plugin_entry(
         id="game_companion_init_layout_calibration_workspace",
@@ -234,6 +315,9 @@ class GameCompanionPlugin(NekoPluginBase):
         tags: list[str] | None = None,
         **_: Any,
     ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.SCREEN_OBSERVE)
+        if capability_error:
+            return Ok(capability_error)
         try:
             return Ok(
                 capture_tft_layout_calibration_screenshot(
@@ -245,6 +329,86 @@ class GameCompanionPlugin(NekoPluginBase):
             )
         except OSError as exc:
             return Ok(_entry_error("screen_capture_failed", str(exc)))
+
+    @plugin_entry(
+        id="game_companion_extract_layout_calibration_video_frames",
+        name="Extract TFT calibration frames from video",
+        description="Extract local TFT recording frames into the layout calibration input directory.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "video_path": {
+                    "type": "string",
+                    "description": "Local path to a TFT recording such as mp4, mkv, mov, webm, avi, or m4v.",
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Optional output directory. Defaults to plugin/plugins/game_companion/.local_calibration/input.",
+                },
+                "samples_manifest_path": {
+                    "type": "string",
+                    "description": "Optional path for the generated samples_manifest.json.",
+                },
+                "frame_indices": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional exact zero-based frame indices to extract.",
+                },
+                "max_frames": {
+                    "type": "integer",
+                    "description": "Maximum frames to sample when frame_indices is omitted. Clamped to 1-60.",
+                },
+                "expected_layout": {
+                    "type": "string",
+                    "description": "Optional expected layout applied to extracted frames.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional calibration tags applied to extracted frames.",
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional label included in extracted frame filenames.",
+                },
+            },
+            "required": ["video_path"],
+        },
+    )
+    def extract_layout_calibration_video_frames_entry(
+        self,
+        video_path: str,
+        output_dir: str | None = None,
+        samples_manifest_path: str | None = None,
+        frame_indices: list[int] | None = None,
+        max_frames: int = 8,
+        expected_layout: str | None = None,
+        tags: list[str] | None = None,
+        label: str | None = None,
+        **_: Any,
+    ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
+        try:
+            return Ok(
+                extract_tft_layout_calibration_video_frames(
+                    video_path,
+                    output_dir=output_dir,
+                    samples_manifest_path=samples_manifest_path,
+                    frame_indices=frame_indices,
+                    max_frames=max_frames,
+                    expected_layout=expected_layout,
+                    tags=tags or [],
+                    label=label,
+                )
+            )
+        except FileNotFoundError as exc:
+            return Ok(_entry_error("video_not_found", str(exc)))
+        except ValueError as exc:
+            return Ok(_entry_error("video_frame_extract_invalid", str(exc)))
+        except OSError as exc:
+            return Ok(_entry_error("video_frame_extract_failed", str(exc)))
 
     @plugin_entry(
         id="game_companion_prepare_layout_calibration_manifest",
@@ -271,6 +435,9 @@ class GameCompanionPlugin(NekoPluginBase):
         output_path: str | None = None,
         **_: Any,
     ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
         try:
             return Ok(build_tft_layout_sample_manifest(input_dir, output_path))
         except FileNotFoundError as exc:
@@ -370,6 +537,9 @@ class GameCompanionPlugin(NekoPluginBase):
         **_: Any,
     ):
         normalized = str(profile_id or "tft").strip().lower()
+        capability_error = self._require_capability(normalized, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
         if normalized != "tft":
             return Ok(
                 {
@@ -422,6 +592,9 @@ class GameCompanionPlugin(NekoPluginBase):
         report: dict[str, Any] | None = None,
         **_: Any,
     ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
         try:
             if isinstance(report, dict):
                 return Ok(summarize_tft_layout_calibration_report(report))
@@ -470,6 +643,9 @@ class GameCompanionPlugin(NekoPluginBase):
         note: str | None = None,
         **_: Any,
     ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
         try:
             return Ok(
                 update_tft_layout_calibration_check(
@@ -519,6 +695,9 @@ class GameCompanionPlugin(NekoPluginBase):
         updates: list[dict[str, Any]],
         **_: Any,
     ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
         try:
             return Ok(update_tft_layout_calibration_checks(report_path, updates=updates))
         except FileNotFoundError as exc:
@@ -532,15 +711,23 @@ class GameCompanionPlugin(NekoPluginBase):
 
     @plugin_entry(
         id="game_companion_ingest_frame",
-        name="Ingest TFT frame",
-        description="Analyze one TFT frame from image_path or image_data_url and update realtime insight state.",
+        name="Ingest game frame",
+        description="Analyze one game frame from image_path or image_data_url and update realtime insight state.",
         input_schema={
             "type": "object",
             "properties": {
-                "profile_id": {"type": "string", "description": "Profile id. Phase 7 supports tft."},
+                "profile_id": {"type": "string", "description": "Profile id. Supports generic and tft."},
                 "image_path": {"type": "string", "description": "Optional local screenshot path."},
                 "image_data_url": {"type": "string", "description": "Optional PNG/JPEG data URL from Electron capture."},
                 "debug_crops_dir": {"type": "string", "description": "Optional crop output directory for image_path ingestion."},
+                "vlm_requested": {
+                    "type": "boolean",
+                    "description": "Plan a vision-model fallback for this ingested frame without executing an external call.",
+                },
+                "source_context": {
+                    "type": "object",
+                    "description": "Optional provenance metadata, for example a video_frame origin with frame_index and timestamp_seconds.",
+                },
             },
             "required": ["profile_id"],
         },
@@ -551,14 +738,30 @@ class GameCompanionPlugin(NekoPluginBase):
         image_path: str | None = None,
         image_data_url: str | None = None,
         debug_crops_dir: str | None = None,
+        vlm_requested: bool = False,
+        source_context: dict[str, Any] | None = None,
         **_: Any,
     ):
         self._ensure_runtime_state()
         normalized = str(profile_id or self._realtime.profile_id or "tft").strip().lower()
+        capability_error = self._require_capability(normalized, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok({"result": capability_error, "realtime": self._realtime.to_dict(), "auto_snapshot": {"saved": False, "reason": "capability_denied"}})
         if image_data_url:
-            result = analyze_frame_data_url(profile_id=normalized, image_data_url=image_data_url)
+            result = analyze_frame_data_url(
+                profile_id=normalized,
+                image_data_url=image_data_url,
+                vlm_requested=bool(vlm_requested),
+                source_context=source_context,
+            )
         elif image_path:
-            result = analyze_frame(profile_id=normalized, image_path=image_path, debug_crops_dir=debug_crops_dir)
+            result = analyze_frame(
+                profile_id=normalized,
+                image_path=image_path,
+                debug_crops_dir=debug_crops_dir,
+                vlm_requested=bool(vlm_requested),
+                source_context=source_context,
+            )
         else:
             result = {
                 "success": False,
@@ -575,8 +778,8 @@ class GameCompanionPlugin(NekoPluginBase):
 
     @plugin_entry(
         id="game_companion_realtime_status",
-        name="TFT realtime insight status",
-        description="Return the current realtime TFT insight session state.",
+        name="Game realtime insight status",
+        description="Return the current realtime game insight session state.",
     )
     def realtime_status(self, **_: Any):
         self._ensure_runtime_state()
@@ -584,8 +787,8 @@ class GameCompanionPlugin(NekoPluginBase):
 
     @plugin_entry(
         id="game_companion_realtime_configure",
-        name="Configure TFT realtime insights",
-        description="Enable or disable UI-driven realtime TFT insight ingestion.",
+        name="Configure game realtime insights",
+        description="Enable or disable UI-driven realtime game insight ingestion.",
         input_schema={
             "type": "object",
             "properties": {
@@ -607,6 +810,11 @@ class GameCompanionPlugin(NekoPluginBase):
         self._ensure_runtime_state()
         if profile_id is not None and not self._profiles.has(profile_id):
             return Ok({"configured": False, "error": "unknown_profile", "realtime": self._realtime.to_dict()})
+        requested_profile = str(profile_id or self._realtime.profile_id or self._active_profile_id or "tft").strip().lower()
+        if enabled is True:
+            capability_error = self._require_capability(requested_profile, Capability.VISION_CLASSIFY)
+            if capability_error:
+                return Ok({"configured": False, "error": capability_error["error"], "realtime": self._realtime.to_dict()})
         realtime = self._realtime.configure(
             enabled=enabled,
             profile_id=profile_id,
@@ -679,6 +887,57 @@ class GameCompanionPlugin(NekoPluginBase):
         if snapshot is None:
             return Ok({"available": False, "error": "no_snapshot_available"})
         return Ok({"available": True, "prompt": build_training_prompt(snapshot)})
+
+    @plugin_entry(
+        id="game_companion_neko_context",
+        name="Build NEKO game context",
+        description="Build a queued, non-interrupting summary-only context packet for Yui/NEKO.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "analysis": {"type": "object", "description": "Optional analysis payload. Defaults to latest stable frame."},
+                "note": {"type": "string", "description": "Optional local note for the context packet."},
+                "enqueue": {"type": "boolean", "description": "Store the sanitized context packet in the plugin-local Yui queue."},
+            },
+        },
+    )
+    def neko_context(self, analysis: dict[str, Any] | None = None, note: str = "", enqueue: bool = False, **_: Any):
+        self._ensure_runtime_state()
+        source = analysis or self._realtime.stable_result or self._realtime.last_result
+        if not isinstance(source, dict):
+            return Ok({"available": False, "error": "no_analysis_available"})
+        guard_profile_id = self._profile_id_for_payload(analysis) if isinstance(analysis, dict) else self._active_profile_id
+        capability_error = self._require_capability(guard_profile_id, Capability.NEKO_CONTEXT)
+        if capability_error:
+            return Ok(capability_error)
+        packet = build_neko_context_packet(source, note=str(note or ""))
+        result = {"available": True, "packet": packet}
+        if enqueue:
+            result["queued"] = enqueue_neko_context_packet(self.store, packet)
+        return Ok(result)
+
+    @plugin_entry(
+        id="game_companion_list_neko_context_queue",
+        name="List NEKO game context queue",
+        description="List sanitized queued game context packets for Yui/NEKO without exposing raw screenshots.",
+    )
+    def list_neko_context_queue(self, **_: Any):
+        capability_error = self._require_capability(self._active_profile_id, Capability.NEKO_CONTEXT)
+        if capability_error:
+            return Ok(capability_error)
+        packets = list_neko_context_queue(self.store)
+        return Ok({"queue_size": len(packets), "packets": packets})
+
+    @plugin_entry(
+        id="game_companion_dequeue_neko_context",
+        name="Dequeue NEKO game context",
+        description="Pop the oldest sanitized queued game context packet for Yui/NEKO.",
+    )
+    def dequeue_neko_context(self, **_: Any):
+        capability_error = self._require_capability(self._active_profile_id, Capability.NEKO_CONTEXT)
+        if capability_error:
+            return Ok(capability_error)
+        return Ok(dequeue_neko_context_packet(self.store))
 
     def _maybe_auto_save_snapshot(self, result: dict[str, Any]) -> dict[str, Any]:
         if not result.get("success"):

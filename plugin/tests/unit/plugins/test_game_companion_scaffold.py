@@ -178,8 +178,8 @@ def test_tft_regions_for_1920x1080() -> None:
         "traits_panel",
     }
     assert len(regions["shop_slots"]) == 5
-    assert regions["shop"] == (470, 800, 1422, 1054)
-    assert regions["gold"] == (820, 760, 930, 805)
+    assert regions["shop"] == (470, 878, 1422, 1046)
+    assert regions["gold"] == (920, 842, 1008, 892)
 
 
 def test_tft_layout_metadata_covers_all_layout_states() -> None:
@@ -218,8 +218,8 @@ def test_tft_region_metadata_includes_layout_purpose_and_recognizers() -> None:
     assert gold["priority"] == 2
     assert gold["purpose"] == "economy"
     assert gold["recognizers"] == ["ocr"]
-    assert gold["bbox"] == [820, 760, 930, 805]
-    assert gold["ratio_bbox"] == [820 / 1920, 760 / 1080, 930 / 1920, 805 / 1080]
+    assert gold["bbox"] == [920, 842, 1008, 892]
+    assert gold["ratio_bbox"] == [920 / 1920, 842 / 1080, 1008 / 1920, 892 / 1080]
 
     augments = payload["regions"]["augments"]
     assert augments["layout"] == LAYOUT_AUGMENT_SELECT
@@ -236,9 +236,9 @@ def test_tft_regions_scale_to_other_16_9_resolutions() -> None:
 
     shop_left, shop_top, shop_right, shop_bottom = regions["shop"]
     assert 0.24 * width <= shop_left <= 0.25 * width
-    assert 0.74 * height <= shop_top <= 0.75 * height
+    assert 0.81 * height <= shop_top <= 0.82 * height
     assert 0.74 * width <= shop_right <= 0.75 * width
-    assert 0.97 * height <= shop_bottom <= 0.98 * height
+    assert 0.96 * height <= shop_bottom <= 0.97 * height
 
     board_left, board_top, board_right, board_bottom = regions["board"]
     assert 0.18 * width <= board_left <= 0.19 * width
@@ -246,8 +246,8 @@ def test_tft_regions_scale_to_other_16_9_resolutions() -> None:
     assert 0.81 * width <= board_right <= 0.82 * width
     assert 0.68 * height <= board_bottom <= 0.69 * height
 
-    assert regions["gold"] == (547, 507, 620, 537)
-    assert regions["shop_slots"]["shop_slot_1"] == (316, 537, 433, 699)
+    assert regions["gold"] == (613, 561, 672, 595)
+    assert regions["shop_slots"]["shop_slot_1"] == (316, 585, 433, 697)
 
 
 def test_tft_regions_reject_non_16_9() -> None:
@@ -332,7 +332,7 @@ def test_save_debug_crops_flattens_grouped_regions_with_metadata(tmp_path: Path)
 
     assert set(payload["layout_profiles"]) == set(LAYOUT_STATES)
     assert Path(payload["crops"]["shop_slot_5"]).name == "normal_shop__p04__shop_slot_5.png"
-    assert payload["metadata"]["shop_slot_5"]["bbox"] == [1242, 806, 1418, 1048]
+    assert payload["metadata"]["shop_slot_5"]["bbox"] == [1242, 878, 1418, 1046]
     assert payload["metadata"]["shop_slot_5"]["recognizers"] == ["template_hash", "ocr"]
     assert payload["metadata"]["augments"]["crop_path"] == payload["crops"]["augments"]
 

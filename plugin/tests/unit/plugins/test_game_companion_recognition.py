@@ -77,11 +77,13 @@ def test_shop_slot_recognition_matches_template_when_available(
         '{"schema_version": 1, "units": [{"id": "demo_unit", "name": "Demo Unit"}]}',
         encoding="utf-8",
     )
-    template = _template_image()
+    slot_boxes = shop_slot_bboxes(1920, 1080)
+    first_slot = slot_boxes["shop_slot_1"]
+    template = _template_image(size=(first_slot[2] - first_slot[0], first_slot[3] - first_slot[1]))
     (unit_assets / "demo_unit.png").parent.mkdir(parents=True, exist_ok=True)
     template.save(unit_assets / "demo_unit.png")
     screenshot = Image.new("RGB", (1920, 1080), color=(2, 8, 14))
-    for bbox in shop_slot_bboxes(1920, 1080).values():
+    for bbox in slot_boxes.values():
         screenshot.paste(template.resize((bbox[2] - bbox[0], bbox[3] - bbox[1])), box=bbox[:2])
 
     payload = recognition.recognize_tft_shop_slots(screenshot, data_dir=data_dir)

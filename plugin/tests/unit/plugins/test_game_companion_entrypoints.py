@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+from fractions import Fraction
 import importlib
 import json
 from pathlib import Path
+import sys
 import tomllib
+import types
 
 from PIL import Image
 
 from plugin.plugins.game_companion import GameCompanionPlugin
+from plugin.plugins.game_companion.core.local_vision import get_default_local_vision_backend, reset_default_local_vision_backend
 from plugin.plugins.game_companion.core.profile_registry import ProfileRegistry
+from plugin.plugins.game_companion.core.profile_registry import ProfileMetadata
 from plugin.plugins.game_companion.core.realtime import RealtimeInsightSession
 from plugin.plugins.game_companion.profiles import builtin_profiles
+from plugin.plugins.game_companion.safety import Capability, CapabilityGate, GameType, RuntimeMode
 
 
 class _Store:
@@ -113,6 +119,7 @@ def _plugin() -> GameCompanionPlugin:
     plugin._realtime = RealtimeInsightSession()
     plugin._last_auto_snapshot_key = ""
     plugin.store = _Store()
+    plugin.logger = _Logger()
     return plugin
 
 
@@ -123,6 +130,7 @@ def _payload(value):
 def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
     manifest = tomllib.loads(Path("plugin/plugins/game_companion/plugin.toml").read_text(encoding="utf-8"))
     entry = manifest["plugin"]["entry"]
+    local_vision = manifest["game_companion"]["local_vision"]
     module_name, class_name = entry.split(":", 1)
 
     plugin_cls = getattr(importlib.import_module(module_name), class_name)
@@ -130,6 +138,10 @@ def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
     entries = plugin.collect_entries(wrap_with_hooks=False)
 
     assert plugin_cls is GameCompanionPlugin
+    assert local_vision["classifier_enabled"] is False
+    assert local_vision["classifier_model_path"] == ""
+    assert local_vision["classifier_labels_path"] == ""
+    assert local_vision["classifier_input_size"] == [224, 224]
     assert {
         "game_companion_status",
         "game_companion_list_profiles",
@@ -137,6 +149,7 @@ def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
         "game_companion_analyze_frame",
         "game_companion_init_layout_calibration_workspace",
         "game_companion_capture_layout_calibration_screenshot",
+        "game_companion_extract_layout_calibration_video_frames",
         "game_companion_prepare_layout_calibration_manifest",
         "game_companion_layout_calibration_status",
         "game_companion_calibrate_layout",
@@ -150,9 +163,64 @@ def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
         "game_companion_list_review_snapshots",
         "game_companion_clear_review_snapshots",
         "game_companion_training_prompt",
+        "game_companion_neko_context",
+        "game_companion_list_neko_context_queue",
+        "game_companion_dequeue_neko_context",
         "startup",
         "shutdown",
     }.issubset(entries)
+
+
+def test_configure_local_vision_backend_registers_onnx_classifier(tmp_path: Path) -> None:
+    class _Input:
+        name = "pixels"
+
+    class _Session:
+        def get_inputs(self):
+            return [_Input()]
+
+        def run(self, _output_names, _feeds):
+            return [[[0.1, 1.9]]]
+
+    model_path = tmp_path / "screen_classifier.onnx"
+    labels_path = tmp_path / "labels.json"
+    screenshot = tmp_path / "frame.png"
+    model_path.write_bytes(b"fake")
+    labels_path.write_text('{"labels": ["loading", "shop"]}', encoding="utf-8")
+    Image.new("RGB", (640, 360), color=(80, 90, 100)).save(screenshot)
+    plugin = _plugin()
+
+    try:
+        status = plugin._configure_local_vision_backend(
+            {
+                "local_vision": {
+                    "classifier_enabled": True,
+                    "classifier_model_path": str(model_path),
+                    "classifier_labels_path": str(labels_path),
+                    "classifier_model_name": "test-startup-classifier",
+                    "classifier_input_size": [32, 32],
+                }
+            },
+            session_factory=lambda _path: _Session(),
+        )
+        payload = _payload(plugin.analyze_frame_entry(profile_id="generic", image_path=str(screenshot)))
+    finally:
+        reset_default_local_vision_backend()
+
+    assert status == {"classifier": "registered", "detector": "not_configured"}
+    assert payload["vision"]["scene"]["label"] == "shop"
+    assert payload["vision"]["scene"]["model_name"] == "test-startup-classifier"
+    assert payload["vision"]["diagnostics"]["analyzers"]["classifier"]["status"] == "ready"
+
+
+def test_configure_local_vision_backend_resets_when_disabled() -> None:
+    plugin = _plugin()
+    reset_default_local_vision_backend()
+
+    status = plugin._configure_local_vision_backend({"local_vision": {"classifier_enabled": False}})
+
+    assert status == {"classifier": "disabled", "detector": "not_configured"}
+    assert get_default_local_vision_backend() is None
 
 
 def test_game_companion_entrypoints_run_offline_tft_frame_with_debug_crops(tmp_path: Path) -> None:
@@ -178,6 +246,274 @@ def test_game_companion_entrypoints_run_offline_tft_frame_with_debug_crops(tmp_p
     debug_crops = analyzed["diagnostics"]["debug_crops"]
     assert debug_crops["output_dir"] == str(crops_dir.resolve())
     assert Path(debug_crops["crops"]["shop_slot_1"]).is_file()
+
+
+def test_game_companion_entrypoint_analyzes_generic_frame(tmp_path: Path) -> None:
+    plugin = _plugin()
+    screenshot = tmp_path / "generic.png"
+    Image.new("RGB", (640, 360), color=(90, 100, 110)).save(screenshot)
+
+    analyzed = _payload(plugin.analyze_frame_entry(profile_id="generic", image_path=str(screenshot)))
+
+    assert analyzed["success"] is True
+    assert analyzed["profile"] == "generic"
+    assert analyzed["state"] == {}
+    assert analyzed["vision"]["schema_version"] == 1
+    assert analyzed["vision"]["scene"]["label"] == "unknown"
+
+
+def test_game_companion_entrypoint_forwards_source_context(tmp_path: Path) -> None:
+    plugin = _plugin()
+    screenshot = tmp_path / "generic_video_frame.png"
+    Image.new("RGB", (640, 360), color=(90, 100, 110)).save(screenshot)
+    source_context = {
+        "type": "video_frame",
+        "profile_id": "generic",
+        "video_path": str((tmp_path / "match.mp4").resolve()),
+        "ordinal": 2,
+        "frame_index": 90,
+        "timestamp_seconds": 9.0,
+    }
+
+    analyzed = _payload(
+        plugin.analyze_frame_entry(
+            profile_id="generic",
+            image_path=str(screenshot),
+            source_context=source_context,
+        )
+    )
+
+    assert analyzed["source"]["origin"] == {**source_context, "video_path": "[redacted_path]"}
+    assert analyzed["vision"]["source"]["origin"] == {**source_context, "video_path": "[redacted_path]"}
+
+
+def test_game_companion_entrypoint_plans_vlm_fallback_without_external_call(tmp_path: Path) -> None:
+    plugin = _plugin()
+    screenshot = tmp_path / "tft.png"
+    Image.new("RGB", (1920, 1080), color=(12, 24, 36)).save(screenshot)
+
+    analyzed = _payload(plugin.analyze_frame_entry(profile_id="tft", image_path=str(screenshot), vlm_requested=True))
+
+    assert analyzed["success"] is True
+    assert analyzed["vision"]["diagnostics"]["vlm_fallback"]["status"] == "planned"
+    assert analyzed["vision"]["diagnostics"]["vlm_fallback"]["reason"] == "user_requested"
+    assert analyzed["vision"]["privacy"]["external_model_calls"] is False
+    assert analyzed["vision"]["model_calls"] == []
+
+
+def test_game_companion_runtime_guard_reports_denied_type_d_capability() -> None:
+    plugin = _plugin()
+
+    decision = plugin._require_capability("tft", Capability.INPUT_CONTROL)
+
+    assert decision["success"] is False
+    assert decision["error"]["code"] == "capability_denied"
+    assert decision["error"]["capability"] == "input_control"
+    assert decision["error"]["profile_id"] == "tft"
+    assert decision["error"]["game_type"] == "online_competitive"
+    assert decision["error"]["runtime_mode"] == "online"
+
+
+def test_type_d_hard_denies_unsafe_capability_even_if_profile_gate_allows() -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="unsafe_tft",
+            display_name="Unsafe TFT",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capability_gate=CapabilityGate(
+                allowed=(Capability.SCREEN_OBSERVE, Capability.INPUT_CONTROL),
+                denied=(),
+            ),
+            capabilities=(Capability.SCREEN_OBSERVE, Capability.INPUT_CONTROL),
+        )
+    )
+
+    decision = plugin._require_capability("unsafe_tft", Capability.INPUT_CONTROL)
+
+    assert decision["success"] is False
+    assert decision["error"]["code"] == "capability_denied"
+    assert decision["error"]["capability"] == "input_control"
+
+
+def test_game_companion_analyze_frame_entry_rejects_profile_without_vision_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="watch_only",
+            display_name="Watch Only",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+    screenshot = tmp_path / "watch_only.png"
+    Image.new("RGB", (640, 360), color=(90, 100, 110)).save(screenshot)
+
+    analyzed = _payload(plugin.analyze_frame_entry(profile_id="watch_only", image_path=str(screenshot)))
+
+    assert analyzed["success"] is False
+    assert analyzed["error"]["code"] == "capability_not_allowed"
+    assert analyzed["error"]["capability"] == "vision_classify"
+
+
+def test_game_companion_neko_context_entry_respects_active_profile_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="no_neko_context",
+            display_name="No NEKO Context",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE, Capability.VISION_CLASSIFY),
+        )
+    )
+    screenshot = tmp_path / "frame.png"
+    Image.new("RGB", (640, 360), color=(90, 100, 110)).save(screenshot)
+    plugin._active_profile_id = "no_neko_context"
+    plugin._realtime.last_result = _payload(plugin.analyze_frame_entry(profile_id="generic", image_path=str(screenshot)))
+
+    context = _payload(plugin.neko_context())
+
+    assert context["success"] is False
+    assert context["error"]["code"] == "capability_not_allowed"
+    assert context["error"]["capability"] == "neko_context"
+
+
+def test_game_companion_ingest_frame_respects_profile_vision_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="ingest_watch_only",
+            display_name="Ingest Watch Only",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+    screenshot = tmp_path / "ingest.png"
+    Image.new("RGB", (640, 360), color=(90, 100, 110)).save(screenshot)
+
+    ingested = _payload(plugin.ingest_frame(profile_id="ingest_watch_only", image_path=str(screenshot)))
+
+    assert ingested["result"]["success"] is False
+    assert ingested["result"]["error"]["code"] == "capability_not_allowed"
+    assert ingested["result"]["error"]["capability"] == "vision_classify"
+    assert ingested["realtime"]["frame_count"] == 0
+    assert ingested["auto_snapshot"] == {"saved": False, "reason": "capability_denied"}
+
+
+def test_capture_layout_calibration_screenshot_entry_requires_screen_observe() -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="blind_profile",
+            display_name="Blind Profile",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.VISION_CLASSIFY,),
+        )
+    )
+    plugin._active_profile_id = "blind_profile"
+
+    captured = _payload(plugin.capture_layout_calibration_screenshot_entry())
+
+    assert captured["success"] is False
+    assert captured["error"]["code"] == "capability_not_allowed"
+    assert captured["error"]["capability"] == "screen_observe"
+
+
+def test_calibrate_layout_entry_requires_vision_capability_before_analyzing(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="no_vision_tft",
+            display_name="No Vision TFT",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+    screenshot = tmp_path / "tft.png"
+    Image.new("RGB", (1920, 1080), color=(11, 22, 33)).save(screenshot)
+
+    result = _payload(
+        plugin.calibrate_layout_entry(
+            output_dir=str(tmp_path / "layout_calibration"),
+            image_paths=[str(screenshot)],
+            profile_id="no_vision_tft",
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "capability_not_allowed"
+    assert result["error"]["capability"] == "vision_classify"
+
+
+def test_realtime_configure_rejects_enabled_profile_without_vision_capability() -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="realtime_watch_only",
+            display_name="Realtime Watch Only",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+
+    configured = _payload(plugin.realtime_configure(enabled=True, profile_id="realtime_watch_only"))
+
+    assert configured["configured"] is False
+    assert configured["error"]["code"] == "capability_not_allowed"
+    assert configured["error"]["capability"] == "vision_classify"
+
+
+def test_neko_context_checks_supplied_analysis_profile_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="payload_no_neko",
+            display_name="Payload No NEKO",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE, Capability.VISION_CLASSIFY),
+        )
+    )
+    screenshot = tmp_path / "frame.png"
+    Image.new("RGB", (640, 360), color=(90, 100, 110)).save(screenshot)
+    analysis = _payload(plugin.analyze_frame_entry(profile_id="generic", image_path=str(screenshot)))
+    analysis["profile"] = "payload_no_neko"
+
+    context = _payload(plugin.neko_context(analysis=analysis))
+
+    assert context["success"] is False
+    assert context["error"]["code"] == "capability_not_allowed"
+    assert context["error"]["profile_id"] == "payload_no_neko"
+    assert context["error"]["capability"] == "neko_context"
+
+
+def test_neko_context_queue_entries_require_neko_context_capability() -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="queue_no_neko",
+            display_name="Queue No NEKO",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE, Capability.VISION_CLASSIFY),
+        )
+    )
+    plugin._active_profile_id = "queue_no_neko"
+
+    listed = _payload(plugin.list_neko_context_queue())
+    dequeued = _payload(plugin.dequeue_neko_context())
+
+    assert listed["success"] is False
+    assert listed["error"]["code"] == "capability_not_allowed"
+    assert dequeued["success"] is False
+    assert dequeued["error"]["code"] == "capability_not_allowed"
 
 
 def test_game_companion_init_layout_calibration_workspace_entry(tmp_path: Path) -> None:
@@ -233,6 +569,148 @@ def test_game_companion_prepare_layout_calibration_manifest_entry(tmp_path: Path
         )
     )
     assert report["summary"]["coverage"]["layout_counts"]["normal_shop"] == 1
+
+
+def test_game_companion_extract_layout_calibration_video_frames_entry_writes_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    plugin = _plugin()
+    video_path = tmp_path / "match.mp4"
+    manifest_path = tmp_path / "samples_manifest.json"
+    video_path.write_bytes(b"fake video placeholder")
+
+    class _FakeFrame:
+        pts = 0
+
+        def to_image(self) -> Image.Image:
+            return Image.new("RGB", (1920, 1080), color=(20, 30, 40))
+
+    class _FakeStream:
+        type = "video"
+        frames = 1
+        time_base = Fraction(1, 100)
+
+    class _FakeStreams:
+        video = [_FakeStream()]
+
+        def __iter__(self):
+            return iter(self.video)
+
+    class _FakeContainer:
+        streams = _FakeStreams()
+
+        def decode(self, video: int = 0):
+            assert video == 0
+            yield _FakeFrame()
+
+        def close(self) -> None:
+            pass
+
+    fake_av = types.ModuleType("av")
+    fake_av.open = lambda _path: _FakeContainer()
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+
+    result = _payload(
+        plugin.extract_layout_calibration_video_frames_entry(
+            video_path=str(video_path),
+            output_dir=str(tmp_path / "frames"),
+            samples_manifest_path=str(manifest_path),
+            expected_layout="normal_shop",
+            tags=["shop_open"],
+            max_frames=1,
+        )
+    )
+
+    assert result["type"] == "tft_layout_calibration_video_frames"
+    assert result["frame_count"] == 1
+    assert Path(result["frames"][0]["image_path"]).is_file()
+    assert result["manifest"]["manifest_path"] == str(manifest_path.resolve())
+    assert result["manifest"]["samples"][0]["expected_layout"] == "normal_shop"
+
+
+def test_calibration_video_and_manifest_entries_require_vision_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="calibration_no_vision",
+            display_name="Calibration No Vision",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+    plugin._active_profile_id = "calibration_no_vision"
+    video_path = tmp_path / "match.mp4"
+    input_dir = tmp_path / "input"
+    video_path.write_bytes(b"fake video placeholder")
+    input_dir.mkdir()
+
+    extracted = _payload(
+        plugin.extract_layout_calibration_video_frames_entry(
+            video_path=str(video_path),
+            output_dir=str(tmp_path / "frames"),
+        )
+    )
+    prepared = _payload(plugin.prepare_layout_calibration_manifest_entry(input_dir=str(input_dir)))
+
+    assert extracted["success"] is False
+    assert extracted["error"]["code"] == "capability_not_allowed"
+    assert extracted["error"]["capability"] == "vision_classify"
+    assert prepared["success"] is False
+    assert prepared["error"]["code"] == "capability_not_allowed"
+    assert prepared["error"]["capability"] == "vision_classify"
+
+
+def test_calibration_report_entries_require_vision_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="report_no_vision",
+            display_name="Report No Vision",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+    plugin._active_profile_id = "report_no_vision"
+    report_path = tmp_path / "calibration_report.json"
+
+    summarized = _payload(plugin.summarize_layout_calibration_entry(report_path=str(report_path)))
+    updated = _payload(
+        plugin.update_layout_calibration_check_entry(
+            report_path=str(report_path),
+            screenshot_index=0,
+            check_id="gold",
+            status="pass",
+        )
+    )
+    batch_updated = _payload(
+        plugin.update_layout_calibration_checks_entry(
+            report_path=str(report_path),
+            updates=[{"screenshot_index": 0, "check_id": "gold", "status": "pass"}],
+        )
+    )
+
+    for result in (summarized, updated, batch_updated):
+        assert result["success"] is False
+        assert result["error"]["code"] == "capability_not_allowed"
+        assert result["error"]["capability"] == "vision_classify"
+
+
+def test_game_companion_extract_layout_calibration_video_frames_entry_errors(tmp_path: Path) -> None:
+    plugin = _plugin()
+
+    result = _payload(
+        plugin.extract_layout_calibration_video_frames_entry(
+            video_path=str(tmp_path / "missing.mp4"),
+            output_dir=str(tmp_path / "frames"),
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "video_not_found"
 
 
 def test_game_companion_prepare_layout_calibration_manifest_entry_errors(tmp_path: Path) -> None:
@@ -477,21 +955,52 @@ def test_game_companion_realtime_and_review_entries_roundtrip(tmp_path: Path) ->
     plugin = _plugin()
     screenshot = tmp_path / "tft.png"
     Image.new("RGB", (1920, 1080), color=(8, 16, 24)).save(screenshot)
+    source_context = {
+        "type": "video_frame",
+        "profile_id": "tft",
+        "video_path": str((tmp_path / "match.mp4").resolve()),
+        "ordinal": 1,
+        "frame_index": 30,
+        "timestamp_seconds": 3.0,
+    }
 
     configured = _payload(plugin.realtime_configure(enabled=True, profile_id="tft", interval_seconds=2))
-    ingested = _payload(plugin.ingest_frame(profile_id="tft", image_path=str(screenshot)))
+    ingested = _payload(plugin.ingest_frame(profile_id="tft", image_path=str(screenshot), source_context=source_context))
     status = _payload(plugin.realtime_status())
     saved = _payload(plugin.save_review_snapshot(note="entrypoint smoke"))
     listed = _payload(plugin.list_review_snapshots())
     prompt = _payload(plugin.training_prompt())
+    context = _payload(plugin.neko_context(note="entrypoint context", enqueue=True))
+    queued = _payload(plugin.list_neko_context_queue())
+    dequeued = _payload(plugin.dequeue_neko_context())
     cleared = _payload(plugin.clear_review_snapshots())
 
     assert configured["configured"] is True
     assert ingested["result"]["success"] is True
+    assert ingested["result"]["source"]["origin"] == {**source_context, "video_path": "[redacted_path]"}
+    assert ingested["result"]["vision"]["source"]["origin"] == {**source_context, "video_path": "[redacted_path]"}
     assert ingested["realtime"]["frame_count"] == 1
     assert status["stable_result"]["profile"] == "tft"
     assert saved["saved"] is True
     assert listed["snapshots"][0]["note"] == "entrypoint smoke"
     assert prompt["available"] is True
     assert prompt["prompt"]["type"] == "tft_training_prompt"
+    assert context["available"] is True
+    assert context["packet"]["type"] == "game_companion_neko_context_packet"
+    assert context["packet"]["delivery"]["mode"] == "queued_non_interrupting"
+    assert context["packet"]["note"] == "entrypoint context"
+    assert context["queued"]["queue_size"] == 1
+    assert queued["queue_size"] == 1
+    assert queued["packets"][0]["note"] == "entrypoint context"
+    assert dequeued["available"] is True
+    assert dequeued["packet"]["note"] == "entrypoint context"
+    assert dequeued["queue_size"] == 0
     assert cleared == {"cleared": True, "snapshots": []}
+
+
+def test_game_companion_neko_context_entry_without_analysis() -> None:
+    plugin = _plugin()
+
+    context = _payload(plugin.neko_context())
+
+    assert context == {"available": False, "error": "no_analysis_available"}
