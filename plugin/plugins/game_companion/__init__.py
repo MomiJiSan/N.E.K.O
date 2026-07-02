@@ -39,6 +39,7 @@ from .core.replay import (
     list_neko_context_queue,
     load_snapshots,
 )
+from .core.tft_recognition import build_tft_recognition_report, recognize_tft_frame
 from .profiles import builtin_profiles
 from .safety import Capability, capability_error_response, evaluate_profile_capability
 
@@ -250,6 +251,75 @@ class GameCompanionPlugin(NekoPluginBase):
                 source_context=source_context,
             )
         )
+
+    @plugin_entry(
+        id="game_companion_recognize_tft_frame",
+        name="Recognize TFT frame",
+        description="Return a focused TFT structured recognition result for one local screenshot.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "Absolute or workspace-visible path to a local TFT screenshot.",
+                },
+                "expected_layout": {
+                    "type": "string",
+                    "description": "Optional TFT layout hint: normal_shop, combat, or augment_select.",
+                },
+            },
+            "required": ["image_path"],
+        },
+    )
+    def recognize_tft_frame_entry(
+        self,
+        image_path: str,
+        expected_layout: str | None = None,
+        **_: Any,
+    ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
+        return Ok(recognize_tft_frame(image_path, expected_layout=expected_layout))
+
+    @plugin_entry(
+        id="game_companion_build_tft_recognition_report",
+        name="Build TFT recognition report",
+        description="Run focused TFT recognition over screenshots from a calibration report.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "calibration_report_path": {
+                    "type": "string",
+                    "description": "Path to a TFT layout calibration_report.json.",
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory where recognition_report_v1.json and recognition_summary_v1.json are written.",
+                },
+            },
+            "required": ["calibration_report_path", "output_dir"],
+        },
+    )
+    def build_tft_recognition_report_entry(
+        self,
+        calibration_report_path: str,
+        output_dir: str,
+        **_: Any,
+    ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
+        try:
+            return Ok(build_tft_recognition_report(calibration_report_path, output_dir=output_dir))
+        except FileNotFoundError as exc:
+            return Ok(_entry_error("report_not_found", str(exc)))
+        except json.JSONDecodeError as exc:
+            return Ok(_entry_error("report_decode_failed", str(exc)))
+        except OSError as exc:
+            return Ok(_entry_error("report_write_failed", str(exc)))
+        except ValueError as exc:
+            return Ok(_entry_error("invalid_report", str(exc)))
 
     @plugin_entry(
         id="game_companion_init_layout_calibration_workspace",

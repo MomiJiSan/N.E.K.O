@@ -147,6 +147,8 @@ def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
         "game_companion_list_profiles",
         "game_companion_select_profile",
         "game_companion_analyze_frame",
+        "game_companion_recognize_tft_frame",
+        "game_companion_build_tft_recognition_report",
         "game_companion_init_layout_calibration_workspace",
         "game_companion_capture_layout_calibration_screenshot",
         "game_companion_extract_layout_calibration_video_frames",
@@ -246,6 +248,100 @@ def test_game_companion_entrypoints_run_offline_tft_frame_with_debug_crops(tmp_p
     debug_crops = analyzed["diagnostics"]["debug_crops"]
     assert debug_crops["output_dir"] == str(crops_dir.resolve())
     assert Path(debug_crops["crops"]["shop_slot_1"]).is_file()
+
+
+def test_game_companion_recognize_tft_frame_entry_returns_structured_state(tmp_path: Path) -> None:
+    plugin = _plugin()
+    screenshot = tmp_path / "tft_shop.png"
+    Image.new("RGB", (1920, 1080), color=(12, 24, 36)).save(screenshot)
+
+    recognized = _payload(
+        plugin.recognize_tft_frame_entry(
+            image_path=str(screenshot),
+            expected_layout="normal_shop",
+        )
+    )
+    combat = _payload(
+        plugin.recognize_tft_frame_entry(
+            image_path=str(screenshot),
+            expected_layout="combat",
+        )
+    )
+    missing = _payload(plugin.recognize_tft_frame_entry(image_path=str(tmp_path / "missing.png")))
+
+    assert recognized["type"] == "tft_recognition_result"
+    assert recognized["success"] is True
+    assert recognized["layout"] == "normal_shop"
+    assert len(recognized["shop"]) == 5
+    assert combat["layout"] == "combat"
+    assert combat["shop"] == []
+    assert missing["success"] is False
+    assert missing["error"]["code"] == "image_read_failed"
+
+
+def test_game_companion_build_tft_recognition_report_entry_writes_report(tmp_path: Path) -> None:
+    plugin = _plugin()
+    screenshot = tmp_path / "tft_shop.png"
+    Image.new("RGB", (1920, 1080), color=(12, 24, 36)).save(screenshot)
+    calibration_report = {
+        "type": "tft_layout_calibration_report",
+        "screenshots": [
+            {
+                "index": 1,
+                "image_path": str(screenshot),
+                "expected_layout": "normal_shop",
+                "label": "shop",
+            }
+        ],
+    }
+    report_path = tmp_path / "calibration_report.json"
+    report_path.write_text(json.dumps(calibration_report), encoding="utf-8")
+
+    report = _payload(
+        plugin.build_tft_recognition_report_entry(
+            calibration_report_path=str(report_path),
+            output_dir=str(tmp_path / "recognition"),
+        )
+    )
+
+    assert report["type"] == "tft_recognition_report"
+    assert report["report_version"] == "recognition_report_v1"
+    assert report["summary"]["total"] == 1
+    assert Path(report["report_path"]).is_file()
+    assert Path(report["summary_path"]).is_file()
+
+
+def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_path: Path) -> None:
+    plugin = _plugin()
+    plugin._profiles.register(
+        ProfileMetadata(
+            profile_id="recognition_no_vision",
+            display_name="Recognition No Vision",
+            game_type=GameType.TYPE_D,
+            default_runtime_mode=RuntimeMode.ONLINE,
+            capabilities=(Capability.SCREEN_OBSERVE,),
+        )
+    )
+    plugin._active_profile_id = "recognition_no_vision"
+    screenshot = tmp_path / "tft_shop.png"
+    report_path = tmp_path / "calibration_report.json"
+    Image.new("RGB", (1920, 1080), color=(12, 24, 36)).save(screenshot)
+    report_path.write_text(json.dumps({"type": "tft_layout_calibration_report", "screenshots": []}), encoding="utf-8")
+
+    recognized = _payload(plugin.recognize_tft_frame_entry(image_path=str(screenshot)))
+    report = _payload(
+        plugin.build_tft_recognition_report_entry(
+            calibration_report_path=str(report_path),
+            output_dir=str(tmp_path / "recognition"),
+        )
+    )
+
+    assert recognized["success"] is False
+    assert recognized["error"]["code"] == "capability_not_allowed"
+    assert recognized["error"]["capability"] == "vision_classify"
+    assert report["success"] is False
+    assert report["error"]["code"] == "capability_not_allowed"
+    assert report["error"]["capability"] == "vision_classify"
 
 
 def test_game_companion_entrypoint_analyzes_generic_frame(tmp_path: Path) -> None:

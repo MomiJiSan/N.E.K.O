@@ -8,7 +8,7 @@ from PIL import Image
 
 from .screen_regions import BBox
 
-OCR_REGION_KEYS = ("gold", "level", "stage", "round", "augments")
+OCR_REGION_KEYS = ("gold", "level", "level_exp", "stage", "round", "augments")
 
 
 def analyze_tft_ocr_regions(
@@ -106,6 +106,7 @@ def _parse_basic_state(region_results: Mapping[str, Mapping[str, Any]]) -> dict[
     return {
         "gold": _parse_first_int(region_results.get("gold", {}).get("text")),
         "level": _parse_first_int(region_results.get("level", {}).get("text")),
+        "level_exp": _parse_level_exp(region_results.get("level_exp", {}).get("text")),
         "stage": _parse_stage(region_results.get("stage", {}).get("text")),
         "round": _parse_stage(region_results.get("round", {}).get("text")),
         "augments": _parse_lines(region_results.get("augments", {}).get("text")),
@@ -118,8 +119,21 @@ def _parse_first_int(text: Any) -> int | None:
 
 
 def _parse_stage(text: Any) -> str | None:
-    match = re.search(r"\b\d+\s*-\s*\d+\b", str(text or ""))
+    match = re.search(r"(?<!\d)\d+\s*-\s*\d+(?!\d)", str(text or ""))
     return re.sub(r"\s+", "", match.group(0)) if match else None
+
+
+def _parse_level_exp(text: Any) -> dict[str, int | None] | None:
+    raw = str(text or "")
+    level = _parse_first_int(raw)
+    xp_match = re.search(r"(\d+)\s*/\s*(\d+)", raw)
+    if level is None and not xp_match:
+        return None
+    return {
+        "level": level,
+        "xp_current": int(xp_match.group(1)) if xp_match else None,
+        "xp_required": int(xp_match.group(2)) if xp_match else None,
+    }
 
 
 def _parse_lines(text: Any) -> list[str]:
