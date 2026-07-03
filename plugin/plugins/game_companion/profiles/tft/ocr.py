@@ -23,6 +23,16 @@ OCR_REGION_KEYS = (
     "shop_slot_3",
     "shop_slot_4",
     "shop_slot_5",
+    "shop_slot_1_name",
+    "shop_slot_1_cost",
+    "shop_slot_2_name",
+    "shop_slot_2_cost",
+    "shop_slot_3_name",
+    "shop_slot_3_cost",
+    "shop_slot_4_name",
+    "shop_slot_4_cost",
+    "shop_slot_5_name",
+    "shop_slot_5_cost",
 )
 
 

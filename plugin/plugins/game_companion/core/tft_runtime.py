@@ -51,10 +51,12 @@ def build_tft_video_state_report(
     if not raw_frames:
         raise ValueError("no frames extracted from TFT runtime video")
 
+    pending_records: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     frames: list[dict[str, Any]] = []
     active_recognizer = recognizer or recognize_tft_frame
     shop_labels = _load_runtime_shop_labels(shop_labels_path)
+    local_shop_cost_hints = _load_local_shop_cost_hints()
     for ordinal, raw_frame in enumerate(raw_frames, start=1):
         image = raw_frame.get("image")
         if not isinstance(image, Image.Image):
@@ -78,25 +80,52 @@ def build_tft_video_state_report(
             source_context["expected_layout"] = frame_layout
         recognition = active_recognizer(image_path, expected_layout=frame_layout)
         _apply_runtime_shop_labels(recognition, frame_index, shop_labels)
+        pending_records.append(
+            {
+                "type": "tft_runtime_state_record",
+                "schema_version": 1,
+                "ordinal": ordinal,
+                "frame_index": frame_index,
+                "timestamp_seconds": timestamp,
+                "image_path": str(image_path.resolve()),
+                "source_context": source_context,
+                "raw_recognition": recognition,
+            }
+        )
+
+    _apply_runtime_temporal_shop_costs(
+        [
+            record["raw_recognition"]
+            for record in pending_records
+            if isinstance(record.get("raw_recognition"), dict)
+        ]
+    )
+    for pending in pending_records:
+        recognition = pending["raw_recognition"]
+        _apply_runtime_local_shop_cost_hints(recognition, local_shop_cost_hints)
         _refresh_runtime_shop_readiness(recognition)
-        state = build_tft_state(recognition, timestamp=timestamp, source_context=source_context)
+        state = build_tft_state(
+            recognition,
+            timestamp=pending.get("timestamp_seconds"),
+            source_context=pending.get("source_context"),
+        )
         record = {
             "type": "tft_runtime_state_record",
             "schema_version": 1,
-            "ordinal": ordinal,
-            "frame_index": frame_index,
-            "timestamp_seconds": timestamp,
-            "image_path": str(image_path.resolve()),
+            "ordinal": pending["ordinal"],
+            "frame_index": pending["frame_index"],
+            "timestamp_seconds": pending["timestamp_seconds"],
+            "image_path": pending["image_path"],
             "state": state,
             "raw_recognition": recognition,
         }
         records.append(record)
         frames.append(
             {
-                "ordinal": ordinal,
-                "frame_index": frame_index,
-                "timestamp_seconds": timestamp,
-                "image_path": str(image_path.resolve()),
+                "ordinal": pending["ordinal"],
+                "frame_index": pending["frame_index"],
+                "timestamp_seconds": pending["timestamp_seconds"],
+                "image_path": pending["image_path"],
                 "layout": state["layout"],
                 "readiness": state["readiness"],
             }
@@ -243,6 +272,158 @@ def _apply_runtime_shop_labels(
             slot["cost_candidate"] = human.get("cost")
             slot["cost_candidate_source"] = "human_verified_label"
             slot["cost_inference"] = {"method": "human_verified_label", "confidence": 1.0}
+
+
+def _apply_runtime_temporal_shop_costs(recognitions: list[dict[str, Any]]) -> None:
+    costs_by_slot_name: dict[tuple[int, str], set[int]] = {}
+    costs_by_name: dict[str, set[int]] = {}
+    for recognition in recognitions:
+        if recognition.get("layout") != "normal_shop":
+            continue
+        for slot in _runtime_occupied_shop_slots(recognition):
+            cost = _runtime_slot_cost(slot)
+            name = _runtime_slot_name(slot)
+            slot_number = _runtime_slot_number(slot)
+            if cost is None or not name:
+                continue
+            costs_by_name.setdefault(name, set()).add(cost)
+            if slot_number is not None:
+                costs_by_slot_name.setdefault((slot_number, name), set()).add(cost)
+
+    slot_consensus = {
+        key: next(iter(costs))
+        for key, costs in costs_by_slot_name.items()
+        if len(costs) == 1
+    }
+    name_consensus = {
+        name: next(iter(costs))
+        for name, costs in costs_by_name.items()
+        if len(costs) == 1
+    }
+    for recognition in recognitions:
+        if recognition.get("layout") != "normal_shop":
+            continue
+        for slot in _runtime_occupied_shop_slots(recognition):
+            if _runtime_slot_cost(slot) is not None:
+                continue
+            name = _runtime_slot_name(slot)
+            slot_number = _runtime_slot_number(slot)
+            if not name:
+                continue
+            if slot_number is not None and (slot_number, name) in slot_consensus:
+                _set_runtime_slot_cost(
+                    slot,
+                    slot_consensus[(slot_number, name)],
+                    source="runtime_temporal_slot_name_cost_consensus",
+                    confidence=0.74,
+                    matched_name=name,
+                )
+            elif name in name_consensus:
+                _set_runtime_slot_cost(
+                    slot,
+                    name_consensus[name],
+                    source="runtime_temporal_name_cost_consensus",
+                    confidence=0.68,
+                    matched_name=name,
+                )
+
+
+def _apply_runtime_local_shop_cost_hints(recognition: dict[str, Any], cost_hints: Mapping[str, int]) -> None:
+    if not cost_hints or recognition.get("layout") != "normal_shop":
+        return
+    for slot in _runtime_occupied_shop_slots(recognition):
+        if _runtime_slot_cost(slot) is not None:
+            continue
+        name = _runtime_slot_name(slot)
+        if not name or name not in cost_hints:
+            continue
+        _set_runtime_slot_cost(
+            slot,
+            cost_hints[name],
+            source="runtime_local_calibration_name_cost",
+            confidence=0.72,
+            matched_name=name,
+        )
+
+
+def _load_local_shop_cost_hints(root: str | Path | None = None) -> dict[str, int]:
+    calibration_root = Path(root).expanduser() if root is not None else DEFAULT_LOCAL_CALIBRATION_DIR
+    if not calibration_root.is_dir():
+        return {}
+    costs_by_name: dict[str, set[int]] = {}
+    for labels_path in calibration_root.rglob("recognition_shop_labels_v1.json"):
+        try:
+            payload = json.loads(labels_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for sample in payload.get("samples", []):
+            if not isinstance(sample, dict):
+                continue
+            human = sample.get("human") if isinstance(sample.get("human"), dict) else sample.get("human_label")
+            if not isinstance(human, dict) or human.get("status") != "verified":
+                continue
+            name = _normalize_runtime_shop_name(human.get("name"))
+            cost = _runtime_valid_cost(human.get("cost"))
+            if name and cost is not None:
+                costs_by_name.setdefault(name, set()).add(cost)
+    return {name: next(iter(costs)) for name, costs in costs_by_name.items() if len(costs) == 1}
+
+
+def _runtime_occupied_shop_slots(recognition: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        slot
+        for slot in recognition.get("shop") or []
+        if isinstance(slot, dict) and slot.get("state") == "occupied"
+    ]
+
+
+def _runtime_slot_name(slot: Mapping[str, Any]) -> str:
+    return _normalize_runtime_shop_name(slot.get("name_candidate") or slot.get("name"))
+
+
+def _normalize_runtime_shop_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _runtime_slot_number(slot: Mapping[str, Any]) -> int | None:
+    try:
+        value = int(slot.get("slot"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _runtime_slot_cost(slot: Mapping[str, Any]) -> int | None:
+    cost = _runtime_valid_cost(slot.get("cost_candidate"))
+    if cost is not None:
+        return cost
+    return _runtime_valid_cost(slot.get("cost"))
+
+
+def _runtime_valid_cost(value: Any) -> int | None:
+    try:
+        cost = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cost if 1 <= cost <= 5 else None
+
+
+def _set_runtime_slot_cost(
+    slot: dict[str, Any],
+    cost: int,
+    *,
+    source: str,
+    confidence: float,
+    matched_name: str,
+) -> None:
+    slot["cost"] = cost
+    slot["cost_candidate"] = cost
+    slot["cost_candidate_source"] = source
+    slot["cost_inference"] = {
+        "method": source,
+        "matched_name": matched_name,
+        "confidence": confidence,
+    }
 
 
 def _refresh_runtime_shop_readiness(recognition: dict[str, Any]) -> None:

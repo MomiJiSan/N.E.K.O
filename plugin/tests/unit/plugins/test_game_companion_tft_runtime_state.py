@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from plugin.plugins.game_companion.core import tft_runtime
 from plugin.plugins.game_companion.core.tft_runtime import build_tft_video_state_report
 from plugin.plugins.game_companion.core.tft_state import build_tft_state
 
@@ -385,3 +386,150 @@ def test_build_tft_video_state_report_applies_verified_shop_labels(tmp_path: Pat
     assert record["raw_recognition"]["shop"][1]["cost_candidate_source"] == "human_verified_label"
     assert len(cost_candidates) / len(occupied) >= 0.8
     assert report["summary"]["normal_shop_ready_count"] == 1
+
+
+def test_build_tft_video_state_report_applies_temporal_shop_cost_consensus(tmp_path: Path) -> None:
+    video = tmp_path / "match.mp4"
+    video.write_bytes(b"fake video placeholder")
+
+    def frame_reader(_video_path: Path, *, frame_indices: list[int], max_frames: int) -> list[dict[str, object]]:
+        return [
+            {"frame_index": 16445, "timestamp_seconds": 274.0, "image": Image.new("RGB", (1920, 1080), "navy")},
+            {"frame_index": 16465, "timestamp_seconds": 274.3, "image": Image.new("RGB", (1920, 1080), "navy")},
+        ]
+
+    def recognizer(image_path: str | Path, *, expected_layout: str | None = None) -> dict[str, object]:
+        frame_index = 16465 if "016465" in str(image_path) else 16445
+        return {
+            "success": True,
+            "image_path": str(image_path),
+            "layout": "normal_shop",
+            "confidence": 0.8,
+            "readiness": {
+                "status": "partial" if frame_index == 16445 else "ready",
+                "blocking_issues": [
+                    {
+                        "code": "shop_cost_ocr_failed",
+                        "check": "shop_costs",
+                        "count": 1,
+                        "slots": [2],
+                    }
+                ]
+                if frame_index == 16445
+                else [],
+            },
+            "warnings": [],
+            "shop": [
+                {"slot": 1, "state": "empty", "name": None, "cost": None, "confidence": 0.8},
+                {
+                    "slot": 2,
+                    "state": "occupied",
+                    "name": "Ahri",
+                    "cost": None if frame_index == 16445 else 3,
+                    "confidence": 0.8,
+                },
+                {"slot": 3, "state": "occupied", "name": "Lux", "cost": 2, "confidence": 0.8},
+                {"slot": 4, "state": "occupied", "name": "Jinx", "cost": 4, "confidence": 0.8},
+                {"slot": 5, "state": "occupied", "name": "Vi", "cost": 1, "confidence": 0.8},
+            ],
+            "augments": [],
+        }
+
+    report = build_tft_video_state_report(
+        video,
+        output_dir=tmp_path / "runtime_state_v1",
+        max_frames=2,
+        frame_indices=[16445, 16465],
+        frame_layouts={16445: "normal_shop", 16465: "normal_shop"},
+        frame_reader=frame_reader,
+        recognizer=recognizer,
+    )
+
+    records = [json.loads(line) for line in Path(report["jsonl_path"]).read_text(encoding="utf-8").splitlines()]
+    first = records[0]
+    occupied = [slot for slot in first["state"]["shop"]["slots"] if slot["state"] == "occupied"]
+    cost_candidates = [slot for slot in occupied if slot["cost"] is not None]
+
+    assert first["state"]["readiness"] == "ready"
+    assert first["state"]["shop"]["slots"][1]["cost"] == 3
+    assert first["raw_recognition"]["shop"][1]["cost_candidate_source"] == "runtime_temporal_slot_name_cost_consensus"
+    assert len(cost_candidates) / len(occupied) >= 0.8
+    assert report["summary"]["normal_shop_ready_count"] == 2
+
+
+def test_build_tft_video_state_report_uses_local_calibration_cost_hints_without_label_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    video = tmp_path / "match.mp4"
+    video.write_bytes(b"fake video placeholder")
+    calibration_root = tmp_path / "calibration"
+    labels_path = calibration_root / "run" / "recognition_shop_labels_v1.json"
+    labels_path.parent.mkdir(parents=True)
+    labels_path.write_text(
+        json.dumps(
+            {
+                "type": "tft_shop_labels",
+                "samples": [
+                    {
+                        "slot": 2,
+                        "human": {"name": "厄加特", "cost": 3, "status": "verified"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tft_runtime, "DEFAULT_LOCAL_CALIBRATION_DIR", calibration_root)
+
+    def frame_reader(_video_path: Path, *, frame_indices: list[int], max_frames: int) -> list[dict[str, object]]:
+        return [
+            {"frame_index": 16445, "timestamp_seconds": 274.0, "image": Image.new("RGB", (1920, 1080), "navy")},
+            {"frame_index": 16465, "timestamp_seconds": 274.3, "image": Image.new("RGB", (1920, 1080), "navy")},
+        ]
+
+    def recognizer(image_path: str | Path, *, expected_layout: str | None = None) -> dict[str, object]:
+        return {
+            "success": True,
+            "image_path": str(image_path),
+            "layout": "normal_shop",
+            "confidence": 0.8,
+            "readiness": {
+                "status": "partial",
+                "blocking_issues": [
+                    {
+                        "code": "shop_cost_ocr_failed",
+                        "check": "shop_costs",
+                        "count": 1,
+                        "slots": [2],
+                    }
+                ],
+            },
+            "warnings": [],
+            "shop": [
+                {"slot": 1, "state": "empty", "name": None, "cost": None, "confidence": 0.8},
+                {"slot": 2, "state": "occupied", "name": "厄加特", "cost": None, "confidence": 0.8},
+                {"slot": 3, "state": "occupied", "name": "Lux", "cost": 2, "confidence": 0.8},
+                {"slot": 4, "state": "occupied", "name": "Jinx", "cost": 4, "confidence": 0.8},
+                {"slot": 5, "state": "occupied", "name": "Vi", "cost": 1, "confidence": 0.8},
+            ],
+            "augments": [],
+        }
+
+    report = build_tft_video_state_report(
+        video,
+        output_dir=tmp_path / "runtime_state_v1",
+        max_frames=2,
+        frame_indices=[16445, 16465],
+        frame_layouts={16445: "normal_shop", 16465: "normal_shop"},
+        frame_reader=frame_reader,
+        recognizer=recognizer,
+    )
+
+    records = [json.loads(line) for line in Path(report["jsonl_path"]).read_text(encoding="utf-8").splitlines()]
+
+    assert [record["state"]["readiness"] for record in records] == ["ready", "ready"]
+    assert records[0]["state"]["shop"]["slots"][1]["cost"] == 3
+    assert records[0]["raw_recognition"]["shop"][1]["cost_candidate_source"] == "runtime_local_calibration_name_cost"
+    assert report["summary"]["normal_shop_ready_count"] == 2
