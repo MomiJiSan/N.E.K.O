@@ -476,6 +476,10 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     layout_counts: dict[str, int] = {}
     readiness_counts: dict[str, int] = {}
     main_blockers: dict[str, int] = {}
+    shop_cost_source_counts: dict[str, int] = {}
+    shop_name_source_counts: dict[str, int] = {}
+    fallback_cost_count = 0
+    ocr_cost_count = 0
     for record in records:
         state = record.get("state") if isinstance(record.get("state"), dict) else {}
         layout = str(state.get("layout") or "unknown")
@@ -486,6 +490,20 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(blockers, list) and blockers:
             code = str(blockers[0].get("code") or "unknown_blocker") if isinstance(blockers[0], dict) else "unknown_blocker"
             main_blockers[code] = main_blockers.get(code, 0) + 1
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        for slot in shop.get("slots", []) if isinstance(shop, dict) else []:
+            if not isinstance(slot, dict) or slot.get("state") != "occupied":
+                continue
+            name_source = str(slot.get("name_source") or "").strip()
+            cost_source = str(slot.get("cost_source") or "").strip()
+            if name_source:
+                shop_name_source_counts[name_source] = shop_name_source_counts.get(name_source, 0) + 1
+            if cost_source and slot.get("cost") is not None:
+                shop_cost_source_counts[cost_source] = shop_cost_source_counts.get(cost_source, 0) + 1
+                if _runtime_is_ocr_cost_source(cost_source):
+                    ocr_cost_count += 1
+                else:
+                    fallback_cost_count += 1
     return {
         "total_frames": len(records),
         "layout_counts": layout_counts,
@@ -496,7 +514,15 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "contaminated_count": readiness_counts.get("contaminated", 0),
         "unknown_count": layout_counts.get("unknown", 0),
         "main_blockers": main_blockers,
+        "shop_cost_source_counts": shop_cost_source_counts,
+        "shop_name_source_counts": shop_name_source_counts,
+        "fallback_cost_count": fallback_cost_count,
+        "ocr_cost_count": ocr_cost_count,
     }
+
+
+def _runtime_is_ocr_cost_source(source: str) -> bool:
+    return source in {"slot_cost", "slot_full"}
 
 
 def _count(records: list[dict[str, Any]], layout: str, readiness: str) -> int:

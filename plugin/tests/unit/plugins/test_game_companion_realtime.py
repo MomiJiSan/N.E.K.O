@@ -328,6 +328,60 @@ def test_neko_context_packet_includes_tft_runtime_state_digest() -> None:
     assert "slot 2 缺费用" in packet["summary"]
 
 
+def test_neko_context_packet_summarizes_tft_shop_cost_sources() -> None:
+    analysis = {
+        "profile": "tft",
+        "state": {"stage": "3-2", "level": 6, "gold": 42},
+        "tft_state": {
+            "type": "tft_frame_state",
+            "game": "tft",
+            "layout": "normal_shop",
+            "readiness": "ready",
+            "summary": "当前是商店界面，5 个商店栏位可识别，4 个有棋子。",
+            "shop": {
+                "slot_count": 5,
+                "occupied_count": 4,
+                "partial_count": 0,
+                "slot_issues": [],
+                "slots": [
+                    {
+                        "slot": 2,
+                        "state": "occupied",
+                        "name": "厄加特",
+                        "cost": 3,
+                        "confidence": 0.95,
+                        "missing_fields": [],
+                        "name_source": "slot_name",
+                        "cost_source": "runtime_local_calibration_name_cost",
+                        "cost_inference": {
+                            "method": "runtime_local_calibration_name_cost",
+                            "matched_name": "厄加特",
+                            "confidence": 0.72,
+                        },
+                    }
+                ],
+            },
+            "blockers": [],
+        },
+        "insights": [],
+    }
+
+    packet = build_neko_context_packet(analysis, note="runtime state")
+
+    assert packet["state_digest"]["tft"]["shop"]["units"] == [
+        {
+            "slot": 2,
+            "name": "厄加特",
+            "cost": 3,
+            "confidence": 0.95,
+            "missing_fields": [],
+            "name_source": "ocr",
+            "cost_source": "local_calibration",
+        }
+    ]
+    assert "slot 2 费用来自本地校准" in packet["summary"]
+
+
 def test_neko_context_queue_is_fifo_and_sanitized() -> None:
     store = _Store()
     analysis = {

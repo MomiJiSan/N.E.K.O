@@ -252,9 +252,36 @@ def _tft_shop_units_digest(slots: Any) -> list[dict[str, Any]]:
                 "cost": slot.get("cost"),
                 "confidence": slot.get("confidence"),
                 "missing_fields": _tft_missing_fields_digest(slot.get("missing_fields")),
+                **_tft_shop_source_digest(slot),
             }
         )
     return units[:5]
+
+
+def _tft_shop_source_digest(slot: dict[str, Any]) -> dict[str, str]:
+    digest: dict[str, str] = {}
+    name_source = _tft_source_label(slot.get("name_source") or slot.get("name_candidate_source"))
+    cost_source = _tft_source_label(slot.get("cost_source") or slot.get("cost_candidate_source"))
+    if name_source:
+        digest["name_source"] = name_source
+    if cost_source:
+        digest["cost_source"] = cost_source
+    return digest
+
+
+def _tft_source_label(source: Any) -> str:
+    value = str(source or "").strip()
+    if value in {"slot_name", "slot_cost", "slot_full"}:
+        return "ocr"
+    if value == "human_verified_label":
+        return "human_verified"
+    if value in {"runtime_temporal_slot_name_cost_consensus", "runtime_temporal_name_cost_consensus"}:
+        return "temporal_consensus"
+    if value == "runtime_local_calibration_name_cost":
+        return "local_calibration"
+    if value in {"frame_name_cost_consensus", "report_name_cost_consensus"}:
+        return "name_cost_consensus"
+    return ""
 
 
 def _tft_shop_slot_issues_digest(slot_issues: Any) -> list[dict[str, Any]]:
@@ -315,6 +342,9 @@ def _context_summary(state: dict[str, Any], insights: list[Any], *, tft_state: d
     parts = []
     if isinstance(tft_state, dict) and tft_state.get("summary"):
         parts.append(_redact_context_text(tft_state.get("summary") or ""))
+        source_summary = _tft_source_context_summary(tft_state)
+        if source_summary:
+            parts.append(source_summary)
     stage = state.get("stage") or state.get("round")
     level = state.get("level")
     gold = state.get("gold")
@@ -332,6 +362,24 @@ def _context_summary(state: dict[str, Any], insights: list[Any], *, tft_state: d
     if titles:
         parts.append("; ".join(titles[:3]))
     return _redact_context_text(" | ".join(parts)) if parts else "No stable game context is available yet."
+
+
+def _tft_source_context_summary(tft_state: dict[str, Any]) -> str:
+    shop = tft_state.get("shop") if isinstance(tft_state.get("shop"), dict) else {}
+    if not shop:
+        return ""
+    details = []
+    for slot in shop.get("slots", [])[:5]:
+        if not isinstance(slot, dict) or slot.get("state") != "occupied" or slot.get("cost") is None:
+            continue
+        source = _tft_source_label(slot.get("cost_source") or slot.get("cost_candidate_source"))
+        if source == "local_calibration":
+            details.append(f"slot {slot.get('slot')} 费用来自本地校准")
+        elif source == "temporal_consensus":
+            details.append(f"slot {slot.get('slot')} 费用来自连续帧推断")
+        elif source == "human_verified":
+            details.append(f"slot {slot.get('slot')} 费用来自人工校准")
+    return "；".join(details[:2])
 
 
 def _source_digest(payload: Any) -> dict[str, Any] | None:

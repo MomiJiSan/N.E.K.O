@@ -31,6 +31,9 @@ def test_build_tft_state_maps_normal_shop_to_runtime_json() -> None:
                 "confidence": 0.92,
                 "name_confidence": 0.66,
                 "cost_confidence": 0.68,
+                "name_candidate_source": "slot_name",
+                "cost_candidate_source": "slot_cost",
+                "cost_inference": {"method": "slot_cost", "confidence": 0.68},
             },
         ],
         "augments": [],
@@ -58,6 +61,9 @@ def test_build_tft_state_maps_normal_shop_to_runtime_json() -> None:
                     "confidence": 0.88,
                     "name_confidence": 0.0,
                     "cost_confidence": 0.0,
+                    "name_source": "",
+                    "cost_source": "",
+                    "cost_inference": None,
                     "missing_fields": [],
                 },
                 {
@@ -68,6 +74,9 @@ def test_build_tft_state_maps_normal_shop_to_runtime_json() -> None:
                     "confidence": 0.92,
                     "name_confidence": 0.66,
                     "cost_confidence": 0.68,
+                    "name_source": "slot_name",
+                    "cost_source": "slot_cost",
+                    "cost_inference": {"method": "slot_cost", "confidence": 0.68},
                     "missing_fields": [],
                 },
             ],
@@ -358,10 +367,41 @@ def test_build_tft_video_state_report_applies_verified_shop_labels(tmp_path: Pat
             "warnings": [],
             "shop": [
                 {"slot": 1, "state": "empty", "name": None, "cost": None, "confidence": 0.8},
-                {"slot": 2, "state": "occupied", "name": "Ahri", "cost": None, "confidence": 0.8},
-                {"slot": 3, "state": "occupied", "name": "Lux", "cost": 2, "confidence": 0.8},
-                {"slot": 4, "state": "occupied", "name": "Jinx", "cost": 4, "confidence": 0.8},
-                {"slot": 5, "state": "occupied", "name": "Vi", "cost": 1, "confidence": 0.8},
+                {
+                    "slot": 2,
+                    "state": "occupied",
+                    "name": "Ahri",
+                    "cost": None,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                },
+                {
+                    "slot": 3,
+                    "state": "occupied",
+                    "name": "Lux",
+                    "cost": 2,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
+                {
+                    "slot": 4,
+                    "state": "occupied",
+                    "name": "Jinx",
+                    "cost": 4,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
+                {
+                    "slot": 5,
+                    "state": "occupied",
+                    "name": "Vi",
+                    "cost": 1,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
             ],
             "augments": [],
         }
@@ -383,8 +423,17 @@ def test_build_tft_video_state_report_applies_verified_shop_labels(tmp_path: Pat
 
     assert record["state"]["readiness"] == "ready"
     assert record["state"]["shop"]["slots"][1]["cost"] == 3
+    assert record["state"]["shop"]["slots"][1]["cost_source"] == "human_verified_label"
+    assert record["state"]["shop"]["slots"][1]["cost_inference"] == {
+        "method": "human_verified_label",
+        "confidence": 1.0,
+    }
     assert record["raw_recognition"]["shop"][1]["cost_candidate_source"] == "human_verified_label"
     assert len(cost_candidates) / len(occupied) >= 0.8
+    assert report["summary"]["shop_cost_source_counts"] == {"human_verified_label": 1, "slot_cost": 3}
+    assert report["summary"]["shop_name_source_counts"] == {"slot_name": 4}
+    assert report["summary"]["fallback_cost_count"] == 1
+    assert report["summary"]["ocr_cost_count"] == 3
     assert report["summary"]["normal_shop_ready_count"] == 1
 
 
@@ -427,10 +476,36 @@ def test_build_tft_video_state_report_applies_temporal_shop_cost_consensus(tmp_p
                     "name": "Ahri",
                     "cost": None if frame_index == 16445 else 3,
                     "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": None if frame_index == 16445 else "slot_cost",
                 },
-                {"slot": 3, "state": "occupied", "name": "Lux", "cost": 2, "confidence": 0.8},
-                {"slot": 4, "state": "occupied", "name": "Jinx", "cost": 4, "confidence": 0.8},
-                {"slot": 5, "state": "occupied", "name": "Vi", "cost": 1, "confidence": 0.8},
+                {
+                    "slot": 3,
+                    "state": "occupied",
+                    "name": "Lux",
+                    "cost": 2,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
+                {
+                    "slot": 4,
+                    "state": "occupied",
+                    "name": "Jinx",
+                    "cost": 4,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
+                {
+                    "slot": 5,
+                    "state": "occupied",
+                    "name": "Vi",
+                    "cost": 1,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
             ],
             "augments": [],
         }
@@ -452,8 +527,16 @@ def test_build_tft_video_state_report_applies_temporal_shop_cost_consensus(tmp_p
 
     assert first["state"]["readiness"] == "ready"
     assert first["state"]["shop"]["slots"][1]["cost"] == 3
+    assert first["state"]["shop"]["slots"][1]["cost_source"] == "runtime_temporal_slot_name_cost_consensus"
     assert first["raw_recognition"]["shop"][1]["cost_candidate_source"] == "runtime_temporal_slot_name_cost_consensus"
     assert len(cost_candidates) / len(occupied) >= 0.8
+    assert report["summary"]["shop_cost_source_counts"] == {
+        "runtime_temporal_slot_name_cost_consensus": 1,
+        "slot_cost": 7,
+    }
+    assert report["summary"]["shop_name_source_counts"] == {"slot_name": 8}
+    assert report["summary"]["fallback_cost_count"] == 1
+    assert report["summary"]["ocr_cost_count"] == 7
     assert report["summary"]["normal_shop_ready_count"] == 2
 
 
@@ -510,9 +593,33 @@ def test_build_tft_video_state_report_uses_local_calibration_cost_hints_without_
             "shop": [
                 {"slot": 1, "state": "empty", "name": None, "cost": None, "confidence": 0.8},
                 {"slot": 2, "state": "occupied", "name": "厄加特", "cost": None, "confidence": 0.8},
-                {"slot": 3, "state": "occupied", "name": "Lux", "cost": 2, "confidence": 0.8},
-                {"slot": 4, "state": "occupied", "name": "Jinx", "cost": 4, "confidence": 0.8},
-                {"slot": 5, "state": "occupied", "name": "Vi", "cost": 1, "confidence": 0.8},
+                {
+                    "slot": 3,
+                    "state": "occupied",
+                    "name": "Lux",
+                    "cost": 2,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
+                {
+                    "slot": 4,
+                    "state": "occupied",
+                    "name": "Jinx",
+                    "cost": 4,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
+                {
+                    "slot": 5,
+                    "state": "occupied",
+                    "name": "Vi",
+                    "cost": 1,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "slot_cost",
+                },
             ],
             "augments": [],
         }
@@ -531,5 +638,13 @@ def test_build_tft_video_state_report_uses_local_calibration_cost_hints_without_
 
     assert [record["state"]["readiness"] for record in records] == ["ready", "ready"]
     assert records[0]["state"]["shop"]["slots"][1]["cost"] == 3
+    assert records[0]["state"]["shop"]["slots"][1]["cost_source"] == "runtime_local_calibration_name_cost"
     assert records[0]["raw_recognition"]["shop"][1]["cost_candidate_source"] == "runtime_local_calibration_name_cost"
+    assert report["summary"]["shop_cost_source_counts"] == {
+        "runtime_local_calibration_name_cost": 2,
+        "slot_cost": 6,
+    }
+    assert report["summary"]["shop_name_source_counts"] == {"slot_name": 6}
+    assert report["summary"]["fallback_cost_count"] == 2
+    assert report["summary"]["ocr_cost_count"] == 6
     assert report["summary"]["normal_shop_ready_count"] == 2

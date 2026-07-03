@@ -20,6 +20,9 @@ class TftShopSlot:
     confidence: float
     name_confidence: float
     cost_confidence: float
+    name_source: str
+    cost_source: str
+    cost_inference: dict[str, Any] | None
     missing_fields: list[str]
 
 
@@ -172,10 +175,13 @@ def _shop_slot(slot: dict[str, Any]) -> TftShopSlot:
         slot=_int(slot.get("slot")),
         state=str(slot.get("state") or "unknown"),
         name=_str_or_none(slot.get("name") or slot.get("name_candidate")),
-        cost=_int_or_none(slot.get("cost") if slot.get("cost") is not None else slot.get("cost_candidate")),
+        cost=_slot_cost(slot),
         confidence=_float(slot.get("confidence")),
         name_confidence=_float(slot.get("name_confidence")),
         cost_confidence=_float(slot.get("cost_confidence")),
+        name_source=_source(slot.get("name_candidate_source") or slot.get("name_source")),
+        cost_source=_source(slot.get("cost_candidate_source") or slot.get("cost_source")),
+        cost_inference=_cost_inference(slot.get("cost_inference")),
         missing_fields=_shop_slot_missing_fields(slot),
     )
 
@@ -186,9 +192,28 @@ def _shop_slot_missing_fields(slot: dict[str, Any]) -> list[str]:
     missing = []
     if not (slot.get("name") or slot.get("name_candidate")):
         missing.append("name")
-    if slot.get("cost", slot.get("cost_candidate")) is None:
+    if _slot_cost(slot) is None:
         missing.append("cost")
     return missing
+
+
+def _slot_cost(slot: dict[str, Any]) -> int | None:
+    return _int_or_none(slot.get("cost") if slot.get("cost") is not None else slot.get("cost_candidate"))
+
+
+def _source(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _cost_inference(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        key: value.get(key)
+        for key in ("method", "matched_name", "confidence")
+        if value.get(key) is not None
+    }
+    return allowed or None
 
 
 def _augment_state(recognition: dict[str, Any]) -> TftAugmentState:
