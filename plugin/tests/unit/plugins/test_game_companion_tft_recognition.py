@@ -18,6 +18,7 @@ from plugin.plugins.game_companion.profiles.tft.screen_regions import (
     LAYOUT_AUGMENT_SELECT,
     LAYOUT_COMBAT,
     LAYOUT_NORMAL_SHOP,
+    LAYOUT_SPECIAL,
     layout_region_bboxes,
 )
 
@@ -60,9 +61,23 @@ class _FakeOcrAdapter:
             key = f"shop_slot_{index}"
             if key in regions:
                 results[key] = {
-                    "text": f"Lux {index + 1}",
+                    "text": f"Lux {min(index + 1, 5)}",
                     "confidence": 0.62,
                     "bbox": list(regions[key]),
+                }
+            name_key = f"{key}_name"
+            if name_key in regions:
+                results[name_key] = {
+                    "text": "Lux",
+                    "confidence": 0.66,
+                    "bbox": list(regions[name_key]),
+                }
+            cost_key = f"{key}_cost"
+            if cost_key in regions:
+                results[cost_key] = {
+                    "text": str(min(index + 1, 5)),
+                    "confidence": 0.68,
+                    "bbox": list(regions[cost_key]),
                 }
         return {"available": True, "status": "ready", "error": None, "regions": results, "parsed": {}}
 
@@ -111,6 +126,40 @@ class _RecordingShopOcrAdapter(_FakeOcrAdapter):
         return super().recognize(image_path, regions)
 
 
+class _ShopCostParseFailedOcrAdapter(_FakeOcrAdapter):
+    def recognize(self, _image_path: str | Path, regions: dict[str, Any]) -> dict[str, Any]:
+        result = super().recognize(_image_path, regions)
+        for key in list(result["regions"]):
+            if key.endswith("_cost"):
+                result["regions"][key]["text"] = "coin"
+            elif key.startswith("shop_slot_") and key.rsplit("_", 1)[-1].isdigit():
+                result["regions"][key]["text"] = "Lux"
+        return result
+
+
+class _PathSensitiveShopCostOcrAdapter(_FakeOcrAdapter):
+    def recognize(self, image_path: str | Path, regions: dict[str, Any]) -> dict[str, Any]:
+        result = super().recognize(image_path, regions)
+        names = {1: "UnitOne", 2: "UnitTwo", 3: "UnitThree", 4: "UnitFour", 5: "UnitFive"}
+        for index in range(1, 6):
+            cost = min(index + 1, 5)
+            slot_key = f"shop_slot_{index}"
+            if slot_key in result["regions"]:
+                result["regions"][slot_key]["text"] = f"{names[index]} {cost}"
+            name_key = f"{slot_key}_name"
+            if name_key in result["regions"]:
+                result["regions"][name_key]["text"] = names[index]
+            cost_key = f"{slot_key}_cost"
+            if cost_key in result["regions"]:
+                result["regions"][cost_key]["text"] = str(cost)
+        if "missing_cost" not in Path(image_path).stem:
+            return result
+        for key in list(result["regions"]):
+            if key == "shop_slot_2" or key == "shop_slot_2_cost":
+                result["regions"][key]["text"] = "UnitTwo"
+        return result
+
+
 def _synthetic_tft_image(path: Path, layout: str = LAYOUT_NORMAL_SHOP) -> None:
     image = Image.new("RGB", (1920, 1080), color=(42, 72, 94))
     draw = ImageDraw.Draw(image)
@@ -155,6 +204,10 @@ def test_tft_recognition_outputs_structured_normal_shop_state(tmp_path: Path) ->
     assert result["shop"][1]["name_candidate"] == "Lux"
     assert result["shop"][1]["cost_candidate"] == 3
     assert result["shop"][1]["ocr_lines"] == ["Lux 3"]
+    assert result["shop"][1]["name_raw_text"] == "Lux"
+    assert result["shop"][1]["cost_raw_text"] == "3"
+    assert result["shop"][1]["name_candidate_source"] == "slot_name"
+    assert result["shop"][1]["cost_candidate_source"] == "slot_cost"
     assert result["shop"][1]["review_status"] == "needs_check"
     assert result["augments"] == []
     assert result["field_status"]["shop"]["status"] == "present"
@@ -185,8 +238,9 @@ def test_tft_shop_slot_subregions_keep_traits_outside_cost_area() -> None:
     subregions = _shop_slot_subregions((100, 200, 300, 500))
 
     assert subregions["slot_full"] == (100, 200, 300, 500)
-    assert subregions["slot_cost"] == (100, 416, 156, 500)
-    assert subregions["slot_traits"][0] >= subregions["slot_cost"][2]
+    assert subregions["slot_cost"] == (100, 428, 136, 491)
+    assert subregions["slot_name"] == (128, 428, 290, 491)
+    assert subregions["slot_traits"][3] <= subregions["slot_cost"][1]
 
 
 def test_tft_human_label_preserves_extra_review_metadata() -> None:
@@ -258,6 +312,21 @@ def test_tft_recognition_warns_when_expected_fields_are_missing(tmp_path: Path) 
     assert any(warning["code"] == "field_missing" and warning["field"] == "stage" for warning in result["warnings"])
 
 
+def test_tft_recognition_reports_detailed_shop_cost_blocker(tmp_path: Path) -> None:
+    screenshot = tmp_path / "normal_shop.png"
+    _synthetic_tft_image(screenshot)
+
+    result = recognize_tft_frame(
+        screenshot,
+        expected_layout=LAYOUT_NORMAL_SHOP,
+        ocr_adapter=_ShopCostParseFailedOcrAdapter(),
+    )
+
+    issue_codes = {issue["code"] for issue in result["readiness"]["blocking_issues"]}
+    assert "shop_cost_parse_failed" in issue_codes
+    assert "ocr_failed" not in issue_codes
+
+
 def test_tft_recognition_reads_augment_text_without_shop_noise(tmp_path: Path) -> None:
     screenshot = tmp_path / "augment.png"
     _synthetic_tft_image(screenshot, layout=LAYOUT_AUGMENT_SELECT)
@@ -290,6 +359,8 @@ def test_tft_recognition_only_sends_occupied_shop_slots_to_ocr(tmp_path: Path) -
 
     assert "shop_slot_1" not in adapter.region_keys
     assert "shop_slot_2" in adapter.region_keys
+    assert "shop_slot_2_name" in adapter.region_keys
+    assert "shop_slot_2_cost" in adapter.region_keys
 
 
 def test_tft_recognition_splits_augment_options(tmp_path: Path) -> None:
@@ -394,12 +465,38 @@ def test_tft_recognition_report_batches_calibration_screenshots(tmp_path: Path) 
     assert report["summary"]["readiness"][LAYOUT_NORMAL_SHOP]["status"] == "ready"
     assert report["summary"]["readiness"][LAYOUT_COMBAT]["status"] == "ready"
     assert report["summary"]["readiness"][LAYOUT_COMBAT]["fields"]["shop"]["status"] == "not_applicable"
+    assert report["summary"]["readiness"]["augment"]["status"] == "ready"
+    assert report["summary"]["readiness"]["augment"]["not_applicable"] == [
+        "shop_slots",
+        "shop_names",
+        "shop_costs",
+        "gold",
+        "level",
+        "xp",
+    ]
+    assert report["results"][2]["recognition"]["readiness"]["layout"] == "augment"
+    assert report["results"][2]["recognition"]["readiness"]["required_checks"] == [
+        "augment_options",
+        "augment_titles",
+        "augment_descriptions",
+    ]
     assert report["results"][0]["recognition"]["shop"][1]["state"] == "occupied"
     assert Path(report["report_path"]).is_file()
     assert Path(report["summary_path"]).is_file()
+    assert Path(report["layout_manifest_path"]).is_file()
     assert Path(report["shop_review_path"]).is_file()
     assert Path(report["shop_labels_path"]).is_file()
     assert Path(report["augment_review_path"]).is_file()
+    layout_manifest = json.loads(Path(report["layout_manifest_path"]).read_text(encoding="utf-8"))
+    assert layout_manifest["type"] == "tft_layout_manifest"
+    assert [sample["layout"] for sample in layout_manifest["samples"]] == ["normal_shop", "combat", "augment"]
+    assert layout_manifest["samples"][1]["not_applicable"] == [
+        "shop_slots",
+        "shop_names",
+        "shop_costs",
+        "augment_options",
+    ]
+    assert layout_manifest["summary"]["combat"]["ready"] == 1
     shop_review = json.loads(Path(report["shop_review_path"]).read_text(encoding="utf-8"))
     first_slot = shop_review["samples"][0]["shop"][0]
     occupied_slot = shop_review["samples"][0]["shop"][1]
@@ -426,3 +523,133 @@ def test_tft_recognition_report_batches_calibration_screenshots(tmp_path: Path) 
         "status": "verified",
         "notes": "kept",
     }
+
+
+def test_tft_recognition_report_marks_popup_contaminated_and_portal_layout_only(tmp_path: Path) -> None:
+    popup = tmp_path / "popup_tooltip.png"
+    portal = tmp_path / "portal_vote.png"
+    _synthetic_tft_image(popup, layout=LAYOUT_SPECIAL)
+    _synthetic_tft_image(portal, layout=LAYOUT_SPECIAL)
+    calibration_report = {
+        "type": "tft_layout_calibration_report",
+        "screenshots": [
+            {"index": 1, "image_path": str(popup), "expected_layout": "popup", "label": "hover tooltip"},
+            {"index": 2, "image_path": str(portal), "expected_layout": "portal", "label": "portal region vote"},
+        ],
+    }
+
+    report = build_tft_recognition_report(
+        calibration_report,
+        output_dir=tmp_path / "recognition",
+        ocr_adapter=_FakeOcrAdapter(),
+    )
+
+    assert report["summary"]["readiness"]["popup"]["status"] == "contaminated"
+    assert report["summary"]["readiness"]["popup"]["main_blocker"] == "contaminated_by_hover"
+    assert report["summary"]["readiness"]["portal"]["status"] == "ready"
+    assert report["summary"]["readiness"]["portal"]["required_checks"] == []
+    assert report["results"][0]["recognition"]["layout"] == LAYOUT_SPECIAL
+    assert report["results"][0]["recognition"]["readiness"]["excluded_from_readiness"] is True
+    assert report["results"][0]["recognition"]["readiness"]["blocking_issues"][0]["code"] == "contaminated_by_hover"
+    assert report["results"][1]["recognition"]["readiness"]["layout"] == "portal"
+
+    layout_manifest = json.loads(Path(report["layout_manifest_path"]).read_text(encoding="utf-8"))
+    assert [sample["layout"] for sample in layout_manifest["samples"]] == ["popup", "portal"]
+    assert layout_manifest["summary"]["popup"]["contaminated"] == 1
+    assert layout_manifest["summary"]["portal"]["ready"] == 1
+
+
+def test_tft_recognition_report_distinguishes_unknown_and_failed_samples(tmp_path: Path) -> None:
+    unknown = tmp_path / "mystery.png"
+    missing = tmp_path / "missing.png"
+    _synthetic_tft_image(unknown, layout=LAYOUT_SPECIAL)
+    calibration_report = {
+        "type": "tft_layout_calibration_report",
+        "screenshots": [
+            {"index": 1, "image_path": str(unknown), "expected_layout": "unknown", "label": "unclassified"},
+            {"index": 2, "image_path": str(missing), "expected_layout": LAYOUT_NORMAL_SHOP, "label": "missing image"},
+        ],
+    }
+
+    report = build_tft_recognition_report(
+        calibration_report,
+        output_dir=tmp_path / "recognition",
+        ocr_adapter=_FakeOcrAdapter(),
+    )
+
+    unknown_readiness = report["results"][0]["recognition"]["readiness"]
+    failed_readiness = report["results"][1]["recognition"]["readiness"]
+    assert unknown_readiness["layout"] == "unknown"
+    assert unknown_readiness["readiness"] == "blocked"
+    assert unknown_readiness["blocking_issues"][0]["code"] == "layout_unknown"
+    assert failed_readiness["layout"] == "normal_shop"
+    assert failed_readiness["readiness"] == "failed"
+    assert failed_readiness["blocking_issues"][0]["code"] == "image_read_failed"
+
+    layout_manifest = json.loads(Path(report["layout_manifest_path"]).read_text(encoding="utf-8"))
+    assert layout_manifest["summary"]["unknown"]["main_blocker"] == "layout_unknown"
+    assert layout_manifest["summary"]["normal_shop"]["failed"] == 1
+
+
+def test_tft_recognition_report_fills_missing_shop_cost_from_batch_consensus(tmp_path: Path) -> None:
+    known = tmp_path / "known_cost.png"
+    missing = tmp_path / "missing_cost.png"
+    _synthetic_tft_image(known)
+    _synthetic_tft_image(missing)
+    calibration_report = {
+        "type": "tft_layout_calibration_report",
+        "screenshots": [
+            {"index": 1, "image_path": str(known), "expected_layout": LAYOUT_NORMAL_SHOP, "label": "known"},
+            {"index": 2, "image_path": str(missing), "expected_layout": LAYOUT_NORMAL_SHOP, "label": "missing"},
+        ],
+    }
+
+    report = build_tft_recognition_report(
+        calibration_report,
+        output_dir=tmp_path / "recognition",
+        ocr_adapter=_PathSensitiveShopCostOcrAdapter(),
+    )
+
+    inferred_slot = report["results"][1]["recognition"]["shop"][1]
+    assert inferred_slot["cost_candidate"] == 3
+    assert inferred_slot["cost_candidate_source"] == "report_name_cost_consensus"
+    assert inferred_slot["cost_inference"]["matched_name"] == "UnitTwo"
+    assert report["summary"]["readiness"][LAYOUT_NORMAL_SHOP]["status"] == "ready"
+
+
+def test_tft_recognition_report_uses_verified_shop_label_for_missing_cost(tmp_path: Path) -> None:
+    screenshot = tmp_path / "missing_cost.png"
+    _synthetic_tft_image(screenshot)
+    output_dir = tmp_path / "recognition"
+    output_dir.mkdir()
+    (output_dir / "recognition_shop_labels_v1.json").write_text(
+        """{
+  "type": "tft_shop_labels",
+  "schema_version": 1,
+  "report_version": "recognition_shop_labels_v1",
+  "samples": [
+    {
+      "index": 1,
+      "slot": 2,
+      "human": {"name": "UnitTwo", "cost": 4, "status": "verified"}
+    }
+  ]
+}""",
+        encoding="utf-8",
+    )
+    calibration_report = {
+        "type": "tft_layout_calibration_report",
+        "screenshots": [
+            {"index": 1, "image_path": str(screenshot), "expected_layout": LAYOUT_NORMAL_SHOP, "label": "missing"},
+        ],
+    }
+
+    report = build_tft_recognition_report(
+        calibration_report,
+        output_dir=output_dir,
+        ocr_adapter=_PathSensitiveShopCostOcrAdapter(),
+    )
+
+    inferred_slot = report["results"][0]["recognition"]["shop"][1]
+    assert inferred_slot["cost_candidate"] == 4
+    assert inferred_slot["cost_candidate_source"] == "human_verified_label"

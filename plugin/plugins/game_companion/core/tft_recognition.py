@@ -15,10 +15,73 @@ from ..profiles.tft.screen_regions import (
     LAYOUT_AUGMENT_SELECT,
     LAYOUT_COMBAT,
     LAYOUT_NORMAL_SHOP,
+    LAYOUT_SPECIAL,
     SHOP_SLOT_KEYS,
     UnsupportedAspectRatioError,
     layout_region_bboxes,
 )
+
+READINESS_LAYOUT_AUGMENT = "augment"
+READINESS_LAYOUT_CAROUSEL = "carousel"
+READINESS_LAYOUT_PORTAL = "portal"
+READINESS_LAYOUT_POPUP = "popup"
+READINESS_LAYOUT_LOADING = "loading"
+READINESS_LAYOUT_UNKNOWN = "unknown"
+
+READINESS_LAYOUT_ORDER = (
+    LAYOUT_NORMAL_SHOP,
+    READINESS_LAYOUT_AUGMENT,
+    LAYOUT_COMBAT,
+    READINESS_LAYOUT_CAROUSEL,
+    READINESS_LAYOUT_PORTAL,
+    READINESS_LAYOUT_POPUP,
+    READINESS_LAYOUT_LOADING,
+    READINESS_LAYOUT_UNKNOWN,
+)
+
+READINESS_LAYOUT_RULES: dict[str, dict[str, Any]] = {
+    LAYOUT_NORMAL_SHOP: {
+        "required_checks": ["stage", "gold", "level", "xp", "shop_slots", "shop_names", "shop_costs"],
+        "not_applicable": ["augment_options"],
+        "description": "Clean planning-phase shop frame with no hover tooltip or popup.",
+    },
+    READINESS_LAYOUT_AUGMENT: {
+        "required_checks": ["augment_options", "augment_titles", "augment_descriptions"],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "gold", "level", "xp"],
+        "description": "Augment selection frame; shop recognition is intentionally N/A.",
+    },
+    LAYOUT_COMBAT: {
+        "required_checks": [],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "augment_options"],
+        "description": "Combat frame; current readiness only verifies that layout routing does not require shop OCR.",
+    },
+    READINESS_LAYOUT_CAROUSEL: {
+        "required_checks": [],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "augment_options"],
+        "description": "Carousel/special selection frame; first pass is layout-only.",
+    },
+    READINESS_LAYOUT_PORTAL: {
+        "required_checks": [],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "augment_options"],
+        "description": "Portal/encounter selection frame; first pass is layout-only.",
+    },
+    READINESS_LAYOUT_POPUP: {
+        "required_checks": [],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "augment_options"],
+        "description": "Hover tooltip or modal-contaminated frame; excluded from readiness.",
+        "excluded_from_readiness": True,
+    },
+    READINESS_LAYOUT_LOADING: {
+        "required_checks": [],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "augment_options"],
+        "description": "Loading/transition frame; first pass is layout-only.",
+    },
+    READINESS_LAYOUT_UNKNOWN: {
+        "required_checks": [],
+        "not_applicable": ["shop_slots", "shop_names", "shop_costs", "augment_options"],
+        "description": "Unknown frame; blocked until the sample is assigned to a supported layout.",
+    },
+}
 
 
 class TftOcrAdapter(Protocol):
@@ -96,7 +159,7 @@ def recognize_tft_frame(
         augments=augments,
     )
 
-    return {
+    result = {
         "type": "tft_recognition_result",
         "schema_version": 1,
         "success": True,
@@ -115,6 +178,8 @@ def recognize_tft_frame(
         "confidence": _overall_confidence(stage, gold, level, xp, shop, augments, warnings),
         "warnings": warnings,
     }
+    result["readiness"] = _recognition_readiness(result)
+    return result
 
 
 def build_tft_recognition_report(
@@ -126,6 +191,15 @@ def build_tft_recognition_report(
     calibration_report = _load_calibration_report(calibration_report_or_path)
     output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
+    report_path = output_path / "recognition_report_v1.json"
+    summary_path = output_path / "recognition_summary_v1.json"
+    layout_manifest_path = output_path / "layout_manifest_v1.json"
+    shop_review_path = output_path / "recognition_shop_review_v1.json"
+    shop_labels_path = output_path / "recognition_shop_labels_v1.json"
+    augment_review_path = output_path / "recognition_augment_review_v1.json"
+    review_crops_dir = output_path / "review_crops"
+    existing_shop_labels = _load_human_labels(shop_labels_path)
+    existing_augment_labels = _load_human_labels(augment_review_path)
     results = []
     for screenshot in calibration_report.get("screenshots", []):
         if not isinstance(screenshot, Mapping):
@@ -138,6 +212,7 @@ def build_tft_recognition_report(
             expected_layout=str(screenshot.get("expected_layout") or ""),
             ocr_adapter=ocr_adapter,
         )
+        recognition["readiness"] = _recognition_readiness(recognition, sample=screenshot)
         results.append(
             {
                 "index": screenshot.get("index"),
@@ -147,18 +222,15 @@ def build_tft_recognition_report(
                 "recognition": recognition,
             }
         )
-
-    report_path = output_path / "recognition_report_v1.json"
-    summary_path = output_path / "recognition_summary_v1.json"
-    shop_review_path = output_path / "recognition_shop_review_v1.json"
-    shop_labels_path = output_path / "recognition_shop_labels_v1.json"
-    augment_review_path = output_path / "recognition_augment_review_v1.json"
-    review_crops_dir = output_path / "review_crops"
-    existing_shop_labels = _load_human_labels(shop_labels_path)
-    existing_augment_labels = _load_human_labels(augment_review_path)
+    _infer_report_shop_costs(results, existing_shop_labels)
+    for item in results:
+        recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
+        if isinstance(recognition, dict):
+            recognition["readiness"] = _recognition_readiness(recognition, sample=item)
     shop_review = _shop_review_report(results, shop_review_path, review_crops_dir, existing_shop_labels)
     shop_labels = _shop_labels_report(shop_review, shop_labels_path)
     augment_review = _augment_review_report(results, augment_review_path, review_crops_dir, existing_augment_labels)
+    layout_manifest = _layout_manifest_report(results, layout_manifest_path)
     successes = sum(1 for item in results if item["recognition"].get("success"))
     summary = {
         "total": len(results),
@@ -182,11 +254,13 @@ def build_tft_recognition_report(
         "shop_review_path": str(shop_review_path.resolve()),
         "shop_labels_path": str(shop_labels_path.resolve()),
         "augment_review_path": str(augment_review_path.resolve()),
+        "layout_manifest_path": str(layout_manifest_path.resolve()),
         "summary": summary,
         "results": results,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    layout_manifest_path.write_text(json.dumps(layout_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     shop_review_path.write_text(json.dumps(shop_review, ensure_ascii=False, indent=2), encoding="utf-8")
     shop_labels_path.write_text(json.dumps(shop_labels, ensure_ascii=False, indent=2), encoding="utf-8")
     augment_review_path.write_text(json.dumps(augment_review, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -197,6 +271,17 @@ def _normalize_layout(layout: str | None) -> str:
     value = str(layout or "").strip().lower()
     if value in {LAYOUT_NORMAL_SHOP, LAYOUT_COMBAT, LAYOUT_AUGMENT_SELECT}:
         return value
+    if value == READINESS_LAYOUT_AUGMENT:
+        return LAYOUT_AUGMENT_SELECT
+    if value in {
+        LAYOUT_SPECIAL,
+        READINESS_LAYOUT_CAROUSEL,
+        READINESS_LAYOUT_PORTAL,
+        READINESS_LAYOUT_POPUP,
+        READINESS_LAYOUT_LOADING,
+        READINESS_LAYOUT_UNKNOWN,
+    }:
+        return LAYOUT_SPECIAL
     return LAYOUT_NORMAL_SHOP
 
 
@@ -220,6 +305,9 @@ def _ocr_regions_for_layout(
             slot_key = f"shop_slot_{slot_number}"
             if slot.get("state") == "occupied" and slot_key in regions:
                 ocr_regions[slot_key] = regions[slot_key]
+                subregions = _shop_slot_subregions(regions[slot_key])
+                ocr_regions[f"{slot_key}_name"] = subregions["slot_name"]
+                ocr_regions[f"{slot_key}_cost"] = subregions["slot_cost"]
     if layout == LAYOUT_AUGMENT_SELECT and isinstance(regions.get("augments"), tuple):
         ocr_regions["augments"] = regions["augments"]
         for option_key in AUGMENT_OPTION_KEYS:
@@ -300,15 +388,29 @@ def _enrich_shop_slots_from_ocr(
             continue
         slot_key = f"shop_slot_{item.get('slot')}"
         raw_text = _region_text(ocr, slot_key).strip()
+        name_key = f"{slot_key}_name"
+        cost_key = f"{slot_key}_cost"
+        name_text = _region_text(ocr, name_key).strip()
+        cost_text = _region_text(ocr, cost_key).strip()
         confidence = _region_confidence(ocr, slot_key)
-        parsed = _parse_shop_card_text(raw_text)
+        name_confidence = _region_confidence(ocr, name_key)
+        cost_confidence = _region_confidence(ocr, cost_key)
+        parsed = _parse_shop_card_text(raw_text, name_text=name_text, cost_text=cost_text)
         item["raw_text"] = raw_text
         item["name"] = parsed["name"]
         item["cost"] = parsed["cost"]
         item["name_candidate"] = parsed["name"]
         item["cost_candidate"] = parsed["cost"]
         item["ocr_lines"] = _ocr_lines(raw_text)
+        item["name_raw_text"] = name_text
+        item["cost_raw_text"] = cost_text
+        item["name_ocr_lines"] = _ocr_lines(name_text)
+        item["cost_ocr_lines"] = _ocr_lines(cost_text)
         item["ocr_confidence"] = _confidence(confidence)
+        item["name_confidence"] = _confidence(name_confidence)
+        item["cost_confidence"] = _confidence(cost_confidence)
+        item["name_candidate_source"] = parsed["name_source"]
+        item["cost_candidate_source"] = parsed["cost_source"]
         if raw_text:
             item["review_status"] = "needs_check"
             item["confidence"] = _confidence((float(item.get("confidence", 0.0)) + _confidence(confidence)) / 2.0)
@@ -322,11 +424,26 @@ def _ocr_lines(text: Any) -> list[str]:
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
 
-def _parse_shop_card_text(text: Any) -> dict[str, Any]:
+def _parse_shop_card_text(
+    text: Any,
+    *,
+    name_text: Any = "",
+    cost_text: Any = "",
+) -> dict[str, Any]:
     raw = str(text or "").strip()
-    cost = _parse_shop_cost(raw)
-    name = _parse_shop_name(raw, cost)
-    return {"name": name, "cost": cost}
+    raw_name = str(name_text or "").strip()
+    raw_cost = str(cost_text or "").strip()
+    cost = _parse_shop_cost(raw_cost)
+    cost_source = "slot_cost" if cost is not None else None
+    if cost is None:
+        cost = _parse_shop_cost(raw)
+        cost_source = "slot_full" if cost is not None else None
+    name = _parse_shop_name(raw_name, cost)
+    name_source = "slot_name" if name else None
+    if name is None:
+        name = _parse_shop_name(raw, cost)
+        name_source = "slot_full" if name else None
+    return {"name": name, "cost": cost, "name_source": name_source, "cost_source": cost_source}
 
 
 def _parse_shop_cost(text: str) -> int | None:
@@ -595,6 +712,325 @@ def _ocr_summary(ocr: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _readiness_taxonomy() -> dict[str, dict[str, Any]]:
+    return {
+        layout: {
+            "required_checks": list(rule.get("required_checks") or []),
+            "not_applicable": list(rule.get("not_applicable") or []),
+            "description": rule.get("description") or "",
+            "excluded_from_readiness": bool(rule.get("excluded_from_readiness")),
+        }
+        for layout, rule in READINESS_LAYOUT_RULES.items()
+    }
+
+
+def _recognition_readiness(
+    recognition: Mapping[str, Any],
+    *,
+    sample: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    layout = _readiness_layout(sample=sample, recognition=recognition)
+    rule = READINESS_LAYOUT_RULES.get(layout, READINESS_LAYOUT_RULES[READINESS_LAYOUT_UNKNOWN])
+    blockers: list[dict[str, Any]] = []
+    if layout == READINESS_LAYOUT_POPUP:
+        blockers.append(
+            _blocking_issue(
+                "contaminated_by_hover",
+                "layout",
+                "Sample is contaminated by a popup, tooltip, hover card, or modal overlay.",
+            )
+        )
+    elif layout == READINESS_LAYOUT_UNKNOWN:
+        blockers.append(
+            _blocking_issue(
+                "layout_unknown",
+                "layout",
+                "Sample could not be assigned to a supported TFT readiness layout.",
+            )
+        )
+    elif not recognition.get("success"):
+        error = recognition.get("error") if isinstance(recognition.get("error"), Mapping) else {}
+        blockers.append(
+            _blocking_issue(
+                _error_blocker_code(str(error.get("code") or "recognition_failed")),
+                "recognition",
+                str(error.get("message") or "Recognition failed for this frame."),
+            )
+        )
+    else:
+        blockers.extend(_required_check_blockers(layout, recognition))
+
+    excluded = bool(rule.get("excluded_from_readiness"))
+    if not recognition.get("success") and layout != READINESS_LAYOUT_UNKNOWN:
+        status = "failed"
+    elif excluded:
+        status = "contaminated"
+    elif blockers:
+        status = "blocked"
+    else:
+        status = "ready"
+    return {
+        "layout": layout,
+        "readiness": status,
+        "status": status,
+        "required_checks": list(rule.get("required_checks") or []),
+        "not_applicable": list(rule.get("not_applicable") or []),
+        "blocking_issues": blockers,
+        "excluded_from_readiness": excluded,
+    }
+
+
+def _readiness_layout(
+    *,
+    sample: Mapping[str, Any] | None,
+    recognition: Mapping[str, Any],
+) -> str:
+    context = _sample_context_text(sample, recognition)
+    if _contains_any(context, ("hover", "tooltip", "popup", "dialog", "modal", "overlay")):
+        return READINESS_LAYOUT_POPUP
+    if _contains_any(context, ("loading", "loadscreen", "loading_screen", "black_screen")):
+        return READINESS_LAYOUT_LOADING
+
+    expected_layout = str((sample or {}).get("expected_layout") or "").strip().lower()
+    direct = _direct_readiness_layout(expected_layout)
+    if direct:
+        return direct
+    if expected_layout == LAYOUT_SPECIAL:
+        return _special_readiness_layout(context)
+
+    inferred = _special_readiness_layout(context)
+    if inferred != READINESS_LAYOUT_UNKNOWN:
+        return inferred
+
+    recognition_layout = str(recognition.get("layout") or "").strip().lower()
+    direct = _direct_readiness_layout(recognition_layout)
+    if direct:
+        return direct
+    if recognition_layout == LAYOUT_SPECIAL:
+        return READINESS_LAYOUT_UNKNOWN
+    return READINESS_LAYOUT_UNKNOWN
+
+
+def _sample_context_text(sample: Mapping[str, Any] | None, recognition: Mapping[str, Any]) -> str:
+    values = [
+        (sample or {}).get("expected_layout"),
+        (sample or {}).get("label"),
+        (sample or {}).get("id"),
+        (sample or {}).get("image_path"),
+        recognition.get("layout"),
+        recognition.get("image_path"),
+    ]
+    return " ".join(str(value or "").lower().replace("-", "_") for value in values)
+
+
+def _direct_readiness_layout(layout: str) -> str | None:
+    if layout == LAYOUT_NORMAL_SHOP:
+        return LAYOUT_NORMAL_SHOP
+    if layout == LAYOUT_COMBAT:
+        return LAYOUT_COMBAT
+    if layout in {LAYOUT_AUGMENT_SELECT, READINESS_LAYOUT_AUGMENT}:
+        return READINESS_LAYOUT_AUGMENT
+    if layout in {
+        READINESS_LAYOUT_CAROUSEL,
+        READINESS_LAYOUT_PORTAL,
+        READINESS_LAYOUT_POPUP,
+        READINESS_LAYOUT_LOADING,
+        READINESS_LAYOUT_UNKNOWN,
+    }:
+        return layout
+    return None
+
+
+def _special_readiness_layout(context: str) -> str:
+    if _contains_any(context, ("carousel", "draft", "shared_draft", "选秀")):
+        return READINESS_LAYOUT_CAROUSEL
+    if _contains_any(context, ("portal", "region", "encounter", "传送门", "地区")):
+        return READINESS_LAYOUT_PORTAL
+    return READINESS_LAYOUT_UNKNOWN
+
+
+def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def _required_check_blockers(layout: str, recognition: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if layout == LAYOUT_NORMAL_SHOP:
+        return _normal_shop_blockers(recognition)
+    if layout == READINESS_LAYOUT_AUGMENT:
+        return _augment_blockers(recognition)
+    return []
+
+
+def _normal_shop_blockers(recognition: Mapping[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for field in ("stage", "gold", "level", "xp"):
+        if not recognition.get(field):
+            blockers.append(_blocking_issue("ocr_failed", field, f"Required {field} OCR value is missing."))
+
+    shop = [slot for slot in recognition.get("shop", []) if isinstance(slot, Mapping)]
+    if not shop:
+        blockers.append(_blocking_issue("roi_misaligned", "shop_slots", "No shop slots were produced for a normal shop sample."))
+        return blockers
+
+    unknown_slots = [slot for slot in shop if slot.get("state") not in {"empty", "occupied"}]
+    if unknown_slots:
+        blockers.append(
+            _blocking_issue(
+                "roi_misaligned",
+                "shop_slots",
+                "Some shop slots have unknown occupancy.",
+                count=len(unknown_slots),
+            )
+        )
+
+    occupied = [slot for slot in shop if slot.get("state") == "occupied"]
+    blockers.extend(_shop_text_blockers(occupied))
+    return blockers
+
+
+def _shop_text_blockers(occupied: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    blocker_groups: dict[tuple[str, str, str], int] = {}
+    for slot in occupied:
+        for code, check, message in _shop_slot_text_blockers(slot):
+            key = (code, check, message)
+            blocker_groups[key] = blocker_groups.get(key, 0) + 1
+    return [
+        _blocking_issue(code, check, message, count=count)
+        for (code, check, message), count in sorted(blocker_groups.items())
+    ]
+
+
+def _shop_slot_text_blockers(slot: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    has_any_text = bool(slot.get("raw_text") or slot.get("name_raw_text") or slot.get("cost_raw_text"))
+    if not has_any_text:
+        return [
+            (
+                "shop_slot_occupied_but_no_text",
+                "shop_slots",
+                "Occupied shop slots produced no OCR text.",
+            )
+        ]
+    blockers = []
+    if not (slot.get("name_candidate") or slot.get("name")):
+        code = "shop_name_ocr_failed" if slot.get("name_raw_text") else "shop_name_crop_empty"
+        blockers.append((code, "shop_names", "Occupied shop slots are missing name candidates."))
+    if slot.get("cost_candidate", slot.get("cost")) is None:
+        code = "shop_cost_parse_failed" if slot.get("cost_raw_text") else "shop_cost_ocr_failed"
+        blockers.append((code, "shop_costs", "Occupied shop slots are missing cost candidates."))
+    return blockers
+
+
+def _augment_blockers(recognition: Mapping[str, Any]) -> list[dict[str, Any]]:
+    options = [option for option in recognition.get("augments", []) if isinstance(option, Mapping)]
+    if not options:
+        return [_blocking_issue("ocr_failed", "augment_options", "No augment options were produced for an augment sample.")]
+    blockers: list[dict[str, Any]] = []
+    missing_titles = [option for option in options if not (option.get("title_candidate") or option.get("title"))]
+    missing_descriptions = [
+        option for option in options if not (option.get("description_candidate") or option.get("description"))
+    ]
+    if missing_titles:
+        blockers.append(
+            _blocking_issue(
+                "ocr_failed",
+                "augment_titles",
+                "Augment options are missing title candidates.",
+                count=len(missing_titles),
+            )
+        )
+    if missing_descriptions:
+        blockers.append(
+            _blocking_issue(
+                "ocr_failed",
+                "augment_descriptions",
+                "Augment options are missing description candidates.",
+                count=len(missing_descriptions),
+            )
+        )
+    return blockers
+
+
+def _blocking_issue(code: str, check: str, message: str, *, count: int | None = None) -> dict[str, Any]:
+    issue = {"code": code, "check": check, "message": message}
+    if count is not None:
+        issue["count"] = count
+    return issue
+
+
+def _error_blocker_code(code: str) -> str:
+    if code in {"unsupported_aspect_ratio", "low_resolution"}:
+        return "low_resolution"
+    if code.startswith("ocr_"):
+        return "ocr_failed"
+    return code or "recognition_failed"
+
+
+def _layout_manifest_report(results: list[Mapping[str, Any]], manifest_path: Path) -> dict[str, Any]:
+    samples = []
+    for item in results:
+        recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
+        readiness = recognition.get("readiness") if isinstance(recognition.get("readiness"), Mapping) else {}
+        samples.append(
+            {
+                "index": item.get("index"),
+                "label": item.get("label") or "",
+                "image_path": item.get("image_path"),
+                "expected_layout": item.get("expected_layout"),
+                "recognition_layout": recognition.get("layout"),
+                "layout": readiness.get("layout") or READINESS_LAYOUT_UNKNOWN,
+                "required_checks": list(readiness.get("required_checks") or []),
+                "not_applicable": list(readiness.get("not_applicable") or []),
+                "blocking_issues": list(readiness.get("blocking_issues") or []),
+                "readiness": readiness.get("readiness") or "blocked",
+                "excluded_from_readiness": bool(readiness.get("excluded_from_readiness")),
+            }
+        )
+    return {
+        "type": "tft_layout_manifest",
+        "schema_version": 1,
+        "report_version": "layout_manifest_v1",
+        "report_path": str(manifest_path.resolve()),
+        "taxonomy": _readiness_taxonomy(),
+        "summary": _layout_manifest_summary(samples),
+        "samples": samples,
+    }
+
+
+def _layout_manifest_summary(samples: list[Mapping[str, Any]]) -> dict[str, Any]:
+    summary = {}
+    for layout in READINESS_LAYOUT_ORDER:
+        layout_samples = [sample for sample in samples if sample.get("layout") == layout]
+        if not layout_samples:
+            continue
+        summary[layout] = _layout_sample_summary(layout, layout_samples)
+    return summary
+
+
+def _layout_sample_summary(layout: str, samples: list[Mapping[str, Any]]) -> dict[str, Any]:
+    blocker_counts: dict[str, int] = {}
+    for sample in samples:
+        for issue in sample.get("blocking_issues", []):
+            if isinstance(issue, Mapping):
+                code = str(issue.get("code") or "unknown")
+                blocker_counts[code] = blocker_counts.get(code, 0) + 1
+    ready = sum(1 for sample in samples if sample.get("readiness") == "ready")
+    blocked = sum(1 for sample in samples if sample.get("readiness") == "blocked")
+    failed = sum(1 for sample in samples if sample.get("readiness") == "failed")
+    contaminated = sum(1 for sample in samples if sample.get("readiness") == "contaminated")
+    rule = READINESS_LAYOUT_RULES.get(layout, READINESS_LAYOUT_RULES[READINESS_LAYOUT_UNKNOWN])
+    return {
+        "samples": len(samples),
+        "ready": ready,
+        "blocked": blocked,
+        "failed": failed,
+        "contaminated": contaminated,
+        "main_blocker": _main_blocker(blocker_counts),
+        "blockers": blocker_counts,
+        "required_checks": list(rule.get("required_checks") or []),
+        "not_applicable": list(rule.get("not_applicable") or []),
+    }
+
+
 def _layout_counts(results: list[Mapping[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in results:
@@ -603,31 +1039,145 @@ def _layout_counts(results: list[Mapping[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def _infer_report_shop_costs(
+    results: list[Mapping[str, Any]],
+    existing_labels: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
+) -> None:
+    existing_labels = existing_labels or {}
+    for item in results:
+        recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
+        sample_index = item.get("index")
+        for slot in recognition.get("shop", []):
+            if not isinstance(slot, dict) or slot.get("state") != "occupied":
+                continue
+            slot_number = int(slot.get("slot") or 0)
+            label = existing_labels.get((str(sample_index), slot_number), {})
+            human = _human_label(_label_payload(label))
+            if human.get("status") != "verified":
+                continue
+            if human.get("name") and not slot.get("name_candidate"):
+                slot["name_candidate"] = human.get("name")
+                slot["name"] = human.get("name")
+                slot["name_candidate_source"] = "human_verified_label"
+            if slot.get("cost_candidate", slot.get("cost")) is None and human.get("cost") is not None:
+                slot["cost_candidate"] = human.get("cost")
+                slot["cost"] = human.get("cost")
+                slot["cost_candidate_source"] = "human_verified_label"
+                slot["cost_inference"] = {
+                    "method": "human_verified_label",
+                    "confidence": 1.0,
+                }
+
+    costs_by_name: dict[str, set[int]] = {}
+    for slot in _report_occupied_shop_slots(results):
+        name = _shop_cost_consensus_key(slot)
+        cost = slot.get("cost_candidate", slot.get("cost"))
+        if name and isinstance(cost, int) and 1 <= cost <= 5:
+            costs_by_name.setdefault(name, set()).add(cost)
+
+    consensus = {name: next(iter(costs)) for name, costs in costs_by_name.items() if len(costs) == 1}
+    for slot in _report_occupied_shop_slots(results):
+        if slot.get("cost_candidate", slot.get("cost")) is not None:
+            continue
+        name = _shop_cost_consensus_key(slot)
+        if not name or name not in consensus:
+            continue
+        slot["cost_candidate"] = consensus[name]
+        slot["cost"] = consensus[name]
+        slot["cost_candidate_source"] = "report_name_cost_consensus"
+        slot["cost_inference"] = {
+            "method": "report_name_cost_consensus",
+            "matched_name": name,
+            "confidence": 0.55,
+        }
+
+
+def _report_occupied_shop_slots(results: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    slots = []
+    for item in results:
+        recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
+        for slot in recognition.get("shop", []):
+            if isinstance(slot, dict) and slot.get("state") == "occupied":
+                slots.append(slot)
+    return slots
+
+
+def _shop_cost_consensus_key(slot: Mapping[str, Any]) -> str:
+    raw_name = _shop_unit_name_from_raw_text(slot.get("raw_text"))
+    return raw_name or str(slot.get("name_candidate") or slot.get("name") or "").strip()
+
+
+def _shop_unit_name_from_raw_text(text: Any) -> str:
+    lines = _ocr_lines(text)
+    if not lines:
+        return ""
+    candidate = re.sub(r"^\s*[1-5]\s*", "", lines[-1])
+    candidate = re.sub(r"\s*[1-5]\s*$", "", candidate).strip(" -:锛殀")
+    return candidate
+
+
 def _readiness_summary(results: list[Mapping[str, Any]]) -> dict[str, Any]:
     by_layout: dict[str, list[Mapping[str, Any]]] = {}
     for item in results:
         recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
-        layout = str(recognition.get("layout") or "unknown")
+        readiness = recognition.get("readiness") if isinstance(recognition.get("readiness"), Mapping) else {}
+        layout = str(readiness.get("layout") or READINESS_LAYOUT_UNKNOWN)
         by_layout.setdefault(layout, []).append(recognition)
-    return {layout: _layout_readiness(items) for layout, items in by_layout.items()}
+    return {layout: _layout_readiness(layout, items) for layout, items in by_layout.items()}
 
 
-def _layout_readiness(items: list[Mapping[str, Any]]) -> dict[str, Any]:
+def _layout_readiness(layout: str, items: list[Mapping[str, Any]]) -> dict[str, Any]:
     fields = ["stage", "gold", "level", "xp", "shop", "augments", "traits", "items"]
     field_summaries = {
         field: _field_readiness([item.get("field_status", {}).get(field, {}) for item in items])
         for field in fields
     }
-    applicable_fields = [summary for summary in field_summaries.values() if summary["status"] != "not_applicable"]
-    if not applicable_fields:
-        status = "not_applicable"
-    elif all(summary["missing"] == 0 and summary["partial"] == 0 for summary in applicable_fields):
+    readiness_items = [item.get("readiness") for item in items if isinstance(item.get("readiness"), Mapping)]
+    ready = sum(1 for item in readiness_items if item.get("readiness") == "ready")
+    blocked = sum(1 for item in readiness_items if item.get("readiness") == "blocked")
+    failed = sum(1 for item in readiness_items if item.get("readiness") == "failed")
+    contaminated = sum(1 for item in readiness_items if item.get("readiness") == "contaminated")
+    excluded = sum(1 for item in readiness_items if item.get("excluded_from_readiness"))
+    blocker_counts: dict[str, int] = {}
+    for item in readiness_items:
+        for issue in item.get("blocking_issues", []):
+            if isinstance(issue, Mapping):
+                code = str(issue.get("code") or "unknown")
+                blocker_counts[code] = blocker_counts.get(code, 0) + 1
+
+    considered = len(items) - excluded
+    if contaminated and considered == 0:
+        status = "contaminated"
+    elif blocked == 0 and failed == 0:
         status = "ready"
-    elif any(summary["present"] or summary["partial"] for summary in applicable_fields):
+    elif ready:
         status = "partial"
+    elif failed and not blocked:
+        status = "failed"
     else:
-        status = "missing"
-    return {"status": status, "total": len(items), "fields": field_summaries}
+        status = "blocked"
+    rule = READINESS_LAYOUT_RULES.get(layout, READINESS_LAYOUT_RULES[READINESS_LAYOUT_UNKNOWN])
+    return {
+        "status": status,
+        "total": len(items),
+        "samples": len(items),
+        "ready": ready,
+        "blocked": blocked,
+        "failed": failed,
+        "contaminated": contaminated,
+        "excluded_from_readiness": excluded,
+        "main_blocker": _main_blocker(blocker_counts),
+        "blockers": blocker_counts,
+        "required_checks": list(rule.get("required_checks") or []),
+        "not_applicable": list(rule.get("not_applicable") or []),
+        "fields": field_summaries,
+    }
+
+
+def _main_blocker(blocker_counts: Mapping[str, int]) -> str | None:
+    if not blocker_counts:
+        return None
+    return sorted(blocker_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
 def _field_readiness(statuses: list[Any]) -> dict[str, Any]:
@@ -780,9 +1330,12 @@ def _shop_review_slots(
         item["crop_paths"] = {}
         if image is not None and isinstance(item.get("bbox"), list):
             subregions = _shop_slot_subregions(tuple(int(value) for value in item["bbox"]))
+            item["crop_quality"] = _shop_crop_quality(tuple(int(value) for value in item["bbox"]), subregions)
             if item.get("state") != "occupied":
                 subregions = {"slot_full": subregions["slot_full"]}
             item["crop_paths"] = _save_review_crops(image, subregions, crops_dir, f"slot_{slot_number}")
+        else:
+            item["crop_quality"] = {"status": "roi_misaligned", "issues": ["missing_image_or_bbox"]}
         reviewed.append(item)
     if image is not None:
         image.close()
@@ -795,10 +1348,64 @@ def _shop_slot_subregions(bbox: tuple[int, int, int, int]) -> dict[str, tuple[in
     height = bottom - top
     return {
         "slot_full": bbox,
-        "slot_name": (left + int(width * 0.08), top + int(height * 0.55), right - int(width * 0.08), top + int(height * 0.77)),
-        "slot_cost": (left, top + int(height * 0.72), left + int(width * 0.28), bottom),
-        "slot_traits": (left + int(width * 0.28), top + int(height * 0.72), right - int(width * 0.08), bottom),
+        "slot_name": (
+            left + int(width * 0.14),
+            top + int(height * 0.76),
+            right - int(width * 0.05),
+            bottom - int(height * 0.03),
+        ),
+        "slot_cost": (
+            left,
+            top + int(height * 0.76),
+            left + int(width * 0.18),
+            bottom - int(height * 0.03),
+        ),
+        "slot_traits": (
+            left + int(width * 0.04),
+            top + int(height * 0.22),
+            left + int(width * 0.58),
+            top + int(height * 0.75),
+        ),
     }
+
+
+def _shop_crop_quality(
+    bbox: tuple[int, int, int, int],
+    subregions: Mapping[str, tuple[int, int, int, int]],
+) -> dict[str, Any]:
+    left, top, right, bottom = bbox
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    issues = []
+    for key, region in subregions.items():
+        if not _bbox_inside(region, bbox):
+            issues.append(f"{key}_outside_slot")
+    name = subregions["slot_name"]
+    cost = subregions["slot_cost"]
+    traits = subregions["slot_traits"]
+    if (name[2] - name[0]) < width * 0.45 or (name[3] - name[1]) < height * 0.12:
+        issues.append("name_crop_too_small")
+    if (cost[2] - cost[0]) < width * 0.16 or (cost[3] - cost[1]) < height * 0.12:
+        issues.append("cost_crop_too_small")
+    if _bboxes_overlap(cost, traits):
+        issues.append("traits_overlap_cost")
+    if any(issue.endswith("_outside_slot") or issue == "traits_overlap_cost" for issue in issues):
+        status = "roi_misaligned"
+    elif "name_crop_too_small" in issues:
+        status = "name_crop_too_small"
+    elif "cost_crop_too_small" in issues:
+        status = "cost_crop_too_small"
+    else:
+        status = "roi_ok"
+    return {"status": status, "issues": issues}
+
+
+def _bbox_inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> bool:
+    return outer[0] <= inner[0] < inner[2] <= outer[2] and outer[1] <= inner[1] < inner[3] <= outer[3]
+
+
+def _bboxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
 
 
 def _shop_labels_report(shop_review: Mapping[str, Any], labels_path: Path) -> dict[str, Any]:
@@ -968,7 +1575,7 @@ def _load_calibration_report(report_or_path: Mapping[str, Any] | str | Path) -> 
 
 
 def _error_result(path: Path, layout: str, code: str, message: str) -> dict[str, Any]:
-    return {
+    result = {
         "type": "tft_recognition_result",
         "schema_version": 1,
         "success": False,
@@ -996,3 +1603,5 @@ def _error_result(path: Path, layout: str, code: str, message: str) -> dict[str,
         "warnings": [{"code": code, "message": message}],
         "error": {"code": code, "message": message},
     }
+    result["readiness"] = _recognition_readiness(result)
+    return result
