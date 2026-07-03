@@ -83,6 +83,13 @@ READINESS_LAYOUT_RULES: dict[str, dict[str, Any]] = {
     },
 }
 
+NORMAL_SHOP_ROI_VERSION = "normal_shop_roi_v1"
+NORMAL_SHOP_SLOT_REGION_RATIOS: dict[str, tuple[float, float, float, float]] = {
+    "slot_name": (0.14, 0.76, 0.95, 0.97),
+    "slot_cost": (0.0, 0.76, 0.18, 0.97),
+    "slot_traits": (0.04, 0.22, 0.58, 0.75),
+}
+
 
 class TftOcrAdapter(Protocol):
     def recognize(self, image_path: str | Path, regions: dict[str, Any]) -> dict[str, Any]:
@@ -1424,27 +1431,39 @@ def _shop_slot_subregions(bbox: tuple[int, int, int, int]) -> dict[str, tuple[in
     left, top, right, bottom = bbox
     width = right - left
     height = bottom - top
+    ratios = NORMAL_SHOP_SLOT_REGION_RATIOS
     return {
         "slot_full": bbox,
-        "slot_name": (
-            left + int(width * 0.14),
-            top + int(height * 0.76),
-            right - int(width * 0.05),
-            bottom - int(height * 0.03),
-        ),
-        "slot_cost": (
-            left,
-            top + int(height * 0.76),
-            left + int(width * 0.18),
-            bottom - int(height * 0.03),
-        ),
-        "slot_traits": (
-            left + int(width * 0.04),
-            top + int(height * 0.22),
-            left + int(width * 0.58),
-            top + int(height * 0.75),
-        ),
+        "slot_name": _ratio_region(bbox, ratios["slot_name"]),
+        "slot_cost": _ratio_region(bbox, ratios["slot_cost"]),
+        "slot_traits": _ratio_region(bbox, ratios["slot_traits"]),
     }
+
+
+def normal_shop_roi_v1_config() -> dict[str, Any]:
+    return {
+        "version": NORMAL_SHOP_ROI_VERSION,
+        "slot_region_ratios": {key: list(value) for key, value in NORMAL_SHOP_SLOT_REGION_RATIOS.items()},
+        "tooltip_avoidance": {
+            "text_band_bottom_max": NORMAL_SHOP_SLOT_REGION_RATIOS["slot_name"][3],
+            "traits_band_bottom_max": NORMAL_SHOP_SLOT_REGION_RATIOS["slot_traits"][3],
+        },
+    }
+
+
+def _ratio_region(
+    bbox: tuple[int, int, int, int],
+    ratios: tuple[float, float, float, float],
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = bbox
+    width = right - left
+    height = bottom - top
+    return (
+        left + int(width * ratios[0]),
+        top + int(height * ratios[1]),
+        left + int(width * ratios[2]),
+        top + int(height * ratios[3]),
+    )
 
 
 def _shop_crop_quality(
@@ -1475,7 +1494,7 @@ def _shop_crop_quality(
         status = "cost_crop_too_small"
     else:
         status = "roi_ok"
-    return {"status": status, "issues": issues}
+    return {"status": status, "issues": issues, "roi_version": NORMAL_SHOP_ROI_VERSION}
 
 
 def _bbox_inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> bool:

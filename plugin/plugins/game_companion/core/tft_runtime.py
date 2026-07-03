@@ -430,11 +430,14 @@ def _refresh_runtime_shop_readiness(recognition: dict[str, Any]) -> None:
     if recognition.get("layout") != "normal_shop" or not recognition.get("success"):
         return
     readiness = recognition.get("readiness") if isinstance(recognition.get("readiness"), dict) else {}
+    if readiness.get("excluded_from_readiness") or readiness.get("status") == "contaminated":
+        return
     issues = [
         issue
         for issue in readiness.get("blocking_issues", [])
-        if isinstance(issue, dict) and not _runtime_shop_issue_resolved(issue, recognition)
+        if isinstance(issue, dict) and not _runtime_is_shop_issue(issue)
     ]
+    issues.extend(_runtime_current_shop_issues(recognition))
     if not issues:
         status = "ready"
     elif _has_runtime_shop_evidence(recognition):
@@ -444,27 +447,70 @@ def _refresh_runtime_shop_readiness(recognition: dict[str, Any]) -> None:
     recognition["readiness"] = {**readiness, "readiness": status, "status": status, "blocking_issues": issues}
 
 
-def _runtime_shop_issue_resolved(issue: dict[str, Any], recognition: dict[str, Any]) -> bool:
-    slots = issue.get("slots")
-    check = issue.get("check")
-    if check not in {"shop_costs", "shop_names"} or not isinstance(slots, list):
-        return False
-    for slot_number in slots:
-        slot = _runtime_shop_slot(recognition, slot_number)
-        if not slot:
-            return False
-        if check == "shop_costs" and slot.get("cost_candidate", slot.get("cost")) is None:
-            return False
-        if check == "shop_names" and not (slot.get("name_candidate") or slot.get("name")):
-            return False
-    return True
+def _runtime_is_shop_issue(issue: dict[str, Any]) -> bool:
+    check = str(issue.get("check") or "")
+    code = str(issue.get("code") or "")
+    return check in {"shop_slots", "shop_names", "shop_costs"} or code.startswith("shop_") or code == "roi_misaligned"
 
 
-def _runtime_shop_slot(recognition: dict[str, Any], slot_number: Any) -> dict[str, Any] | None:
-    for slot in recognition.get("shop") or []:
-        if isinstance(slot, dict) and str(slot.get("slot")) == str(slot_number):
-            return slot
-    return None
+def _runtime_current_shop_issues(recognition: dict[str, Any]) -> list[dict[str, Any]]:
+    shop = [slot for slot in recognition.get("shop") or [] if isinstance(slot, dict)]
+    if not shop:
+        return [
+            {
+                "code": "roi_misaligned",
+                "check": "shop_slots",
+                "message": "No shop slots were produced for a normal shop sample.",
+            }
+        ]
+    unknown_slots = [_runtime_slot_number(slot) for slot in shop if slot.get("state") not in {"empty", "occupied"}]
+    issues = []
+    known_unknown_slots = [slot for slot in unknown_slots if slot is not None]
+    if known_unknown_slots:
+        issues.append(
+            {
+                "code": "roi_misaligned",
+                "check": "shop_slots",
+                "message": "Some shop slots have unknown occupancy.",
+                "count": len(known_unknown_slots),
+                "slots": known_unknown_slots,
+            }
+        )
+    occupied = [slot for slot in shop if slot.get("state") == "occupied"]
+    issues.extend(_runtime_group_shop_text_issues(occupied))
+    return issues
+
+
+def _runtime_group_shop_text_issues(occupied: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for slot in occupied:
+        for code, check, message in _runtime_shop_slot_text_issues(slot):
+            payload = groups.setdefault((code, check, message), {"count": 0, "slots": []})
+            payload["count"] += 1
+            slot_number = _runtime_slot_number(slot)
+            if slot_number is not None:
+                payload["slots"].append(slot_number)
+    return [
+        {
+            "code": code,
+            "check": check,
+            "message": message,
+            "count": payload["count"],
+            "slots": payload["slots"],
+        }
+        for (code, check, message), payload in sorted(groups.items())
+    ]
+
+
+def _runtime_shop_slot_text_issues(slot: dict[str, Any]) -> list[tuple[str, str, str]]:
+    issues = []
+    if not (slot.get("name_candidate") or slot.get("name")):
+        code = "shop_name_ocr_failed" if slot.get("name_raw_text") else "shop_name_crop_empty"
+        issues.append((code, "shop_names", "Occupied shop slots are missing name candidates."))
+    if _runtime_slot_cost(slot) is None:
+        code = "shop_cost_parse_failed" if slot.get("cost_raw_text") else "shop_cost_ocr_failed"
+        issues.append((code, "shop_costs", "Occupied shop slots are missing cost candidates."))
+    return issues
 
 
 def _has_runtime_shop_evidence(recognition: dict[str, Any]) -> bool:
@@ -480,6 +526,9 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     shop_name_source_counts: dict[str, int] = {}
     fallback_cost_count = 0
     ocr_cost_count = 0
+    shop_occupied_slot_count = 0
+    shop_costed_slot_count = 0
+    shop_named_slot_count = 0
     for record in records:
         state = record.get("state") if isinstance(record.get("state"), dict) else {}
         layout = str(state.get("layout") or "unknown")
@@ -490,13 +539,20 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(blockers, list) and blockers:
             code = str(blockers[0].get("code") or "unknown_blocker") if isinstance(blockers[0], dict) else "unknown_blocker"
             main_blockers[code] = main_blockers.get(code, 0) + 1
+        if not _runtime_should_count_shop_summary(state):
+            continue
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
         for slot in shop.get("slots", []) if isinstance(shop, dict) else []:
             if not isinstance(slot, dict) or slot.get("state") != "occupied":
                 continue
+            shop_occupied_slot_count += 1
             name_source = str(slot.get("name_source") or "").strip()
             cost_source = str(slot.get("cost_source") or "").strip()
-            if name_source:
+            if slot.get("name"):
+                shop_named_slot_count += 1
+            if slot.get("cost") is not None:
+                shop_costed_slot_count += 1
+            if name_source and slot.get("name"):
                 shop_name_source_counts[name_source] = shop_name_source_counts.get(name_source, 0) + 1
             if cost_source and slot.get("cost") is not None:
                 shop_cost_source_counts[cost_source] = shop_cost_source_counts.get(cost_source, 0) + 1
@@ -504,11 +560,17 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     ocr_cost_count += 1
                 else:
                     fallback_cost_count += 1
+    normal_shop_frame_count = layout_counts.get("normal_shop", 0)
+    counted_cost_sources = fallback_cost_count + ocr_cost_count
     return {
         "total_frames": len(records),
         "layout_counts": layout_counts,
         "readiness_counts": readiness_counts,
+        "normal_shop_frame_count": normal_shop_frame_count,
         "normal_shop_ready_count": _count(records, "normal_shop", "ready"),
+        "normal_shop_ready_rate": _runtime_rate(_count(records, "normal_shop", "ready"), normal_shop_frame_count),
+        "normal_shop_partial_rate": _runtime_rate(_count(records, "normal_shop", "partial"), normal_shop_frame_count),
+        "normal_shop_blocked_rate": _runtime_rate(_count(records, "normal_shop", "blocked"), normal_shop_frame_count),
         "augment_ready_count": _count(records, "augment", "ready"),
         "combat_ready_count": _count(records, "combat", "ready"),
         "contaminated_count": readiness_counts.get("contaminated", 0),
@@ -518,11 +580,25 @@ def _runtime_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "shop_name_source_counts": shop_name_source_counts,
         "fallback_cost_count": fallback_cost_count,
         "ocr_cost_count": ocr_cost_count,
+        "fallback_ratio": _runtime_rate(fallback_cost_count, counted_cost_sources),
+        "shop_occupied_slot_count": shop_occupied_slot_count,
+        "shop_costed_slot_count": shop_costed_slot_count,
+        "shop_named_slot_count": shop_named_slot_count,
+        "cost_coverage": _runtime_rate(shop_costed_slot_count, shop_occupied_slot_count),
+        "name_coverage": _runtime_rate(shop_named_slot_count, shop_occupied_slot_count),
     }
+
+
+def _runtime_should_count_shop_summary(state: dict[str, Any]) -> bool:
+    return state.get("layout") == "normal_shop" and state.get("readiness") in {"ready", "partial"}
 
 
 def _runtime_is_ocr_cost_source(source: str) -> bool:
     return source in {"slot_cost", "slot_full"}
+
+
+def _runtime_rate(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 4) if denominator else 0.0
 
 
 def _count(records: list[dict[str, Any]], layout: str, readiness: str) -> int:

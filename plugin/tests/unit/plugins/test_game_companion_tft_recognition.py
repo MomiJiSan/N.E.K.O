@@ -7,10 +7,13 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from plugin.plugins.game_companion.core.tft_recognition import (
+    NORMAL_SHOP_ROI_VERSION,
     _parse_stage as _parse_recognition_stage,
     _human_label,
+    _shop_crop_quality,
     _shop_slot_subregions,
     build_tft_recognition_report,
+    normal_shop_roi_v1_config,
     recognize_tft_frame,
 )
 from plugin.plugins.game_companion.profiles.tft.ocr import _parse_stage as _parse_ocr_stage
@@ -245,11 +248,24 @@ def test_tft_stage_parser_accepts_cjk_prefix_noise() -> None:
 
 def test_tft_shop_slot_subregions_keep_traits_outside_cost_area() -> None:
     subregions = _shop_slot_subregions((100, 200, 300, 500))
+    quality = _shop_crop_quality((100, 200, 300, 500), subregions)
 
     assert subregions["slot_full"] == (100, 200, 300, 500)
     assert subregions["slot_cost"] == (100, 428, 136, 491)
     assert subregions["slot_name"] == (128, 428, 290, 491)
     assert subregions["slot_traits"][3] <= subregions["slot_cost"][1]
+    assert quality["roi_version"] == NORMAL_SHOP_ROI_VERSION
+    assert quality["status"] == "roi_ok"
+
+
+def test_tft_normal_shop_roi_v1_config_locks_text_subregion_ratios() -> None:
+    config = normal_shop_roi_v1_config()
+
+    assert config["version"] == "normal_shop_roi_v1"
+    assert config["slot_region_ratios"]["slot_name"] == [0.14, 0.76, 0.95, 0.97]
+    assert config["slot_region_ratios"]["slot_cost"] == [0.0, 0.76, 0.18, 0.97]
+    assert config["slot_region_ratios"]["slot_traits"] == [0.04, 0.22, 0.58, 0.75]
+    assert config["tooltip_avoidance"]["text_band_bottom_max"] == 0.97
 
 
 def test_tft_human_label_preserves_extra_review_metadata() -> None:

@@ -648,3 +648,122 @@ def test_build_tft_video_state_report_uses_local_calibration_cost_hints_without_
     assert report["summary"]["fallback_cost_count"] == 2
     assert report["summary"]["ocr_cost_count"] == 6
     assert report["summary"]["normal_shop_ready_count"] == 2
+
+
+def test_build_tft_video_state_report_keeps_missing_name_partial_when_cost_is_known(tmp_path: Path) -> None:
+    video = tmp_path / "match.mp4"
+    video.write_bytes(b"fake video placeholder")
+
+    def frame_reader(_video_path: Path, *, frame_indices: list[int], max_frames: int) -> list[dict[str, object]]:
+        return [{"frame_index": 16445, "timestamp_seconds": 274.0, "image": Image.new("RGB", (1920, 1080), "navy")}]
+
+    def recognizer(image_path: str | Path, *, expected_layout: str | None = None) -> dict[str, object]:
+        return {
+            "success": True,
+            "image_path": str(image_path),
+            "layout": "normal_shop",
+            "confidence": 0.8,
+            "readiness": {"status": "ready", "blocking_issues": []},
+            "warnings": [],
+            "shop": [
+                {"slot": 1, "state": "empty", "name": None, "cost": None, "confidence": 0.8},
+                {
+                    "slot": 2,
+                    "state": "occupied",
+                    "name": None,
+                    "cost": 3,
+                    "confidence": 0.8,
+                    "cost_candidate_source": "slot_cost",
+                },
+            ],
+            "augments": [],
+        }
+
+    report = build_tft_video_state_report(
+        video,
+        output_dir=tmp_path / "runtime_state_v1",
+        max_frames=1,
+        frame_indices=[16445],
+        frame_layouts={16445: "normal_shop"},
+        frame_reader=frame_reader,
+        recognizer=recognizer,
+    )
+
+    record = json.loads(Path(report["jsonl_path"]).read_text(encoding="utf-8").splitlines()[0])
+    slot = record["state"]["shop"]["slots"][1]
+
+    assert record["state"]["readiness"] == "partial"
+    assert slot["cost"] == 3
+    assert slot["cost_source"] == "slot_cost"
+    assert slot["missing_fields"] == ["name"]
+    assert record["state"]["blockers"] == [
+        {
+            "code": "shop_name_crop_empty",
+            "check": "shop_names",
+            "message": "Occupied shop slots are missing name candidates.",
+            "count": 1,
+            "slots": [2],
+        }
+    ]
+    assert report["summary"]["normal_shop_ready_count"] == 0
+    assert report["summary"]["readiness_counts"] == {"partial": 1}
+    assert report["summary"]["cost_coverage"] == 1.0
+    assert report["summary"]["name_coverage"] == 0.0
+
+
+def test_build_tft_video_state_report_excludes_contaminated_shop_sources_from_summary(tmp_path: Path) -> None:
+    video = tmp_path / "match.mp4"
+    video.write_bytes(b"fake video placeholder")
+
+    def frame_reader(_video_path: Path, *, frame_indices: list[int], max_frames: int) -> list[dict[str, object]]:
+        return [{"frame_index": 16445, "timestamp_seconds": 274.0, "image": Image.new("RGB", (1920, 1080), "navy")}]
+
+    def recognizer(image_path: str | Path, *, expected_layout: str | None = None) -> dict[str, object]:
+        return {
+            "success": True,
+            "image_path": str(image_path),
+            "layout": "normal_shop",
+            "confidence": 0.8,
+            "readiness": {
+                "status": "contaminated",
+                "blocking_issues": [
+                    {
+                        "code": "contaminated_by_hover",
+                        "check": "layout",
+                        "message": "Hover tooltip covers shop text.",
+                    }
+                ],
+                "excluded_from_readiness": True,
+            },
+            "warnings": [],
+            "shop": [
+                {
+                    "slot": 2,
+                    "state": "occupied",
+                    "name": "Urgot",
+                    "cost": 3,
+                    "confidence": 0.8,
+                    "name_candidate_source": "slot_name",
+                    "cost_candidate_source": "runtime_local_calibration_name_cost",
+                },
+            ],
+            "augments": [],
+        }
+
+    report = build_tft_video_state_report(
+        video,
+        output_dir=tmp_path / "runtime_state_v1",
+        max_frames=1,
+        frame_indices=[16445],
+        frame_layouts={16445: "normal_shop"},
+        frame_reader=frame_reader,
+        recognizer=recognizer,
+    )
+
+    assert report["summary"]["contaminated_count"] == 1
+    assert report["summary"]["shop_cost_source_counts"] == {}
+    assert report["summary"]["shop_name_source_counts"] == {}
+    assert report["summary"]["fallback_cost_count"] == 0
+    assert report["summary"]["ocr_cost_count"] == 0
+    assert report["summary"]["cost_coverage"] == 0.0
+    assert report["summary"]["name_coverage"] == 0.0
