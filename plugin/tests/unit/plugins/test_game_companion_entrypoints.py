@@ -10,6 +10,7 @@ import types
 
 from PIL import Image
 
+import plugin.plugins.game_companion as game_companion_module
 from plugin.plugins.game_companion import GameCompanionPlugin
 from plugin.plugins.game_companion.core.local_vision import get_default_local_vision_backend, reset_default_local_vision_backend
 from plugin.plugins.game_companion.core.profile_registry import ProfileRegistry
@@ -150,6 +151,7 @@ def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
         "game_companion_recognize_tft_frame",
         "game_companion_build_tft_recognition_report",
         "game_companion_build_tft_video_state_report",
+        "game_companion_tft_normal_shop_smoke",
         "game_companion_init_layout_calibration_workspace",
         "game_companion_capture_layout_calibration_screenshot",
         "game_companion_extract_layout_calibration_video_frames",
@@ -334,6 +336,45 @@ def test_game_companion_build_tft_video_state_report_entry_reports_missing_video
     assert result["error"]["code"] == "video_not_found"
 
 
+def test_game_companion_tft_normal_shop_smoke_entry_writes_report(tmp_path: Path, monkeypatch) -> None:
+    plugin = _plugin()
+    plugin._active_profile_id = "tft"
+    video = tmp_path / "match.mp4"
+    video.write_bytes(b"fake")
+
+    def fake_smoke_report(video_path: str, *, output_dir: str | None = None):
+        report_path = Path(output_dir or tmp_path) / "tft_normal_shop_smoke_v1.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "type": "tft_normal_shop_smoke_report",
+            "report_version": "tft_normal_shop_smoke_v1",
+            "success": True,
+            "video_path": str(Path(video_path).resolve()),
+            "report_path": str(report_path.resolve()),
+            "pass": True,
+            "failures": [],
+            "normal_shop": {"ready_rate": 1.0},
+            "mixed": {"non_shop_source_slots": 0},
+            "overlay": {"shop_payloads": 0},
+        }
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(game_companion_module, "build_tft_normal_shop_smoke_report", fake_smoke_report)
+
+    result = _payload(
+        plugin.tft_normal_shop_smoke_entry(
+            video_path=str(video),
+            output_dir=str(tmp_path / "smoke"),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["pass"] is True
+    assert result["report_version"] == "tft_normal_shop_smoke_v1"
+    assert Path(result["report_path"]).is_file()
+
+
 def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_path: Path) -> None:
     plugin = _plugin()
     plugin._profiles.register(
@@ -359,6 +400,7 @@ def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_pa
         )
     )
     video_report = _payload(plugin.build_tft_video_state_report_entry(video_path=str(tmp_path / "missing.mp4")))
+    smoke_report = _payload(plugin.tft_normal_shop_smoke_entry(video_path=str(tmp_path / "missing.mp4")))
 
     assert recognized["success"] is False
     assert recognized["error"]["code"] == "capability_not_allowed"
@@ -369,6 +411,9 @@ def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_pa
     assert video_report["success"] is False
     assert video_report["error"]["code"] == "capability_not_allowed"
     assert video_report["error"]["capability"] == "vision_classify"
+    assert smoke_report["success"] is False
+    assert smoke_report["error"]["code"] == "capability_not_allowed"
+    assert smoke_report["error"]["capability"] == "vision_classify"
 
 
 def test_game_companion_entrypoint_analyzes_generic_frame(tmp_path: Path) -> None:

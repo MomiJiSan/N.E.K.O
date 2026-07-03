@@ -41,6 +41,7 @@ from .core.replay import (
 )
 from .core.tft_recognition import build_tft_recognition_report, recognize_tft_frame
 from .core.tft_runtime import build_tft_video_state_report
+from .core.tft_smoke import build_tft_normal_shop_smoke_report
 from .core.tft_state import build_tft_state
 from .profiles import builtin_profiles
 from .safety import Capability, capability_error_response, evaluate_profile_capability
@@ -403,6 +404,43 @@ class GameCompanionPlugin(NekoPluginBase):
             return Ok(_entry_error("video_state_report_invalid", str(exc)))
         except OSError as exc:
             return Ok(_entry_error("video_state_report_failed", str(exc)))
+
+    @plugin_entry(
+        id="game_companion_tft_normal_shop_smoke",
+        name="Run TFT normal shop smoke",
+        description="Run the fixed TFT normal_shop smoke suite over a local recording and write a unified pass/fail report.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "video_path": {
+                    "type": "string",
+                    "description": "Local path to the TFT recording used for the fixed normal_shop smoke suite.",
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory where tft_normal_shop_smoke_v1.json and child runtime reports are written.",
+                },
+            },
+            "required": ["video_path"],
+        },
+    )
+    def tft_normal_shop_smoke_entry(
+        self,
+        video_path: str,
+        output_dir: str | None = None,
+        **_: Any,
+    ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
+        try:
+            return Ok(build_tft_normal_shop_smoke_report(video_path, output_dir=output_dir))
+        except FileNotFoundError as exc:
+            return Ok(_entry_error("video_not_found", str(exc)))
+        except ValueError as exc:
+            return Ok(_entry_error("tft_smoke_invalid", str(exc)))
+        except OSError as exc:
+            return Ok(_entry_error("tft_smoke_failed", str(exc)))
 
     @plugin_entry(
         id="game_companion_init_layout_calibration_workspace",
