@@ -40,6 +40,8 @@ from .core.replay import (
     load_snapshots,
 )
 from .core.tft_recognition import build_tft_recognition_report, recognize_tft_frame
+from .core.tft_runtime import build_tft_video_state_report
+from .core.tft_state import build_tft_state
 from .profiles import builtin_profiles
 from .safety import Capability, capability_error_response, evaluate_profile_capability
 
@@ -280,7 +282,9 @@ class GameCompanionPlugin(NekoPluginBase):
         capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
         if capability_error:
             return Ok(capability_error)
-        return Ok(recognize_tft_frame(image_path, expected_layout=expected_layout))
+        recognition = recognize_tft_frame(image_path, expected_layout=expected_layout)
+        recognition["state"] = build_tft_state(recognition)
+        return Ok(recognition)
 
     @plugin_entry(
         id="game_companion_build_tft_recognition_report",
@@ -320,6 +324,85 @@ class GameCompanionPlugin(NekoPluginBase):
             return Ok(_entry_error("report_write_failed", str(exc)))
         except ValueError as exc:
             return Ok(_entry_error("invalid_report", str(exc)))
+
+    @plugin_entry(
+        id="game_companion_build_tft_video_state_report",
+        name="Build TFT video state report",
+        description="Sample a local TFT recording and write runtime TFTState JSONL, summary, and contact sheet.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "video_path": {
+                    "type": "string",
+                    "description": "Local path to a TFT recording such as mp4, mkv, mov, webm, avi, or m4v.",
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory where runtime_state_v1 artifacts are written.",
+                },
+                "sample_interval_seconds": {
+                    "type": "number",
+                    "description": "Target frame sampling interval in seconds. Defaults to 2.0.",
+                },
+                "max_frames": {
+                    "type": "integer",
+                    "description": "Maximum frames to sample. Clamped by the runtime reporter.",
+                },
+                "frame_indices": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional exact zero-based frame indices to sample.",
+                },
+                "frame_layouts": {
+                    "type": "object",
+                    "description": "Optional mapping of frame index to layout hint for mixed-layout video verification.",
+                },
+                "shop_labels_path": {
+                    "type": "string",
+                    "description": "Optional recognition_shop_labels_v1.json used as local verified shop cost/name fallback.",
+                },
+                "expected_layout": {
+                    "type": "string",
+                    "description": "Optional layout hint applied to sampled frames: normal_shop, combat, or augment_select.",
+                },
+            },
+            "required": ["video_path"],
+        },
+    )
+    def build_tft_video_state_report_entry(
+        self,
+        video_path: str,
+        output_dir: str | None = None,
+        sample_interval_seconds: float = 2.0,
+        max_frames: int = 60,
+        expected_layout: str | None = None,
+        frame_indices: list[int] | None = None,
+        frame_layouts: dict[str, str] | None = None,
+        shop_labels_path: str | None = None,
+        **_: Any,
+    ):
+        capability_error = self._require_capability(self._active_profile_id, Capability.VISION_CLASSIFY)
+        if capability_error:
+            return Ok(capability_error)
+        try:
+            return Ok(
+                build_tft_video_state_report(
+                    video_path,
+                    output_dir=output_dir,
+                    sample_interval_seconds=sample_interval_seconds,
+                    max_frames=max_frames,
+                    expected_layout=expected_layout,
+                    frame_indices=frame_indices,
+                    frame_layouts=frame_layouts,
+                    shop_labels_path=shop_labels_path,
+                )
+            )
+        except FileNotFoundError as exc:
+            return Ok(_entry_error("video_not_found", str(exc)))
+        except ValueError as exc:
+            return Ok(_entry_error("video_state_report_invalid", str(exc)))
+        except OSError as exc:
+            return Ok(_entry_error("video_state_report_failed", str(exc)))
 
     @plugin_entry(
         id="game_companion_init_layout_calibration_workspace",
@@ -842,9 +925,32 @@ class GameCompanionPlugin(NekoPluginBase):
                 "insights": [],
                 "diagnostics": {"warnings": []},
             }
+        raw_recognition = (
+            recognize_tft_frame(image_path, expected_layout=_expected_tft_layout(source_context))
+            if normalized == "tft" and image_path
+            else None
+        )
+        state = (
+            build_tft_state(
+                raw_recognition,
+                timestamp=_source_timestamp(source_context),
+                source_context=_redacted_source_context(source_context),
+            )
+            if raw_recognition is not None
+            else None
+        )
+        if raw_recognition is not None:
+            raw_recognition["state"] = state
+        if state is not None and isinstance(result, dict):
+            result["tft_state"] = state
         realtime = self._realtime.ingest(result)
         auto_snapshot = self._maybe_auto_save_snapshot(result)
-        return Ok({"result": result, "realtime": realtime, "auto_snapshot": auto_snapshot})
+        payload = {"ok": bool(result.get("success")), "result": result, "realtime": realtime, "auto_snapshot": auto_snapshot}
+        if state is not None:
+            payload["state"] = state
+        if raw_recognition is not None:
+            payload["raw_recognition"] = raw_recognition
+        return Ok(payload)
 
     @plugin_entry(
         id="game_companion_realtime_status",
@@ -1027,3 +1133,36 @@ class GameCompanionPlugin(NekoPluginBase):
 
 def _entry_error(code: str, message: str) -> dict[str, Any]:
     return {"success": False, "error": {"code": code, "message": message}}
+
+
+def _expected_tft_layout(source_context: dict[str, Any] | None) -> str | None:
+    if not isinstance(source_context, dict):
+        return None
+    for key in ("expected_layout", "layout", "layout_hint"):
+        value = source_context.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _source_timestamp(source_context: dict[str, Any] | None) -> float | None:
+    if not isinstance(source_context, dict):
+        return None
+    value = source_context.get("timestamp_seconds")
+    if value is None:
+        value = source_context.get("timestamp")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _redacted_source_context(source_context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(source_context, dict):
+        return {}
+    redacted = dict(source_context)
+    if redacted.get("video_path"):
+        redacted["video_path"] = "[redacted_path]"
+    if redacted.get("image_path"):
+        redacted["image_path"] = "[redacted_path]"
+    return redacted

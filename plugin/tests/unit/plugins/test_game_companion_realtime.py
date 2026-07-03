@@ -274,6 +274,60 @@ def test_neko_context_packet_redacts_paths_and_data_urls_from_allowed_strings() 
     assert "[redacted_image_data]" in serialized
 
 
+def test_neko_context_packet_includes_tft_runtime_state_digest() -> None:
+    analysis = {
+        "profile": "tft",
+        "state": {"stage": "3-2", "level": 6, "gold": 42},
+        "tft_state": {
+            "type": "tft_frame_state",
+            "game": "tft",
+            "layout": "normal_shop",
+            "readiness": "partial",
+            "summary": "当前是商店界面，5 个商店栏位可识别，4 个有棋子；商店可部分识别，slot 2 缺费用。",
+            "shop": {
+                "slot_count": 5,
+                "occupied_count": 4,
+                "partial_count": 1,
+                "slot_issues": [{"slot": 2, "state": "occupied", "missing_fields": ["cost"]}],
+                "slots": [
+                    {"slot": 1, "state": "occupied", "name": "Lux", "cost": 3, "confidence": 0.8},
+                    {
+                        "slot": 2,
+                        "state": "occupied",
+                        "name": "Ahri",
+                        "cost": None,
+                        "confidence": 0.7,
+                        "missing_fields": ["cost"],
+                    },
+                ],
+            },
+            "blockers": [{"code": "shop_cost_ocr_failed", "slots": [2]}],
+        },
+        "insights": [],
+    }
+
+    packet = build_neko_context_packet(analysis, note="runtime state")
+
+    assert packet["state_digest"]["tft"] == {
+        "layout": "normal_shop",
+        "readiness": "partial",
+        "summary": "当前是商店界面，5 个商店栏位可识别，4 个有棋子；商店可部分识别，slot 2 缺费用。",
+        "shop": {
+            "slot_count": 5,
+            "occupied_count": 4,
+            "partial_count": 1,
+            "units": [
+                {"slot": 1, "name": "Lux", "cost": 3, "confidence": 0.8, "missing_fields": []},
+                {"slot": 2, "name": "Ahri", "cost": None, "confidence": 0.7, "missing_fields": ["cost"]},
+            ],
+            "slot_issues": [{"slot": 2, "state": "occupied", "missing_fields": ["cost"]}],
+        },
+        "blockers": [{"code": "shop_cost_ocr_failed", "slots": [2]}],
+    }
+    assert "商店可部分识别" in packet["summary"]
+    assert "slot 2 缺费用" in packet["summary"]
+
+
 def test_neko_context_queue_is_fifo_and_sanitized() -> None:
     store = _Store()
     analysis = {

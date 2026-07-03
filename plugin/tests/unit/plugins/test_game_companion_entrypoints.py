@@ -149,6 +149,7 @@ def test_plugin_manifest_entry_imports_and_collects_expected_entries() -> None:
         "game_companion_analyze_frame",
         "game_companion_recognize_tft_frame",
         "game_companion_build_tft_recognition_report",
+        "game_companion_build_tft_video_state_report",
         "game_companion_init_layout_calibration_workspace",
         "game_companion_capture_layout_calibration_screenshot",
         "game_companion_extract_layout_calibration_video_frames",
@@ -272,11 +273,19 @@ def test_game_companion_recognize_tft_frame_entry_returns_structured_state(tmp_p
     assert recognized["type"] == "tft_recognition_result"
     assert recognized["success"] is True
     assert recognized["layout"] == "normal_shop"
+    assert recognized["state"]["type"] == "tft_frame_state"
+    assert recognized["state"]["game"] == "tft"
+    assert recognized["state"]["layout"] == "normal_shop"
+    assert recognized["state"]["shop"]["slot_count"] == 5
     assert len(recognized["shop"]) == 5
     assert combat["layout"] == "combat"
+    assert combat["state"]["layout"] == "combat"
+    assert combat["state"]["shop"] is None
+    assert combat["state"]["combat"] == {"status": "observed", "details": []}
     assert combat["shop"] == []
     assert missing["success"] is False
     assert missing["error"]["code"] == "image_read_failed"
+    assert missing["state"]["readiness"] == "blocked"
 
 
 def test_game_companion_build_tft_recognition_report_entry_writes_report(tmp_path: Path) -> None:
@@ -311,6 +320,20 @@ def test_game_companion_build_tft_recognition_report_entry_writes_report(tmp_pat
     assert Path(report["summary_path"]).is_file()
 
 
+def test_game_companion_build_tft_video_state_report_entry_reports_missing_video(tmp_path: Path) -> None:
+    plugin = _plugin()
+
+    result = _payload(
+        plugin.build_tft_video_state_report_entry(
+            video_path=str(tmp_path / "missing.mp4"),
+            output_dir=str(tmp_path / "runtime_state_v1"),
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "video_not_found"
+
+
 def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_path: Path) -> None:
     plugin = _plugin()
     plugin._profiles.register(
@@ -335,6 +358,7 @@ def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_pa
             output_dir=str(tmp_path / "recognition"),
         )
     )
+    video_report = _payload(plugin.build_tft_video_state_report_entry(video_path=str(tmp_path / "missing.mp4")))
 
     assert recognized["success"] is False
     assert recognized["error"]["code"] == "capability_not_allowed"
@@ -342,6 +366,9 @@ def test_game_companion_tft_recognition_entries_require_vision_capability(tmp_pa
     assert report["success"] is False
     assert report["error"]["code"] == "capability_not_allowed"
     assert report["error"]["capability"] == "vision_classify"
+    assert video_report["success"] is False
+    assert video_report["error"]["code"] == "capability_not_allowed"
+    assert video_report["error"]["capability"] == "vision_classify"
 
 
 def test_game_companion_entrypoint_analyzes_generic_frame(tmp_path: Path) -> None:
@@ -1072,6 +1099,12 @@ def test_game_companion_realtime_and_review_entries_roundtrip(tmp_path: Path) ->
     cleared = _payload(plugin.clear_review_snapshots())
 
     assert configured["configured"] is True
+    assert ingested["ok"] is True
+    assert ingested["state"]["type"] == "tft_frame_state"
+    assert ingested["state"]["game"] == "tft"
+    assert ingested["state"]["source_context"]["frame_index"] == 30
+    assert ingested["result"]["tft_state"]["type"] == "tft_frame_state"
+    assert ingested["raw_recognition"]["type"] == "tft_recognition_result"
     assert ingested["result"]["success"] is True
     assert ingested["result"]["source"]["origin"] == {**source_context, "video_path": "[redacted_path]"}
     assert ingested["result"]["vision"]["source"]["origin"] == {**source_context, "video_path": "[redacted_path]"}
@@ -1085,6 +1118,7 @@ def test_game_companion_realtime_and_review_entries_roundtrip(tmp_path: Path) ->
     assert context["packet"]["type"] == "game_companion_neko_context_packet"
     assert context["packet"]["delivery"]["mode"] == "queued_non_interrupting"
     assert context["packet"]["note"] == "entrypoint context"
+    assert context["packet"]["state_digest"]["tft"]["layout"] == ingested["state"]["layout"]
     assert context["queued"]["queue_size"] == 1
     assert queued["queue_size"] == 1
     assert queued["packets"][0]["note"] == "entrypoint context"

@@ -147,6 +147,8 @@ def recognize_tft_frame(
     level = _field_from_text("level", level_text, level_confidence, _parse_int) if "level_exp" in regions else None
     xp = _xp_from_text(level_text, level_confidence) if "level_exp" in regions else None
     shop = _enrich_shop_slots_from_ocr(shop, ocr) if layout == LAYOUT_NORMAL_SHOP else []
+    if layout == LAYOUT_NORMAL_SHOP:
+        _infer_frame_shop_costs(shop)
     augments = _augment_options_from_ocr(ocr) if layout == LAYOUT_AUGMENT_SELECT else []
     warnings.extend(_missing_field_warnings(layout, stage=stage, gold=gold, level=level, xp=xp, augments=augments))
     field_status = _field_statuses(
@@ -461,6 +463,35 @@ def _parse_shop_name(text: str, cost: int | None) -> str | None:
     return None
 
 
+def _infer_frame_shop_costs(shop: list[dict[str, Any]]) -> None:
+    costs_by_name: dict[str, set[int]] = {}
+    for slot in shop:
+        if not isinstance(slot, dict) or slot.get("state") != "occupied":
+            continue
+        name = _shop_cost_consensus_key(slot)
+        cost = slot.get("cost_candidate", slot.get("cost"))
+        if name and isinstance(cost, int) and 1 <= cost <= 5:
+            costs_by_name.setdefault(name, set()).add(cost)
+
+    consensus = {name: next(iter(costs)) for name, costs in costs_by_name.items() if len(costs) == 1}
+    for slot in shop:
+        if not isinstance(slot, dict) or slot.get("state") != "occupied":
+            continue
+        if slot.get("cost_candidate", slot.get("cost")) is not None:
+            continue
+        name = _shop_cost_consensus_key(slot)
+        if not name or name not in consensus:
+            continue
+        slot["cost_candidate"] = consensus[name]
+        slot["cost"] = consensus[name]
+        slot["cost_candidate_source"] = "frame_name_cost_consensus"
+        slot["cost_inference"] = {
+            "method": "frame_name_cost_consensus",
+            "matched_name": name,
+            "confidence": 0.52,
+        }
+
+
 def _field_from_text(
     name: str,
     text: Any,
@@ -765,6 +796,8 @@ def _recognition_readiness(
         status = "failed"
     elif excluded:
         status = "contaminated"
+    elif _is_partial_normal_shop_readiness(layout, recognition, blockers):
+        status = "partial"
     elif blockers:
         status = "blocked"
     else:
@@ -889,15 +922,41 @@ def _normal_shop_blockers(recognition: Mapping[str, Any]) -> list[dict[str, Any]
 
 
 def _shop_text_blockers(occupied: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    blocker_groups: dict[tuple[str, str, str], int] = {}
+    blocker_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
     for slot in occupied:
         for code, check, message in _shop_slot_text_blockers(slot):
             key = (code, check, message)
-            blocker_groups[key] = blocker_groups.get(key, 0) + 1
+            group = blocker_groups.setdefault(key, {"count": 0, "slots": []})
+            group["count"] += 1
+            slot_number = _safe_slot_number(slot)
+            if slot_number is not None:
+                group["slots"].append(slot_number)
     return [
-        _blocking_issue(code, check, message, count=count)
-        for (code, check, message), count in sorted(blocker_groups.items())
+        _blocking_issue(code, check, message, count=payload["count"], slots=payload["slots"])
+        for (code, check, message), payload in sorted(blocker_groups.items())
     ]
+
+
+def _is_partial_normal_shop_readiness(
+    layout: str,
+    recognition: Mapping[str, Any],
+    blockers: list[dict[str, Any]],
+) -> bool:
+    if layout != LAYOUT_NORMAL_SHOP or not blockers:
+        return False
+    shop = [slot for slot in recognition.get("shop", []) if isinstance(slot, Mapping)]
+    if not shop or any(issue.get("code") == "roi_misaligned" for issue in blockers):
+        return False
+    occupied = [slot for slot in shop if slot.get("state") == "occupied"]
+    if not occupied:
+        return False
+    has_any_name = any(slot.get("name_candidate") or slot.get("name") for slot in occupied)
+    has_any_cost = any(slot.get("cost_candidate", slot.get("cost")) is not None for slot in occupied)
+    if not (has_any_name or has_any_cost):
+        return False
+    shop_blockers = [issue for issue in blockers if str(issue.get("check") or "").startswith("shop_")]
+    non_shop_blockers = [issue for issue in blockers if issue not in shop_blockers]
+    return bool(shop_blockers) and not non_shop_blockers
 
 
 def _shop_slot_text_blockers(slot: Mapping[str, Any]) -> list[tuple[str, str, str]]:
@@ -950,10 +1009,27 @@ def _augment_blockers(recognition: Mapping[str, Any]) -> list[dict[str, Any]]:
     return blockers
 
 
-def _blocking_issue(code: str, check: str, message: str, *, count: int | None = None) -> dict[str, Any]:
+def _safe_slot_number(slot: Mapping[str, Any]) -> int | None:
+    try:
+        value = int(slot.get("slot"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _blocking_issue(
+    code: str,
+    check: str,
+    message: str,
+    *,
+    count: int | None = None,
+    slots: list[int] | None = None,
+) -> dict[str, Any]:
     issue = {"code": code, "check": check, "message": message}
     if count is not None:
         issue["count"] = count
+    if slots:
+        issue["slots"] = sorted(set(slots))
     return issue
 
 
@@ -1134,6 +1210,7 @@ def _layout_readiness(layout: str, items: list[Mapping[str, Any]]) -> dict[str, 
     }
     readiness_items = [item.get("readiness") for item in items if isinstance(item.get("readiness"), Mapping)]
     ready = sum(1 for item in readiness_items if item.get("readiness") == "ready")
+    partial = sum(1 for item in readiness_items if item.get("readiness") == "partial")
     blocked = sum(1 for item in readiness_items if item.get("readiness") == "blocked")
     failed = sum(1 for item in readiness_items if item.get("readiness") == "failed")
     contaminated = sum(1 for item in readiness_items if item.get("readiness") == "contaminated")
@@ -1148,9 +1225,9 @@ def _layout_readiness(layout: str, items: list[Mapping[str, Any]]) -> dict[str, 
     considered = len(items) - excluded
     if contaminated and considered == 0:
         status = "contaminated"
-    elif blocked == 0 and failed == 0:
+    elif blocked == 0 and failed == 0 and partial == 0:
         status = "ready"
-    elif ready:
+    elif partial or ready:
         status = "partial"
     elif failed and not blocked:
         status = "failed"
@@ -1162,6 +1239,7 @@ def _layout_readiness(layout: str, items: list[Mapping[str, Any]]) -> dict[str, 
         "total": len(items),
         "samples": len(items),
         "ready": ready,
+        "partial": partial,
         "blocked": blocked,
         "failed": failed,
         "contaminated": contaminated,

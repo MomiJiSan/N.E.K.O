@@ -160,6 +160,15 @@ class _PathSensitiveShopCostOcrAdapter(_FakeOcrAdapter):
         return result
 
 
+class _SingleMissingCostOcrAdapter(_PathSensitiveShopCostOcrAdapter):
+    def recognize(self, image_path: str | Path, regions: dict[str, Any]) -> dict[str, Any]:
+        result = super().recognize(image_path, regions)
+        for key in ("shop_slot_2", "shop_slot_2_cost"):
+            if key in result["regions"]:
+                result["regions"][key]["text"] = "UnitTwo" if key == "shop_slot_2" else ""
+        return result
+
+
 def _synthetic_tft_image(path: Path, layout: str = LAYOUT_NORMAL_SHOP) -> None:
     image = Image.new("RGB", (1920, 1080), color=(42, 72, 94))
     draw = ImageDraw.Draw(image)
@@ -325,6 +334,23 @@ def test_tft_recognition_reports_detailed_shop_cost_blocker(tmp_path: Path) -> N
     issue_codes = {issue["code"] for issue in result["readiness"]["blocking_issues"]}
     assert "shop_cost_parse_failed" in issue_codes
     assert "ocr_failed" not in issue_codes
+
+
+def test_tft_recognition_marks_single_missing_shop_cost_partial_with_slot_blocker(tmp_path: Path) -> None:
+    screenshot = tmp_path / "missing_cost.png"
+    _synthetic_tft_image(screenshot)
+
+    result = recognize_tft_frame(
+        screenshot,
+        expected_layout=LAYOUT_NORMAL_SHOP,
+        ocr_adapter=_SingleMissingCostOcrAdapter(),
+    )
+
+    assert result["readiness"]["status"] == "partial"
+    issues = result["readiness"]["blocking_issues"]
+    cost_issue = next(issue for issue in issues if issue["code"] == "shop_cost_ocr_failed")
+    assert cost_issue["slots"] == [2]
+    assert cost_issue["count"] == 1
 
 
 def test_tft_recognition_reads_augment_text_without_shop_noise(tmp_path: Path) -> None:
@@ -615,6 +641,29 @@ def test_tft_recognition_report_fills_missing_shop_cost_from_batch_consensus(tmp
     assert inferred_slot["cost_candidate_source"] == "report_name_cost_consensus"
     assert inferred_slot["cost_inference"]["matched_name"] == "UnitTwo"
     assert report["summary"]["readiness"][LAYOUT_NORMAL_SHOP]["status"] == "ready"
+
+
+def test_tft_recognition_report_counts_partial_normal_shop_samples(tmp_path: Path) -> None:
+    screenshot = tmp_path / "missing_cost.png"
+    _synthetic_tft_image(screenshot)
+    calibration_report = {
+        "type": "tft_layout_calibration_report",
+        "screenshots": [
+            {"index": 1, "image_path": str(screenshot), "expected_layout": LAYOUT_NORMAL_SHOP, "label": "missing"},
+        ],
+    }
+
+    report = build_tft_recognition_report(
+        calibration_report,
+        output_dir=tmp_path / "recognition",
+        ocr_adapter=_SingleMissingCostOcrAdapter(),
+    )
+
+    readiness = report["summary"]["readiness"][LAYOUT_NORMAL_SHOP]
+    assert readiness["status"] == "partial"
+    assert readiness["partial"] == 1
+    assert readiness["blocked"] == 0
+    assert readiness["main_blocker"] == "shop_cost_ocr_failed"
 
 
 def test_tft_recognition_report_uses_verified_shop_label_for_missing_cost(tmp_path: Path) -> None:

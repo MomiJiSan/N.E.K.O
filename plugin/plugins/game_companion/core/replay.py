@@ -103,6 +103,7 @@ def build_training_prompt(snapshot: dict[str, Any]) -> dict[str, Any]:
 def build_neko_context_packet(payload: dict[str, Any], *, note: str = "") -> dict[str, Any]:
     profile = _redact_context_text(payload.get("profile") or payload.get("profile_id") or "tft")
     state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    tft_state = payload.get("tft_state") if isinstance(payload.get("tft_state"), dict) else {}
     insights = payload.get("insights") if isinstance(payload.get("insights"), list) else []
     vision = payload.get("vision") if isinstance(payload.get("vision"), dict) else {}
     privacy = vision.get("privacy") if isinstance(vision.get("privacy"), dict) else {}
@@ -127,9 +128,9 @@ def build_neko_context_packet(payload: dict[str, Any], *, note: str = "") -> dic
             "source_path_included": False,
             "external_model_calls": bool(privacy.get("external_model_calls") is True),
         },
-        "state_digest": _state_digest(state),
+        "state_digest": _state_digest(state, tft_state=tft_state),
         "events": _context_events(insights),
-        "summary": _context_summary(state, insights),
+        "summary": _context_summary(state, insights, tft_state=tft_state),
         "ttl_seconds": 120,
         "note": _redact_context_text(note),
     }
@@ -193,12 +194,105 @@ def _sanitize_context_events(events: Any) -> list[dict[str, Any]]:
     return sanitized_events
 
 
-def _state_digest(state: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _state_digest(state: dict[str, Any], *, tft_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    digest = {
         key: state.get(key)
         for key in ("stage", "level", "gold")
         if state.get(key) is not None
     }
+    if isinstance(tft_state, dict) and tft_state:
+        digest["tft"] = _tft_state_digest(tft_state)
+    return digest
+
+
+def _tft_state_digest(tft_state: dict[str, Any]) -> dict[str, Any]:
+    digest: dict[str, Any] = {
+        "layout": _redact_context_text(tft_state.get("layout") or "unknown"),
+        "readiness": _redact_context_text(tft_state.get("readiness") or "unknown"),
+        "summary": _redact_context_text(tft_state.get("summary") or ""),
+    }
+    shop = tft_state.get("shop") if isinstance(tft_state.get("shop"), dict) else {}
+    if shop:
+        digest["shop"] = {
+            "slot_count": shop.get("slot_count"),
+            "occupied_count": shop.get("occupied_count"),
+            "partial_count": shop.get("partial_count") or 0,
+            "units": _tft_shop_units_digest(shop.get("slots")),
+            "slot_issues": _tft_shop_slot_issues_digest(shop.get("slot_issues")),
+        }
+    augment = tft_state.get("augment") if isinstance(tft_state.get("augment"), dict) else {}
+    if augment:
+        digest["augment"] = {
+            "option_count": augment.get("option_count"),
+            "options": _tft_augment_options_digest(augment.get("options")),
+        }
+    blockers = tft_state.get("blockers") if isinstance(tft_state.get("blockers"), list) else []
+    digest["blockers"] = [
+        {
+            "code": _redact_context_text(item.get("code") or ""),
+            **({"slots": [int(slot) for slot in item.get("slots", []) if isinstance(slot, int)]} if isinstance(item.get("slots"), list) else {}),
+        }
+        for item in blockers[:5]
+        if isinstance(item, dict)
+    ]
+    return digest
+
+
+def _tft_shop_units_digest(slots: Any) -> list[dict[str, Any]]:
+    if not isinstance(slots, list):
+        return []
+    units: list[dict[str, Any]] = []
+    for slot in slots:
+        if not isinstance(slot, dict) or slot.get("state") != "occupied":
+            continue
+        units.append(
+            {
+                "slot": slot.get("slot"),
+                "name": _redact_context_text(slot.get("name") or ""),
+                "cost": slot.get("cost"),
+                "confidence": slot.get("confidence"),
+                "missing_fields": _tft_missing_fields_digest(slot.get("missing_fields")),
+            }
+        )
+    return units[:5]
+
+
+def _tft_shop_slot_issues_digest(slot_issues: Any) -> list[dict[str, Any]]:
+    if not isinstance(slot_issues, list):
+        return []
+    issues = []
+    for issue in slot_issues[:5]:
+        if not isinstance(issue, dict):
+            continue
+        issues.append(
+            {
+                "slot": issue.get("slot"),
+                "state": _redact_context_text(issue.get("state") or ""),
+                "missing_fields": _tft_missing_fields_digest(issue.get("missing_fields")),
+            }
+        )
+    return issues
+
+
+def _tft_missing_fields_digest(fields: Any) -> list[str]:
+    if not isinstance(fields, list):
+        return []
+    allowed = {"name", "cost"}
+    return [field for field in (_redact_context_text(item) for item in fields[:4]) if field in allowed]
+
+
+def _tft_augment_options_digest(options: Any) -> list[dict[str, Any]]:
+    if not isinstance(options, list):
+        return []
+    return [
+        {
+            "slot": option.get("slot"),
+            "title": _redact_context_text(option.get("title") or ""),
+            "confidence": option.get("confidence"),
+        }
+        for option in options[:3]
+        if isinstance(option, dict)
+    ]
 
 
 def _context_events(insights: list[Any]) -> list[dict[str, Any]]:
@@ -217,8 +311,10 @@ def _context_events(insights: list[Any]) -> list[dict[str, Any]]:
     return events
 
 
-def _context_summary(state: dict[str, Any], insights: list[Any]) -> str:
+def _context_summary(state: dict[str, Any], insights: list[Any], *, tft_state: dict[str, Any] | None = None) -> str:
     parts = []
+    if isinstance(tft_state, dict) and tft_state.get("summary"):
+        parts.append(_redact_context_text(tft_state.get("summary") or ""))
     stage = state.get("stage") or state.get("round")
     level = state.get("level")
     gold = state.get("gold")
