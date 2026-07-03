@@ -148,6 +148,17 @@ def build_tft_recognition_report(
             }
         )
 
+    report_path = output_path / "recognition_report_v1.json"
+    summary_path = output_path / "recognition_summary_v1.json"
+    shop_review_path = output_path / "recognition_shop_review_v1.json"
+    shop_labels_path = output_path / "recognition_shop_labels_v1.json"
+    augment_review_path = output_path / "recognition_augment_review_v1.json"
+    review_crops_dir = output_path / "review_crops"
+    existing_shop_labels = _load_human_labels(shop_labels_path)
+    existing_augment_labels = _load_human_labels(augment_review_path)
+    shop_review = _shop_review_report(results, shop_review_path, review_crops_dir, existing_shop_labels)
+    shop_labels = _shop_labels_report(shop_review, shop_labels_path)
+    augment_review = _augment_review_report(results, augment_review_path, review_crops_dir, existing_augment_labels)
     successes = sum(1 for item in results if item["recognition"].get("success"))
     summary = {
         "total": len(results),
@@ -156,12 +167,8 @@ def build_tft_recognition_report(
         "layouts": _layout_counts(results),
         "warnings": sum(len(item["recognition"].get("warnings") or []) for item in results),
         "readiness": _readiness_summary(results),
-        "metrics": _recognition_metrics(results),
+        "metrics": _recognition_metrics(results, shop_labels, augment_review),
     }
-    report_path = output_path / "recognition_report_v1.json"
-    summary_path = output_path / "recognition_summary_v1.json"
-    shop_review_path = output_path / "recognition_shop_review_v1.json"
-    shop_review = _shop_review_report(results, shop_review_path)
     report = {
         "type": "tft_recognition_report",
         "schema_version": 1,
@@ -173,12 +180,16 @@ def build_tft_recognition_report(
         "report_path": str(report_path.resolve()),
         "summary_path": str(summary_path.resolve()),
         "shop_review_path": str(shop_review_path.resolve()),
+        "shop_labels_path": str(shop_labels_path.resolve()),
+        "augment_review_path": str(augment_review_path.resolve()),
         "summary": summary,
         "results": results,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     shop_review_path.write_text(json.dumps(shop_review, ensure_ascii=False, indent=2), encoding="utf-8")
+    shop_labels_path.write_text(json.dumps(shop_labels, ensure_ascii=False, indent=2), encoding="utf-8")
+    augment_review_path.write_text(json.dumps(augment_review, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 
 
@@ -294,6 +305,9 @@ def _enrich_shop_slots_from_ocr(
         item["raw_text"] = raw_text
         item["name"] = parsed["name"]
         item["cost"] = parsed["cost"]
+        item["name_candidate"] = parsed["name"]
+        item["cost_candidate"] = parsed["cost"]
+        item["ocr_lines"] = _ocr_lines(raw_text)
         item["ocr_confidence"] = _confidence(confidence)
         if raw_text:
             item["review_status"] = "needs_check"
@@ -302,6 +316,10 @@ def _enrich_shop_slots_from_ocr(
             item["review_status"] = "ocr_missing"
         enriched.append(item)
     return enriched
+
+
+def _ocr_lines(text: Any) -> list[str]:
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
 
 def _parse_shop_card_text(text: Any) -> dict[str, Any]:
@@ -356,14 +374,18 @@ def _xp_from_text(text: Any, confidence: float | None) -> dict[str, Any] | None:
 
 
 def _augment_options_from_ocr(ocr: Mapping[str, Any]) -> list[dict[str, Any]]:
+    regions = _ocr_regions_map(ocr)
     option_regions = [
         _augment_option_from_text(
             slot=index,
             text=_region_text(ocr, f"augment_option_{index}"),
             confidence=_region_confidence(ocr, f"augment_option_{index}"),
+            bbox=regions.get(f"augment_option_{index}", {}).get("bbox")
+            if isinstance(regions.get(f"augment_option_{index}"), Mapping)
+            else None,
         )
         for index in range(1, 4)
-        if f"augment_option_{index}" in _ocr_regions_map(ocr)
+        if f"augment_option_{index}" in regions
     ]
     if option_regions:
         return option_regions
@@ -375,12 +397,12 @@ def _augment_options_from_ocr(ocr: Mapping[str, Any]) -> list[dict[str, Any]]:
         lines = lines[1:]
     confidence = _confidence(_region_confidence(ocr, "augments"))
     return [
-        _augment_option_from_text(slot=index, text=line, confidence=confidence)
+        _augment_option_from_text(slot=index, text=line, confidence=confidence, bbox=None)
         for index, line in enumerate(lines[:3], start=1)
     ]
 
 
-def _augment_option_from_text(slot: int, text: Any, confidence: float | None) -> dict[str, Any]:
+def _augment_option_from_text(slot: int, text: Any, confidence: float | None, bbox: Any) -> dict[str, Any]:
     raw_text = str(text or "").strip()
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     title = lines[0] if lines else ""
@@ -388,10 +410,13 @@ def _augment_option_from_text(slot: int, text: Any, confidence: float | None) ->
     return {
         "slot": slot,
         "title": title,
+        "title_candidate": title or None,
         "description": description,
+        "description_candidate": description or None,
         "raw_text": raw_text,
         "confidence": _confidence(confidence),
         "review_status": "needs_check" if title else "missing",
+        "bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
     }
 
 
@@ -631,21 +656,63 @@ def _field_readiness(statuses: list[Any]) -> dict[str, Any]:
     }
 
 
-def _recognition_metrics(results: list[Mapping[str, Any]]) -> dict[str, float]:
+def _recognition_metrics(
+    results: list[Mapping[str, Any]],
+    shop_labels: Mapping[str, Any] | None = None,
+    augment_review: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     recognitions = [item.get("recognition", {}) for item in results if isinstance(item.get("recognition"), Mapping)]
     normal_shop = [item for item in recognitions if item.get("layout") == LAYOUT_NORMAL_SHOP]
     augment_select = [item for item in recognitions if item.get("layout") == LAYOUT_AUGMENT_SELECT]
     shop_slots = [slot for item in normal_shop for slot in item.get("shop", []) if isinstance(slot, Mapping)]
     occupied_slots = [slot for slot in shop_slots if slot.get("state") == "occupied"]
     augment_options = [option for item in augment_select for option in item.get("augments", []) if isinstance(option, Mapping)]
+    shop_label_samples = (shop_labels or {}).get("samples") if isinstance(shop_labels, Mapping) else []
+    augment_samples = (augment_review or {}).get("samples") if isinstance(augment_review, Mapping) else []
+    shop_human_labels = [
+        sample.get("human", {})
+        for sample in shop_label_samples
+        if isinstance(sample, Mapping) and isinstance(sample.get("human"), Mapping)
+    ]
+    augment_human_labels = [
+        option.get("human_label", {})
+        for sample in augment_samples
+        if isinstance(sample, Mapping)
+        for option in sample.get("augments", [])
+        if isinstance(option, Mapping) and isinstance(option.get("human_label"), Mapping)
+    ]
     return {
         "stage_present_rate": _rate(recognitions, lambda item: bool(item.get("stage"))),
         "gold_present_rate": _rate(normal_shop, lambda item: bool(item.get("gold"))),
         "level_xp_present_rate": _rate(normal_shop, lambda item: bool(item.get("level")) and bool(item.get("xp"))),
         "shop_slot_state_rate": _rate(shop_slots, lambda slot: slot.get("state") in {"empty", "occupied"}),
-        "shop_cost_present_rate": _rate(occupied_slots, lambda slot: slot.get("cost") is not None),
-        "shop_name_present_rate": _rate(occupied_slots, lambda slot: bool(slot.get("name"))),
-        "augment_title_present_rate": _rate(augment_options, lambda option: bool(option.get("title"))),
+        "shop_cost_present_rate": _rate(occupied_slots, lambda slot: slot.get("cost_candidate") is not None),
+        "shop_name_present_rate": _rate(occupied_slots, lambda slot: bool(slot.get("name_candidate"))),
+        "augment_title_present_rate": _rate(augment_options, lambda option: bool(option.get("title_candidate") or option.get("title"))),
+        "shop_cost_candidate_rate": _rate(occupied_slots, lambda slot: slot.get("cost_candidate") is not None),
+        "shop_name_candidate_rate": _rate(occupied_slots, lambda slot: bool(slot.get("name_candidate"))),
+        "shop_cost_verified_rate": _rate(shop_human_labels, lambda label: label.get("status") == "verified" and label.get("cost") is not None),
+        "shop_name_verified_rate": _rate(shop_human_labels, lambda label: label.get("status") == "verified" and bool(label.get("name"))),
+        "augment_title_candidate_rate": _rate(
+            augment_options,
+            lambda option: bool(option.get("title_candidate") or option.get("title")),
+        ),
+        "augment_description_candidate_rate": _rate(
+            augment_options,
+            lambda option: bool(option.get("description_candidate") or option.get("description")),
+        ),
+        "augment_title_verified_rate": _rate(
+            augment_human_labels,
+            lambda label: label.get("status") == "verified" and bool(label.get("title")),
+        ),
+        "augment_description_verified_rate": _rate(
+            augment_human_labels,
+            lambda label: label.get("status") == "verified" and bool(label.get("description")),
+        ),
+        "shop_occupied_slot_count": len(occupied_slots),
+        "shop_label_count": len(shop_human_labels),
+        "augment_option_count": len(augment_options),
+        "augment_label_count": len(augment_human_labels),
     }
 
 
@@ -655,19 +722,32 @@ def _rate(items: list[Any], predicate: Any) -> float:
     return round(sum(1 for item in items if predicate(item)) / len(items), 4)
 
 
-def _shop_review_report(results: list[Mapping[str, Any]], report_path: Path) -> dict[str, Any]:
+def _shop_review_report(
+    results: list[Mapping[str, Any]],
+    report_path: Path,
+    crops_dir: Path,
+    existing_labels: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> dict[str, Any]:
     samples = []
     for item in results:
         recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
         if recognition.get("layout") != LAYOUT_NORMAL_SHOP:
             continue
+        sample_crops_dir = crops_dir / f"sample_{item.get('index')}"
+        shop = _shop_review_slots(
+            image_path=item.get("image_path"),
+            sample_index=item.get("index"),
+            shop=recognition.get("shop") or [],
+            crops_dir=sample_crops_dir,
+            existing_labels=existing_labels,
+        )
         samples.append(
             {
                 "index": item.get("index"),
                 "label": item.get("label") or "",
                 "image_path": item.get("image_path"),
                 "layout": recognition.get("layout"),
-                "shop": recognition.get("shop") or [],
+                "shop": shop,
             }
         )
     return {
@@ -677,6 +757,208 @@ def _shop_review_report(results: list[Mapping[str, Any]], report_path: Path) -> 
         "report_path": str(report_path.resolve()),
         "samples": samples,
     }
+
+
+def _shop_review_slots(
+    *,
+    image_path: Any,
+    sample_index: Any,
+    shop: list[Mapping[str, Any]],
+    crops_dir: Path,
+    existing_labels: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    image = _open_review_image(image_path)
+    reviewed = []
+    for slot in shop:
+        item = dict(slot)
+        slot_number = int(item.get("slot") or 0)
+        label = existing_labels.get((str(sample_index), slot_number), {})
+        human_label = _human_label(label.get("human") if isinstance(label, Mapping) else None)
+        item["name_candidate"] = item.get("name_candidate") or item.get("name")
+        item["cost_candidate"] = item.get("cost_candidate", item.get("cost"))
+        item["human_label"] = human_label
+        item["crop_paths"] = {}
+        if image is not None and isinstance(item.get("bbox"), list):
+            subregions = _shop_slot_subregions(tuple(int(value) for value in item["bbox"]))
+            if item.get("state") != "occupied":
+                subregions = {"slot_full": subregions["slot_full"]}
+            item["crop_paths"] = _save_review_crops(image, subregions, crops_dir, f"slot_{slot_number}")
+        reviewed.append(item)
+    if image is not None:
+        image.close()
+    return reviewed
+
+
+def _shop_slot_subregions(bbox: tuple[int, int, int, int]) -> dict[str, tuple[int, int, int, int]]:
+    left, top, right, bottom = bbox
+    width = right - left
+    height = bottom - top
+    return {
+        "slot_full": bbox,
+        "slot_name": (left + int(width * 0.08), top + int(height * 0.55), right - int(width * 0.08), top + int(height * 0.77)),
+        "slot_cost": (left, top + int(height * 0.72), left + int(width * 0.28), bottom),
+        "slot_traits": (left + int(width * 0.28), top + int(height * 0.72), right - int(width * 0.08), bottom),
+    }
+
+
+def _shop_labels_report(shop_review: Mapping[str, Any], labels_path: Path) -> dict[str, Any]:
+    samples = []
+    for sample in shop_review.get("samples", []):
+        if not isinstance(sample, Mapping):
+            continue
+        for slot in sample.get("shop", []):
+            if not isinstance(slot, Mapping) or slot.get("state") != "occupied":
+                continue
+            samples.append(
+                {
+                    "index": sample.get("index"),
+                    "label": sample.get("label") or "",
+                    "slot": slot.get("slot"),
+                    "image_path": sample.get("image_path"),
+                    "crop_path": (slot.get("crop_paths") or {}).get("slot_full"),
+                    "machine": {
+                        "name_candidate": slot.get("name_candidate"),
+                        "cost_candidate": slot.get("cost_candidate"),
+                        "raw_text": slot.get("raw_text") or "",
+                        "confidence": slot.get("confidence"),
+                    },
+                    "human": slot.get("human_label") or _human_label(None),
+                }
+            )
+    return {
+        "type": "tft_shop_labels",
+        "schema_version": 1,
+        "report_version": "recognition_shop_labels_v1",
+        "report_path": str(labels_path.resolve()),
+        "samples": samples,
+    }
+
+
+def _augment_review_report(
+    results: list[Mapping[str, Any]],
+    report_path: Path,
+    crops_dir: Path,
+    existing_labels: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> dict[str, Any]:
+    samples = []
+    for item in results:
+        recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
+        if recognition.get("layout") != LAYOUT_AUGMENT_SELECT:
+            continue
+        image = _open_review_image(item.get("image_path"))
+        sample_crops_dir = crops_dir / f"sample_{item.get('index')}" / "augments"
+        augments = []
+        for option in recognition.get("augments", []):
+            if not isinstance(option, Mapping):
+                continue
+            slot_number = int(option.get("slot") or 0)
+            label = existing_labels.get((str(item.get("index")), slot_number), {})
+            crop_path = None
+            if image is not None and isinstance(option.get("bbox"), list):
+                saved = _save_review_crops(
+                    image,
+                    {"option": tuple(int(value) for value in option["bbox"])},
+                    sample_crops_dir,
+                    f"augment_{slot_number}",
+                )
+                crop_path = saved.get("option")
+            augments.append(
+                {
+                    "slot": option.get("slot"),
+                    "title_candidate": option.get("title_candidate") or option.get("title"),
+                    "description_candidate": option.get("description_candidate") or option.get("description"),
+                    "raw_text": option.get("raw_text") or "",
+                    "confidence": option.get("confidence"),
+                    "review_status": option.get("review_status") or "needs_check",
+                    "crop_path": crop_path,
+                    "bbox": option.get("bbox"),
+                    "human_label": _human_label(_label_payload(label), augment=True),
+                }
+            )
+        if image is not None:
+            image.close()
+        samples.append(
+            {
+                "index": item.get("index"),
+                "label": item.get("label") or "",
+                "image_path": item.get("image_path"),
+                "layout": recognition.get("layout"),
+                "augments": augments,
+            }
+        )
+    return {
+        "type": "tft_augment_review",
+        "schema_version": 1,
+        "report_version": "recognition_augment_review_v1",
+        "report_path": str(report_path.resolve()),
+        "samples": samples,
+    }
+
+
+def _open_review_image(image_path: Any) -> Image.Image | None:
+    try:
+        image = Image.open(Path(str(image_path)).expanduser())
+        image.load()
+        return image
+    except Exception:
+        return None
+
+
+def _save_review_crops(
+    image: Image.Image,
+    regions: Mapping[str, tuple[int, int, int, int]],
+    crops_dir: Path,
+    prefix: str,
+) -> dict[str, str]:
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    saved = {}
+    for key, bbox in regions.items():
+        crop_path = crops_dir / f"{prefix}_{key}.png"
+        image.crop(bbox).save(crop_path)
+        saved[key] = str(crop_path.resolve())
+    return saved
+
+
+def _load_human_labels(path: Path) -> dict[tuple[str, int], Mapping[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    labels = {}
+    for sample in payload.get("samples", []):
+        if not isinstance(sample, Mapping):
+            continue
+        slot = sample.get("slot")
+        if slot is None:
+            slot = sample.get("augment_slot")
+        if slot is not None:
+            labels[(str(sample.get("index")), int(slot))] = sample
+        for option in sample.get("augments", []):
+            if not isinstance(option, Mapping):
+                continue
+            option_slot = option.get("slot") if option.get("slot") is not None else option.get("augment_slot")
+            if option_slot is not None:
+                labels[(str(sample.get("index")), int(option_slot))] = {"index": sample.get("index"), **option}
+    return labels
+
+
+def _label_payload(label: Any) -> Any:
+    if not isinstance(label, Mapping):
+        return None
+    if isinstance(label.get("human"), Mapping):
+        return label.get("human")
+    if isinstance(label.get("human_label"), Mapping):
+        return label.get("human_label")
+    return label
+
+
+def _human_label(label: Any, *, augment: bool = False) -> dict[str, Any]:
+    source = dict(label) if isinstance(label, Mapping) else {}
+    if augment:
+        return {**source, "title": source.get("title"), "description": source.get("description"), "status": source.get("status") or "unreviewed"}
+    return {**source, "name": source.get("name"), "cost": source.get("cost"), "status": source.get("status") or "unreviewed"}
 
 
 def _load_calibration_report(report_or_path: Mapping[str, Any] | str | Path) -> Mapping[str, Any]:

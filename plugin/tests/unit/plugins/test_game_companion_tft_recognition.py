@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,8 @@ from PIL import Image, ImageDraw
 
 from plugin.plugins.game_companion.core.tft_recognition import (
     _parse_stage as _parse_recognition_stage,
+    _human_label,
+    _shop_slot_subregions,
     build_tft_recognition_report,
     recognize_tft_frame,
 )
@@ -149,6 +152,9 @@ def test_tft_recognition_outputs_structured_normal_shop_state(tmp_path: Path) ->
     assert result["shop"][1]["raw_text"] == "Lux 3"
     assert result["shop"][1]["name"] == "Lux"
     assert result["shop"][1]["cost"] == 3
+    assert result["shop"][1]["name_candidate"] == "Lux"
+    assert result["shop"][1]["cost_candidate"] == 3
+    assert result["shop"][1]["ocr_lines"] == ["Lux 3"]
     assert result["shop"][1]["review_status"] == "needs_check"
     assert result["augments"] == []
     assert result["field_status"]["shop"]["status"] == "present"
@@ -173,6 +179,29 @@ def test_tft_recognition_uses_round_fallback_and_last_gold_number(tmp_path: Path
 def test_tft_stage_parser_accepts_cjk_prefix_noise() -> None:
     assert _parse_recognition_stage("\u603b3-2") == "3-2"
     assert _parse_ocr_stage("\u5fd84-2") == "4-2"
+
+
+def test_tft_shop_slot_subregions_keep_traits_outside_cost_area() -> None:
+    subregions = _shop_slot_subregions((100, 200, 300, 500))
+
+    assert subregions["slot_full"] == (100, 200, 300, 500)
+    assert subregions["slot_cost"] == (100, 416, 156, 500)
+    assert subregions["slot_traits"][0] >= subregions["slot_cost"][2]
+
+
+def test_tft_human_label_preserves_extra_review_metadata() -> None:
+    assert _human_label({"name": "Lux", "cost": 3, "status": "verified", "notes": "checked"}) == {
+        "name": "Lux",
+        "cost": 3,
+        "status": "verified",
+        "notes": "checked",
+    }
+    assert _human_label({"title": "Augment", "description": "Desc", "status": "verified", "tags": ["good"]}, augment=True) == {
+        "title": "Augment",
+        "description": "Desc",
+        "status": "verified",
+        "tags": ["good"],
+    }
 
 
 def test_tft_recognition_skips_shop_for_combat_layout(tmp_path: Path) -> None:
@@ -283,29 +312,85 @@ def test_tft_recognition_splits_augment_options(tmp_path: Path) -> None:
 def test_tft_recognition_report_batches_calibration_screenshots(tmp_path: Path) -> None:
     normal = tmp_path / "normal.png"
     combat = tmp_path / "combat.png"
+    augment = tmp_path / "augment.png"
     _synthetic_tft_image(normal)
     _synthetic_tft_image(combat, layout=LAYOUT_COMBAT)
+    _synthetic_tft_image(augment, layout=LAYOUT_AUGMENT_SELECT)
     calibration_report = {
         "type": "tft_layout_calibration_report",
         "screenshots": [
             {"index": 1, "image_path": str(normal), "expected_layout": LAYOUT_NORMAL_SHOP, "label": "shop"},
             {"index": 2, "image_path": str(combat), "expected_layout": LAYOUT_COMBAT, "label": "combat"},
+            {"index": 3, "image_path": str(augment), "expected_layout": LAYOUT_AUGMENT_SELECT, "label": "augment"},
         ],
     }
+    output_dir = tmp_path / "recognition"
+    output_dir.mkdir()
+    labels_path = output_dir / "recognition_shop_labels_v1.json"
+    labels_path.write_text(
+        """{
+  "type": "tft_shop_labels",
+  "schema_version": 1,
+  "report_version": "recognition_shop_labels_v1",
+  "samples": [
+    {
+      "index": 1,
+      "slot": 2,
+      "human": {"name": "Verified Lux", "cost": 3, "status": "verified"}
+    }
+  ]
+}""",
+        encoding="utf-8",
+    )
+    augment_review_path = output_dir / "recognition_augment_review_v1.json"
+    augment_review_path.write_text(
+        """{
+  "type": "tft_augment_review",
+  "schema_version": 1,
+  "report_version": "recognition_augment_review_v1",
+  "samples": [
+    {
+      "index": 3,
+      "augments": [
+        {
+          "slot": 1,
+          "human_label": {
+            "title": "Verified Augment",
+            "description": "Verified description",
+            "status": "verified",
+            "notes": "kept"
+          }
+        }
+      ]
+    }
+  ]
+}""",
+        encoding="utf-8",
+    )
 
     report = build_tft_recognition_report(
         calibration_report,
-        output_dir=tmp_path / "recognition",
+        output_dir=output_dir,
         ocr_adapter=_FakeOcrAdapter(),
     )
 
     assert report["type"] == "tft_recognition_report"
-    assert report["summary"]["total"] == 2
-    assert report["summary"]["successes"] == 2
+    assert report["summary"]["total"] == 3
+    assert report["summary"]["successes"] == 3
     assert report["summary"]["metrics"]["stage_present_rate"] == 1.0
     assert report["summary"]["metrics"]["shop_slot_state_rate"] == 1.0
-    assert report["summary"]["metrics"]["shop_cost_present_rate"] > 0.0
-    assert report["summary"]["metrics"]["augment_title_present_rate"] == 0.0
+    assert report["summary"]["metrics"]["shop_cost_candidate_rate"] > 0.0
+    assert report["summary"]["metrics"]["shop_name_candidate_rate"] > 0.0
+    assert report["summary"]["metrics"]["shop_cost_verified_rate"] > 0.0
+    assert report["summary"]["metrics"]["shop_name_verified_rate"] > 0.0
+    assert report["summary"]["metrics"]["augment_title_candidate_rate"] == 1.0
+    assert report["summary"]["metrics"]["augment_description_candidate_rate"] == 1.0
+    assert report["summary"]["metrics"]["augment_title_verified_rate"] > 0.0
+    assert report["summary"]["metrics"]["augment_description_verified_rate"] > 0.0
+    assert report["summary"]["metrics"]["shop_occupied_slot_count"] > 0
+    assert report["summary"]["metrics"]["shop_label_count"] > 0
+    assert report["summary"]["metrics"]["augment_option_count"] == 3
+    assert report["summary"]["metrics"]["augment_label_count"] == 3
     assert report["summary"]["readiness"][LAYOUT_NORMAL_SHOP]["status"] == "ready"
     assert report["summary"]["readiness"][LAYOUT_COMBAT]["status"] == "ready"
     assert report["summary"]["readiness"][LAYOUT_COMBAT]["fields"]["shop"]["status"] == "not_applicable"
@@ -313,6 +398,31 @@ def test_tft_recognition_report_batches_calibration_screenshots(tmp_path: Path) 
     assert Path(report["report_path"]).is_file()
     assert Path(report["summary_path"]).is_file()
     assert Path(report["shop_review_path"]).is_file()
-    shop_review = Path(report["shop_review_path"]).read_text(encoding="utf-8")
-    assert '"type": "tft_shop_review"' in shop_review
-    assert '"normal_shop"' in shop_review
+    assert Path(report["shop_labels_path"]).is_file()
+    assert Path(report["augment_review_path"]).is_file()
+    shop_review = json.loads(Path(report["shop_review_path"]).read_text(encoding="utf-8"))
+    first_slot = shop_review["samples"][0]["shop"][0]
+    occupied_slot = shop_review["samples"][0]["shop"][1]
+    assert first_slot["state"] == "empty"
+    assert set(first_slot["crop_paths"]) == {"slot_full"}
+    assert occupied_slot["name_candidate"] == "Lux"
+    assert occupied_slot["cost_candidate"] == 3
+    assert occupied_slot["human_label"] == {"name": "Verified Lux", "cost": 3, "status": "verified"}
+    assert set(occupied_slot["crop_paths"]) == {"slot_full", "slot_name", "slot_cost", "slot_traits"}
+    for crop_path in occupied_slot["crop_paths"].values():
+        assert Path(crop_path).is_file()
+    shop_labels = json.loads(Path(report["shop_labels_path"]).read_text(encoding="utf-8"))
+    assert shop_labels["type"] == "tft_shop_labels"
+    assert shop_labels["samples"][0]["human"] == {"name": "Verified Lux", "cost": 3, "status": "verified"}
+    augment_review = json.loads(Path(report["augment_review_path"]).read_text(encoding="utf-8"))
+    assert augment_review["type"] == "tft_augment_review"
+    assert len(augment_review["samples"]) == 1
+    assert len(augment_review["samples"][0]["augments"]) == 3
+    assert augment_review["samples"][0]["augments"][0]["title_candidate"] == "Augment 1"
+    assert Path(augment_review["samples"][0]["augments"][0]["crop_path"]).is_file()
+    assert augment_review["samples"][0]["augments"][0]["human_label"] == {
+        "title": "Verified Augment",
+        "description": "Verified description",
+        "status": "verified",
+        "notes": "kept",
+    }
