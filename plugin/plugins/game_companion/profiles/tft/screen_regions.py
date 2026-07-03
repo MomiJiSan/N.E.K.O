@@ -92,6 +92,12 @@ SHOP_SLOT_KEYS = (
     "shop_slot_5",
 )
 
+AUGMENT_OPTION_KEYS = (
+    "augment_option_1",
+    "augment_option_2",
+    "augment_option_3",
+)
+
 LEGACY_GROUPED_REGION_KEYS = (
     "shop",
     "bench",
@@ -156,7 +162,7 @@ TFT_LAYOUT_PROFILES: dict[str, TFTLayoutProfile] = {
         key=LAYOUT_AUGMENT_SELECT,
         display_name="Augment select",
         description="Augment selection overlay. It should be detected and handled separately from normal shop analysis.",
-        primary_regions=("stage", "round", "augments", "notifications"),
+        primary_regions=("stage", "round", "augments", *AUGMENT_OPTION_KEYS, "notifications"),
     ),
     LAYOUT_SPECIAL: TFTLayoutProfile(
         key=LAYOUT_SPECIAL,
@@ -261,6 +267,36 @@ REGION_DEFINITIONS: tuple[ScreenRegion, ...] = (
         layout=LAYOUT_AUGMENT_SELECT,
         priority=1,
         purpose="augment_text",
+        recognizers=("ocr",),
+        active_layouts=(LAYOUT_AUGMENT_SELECT,),
+    ),
+    ScreenRegion(
+        "augment_option_1",
+        "Augment option 1",
+        _ratio_box(520, 260, 800, 860),
+        layout=LAYOUT_AUGMENT_SELECT,
+        priority=1,
+        purpose="augment_option_text",
+        recognizers=("ocr",),
+        active_layouts=(LAYOUT_AUGMENT_SELECT,),
+    ),
+    ScreenRegion(
+        "augment_option_2",
+        "Augment option 2",
+        _ratio_box(820, 260, 1100, 860),
+        layout=LAYOUT_AUGMENT_SELECT,
+        priority=1,
+        purpose="augment_option_text",
+        recognizers=("ocr",),
+        active_layouts=(LAYOUT_AUGMENT_SELECT,),
+    ),
+    ScreenRegion(
+        "augment_option_3",
+        "Augment option 3",
+        _ratio_box(1120, 260, 1400, 860),
+        layout=LAYOUT_AUGMENT_SELECT,
+        priority=1,
+        purpose="augment_option_text",
         recognizers=("ocr",),
         active_layouts=(LAYOUT_AUGMENT_SELECT,),
     ),

@@ -45,6 +45,22 @@ class _FakeOcrAdapter:
                 "confidence": 0.81,
                 "bbox": list(regions["augments"]),
             }
+        for index in range(1, 4):
+            key = f"augment_option_{index}"
+            if key in regions:
+                results[key] = {
+                    "text": f"Augment {index}\nDescription {index}\n\u6218\u529b\u5f3a\u5316",
+                    "confidence": 0.7 + index * 0.03,
+                    "bbox": list(regions[key]),
+                }
+        for index in range(1, 6):
+            key = f"shop_slot_{index}"
+            if key in regions:
+                results[key] = {
+                    "text": f"Lux {index + 1}",
+                    "confidence": 0.62,
+                    "bbox": list(regions[key]),
+                }
         return {"available": True, "status": "ready", "error": None, "regions": results, "parsed": {}}
 
 
@@ -80,6 +96,16 @@ class _MissingStageOcrAdapter:
 class _FailingOcrAdapter:
     def recognize(self, _image_path: str | Path, _regions: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("OCR exploded")
+
+
+class _RecordingShopOcrAdapter(_FakeOcrAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.region_keys: set[str] = set()
+
+    def recognize(self, image_path: str | Path, regions: dict[str, Any]) -> dict[str, Any]:
+        self.region_keys = set(regions)
+        return super().recognize(image_path, regions)
 
 
 def _synthetic_tft_image(path: Path, layout: str = LAYOUT_NORMAL_SHOP) -> None:
@@ -118,6 +144,12 @@ def test_tft_recognition_outputs_structured_normal_shop_state(tmp_path: Path) ->
     assert len(result["shop"]) == 5
     assert result["shop"][0]["state"] == "empty"
     assert result["shop"][1]["state"] == "occupied"
+    assert result["shop"][0]["raw_text"] == ""
+    assert result["shop"][0]["review_status"] == "empty"
+    assert result["shop"][1]["raw_text"] == "Lux 3"
+    assert result["shop"][1]["name"] == "Lux"
+    assert result["shop"][1]["cost"] == 3
+    assert result["shop"][1]["review_status"] == "needs_check"
     assert result["augments"] == []
     assert result["field_status"]["shop"]["status"] == "present"
     assert result["warnings"] == []
@@ -175,6 +207,10 @@ def test_tft_recognition_ocr_exception_becomes_warning(tmp_path: Path) -> None:
     assert result["success"] is True
     assert result["stage"] is None
     assert result["shop"]
+    assert result["shop"][1]["review_status"] == "ocr_missing"
+    assert result["shop"][1]["raw_text"] == ""
+    assert result["shop"][1]["name"] is None
+    assert result["shop"][1]["cost"] is None
     assert result["warnings"][0]["code"] == "ocr_failed"
 
 
@@ -212,6 +248,38 @@ def test_tft_recognition_reads_augment_text_without_shop_noise(tmp_path: Path) -
     assert "战力强化" in result["augments"][0]["raw_text"]
 
 
+def test_tft_recognition_only_sends_occupied_shop_slots_to_ocr(tmp_path: Path) -> None:
+    screenshot = tmp_path / "normal_shop.png"
+    _synthetic_tft_image(screenshot)
+    adapter = _RecordingShopOcrAdapter()
+
+    recognize_tft_frame(
+        screenshot,
+        expected_layout=LAYOUT_NORMAL_SHOP,
+        ocr_adapter=adapter,
+    )
+
+    assert "shop_slot_1" not in adapter.region_keys
+    assert "shop_slot_2" in adapter.region_keys
+
+
+def test_tft_recognition_splits_augment_options(tmp_path: Path) -> None:
+    screenshot = tmp_path / "augment.png"
+    _synthetic_tft_image(screenshot, layout=LAYOUT_AUGMENT_SELECT)
+
+    result = recognize_tft_frame(
+        screenshot,
+        expected_layout=LAYOUT_AUGMENT_SELECT,
+        ocr_adapter=_FakeOcrAdapter(),
+    )
+
+    assert len(result["augments"]) == 3
+    assert result["augments"][0]["slot"] == 1
+    assert result["augments"][0]["title"] == "Augment 1"
+    assert result["augments"][0]["description"] == "Description 1 战力强化"
+    assert result["augments"][0]["review_status"] == "needs_check"
+
+
 def test_tft_recognition_report_batches_calibration_screenshots(tmp_path: Path) -> None:
     normal = tmp_path / "normal.png"
     combat = tmp_path / "combat.png"
@@ -234,9 +302,17 @@ def test_tft_recognition_report_batches_calibration_screenshots(tmp_path: Path) 
     assert report["type"] == "tft_recognition_report"
     assert report["summary"]["total"] == 2
     assert report["summary"]["successes"] == 2
+    assert report["summary"]["metrics"]["stage_present_rate"] == 1.0
+    assert report["summary"]["metrics"]["shop_slot_state_rate"] == 1.0
+    assert report["summary"]["metrics"]["shop_cost_present_rate"] > 0.0
+    assert report["summary"]["metrics"]["augment_title_present_rate"] == 0.0
     assert report["summary"]["readiness"][LAYOUT_NORMAL_SHOP]["status"] == "ready"
     assert report["summary"]["readiness"][LAYOUT_COMBAT]["status"] == "ready"
     assert report["summary"]["readiness"][LAYOUT_COMBAT]["fields"]["shop"]["status"] == "not_applicable"
     assert report["results"][0]["recognition"]["shop"][1]["state"] == "occupied"
     assert Path(report["report_path"]).is_file()
     assert Path(report["summary_path"]).is_file()
+    assert Path(report["shop_review_path"]).is_file()
+    shop_review = Path(report["shop_review_path"]).read_text(encoding="utf-8")
+    assert '"type": "tft_shop_review"' in shop_review
+    assert '"normal_shop"' in shop_review

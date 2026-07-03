@@ -21,6 +21,7 @@ from plugin.plugins.game_companion.core.calibration import (
     update_tft_layout_calibration_checks,
 )
 from plugin.plugins.game_companion.profiles.tft.screen_regions import (
+    AUGMENT_OPTION_KEYS,
     LAYOUT_AUGMENT_SELECT,
     LAYOUT_COMBAT,
     LAYOUT_NORMAL_SHOP,
@@ -49,6 +50,7 @@ def test_tft_layout_profiles_define_reconnaissance_states() -> None:
     assert layout_profile(LAYOUT_SPECIAL).deep_recognition is False
     assert "shop_slots" in layout_profile(LAYOUT_NORMAL_SHOP).primary_regions
     assert "augments" in layout_profile(LAYOUT_AUGMENT_SELECT).primary_regions
+    assert all(key in layout_profile(LAYOUT_AUGMENT_SELECT).primary_regions for key in AUGMENT_OPTION_KEYS)
 
 
 def test_screen_regions_expose_semantic_metadata_for_16_9_layout() -> None:
@@ -64,6 +66,8 @@ def test_screen_regions_expose_semantic_metadata_for_16_9_layout() -> None:
     assert metadata["gold"]["priority"] < metadata["shop_slot_1"]["priority"]
     assert metadata["augments"]["layout"] == LAYOUT_AUGMENT_SELECT
     assert metadata["augments"]["active_layouts"] == [LAYOUT_AUGMENT_SELECT]
+    assert metadata["augment_option_1"]["layout"] == LAYOUT_AUGMENT_SELECT
+    assert metadata["augment_option_1"]["purpose"] == "augment_option_text"
     assert metadata["players_panel"]["purpose"] == "players"
     assert metadata["level_exp"]["purpose"] == "economy"
 
@@ -79,11 +83,14 @@ def test_layout_region_bboxes_filter_by_primary_layout() -> None:
     assert "equipment" in normal_regions
     assert all(key in normal_regions for key in SHOP_SLOT_KEYS)
     assert "augments" not in normal_regions
-    assert set(augment_regions) == {"stage", "round", "augments", "notifications"}
+    assert set(augment_regions) == {"stage", "round", "augments", *AUGMENT_OPTION_KEYS, "notifications"}
     assert [region.key for region in screen_region_definitions(layout=LAYOUT_AUGMENT_SELECT)] == [
         "stage",
         "round",
         "augments",
+        "augment_option_1",
+        "augment_option_2",
+        "augment_option_3",
         "notifications",
     ]
 
@@ -98,6 +105,7 @@ def test_grouped_region_metadata_exposes_semantic_groups() -> None:
     assert any(region["key"] == "board" for region in grouped["groups"]["combat"])
     assert any(region["key"] == "equipment" for region in grouped["groups"]["combat"])
     assert any(region["key"] == "augments" for region in grouped["groups"]["augment_select"])
+    assert any(region["key"] == "augment_option_1" for region in grouped["groups"]["augment_select"])
 
 
 def test_debug_crops_include_layout_metadata_and_readable_filenames(tmp_path: Path) -> None:

@@ -8,7 +8,22 @@ from PIL import Image
 
 from .screen_regions import BBox
 
-OCR_REGION_KEYS = ("gold", "level", "level_exp", "stage", "round", "augments")
+OCR_REGION_KEYS = (
+    "gold",
+    "level",
+    "level_exp",
+    "stage",
+    "round",
+    "augments",
+    "augment_option_1",
+    "augment_option_2",
+    "augment_option_3",
+    "shop_slot_1",
+    "shop_slot_2",
+    "shop_slot_3",
+    "shop_slot_4",
+    "shop_slot_5",
+)
 
 
 def analyze_tft_ocr_regions(

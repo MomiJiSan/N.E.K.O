@@ -11,6 +11,7 @@ from PIL import Image, ImageStat
 
 from ..profiles.tft.ocr import analyze_tft_ocr_regions
 from ..profiles.tft.screen_regions import (
+    AUGMENT_OPTION_KEYS,
     LAYOUT_AUGMENT_SELECT,
     LAYOUT_COMBAT,
     LAYOUT_NORMAL_SHOP,
@@ -45,6 +46,7 @@ def recognize_tft_frame(
             width, height = image.size
             regions = layout_region_bboxes(width, height, layout)
             shop = _recognize_shop_slots(image, regions) if layout == LAYOUT_NORMAL_SHOP else []
+            ocr_regions = _ocr_regions_for_layout(regions, layout, shop)
     except UnsupportedAspectRatioError as exc:
         return _error_result(path, layout, "unsupported_aspect_ratio", str(exc))
     except OSError as exc:
@@ -52,7 +54,7 @@ def recognize_tft_frame(
 
     adapter = ocr_adapter or RapidOcrTftAdapter()
     try:
-        ocr = adapter.recognize(path, regions)
+        ocr = adapter.recognize(path, ocr_regions)
     except Exception as exc:
         ocr = {
             "available": False,
@@ -81,6 +83,7 @@ def recognize_tft_frame(
     level_confidence = _region_confidence(ocr, "level_exp") or _region_confidence(ocr, "level")
     level = _field_from_text("level", level_text, level_confidence, _parse_int) if "level_exp" in regions else None
     xp = _xp_from_text(level_text, level_confidence) if "level_exp" in regions else None
+    shop = _enrich_shop_slots_from_ocr(shop, ocr) if layout == LAYOUT_NORMAL_SHOP else []
     augments = _augment_options_from_ocr(ocr) if layout == LAYOUT_AUGMENT_SELECT else []
     warnings.extend(_missing_field_warnings(layout, stage=stage, gold=gold, level=level, xp=xp, augments=augments))
     field_status = _field_statuses(
@@ -153,9 +156,12 @@ def build_tft_recognition_report(
         "layouts": _layout_counts(results),
         "warnings": sum(len(item["recognition"].get("warnings") or []) for item in results),
         "readiness": _readiness_summary(results),
+        "metrics": _recognition_metrics(results),
     }
     report_path = output_path / "recognition_report_v1.json"
     summary_path = output_path / "recognition_summary_v1.json"
+    shop_review_path = output_path / "recognition_shop_review_v1.json"
+    shop_review = _shop_review_report(results, shop_review_path)
     report = {
         "type": "tft_recognition_report",
         "schema_version": 1,
@@ -166,11 +172,13 @@ def build_tft_recognition_report(
         else "",
         "report_path": str(report_path.resolve()),
         "summary_path": str(summary_path.resolve()),
+        "shop_review_path": str(shop_review_path.resolve()),
         "summary": summary,
         "results": results,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    shop_review_path.write_text(json.dumps(shop_review, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 
 
@@ -183,6 +191,30 @@ def _normalize_layout(layout: str | None) -> str:
 
 def _flat_regions(regions: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in regions.items() if isinstance(value, tuple) and len(value) == 4}
+
+
+def _ocr_regions_for_layout(
+    regions: Mapping[str, Any],
+    layout: str,
+    shop: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    ocr_regions = {
+        key: value
+        for key, value in _flat_regions(regions).items()
+        if key not in SHOP_SLOT_KEYS and key != "augments"
+    }
+    if layout == LAYOUT_NORMAL_SHOP:
+        for slot in shop:
+            slot_number = slot.get("slot")
+            slot_key = f"shop_slot_{slot_number}"
+            if slot.get("state") == "occupied" and slot_key in regions:
+                ocr_regions[slot_key] = regions[slot_key]
+    if layout == LAYOUT_AUGMENT_SELECT and isinstance(regions.get("augments"), tuple):
+        ocr_regions["augments"] = regions["augments"]
+        for option_key in AUGMENT_OPTION_KEYS:
+            if option_key in regions:
+                ocr_regions[option_key] = regions[option_key]
+    return ocr_regions
 
 
 def _recognize_shop_slots(image: Image.Image, regions: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -219,6 +251,8 @@ def _recognize_shop_slots(image: Image.Image, regions: Mapping[str, Any]) -> lis
                 "state": state,
                 "name": None,
                 "cost": None,
+                "raw_text": "",
+                "review_status": _initial_shop_review_status(state),
                 "confidence": round(confidence, 4),
                 "bbox": list(bbox),
                 "diagnostics": {
@@ -229,6 +263,67 @@ def _recognize_shop_slots(image: Image.Image, regions: Mapping[str, Any]) -> lis
             }
         )
     return slots
+
+
+def _initial_shop_review_status(state: str) -> str:
+    if state == "empty":
+        return "empty"
+    if state == "occupied":
+        return "needs_ocr"
+    return "unknown"
+
+
+def _enrich_shop_slots_from_ocr(
+    shop: list[Mapping[str, Any]],
+    ocr: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for slot in shop:
+        item = dict(slot)
+        if item.get("state") != "occupied":
+            item.setdefault("raw_text", "")
+            item.setdefault("name", None)
+            item.setdefault("cost", None)
+            item["review_status"] = "empty" if item.get("state") == "empty" else "unknown"
+            enriched.append(item)
+            continue
+        slot_key = f"shop_slot_{item.get('slot')}"
+        raw_text = _region_text(ocr, slot_key).strip()
+        confidence = _region_confidence(ocr, slot_key)
+        parsed = _parse_shop_card_text(raw_text)
+        item["raw_text"] = raw_text
+        item["name"] = parsed["name"]
+        item["cost"] = parsed["cost"]
+        item["ocr_confidence"] = _confidence(confidence)
+        if raw_text:
+            item["review_status"] = "needs_check"
+            item["confidence"] = _confidence((float(item.get("confidence", 0.0)) + _confidence(confidence)) / 2.0)
+        else:
+            item["review_status"] = "ocr_missing"
+        enriched.append(item)
+    return enriched
+
+
+def _parse_shop_card_text(text: Any) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    cost = _parse_shop_cost(raw)
+    name = _parse_shop_name(raw, cost)
+    return {"name": name, "cost": cost}
+
+
+def _parse_shop_cost(text: str) -> int | None:
+    candidates = [int(value) for value in re.findall(r"\d+", text) if 1 <= int(value) <= 5]
+    return candidates[-1] if candidates else None
+
+
+def _parse_shop_name(text: str, cost: int | None) -> str | None:
+    for line in [line.strip() for line in text.splitlines() if line.strip()]:
+        candidate = re.sub(r"\d+", "", line).strip(" -:：|")
+        if cost is not None and str(cost) == line.strip():
+            continue
+        if candidate:
+            return candidate
+    return None
 
 
 def _field_from_text(
@@ -261,6 +356,17 @@ def _xp_from_text(text: Any, confidence: float | None) -> dict[str, Any] | None:
 
 
 def _augment_options_from_ocr(ocr: Mapping[str, Any]) -> list[dict[str, Any]]:
+    option_regions = [
+        _augment_option_from_text(
+            slot=index,
+            text=_region_text(ocr, f"augment_option_{index}"),
+            confidence=_region_confidence(ocr, f"augment_option_{index}"),
+        )
+        for index in range(1, 4)
+        if f"augment_option_{index}" in _ocr_regions_map(ocr)
+    ]
+    if option_regions:
+        return option_regions
     text = _region_text(ocr, "augments")
     if not text:
         return []
@@ -269,15 +375,24 @@ def _augment_options_from_ocr(ocr: Mapping[str, Any]) -> list[dict[str, Any]]:
         lines = lines[1:]
     confidence = _confidence(_region_confidence(ocr, "augments"))
     return [
-        {
-            "slot": index,
-            "title": line,
-            "description": "",
-            "raw_text": line,
-            "confidence": confidence,
-        }
+        _augment_option_from_text(slot=index, text=line, confidence=confidence)
         for index, line in enumerate(lines[:3], start=1)
     ]
+
+
+def _augment_option_from_text(slot: int, text: Any, confidence: float | None) -> dict[str, Any]:
+    raw_text = str(text or "").strip()
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    title = lines[0] if lines else ""
+    description = " ".join(lines[1:]) if len(lines) > 1 else ""
+    return {
+        "slot": slot,
+        "title": title,
+        "description": description,
+        "raw_text": raw_text,
+        "confidence": _confidence(confidence),
+        "review_status": "needs_check" if title else "missing",
+    }
 
 
 def _missing_field_warnings(
@@ -381,7 +496,7 @@ def _shop_status(layout: str, shop: list[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 def _region_text(ocr: Mapping[str, Any], key: str) -> str:
-    regions = ocr.get("regions") if isinstance(ocr.get("regions"), Mapping) else {}
+    regions = _ocr_regions_map(ocr)
     region = regions.get(key) if isinstance(regions, Mapping) else None
     if isinstance(region, Mapping):
         return str(region.get("text") or "")
@@ -391,11 +506,16 @@ def _region_text(ocr: Mapping[str, Any], key: str) -> str:
 
 
 def _region_confidence(ocr: Mapping[str, Any], key: str) -> float | None:
-    regions = ocr.get("regions") if isinstance(ocr.get("regions"), Mapping) else {}
+    regions = _ocr_regions_map(ocr)
     region = regions.get(key) if isinstance(regions, Mapping) else None
     if isinstance(region, Mapping) and region.get("confidence") is not None:
         return float(region["confidence"])
     return None
+
+
+def _ocr_regions_map(ocr: Mapping[str, Any]) -> Mapping[str, Any]:
+    regions = ocr.get("regions") if isinstance(ocr.get("regions"), Mapping) else {}
+    return regions
 
 
 def _parse_int(text: Any) -> int | None:
@@ -508,6 +628,54 @@ def _field_readiness(statuses: list[Any]) -> dict[str, Any]:
         "partial": partial,
         "missing": missing,
         "not_applicable": not_applicable,
+    }
+
+
+def _recognition_metrics(results: list[Mapping[str, Any]]) -> dict[str, float]:
+    recognitions = [item.get("recognition", {}) for item in results if isinstance(item.get("recognition"), Mapping)]
+    normal_shop = [item for item in recognitions if item.get("layout") == LAYOUT_NORMAL_SHOP]
+    augment_select = [item for item in recognitions if item.get("layout") == LAYOUT_AUGMENT_SELECT]
+    shop_slots = [slot for item in normal_shop for slot in item.get("shop", []) if isinstance(slot, Mapping)]
+    occupied_slots = [slot for slot in shop_slots if slot.get("state") == "occupied"]
+    augment_options = [option for item in augment_select for option in item.get("augments", []) if isinstance(option, Mapping)]
+    return {
+        "stage_present_rate": _rate(recognitions, lambda item: bool(item.get("stage"))),
+        "gold_present_rate": _rate(normal_shop, lambda item: bool(item.get("gold"))),
+        "level_xp_present_rate": _rate(normal_shop, lambda item: bool(item.get("level")) and bool(item.get("xp"))),
+        "shop_slot_state_rate": _rate(shop_slots, lambda slot: slot.get("state") in {"empty", "occupied"}),
+        "shop_cost_present_rate": _rate(occupied_slots, lambda slot: slot.get("cost") is not None),
+        "shop_name_present_rate": _rate(occupied_slots, lambda slot: bool(slot.get("name"))),
+        "augment_title_present_rate": _rate(augment_options, lambda option: bool(option.get("title"))),
+    }
+
+
+def _rate(items: list[Any], predicate: Any) -> float:
+    if not items:
+        return 0.0
+    return round(sum(1 for item in items if predicate(item)) / len(items), 4)
+
+
+def _shop_review_report(results: list[Mapping[str, Any]], report_path: Path) -> dict[str, Any]:
+    samples = []
+    for item in results:
+        recognition = item.get("recognition") if isinstance(item.get("recognition"), Mapping) else {}
+        if recognition.get("layout") != LAYOUT_NORMAL_SHOP:
+            continue
+        samples.append(
+            {
+                "index": item.get("index"),
+                "label": item.get("label") or "",
+                "image_path": item.get("image_path"),
+                "layout": recognition.get("layout"),
+                "shop": recognition.get("shop") or [],
+            }
+        )
+    return {
+        "type": "tft_shop_review",
+        "schema_version": 1,
+        "report_version": "recognition_shop_review_v1",
+        "report_path": str(report_path.resolve()),
+        "samples": samples,
     }
 
 
