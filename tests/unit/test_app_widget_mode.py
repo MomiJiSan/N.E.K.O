@@ -61,6 +61,7 @@ def test_widget_mode_browser_client_syncs_minimal_state_and_event() -> None:
             for (const callback of listeners.get(event.type) || []) callback(event);
           }},
           showStatusToast(message) {{ notices.push(message); }},
+          t(key) {{ return key; }},
           nekoLocalMutationSecurity: {{
             peekCachedToken() {{ return 'csrf-token'; }},
           }},
@@ -146,7 +147,11 @@ def test_widget_mode_browser_client_syncs_minimal_state_and_event() -> None:
               || !stateEvents.some((state) => state.enabled === true)) {{
             throw new Error('state event did not cover both states');
           }}
-          if (notices.length !== 2) throw new Error('toggle notices missing');
+          if (notices.length !== 2
+              || notices[0] !== '贴边探身 Beta 已开启。'
+              || notices[1] !== '隐身模式已开启。') {{
+            throw new Error('toggle notices did not use the local fallbacks');
+          }}
           console.log('Widget Mode minimal browser client passed');
         }})().catch((error) => {{
           console.error(error && error.stack ? error.stack : error);
