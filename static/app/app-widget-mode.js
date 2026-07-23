@@ -115,14 +115,14 @@
             applyBackendState(data.state);
             if (!silent) {
                 showNotice(next
-                    ? t('settings.widgetMode.enabledNotice', '贴边探身已开启。')
-                    : t('settings.widgetMode.disabledNotice', '贴边探身已关闭。'));
+                    ? t('settings.widgetMode.enabledNotice', '贴边探身 Beta 已开启。')
+                    : t('settings.widgetMode.disabledNotice', '贴边探身 Beta 已关闭。'));
             }
             return true;
         } catch (error) {
             console.warn('[WidgetMode] toggle failed:', error);
             if (!silent) {
-                showNotice(t('settings.widgetMode.toggleFailed', '贴边探身切换失败，请稍后重试。'));
+                showNotice(t('settings.widgetMode.toggleFailed', '贴边探身 Beta 切换失败，请稍后重试。'));
             }
             await refreshState();
             return false;
@@ -145,7 +145,7 @@
         } catch (error) {
             console.warn('[WidgetMode] stealth toggle failed:', error);
             if (!silent) {
-                showNotice(t('settings.widgetMode.toggleFailed', '贴边探身切换失败，请稍后重试。'));
+                showNotice(t('settings.widgetMode.toggleFailed', '贴边探身 Beta 切换失败，请稍后重试。'));
             }
             await refreshState();
             return false;
