@@ -1,0 +1,20 @@
+[plugin]
+id = "from_the_heart"
+name = "From the Heart Game Bridge"
+description = "Bounded dialogue and visual enhancement for NEKO: From the Heart."
+version = "0.2.0"
+entry = "plugin.plugins.from_the_heart:FromTheHeartPlugin"
+
+[plugin.author]
+name = "N.E.K.O Team"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[plugin.store]
+enabled = false
