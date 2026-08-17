@@ -801,6 +801,7 @@ class _TransportMixin:
             "request_id": None,
             "task": None,
             "ticket": None,
+            "submit_task": None,
         }
 
     def _bind_external_visual_frame(
@@ -905,6 +906,13 @@ class _TransportMixin:
                 self._fire_task(
                     self._ensure_response_arbiter().cancel_ticket(ticket)
                 )
+            submit_task = record.get("submit_task")
+            if (
+                submit_task is not None
+                and submit_task is not asyncio.current_task()
+                and not submit_task.done()
+            ):
+                submit_task.cancel()
 
     async def stream_image(
         self,
