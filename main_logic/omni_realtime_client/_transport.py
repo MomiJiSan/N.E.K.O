@@ -800,6 +800,7 @@ class _TransportMixin:
             "source": None,
             "request_id": None,
             "task": None,
+            "ticket": None,
         }
 
     def _bind_external_visual_frame(
@@ -857,7 +858,6 @@ class _TransportMixin:
 
         task = record.get("task")
         if task is None:
-            self._external_visual_turns.pop(turn_id, None)
             return None
         try:
             description = await asyncio.wait_for(
@@ -875,10 +875,9 @@ class _TransportMixin:
             # _abandon_external_visual_turn(). Propagate that cancellation so
             # the superseded transcript cannot enqueue after the new turn has
             # paused dispatch.
-            raise
-        finally:
             if self._external_visual_turns.get(turn_id) is record:
                 self._external_visual_turns.pop(turn_id, None)
+            raise
 
         if (
             not description
@@ -901,6 +900,11 @@ class _TransportMixin:
             task = record.get("task")
             if task is not None and not task.done():
                 task.cancel()
+            ticket = record.get("ticket")
+            if ticket is not None:
+                self._fire_task(
+                    self._ensure_response_arbiter().cancel_ticket(ticket)
+                )
 
     async def stream_image(
         self,
