@@ -998,6 +998,9 @@ class _TransportMixin:
                         mode=delivery_mode.value,
                         generation=getattr(self, "_latest_image_generation", 0),
                         description=clean_description or None,
+                        rejection_reason=(
+                            None if clean_description else "analysis_empty"
+                        ),
                     )
 
                 self._latest_image_generation = (
@@ -1035,6 +1038,9 @@ class _TransportMixin:
                     mode=VisualDeliveryMode.EXTERNAL_DESCRIPTION.value,
                     generation=getattr(self, "_latest_image_generation", 0),
                     description=clean_description or None,
+                    rejection_reason=(
+                        None if clean_description else "analysis_empty"
+                    ),
                 )
 
             # Standard StepFun is the only realtime provider without native
