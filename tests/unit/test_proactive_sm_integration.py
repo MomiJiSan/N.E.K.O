@@ -419,6 +419,49 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     )
 
 
+async def test_voice_mode_native_media_rechecks_user_activity_after_stream():
+    sess = _make_voice_sess()
+    sess._inject_rejection_handlers = {}
+    mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
+
+    async def _stream_image(
+        _image_b64,
+        *,
+        bypass_rate_limit=False,
+        cache_latest=True,
+        source=None,
+        request_id=None,
+        on_rejected=None,
+    ):
+        assert bypass_rate_limit is True
+        assert cache_latest is False
+        assert source == "callback"
+        assert on_rejected is not None
+        await asyncio.sleep(0)
+        sess._client_vad_active = True
+        return SimpleNamespace(accepted=True, mode="native")
+
+    sess.stream_image = _stream_image
+    cb = {
+        "_callback_delivery_id": "id-vad-during-native-media",
+        "status": "completed",
+        "summary": "defer native visual callback",
+        "media_images": ["callback-image"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.inject_calls == 0
+    assert mgr.pending_agent_callbacks == [cb]
+    assert cb.get("_voice_delivery_committed") is None
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+
 async def test_external_callback_rechecks_user_activity_after_visual_analysis():
     """A user turn that wins the vision await must preempt proactive injection."""
     sess = _make_voice_sess()
@@ -532,6 +575,45 @@ async def test_callback_media_analysis_rechecks_session_ownership():
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
     )
+
+
+async def test_callback_external_description_prefix_has_item_id():
+    sess = _make_voice_sess()
+    sess._inject_rejection_handlers = {}
+    sess._fire_task = lambda coro: coro.close()
+    sess._expire_inject_rejection_handler = AsyncMock()
+    mgr = _make_mgr(session=sess)
+
+    async def _stream_image(
+        _image_b64,
+        *,
+        bypass_rate_limit=False,
+        cache_latest=True,
+        source=None,
+        request_id=None,
+        on_rejected=None,
+    ):
+        return SimpleNamespace(
+            accepted=True,
+            mode="external_description",
+            description="画面里有一只猫。",
+        )
+
+    sess.stream_image = _stream_image
+    cb = {
+        "_callback_delivery_id": "id-description-prefix-item",
+        "status": "completed",
+        "summary": "visual callback",
+        "media_images": ["callback-image"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert len(sess.injected_events) == 1
+    visual_event = sess.injected_events[0][0]
+    assert visual_event["item"]["id"].startswith("item_neko_callback_visual_")
 
 
 async def test_external_callback_rechecks_independent_asr_turn_after_visual_analysis():

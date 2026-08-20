@@ -1084,16 +1084,17 @@ class ProactiveMixin:
                 # If a user turn won the slow vision-model await, discard the
                 # unsent description events and let that user turn keep
                 # priority. The callback remains queued for a later retry.
-                if voice_media_events and _voice_activity_since(media_started_at):
+                if _voice_activity_since(media_started_at):
                     self._clear_voice_delivery_committed(voice_commit_snapshot)
-                    for _owner_cb, event in voice_media_events:
-                        voice_sess._inject_rejection_handlers.pop(
-                            event.get("event_id"),
-                            None,
-                        )
+                    if voice_media_events:
+                        for _owner_cb, event in voice_media_events:
+                            voice_sess._inject_rejection_handlers.pop(
+                                event.get("event_id"),
+                                None,
+                            )
                     logger.info(
                         "[%s] trigger_agent_callbacks: activity started during "
-                        "external visual analysis; deferring callback delivery",
+                        "callback media delivery; deferring callback delivery",
                         self.lanlan_name,
                     )
                     # The winning ASR turn may end without a final transcript
@@ -2090,6 +2091,9 @@ class ProactiveMixin:
                                 "type": "conversation.item.create",
                                 "event_id": description_event_id,
                                 "item": {
+                                    "id": (
+                                        f"item_neko_callback_visual_{uuid4().hex}"
+                                    ),
                                     "type": "message",
                                     "role": "user",
                                     "content": [{
