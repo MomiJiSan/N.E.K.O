@@ -2206,22 +2206,39 @@ class ProactiveMixin:
         self,
         callbacks: list,
         session: object,
-    ) -> None:
+    ) -> dict[str, bool]:
         """Stage retained callback images before a natural-turn consumer.
 
         Passive consumers remove callbacks after rendering their text. Media
         therefore needs an explicit ownership handoff first: native/offline
         images are staged into the exact session that will consume the prompt,
         while external visual descriptions are folded into the callback body.
-        A transient rejection leaves the callback unready and queued.
+        A transient rejection leaves the callback unready and queued.  The
+        returned live outcome also covers WebSocket-native rejection events
+        that can arrive after ``stream_image`` has returned; the hot-swap
+        owner keeps it through the short delivery-settlement window before it
+        acknowledges or removes the callback.
         """
+
+        outcome = {
+            "safe_to_continue": True,
+            "native_rejection_pending": False,
+            "rejected": False,
+            "settled": False,
+        }
 
         stream_image = getattr(session, "stream_image", None)
         if session is None or not callable(stream_image):
-            return
+            return outcome
         session_id = self._session_media_identity(session)
         if session_id is None:
-            return
+            return outcome
+        realtime_session = isinstance(session, OmniRealtimeClient)
+        websocket_native_session = realtime_session and not getattr(
+            session,
+            "_is_gemini",
+            False,
+        )
         terminal_rejections = {
             "analysis_empty",
             "invalid_payload",
@@ -2253,6 +2270,18 @@ class ProactiveMixin:
             index = staged_count
             while index < len(images):
                 image_b64 = images[index]
+
+                def _on_passive_media_rejected(
+                    _error_msg: str,
+                    *,
+                    _callback=callback,
+                ) -> None:
+                    if outcome["settled"]:
+                        return
+                    outcome["rejected"] = True
+                    outcome["safe_to_continue"] = False
+                    _callback["_passive_media_staged_count"] = 0
+
                 try:
                     try:
                         stage_result = await stream_image(
@@ -2261,6 +2290,7 @@ class ProactiveMixin:
                             cache_latest=False,
                             source="callback",
                             request_id=callback.get("_callback_delivery_id"),
+                            on_rejected=_on_passive_media_rejected,
                         )
                     except TypeError as exc:
                         if "unexpected keyword argument" not in str(exc):
@@ -2285,6 +2315,12 @@ class ProactiveMixin:
                         callback["_passive_media_staged_count"] = staged_count
                     else:
                         callback["_passive_media_staged_count"] = index
+                        if realtime_session and index > 0:
+                            # At least one native image is already irreversible
+                            # in this Provider session.  Continuing the swap
+                            # would let a later user turn consume that prefix
+                            # without the callback text that owns it.
+                            outcome["safe_to_continue"] = False
                     break
 
                 structured = hasattr(stage_result, "accepted")
@@ -2306,6 +2342,8 @@ class ProactiveMixin:
                             callback["_passive_media_staged_count"] = staged_count
                         else:
                             callback["_passive_media_staged_count"] = index
+                            if realtime_session and index > 0:
+                                outcome["safe_to_continue"] = False
                         break
                     images.pop(index)
                     callback["media_images"] = images
@@ -2342,6 +2380,8 @@ class ProactiveMixin:
                     images.pop(index)
                     callback["media_images"] = images
                     continue
+                if mode == "native" and websocket_native_session:
+                    outcome["native_rejection_pending"] = True
                 index += 1
                 callback["_passive_media_staged_count"] = index
             else:
@@ -2353,6 +2393,8 @@ class ProactiveMixin:
                     callback.pop("media_images", None)
                     callback.pop("_passive_media_session_id", None)
                     callback.pop("_passive_media_staged_count", None)
+
+        return outcome
 
     def on_voice_playback_signal(self, *, playing: bool, **meta) -> None:
         """Handle a FRONTEND-reported audio playback boundary.

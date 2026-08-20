@@ -52,6 +52,7 @@ from ._shared import (
     _HANDSHAKE_OVERRIDE_UNSET,
     _START_LLM_CONCURRENT_ABORTED,
     _ORPHAN_SESSION_REAPER_TASKS,
+    _VOICE_PROACTIVE_ACK_GRACE_S,
 )
 from .callback_render import (
     _build_callback_instruction,
@@ -357,6 +358,42 @@ class LifecycleMixin:
             async def on_silence_timeout(session_ref=session):
                 await self.handle_silence_timeout(expected_session=session_ref)
             session.on_silence_timeout = on_silence_timeout
+
+    async def _restart_message_handler_after_session_reconnect(
+        self,
+        session_ref,
+    ) -> bool:
+        """Replace the receive task after an in-place Provider reconnect.
+
+        Gemini quarantine reconnects the same ``OmniRealtimeClient`` object,
+        while its existing handler remains bound to the retired SDK session.
+        Keep task ownership in Core and use the manager/session identity as the
+        CAS fence so a concurrent end-session or hot swap cannot resurrect a
+        listener for a session it already replaced.
+        """
+
+        if session_ref is not self.session or not self.is_active:
+            return False
+        previous_task = self.message_handler_task
+        if previous_task is not None and previous_task is not asyncio.current_task():
+            if not previous_task.done():
+                previous_task.cancel()
+            await asyncio.gather(previous_task, return_exceptions=True)
+
+        async with self.lock:
+            if session_ref is not self.session or not self.is_active:
+                return False
+            current_task = self.message_handler_task
+            if (
+                current_task is not None
+                and current_task is not previous_task
+                and not current_task.done()
+            ):
+                return True
+            self.message_handler_task = asyncio.create_task(
+                session_ref.handle_messages()
+            )
+        return True
 
     async def _teardown_pending_session_from_lifecycle_callback(self, expected_session, message=None):
         """Handle lifecycle callback (connection_error / silence_timeout) fired
@@ -2345,6 +2382,7 @@ class LifecycleMixin:
             _passive_sel: list = []
             _passive_swap_text = ""
             _extras_for_budget: list = []
+            _passive_media_outcome: dict[str, bool] | None = None
 
             def _abort_if_passive_claim_retracted(stage: str) -> None:
                 if any(cb.get(DELIVERY_RETRACTED_KEY)
@@ -2467,10 +2505,18 @@ class LifecycleMixin:
                             render=False,
                         )
                     )
-                    await self._stage_passive_callback_media(
+                    _passive_media_outcome = await self._stage_passive_callback_media(
                         _passive_sel,
                         self.pending_session,
                     )
+                    if not _passive_media_outcome["safe_to_continue"]:
+                        logger.warning(
+                            "Final Swap Sequence: passive native media staging became partial/rejected; abandoning pending session"
+                        )
+                        await self._cleanup_pending_session_resources()
+                        await self._reset_preparation_state(clear_main_cache=True)
+                        self.is_hot_swap_imminent = False
+                        return
                     _passive_sel, _passive_swap_text = (
                         self._render_claimed_passive_callbacks_for_swap_prime(
                             _passive_sel
@@ -2519,10 +2565,18 @@ class LifecycleMixin:
                         render=False,
                     )
                 )
-                await self._stage_passive_callback_media(
+                _passive_media_outcome = await self._stage_passive_callback_media(
                     _passive_sel,
                     self.pending_session,
                 )
+                if not _passive_media_outcome["safe_to_continue"]:
+                    logger.warning(
+                        "Final Swap Sequence: passive native media staging became partial/rejected; abandoning pending session"
+                    )
+                    await self._cleanup_pending_session_resources()
+                    await self._reset_preparation_state(clear_main_cache=True)
+                    self.is_hot_swap_imminent = False
+                    return
                 _passive_sel, _passive_swap_text = (
                     self._render_claimed_passive_callbacks_for_swap_prime(
                         _passive_sel
@@ -2645,6 +2699,52 @@ class LifecycleMixin:
                 # 队列没动过：已注入 new_session 的 _selected 仍在队列里，随
                 # 接管方纪元的下一次 hot-swap 照常投递（与 _deferred 一致）。
                 return
+
+            # WebSocket-native image writes are only provisionally accepted:
+            # the Provider can reject them on the receive loop after
+            # ``stream_image`` returns.  Start the replacement listener before
+            # removing/acknowledging its callback and keep the same short
+            # rejection window used by active voice callback delivery.  A
+            # rejection retires the whole replacement session because its
+            # already-written media prefix cannot be rolled back safely.
+            if (
+                _passive_media_outcome is not None
+                and _passive_media_outcome["native_rejection_pending"]
+            ):
+                self.message_handler_task = asyncio.create_task(
+                    new_session.handle_messages()
+                )
+                try:
+                    await asyncio.sleep(_VOICE_PROACTIVE_ACK_GRACE_S)
+                finally:
+                    _passive_media_outcome["settled"] = True
+                if _passive_media_outcome["rejected"]:
+                    logger.warning(
+                        "Final Swap Sequence: passive native media was rejected; retiring promoted replacement before callback ACK"
+                    )
+                    replacement_listener = self.message_handler_task
+                    if replacement_listener and not replacement_listener.done():
+                        replacement_listener.cancel()
+                        await asyncio.gather(
+                            replacement_listener,
+                            return_exceptions=True,
+                        )
+                    self.message_handler_task = None
+                    try:
+                        await new_session.close()
+                    except Exception as close_err:
+                        logger.debug(
+                            "Final Swap Sequence: rejected passive media replacement close failed: %s",
+                            close_err,
+                        )
+                    if self.session is new_session:
+                        self.session = None
+                    self.is_active = False
+                    await self._reset_preparation_state(
+                        clear_main_cache=True,
+                        from_final_swap=True,
+                    )
+                    return
             # promote 成功：被注入的 session 已成为活跃会话，注入内容必随其下一
             # 轮回复送达——此刻才把 _selected 从队列移除。按对象身份移除：窗口期
             # 内被并发路径（语音投递清除/retraction/清扫/cap）先行移除的条目在此
@@ -2718,7 +2818,14 @@ class LifecycleMixin:
             )
 
             # ── 步骤 4：启动新 listener ───────────────────────────────────────────
-            if self.session and hasattr(self.session, 'handle_messages'):
+            if (
+                self.session
+                and hasattr(self.session, 'handle_messages')
+                and (
+                    not self.message_handler_task
+                    or self.message_handler_task.done()
+                )
+            ):
                 self.message_handler_task = asyncio.create_task(self.session.handle_messages())
 
             # ── 步骤 5：flush 热切换音频缓存到新 session ─────────────────────────

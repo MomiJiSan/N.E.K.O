@@ -20,7 +20,7 @@ import re
 import sys
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -1297,6 +1297,7 @@ async def test_passive_image_is_staged_before_text_drain_can_prune_callback():
         cache_latest=False,
         source="callback",
         request_id="id-passive-image-text",
+        on_rejected=ANY,
     )
     assert "camera event" in rendered
     assert mgr.pending_agent_callbacks == []
@@ -1339,6 +1340,7 @@ async def test_text_passive_media_stages_only_the_selected_prompt_snapshot():
         cache_latest=False,
         source="callback",
         request_id="id-selected-media",
+        on_rejected=ANY,
     )
     assert "selected callback" in rendered
     assert "must not render" not in rendered
@@ -1443,6 +1445,74 @@ async def test_partial_offline_passive_media_staging_rolls_back_callback_prefix(
     assert cb["_passive_media_staged_count"] == 0
     assert rendered == ""
     assert mgr.pending_agent_callbacks == [cb]
+
+
+async def test_partial_native_passive_media_staging_requires_session_retirement():
+    session = _make_voice_sess()
+    session._is_gemini = False
+
+    async def stream_image(image_b64, **_kwargs):
+        if image_b64 == "callback-image-2":
+            raise RuntimeError("transient second-image failure")
+        return ImageStageResult(accepted=True, mode="native")
+
+    session.stream_image = AsyncMock(side_effect=stream_image)
+    mgr = _make_mgr(session=session)
+    cb = {
+        "_callback_delivery_id": "id-native-partial-retire",
+        "status": "completed",
+        "summary": "two native callback images",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "media_images": ["callback-image-1", "callback-image-2"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    outcome = await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+
+    assert outcome["safe_to_continue"] is False
+    assert outcome["native_rejection_pending"] is True
+    assert cb["_passive_media_staged_count"] == 1
+    assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
+
+
+async def test_passive_native_async_rejection_invalidates_live_stage_outcome():
+    session = _make_voice_sess()
+    session._is_gemini = False
+    rejection_handlers = []
+
+    async def stream_image(_image_b64, *, on_rejected=None, **_kwargs):
+        rejection_handlers.append(on_rejected)
+        return ImageStageResult(accepted=True, mode="native")
+
+    session.stream_image = AsyncMock(side_effect=stream_image)
+    mgr = _make_mgr(session=session)
+    cb = {
+        "_callback_delivery_id": "id-native-async-reject",
+        "status": "completed",
+        "summary": "native callback image",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "media_images": ["callback-image"],
+    }
+
+    outcome = await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+    assert outcome["safe_to_continue"] is True
+    assert outcome["native_rejection_pending"] is True
+
+    rejection_handlers[0]("provider rejected callback image")
+
+    assert outcome["rejected"] is True
+    assert outcome["safe_to_continue"] is False
+    assert cb["_passive_media_staged_count"] == 0
 
 
 async def test_external_passive_image_description_rides_hot_swap_prime():

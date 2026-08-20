@@ -616,6 +616,7 @@ async def test_new_gemini_turn_cancels_resolved_turn_during_sdk_send():
     replacement_session = AsyncMock()
 
     async def reconnect(*_args, **_kwargs):
+        client._connection_generation += 1
         client._gemini_session = replacement_session
         client.ws = replacement_session
 
@@ -672,6 +673,7 @@ async def test_new_gemini_turn_quarantines_accepted_turn_before_first_content():
     replacement_session = AsyncMock()
 
     async def reconnect(*_args, **_kwargs):
+        client._connection_generation += 1
         client._gemini_session = replacement_session
         client.ws = replacement_session
 
@@ -690,12 +692,15 @@ async def test_new_gemini_turn_quarantines_accepted_turn_before_first_content():
     assert client._gemini_external_outcome_token is not None
     assert client._is_responding is False
 
-    await client.prepare_external_voice_turn(turn_id="gemini-successor")
+    reconnected = await client.prepare_external_voice_turn(
+        turn_id="gemini-successor"
+    )
 
     old_context.__aexit__.assert_awaited_once_with(None, None, None)
     client.connect.assert_awaited_once_with("system prompt", native_audio=True)
     assert client._gemini_session is replacement_session
     assert client._gemini_external_outcome_token is None
+    assert reconnected is True
     client.abandon_external_voice_turn("gemini-successor")
     await client.close()
 

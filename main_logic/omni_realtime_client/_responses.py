@@ -380,12 +380,18 @@ class _ResponseMixin:
         if getattr(self, "_gemini_proactive_submit_task", None) is submit_task:
             self._gemini_proactive_submit_task = None
 
-    async def prepare_external_voice_turn(self, *, turn_id: str) -> None:
-        """Prepare the active Provider session for one external ASR turn."""
+    async def prepare_external_voice_turn(self, *, turn_id: str) -> bool:
+        """Prepare one external ASR turn; report an in-place reconnect.
+
+        Gemini quarantine may retire and replace the SDK connection on this
+        same client instance.  The Core owner uses the returned flag to replace
+        the receive task that captured the retired session.
+        """
 
         stable_turn_id = str(turn_id or "").strip()
         if not stable_turn_id:
             raise ValueError("external voice turn_id must not be empty")
+        connection_generation = self._connection_generation
         async with self._ensure_turn_admission_lock():
             if self._is_gemini:
                 self._start_gemini_external_submit_quarantine()
@@ -403,6 +409,7 @@ class _ResponseMixin:
             except BaseException:
                 self.abandon_external_voice_turn(stable_turn_id)
                 raise
+        return self._connection_generation != connection_generation
 
     def _settle_gemini_external_turn(self, token: object | None = None) -> None:
         """Release accepted external-ASR ownership at its terminal edge."""

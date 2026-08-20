@@ -1435,6 +1435,61 @@ async def test_speech_started_prepares_external_voice_turn() -> None:
     runtime.handle_new_message.assert_awaited_once_with()
 
 
+async def test_gemini_prepare_reconnect_replaces_core_receive_task() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime)
+    runtime.session.prepare_external_voice_turn = AsyncMock(return_value=True)
+    runtime._restart_message_handler_after_session_reconnect = AsyncMock(
+        return_value=True
+    )
+
+    await runtime._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        runtime._asr_session_epoch,
+    )
+
+    runtime._restart_message_handler_after_session_reconnect.assert_awaited_once_with(
+        runtime.session
+    )
+    runtime.handle_new_message.assert_awaited_once_with()
+
+
+async def test_reconnect_listener_replacement_cancels_retired_receive_task() -> None:
+    manager = LLMSessionManager.__new__(LLMSessionManager)
+    manager.lock = asyncio.Lock()
+    manager.is_active = True
+    replacement_started = asyncio.Event()
+
+    class Session:
+        async def handle_messages(self):
+            replacement_started.set()
+            await asyncio.Event().wait()
+
+    session = Session()
+    manager.session = session
+    retired_cancelled = asyncio.Event()
+
+    async def retired_receive_loop():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            retired_cancelled.set()
+            raise
+
+    retired_task = asyncio.create_task(retired_receive_loop())
+    manager.message_handler_task = retired_task
+    await asyncio.sleep(0)
+
+    assert await manager._restart_message_handler_after_session_reconnect(session)
+    await asyncio.wait_for(replacement_started.wait(), 1)
+
+    assert retired_cancelled.is_set()
+    assert retired_task.done()
+    assert manager.message_handler_task is not retired_task
+    manager.message_handler_task.cancel()
+    await asyncio.gather(manager.message_handler_task, return_exceptions=True)
+
+
 async def test_game_takeover_during_core_prepare_drops_stale_message() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime)

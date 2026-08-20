@@ -2553,7 +2553,18 @@ class AsrRuntimeMixin:
         preparation_succeeded = False
         try:
             if callable(prepare):
-                await prepare(turn_id=external_turn_id)
+                reconnected = await prepare(turn_id=external_turn_id)
+                if reconnected is True and not await (
+                    self._restart_message_handler_after_session_reconnect(
+                        session_ref
+                    )
+                ):
+                    if abandon_on_failure:
+                        self._abandon_core_voice_turn(
+                            external_turn_id,
+                            session_ref=session_ref,
+                        )
+                    return False
             else:
                 interrupt = getattr(session_ref, "handle_interruption", None)
                 if callable(interrupt):
@@ -2746,7 +2757,13 @@ class AsrRuntimeMixin:
                         None,
                     )
                     if callable(prepare):
-                        await prepare(turn_id=external_turn_id)
+                        reconnected = await prepare(turn_id=external_turn_id)
+                        if reconnected is True and not await (
+                            self._restart_message_handler_after_session_reconnect(
+                                session_ref
+                            )
+                        ):
+                            return
                     if not route_still_core() or self.session is not session_ref:
                         return
                 await self._submit_core_voice_turn(
