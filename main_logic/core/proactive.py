@@ -49,15 +49,16 @@ from ._shared import (
 from .callback_render import _build_callback_instruction, _select_callbacks_within_token_budget
 
 
-_TERMINAL_CALLBACK_IMAGE_REJECTIONS = frozenset({
-    "analysis_empty",
-    "invalid_payload",
-    "payload_too_large",
-})
-
-
 class ProactiveMixin:
     """Proactive delivery methods (see module docstring)."""
+
+    @staticmethod
+    def _terminal_callback_image_rejections() -> frozenset[str]:
+        return frozenset({
+            "analysis_empty",
+            "invalid_payload",
+            "payload_too_large",
+        })
 
     def note_user_engagement(self, *, at: float | None = None) -> None:
         """Record a genuine user interaction for silence-aware proactive guards."""
@@ -2146,7 +2147,7 @@ class ProactiveMixin:
                         if (
                             native_prefix_committed
                             and rejection_reason
-                            not in _TERMINAL_CALLBACK_IMAGE_REJECTIONS
+                            not in self._terminal_callback_image_rejections()
                         ):
                             # The callback transaction already persisted a raw
                             # image, but this attempt cannot reach its paired
@@ -2461,7 +2462,7 @@ class ProactiveMixin:
                     description = stage_result
                 if not accepted:
                     reason = getattr(stage_result, "rejection_reason", None)
-                    if reason not in _TERMINAL_CALLBACK_IMAGE_REJECTIONS:
+                    if reason not in self._terminal_callback_image_rejections():
                         callback["media_images"] = images
                         if pending_images_snapshot is not None:
                             pending_images[:] = pending_images_snapshot
