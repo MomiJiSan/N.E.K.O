@@ -132,6 +132,7 @@ class _TransportMixin:
 
     async def connect(self, instructions: str, native_audio=True) -> None:
         """Establish WebSocket connection with the Realtime API."""
+        self._native_audio = native_audio
         # Validate turn_detection_mode BEFORE any side effect (websockets.connect,
         # silence-check task, or Gemini SDK init). Applies uniformly to all providers.
         if self.turn_detection_mode not in (TurnDetectionMode.MANUAL, TurnDetectionMode.SERVER_VAD):
@@ -489,10 +490,10 @@ class _TransportMixin:
             logger.warning("⚠️ 图片重压缩失败 type=%s: %s — 丢弃帧", etype, e)
             return None
 
-    async def send_event(self, event, *, raise_on_oversize: bool = False) -> None:
+    async def send_event(self, event, *, raise_on_oversize: bool = False) -> bool:
         # 检查是否已发生致命错误，直接跳过发送
         if self._fatal_error_occurred:
-            return
+            return False
 
         # Gemini 不使用 WebSocket 风格的事件发送
         # 而是使用 session.send_client_content() 或 session.send_realtime_input()
@@ -500,14 +501,14 @@ class _TransportMixin:
             # Gemini 的事件通过专用方法处理，这里直接返回
             # 对于 session.update / conversation.item.create 等事件，Gemini 不支持
             logger.debug(f"Gemini mode: skipping WebSocket event {event.get('type', 'unknown')}")
-            return
+            return False
 
         # Backpressure: 检查是否处于节流状态
         if self._is_throttled:
             if time.time() < self._throttle_until:
                 # 仍在节流期，丢弃音频帧以减轻服务器压力
                 if event.get("type") == "input_audio_buffer.append":
-                    return  # 丢弃音频帧
+                    return False  # 丢弃音频帧
             else:
                 # 节流期结束，恢复正常发送
                 self._is_throttled = False
@@ -515,7 +516,7 @@ class _TransportMixin:
 
         # 检查websocket是否有效
         if not self.ws:
-            return
+            return False
 
         # Use setdefault so callers that explicitly stamp an event_id
         # (e.g. proactive inject paths matching server-side
@@ -525,7 +526,7 @@ class _TransportMixin:
         async with self._send_semaphore:  # 限制并发发送数量
             try:
                 if not self.ws:
-                    return
+                    return False
                 payload = json.dumps(event)
                 # Guard: Qwen/GLM/Step servers enforce 256KB max frame; for
                 # oversized image payloads, try to re-compress the JPEG at
@@ -541,8 +542,9 @@ class _TransportMixin:
                             raise RealtimeImagePayloadTooLargeError(
                                 "image payload exceeds realtime WebSocket frame limit"
                             )
-                        return
+                        return False
                 await self.ws.send(payload)
+                return True
             except Exception as e:
                 error_msg = str(e)
                 # ── Fatal WebSocket errors ────────────────────────────
@@ -761,6 +763,11 @@ class _TransportMixin:
 
         self._raw_visual_delivery_blocked = True
 
+    def allow_raw_visual_delivery(self) -> None:
+        """Release a temporary raw-frame fence after native routing settles."""
+
+        self._raw_visual_delivery_blocked = False
+
     def set_visual_delivery_mode(
         self,
         mode: VisualDeliveryMode | str,
@@ -877,6 +884,16 @@ class _TransportMixin:
         except asyncio.TimeoutError:
             task.cancel()
             description = ""
+        except Exception as exc:
+            # Ambient screen/camera analysis is best-effort: a transient
+            # vision outage must not discard the completed ASR transcript.
+            # Callback-owned one-shot images use stream_image() directly and
+            # still propagate their exception so the callback can retry.
+            logger.warning(
+                "external visual analysis failed; continuing transcript-only: %s",
+                exc,
+            )
+            description = ""
         except asyncio.CancelledError:
             if not task.cancelled():
                 task.cancel()
@@ -933,7 +950,7 @@ class _TransportMixin:
         cache_latest: bool = True,
         event_id: str | None = None,
         on_rejected: Optional[Callable[[str], None]] = None,
-    ) -> ImageStageResult | str | None:
+    ) -> ImageStageResult:
         """Stream raw image data to the API.
 
         ``bypass_rate_limit=True`` skips the native-vision frame-rate throttle
@@ -1114,7 +1131,8 @@ class _TransportMixin:
 
             # Rate limiting for native image input (with VAD-based throttling).
             # A deliberate cue image (bypass_rate_limit) skips the interval check
-            # so it's never silently dropped, but still stamps the timestamp.
+            # so it's never silently dropped. The timestamp is updated only
+            # after the provider confirms that the frame was sent.
             if self._supports_native_image:
                 current_time = time.time()
                 if not bypass_rate_limit:
@@ -1129,11 +1147,6 @@ class _TransportMixin:
                             mode=VisualDeliveryMode.NATIVE.value,
                             generation=getattr(self, "_latest_image_generation", 0),
                         )
-                # Stamp even on the bypass path: a frame WAS sent to the server,
-                # so it must count toward the throttle window — this keeps
-                # back-to-back bypassed cue images from flooding native vision.
-                self._last_native_image_time = current_time
-
             # Gemini uses SDK, not WebSocket events (_audio_in_buffer is not set for Gemini)
             if self._is_gemini:
                 if self._gemini_session:
@@ -1147,6 +1160,8 @@ class _TransportMixin:
                         if "closed" in str(e).lower():
                             self._fatal_error_occurred = True
                         raise
+                    if self._supports_native_image:
+                        self._last_native_image_time = current_time
                     return ImageStageResult(
                         accepted=True,
                         mode=VisualDeliveryMode.NATIVE.value,
@@ -1173,12 +1188,17 @@ class _TransportMixin:
                 }
                 if event_id is not None:
                     append_event["event_id"] = event_id
-                await self.send_event(
+                sent = await self.send_event(
                     append_event,
                     raise_on_oversize=bypass_rate_limit,
                 )
+                if not sent and rejection_event_id is not None:
+                    self._inject_rejection_handlers.pop(rejection_event_id, None)
+                    rejection_event_id = None
+                if sent and self._supports_native_image:
+                    self._last_native_image_time = current_time
                 return ImageStageResult(
-                    accepted=True,
+                    accepted=sent,
                     mode=VisualDeliveryMode.NATIVE.value,
                     generation=getattr(self, "_latest_image_generation", 0),
                 )
@@ -1230,9 +1250,9 @@ class _TransportMixin:
                                     }
                                 }
                                 logger.info("Sending image description before recognition.")
-                                await self.send_event(text_event)
-                                description_sent = True
-                                await self._analyze_image_with_vision_model(image_b64)
+                                description_sent = await self.send_event(text_event)
+                                if description_sent:
+                                    await self._analyze_image_with_vision_model(image_b64)
                         elif not self._image_sent_this_turn:
                             self._image_sent_this_turn = True
                             text_event = {
@@ -1249,8 +1269,7 @@ class _TransportMixin:
                                     }
                             }
                             logger.info("Sending image description after recognition.")
-                            await self.send_event(text_event)
-                            description_sent = True
+                            description_sent = await self.send_event(text_event)
                     return ImageStageResult(
                         accepted=description_sent,
                         mode=VisualDeliveryMode.EXTERNAL_DESCRIPTION.value,
@@ -1263,12 +1282,17 @@ class _TransportMixin:
 
                 if event_id is not None:
                     append_event["event_id"] = event_id
-                await self.send_event(
+                sent = await self.send_event(
                     append_event,
                     raise_on_oversize=bypass_rate_limit,
                 )
+                if not sent and rejection_event_id is not None:
+                    self._inject_rejection_handlers.pop(rejection_event_id, None)
+                    rejection_event_id = None
+                if sent and self._supports_native_image:
+                    self._last_native_image_time = current_time
                 return ImageStageResult(
-                    accepted=True,
+                    accepted=sent,
                     mode=VisualDeliveryMode.NATIVE.value,
                     generation=getattr(self, "_latest_image_generation", 0),
                 )

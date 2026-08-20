@@ -505,6 +505,7 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # closing the post-activity-check race where the stale inject could land
         # while user speech was already being captured.
         self._gemini_proactive_submit_task: Optional[asyncio.Task] = None
+        self._gemini_proactive_quarantine_task: Optional[asyncio.Task] = None
 
     def _create_audio_processor(self) -> AudioProcessor:
         """Create session-owned audio state, including native RNNoise state."""

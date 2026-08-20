@@ -381,6 +381,7 @@ class _ResponseMixin:
             raise ValueError("external voice turn_id must not be empty")
         if self._is_gemini:
             await self._cancel_gemini_proactive_submit()
+            await self._await_gemini_proactive_quarantine()
         self._begin_external_visual_turn(stable_turn_id)
         try:
             if not self._is_gemini:
@@ -392,6 +393,35 @@ class _ResponseMixin:
         except BaseException:
             self.abandon_external_voice_turn(stable_turn_id)
             raise
+
+    async def _await_gemini_proactive_quarantine(self) -> None:
+        """Join stale Gemini proactive quarantine before opening a user turn."""
+
+        quarantine_task = getattr(self, "_gemini_proactive_quarantine_task", None)
+        if (
+            quarantine_task is None
+            or quarantine_task is asyncio.current_task()
+        ):
+            return
+        try:
+            await asyncio.shield(quarantine_task)
+        except asyncio.CancelledError:
+            if not quarantine_task.cancelled():
+                raise
+        finally:
+            if getattr(self, "_gemini_proactive_quarantine_task", None) is quarantine_task:
+                self._gemini_proactive_quarantine_task = None
+
+        # A quarantine with no terminal lifecycle retires the old Gemini
+        # session. Reconnect before admitting the user's turn so its transcript
+        # cannot race the retired SDK context.
+        if getattr(self, "_gemini_session", None) is None:
+            instructions = str(getattr(self, "instructions", "") or "")
+            if instructions:
+                await self.connect(
+                    instructions,
+                    native_audio=getattr(self, "_native_audio", True),
+                )
 
     def abandon_external_voice_turn(self, turn_id: str | None = None) -> None:
         """Release an external-ASR dispatch pause, optionally by turn key."""
@@ -601,12 +631,13 @@ class _ResponseMixin:
                             None,
                             None,
                         )
-                        self._fire_task(
+                        quarantine_task = self._fire_task(
                             self._interrupt_and_quarantine_gemini_proactive_outcome(
                                 outcome_token,
                                 error_msg="Gemini proactive SDK send was cancelled",
                             )
                         )
+                        self._gemini_proactive_quarantine_task = quarantine_task
                 raise
             except Exception:
                 outcome = getattr(self, "_gemini_proactive_outcome", None)
@@ -835,6 +866,15 @@ class _ResponseMixin:
             return
         token, on_rejected, on_completed = outcome
         self._gemini_proactive_outcome = None
+        quarantine_task = getattr(self, "_gemini_proactive_quarantine_task", None)
+        if (
+            quarantine_task is not None
+            and quarantine_task is not asyncio.current_task()
+            and not quarantine_task.done()
+        ):
+            quarantine_task.cancel()
+        if quarantine_task is not asyncio.current_task():
+            self._gemini_proactive_quarantine_task = None
         if getattr(self, "_proactive_inject_outcome_token", None) == token:
             self._proactive_inject_outcome_token = None
             self._proactive_inject_awaiting_outcome = False

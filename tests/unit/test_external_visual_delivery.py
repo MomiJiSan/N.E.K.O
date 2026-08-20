@@ -137,7 +137,10 @@ async def test_external_description_rejects_oversized_callback_before_analysis()
 
 
 @pytest.mark.asyncio
-async def test_raw_visual_guard_rejects_native_qwen_frame_without_provider_event():
+@pytest.mark.parametrize("bypass_rate_limit", [False, True])
+async def test_raw_visual_guard_rejects_native_qwen_frame_without_provider_event(
+    bypass_rate_limit,
+):
     client = _make_qwen_client()
     client.block_raw_visual_delivery()
 
@@ -145,6 +148,7 @@ async def test_raw_visual_guard_rejects_native_qwen_frame_without_provider_event
         DUMMY_IMAGE_B64,
         source="screen",
         request_id="sync-failed-screen",
+        bypass_rate_limit=bypass_rate_limit,
     )
 
     assert result == ImageStageResult(
@@ -168,6 +172,47 @@ async def test_native_mode_noop_does_not_clear_independent_raw_visual_fence():
     result = await client.stream_image(DUMMY_IMAGE_B64)
     assert result.rejection_reason == "raw_visual_delivery_blocked"
     client.ws.send.assert_not_awaited()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_native_image_unsent_does_not_report_acceptance_or_start_throttle():
+    client = _make_qwen_client()
+    client.ws = None
+    client._last_native_image_time = 0.0
+
+    result = await client.stream_image(DUMMY_IMAGE_B64, source="screen")
+
+    assert result.accepted is False
+    assert client._last_native_image_time == 0.0
+
+
+@pytest.mark.asyncio
+async def test_native_oversized_image_unsent_does_not_start_throttle():
+    client = _make_qwen_client()
+    client._last_native_image_time = 0.0
+
+    result = await client.stream_image(
+        "A" * 400_000,
+        source="screen",
+        bypass_rate_limit=False,
+    )
+
+    assert result.accepted is False
+    assert client._last_native_image_time == 0.0
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_native_route_can_release_temporary_raw_visual_fence():
+    client = _make_qwen_client()
+    client.block_raw_visual_delivery()
+    client.allow_raw_visual_delivery()
+
+    result = await client.stream_image(DUMMY_IMAGE_B64, source="screen")
+
+    assert result.accepted is True
+    assert client.ws.send.await_count == 1
     await client.close()
 
 
@@ -715,6 +760,33 @@ async def test_visual_join_timeout_submits_asr_text_without_placeholder():
     assert item_texts == ["只回答文字也可以"]
     assert [event["type"] for event in sent].count("response.create") == 1
     client.abandon_external_voice_turn("turn-timeout")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ambient_visual_error_falls_back_to_transcript_only():
+    client = _make_qwen_client()
+    client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
+    client.handle_interruption = AsyncMock()
+    client._analyze_image_with_vision_model = AsyncMock(
+        side_effect=RuntimeError("vision provider timeout")
+    )
+    sent = _wire_completed_response_transport(client)
+
+    await client.prepare_external_voice_turn(turn_id="turn-ambient-error")
+    await client.stream_image(
+        DUMMY_IMAGE_B64,
+        source="screen",
+        request_id="ambient-error-frame",
+    )
+    ticket = await client.submit_external_text_turn(
+        "只发送转写", turn_id="turn-ambient-error"
+    )
+    await ticket.done
+
+    assert [_event_text(event) for event in sent if _event_text(event)] == [
+        "只发送转写"
+    ]
     await client.close()
 
 

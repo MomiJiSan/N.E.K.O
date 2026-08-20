@@ -108,49 +108,65 @@ class StreamingMixin:
         if getattr(self, "_deferred_pending_input_flush_count", 0) > 0:
             return
         async with self.input_cache_lock:
+            if getattr(self, "_pending_input_flush_active", False):
+                return
             if not self.pending_input_data:
                 return
-            # Drain atomically, then process outside this lock. One-shot image
-            # attachments may need _ensure_offline_session_for_text_input(),
-            # whose handoff reacquires input_cache_lock; awaiting that path
-            # while still holding the lock would deadlock.
-            pending_messages = list(self.pending_input_data)
-            self.pending_input_data.clear()
+            self._pending_input_flush_active = True
 
-        if not self.session or not self.is_active:
-            return
+        try:
+            while True:
+                async with self.input_cache_lock:
+                    if not self.pending_input_data:
+                        self._pending_input_flush_active = False
+                        return
+                    # Drain atomically, then process outside this lock. One-shot
+                    # image attachments may need _ensure_offline_session_for_text_input(),
+                    # whose handoff reacquires input_cache_lock; awaiting that
+                    # path while still holding the lock would deadlock.
+                    pending_messages = list(self.pending_input_data)
+                    self.pending_input_data.clear()
 
-        # 缓存阶段（_stream_data_now）不知道 session 最终是 voice 还是
-        # text。如果最终启好的是 voice session，缓存里的纯 text 输入若
-        # 直接 flush 进 _process_stream_data_internal，会把刚 ready 的 voice
-        # session 撕成 text；继续丢弃纯文本。但 avatar_drop_image/user_image
-        # 是明确的一次性附件，必须保留其既有 offline vision 合同。screen /
-        # camera 也继续走 realtime 合法路径。audio 在缓存阶段不会出现。
-        dropped_text_for_voice = 0
-        for message in pending_messages:
-            msg_input_type = message.get("input_type")
-            try:
-                if msg_input_type == "audio":
-                    await self._enqueue_audio_stream_data(message)
-                else:
-                    if (
-                        isinstance(self.session, OmniRealtimeClient)
-                        and msg_input_type == "text"
-                    ):
-                        self.note_stream_input_ingress(message)
-                        dropped_text_for_voice += 1
-                        continue
-                    await self._process_stream_data_internal(message)
-            except Exception as e:
-                logger.error(f"💥 发送缓存的输入数据失败: {e}")
-                break
-        if dropped_text_for_voice:
-            logger.info(
-                "[%s] _flush_pending_input_data: dropped %d cached text "
-                "message(s) because final session is voice mode",
-                self.lanlan_name,
-                dropped_text_for_voice,
-            )
+                if not self.session or not self.is_active:
+                    async with self.input_cache_lock:
+                        self._pending_input_flush_active = False
+                    return
+
+                # 缓存阶段（_stream_data_now）不知道 session 最终是 voice 还是
+                # text。如果最终启好的是 voice session，缓存里的纯 text 输入若
+                # 直接 flush 进 _process_stream_data_internal，会把刚 ready 的 voice
+                # session 撕成 text；继续丢弃纯文本。但 avatar_drop_image/user_image
+                # 是明确的一次性附件，必须保留其既有 offline vision 合同。screen /
+                # camera 也继续走 realtime 合法路径。audio 在缓存阶段不会出现。
+                dropped_text_for_voice = 0
+                for message in pending_messages:
+                    msg_input_type = message.get("input_type")
+                    try:
+                        if msg_input_type == "audio":
+                            await self._enqueue_audio_stream_data(message)
+                        else:
+                            if (
+                                isinstance(self.session, OmniRealtimeClient)
+                                and msg_input_type == "text"
+                            ):
+                                self.note_stream_input_ingress(message)
+                                dropped_text_for_voice += 1
+                                continue
+                            await self._process_stream_data_internal(message)
+                    except Exception as e:
+                        logger.error(f"💥 发送缓存的输入数据失败: {e}")
+                        break
+                if dropped_text_for_voice:
+                    logger.info(
+                        "[%s] _flush_pending_input_data: dropped %d cached text "
+                        "message(s) because final session is voice mode",
+                        self.lanlan_name,
+                        dropped_text_for_voice,
+                    )
+        finally:
+            async with self.input_cache_lock:
+                if getattr(self, "_pending_input_flush_active", False):
+                    self._pending_input_flush_active = False
     
     def _should_drop_live_vision_stream(self, input_type: str | None) -> bool:
         """Deliberately checked at each stream boundary; callers may enter below stream_data."""
@@ -185,6 +201,12 @@ class StreamingMixin:
             self.note_stream_input_ingress(message)
         # 检查session是否就绪
         async with self.input_cache_lock:
+            if getattr(self, "_pending_input_flush_active", False):
+                # Replay owns ordering until its current batch finishes. Queue
+                # live input behind it instead of racing the same offline
+                # session's stream_text/stream_image call.
+                self.pending_input_data.append(message)
+                return
             if not self.session_ready:
                 # 检查是否正在启动session - 只有在启动过程中才缓存
                 if self._starting_session_count > 0:

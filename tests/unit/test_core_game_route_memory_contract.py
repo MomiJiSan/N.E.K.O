@@ -1232,6 +1232,32 @@ async def test_cached_text_dropped_for_voice_still_records_engagement():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_live_text_queues_behind_pending_input_flush():
+    """Live input must not overtake the batch currently being replayed."""
+    mgr = _make_manager()
+    mgr.session = object.__new__(core_module.OmniOfflineClient)
+    mgr.is_active = True
+    mgr.session_ready = True
+    mgr._starting_session_count = 0
+    mgr.input_cache_lock = asyncio.Lock()
+    mgr.pending_input_data = []
+    mgr._pending_input_flush_active = True
+    mgr.note_stream_input_ingress = Mock()
+    mgr._should_drop_live_vision_stream = Mock(return_value=False)
+
+    await core_module.LLMSessionManager._stream_data_now(
+        mgr,
+        {"input_type": "text", "data": "new live text"},
+    )
+
+    assert len(mgr.pending_input_data) == 1
+    assert mgr.pending_input_data[0]["input_type"] == "text"
+    assert mgr.pending_input_data[0]["data"] == "new live text"
+    assert isinstance(mgr.pending_input_data[0]["_user_input_ingress_time"], float)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 @pytest.mark.parametrize("input_type", ["avatar_drop_image", "user_image"])
 async def test_cached_user_image_hands_ready_voice_session_to_offline_vision(
     monkeypatch,
