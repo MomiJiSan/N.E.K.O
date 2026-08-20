@@ -431,6 +431,21 @@ def _passive_callback(summary, *, coalesce_key=""):
     }
 
 
+def test_swap_prime_render_excludes_retracted_claimed_callback():
+    mgr = _make_swap_manager()
+    callback = _passive_callback("expired during media staging")
+    callback[SWAP_PRIME_DELIVERY_CLAIM_KEY] = True
+    callback[DELIVERY_RETRACTED_KEY] = True
+
+    ready, rendered = mgr._render_claimed_passive_callbacks_for_swap_prime(
+        [callback]
+    )
+
+    assert ready == []
+    assert rendered == ""
+    assert SWAP_PRIME_DELIVERY_CLAIM_KEY not in callback
+
+
 def _install_passive_prime_barrier(session, *, expected_text):
     prime_entered = asyncio.Event()
     allow_prime = asyncio.Event()

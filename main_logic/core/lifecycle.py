@@ -2233,7 +2233,8 @@ class LifecycleMixin:
         ready = [
             callback
             for callback in selected
-            if self._callback_media_ready_for_session(
+            if not callback.get(DELIVERY_RETRACTED_KEY)
+            and self._callback_media_ready_for_session(
                 callback,
                 getattr(self, "pending_session", None),
             )

@@ -2268,6 +2268,9 @@ class _TransportMixin:
 
                 if event_type == "session.updated":
                     self._notify_session_updated(event)
+                    handler = self.extra_event_handlers.get(event_type)
+                    if handler is not None:
+                        await handler(event)
                     continue
 
                 if event_type in ID_BEARING_RESPONSE_CONTENT_EVENT_TYPES:
