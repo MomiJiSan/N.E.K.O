@@ -495,6 +495,11 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # was optimistically pruned after send. Entries also self-expire to
         # avoid leaks if the server never acks.
         self._inject_rejection_handlers: Dict[str, Callable[[str], None]] = {}
+        # ``session.updated`` is the ordered Provider acknowledgement used by
+        # hot-swap passive-media delivery barriers. Each waiter names the exact
+        # instructions snapshot sent after its media writes, so an older
+        # connection-setup acknowledgement cannot settle a later handoff.
+        self._session_update_ack_waiters: list[tuple[str, asyncio.Future]] = []
         # One-shot gate for the no-event_id content fallback in
         # ``_route_inject_rejection``. True only between "a proactive inject
         # just sent its ``response.create``" and "that inject's outcome was

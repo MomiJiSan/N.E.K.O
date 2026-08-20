@@ -1457,7 +1457,11 @@ class _ResponseMixin:
                     "prompt_ephemeral: external visual analysis failed: %s",
                     exc,
                 )
-                stage_result = None
+                # A transient analysis failure is retryable. Keep the exact
+                # generation unconsumed and do not downgrade this attempt to a
+                # text-only nudge. Only an explicit empty analysis result below
+                # is terminal for the selected frame.
+                return False
             external_description = str(
                 getattr(stage_result, "description", "") or ""
             ).strip()

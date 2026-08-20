@@ -2206,7 +2206,7 @@ class ProactiveMixin:
         self,
         callbacks: list,
         session: object,
-    ) -> dict[str, bool]:
+    ) -> dict[str, object]:
         """Stage retained callback images before a natural-turn consumer.
 
         Passive consumers remove callbacks after rendering their text. Media
@@ -2216,8 +2216,8 @@ class ProactiveMixin:
         A transient rejection leaves the callback unready and queued.  The
         returned live outcome also covers WebSocket-native rejection events
         that can arrive after ``stream_image`` has returned; the hot-swap
-        owner keeps it through the short delivery-settlement window before it
-        acknowledges or removes the callback.
+        owner keeps it until the later session-update barrier proves that the
+        Provider processed the preceding image and callback-context writes.
         """
 
         outcome = {
@@ -2225,6 +2225,7 @@ class ProactiveMixin:
             "native_rejection_pending": False,
             "rejected": False,
             "settled": False,
+            "rejection_observed": asyncio.Event(),
         }
 
         stream_image = getattr(session, "stream_image", None)
@@ -2238,6 +2239,12 @@ class ProactiveMixin:
             session,
             "_is_gemini",
             False,
+        )
+        raw_visual_mode = getattr(session, "_visual_delivery_mode", "native")
+        websocket_native_delivery = (
+            websocket_native_session
+            and bool(getattr(session, "_supports_native_image", False))
+            and getattr(raw_visual_mode, "value", raw_visual_mode) == "native"
         )
         terminal_rejections = {
             "analysis_empty",
@@ -2280,6 +2287,7 @@ class ProactiveMixin:
                         return
                     outcome["rejected"] = True
                     outcome["safe_to_continue"] = False
+                    outcome["rejection_observed"].set()
                     _callback["_passive_media_staged_count"] = 0
 
                 try:
@@ -2315,11 +2323,12 @@ class ProactiveMixin:
                         callback["_passive_media_staged_count"] = staged_count
                     else:
                         callback["_passive_media_staged_count"] = index
-                        if realtime_session and index > 0:
-                            # At least one native image is already irreversible
-                            # in this Provider session.  Continuing the swap
-                            # would let a later user turn consume that prefix
-                            # without the callback text that owns it.
+                        if websocket_native_delivery:
+                            # A WebSocket send exception does not prove that no
+                            # bytes crossed the transport boundary. Even image
+                            # zero may therefore already be irreversible in the
+                            # Provider session; retire it instead of promoting
+                            # ambiguous, unlabelled visual context.
                             outcome["safe_to_continue"] = False
                     break
 

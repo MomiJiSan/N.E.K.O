@@ -1450,6 +1450,8 @@ async def test_partial_offline_passive_media_staging_rolls_back_callback_prefix(
 async def test_partial_native_passive_media_staging_requires_session_retirement():
     session = _make_voice_sess()
     session._is_gemini = False
+    session._supports_native_image = True
+    session._visual_delivery_mode = "native"
 
     async def stream_image(image_b64, **_kwargs):
         if image_b64 == "callback-image-2":
@@ -1477,6 +1479,36 @@ async def test_partial_native_passive_media_staging_requires_session_retirement(
     assert outcome["safe_to_continue"] is False
     assert outcome["native_rejection_pending"] is True
     assert cb["_passive_media_staged_count"] == 1
+    assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
+
+
+async def test_first_native_passive_media_exception_requires_session_retirement():
+    session = _make_voice_sess()
+    session._is_gemini = False
+    session._supports_native_image = True
+    session._visual_delivery_mode = "native"
+    session.stream_image = AsyncMock(
+        side_effect=RuntimeError("ambiguous first-image write failure")
+    )
+    mgr = _make_mgr(session=session)
+    cb = {
+        "_callback_delivery_id": "id-native-first-retire",
+        "status": "completed",
+        "summary": "one native callback image",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "media_images": ["callback-image-1"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    outcome = await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+
+    assert outcome["safe_to_continue"] is False
+    assert cb["_passive_media_staged_count"] == 0
     assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
 
 
@@ -1512,6 +1544,7 @@ async def test_passive_native_async_rejection_invalidates_live_stage_outcome():
 
     assert outcome["rejected"] is True
     assert outcome["safe_to_continue"] is False
+    assert outcome["rejection_observed"].is_set()
     assert cb["_passive_media_staged_count"] == 0
 
 

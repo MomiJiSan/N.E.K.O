@@ -404,6 +404,32 @@ async def test_external_proactive_snapshot_queues_description_without_raw_event(
 
 
 @pytest.mark.asyncio
+async def test_external_proactive_transient_analysis_error_keeps_snapshot_for_retry():
+    client = _make_qwen_client()
+    client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
+    client._ai_recent_activity_time = 0
+    client._user_recent_activity_time = 0
+    client._client_vad_active = False
+    client._client_vad_last_speech_time = 0
+    client._analyze_image_with_vision_model = AsyncMock(
+        side_effect=RuntimeError("vision provider timeout")
+    )
+    client.inject_text_and_request_response = AsyncMock()
+    await client.stream_image(
+        DUMMY_IMAGE_B64,
+        source="screen",
+        request_id="proactive-transient-analysis",
+    )
+
+    delivered = await client.prompt_ephemeral("主动看看屏幕")
+
+    assert delivered is False
+    assert client._proactive_image_consumed is False
+    client.inject_text_and_request_response.assert_not_awaited()
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_external_proactive_visual_await_yields_to_independent_asr_turn():
     """A user turn that starts during vision analysis must preempt the nudge."""
     client = _make_qwen_client()

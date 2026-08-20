@@ -613,6 +613,54 @@ class _TransportMixin:
         }
         await self.send_event(event)
 
+    def expect_session_update_ack(self, instructions: str) -> asyncio.Future:
+        """Arm an exact waiter for a future ``session.updated`` snapshot."""
+
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        self._session_update_ack_waiters.append((str(instructions), waiter))
+        return waiter
+
+    def discard_session_update_ack(self, waiter: asyncio.Future) -> None:
+        """Remove a delivery-barrier waiter without affecting other updates."""
+
+        self._session_update_ack_waiters = [
+            (expected, pending)
+            for expected, pending in self._session_update_ack_waiters
+            if pending is not waiter
+        ]
+        if not waiter.done():
+            waiter.cancel()
+
+    def _notify_session_updated(self, event: Dict[str, Any]) -> None:
+        """Settle waiters whose exact instructions snapshot was accepted."""
+
+        session = event.get("session")
+        if not isinstance(session, dict):
+            return
+        accepted_instructions = session.get("instructions")
+        if accepted_instructions is None:
+            return
+        accepted_text = str(accepted_instructions)
+        remaining = []
+        for expected, waiter in self._session_update_ack_waiters:
+            if waiter.done():
+                continue
+            if expected == accepted_text:
+                waiter.set_result(None)
+            else:
+                remaining.append((expected, waiter))
+        self._session_update_ack_waiters = remaining
+
+    def _cancel_session_update_ack_waiters(self) -> None:
+        waiters, self._session_update_ack_waiters = (
+            self._session_update_ack_waiters,
+            [],
+        )
+        for _expected, waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+
     async def stream_audio(
         self,
         audio_chunk: bytes,
@@ -2218,6 +2266,10 @@ class _TransportMixin:
                         await self.close()
                     continue
 
+                if event_type == "session.updated":
+                    self._notify_session_updated(event)
+                    continue
+
                 if event_type in ID_BEARING_RESPONSE_CONTENT_EVENT_TYPES:
                     content_started = self._response_arbiter.notify_response_content(
                         event
@@ -2952,6 +3004,7 @@ class _TransportMixin:
         # their analysis, arbiter ticket, and submit task synchronously before
         # teardown can yield and a replacement connection can attach.
         self._abandon_external_visual_turn(quarantine_gemini_submit=False)
+        self._cancel_session_update_ack_waiters()
         generation = self._connection_generation
         ws, self.ws = self.ws, None
         # The manager is the one closing, so it already knows this session is

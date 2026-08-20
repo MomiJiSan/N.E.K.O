@@ -52,7 +52,7 @@ from ._shared import (
     _HANDSHAKE_OVERRIDE_UNSET,
     _START_LLM_CONCURRENT_ABORTED,
     _ORPHAN_SESSION_REAPER_TASKS,
-    _VOICE_PROACTIVE_ACK_GRACE_S,
+    _PASSIVE_MEDIA_SESSION_UPDATE_ACK_TIMEOUT_S,
 )
 from .callback_render import (
     _build_callback_instruction,
@@ -2700,27 +2700,46 @@ class LifecycleMixin:
                 # 接管方纪元的下一次 hot-swap 照常投递（与 _deferred 一致）。
                 return
 
-            # WebSocket-native image writes are only provisionally accepted:
-            # the Provider can reject them on the receive loop after
-            # ``stream_image`` returns.  Start the replacement listener before
-            # removing/acknowledging its callback and keep the same short
-            # rejection window used by active voice callback delivery.  A
-            # rejection retires the whole replacement session because its
-            # already-written media prefix cannot be rolled back safely.
+            # WebSocket-native image writes are only provisionally accepted.
+            # The passive text prime sends a session.update after those writes;
+            # its matching session.updated snapshot is the ordered Provider
+            # boundary proving that the entire media+text prefix was processed.
+            # Do not replace this with a timing grace period: an image error can
+            # legitimately arrive later than a local sleep.
             if (
                 _passive_media_outcome is not None
                 and _passive_media_outcome["native_rejection_pending"]
             ):
+                session_update_ack = new_session.expect_session_update_ack(
+                    new_session.instructions
+                )
                 self.message_handler_task = asyncio.create_task(
                     new_session.handle_messages()
                 )
+                rejection_wait = asyncio.create_task(
+                    _passive_media_outcome["rejection_observed"].wait()
+                )
                 try:
-                    await asyncio.sleep(_VOICE_PROACTIVE_ACK_GRACE_S)
+                    done, _pending = await asyncio.wait(
+                        {session_update_ack, rejection_wait},
+                        timeout=_PASSIVE_MEDIA_SESSION_UPDATE_ACK_TIMEOUT_S,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
                 finally:
                     _passive_media_outcome["settled"] = True
-                if _passive_media_outcome["rejected"]:
+                    new_session.discard_session_update_ack(session_update_ack)
+                    if not rejection_wait.done():
+                        rejection_wait.cancel()
+                    await asyncio.gather(rejection_wait, return_exceptions=True)
+                media_prefix_committed = (
+                    session_update_ack in done
+                    and not session_update_ack.cancelled()
+                    and session_update_ack.exception() is None
+                    and not _passive_media_outcome["rejected"]
+                )
+                if not media_prefix_committed:
                     logger.warning(
-                        "Final Swap Sequence: passive native media was rejected; retiring promoted replacement before callback ACK"
+                        "Final Swap Sequence: passive native media was rejected or its session-update barrier timed out; retiring promoted replacement before callback ACK"
                     )
                     replacement_listener = self.message_handler_task
                     if replacement_listener and not replacement_listener.done():
