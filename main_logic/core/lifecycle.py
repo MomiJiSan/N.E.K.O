@@ -2791,6 +2791,9 @@ class LifecycleMixin:
                     if self.session is new_session:
                         self.session = None
                     self.is_active = False
+                    await self._close_independent_asr(
+                        next_route_mode="blocked",
+                    )
                     await self.send_status(json.dumps({
                         "code": "INTERNAL_UPDATE_FAILED",
                         "details": {

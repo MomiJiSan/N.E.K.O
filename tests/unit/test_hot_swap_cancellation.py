@@ -1513,8 +1513,19 @@ async def test_prime_dispatch_failure_on_the_skipped_branch_takes_the_targeted_a
 async def test_passive_native_rejection_retires_replacement_before_callback_ack():
     mgr = _make_swap_manager()
     statuses = []
-    mgr.send_status = AsyncMock(side_effect=statuses.append)
-    mgr.send_session_ended_by_server = AsyncMock()
+    cleanup_steps = []
+
+    def _record_status(status):
+        statuses.append(status)
+        cleanup_steps.append("status")
+
+    mgr._close_independent_asr = AsyncMock(
+        side_effect=lambda **_kwargs: cleanup_steps.append("asr")
+    )
+    mgr.send_status = AsyncMock(side_effect=_record_status)
+    mgr.send_session_ended_by_server = AsyncMock(
+        side_effect=lambda: cleanup_steps.append("ended")
+    )
     old_session = _FakeSession("old")
     new_session = OmniRealtimeClient.__new__(OmniRealtimeClient)
     new_session.ws = object()
@@ -1581,8 +1592,12 @@ async def test_passive_native_rejection_retires_replacement_before_callback_ack(
     assert old_session.closed is True
     assert new_session.closed is True
     assert mgr.session is None
+    mgr._close_independent_asr.assert_awaited_once_with(
+        next_route_mode="blocked",
+    )
     assert any("INTERNAL_UPDATE_FAILED" in status for status in statuses)
     mgr.send_session_ended_by_server.assert_awaited_once_with()
+    assert cleanup_steps == ["asr", "status", "ended"]
     assert mgr.pending_agent_callbacks == [callback]
     assert callback_ack.done() is False
 
