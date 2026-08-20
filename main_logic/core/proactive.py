@@ -1056,6 +1056,26 @@ class ProactiveMixin:
                     )
                     self._schedule_proactive_retry(self.proactive_manager.min_gap_s)
                     return False
+                # Vision analysis can yield long enough for a hot swap to
+                # retire the captured realtime session.  Activity checks on
+                # the old session are insufficient: never inject callback
+                # text into a session that is no longer manager-owned.
+                if self.session is not voice_sess:
+                    self._clear_voice_delivery_committed(voice_commit_snapshot)
+                    for _owner_cb, event in voice_media_events:
+                        voice_sess._inject_rejection_handlers.pop(
+                            event.get("event_id"),
+                            None,
+                        )
+                    logger.info(
+                        "[%s] trigger_agent_callbacks: voice session changed "
+                        "during callback media analysis; deferring callback",
+                        self.lanlan_name,
+                    )
+                    self._schedule_proactive_retry(
+                        self.proactive_manager.min_gap_s
+                    )
+                    return False
                 # External descriptions are still local at this point; unlike
                 # native images, nothing has been persisted to the provider.
                 # If a user turn won the slow vision-model await, discard the
@@ -2528,6 +2548,7 @@ class ProactiveMixin:
             callback["detail"] = detail
             error_message = str(callback.get("error_message") or "").strip()
             source_name = str(callback.get("source_name") or "").strip()
+            media_images = callback.get("media_images")
             status = callback.get("status") or "completed"
             origin = callback.get("origin")
             if origin not in ("task_result", "event"):
@@ -2545,7 +2566,14 @@ class ProactiveMixin:
             #
             # Apply this before either queue is touched so text mode cannot
             # inject a garbage header-only block that voice mode discarded.
-            if not summary and not detail and not error_message and not source_name and status == "completed":
+            if (
+                not summary
+                and not detail
+                and not error_message
+                and not source_name
+                and not media_images
+                and status == "completed"
+            ):
                 return
             # Stable delivery id so the voice inject success path can
             # precisely drop the matching extras entry from

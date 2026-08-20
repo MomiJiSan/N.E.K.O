@@ -490,7 +490,13 @@ class _TransportMixin:
             logger.warning("⚠️ 图片重压缩失败 type=%s: %s — 丢弃帧", etype, e)
             return None
 
-    async def send_event(self, event, *, raise_on_oversize: bool = False) -> bool:
+    async def send_event(
+        self,
+        event,
+        *,
+        raise_on_oversize: bool = False,
+        expected_visual_mode: VisualDeliveryMode | str | None = None,
+    ) -> bool:
         # 检查是否已发生致命错误，直接跳过发送
         if self._fatal_error_occurred:
             return False
@@ -542,6 +548,22 @@ class _TransportMixin:
                             raise RealtimeImagePayloadTooLargeError(
                                 "image payload exceeds realtime WebSocket frame limit"
                             )
+                        return False
+                # The raw-vision fence may be armed while this send waits for
+                # the semaphore or while an oversized image is recompressed.
+                # Recheck immediately before the provider write so a native
+                # frame cannot cross a route-mode boundary after admission.
+                if expected_visual_mode is not None:
+                    expected_mode = VisualDeliveryMode(expected_visual_mode)
+                    current_mode = getattr(
+                        self,
+                        "_visual_delivery_mode",
+                        VisualDeliveryMode.NATIVE,
+                    )
+                    if current_mode != expected_mode or (
+                        expected_mode == VisualDeliveryMode.NATIVE
+                        and getattr(self, "_raw_visual_delivery_blocked", False)
+                    ):
                         return False
                 await self.ws.send(payload)
                 return True
@@ -1152,6 +1174,23 @@ class _TransportMixin:
                 if self._gemini_session:
                     try:
                         image_bytes = base64.b64decode(image_b64)
+                        if (
+                            getattr(
+                                self,
+                                "_visual_delivery_mode",
+                                VisualDeliveryMode.NATIVE,
+                            )
+                            != VisualDeliveryMode.NATIVE
+                            or getattr(self, "_raw_visual_delivery_blocked", False)
+                        ):
+                            return ImageStageResult(
+                                accepted=False,
+                                mode=VisualDeliveryMode.NATIVE.value,
+                                generation=getattr(
+                                    self, "_latest_image_generation", 0
+                                ),
+                                rejection_reason="raw_visual_delivery_blocked",
+                            )
                         await self._gemini_session.send_realtime_input(
                             media={"data": image_bytes, "mime_type": "image/jpeg"}
                         )
@@ -1191,6 +1230,7 @@ class _TransportMixin:
                 sent = await self.send_event(
                     append_event,
                     raise_on_oversize=bypass_rate_limit,
+                    expected_visual_mode=VisualDeliveryMode.NATIVE,
                 )
                 if not sent and rejection_event_id is not None:
                     self._inject_rejection_handlers.pop(rejection_event_id, None)
@@ -1201,6 +1241,12 @@ class _TransportMixin:
                     accepted=sent,
                     mode=VisualDeliveryMode.NATIVE.value,
                     generation=getattr(self, "_latest_image_generation", 0),
+                    rejection_reason=(
+                        "raw_visual_delivery_blocked"
+                        if not sent
+                        and getattr(self, "_raw_visual_delivery_blocked", False)
+                        else None
+                    ),
                 )
 
             if self._audio_in_buffer or bypass_rate_limit:
@@ -1285,6 +1331,7 @@ class _TransportMixin:
                 sent = await self.send_event(
                     append_event,
                     raise_on_oversize=bypass_rate_limit,
+                    expected_visual_mode=VisualDeliveryMode.NATIVE,
                 )
                 if not sent and rejection_event_id is not None:
                     self._inject_rejection_handlers.pop(rejection_event_id, None)
@@ -1295,6 +1342,12 @@ class _TransportMixin:
                     accepted=sent,
                     mode=VisualDeliveryMode.NATIVE.value,
                     generation=getattr(self, "_latest_image_generation", 0),
+                    rejection_reason=(
+                        "raw_visual_delivery_blocked"
+                        if not sent
+                        and getattr(self, "_raw_visual_delivery_blocked", False)
+                        else None
+                    ),
                 )
             return ImageStageResult(
                 accepted=False,

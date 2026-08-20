@@ -160,6 +160,26 @@ def test_enqueue_agent_callback_uses_generic_context_source_budget(monkeypatch):
     assert mgr.pending_extra_replies[1]["context_source"] == "proactive.callback"
 
 
+def test_enqueue_agent_callback_keeps_image_only_completed_callback():
+    mgr = _make_mgr()
+    callback = {
+        "status": "completed",
+        "summary": "",
+        "detail": "",
+        "media_images": ["image-b64"],
+        "origin": "event",
+    }
+
+    core_module.LLMSessionManager.enqueue_agent_callback(mgr, callback)
+
+    assert mgr.pending_agent_callbacks == [callback]
+    assert len(mgr.pending_extra_replies) == 1
+    assert (
+        mgr.pending_extra_replies[0]["_callback_delivery_id"]
+        == callback["_callback_delivery_id"]
+    )
+
+
 def _make_voice_sess(*, is_responding=False, inject=None):
     """Build an ``OmniRealtimeClient`` test double via ``__new__`` (NOT a
     subclass).
@@ -444,6 +464,61 @@ async def test_external_callback_rechecks_user_activity_after_visual_analysis():
     delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(
         mgr
     )
+
+    assert delivered is False
+    assert sess.inject_calls == 0
+    assert sess._inject_rejection_handlers == {}
+    assert mgr.pending_agent_callbacks == [cb]
+    assert cb.get("_voice_delivery_committed") is None
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+
+async def test_callback_media_analysis_rechecks_session_ownership():
+    sess = _make_voice_sess()
+    sess._inject_rejection_handlers = {}
+    replacement = _make_voice_sess()
+    mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
+
+    async def _stream_image(
+        _image_b64,
+        *,
+        bypass_rate_limit=False,
+        cache_latest=True,
+        source=None,
+        request_id=None,
+        on_rejected=None,
+    ):
+        assert bypass_rate_limit is True
+        assert cache_latest is False
+        assert source == "callback"
+        assert request_id == "id-session-swap-during-vision"
+        assert on_rejected is not None
+        await asyncio.sleep(0)
+        mgr.session = replacement
+        return SimpleNamespace(
+            accepted=True,
+            mode="external_description",
+            description="画面里有一只猫。",
+        )
+
+    async def _expire(_event_id, _timeout):
+        return None
+
+    sess.stream_image = _stream_image
+    sess._expire_inject_rejection_handler = _expire
+    sess._fire_task = lambda coro: coro.close()
+    cb = {
+        "_callback_delivery_id": "id-session-swap-during-vision",
+        "status": "completed",
+        "summary": "defer this visual callback",
+        "media_images": ["callback-image"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
 
     assert delivered is False
     assert sess.inject_calls == 0
