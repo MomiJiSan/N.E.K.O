@@ -49,10 +49,6 @@ from ._shared import (
 from .callback_render import _build_callback_instruction, _select_callbacks_within_token_budget
 
 
-_PASSIVE_MEDIA_SESSION_KEY = "_passive_media_session_id"
-_PASSIVE_MEDIA_STAGED_COUNT_KEY = "_passive_media_staged_count"
-
-
 class ProactiveMixin:
     """Proactive delivery methods (see module docstring)."""
 
@@ -2156,14 +2152,19 @@ class ProactiveMixin:
                 session._inject_rejection_handlers.pop(event_id, None)
         return all_ok
 
-    @staticmethod
-    def _callback_media_ready_for_session(callback: dict, session: object) -> bool:
+    def _callback_media_ready_for_session(
+        self,
+        callback: dict,
+        session: object,
+    ) -> bool:
         """Return whether callback media is already owned by ``session``."""
 
         images = callback.get("media_images")
         return not images or (
-            callback.get(_PASSIVE_MEDIA_SESSION_KEY) == id(session)
-            and int(callback.get(_PASSIVE_MEDIA_STAGED_COUNT_KEY, 0) or 0)
+            callback.get("_passive_media_session_id") == id(session)
+            and int(
+                callback.get("_passive_media_staged_count", 0) or 0
+            )
             >= len(images)
         )
 
@@ -2195,19 +2196,19 @@ class ProactiveMixin:
                 continue
             images = list(callback.get("media_images") or [])
             if not images:
-                callback.pop(_PASSIVE_MEDIA_SESSION_KEY, None)
-                callback.pop(_PASSIVE_MEDIA_STAGED_COUNT_KEY, None)
+                callback.pop("_passive_media_session_id", None)
+                callback.pop("_passive_media_staged_count", None)
                 continue
             if self._callback_media_ready_for_session(callback, session):
                 continue
             staged_count = 0
-            if callback.get(_PASSIVE_MEDIA_SESSION_KEY) == session_id:
+            if callback.get("_passive_media_session_id") == session_id:
                 staged_count = int(
-                    callback.get(_PASSIVE_MEDIA_STAGED_COUNT_KEY, 0) or 0
+                    callback.get("_passive_media_staged_count", 0) or 0
                 )
             else:
-                callback[_PASSIVE_MEDIA_SESSION_KEY] = session_id
-                callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = 0
+                callback["_passive_media_session_id"] = session_id
+                callback["_passive_media_staged_count"] = 0
 
             index = staged_count
             while index < len(images):
@@ -2235,7 +2236,7 @@ class ProactiveMixin:
                         exc,
                     )
                     callback["media_images"] = images
-                    callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = index
+                    callback["_passive_media_staged_count"] = index
                     break
 
                 structured = hasattr(stage_result, "accepted")
@@ -2252,7 +2253,7 @@ class ProactiveMixin:
                     reason = getattr(stage_result, "rejection_reason", None)
                     if reason not in terminal_rejections:
                         callback["media_images"] = images
-                        callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = index
+                        callback["_passive_media_staged_count"] = index
                         break
                     images.pop(index)
                     callback["media_images"] = images
@@ -2290,16 +2291,16 @@ class ProactiveMixin:
                     callback["media_images"] = images
                     continue
                 index += 1
-                callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = index
+                callback["_passive_media_staged_count"] = index
             else:
                 if images:
                     callback["media_images"] = images
-                    callback[_PASSIVE_MEDIA_SESSION_KEY] = session_id
-                    callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = len(images)
+                    callback["_passive_media_session_id"] = session_id
+                    callback["_passive_media_staged_count"] = len(images)
                 else:
                     callback.pop("media_images", None)
-                    callback.pop(_PASSIVE_MEDIA_SESSION_KEY, None)
-                    callback.pop(_PASSIVE_MEDIA_STAGED_COUNT_KEY, None)
+                    callback.pop("_passive_media_session_id", None)
+                    callback.pop("_passive_media_staged_count", None)
 
     def on_voice_playback_signal(self, *, playing: bool, **meta) -> None:
         """Handle a FRONTEND-reported audio playback boundary.
