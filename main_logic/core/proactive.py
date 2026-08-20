@@ -49,6 +49,13 @@ from ._shared import (
 from .callback_render import _build_callback_instruction, _select_callbacks_within_token_budget
 
 
+_TERMINAL_CALLBACK_IMAGE_REJECTIONS = frozenset({
+    "analysis_empty",
+    "invalid_payload",
+    "payload_too_large",
+})
+
+
 class ProactiveMixin:
     """Proactive delivery methods (see module docstring)."""
 
@@ -1047,10 +1054,44 @@ class ProactiveMixin:
                 voice_commit_snapshot = tuple(voice_snapshot)
                 voice_media_events: list[tuple[dict, dict]] = []
                 media_session_unsafe = False
+                native_media_prefix_committed = False
 
                 def _mark_media_session_unsafe() -> None:
                     nonlocal media_session_unsafe
                     media_session_unsafe = True
+
+                def _mark_native_media_prefix_committed() -> None:
+                    nonlocal native_media_prefix_committed
+                    native_media_prefix_committed = True
+
+                async def _retire_unsafe_media_session() -> None:
+                    # A native callback image is already persistent provider
+                    # context, but its paired callback text will not be sent.
+                    # Fence the client before the shared admission lock is
+                    # released, then tear down the exact manager-owned session
+                    # so the next user/ASR turn cannot consume the unlabelled
+                    # prefix.
+                    voice_sess._fatal_error_occurred = True
+                    try:
+                        await voice_sess.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] failed to close realtime session after "
+                            "partial proactive media delivery: %s",
+                            self.lanlan_name,
+                            exc,
+                        )
+                    if self.session is voice_sess:
+                        # Full manager cleanup can wait on ASR registry work
+                        # whose turn is queued behind this same admission lock.
+                        # Start it now, but do not await it until the callback
+                        # transaction releases the lock.
+                        self._fire_task(
+                            self.end_session(
+                                by_server=True,
+                                expected_session=voice_sess,
+                            )
+                        )
 
                 media_started_at = time.time()
                 try:
@@ -1060,6 +1101,9 @@ class ProactiveMixin:
                         on_rejected=_on_voice_media_rejected,
                         events_before_text=voice_media_events,
                         on_session_unsafe=_mark_media_session_unsafe,
+                        on_native_prefix_committed=(
+                            _mark_native_media_prefix_committed
+                        ),
                     )
                 except BaseException:
                     self._clear_voice_delivery_committed(voice_commit_snapshot)
@@ -1067,33 +1111,7 @@ class ProactiveMixin:
                 if not media_ok:
                     self._clear_voice_delivery_committed(voice_commit_snapshot)
                     if media_session_unsafe:
-                        # At least one native callback image may already be
-                        # persistent provider context, but its paired callback
-                        # text will not be sent. Fence the client before this
-                        # shared admission lock is released, then tear down the
-                        # exact manager-owned session so the next user/ASR turn
-                        # cannot consume the unlabelled prefix.
-                        voice_sess._fatal_error_occurred = True
-                        try:
-                            await voice_sess.close()
-                        except Exception as exc:
-                            logger.warning(
-                                "[%s] failed to close realtime session after "
-                                "partial proactive media delivery: %s",
-                                self.lanlan_name,
-                                exc,
-                            )
-                        if self.session is voice_sess:
-                            # Full manager cleanup can wait on ASR registry work
-                            # whose turn is queued behind this same admission
-                            # lock. Start it now, but do not await it until the
-                            # current callback transaction releases the lock.
-                            self._fire_task(
-                                self.end_session(
-                                    by_server=True,
-                                    expected_session=voice_sess,
-                                )
-                            )
+                        await _retire_unsafe_media_session()
                     # A media stream failed — DEFER the whole inject so this cb
                     # retries WITH its image rather than being delivered
                     # text-only and pruned (which would lose the retained
@@ -1143,6 +1161,9 @@ class ProactiveMixin:
                                 event.get("event_id"),
                                 None,
                             )
+                    if native_media_prefix_committed:
+                        _mark_media_session_unsafe()
+                        await _retire_unsafe_media_session()
                     logger.info(
                         "[%s] trigger_agent_callbacks: activity started during "
                         "callback media delivery; deferring callback delivery",
@@ -1992,6 +2013,7 @@ class ProactiveMixin:
         on_rejected=None,
         events_before_text: list[tuple[dict, dict]] | None = None,
         on_session_unsafe=None,
+        on_native_prefix_committed=None,
     ) -> bool:
         """Stream images carried by proactive callbacks (push_message
         media_parts with ai_behavior="respond") into ``session`` right before
@@ -2121,10 +2143,11 @@ class ProactiveMixin:
                             "rejection_reason",
                             None,
                         )
-                        if native_prefix_committed and rejection_reason not in {
-                            "payload_too_large",
-                            "analysis_empty",
-                        }:
+                        if (
+                            native_prefix_committed
+                            and rejection_reason
+                            not in _TERMINAL_CALLBACK_IMAGE_REJECTIONS
+                        ):
                             # The callback transaction already persisted a raw
                             # image, but this attempt cannot reach its paired
                             # text. Retryable rejection (including a native raw
@@ -2140,19 +2163,25 @@ class ProactiveMixin:
                             raise RealtimeImagePayloadTooLargeError(
                                 "callback image exceeds the external visual payload limit"
                             )
-                        if rejection_reason == "analysis_empty":
+                        if rejection_reason in {
+                            "analysis_empty",
+                            "invalid_payload",
+                        }:
                             images.remove(b64)
                             if not images:
                                 cb.pop("media_images", None)
                             logger.warning(
-                                "[%s] dropping proactive image whose external "
-                                "analysis produced no description",
+                                "[%s] dropping terminally rejected proactive "
+                                "image (%s)",
                                 self.lanlan_name,
+                                rejection_reason,
                             )
                             continue
                         raise RuntimeError("callback image was not accepted")
                     if delivery_mode == "native":
                         native_prefix_committed = True
+                        if callable(on_native_prefix_committed):
+                            on_native_prefix_committed()
                     if delivery_mode == "external_description":
                         if not isinstance(description, str) or not description.strip():
                             raise RuntimeError(
@@ -2309,6 +2338,7 @@ class ProactiveMixin:
 
         outcome = {
             "safe_to_continue": True,
+            "native_prefix_committed": False,
             "native_rejection_pending": False,
             "rejected": False,
             "settled": False,
@@ -2333,11 +2363,6 @@ class ProactiveMixin:
             and bool(getattr(session, "_supports_native_image", False))
             and getattr(raw_visual_mode, "value", raw_visual_mode) == "native"
         )
-        terminal_rejections = {
-            "analysis_empty",
-            "invalid_payload",
-            "payload_too_large",
-        }
         for callback in callbacks:
             if not isinstance(callback, dict):
                 continue
@@ -2436,7 +2461,7 @@ class ProactiveMixin:
                     description = stage_result
                 if not accepted:
                     reason = getattr(stage_result, "rejection_reason", None)
-                    if reason not in terminal_rejections:
+                    if reason not in _TERMINAL_CALLBACK_IMAGE_REJECTIONS:
                         callback["media_images"] = images
                         if pending_images_snapshot is not None:
                             pending_images[:] = pending_images_snapshot
@@ -2481,8 +2506,10 @@ class ProactiveMixin:
                     images.pop(index)
                     callback["media_images"] = images
                     continue
-                if mode == "native" and websocket_native_session:
-                    outcome["native_rejection_pending"] = True
+                if mode == "native" and realtime_session:
+                    outcome["native_prefix_committed"] = True
+                    if websocket_native_session:
+                        outcome["native_rejection_pending"] = True
                 index += 1
                 callback["_passive_media_staged_count"] = index
             else:

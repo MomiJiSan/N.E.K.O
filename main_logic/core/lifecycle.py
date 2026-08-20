@@ -2394,6 +2394,25 @@ class LifecycleMixin:
                     )
                     raise asyncio.CancelledError()
 
+            async def _abort_if_native_prefix_lost_its_text(
+                outcome: dict | None,
+                rendered_text: str,
+                stage: str,
+            ) -> bool:
+                if rendered_text or not (
+                    outcome and outcome.get("native_prefix_committed")
+                ):
+                    return False
+                logger.warning(
+                    "Final Swap Sequence: passive native media lost its "
+                    "callback text %s; abandoning pending session",
+                    stage,
+                )
+                await self._cleanup_pending_session_resources()
+                await self._reset_preparation_state(clear_main_cache=True)
+                self.is_hot_swap_imminent = False
+                return True
+
             next_session_context_messages = getattr(self, "next_session_context_messages", []) or []
             incremental_next_session_context = next_session_context_messages[
                 self.initial_next_session_context_snapshot_len:
@@ -2523,6 +2542,12 @@ class LifecycleMixin:
                             _passive_sel
                         )
                     )
+                    if await _abort_if_native_prefix_lost_its_text(
+                        _passive_media_outcome,
+                        _passive_swap_text,
+                        "after Gemini media staging",
+                    ):
+                        return
                     if _passive_swap_text:
                         final_prime_text += "\n" + _passive_swap_text
                 try:
@@ -2583,6 +2608,12 @@ class LifecycleMixin:
                         _passive_sel
                     )
                 )
+                if await _abort_if_native_prefix_lost_its_text(
+                    _passive_media_outcome,
+                    _passive_swap_text,
+                    "after media staging",
+                ):
+                    return
                 if _passive_swap_text:
                     try:
                         await self.pending_session.prime_context(_passive_swap_text, skipped=True)
@@ -2760,6 +2791,15 @@ class LifecycleMixin:
                     if self.session is new_session:
                         self.session = None
                     self.is_active = False
+                    await self.send_status(json.dumps({
+                        "code": "INTERNAL_UPDATE_FAILED",
+                        "details": {
+                            "error": (
+                                "passive media session-update barrier failed"
+                            ),
+                        },
+                    }))
+                    await self.send_session_ended_by_server()
                     await self._reset_preparation_state(
                         clear_main_cache=True,
                         from_final_swap=True,

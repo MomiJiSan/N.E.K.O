@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
+import pytest
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 # 为隔离 trigger_agent_callbacks / trigger_greeting 的环境依赖（prompt 资源、
@@ -476,8 +478,19 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
 async def test_voice_mode_native_media_rechecks_user_activity_after_stream():
     sess = _make_voice_sess()
     sess._inject_rejection_handlers = {}
+    sess._fatal_error_occurred = False
+    sess.close = AsyncMock()
     mgr = _make_mgr(session=sess)
+    mgr.end_session = AsyncMock()
     mgr._schedule_proactive_retry = MagicMock()
+    retirement_tasks = []
+
+    def _fire_retirement(coro):
+        task = asyncio.create_task(coro)
+        retirement_tasks.append(task)
+        return task
+
+    mgr._fire_task = _fire_retirement
 
     async def _stream_image(
         _image_b64,
@@ -506,9 +519,16 @@ async def test_voice_mode_native_media_rechecks_user_activity_after_stream():
     mgr.pending_agent_callbacks = [cb]
 
     delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+    await asyncio.gather(*retirement_tasks)
 
     assert delivered is False
     assert sess.inject_calls == 0
+    assert sess._fatal_error_occurred is True
+    sess.close.assert_awaited_once_with()
+    mgr.end_session.assert_awaited_once_with(
+        by_server=True,
+        expected_session=sess,
+    )
     assert mgr.pending_agent_callbacks == [cb]
     assert cb.get("_voice_delivery_committed") is None
     mgr._schedule_proactive_retry.assert_called_once_with(
@@ -971,10 +991,12 @@ async def test_voice_mode_rechecks_retracted_callbacks_before_inject():
         on_rejected=None,
         events_before_text=None,
         on_session_unsafe=None,
+        on_native_prefix_committed=None,
     ):
         assert on_rejected is not None
         assert events_before_text == []
         assert on_session_unsafe is not None
+        assert on_native_prefix_committed is not None
         cb[DELIVERY_RETRACTED_KEY] = True
         return True
     mgr._stream_cb_media = _stream_then_retract
@@ -1479,6 +1501,7 @@ async def test_partial_native_passive_media_staging_requires_session_retirement(
     )
 
     assert outcome["safe_to_continue"] is False
+    assert outcome["native_prefix_committed"] is True
     assert outcome["native_rejection_pending"] is True
     assert cb["_passive_media_staged_count"] == 1
     assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
@@ -1510,6 +1533,7 @@ async def test_first_native_passive_media_exception_requires_session_retirement(
     )
 
     assert outcome["safe_to_continue"] is False
+    assert outcome["native_prefix_committed"] is False
     assert cb["_passive_media_staged_count"] == 0
     assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
 
@@ -1544,6 +1568,7 @@ async def test_partial_gemini_passive_media_staging_requires_session_retirement(
     )
 
     assert outcome["safe_to_continue"] is False
+    assert outcome["native_prefix_committed"] is True
     assert cb["_passive_media_staged_count"] == 1
     assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
 
@@ -1574,6 +1599,7 @@ async def test_passive_native_async_rejection_invalidates_live_stage_outcome():
         session,
     )
     assert outcome["safe_to_continue"] is True
+    assert outcome["native_prefix_committed"] is True
     assert outcome["native_rejection_pending"] is True
 
     rejection_handlers[0]("provider rejected callback image")
@@ -2075,7 +2101,13 @@ async def test_voice_mode_drops_permanently_oversized_image_and_delivers_text():
     assert mgr.pending_agent_callbacks == []
 
 
-async def test_voice_mode_drops_terminally_unanalyzable_image_and_delivers_text():
+@pytest.mark.parametrize(
+    "rejection_reason",
+    ["analysis_empty", "invalid_payload"],
+)
+async def test_voice_mode_drops_terminally_rejected_image_and_delivers_text(
+    rejection_reason,
+):
     from main_logic.omni_realtime_client import ImageStageResult
 
     sess = _make_voice_sess()
@@ -2093,13 +2125,13 @@ async def test_voice_mode_drops_terminally_unanalyzable_image_and_delivers_text(
         return ImageStageResult(
             accepted=False,
             mode="external_description",
-            rejection_reason="analysis_empty",
+            rejection_reason=rejection_reason,
         )
 
     sess.stream_image = _stream_image
     mgr = _make_mgr(session=sess)
     cb = {
-        "_callback_delivery_id": "id-empty-analysis",
+        "_callback_delivery_id": f"id-{rejection_reason}",
         "status": "completed",
         "summary": "deliver text despite unusable media",
         "media_images": ["unanalyzable-image"],

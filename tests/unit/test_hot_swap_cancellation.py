@@ -38,6 +38,7 @@ its cancel set; ``assert not swap_task.cancelled()`` pins that guard.
 """
 import asyncio
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -633,6 +634,42 @@ async def test_final_swap_passive_prime_failure_aborts_pending_session():
     assert mgr.pending_agent_callbacks == [callback]
     assert SWAP_PRIME_DELIVERY_CLAIM_KEY not in callback
     assert not delivery_ack.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_gemini", [False, True])
+async def test_final_swap_native_media_retraction_before_text_aborts_pending(
+    is_gemini,
+):
+    mgr = _make_swap_manager()
+    old_session = _FakeSession("old")
+    new_session = _make_fake_realtime_session("pending")
+    new_session._is_gemini = is_gemini
+    mgr.session = old_session
+    mgr.pending_session = new_session
+    mgr.is_hot_swap_imminent = True
+    callback = _passive_callback("retracted after native staging")
+    callback[DELIVERY_RETRACTED_KEY] = True
+    mgr.pending_agent_callbacks = [callback]
+    mgr._select_passive_callbacks_for_swap_prime = (
+        lambda **_kwargs: ([callback], "")
+    )
+    mgr._stage_passive_callback_media = AsyncMock(return_value={
+        "safe_to_continue": True,
+        "native_prefix_committed": True,
+        "native_rejection_pending": not is_gemini,
+        "rejected": False,
+    })
+    mgr._render_claimed_passive_callbacks_for_swap_prime = MagicMock(
+        return_value=([], "")
+    )
+
+    swap_task = await _run_swap_as_final_swap_task(mgr)
+
+    assert not swap_task.cancelled()
+    assert mgr.session is old_session
+    assert new_session.closed is True
+    assert mgr.pending_agent_callbacks == []
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1512,9 @@ async def test_prime_dispatch_failure_on_the_skipped_branch_takes_the_targeted_a
 @pytest.mark.asyncio
 async def test_passive_native_rejection_retires_replacement_before_callback_ack():
     mgr = _make_swap_manager()
+    statuses = []
+    mgr.send_status = AsyncMock(side_effect=statuses.append)
+    mgr.send_session_ended_by_server = AsyncMock()
     old_session = _FakeSession("old")
     new_session = OmniRealtimeClient.__new__(OmniRealtimeClient)
     new_session.ws = object()
@@ -1541,6 +1581,8 @@ async def test_passive_native_rejection_retires_replacement_before_callback_ack(
     assert old_session.closed is True
     assert new_session.closed is True
     assert mgr.session is None
+    assert any("INTERNAL_UPDATE_FAILED" in status for status in statuses)
+    mgr.send_session_ended_by_server.assert_awaited_once_with()
     assert mgr.pending_agent_callbacks == [callback]
     assert callback_ack.done() is False
 
