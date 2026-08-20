@@ -624,17 +624,12 @@ class _TransportMixin:
         if self._fatal_error_occurred:
             return
 
-        current_time = time.time()
         # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
         raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
+        raw_loud = False
         if len(raw_samples) > 0:
             local_rms = np.sqrt(np.mean(raw_samples.astype(np.float32) ** 2))
-            if local_rms > self._client_vad_threshold:
-                self._last_local_loud_time = current_time
-                # Mark physical user activity before the provider's delayed
-                # speech_started event. Callback admission uses this signal to
-                # let already-arrived microphone audio win the shared boundary.
-                self._user_recent_activity_time = current_time
+            raw_loud = local_rms > self._client_vad_threshold
 
         # Detect input sample rate based on chunk size
         # 48kHz: 480 samples (10ms) = 960 bytes
@@ -653,14 +648,6 @@ class _TransportMixin:
             if len(audio_chunk) == 0:
                 return
 
-        # Unified VAD update (priority: server VAD > RNNoise > RMS)
-        # Grace period check: always runs regardless of VAD source
-        if self._client_vad_active and current_time - self._client_vad_last_speech_time > self._client_vad_grace_period:
-            self._client_vad_active = False
-
-        # Client-side speech detection (only when no server VAD — server events handle it in handle_messages)
-        # use_rnnoise_path is true only for 48kHz input when AudioProcessor exists;
-        # for 16kHz/mobile input RNNoise doesn't run, so fall back to RMS.
         audio_processor = self._audio_processor
         use_rnnoise_path = use_rnnoise_path and audio_processor is not None
         _rnnoise_vad_live = (
@@ -668,39 +655,6 @@ class _TransportMixin:
             and audio_processor.noise_reduce_enabled
             and audio_processor._denoiser is not None
         )
-        self._rnnoise_vad_active = _rnnoise_vad_live
-        if not self._has_server_vad:
-            if _rnnoise_vad_live:
-                # Priority 2: RNNoise speech probability with sustained threshold
-                if audio_processor.speech_probability > 0.4:
-                    # B: 单帧 RNNoise 判定为语音就立即打点，独立于 sustain。
-                    # _client_vad_active 仍需 500ms sustain，_user_recent_activity
-                    # 只看"最近是否发声"，主动搭话 guard 用它兜住首 500ms 和停顿缝隙。
-                    self._user_recent_activity_time = current_time
-                    if self._speech_detect_start == 0.0:
-                        self._speech_detect_start = current_time
-                    elif current_time - self._speech_detect_start >= self._speech_sustain_threshold:
-                        self._client_vad_last_speech_time = current_time
-                        self._client_vad_active = True
-                else:
-                    self._speech_detect_start = 0.0
-            else:
-                # Priority 3: RMS energy fallback
-                samples = np.frombuffer(audio_chunk, dtype=np.int16)
-                if len(samples) > 0:
-                    rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
-                    if rms > self._client_vad_threshold:
-                        self._client_vad_last_speech_time = current_time
-                        self._client_vad_active = True
-                        # RMS 噪音率高，但若 RNNoise 不可用（16kHz/移动端），
-                        # RMS 是唯一信号，也喂给 B 兜底。阈值已经是 500（较高），
-                        # 一般环境噪音达不到。
-                        self._user_recent_activity_time = current_time
-
-        # 静音清 buffer：有 RNNoise 以 RNNoise 为准，否则 VAD + 连续本地静音（见 _should_clear_audio_buffer_on_silence）
-        if self._should_clear_audio_buffer_on_silence(current_time, use_rnnoise_path):
-            self._silence_reset_pending = False
-            await self.clear_audio_buffer()
 
         # Serialize at the actual user-audio admission boundary, not inside the
         # provider receive loop. A callback that already owns the boundary can
@@ -709,6 +663,49 @@ class _TransportMixin:
         async with self._ensure_turn_admission_lock():
             if self._fatal_error_occurred:
                 return
+            admitted_at = time.time()
+            # Activity/VAD state is part of admission too. Updating it before
+            # this lock lets queued PCM invalidate the callback transaction
+            # currently owning the boundary, even though that audio cannot yet
+            # reach the provider.
+            if raw_loud:
+                self._last_local_loud_time = admitted_at
+                self._user_recent_activity_time = admitted_at
+
+            # Unified VAD update (priority: server VAD > RNNoise > RMS).
+            if (
+                self._client_vad_active
+                and admitted_at - self._client_vad_last_speech_time
+                > self._client_vad_grace_period
+            ):
+                self._client_vad_active = False
+            self._rnnoise_vad_active = _rnnoise_vad_live
+            if not self._has_server_vad:
+                if _rnnoise_vad_live:
+                    if audio_processor.speech_probability > 0.4:
+                        self._user_recent_activity_time = admitted_at
+                        if self._speech_detect_start == 0.0:
+                            self._speech_detect_start = admitted_at
+                        elif (
+                            admitted_at - self._speech_detect_start
+                            >= self._speech_sustain_threshold
+                        ):
+                            self._client_vad_last_speech_time = admitted_at
+                            self._client_vad_active = True
+                    else:
+                        self._speech_detect_start = 0.0
+                elif raw_loud:
+                    self._client_vad_last_speech_time = admitted_at
+                    self._client_vad_active = True
+
+            # 静音清 buffer：有 RNNoise 以 RNNoise 为准，否则 VAD + 连续本地静音。
+            if self._should_clear_audio_buffer_on_silence(
+                admitted_at,
+                use_rnnoise_path,
+            ):
+                self._silence_reset_pending = False
+                await self.clear_audio_buffer()
+
             # Gemini uses different API (16kHz, no uplink resample needed)
             if self._is_gemini:
                 await self._stream_audio_gemini(audio_chunk)

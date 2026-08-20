@@ -575,13 +575,12 @@ async def _handle_agent_event(event: dict):
             # by the manager — the eventual proactive response would then lack
             # its matching visual context.
             deferred_proactive_images: list[str] = []
-            # Passive/read images rejected during a temporary route/session
-            # handoff stay attached to the callback for the next natural turn.
+            # Passive/read images stay attached to the callback until the next
+            # natural text/hot-swap consumer selects that exact callback. This
+            # keeps native provider context from receiving an unlabeled image
+            # before the matching passive text is eligible for delivery.
             deferred_callback_images: list[str] = []
-            direct_visual_descriptions: list[str] = []
             if media_parts and ai_behavior_v2 in ("respond", "read"):
-                sess = getattr(mgr, "session", None)
-                stream_image = getattr(sess, "stream_image", None) if sess else None
                 for mp in media_parts:
                     if not isinstance(mp, dict):
                         continue
@@ -608,74 +607,7 @@ async def _handle_agent_event(event: dict):
                             # the callback's source header supplies the text cue.
                             deferred_proactive_images.append(b64)
                             continue
-                        # Passive/read images are context-only: analyze or send
-                        # them once without entering the ambient screen/camera
-                        # cache, then bind any external-vision description to the
-                        # passive callback drained on the next natural user turn.
-                        if stream_image is None:
-                            logger.debug(
-                                "[EventBus] image media_part dropped: session=%s has no stream_image",
-                                type(sess).__name__ if sess else "None",
-                            )
-                            if ai_behavior_v2 == "read":
-                                deferred_callback_images.append(b64)
-                            continue
-                        # ``stream_image`` takes a base64 STRING (not bytes); pass through
-                        try:
-                            try:
-                                stage_result = await stream_image(
-                                    b64,
-                                    bypass_rate_limit=True,
-                                    cache_latest=False,
-                                    source="callback",
-                                    request_id=event.get("task_id") or None,
-                                )
-                            except TypeError as exc:
-                                if "unexpected keyword argument" not in str(exc):
-                                    raise
-                                # Offline and legacy sessions predate callback
-                                # metadata; retain their existing pending-image
-                                # staging contract without weakening Realtime.
-                                try:
-                                    stage_result = await stream_image(
-                                        b64,
-                                        bypass_rate_limit=True,
-                                    )
-                                except TypeError as fallback_exc:
-                                    if "unexpected keyword argument" not in str(fallback_exc):
-                                        raise
-                                    stage_result = await stream_image(b64)
-                            structured_result = hasattr(stage_result, "accepted")
-                            accepted = (
-                                bool(stage_result.accepted)
-                                if structured_result
-                                else True
-                            )
-                            if not accepted:
-                                logger.warning(
-                                    "[EventBus] callback image was not accepted (mime=%s)",
-                                    mime,
-                                )
-                                if ai_behavior_v2 == "read":
-                                    deferred_callback_images.append(b64)
-                                continue
-                            description = getattr(stage_result, "description", None)
-                            if isinstance(description, str) and description.strip():
-                                direct_visual_descriptions.append(
-                                    "[系统视觉感知结果，不是用户陈述]\n"
-                                    f"当前画面：{description.strip()}"
-                                )
-                            logger.debug(
-                                "[EventBus] image media_part injected (base64 len=%d, mime=%s)",
-                                len(b64),
-                                mime,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "[EventBus] image media_part stream_image failed: %s", e
-                            )
-                            if ai_behavior_v2 == "read":
-                                deferred_callback_images.append(b64)
+                        deferred_callback_images.append(b64)
                     elif isinstance(url, str) and url:
                         # TODO(v0.9): fetch URL → bytes → base64 → stream_image.
                         # Until then plugin authors should inline-encode small
@@ -691,7 +623,6 @@ async def _handle_agent_event(event: dict):
                 text
                 or deferred_proactive_images
                 or deferred_callback_images
-                or direct_visual_descriptions
             ):
                 if text and event.get("direct_reply"):
                     detail_text = (event.get("detail") or text).strip()
@@ -805,14 +736,6 @@ async def _handle_agent_event(event: dict):
                     cb_coalesce_key = ""
                 callback_summary = event.get("summary") or text
                 callback_detail = event.get("detail") or text
-                if direct_visual_descriptions:
-                    visual_context = "\n\n".join(direct_visual_descriptions)
-                    callback_summary = callback_summary or visual_context
-                    callback_detail = "\n\n".join(
-                        part
-                        for part in (callback_detail, visual_context)
-                        if part
-                    )
                 callback = {
                     "event": "agent_task_callback",
                     "origin": origin,
@@ -828,8 +751,8 @@ async def _handle_agent_event(event: dict):
                     "delivery_mode": delivery_mode,
                     "priority": cb_priority,
                     "coalesce_key": cb_coalesce_key,
-                    # Respond images stream at manager-release time. Read images
-                    # already took the explicit one-shot path above.
+                    # Both respond and read images cross the provider boundary
+                    # only at their callback's actual delivery point.
                     "media_images": (
                         deferred_proactive_images + deferred_callback_images
                     ),

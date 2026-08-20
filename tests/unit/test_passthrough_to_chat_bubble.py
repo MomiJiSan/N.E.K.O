@@ -428,7 +428,7 @@ async def test_image_only_respond_defers_callback_owned_media(monkeypatch):
 
 
 @pytest.mark.unit
-async def test_read_image_uses_one_shot_description_without_ambient_cache(
+async def test_read_image_defers_media_until_passive_callback_consumption(
     monkeypatch,
 ):
     from app import main_server
@@ -477,23 +477,16 @@ async def test_read_image_uses_one_shot_description_without_ambient_cache(
         }
     )
 
-    fake_mgr.session.stream_image.assert_awaited_once_with(
-        "read-image-b64",
-        bypass_rate_limit=True,
-        cache_latest=False,
-        source="callback",
-        request_id="passive-image-read",
-    )
+    fake_mgr.session.stream_image.assert_not_awaited()
     fake_mgr.enqueue_agent_callback.assert_called_once()
     callback = fake_mgr.enqueue_agent_callback.call_args.args[0]
-    assert callback["media_images"] == []
-    assert "[系统视觉感知结果，不是用户陈述]" in callback["detail"]
-    assert "桌面上有一本打开的书。" in callback["detail"]
+    assert callback["media_images"] == ["read-image-b64"]
+    assert callback["detail"] == "学习状态更新"
     fake_mgr.submit_proactive_callback.assert_not_called()
 
 
 @pytest.mark.unit
-async def test_read_image_rejection_keeps_callback_media_for_retry(monkeypatch):
+async def test_read_image_does_not_probe_current_session_before_enqueue(monkeypatch):
     from app import main_server
 
     fake_mgr = MagicMock()
@@ -541,6 +534,7 @@ async def test_read_image_rejection_keeps_callback_media_for_retry(monkeypatch):
     )
 
     fake_mgr.enqueue_agent_callback.assert_called_once()
+    fake_mgr.session.stream_image.assert_not_awaited()
     callback = fake_mgr.enqueue_agent_callback.call_args.args[0]
     assert callback["media_images"] == ["retry-image-b64"]
     fake_mgr.submit_proactive_callback.assert_not_called()

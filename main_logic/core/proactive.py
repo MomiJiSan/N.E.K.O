@@ -779,14 +779,17 @@ class ProactiveMixin:
                 # Injecting then makes her interrupt herself, so defer; the
                 # voice_play_end signal re-fires this and the manager releases
                 # the next cue only once she has truly stopped talking.
+                recent_activity_remaining = (
+                    getattr(voice_sess, "_user_recent_activity_time", 0.0)
+                    + getattr(voice_sess, "_user_recent_activity_window", 8.0)
+                    - time.time()
+                )
                 if (
                     self.state.phase is not ProactivePhase.IDLE
                     or voice_sess.is_active_response()
                     or getattr(voice_sess, "_proactive_inject_awaiting_outcome", False)
                     or self._is_voice_playing()
-                    or time.time()
-                    - getattr(voice_sess, "_user_recent_activity_time", 0.0)
-                    < getattr(voice_sess, "_user_recent_activity_window", 8.0)
+                    or recent_activity_remaining > 0.0
                 ):
                     logger.debug(
                         "[%s] trigger_agent_callbacks: voice session busy (phase=%s, active_response=%s, playback=%s); deferring proactive (n=%d)",
@@ -796,6 +799,15 @@ class ProactiveMixin:
                         self._voice_playback_active,
                         len(proactive_cbs),
                     )
+                    if recent_activity_remaining > 0.0:
+                        # Recent PCM can arrive without ever producing
+                        # response.done / voice_play_end (noise, partial ASR,
+                        # cancelled turn). The callback has already left the
+                        # pacing manager, so arm its own wake-up at the exact
+                        # activity-window boundary instead of waiting forever.
+                        self._schedule_proactive_retry(
+                            recent_activity_remaining
+                        )
                     return False
 
                 # ⚠️ 不能砍成短码：_build_callback_instruction 的模板有 zh-TW 行，

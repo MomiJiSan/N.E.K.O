@@ -681,17 +681,21 @@ async def test_native_audio_send_waits_for_turn_admission_boundary():
     client = _make_qwen_client(turn_admission_lock=admission_lock)
     client.send_event = AsyncMock()
 
+    loud_pcm = int(1000).to_bytes(2, "little", signed=True) * 512
+    client._user_recent_activity_time = 0.0
     await admission_lock.acquire()
-    send_task = asyncio.create_task(client.stream_audio(bytes(1024)))
+    send_task = asyncio.create_task(client.stream_audio(loud_pcm))
     await asyncio.sleep(0)
 
     client.send_event.assert_not_awaited()
+    assert client._user_recent_activity_time == 0.0
 
     admission_lock.release()
     await send_task
 
     client.send_event.assert_awaited_once()
     assert client.send_event.await_args.args[0]["type"] == "input_audio_buffer.append"
+    assert client._user_recent_activity_time > 0.0
     await client.close()
 
 

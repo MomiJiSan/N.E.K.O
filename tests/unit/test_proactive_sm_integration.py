@@ -322,6 +322,33 @@ async def test_voice_callback_defers_when_microphone_activity_arrived_first():
     assert mgr.pending_agent_callbacks == [cb]
 
 
+async def test_recent_voice_activity_arms_retry_without_turn_end_signal():
+    sess = _make_voice_sess()
+    sess._user_recent_activity_window = 0.02
+    sess._user_recent_activity_time = time.time()
+    mgr = _make_mgr(session=sess)
+    cb = {
+        "_callback_delivery_id": "id-recent-activity-retry",
+        "status": "completed",
+        "summary": "retry after the activity window",
+    }
+    mgr.pending_agent_callbacks = [cb]
+    retry_fired = asyncio.Event()
+
+    async def retry_trigger():
+        retry_fired.set()
+        return False
+
+    mgr.trigger_agent_callbacks = retry_trigger
+    mgr._fire_task = asyncio.create_task
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert mgr.pending_agent_callbacks == [cb]
+    await asyncio.wait_for(retry_fired.wait(), timeout=0.2)
+
+
 async def test_voice_nudge_waits_for_callback_inject_lock():
     sess = _make_voice_sess()
     sess._proactive_inject_awaiting_outcome = False
