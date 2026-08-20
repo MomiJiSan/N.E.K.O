@@ -658,6 +658,49 @@ async def test_new_gemini_turn_cancels_resolved_turn_during_sdk_send():
 
 
 @pytest.mark.asyncio
+async def test_new_gemini_turn_quarantines_accepted_turn_before_first_content():
+    """A returned SDK send still owns the session until Gemini terminates it."""
+    client = _make_qwen_client()
+    client._is_gemini = True
+    old_session = AsyncMock()
+    client._gemini_session = old_session
+    client.ws = old_session
+    old_context = AsyncMock()
+    client._gemini_context_manager = old_context
+    client.instructions = "system prompt"
+    client._native_audio = True
+    replacement_session = AsyncMock()
+
+    async def reconnect(*_args, **_kwargs):
+        client._gemini_session = replacement_session
+        client.ws = replacement_session
+
+    client.connect = AsyncMock(side_effect=reconnect)
+    client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
+    client.handle_interruption = AsyncMock()
+    client.create_response = AsyncMock()
+
+    await client.prepare_external_voice_turn(turn_id="gemini-accepted-old")
+    await client.submit_external_voice_turn(
+        "已经被 Gemini 接受",
+        turn_id="gemini-accepted-old",
+    )
+
+    assert client._gemini_external_submit_task is None
+    assert client._gemini_external_outcome_token is not None
+    assert client._is_responding is False
+
+    await client.prepare_external_voice_turn(turn_id="gemini-successor")
+
+    old_context.__aexit__.assert_awaited_once_with(None, None, None)
+    client.connect.assert_awaited_once_with("system prompt", native_audio=True)
+    assert client._gemini_session is replacement_session
+    assert client._gemini_external_outcome_token is None
+    client.abandon_external_voice_turn("gemini-successor")
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_server_vad_receive_does_not_wait_for_turn_admission_boundary():
     admission_lock = asyncio.Lock()
     client = _make_qwen_client(turn_admission_lock=admission_lock)

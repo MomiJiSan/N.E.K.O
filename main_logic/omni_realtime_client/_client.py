@@ -517,6 +517,11 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # visual record is abandoned so a successor turn can join quarantine
         # and retire the owning SDK session before reconnecting.
         self._gemini_external_submit_task: Optional[asyncio.Task] = None
+        # ``send_client_content`` returning only proves that Gemini accepted the
+        # turn; the response still owns this session until its terminal event.
+        # Keep a distinct token because the submit coroutine itself may already
+        # be finished when the next external-ASR utterance starts.
+        self._gemini_external_outcome_token: Optional[object] = None
         self._gemini_external_quarantine_task: Optional[asyncio.Task] = None
 
     def _create_audio_processor(self) -> AudioProcessor:

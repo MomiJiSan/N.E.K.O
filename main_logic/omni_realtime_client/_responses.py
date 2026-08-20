@@ -404,6 +404,14 @@ class _ResponseMixin:
                 self.abandon_external_voice_turn(stable_turn_id)
                 raise
 
+    def _settle_gemini_external_turn(self, token: object | None = None) -> None:
+        """Release accepted external-ASR ownership at its terminal edge."""
+
+        current = getattr(self, "_gemini_external_outcome_token", None)
+        if token is not None and current is not token:
+            return
+        self._gemini_external_outcome_token = None
+
     def _start_gemini_external_submit_quarantine(
         self,
         submit_task: Optional[asyncio.Task] = None,
@@ -412,11 +420,13 @@ class _ResponseMixin:
 
         if submit_task is None:
             submit_task = getattr(self, "_gemini_external_submit_task", None)
+        outcome_token = getattr(self, "_gemini_external_outcome_token", None)
         if (
-            submit_task is None
-            or submit_task is asyncio.current_task()
-            or submit_task.done()
+            (submit_task is None or submit_task.done())
+            and outcome_token is None
         ):
+            return
+        if submit_task is asyncio.current_task():
             return
         quarantine_task = getattr(
             self,
@@ -426,20 +436,35 @@ class _ResponseMixin:
         if quarantine_task is not None and not quarantine_task.done():
             return
         self._gemini_external_quarantine_task = self._fire_task(
-            self._quarantine_gemini_external_submit(submit_task)
+            self._quarantine_gemini_external_submit(submit_task, outcome_token)
         )
 
     async def _quarantine_gemini_external_submit(
         self,
-        submit_task: asyncio.Task,
+        submit_task: Optional[asyncio.Task],
+        outcome_token: object | None,
     ) -> None:
         """Join a cancelled SDK send, then close the ambiguous connection."""
 
-        if not submit_task.done():
+        submit_was_inflight = submit_task is not None and not submit_task.done()
+        if submit_was_inflight:
             submit_task.cancel()
             await asyncio.gather(submit_task, return_exceptions=True)
-        if getattr(self, "_gemini_external_submit_task", None) is submit_task:
+        if (
+            submit_task is not None
+            and getattr(self, "_gemini_external_submit_task", None) is submit_task
+        ):
             self._gemini_external_submit_task = None
+        if (
+            not submit_was_inflight
+            and outcome_token is not None
+            and getattr(self, "_gemini_external_outcome_token", None)
+            is not outcome_token
+        ):
+            # Its terminal event won the race with quarantine startup, so the
+            # session no longer contains an ambiguous accepted turn.
+            return
+        self._settle_gemini_external_turn(outcome_token)
         # Cancellation only ends our await; Gemini may already have accepted
         # the turn. The connection is the smallest scope that can prove no late
         # transcript/response from that turn can cross into its successor.
@@ -555,12 +580,18 @@ class _ResponseMixin:
             if visual_record is not None:
                 visual_record["submit_task"] = asyncio.current_task()
             submit_task = asyncio.current_task()
+            outcome_token = object()
             self._gemini_external_submit_task = submit_task
+            self._gemini_external_outcome_token = outcome_token
+            accepted = False
             try:
                 await self.create_response(item_text)
+                accepted = True
             finally:
                 if getattr(self, "_gemini_external_submit_task", None) is submit_task:
                     self._gemini_external_submit_task = None
+                if not accepted:
+                    self._settle_gemini_external_turn(outcome_token)
                 if (
                     visual_record is not None
                     and self._external_visual_turns.get(stable_turn_id)

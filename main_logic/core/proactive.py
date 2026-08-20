@@ -2237,6 +2237,10 @@ class ProactiveMixin:
                 continue
             if self._callback_media_ready_for_session(callback, session):
                 continue
+            pending_images = getattr(session, "_pending_images", None)
+            pending_images_snapshot = (
+                list(pending_images) if isinstance(pending_images, list) else None
+            )
             staged_count = 0
             if callback.get("_passive_media_session_id") == session_id:
                 staged_count = int(
@@ -2272,7 +2276,15 @@ class ProactiveMixin:
                         exc,
                     )
                     callback["media_images"] = images
-                    callback["_passive_media_staged_count"] = index
+                    if pending_images_snapshot is not None:
+                        # Offline images are only an in-memory queue. Restore
+                        # the exact pre-callback state so a later user prompt
+                        # cannot consume a successfully staged prefix without
+                        # this callback's text.
+                        pending_images[:] = pending_images_snapshot
+                        callback["_passive_media_staged_count"] = staged_count
+                    else:
+                        callback["_passive_media_staged_count"] = index
                     break
 
                 structured = hasattr(stage_result, "accepted")
@@ -2289,7 +2301,11 @@ class ProactiveMixin:
                     reason = getattr(stage_result, "rejection_reason", None)
                     if reason not in terminal_rejections:
                         callback["media_images"] = images
-                        callback["_passive_media_staged_count"] = index
+                        if pending_images_snapshot is not None:
+                            pending_images[:] = pending_images_snapshot
+                            callback["_passive_media_staged_count"] = staged_count
+                        else:
+                            callback["_passive_media_staged_count"] = index
                         break
                     images.pop(index)
                     callback["media_images"] = images

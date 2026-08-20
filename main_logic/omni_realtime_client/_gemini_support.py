@@ -527,6 +527,7 @@ class _GeminiMixin:
             self._settle_gemini_proactive_inject(
                 error_msg="Gemini realtime message loop ended"
             )
+            self._settle_gemini_external_turn()
 
     async def _process_gemini_response(self, response) -> None:
         """Process a single Gemini response event."""
@@ -710,6 +711,7 @@ class _GeminiMixin:
                     except Exception:
                         pass
                     self._is_responding = False
+                    self._settle_gemini_external_turn()
                     if not was_interrupted:
                         self._settle_gemini_proactive_inject()
                     if self._skip_until_next_response:
@@ -720,6 +722,7 @@ class _GeminiMixin:
 
                 # 检查是否被中断
                 if was_interrupted:
+                    self._settle_gemini_external_turn()
                     self._settle_gemini_proactive_inject(
                         error_msg="Gemini proactive response interrupted"
                     )
