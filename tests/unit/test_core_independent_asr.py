@@ -6764,6 +6764,31 @@ async def test_free_core_uses_native_asr_when_preferences_are_unreadable(
     assert "ASR_INDEPENDENT_DISABLED" in runtime.send_status.await_args.args[0]
 
 
+async def test_unreadable_independent_setting_preserves_visual_route_on_hot_swap(
+    monkeypatch,
+) -> None:
+    runtime = _Runtime()
+    runtime.core_api_type = "gemini"
+    runtime.session.set_visual_delivery_mode = MagicMock()
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(side_effect=OSError("preferences unavailable")),
+    )
+    runtime.set_independent_asr_handshake(True)
+
+    await runtime._start_independent_asr_if_enabled("audio")
+    await runtime._reconcile_independent_asr_after_core_change()
+
+    assert runtime._asr_route_mode == "blocked"
+    assert runtime._visual_route_mode == "independent"
+    delivered_modes = [
+        getattr(call.args[0], "value", call.args[0])
+        for call in runtime.session.set_visual_delivery_mode.call_args_list
+    ]
+    assert delivered_modes[-1:] == ["external_description"]
+
+
 async def test_unknown_core_capability_remains_fail_closed(monkeypatch) -> None:
     runtime = _Runtime()
     runtime.core_api_type = "unknown"

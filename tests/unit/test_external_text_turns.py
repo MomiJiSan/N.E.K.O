@@ -218,6 +218,68 @@ async def test_response_arbiter_rejects_cancelled_admission_before_item_send():
 
 
 @pytest.mark.asyncio
+async def test_response_arbiter_deletes_committed_item_after_admission_invalidates():
+    sent = []
+    item_write_started = asyncio.Event()
+    release_item_write = asyncio.Event()
+    admitted = True
+    arbiter = None
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "conversation.item.create":
+            item_write_started.set()
+            await release_item_write.wait()
+            arbiter.notify_item_created(
+                {
+                    "type": "conversation.item.created",
+                    "item": {"id": "committed-item", "role": "user"},
+                }
+            )
+        elif event["type"] == "response.create":
+            arbiter.notify_response_created(
+                {"type": "response.created", "response": {"id": "resp-1"}}
+            )
+            arbiter.notify_response_terminal(
+                {
+                    "type": "response.done",
+                    "response": {"id": "resp-1", "status": "completed"},
+                }
+            )
+
+    arbiter = RealtimeResponseArbiter(send)
+    ticket = await arbiter.enqueue(
+        source="external_asr",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": "committed-item",
+                    "role": "user",
+                    "content": [],
+                },
+            },
+        ),
+        response_event={"type": "response.create"},
+        ack_expected=True,
+        expected_item_id="committed-item",
+        expected_item_role="user",
+        admission_check=lambda: admitted,
+    )
+    await item_write_started.wait()
+    admitted = False
+    release_item_write.set()
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        await asyncio.wait_for(ticket.done, 0.2)
+    assert [event["type"] for event in sent] == [
+        "conversation.item.create",
+        "conversation.item.delete",
+    ]
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cancel_ticket_after_terminal_does_not_cancel_new_server_response():
     sent = []
     arbiter = None

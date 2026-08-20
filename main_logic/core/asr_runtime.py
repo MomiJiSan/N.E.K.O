@@ -754,6 +754,7 @@ class AsrRuntimeMixin:
             # before any later failure handling or callback can run.
             if not core_start_is_current():
                 return
+            self._visual_route_mode = "independent"
             self._sync_realtime_visual_delivery_mode("independent")
             await self._fail_closed_voice_route(
                 "asr_settings_unreadable",

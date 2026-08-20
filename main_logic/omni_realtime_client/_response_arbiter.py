@@ -170,6 +170,11 @@ class _QueuedResponse:
     completed: asyncio.Future[None] | None = field(default=None, compare=False)
     bypass_count: int = field(default=0, compare=False)
     response_send_started: bool = field(default=False, compare=False)
+    # Once the first pre-response event enters the transport send, the item is
+    # committed to the provider. Admission invalidation after that point must
+    # finish (or cancel) the same response lifecycle rather than orphaning the
+    # persisted conversation item by suppressing response.create.
+    item_committed: bool = field(default=False, compare=False)
     # Evidence this request collected for itself, so both the terminal path
     # and the started-timeout path judge an adoption from the same facts.
     adoption: _AdoptionEvidence = field(
@@ -427,11 +432,17 @@ class RealtimeResponseArbiter:
 
         current.interrupted = True
         current.interrupt_event.set()
-        if not current.ticket.sent.done():
+        if not current.ticket.sent.done() and not current.item_committed:
             self._wake_current_with_error(
                 current,
                 RuntimeError("response dispatch interrupted before response.create"),
             )
+        elif current.item_committed:
+            if current.item_ack is not None and not current.item_ack.done():
+                # Wake the worker so it can issue the compensating item delete;
+                # setting a result keeps connection-level failures distinct
+                # from a user interruption while preserving cleanup.
+                current.item_ack.set_result(None)
         else:
             await self._send_event({"type": "response.cancel"})
         assert current.completed is not None
@@ -1918,6 +1929,19 @@ class RealtimeResponseArbiter:
                     waiter.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
 
+    async def _delete_committed_item(self, queued: _QueuedResponse) -> None:
+        """Remove a pre-response item invalidated after its transport commit."""
+
+        item_id = queued.expected_item_id
+        if not item_id or not self._connection_available:
+            return
+        await self._worker_send(
+            {
+                "type": "conversation.item.delete",
+                "item_id": item_id,
+            }
+        )
+
     async def _process(self, queued: _QueuedResponse) -> None:
         self._current = queued
         # The disqualifier arms HERE, not after the waits below. From this
@@ -1962,39 +1986,69 @@ class RealtimeResponseArbiter:
                 self._adoptable_serial, self._item_created_serial
             )
             for event in queued.events_before_response:
-                if queued.interrupted or (
-                    queued.admission_check is not None
-                    and not queued.admission_check()
+                if not queued.item_committed and (
+                    queued.interrupted
+                    or (
+                        queued.admission_check is not None
+                        and not queued.admission_check()
+                    )
                 ):
                     raise RuntimeError("response dispatch interrupted")
+                if not queued.item_committed:
+                    queued.item_committed = True
                 await self._worker_send(event)
 
+            admission_rejected = bool(
+                queued.admission_check is not None
+                and not queued.admission_check()
+            )
+            if queued.item_committed and (
+                queued.interrupted or admission_rejected
+            ):
+                await self._delete_committed_item(queued)
+                raise RuntimeError("response dispatch interrupted")
+
             if queued.item_ack is not None:
-                try:
-                    # The one bound that was not instrumented, which made
-                    # "no wait spent half its allowance" a claim nothing could
-                    # back for it. It is also the bound I once mis-reported as
-                    # over budget from outside the arbiter, so leaving it
-                    # unmeasured from inside was the worst possible gap.
-                    with self._report_wait_margin(
-                        "conversation item ack", queued.item_ack_timeout
-                    ):
-                        await asyncio.wait_for(
-                            asyncio.shield(queued.item_ack), queued.item_ack_timeout
-                        )
-                    item_acked = True
-                    queued.item_acked = True
-                except asyncio.TimeoutError:
+                if queued.item_committed and queued.interrupted:
                     item_acked = False
                     queued.item_acked = False
-                    queued.item_ack.cancel()
+                else:
+                    try:
+                        # The one bound that was not instrumented, which made
+                        # "no wait spent half its allowance" a claim nothing could
+                        # back for it. It is also the bound I once mis-reported as
+                        # over budget from outside the arbiter, so leaving it
+                        # unmeasured from inside was the worst possible gap.
+                        with self._report_wait_margin(
+                            "conversation item ack", queued.item_ack_timeout
+                        ):
+                            await asyncio.wait_for(
+                                asyncio.shield(queued.item_ack),
+                                queued.item_ack_timeout,
+                            )
+                        item_acked = True
+                        queued.item_acked = True
+                    except asyncio.TimeoutError:
+                        item_acked = False
+                        queued.item_acked = False
+                        queued.item_ack.cancel()
 
+            admission_rejected = bool(
+                queued.admission_check is not None
+                and not queued.admission_check()
+            )
+            if queued.item_committed and (
+                queued.interrupted or admission_rejected
+            ):
+                await self._delete_committed_item(queued)
+                raise RuntimeError("response dispatch interrupted")
             if queued.interrupted:
                 raise RuntimeError("response dispatch interrupted")
             if not self._connection_available:
                 raise ConnectionError("realtime connection is unavailable")
             if (
                 queued.admission_check is not None
+                and not queued.item_committed
                 and not queued.admission_check()
             ):
                 raise RuntimeError("response dispatch admission rejected")
