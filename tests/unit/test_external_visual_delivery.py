@@ -701,6 +701,36 @@ async def test_new_gemini_turn_quarantines_accepted_turn_before_first_content():
 
 
 @pytest.mark.asyncio
+async def test_retired_gemini_handler_cannot_settle_replacement_external_turn():
+    client = _make_qwen_client()
+    client._is_gemini = True
+    release_old_handler = asyncio.Event()
+
+    class OldSession:
+        def receive(self):
+            async def responses():
+                await release_old_handler.wait()
+                raise RuntimeError("closed")
+                yield None
+
+            return responses()
+
+    client._gemini_session = OldSession()
+    old_handler = asyncio.create_task(client._handle_messages_gemini())
+    await asyncio.sleep(0)
+
+    client._connection_generation += 1
+    replacement_token = object()
+    client._gemini_external_outcome_token = replacement_token
+    release_old_handler.set()
+    await old_handler
+
+    assert client._gemini_external_outcome_token is replacement_token
+    client._gemini_external_outcome_token = None
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_server_vad_receive_does_not_wait_for_turn_admission_boundary():
     admission_lock = asyncio.Lock()
     client = _make_qwen_client(turn_admission_lock=admission_lock)
