@@ -613,7 +613,12 @@ class _TransportMixin:
         }
         await self.send_event(event)
 
-    async def stream_audio(self, audio_chunk: bytes) -> None:
+    async def stream_audio(
+        self,
+        audio_chunk: bytes,
+        *,
+        captured_at: float | None = None,
+    ) -> None:
         """Stream raw audio data to the API.
 
         Supports two input modes:
@@ -623,6 +628,12 @@ class _TransportMixin:
         # 检查是否已发生致命错误，如果是则直接返回
         if self._fatal_error_occurred:
             return
+
+        audio_timeline_at = (
+            float(captured_at)
+            if isinstance(captured_at, (int, float)) and captured_at > 0
+            else time.time()
+        )
 
         # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
         raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
@@ -669,13 +680,13 @@ class _TransportMixin:
             # currently owning the boundary, even though that audio cannot yet
             # reach the provider.
             if raw_loud:
-                self._last_local_loud_time = admitted_at
+                self._last_local_loud_time = audio_timeline_at
                 self._user_recent_activity_time = admitted_at
 
             # Unified VAD update (priority: server VAD > RNNoise > RMS).
             if (
                 self._client_vad_active
-                and admitted_at - self._client_vad_last_speech_time
+                and audio_timeline_at - self._client_vad_last_speech_time
                 > self._client_vad_grace_period
             ):
                 self._client_vad_active = False
@@ -685,22 +696,22 @@ class _TransportMixin:
                     if audio_processor.speech_probability > 0.4:
                         self._user_recent_activity_time = admitted_at
                         if self._speech_detect_start == 0.0:
-                            self._speech_detect_start = admitted_at
+                            self._speech_detect_start = audio_timeline_at
                         elif (
-                            admitted_at - self._speech_detect_start
+                            audio_timeline_at - self._speech_detect_start
                             >= self._speech_sustain_threshold
                         ):
-                            self._client_vad_last_speech_time = admitted_at
+                            self._client_vad_last_speech_time = audio_timeline_at
                             self._client_vad_active = True
                     else:
                         self._speech_detect_start = 0.0
                 elif raw_loud:
-                    self._client_vad_last_speech_time = admitted_at
+                    self._client_vad_last_speech_time = audio_timeline_at
                     self._client_vad_active = True
 
             # 静音清 buffer：有 RNNoise 以 RNNoise 为准，否则 VAD + 连续本地静音。
             if self._should_clear_audio_buffer_on_silence(
-                admitted_at,
+                audio_timeline_at,
                 use_rnnoise_path,
             ):
                 self._silence_reset_pending = False

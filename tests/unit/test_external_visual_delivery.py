@@ -743,6 +743,35 @@ async def test_native_audio_send_waits_for_turn_admission_boundary():
 
 
 @pytest.mark.asyncio
+async def test_queued_native_audio_uses_capture_timeline_for_client_vad():
+    client = _make_qwen_client()
+    client.send_event = AsyncMock()
+    client._has_server_vad = False
+    client._speech_sustain_threshold = 0.5
+    client._client_vad_grace_period = 2.0
+    client._client_vad_active = False
+    client._speech_detect_start = 0.0
+    client._audio_processor.noise_reduce_enabled = True
+    client._audio_processor._denoiser = object()
+    client._audio_processor._last_speech_prob = 0.9
+    client.process_audio_chunk_async = AsyncMock(
+        return_value=int(1000).to_bytes(2, "little", signed=True) * 160
+    )
+    loud_pcm = int(1000).to_bytes(2, "little", signed=True) * 480
+    first_captured_at = time.time() - 5.0
+
+    await client.stream_audio(loud_pcm, captured_at=first_captured_at)
+    await client.stream_audio(loud_pcm, captured_at=first_captured_at + 1.0)
+
+    assert client._speech_detect_start == first_captured_at
+    assert client._client_vad_active is True
+    assert client._client_vad_last_speech_time == first_captured_at + 1.0
+    assert client._last_local_loud_time == first_captured_at + 1.0
+    assert client._user_recent_activity_time > first_captured_at + 1.0
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_gemini_proactive_inject_folds_external_description_into_user_turn():
     client = OmniRealtimeClient.__new__(OmniRealtimeClient)
     client._fatal_error_occurred = False

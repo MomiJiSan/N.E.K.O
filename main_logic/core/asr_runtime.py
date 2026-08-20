@@ -71,6 +71,7 @@ class _QueuedMicFrame:
     source_rate_hz: int
     token: VoiceIngressToken
     received_at: float
+    captured_at: float
     audio_stream_epoch: int = 0
     ingress_sequence: int = 0
 
@@ -81,6 +82,7 @@ class _QueuedMicFrame:
         *,
         token: VoiceIngressToken,
         received_at: float | None = None,
+        captured_at: float | None = None,
         audio_stream_epoch: int = 0,
         ingress_sequence: int = 0,
     ) -> "_QueuedMicFrame":
@@ -109,6 +111,7 @@ class _QueuedMicFrame:
             source_rate_hz=source_rate_hz,
             token=token,
             received_at=time.monotonic() if received_at is None else received_at,
+            captured_at=time.time() if captured_at is None else captured_at,
             audio_stream_epoch=audio_stream_epoch,
             ingress_sequence=ingress_sequence,
         )
@@ -162,6 +165,7 @@ class _AudioDurationQueue:
 class _HotSwapAudioFrame:
     pcm16: bytes
     token: VoiceIngressToken
+    captured_at: float = 0.0
     speech_probability: float | None = None
     rnnoise_available: bool = False
     rnnoise_evidence: RnnoiseEvidence | None = None
@@ -1455,6 +1459,7 @@ class AsrRuntimeMixin:
                     ingress_token=token,
                     audio_stream_epoch=frame.audio_stream_epoch,
                     ingress_sequence=frame.ingress_sequence,
+                    captured_at=frame.captured_at,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1596,6 +1601,7 @@ class AsrRuntimeMixin:
         ingress_token: VoiceIngressToken,
         audio_stream_epoch: int | None = None,
         ingress_sequence: int | None = None,
+        captured_at: float | None = None,
     ) -> None:
         sequence_owned = ingress_sequence is None
         if ingress_sequence is None:
@@ -1654,6 +1660,11 @@ class AsrRuntimeMixin:
                 return
             if not processed_frame.pcm16:
                 return
+            audio_captured_at = (
+                float(captured_at)
+                if isinstance(captured_at, (int, float)) and captured_at > 0
+                else time.time()
+            )
             if (
                 not self.is_active
                 or self._audio_stream_epoch != audio_epoch
@@ -1691,6 +1702,7 @@ class AsrRuntimeMixin:
                             rnnoise_evidence=processed_frame.rnnoise_evidence,
                             audio_stream_epoch=audio_epoch,
                             ingress_sequence=ingress_sequence,
+                            captured_at=audio_captured_at,
                         )
                     )
             if cache_for_hot_swap:
@@ -1714,6 +1726,7 @@ class AsrRuntimeMixin:
                 rnnoise_available=processed_frame.rnnoise_available,
                 rnnoise_evidence=processed_frame.rnnoise_evidence,
                 ingress_token=ingress_token,
+                captured_at=audio_captured_at,
             )
         except struct.error:
             logger.error("Microphone input rejected: invalid PCM samples")
@@ -1734,6 +1747,7 @@ class AsrRuntimeMixin:
         rnnoise_available: bool | None = None,
         rnnoise_evidence: RnnoiseEvidence | None = None,
         ingress_token: VoiceIngressToken | None = None,
+        captured_at: float | None = None,
     ) -> bool:
         route_mode = self._asr_route_mode
         if not self._voice_input_accepts_pcm():
@@ -1774,7 +1788,10 @@ class AsrRuntimeMixin:
                     self.last_audio_send_error_time = now
                 return True
             try:
-                await stream_audio(pcm16)
+                if isinstance(session_ref, _core_facade.OmniRealtimeClient):
+                    await stream_audio(pcm16, captured_at=captured_at)
+                else:
+                    await stream_audio(pcm16)
                 if not native_send_is_current():
                     return True
                 self._record_omni_microphone_audio(len(pcm16))
@@ -1958,6 +1975,7 @@ class AsrRuntimeMixin:
                             rnnoise_available=frame.rnnoise_available,
                             rnnoise_evidence=frame.rnnoise_evidence,
                             ingress_token=token,
+                            captured_at=audio_frames[batch_end - 1].captured_at,
                         )
                     except asyncio.CancelledError:
                         damaged_frames.extend(audio_frames[index:])

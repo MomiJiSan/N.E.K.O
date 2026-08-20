@@ -1106,6 +1106,7 @@ async def test_game_consumer_accepts_real_pcm_through_pipeline(
             "data": [1] * 160,
         },
         ingress_token=token,
+        captured_at=1234.5,
     )
 
     runtime._voice_input_audio_pipeline.process.assert_awaited_once()
@@ -1116,6 +1117,7 @@ async def test_game_consumer_accepts_real_pcm_through_pipeline(
         rnnoise_available=processed.rnnoise_available,
         rnnoise_evidence=evidence,
         ingress_token=token,
+        captured_at=1234.5,
     )
 
 
@@ -1191,6 +1193,7 @@ async def test_hot_swap_cache_replay_preserves_rnnoise_evidence() -> None:
             "data": [1] * 160,
         },
         ingress_token=token,
+        captured_at=2345.6,
     )
 
     assert len(runtime.hot_swap_audio_cache) == 1
@@ -1205,6 +1208,7 @@ async def test_hot_swap_cache_replay_preserves_rnnoise_evidence() -> None:
         rnnoise_available=processed.rnnoise_available,
         rnnoise_evidence=evidence,
         ingress_token=token,
+        captured_at=2345.6,
     )
 
 
