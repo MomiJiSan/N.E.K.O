@@ -845,6 +845,7 @@ class AsrRuntimeMixin:
         # Close the raw-image path as soon as the independent-ASR choice is
         # authoritative. Provider connection may take seconds or fail; neither
         # window may let screen/camera or callback images reach Realtime raw.
+        self._visual_route_mode = "independent"
         self._sync_realtime_visual_delivery_mode("independent")
         if (
             connect_budget_seconds is not None

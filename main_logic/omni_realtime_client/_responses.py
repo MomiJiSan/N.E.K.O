@@ -287,6 +287,12 @@ class _ResponseMixin:
         )
         arbiter = self._ensure_response_arbiter()
         try:
+            admission_check = None
+            if visual_record is not None:
+                admission_check = (
+                    lambda: self._external_visual_turns.get(stable_turn_id)
+                    is visual_record
+                )
             ticket = await arbiter.enqueue(
                 source="external_asr",
                 events_before_response=(item_event,),
@@ -295,6 +301,7 @@ class _ResponseMixin:
                 expected_item_id=expected_item_id,
                 expected_item_role="user",
                 priority=0,
+                admission_check=admission_check,
             )
         except BaseException:
             if (

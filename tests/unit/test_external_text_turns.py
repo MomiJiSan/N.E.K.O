@@ -191,6 +191,33 @@ async def test_response_arbiter_holds_lane_until_response_done():
 
 
 @pytest.mark.asyncio
+async def test_response_arbiter_rejects_cancelled_admission_before_item_send():
+    sent = []
+
+    async def send(event):
+        sent.append(dict(event))
+
+    arbiter = RealtimeResponseArbiter(send)
+    ticket = await arbiter.enqueue(
+        source="external_asr",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "item": {"role": "user", "content": []},
+            },
+        ),
+        admission_check=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="admission rejected"):
+        await asyncio.wait_for(ticket.sent, 0.2)
+    with pytest.raises(RuntimeError, match="admission rejected"):
+        await asyncio.wait_for(ticket.done, 0.2)
+    assert sent == []
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cancel_ticket_after_terminal_does_not_cancel_new_server_response():
     sent = []
     arbiter = None

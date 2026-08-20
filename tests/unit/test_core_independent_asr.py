@@ -5582,6 +5582,36 @@ async def test_core_passes_only_configured_speaker_shadow_factory(
     factory.assert_not_called()
 
 
+async def test_failed_independent_start_preserves_external_visual_route_memory(
+    monkeypatch,
+) -> None:
+    runtime = _Runtime()
+    runtime.core_api_type = "gemini"
+    runtime.session.set_visual_delivery_mode = MagicMock()
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(return_value={"independentAsrEnabled": True}),
+    )
+    start_mock = AsyncMock(
+        return_value=AsrStartResult(
+            status=AsrStartStatus.FAILED,
+            failure_code="ASR_CONNECT_FAILED",
+        )
+    )
+    monkeypatch.setattr(runtime._asr_runtime, "start", start_mock)
+
+    await runtime._start_independent_asr_if_enabled("audio")
+
+    assert runtime._asr_route_mode == "blocked"
+    assert runtime._visual_route_mode == "independent"
+    delivered_modes = [
+        getattr(call.args[0], "value", call.args[0])
+        for call in runtime.session.set_visual_delivery_mode.call_args_list
+    ]
+    assert delivered_modes[-1:] == ["external_description"]
+
+
 async def test_connect_budget_does_not_block_a_free_native_route(
     monkeypatch,
 ) -> None:

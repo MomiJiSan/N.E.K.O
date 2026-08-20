@@ -160,6 +160,7 @@ class _QueuedResponse:
     response_done_timeout: float = field(compare=False)
     cancel_timeout: float = field(compare=False)
     ticket: ResponseTicket = field(compare=False)
+    admission_check: Callable[[], bool] | None = field(default=None, compare=False)
     item_ack: asyncio.Future[None] | None = field(default=None, compare=False)
     terminal: asyncio.Future[None] | None = field(default=None, compare=False)
     terminal_error: BaseException | None = field(default=None, compare=False)
@@ -329,6 +330,7 @@ class RealtimeResponseArbiter:
         response_started_timeout: float = 5.0,
         response_done_timeout: float = _DEFAULT_RESPONSE_DONE_TIMEOUT,
         cancel_timeout: float = 3.0,
+        admission_check: Callable[[], bool] | None = None,
     ) -> ResponseTicket:
         loop = asyncio.get_running_loop()
         ticket = ResponseTicket(
@@ -380,6 +382,7 @@ class RealtimeResponseArbiter:
             response_done_timeout=response_done_timeout,
             cancel_timeout=cancel_timeout,
             ticket=ticket,
+            admission_check=admission_check,
             event_ids=frozenset(ids),
             completed=loop.create_future(),
         )
@@ -1943,6 +1946,11 @@ class RealtimeResponseArbiter:
                 raise RuntimeError("response dispatch interrupted")
             if not self._connection_available:
                 raise ConnectionError("realtime connection is unavailable")
+            if (
+                queued.admission_check is not None
+                and not queued.admission_check()
+            ):
+                raise RuntimeError("response dispatch admission rejected")
             self._idle.clear()
             if queued.ack_expected:
                 queued.item_ack = loop.create_future()
@@ -1954,7 +1962,10 @@ class RealtimeResponseArbiter:
                 self._adoptable_serial, self._item_created_serial
             )
             for event in queued.events_before_response:
-                if queued.interrupted:
+                if queued.interrupted or (
+                    queued.admission_check is not None
+                    and not queued.admission_check()
+                ):
                     raise RuntimeError("response dispatch interrupted")
                 await self._worker_send(event)
 
@@ -1982,6 +1993,11 @@ class RealtimeResponseArbiter:
                 raise RuntimeError("response dispatch interrupted")
             if not self._connection_available:
                 raise ConnectionError("realtime connection is unavailable")
+            if (
+                queued.admission_check is not None
+                and not queued.admission_check()
+            ):
+                raise RuntimeError("response dispatch admission rejected")
             if queued.ticket.started.done():
                 if queued.ticket.started.cancelled():
                     raise RuntimeError(
