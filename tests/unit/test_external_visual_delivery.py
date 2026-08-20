@@ -213,8 +213,18 @@ async def test_native_mode_noop_does_not_clear_independent_raw_visual_fence():
 
 @pytest.mark.asyncio
 async def test_native_frame_rechecks_raw_fence_after_send_slot_wait():
+    class _ObservedSemaphore(asyncio.Semaphore):
+        def __init__(self):
+            super().__init__(0)
+            self.acquire_started = asyncio.Event()
+
+        async def acquire(self):
+            self.acquire_started.set()
+            return await super().acquire()
+
     client = _make_qwen_client()
-    client._send_semaphore = asyncio.Semaphore(0)
+    send_semaphore = _ObservedSemaphore()
+    client._send_semaphore = send_semaphore
 
     task = asyncio.create_task(
         client.stream_image(
@@ -224,13 +234,10 @@ async def test_native_frame_rechecks_raw_fence_after_send_slot_wait():
             bypass_rate_limit=True,
         )
     )
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if not task.done():
-            break
+    await asyncio.wait_for(send_semaphore.acquire_started.wait(), timeout=0.5)
 
     client.block_raw_visual_delivery()
-    client._send_semaphore.release()
+    send_semaphore.release()
     result = await task
 
     assert result == ImageStageResult(
