@@ -783,6 +783,9 @@ class ProactiveMixin:
                     or voice_sess.is_active_response()
                     or getattr(voice_sess, "_proactive_inject_awaiting_outcome", False)
                     or self._is_voice_playing()
+                    or time.time()
+                    - getattr(voice_sess, "_user_recent_activity_time", 0.0)
+                    < getattr(voice_sess, "_user_recent_activity_window", 8.0)
                 ):
                     logger.debug(
                         "[%s] trigger_agent_callbacks: voice session busy (phase=%s, active_response=%s, playback=%s); deferring proactive (n=%d)",
@@ -2152,6 +2155,22 @@ class ProactiveMixin:
                 session._inject_rejection_handlers.pop(event_id, None)
         return all_ok
 
+    @staticmethod
+    def _session_media_identity(session: object) -> str | None:
+        """Return an object-lifetime-stable identity for media ownership."""
+
+        if session is None:
+            return None
+        identity = getattr(session, "_passive_media_identity", None)
+        if identity is not None:
+            return str(identity)
+        identity = uuid4().hex
+        try:
+            setattr(session, "_passive_media_identity", identity)
+        except Exception:
+            return None
+        return identity
+
     def _callback_media_ready_for_session(
         self,
         callback: dict,
@@ -2160,8 +2179,10 @@ class ProactiveMixin:
         """Return whether callback media is already owned by ``session``."""
 
         images = callback.get("media_images")
+        session_identity = self._session_media_identity(session)
         return not images or (
-            callback.get("_passive_media_session_id") == id(session)
+            session_identity is not None
+            and callback.get("_passive_media_session_id") == session_identity
             and int(
                 callback.get("_passive_media_staged_count", 0) or 0
             )
@@ -2185,7 +2206,9 @@ class ProactiveMixin:
         stream_image = getattr(session, "stream_image", None)
         if session is None or not callable(stream_image):
             return
-        session_id = id(session)
+        session_id = self._session_media_identity(session)
+        if session_id is None:
+            return
         terminal_rejections = {
             "analysis_empty",
             "invalid_payload",

@@ -300,6 +300,28 @@ async def test_voice_gate_sees_arbiter_busyness_not_just_the_responding_flag():
     assert mgr.pending_agent_callbacks == []
 
 
+async def test_voice_callback_defers_when_microphone_activity_arrived_first():
+    sess = _make_voice_sess()
+    sess._user_recent_activity_time = time.time()
+    sess.stream_image = AsyncMock()
+    mgr = _make_mgr(session=sess)
+    cb = {
+        "_callback_delivery_id": "id-recent-microphone",
+        "status": "completed",
+        "summary": "must wait for the user turn",
+        "media_images": ["image-b64"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    sess.on_sid_rotate.assert_not_awaited()
+    sess.stream_image.assert_not_awaited()
+    assert sess.inject_calls == 0
+    assert mgr.pending_agent_callbacks == [cb]
+
+
 async def test_voice_nudge_waits_for_callback_inject_lock():
     sess = _make_voice_sess()
     sess._proactive_inject_awaiting_outcome = False
@@ -1247,6 +1269,40 @@ async def test_passive_image_is_staged_before_text_drain_can_prune_callback():
     )
     assert "camera event" in rendered
     assert mgr.pending_agent_callbacks == []
+
+
+def test_passive_media_identity_is_stable_and_distinct_per_session():
+    mgr = _make_mgr()
+    first_session = SimpleNamespace()
+    replacement_session = SimpleNamespace()
+    first_identity = core_module.LLMSessionManager._session_media_identity(
+        first_session
+    )
+    replacement_identity = (
+        core_module.LLMSessionManager._session_media_identity(
+            replacement_session
+        )
+    )
+    cb = {
+        "media_images": ["image-b64"],
+        "_passive_media_session_id": first_identity,
+        "_passive_media_staged_count": 1,
+    }
+
+    assert first_identity == core_module.LLMSessionManager._session_media_identity(
+        first_session
+    )
+    assert first_identity != replacement_identity
+    assert core_module.LLMSessionManager._callback_media_ready_for_session(
+        mgr,
+        cb,
+        first_session,
+    )
+    assert not core_module.LLMSessionManager._callback_media_ready_for_session(
+        mgr,
+        cb,
+        replacement_session,
+    )
 
 
 async def test_transient_passive_image_rejection_keeps_callback_for_retry():

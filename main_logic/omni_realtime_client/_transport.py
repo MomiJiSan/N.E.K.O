@@ -631,6 +631,10 @@ class _TransportMixin:
             local_rms = np.sqrt(np.mean(raw_samples.astype(np.float32) ** 2))
             if local_rms > self._client_vad_threshold:
                 self._last_local_loud_time = current_time
+                # Mark physical user activity before the provider's delayed
+                # speech_started event. Callback admission uses this signal to
+                # let already-arrived microphone audio win the shared boundary.
+                self._user_recent_activity_time = current_time
 
         # Detect input sample rate based on chunk size
         # 48kHz: 480 samples (10ms) = 960 bytes
@@ -698,25 +702,32 @@ class _TransportMixin:
             self._silence_reset_pending = False
             await self.clear_audio_buffer()
 
-        # Gemini uses different API (16kHz, no uplink resample needed)
-        if self._is_gemini:
-            await self._stream_audio_gemini(audio_chunk)
-            return
+        # Serialize at the actual user-audio admission boundary, not inside the
+        # provider receive loop. A callback that already owns the boundary can
+        # finish its native image+text transaction before new PCM is admitted;
+        # receive-side audio/done/error events remain continuously drainable.
+        async with self._ensure_turn_admission_lock():
+            if self._fatal_error_occurred:
+                return
+            # Gemini uses different API (16kHz, no uplink resample needed)
+            if self._is_gemini:
+                await self._stream_audio_gemini(audio_chunk)
+                return
 
-        # By this point audio_chunk is always 16kHz (RNNoise-downsampled,
-        # mobile-native, or hot-swap-cache replay). Upsample to the provider
-        # uplink rate as the very last step (24kHz for OpenAI; no-op others).
-        audio_chunk = self._resample_uplink(audio_chunk)
-        if not audio_chunk:
-            return  # resampler still buffering — nothing to send this frame
+            # By this point audio_chunk is always 16kHz (RNNoise-downsampled,
+            # mobile-native, or hot-swap-cache replay). Upsample to the provider
+            # uplink rate as the very last step (24kHz for OpenAI; no-op others).
+            audio_chunk = self._resample_uplink(audio_chunk)
+            if not audio_chunk:
+                return  # resampler still buffering — nothing to send this frame
 
-        audio_b64 = base64.b64encode(audio_chunk).decode()
+            audio_b64 = base64.b64encode(audio_chunk).decode()
 
-        append_event = {
-            "type": "input_audio_buffer.append",
-            "audio": audio_b64
-        }
-        await self.send_event(append_event)
+            append_event = {
+                "type": "input_audio_buffer.append",
+                "audio": audio_b64
+            }
+            await self.send_event(append_event)
 
     async def _analyze_image_with_vision_model(
         self,
@@ -2424,25 +2435,20 @@ class _TransportMixin:
                     logger.info("input_audio_buffer.committed observed (total=%d)", self._input_audio_committed_total)
                 # Handle interruptions
                 elif event_type == "input_audio_buffer.speech_started":
-                    # A callback native-image write is irreversible. Admit VAD
-                    # under the same Core-provided lock held across callback
-                    # media+text injection so the image cannot be committed in
-                    # one turn and its label deferred into another.
-                    async with self._ensure_turn_admission_lock():
-                        self._speech_started_total += 1
-                        logger.info("Speech detected")
-                        self._response_arbiter.notify_server_vad_started()
-                        self._audio_in_buffer = True
-                        # 重置静默计时器
-                        self._last_speech_time = time.time()
-                        # Priority 1: server VAD → sync to unified _client_vad_active
-                        self._client_vad_active = True
-                        self._client_vad_last_speech_time = self._last_speech_time
-                        # B: server-VAD 也喂给 _user_recent_activity，保持各 VAD 源对称。
-                        self._user_recent_activity_time = self._last_speech_time
-                        if self._is_responding:
-                            logger.info("Handling interruption")
-                            await self.handle_interruption()
+                    self._speech_started_total += 1
+                    logger.info("Speech detected")
+                    self._response_arbiter.notify_server_vad_started()
+                    self._audio_in_buffer = True
+                    # 重置静默计时器
+                    self._last_speech_time = time.time()
+                    # Priority 1: server VAD → sync to unified _client_vad_active
+                    self._client_vad_active = True
+                    self._client_vad_last_speech_time = self._last_speech_time
+                    # B: server-VAD 也喂给 _user_recent_activity，保持各 VAD 源对称。
+                    self._user_recent_activity_time = self._last_speech_time
+                    if self._is_responding:
+                        logger.info("Handling interruption")
+                        await self.handle_interruption()
                 elif event_type == "input_audio_buffer.speech_stopped":
                     self._speech_stopped_total += 1
                     logger.info("Speech ended")

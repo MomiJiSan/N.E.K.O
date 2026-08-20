@@ -626,7 +626,7 @@ async def test_new_gemini_turn_cancels_resolved_turn_during_sdk_send():
 
 
 @pytest.mark.asyncio
-async def test_server_vad_waits_for_callback_turn_admission_boundary():
+async def test_server_vad_receive_does_not_wait_for_turn_admission_boundary():
     admission_lock = asyncio.Lock()
     client = _make_qwen_client(turn_admission_lock=admission_lock)
     client.ws.__aiter__.return_value = [
@@ -634,17 +634,32 @@ async def test_server_vad_waits_for_callback_turn_admission_boundary():
     ]
 
     await admission_lock.acquire()
-    receive_task = asyncio.create_task(client.handle_messages())
-    await asyncio.sleep(0)
-
-    assert client._speech_started_total == 0
-    assert client._client_vad_active is False
-
-    admission_lock.release()
-    await receive_task
+    await client.handle_messages()
 
     assert client._speech_started_total == 1
     assert client._client_vad_active is True
+
+    admission_lock.release()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_native_audio_send_waits_for_turn_admission_boundary():
+    admission_lock = asyncio.Lock()
+    client = _make_qwen_client(turn_admission_lock=admission_lock)
+    client.send_event = AsyncMock()
+
+    await admission_lock.acquire()
+    send_task = asyncio.create_task(client.stream_audio(bytes(1024)))
+    await asyncio.sleep(0)
+
+    client.send_event.assert_not_awaited()
+
+    admission_lock.release()
+    await send_task
+
+    client.send_event.assert_awaited_once()
+    assert client.send_event.await_args.args[0]["type"] == "input_audio_buffer.append"
     await client.close()
 
 
