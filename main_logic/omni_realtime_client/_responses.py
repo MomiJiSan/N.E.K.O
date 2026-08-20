@@ -397,6 +397,39 @@ class _ResponseMixin:
                 self._start_gemini_external_submit_quarantine()
                 await self._await_gemini_external_quarantine()
                 await self._cancel_gemini_proactive_submit()
+                proactive_outcome = getattr(
+                    self,
+                    "_gemini_proactive_outcome",
+                    None,
+                )
+                proactive_quarantine = getattr(
+                    self,
+                    "_gemini_proactive_quarantine_task",
+                    None,
+                )
+                if (
+                    proactive_outcome is not None
+                    and (
+                        proactive_quarantine is None
+                        or proactive_quarantine.done()
+                    )
+                ):
+                    # SDK-send completion is not a Gemini lifecycle terminal.
+                    # Until first content / turn_complete / interrupted arrives,
+                    # the accepted proactive turn still owns this unscoped SDK
+                    # session. Quarantine that outcome before admitting an
+                    # external-ASR successor, just as the in-flight cancellation
+                    # path does.
+                    proactive_quarantine = self._fire_task(
+                        self._interrupt_and_quarantine_gemini_proactive_outcome(
+                            proactive_outcome[0],
+                            error_msg=(
+                                "Gemini proactive turn was superseded by "
+                                "external voice input"
+                            ),
+                        )
+                    )
+                    self._gemini_proactive_quarantine_task = proactive_quarantine
                 await self._await_gemini_proactive_quarantine()
             self._begin_external_visual_turn(stable_turn_id)
             try:

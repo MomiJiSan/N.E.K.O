@@ -1974,6 +1974,61 @@ async def test_voice_mode_callback_image_rejection_before_inject_keeps_cb():
     )
 
 
+async def test_partial_proactive_native_rejection_retires_active_session():
+    """A raw callback prefix cannot survive without its paired callback text."""
+    sess = _make_voice_sess()
+    sess._is_gemini = False
+    sess._supports_native_image = True
+    sess._visual_delivery_mode = "native"
+    sess._fatal_error_occurred = False
+    sess.close = AsyncMock()
+
+    async def _stream_image(image_b64, **_kwargs):
+        if image_b64 == "callback-image-1":
+            return ImageStageResult(accepted=True, mode="native")
+        sess._visual_delivery_mode = "external_description"
+        return ImageStageResult(
+            accepted=False,
+            mode="external_description",
+        )
+
+    sess.stream_image = AsyncMock(side_effect=_stream_image)
+    mgr = _make_mgr(session=sess)
+    mgr.end_session = AsyncMock()
+    retirement_tasks = []
+
+    def _fire_retirement(coro):
+        task = asyncio.create_task(coro)
+        retirement_tasks.append(task)
+        return task
+
+    mgr._fire_task = _fire_retirement
+    mgr._schedule_proactive_retry = MagicMock()
+    cb = {
+        "_callback_delivery_id": "id-proactive-native-partial-reject",
+        "status": "completed",
+        "summary": "two native callback images",
+        "media_images": ["callback-image-1", "callback-image-2"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+    await asyncio.gather(*retirement_tasks)
+
+    assert delivered is False
+    assert sess.inject_calls == 0
+    assert sess._fatal_error_occurred is True
+    sess.close.assert_awaited_once_with()
+    mgr.end_session.assert_awaited_once_with(
+        by_server=True,
+        expected_session=sess,
+    )
+    assert mgr.pending_agent_callbacks == [cb]
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+
 async def test_voice_mode_drops_permanently_oversized_image_and_delivers_text():
     from main_logic.omni_realtime_client import ImageStageResult
 

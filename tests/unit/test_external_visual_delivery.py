@@ -558,6 +558,65 @@ async def test_new_gemini_turn_cancels_proactive_sdk_send_before_returning():
 
 
 @pytest.mark.asyncio
+async def test_new_gemini_turn_quarantines_completed_proactive_sdk_send(
+    monkeypatch,
+):
+    """SDK-send success still owns the old Gemini session until terminal."""
+    monkeypatch.setattr(
+        "main_logic.omni_realtime_client._responses."
+        "_GEMINI_PROACTIVE_CANCEL_GRACE_SECONDS",
+        0,
+    )
+    client = _make_qwen_client()
+    client._is_gemini = True
+    old_session = AsyncMock()
+    old_session.send_client_content = AsyncMock()
+    old_context = AsyncMock()
+    old_context.__aexit__ = AsyncMock()
+    client._gemini_session = old_session
+    client.ws = old_session
+    client._gemini_context_manager = old_context
+    client.instructions = "system prompt"
+    client._native_audio = True
+    client.handle_interruption = AsyncMock()
+    client.cancel_response = AsyncMock()
+    replacement_session = AsyncMock()
+
+    async def reconnect(*_args, **_kwargs):
+        client._connection_generation += 1
+        client._gemini_session = replacement_session
+        client.ws = replacement_session
+
+    client.connect = AsyncMock(side_effect=reconnect)
+    rejected = []
+
+    await client.inject_text_and_request_response(
+        "主动提醒",
+        on_rejected=rejected.append,
+    )
+
+    assert client._gemini_proactive_submit_task is None
+    assert client._gemini_proactive_outcome is not None
+    assert client._is_responding is False
+
+    reconnected = await client.prepare_external_voice_turn(
+        turn_id="external-successor"
+    )
+
+    client.cancel_response.assert_awaited_once()
+    old_context.__aexit__.assert_awaited_once_with(None, None, None)
+    client.connect.assert_awaited_once_with("system prompt", native_audio=True)
+    assert client._gemini_session is replacement_session
+    assert client._gemini_proactive_outcome is None
+    assert rejected == [
+        "Gemini proactive turn was superseded by external voice input"
+    ]
+    assert reconnected is True
+    client.abandon_external_voice_turn("external-successor")
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_gemini_close_cancels_and_joins_proactive_sdk_send():
     client = _make_qwen_client()
     client._is_gemini = True
