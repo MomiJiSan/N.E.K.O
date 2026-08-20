@@ -140,6 +140,7 @@ class ProactiveMixin:
             delivered = await session.prompt_ephemeral(
                 language=_lang,
                 user_turn_active=self._independent_asr_user_turn_active,
+                session_owned=lambda: self.is_active and self.session is session,
             )
         if delivered:
             logger.info("[%s] voice proactive nudge delivered (%s)", self.lanlan_name, _lang)
@@ -2557,6 +2558,7 @@ class ProactiveMixin:
                 isinstance(cb, dict)
                 and cb.get("channel") == "topic_hook"
                 and not cb.get(DELIVERY_RETRACTED_KEY)
+                and not cb.get(SWAP_PRIME_DELIVERY_CLAIM_KEY)
                 and not self._topic_hook_release_allowed(cb)
             ):
                 resolve_callback_delivery_ack(cb, False)
@@ -2948,7 +2950,51 @@ class ProactiveMixin:
             # Pruning is best-effort housekeeping — never let it break callback bookkeeping.
             pass
 
-    def drain_agent_callbacks_for_llm(self) -> str:
+    def _claim_agent_callbacks_for_llm(self) -> list:
+        """Select and fence the exact callback snapshot for one text prompt.
+
+        Selection intentionally happens before any callback-media await. The
+        existing swap-prime claim is the shared provider-ownership fence: once
+        selected, coalescing/flood/topic cleanup cannot retract text whose
+        media may already have crossed into the target session.
+        """
+        self._purge_undeliverable_callbacks()
+        if not self.pending_agent_callbacks:
+            return []
+        candidate_callbacks = list(self.pending_agent_callbacks)
+        if self._retract_unavailable_topic_hook_snapshots(candidate_callbacks):
+            logger.info(
+                "[%s] drain_agent_callbacks_for_llm: topic hook dropped before passive drain — delivery gate closed",
+                self.lanlan_name,
+            )
+        self._retract_stale_coalesced(candidate_callbacks)
+        active_callbacks = [
+            callback
+            for callback in self.filter_deliverable_callbacks(candidate_callbacks)
+            if not callback.get(SWAP_PRIME_DELIVERY_CLAIM_KEY)
+        ]
+        if not active_callbacks:
+            return []
+        from config import AGENT_CALLBACK_TOTAL_MAX_TOKENS
+
+        callbacks_snapshot, _deferred = _select_callbacks_within_token_budget(
+            active_callbacks,
+            AGENT_CALLBACK_TOTAL_MAX_TOKENS,
+        )
+        for callback in callbacks_snapshot:
+            callback[SWAP_PRIME_DELIVERY_CLAIM_KEY] = True
+        return callbacks_snapshot
+
+    @staticmethod
+    def _release_agent_callback_prompt_claims(callbacks: list) -> None:
+        for callback in callbacks or []:
+            if isinstance(callback, dict):
+                callback.pop(SWAP_PRIME_DELIVERY_CLAIM_KEY, None)
+
+    def drain_agent_callbacks_for_llm(
+        self,
+        callbacks_snapshot: list | None = None,
+    ) -> str:
         """Drain pending_agent_callbacks and format as a system context string.
 
         Clears pending_agent_callbacks (NOT pending_extra_replies, which is
@@ -2962,35 +3008,23 @@ class ProactiveMixin:
         ended up here because the SM denied the claim earlier). The caller
         therefore should NOT prepend an additional notification template.
         """
-        self._purge_undeliverable_callbacks()
-        if not self.pending_agent_callbacks:
-            return ""
-        candidate_callbacks = list(self.pending_agent_callbacks)
-        if self._retract_unavailable_topic_hook_snapshots(candidate_callbacks):
-            logger.info(
-                "[%s] drain_agent_callbacks_for_llm: topic hook dropped before passive drain — delivery gate closed",
-                self.lanlan_name,
-            )
-        # Pull-model staleness: uniform with the voice/text/hot-swap delivery
-        # points — a cue restored from a failed proactive attempt (or any path
-        # that re-appends without the push-side scan) must not deliver once a
-        # newer same-coalesce_key cue exists.
-        self._retract_stale_coalesced(candidate_callbacks)
+        if callbacks_snapshot is None:
+            callbacks_snapshot = self._claim_agent_callbacks_for_llm()
+        callbacks_snapshot = list(callbacks_snapshot or [])
+        queued_obj_ids = {id(callback) for callback in self.pending_agent_callbacks}
         active_callbacks = [
             callback
-            for callback in self.filter_deliverable_callbacks(candidate_callbacks)
-            if not callback.get(SWAP_PRIME_DELIVERY_CLAIM_KEY)
-            and self._callback_media_ready_for_session(callback, self.session)
+            for callback in callbacks_snapshot
+            if id(callback) in queued_obj_ids
+            and not callback.get(DELIVERY_RETRACTED_KEY)
+            and self._callback_media_ready_for_session(
+                callback,
+                getattr(self, "session", None),
+            )
         ]
         if not active_callbacks:
+            self._release_agent_callback_prompt_claims(callbacks_snapshot)
             return ""
-        from config import AGENT_CALLBACK_TOTAL_MAX_TOKENS
-        # Budget-aware selection: render (and ack) only the callbacks that fit
-        # the total budget this turn; defer the rest to the next drain instead
-        # of acking them as delivered while their text falls off the cap.
-        callbacks_snapshot, _deferred = _select_callbacks_within_token_budget(
-            active_callbacks, AGENT_CALLBACK_TOTAL_MAX_TOKENS
-        )
         delivered_to_prompt = False
         try:
             # 同上；user_language 为空时才回落全局语言（此前回落的是短码）。
@@ -2998,7 +3032,7 @@ class ProactiveMixin:
                 getattr(self, 'user_language', '') or get_global_language_full(), format='full'
             )
             rendered = _build_callback_instruction(
-                callbacks_snapshot,
+                active_callbacks,
                 lang=_lang,
                 lanlan_name=getattr(self, "lanlan_name", "") or "",
                 master_name=getattr(self, "master_name", "") or "",
@@ -3008,12 +3042,13 @@ class ProactiveMixin:
             return rendered
         finally:
             if delivered_to_prompt:
-                for cb in callbacks_snapshot:
+                for cb in active_callbacks:
                     resolve_callback_delivery_ack(cb, True)
             # Keep claimed and over-budget callbacks in their original order;
             # only the entries actually rendered by this drain leave the queue.
-            delivered_obj_ids = {id(cb) for cb in callbacks_snapshot}
+            delivered_obj_ids = {id(cb) for cb in active_callbacks}
             self.pending_agent_callbacks = [
                 cb for cb in self.pending_agent_callbacks
                 if id(cb) not in delivered_obj_ids
             ]
+            self._release_agent_callback_prompt_claims(callbacks_snapshot)

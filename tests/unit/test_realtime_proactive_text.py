@@ -567,6 +567,39 @@ async def test_prompt_rechecks_arbiter_after_visual_await():
 
 
 @pytest.mark.unit
+async def test_prompt_rechecks_session_ownership_after_visual_await():
+    client = _make_client()
+    client._latest_image_b64 = DUMMY_IMAGE_B64
+    client._proactive_image_consumed = False
+    client.on_sid_rotate = AsyncMock()
+    visual_started = asyncio.Event()
+    release_visual = asyncio.Event()
+    ownership = {"current": True}
+
+    async def delayed_stream_image(*_args, **_kwargs):
+        visual_started.set()
+        await release_visual.wait()
+
+    client.stream_image = delayed_stream_image
+    task = asyncio.create_task(
+        client.prompt_ephemeral(
+            "do not inject into a retired session",
+            session_owned=lambda: ownership["current"],
+        )
+    )
+    await visual_started.wait()
+    ownership["current"] = False
+    release_visual.set()
+
+    assert await task is False
+    assert not any(
+        event.get("type") == "response.create"
+        for event in _sent_events(client)
+    )
+    await client.close()
+
+
+@pytest.mark.unit
 async def test_prompt_rechecks_activity_after_sid_rotation_await():
     client = _make_client()
     client._latest_image_b64 = DUMMY_IMAGE_B64

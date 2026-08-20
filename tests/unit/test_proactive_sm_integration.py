@@ -343,7 +343,9 @@ async def test_voice_nudge_waits_for_callback_inject_lock():
     sess.prompt_ephemeral.assert_awaited_once_with(
         language="en",
         user_turn_active=mgr._independent_asr_user_turn_active,
+        session_owned=sess.prompt_ephemeral.await_args.kwargs["session_owned"],
     )
+    assert sess.prompt_ephemeral.await_args.kwargs["session_owned"]() is True
 
 
 async def test_voice_nudge_request_locale_is_forwarded_without_mutating_manager_state():
@@ -367,7 +369,9 @@ async def test_voice_nudge_request_locale_is_forwarded_without_mutating_manager_
     sess.prompt_ephemeral.assert_awaited_once_with(
         language="zh-TW",
         user_turn_active=mgr._independent_asr_user_turn_active,
+        session_owned=sess.prompt_ephemeral.await_args.kwargs["session_owned"],
     )
+    assert sess.prompt_ephemeral.await_args.kwargs["session_owned"]() is True
     assert mgr.user_language == "en"
     assert mgr._user_language_explicit is False
     assert mgr._conversation_render_language is None
@@ -1268,6 +1272,49 @@ async def test_passive_image_is_staged_before_text_drain_can_prune_callback():
         request_id="id-passive-image-text",
     )
     assert "camera event" in rendered
+    assert mgr.pending_agent_callbacks == []
+
+
+async def test_text_passive_media_stages_only_the_selected_prompt_snapshot():
+    session = _FakeOmniOffline(delivered=True)
+    session.stream_image = AsyncMock(return_value=None)
+    mgr = _make_mgr(session=session)
+    retracted = {
+        "_callback_delivery_id": "id-retracted-media",
+        "status": "completed",
+        "summary": "must not render",
+        "media_images": ["retracted-image"],
+        DELIVERY_RETRACTED_KEY: True,
+    }
+    selected = {
+        "_callback_delivery_id": "id-selected-media",
+        "status": "completed",
+        "summary": "selected callback",
+        "media_images": ["selected-image"],
+    }
+    mgr.pending_agent_callbacks = [retracted, selected]
+
+    snapshot = core_module.LLMSessionManager._claim_agent_callbacks_for_llm(mgr)
+    await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        snapshot,
+        session,
+    )
+    rendered = core_module.LLMSessionManager.drain_agent_callbacks_for_llm(
+        mgr,
+        snapshot,
+    )
+
+    assert snapshot == [selected]
+    session.stream_image.assert_awaited_once_with(
+        "selected-image",
+        bypass_rate_limit=True,
+        cache_latest=False,
+        source="callback",
+        request_id="id-selected-media",
+    )
+    assert "selected callback" in rendered
+    assert "must not render" not in rendered
     assert mgr.pending_agent_callbacks == []
 
 

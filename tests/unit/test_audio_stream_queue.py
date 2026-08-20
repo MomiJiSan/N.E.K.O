@@ -115,6 +115,37 @@ async def test_flush_pending_input_data_routes_audio_through_bounded_queue():
     assert mgr.pending_input_data == []
 
 
+async def test_cancelled_pending_input_flush_restores_unprocessed_suffix_first():
+    mgr = LLMSessionManager.__new__(LLMSessionManager)
+    first = {"input_type": "text", "data": "first"}
+    blocked = {"input_type": "text", "data": "blocked"}
+    suffix = {"input_type": "text", "data": "suffix"}
+    live = {"input_type": "text", "data": "live"}
+    mgr.pending_input_data = [first, blocked, suffix]
+    mgr.input_cache_lock = asyncio.Lock()
+    mgr.session = object()
+    mgr.is_active = True
+    mgr._enqueue_audio_stream_data = AsyncMock()
+    blocked_started = asyncio.Event()
+
+    async def process(message):
+        if message is blocked:
+            blocked_started.set()
+            await asyncio.Event().wait()
+
+    mgr._process_stream_data_internal = process
+    task = asyncio.create_task(LLMSessionManager._flush_pending_input_data(mgr))
+    await blocked_started.wait()
+    mgr.pending_input_data.append(live)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert mgr.pending_input_data == [blocked, suffix, live]
+    assert mgr._pending_input_flush_active is False
+
+
 def _queue_token() -> VoiceIngressToken:
     return VoiceIngressToken(1, "socket", 1, 1, 1)
 

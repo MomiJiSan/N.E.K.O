@@ -114,6 +114,38 @@ async def test_external_description_stages_qwen_frame_without_raw_provider_event
 
 
 @pytest.mark.asyncio
+async def test_external_description_rejects_frame_older_than_latest_ingress():
+    client = _make_qwen_client()
+    client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
+
+    newer = await client.stream_image(
+        DUMMY_IMAGE_B64 + "newer",
+        source="camera",
+        request_id="camera-2",
+        captured_at=20.0,
+    )
+    older = await client.stream_image(
+        DUMMY_IMAGE_B64 + "older",
+        source="screen",
+        request_id="screen-1",
+        captured_at=10.0,
+    )
+
+    assert newer.accepted is True
+    assert older == ImageStageResult(
+        accepted=False,
+        mode="external_description",
+        generation=newer.generation,
+        rejection_reason="stale_frame",
+    )
+    assert client._latest_image_b64 == DUMMY_IMAGE_B64 + "newer"
+    assert client._latest_image_source == "camera"
+    assert client._latest_image_request_id == "camera-2"
+    assert client._latest_image_captured_at == 20.0
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_external_description_rejects_oversized_callback_before_analysis():
     from utils.screenshot_utils import MAX_BASE64_SIZE
 

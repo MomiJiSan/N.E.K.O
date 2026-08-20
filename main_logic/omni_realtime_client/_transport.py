@@ -987,6 +987,7 @@ class _TransportMixin:
         *,
         source: str = "unknown",
         request_id: str | None = None,
+        captured_at: float | None = None,
         bypass_rate_limit: bool = False,
         cache_latest: bool = True,
         event_id: str | None = None,
@@ -1071,12 +1072,35 @@ class _TransportMixin:
                         ),
                     )
 
+                has_ingress_order = isinstance(captured_at, (int, float))
+                frame_captured_at = (
+                    float(captured_at)
+                    if has_ingress_order
+                    else time.monotonic()
+                )
+                if has_ingress_order and frame_captured_at <= getattr(
+                    self,
+                    "_latest_image_captured_at",
+                    0.0,
+                ):
+                    logger.info(
+                        "external visual frame rejected as stale source=%s request_id=%s",
+                        stable_source,
+                        stable_request_id,
+                    )
+                    return ImageStageResult(
+                        accepted=False,
+                        mode=delivery_mode.value,
+                        generation=getattr(self, "_latest_image_generation", 0),
+                        rejection_reason="stale_frame",
+                    )
+
                 self._latest_image_generation = (
                     getattr(self, "_latest_image_generation", 0) + 1
                 )
                 generation = self._latest_image_generation
                 self._latest_image_b64 = image_b64
-                self._latest_image_captured_at = time.monotonic()
+                self._latest_image_captured_at = frame_captured_at
                 self._latest_image_source = stable_source
                 self._latest_image_request_id = stable_request_id
                 self._proactive_image_consumed = False

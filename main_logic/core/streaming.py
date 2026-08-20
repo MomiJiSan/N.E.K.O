@@ -127,21 +127,25 @@ class StreamingMixin:
                     pending_messages = list(self.pending_input_data)
                     self.pending_input_data.clear()
 
-                if not self.session or not self.is_active:
-                    async with self.input_cache_lock:
-                        self._pending_input_flush_active = False
-                    return
+                # Once detached from ``pending_input_data``, this local batch
+                # owns every message until each item reaches a terminal handling
+                # point. Cancellation/session teardown must put the untouched
+                # suffix back ahead of live inputs queued while the flush was
+                # active; otherwise startup cancellation silently loses input.
+                next_unprocessed = 0
+                try:
+                    if not self.session or not self.is_active:
+                        return
 
-                # 缓存阶段（_stream_data_now）不知道 session 最终是 voice 还是
-                # text。如果最终启好的是 voice session，缓存里的纯 text 输入若
-                # 直接 flush 进 _process_stream_data_internal，会把刚 ready 的 voice
-                # session 撕成 text；继续丢弃纯文本。但 avatar_drop_image/user_image
-                # 是明确的一次性附件，必须保留其既有 offline vision 合同。screen /
-                # camera 也继续走 realtime 合法路径。audio 在缓存阶段不会出现。
-                dropped_text_for_voice = 0
-                for message in pending_messages:
-                    msg_input_type = message.get("input_type")
-                    try:
+                    # 缓存阶段（_stream_data_now）不知道 session 最终是 voice 还是
+                    # text。如果最终启好的是 voice session，缓存里的纯 text 输入若
+                    # 直接 flush 进 _process_stream_data_internal，会把刚 ready 的 voice
+                    # session 撕成 text；继续丢弃纯文本。但 avatar_drop_image/user_image
+                    # 是明确的一次性附件，必须保留其既有 offline vision 合同。screen /
+                    # camera 也继续走 realtime 合法路径。audio 在缓存阶段不会出现。
+                    dropped_text_for_voice = 0
+                    for index, message in enumerate(pending_messages):
+                        msg_input_type = message.get("input_type")
                         if msg_input_type == "audio":
                             await self._enqueue_audio_stream_data(message)
                         else:
@@ -151,18 +155,27 @@ class StreamingMixin:
                             ):
                                 self.note_stream_input_ingress(message)
                                 dropped_text_for_voice += 1
+                                next_unprocessed = index + 1
                                 continue
                             await self._process_stream_data_internal(message)
-                    except Exception as e:
-                        logger.error(f"💥 发送缓存的输入数据失败: {e}")
-                        break
-                if dropped_text_for_voice:
-                    logger.info(
-                        "[%s] _flush_pending_input_data: dropped %d cached text "
-                        "message(s) because final session is voice mode",
-                        self.lanlan_name,
-                        dropped_text_for_voice,
-                    )
+                        next_unprocessed = index + 1
+                    if dropped_text_for_voice:
+                        logger.info(
+                            "[%s] _flush_pending_input_data: dropped %d cached text "
+                            "message(s) because final session is voice mode",
+                            self.lanlan_name,
+                            dropped_text_for_voice,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"💥 发送缓存的输入数据失败: {e}")
+                    return
+                finally:
+                    unprocessed = pending_messages[next_unprocessed:]
+                    if unprocessed:
+                        async with self.input_cache_lock:
+                            self.pending_input_data[0:0] = unprocessed
         finally:
             async with self.input_cache_lock:
                 if getattr(self, "_pending_input_flush_active", False):
@@ -199,6 +212,19 @@ class StreamingMixin:
             # circuit breaker, failed startup, or final voice-mode flush drops
             # it before the normal text/image processing branches are reached.
             self.note_stream_input_ingress(message)
+        elif input_type in _LIVE_VISION_STREAM_INPUT_TYPES:
+            # Preserve router ingress ordering across the independent screen /
+            # camera tasks and their threaded validation. Direct/internal
+            # callers receive a monotonic fallback sampled before any await.
+            captured_at = message.get("_visual_input_ingress_time")
+            message = {
+                **message,
+                "_visual_input_ingress_time": (
+                    float(captured_at)
+                    if isinstance(captured_at, (int, float))
+                    else time.monotonic()
+                ),
+            }
         # 检查session是否就绪
         async with self.input_cache_lock:
             if getattr(self, "_pending_input_flush_active", False):
@@ -535,15 +561,25 @@ class StreamingMixin:
                     # snapshot 回滚。
                     _agent_cb_ctx = ""
                     if self.pending_agent_callbacks:
+                        callbacks_snapshot = self._claim_agent_callbacks_for_llm()
                         try:
                             await self._stage_passive_callback_media(
-                                list(self.pending_agent_callbacks),
+                                callbacks_snapshot,
                                 self.session,
                             )
-                            _agent_cb_ctx = self.drain_agent_callbacks_for_llm() or ""
+                            _agent_cb_ctx = (
+                                self.drain_agent_callbacks_for_llm(
+                                    callbacks_snapshot
+                                )
+                                or ""
+                            )
                         except Exception as _cb_err:
                             logger.warning(f"⚠️ Agent callback drain failed: {_cb_err}")
                             _agent_cb_ctx = ""
+                        finally:
+                            self._release_agent_callback_prompt_claims(
+                                callbacks_snapshot
+                            )
 
                     text_request_id = message.get("request_id")
                     self._active_text_request_id = text_request_id
@@ -703,6 +739,9 @@ class StreamingMixin:
                                     image_b64,
                                     source=input_type,
                                     request_id=message.get("request_id"),
+                                    captured_at=message.get(
+                                        "_visual_input_ingress_time"
+                                    ),
                                 )
                                 image_accepted = bool(
                                     getattr(stage_result, "accepted", False)

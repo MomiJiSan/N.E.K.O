@@ -2082,7 +2082,13 @@ class LifecycleMixin:
             # 塞回是尽力而为：绝不能让队列簿记反过来打断中止清理流程。
             logger.warning(f"Final Swap Sequence: failed to restore undelivered extras: {e}")
 
-    def _select_passive_callbacks_for_swap_prime(self, extras_selected: list = None) -> tuple:
+    def _select_passive_callbacks_for_swap_prime(
+        self,
+        extras_selected: list = None,
+        *,
+        require_media_ready: bool = True,
+        render: bool = True,
+    ) -> tuple:
         """[Hot-swap related] Pick queued passive callbacks to ride the swap prime.
 
         Passive (``delivery_mode="passive"`` / ai_behavior="read") callbacks
@@ -2132,9 +2138,12 @@ class LifecycleMixin:
                 and not cb.get(DELIVERY_RETRACTED_KEY)
                 and not cb.get(SWAP_PRIME_DELIVERY_CLAIM_KEY)
                 and cb.get("channel") != "topic_hook"
-                and self._callback_media_ready_for_session(
-                    cb,
-                    self.pending_session,
+                and (
+                    not require_media_ready
+                    or self._callback_media_ready_for_session(
+                        cb,
+                        getattr(self, "pending_session", None),
+                    )
                 )
             ]
             if not candidates:
@@ -2157,15 +2166,17 @@ class LifecycleMixin:
             selected = selected_all[len(_extras):]
             if not selected:
                 return [], ""
-            # 与 proactive 三条投递路径同口径：字形留到渲染函数再归一化。
-            _lang = normalize_language_code(self.user_language, format='full')
-            rendered = _build_callback_instruction(
-                selected,
-                lang=_lang,
-                lanlan_name=getattr(self, "lanlan_name", "") or "",
-                master_name=getattr(self, "master_name", "") or "",
-                passive=True,
-            )
+            rendered = ""
+            if render:
+                # 与 proactive 三条投递路径同口径：字形留到渲染函数再归一化。
+                _lang = normalize_language_code(self.user_language, format='full')
+                rendered = _build_callback_instruction(
+                    selected,
+                    lang=_lang,
+                    lanlan_name=getattr(self, "lanlan_name", "") or "",
+                    master_name=getattr(self, "master_name", "") or "",
+                    passive=True,
+                )
             # No await exists between selection and this ownership claim. From
             # here until promote/abort, every queue mutation sees the same
             # provider-owned boundary as the swap sequence.
@@ -2176,6 +2187,34 @@ class LifecycleMixin:
             # 选取/渲染失败绝不能打断 swap：这批 passive 留在队列等下一轮。
             logger.warning(f"Final Swap Sequence: passive callback selection failed: {e}")
             return [], ""
+
+    def _render_claimed_passive_callbacks_for_swap_prime(
+        self,
+        selected: list,
+    ) -> tuple:
+        """Render the media-ready subset of one pre-staging swap snapshot."""
+        ready = [
+            callback
+            for callback in selected
+            if self._callback_media_ready_for_session(
+                callback,
+                getattr(self, "pending_session", None),
+            )
+        ]
+        ready_obj_ids = {id(callback) for callback in ready}
+        self._release_swap_prime_passive_claims(
+            [callback for callback in selected if id(callback) not in ready_obj_ids]
+        )
+        if not ready:
+            return [], ""
+        _lang = normalize_language_code(self.user_language, format='full')
+        return ready, _build_callback_instruction(
+            ready,
+            lang=_lang,
+            lanlan_name=getattr(self, "lanlan_name", "") or "",
+            master_name=getattr(self, "master_name", "") or "",
+            passive=True,
+        )
 
     @staticmethod
     def _release_swap_prime_passive_claims(selected: list) -> None:
@@ -2422,12 +2461,20 @@ class LifecycleMixin:
                 # skip-guard 丢弃、内容留在上下文，read 语义不变。
                 if (isinstance(self.pending_session, OmniRealtimeClient)
                         and getattr(self.pending_session, "_is_gemini", False)):
+                    _passive_sel, _ = (
+                        self._select_passive_callbacks_for_swap_prime(
+                            require_media_ready=False,
+                            render=False,
+                        )
+                    )
                     await self._stage_passive_callback_media(
-                        list(getattr(self, "pending_agent_callbacks", []) or []),
+                        _passive_sel,
                         self.pending_session,
                     )
                     _passive_sel, _passive_swap_text = (
-                        self._select_passive_callbacks_for_swap_prime()
+                        self._render_claimed_passive_callbacks_for_swap_prime(
+                            _passive_sel
+                        )
                     )
                     if _passive_swap_text:
                         final_prime_text += "\n" + _passive_swap_text
@@ -2465,13 +2512,20 @@ class LifecycleMixin:
             # 不能继续 promote 后又把 cue 留队造成未来重试/双投。
             if (isinstance(self.pending_session, OmniRealtimeClient)
                     and not getattr(self.pending_session, "_is_gemini", False)):
+                _passive_sel, _ = (
+                    self._select_passive_callbacks_for_swap_prime(
+                        extras_selected=_extras_for_budget,
+                        require_media_ready=False,
+                        render=False,
+                    )
+                )
                 await self._stage_passive_callback_media(
-                    list(getattr(self, "pending_agent_callbacks", []) or []),
+                    _passive_sel,
                     self.pending_session,
                 )
                 _passive_sel, _passive_swap_text = (
-                    self._select_passive_callbacks_for_swap_prime(
-                        extras_selected=_extras_for_budget,
+                    self._render_claimed_passive_callbacks_for_swap_prime(
+                        _passive_sel
                     )
                 )
                 if _passive_swap_text:

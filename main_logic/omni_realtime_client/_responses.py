@@ -1152,6 +1152,7 @@ class _ResponseMixin:
         *,
         language: str = "zh",
         user_turn_active: Optional[Callable[[], bool]] = None,
+        session_owned: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """Inject a text turn and explicitly request proactive speech.
 
@@ -1481,6 +1482,14 @@ class _ResponseMixin:
 
         # Re-check activity after any image await. A user or AI turn that won
         # during the visual send must preempt this proactive response.create.
+        # The manager can also replace this client during the await; a retired
+        # session must never receive a nudge whose result would be discarded.
+        if callable(session_owned) and not session_owned():
+            _remove_visual_rejection_handler()
+            logger.info(
+                "prompt_ephemeral: skipped — session ownership changed during visual inject"
+            )
+            return False
         if (
             self.is_active_response()
             or (callable(user_turn_active) and user_turn_active())
