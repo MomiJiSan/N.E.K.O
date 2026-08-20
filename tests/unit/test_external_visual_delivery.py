@@ -26,13 +26,17 @@ VISUAL_CONTEXT_PREFIX = "[系统视觉感知结果，不是用户陈述]"
 ASR_TRANSCRIPT_PREFIX = "[用户语音转写]"
 
 
-def _make_qwen_client() -> OmniRealtimeClient:
+def _make_qwen_client(
+    *,
+    turn_admission_lock: asyncio.Lock | None = None,
+) -> OmniRealtimeClient:
     client = OmniRealtimeClient(
         base_url="wss://test.example.invalid/realtime",
         api_key="test-key",
         model="qwen-omni-turbo-realtime",
         api_type="qwen",
         turn_detection_mode=TurnDetectionMode.SERVER_VAD,
+        turn_admission_lock=turn_admission_lock,
     )
     client.ws = AsyncMock()
     client._audio_in_buffer = True
@@ -567,10 +571,23 @@ async def test_gemini_external_voice_turn_includes_visual_description():
 
 @pytest.mark.asyncio
 async def test_new_gemini_turn_cancels_resolved_turn_during_sdk_send():
-    """A superseded Gemini transcript stays cancellable through SDK send."""
+    """A superseded Gemini SDK send retires before its successor is admitted."""
     client = _make_qwen_client()
     client._is_gemini = True
-    client._gemini_session = AsyncMock()
+    old_session = AsyncMock()
+    client._gemini_session = old_session
+    client.ws = old_session
+    old_context = AsyncMock()
+    client._gemini_context_manager = old_context
+    client.instructions = "system prompt"
+    client._native_audio = True
+    replacement_session = AsyncMock()
+
+    async def reconnect(*_args, **_kwargs):
+        client._gemini_session = replacement_session
+        client.ws = replacement_session
+
+    client.connect = AsyncMock(side_effect=reconnect)
     client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
     client.handle_interruption = AsyncMock()
     client._analyze_image_with_vision_model = AsyncMock(return_value="旧画面")
@@ -581,7 +598,7 @@ async def test_new_gemini_turn_cancels_resolved_turn_during_sdk_send():
         send_started.set()
         await release_send.wait()
 
-    client._gemini_session.send_client_content.side_effect = send_client_content
+    old_session.send_client_content.side_effect = send_client_content
     await client.prepare_external_voice_turn(turn_id="gemini-old-turn")
     await client.stream_image(DUMMY_IMAGE_B64, source="screen", request_id="old")
     old_submit = asyncio.create_task(
@@ -599,9 +616,35 @@ async def test_new_gemini_turn_cancels_resolved_turn_during_sdk_send():
 
     assert cancelled_by_new_turn is True
     assert "gemini-old-turn" not in client._external_visual_turns
-    client._gemini_session.send_client_content.assert_awaited_once()
+    old_session.send_client_content.assert_awaited_once()
+    old_context.__aexit__.assert_awaited_once_with(None, None, None)
+    client.connect.assert_awaited_once_with("system prompt", native_audio=True)
+    assert client._gemini_session is replacement_session
     client.abandon_external_voice_turn("gemini-new-turn")
     release_send.set()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_server_vad_waits_for_callback_turn_admission_boundary():
+    admission_lock = asyncio.Lock()
+    client = _make_qwen_client(turn_admission_lock=admission_lock)
+    client.ws.__aiter__.return_value = [
+        json.dumps({"type": "input_audio_buffer.speech_started"})
+    ]
+
+    await admission_lock.acquire()
+    receive_task = asyncio.create_task(client.handle_messages())
+    await asyncio.sleep(0)
+
+    assert client._speech_started_total == 0
+    assert client._client_vad_active is False
+
+    admission_lock.release()
+    await receive_task
+
+    assert client._speech_started_total == 1
+    assert client._client_vad_active is True
     await client.close()
 
 

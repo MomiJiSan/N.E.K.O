@@ -414,6 +414,7 @@ class _GeminiMixin:
         if (
             not self._gemini_context_manager
             and getattr(self, "_gemini_proactive_submit_task", None) is None
+            and getattr(self, "_gemini_external_submit_task", None) is None
         ):
             return
         await self._own_teardown("_gemini_close_task", self._detach_for_gemini_close)
@@ -425,6 +426,7 @@ class _GeminiMixin:
             self._gemini_context_manager,
             self._gemini_session,
             getattr(self, "_gemini_proactive_submit_task", None),
+            getattr(self, "_gemini_external_submit_task", None),
         )
 
     async def _close_gemini_impl(
@@ -432,11 +434,19 @@ class _GeminiMixin:
         context,
         session,
         proactive_submit_task=None,
+        external_submit_task=None,
     ) -> None:
         await self._cancel_gemini_proactive_submit(
             session_closing=True,
             submit_task=proactive_submit_task,
         )
+        if (
+            external_submit_task is not None
+            and external_submit_task is not asyncio.current_task()
+            and not external_submit_task.done()
+        ):
+            external_submit_task.cancel()
+            await asyncio.gather(external_submit_task, return_exceptions=True)
         if context is None:
             return
         try:

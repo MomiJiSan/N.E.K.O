@@ -30,6 +30,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 # state/session/lock 结构，然后直接调用 trigger_agent_callbacks 的关键分支。
 import main_logic.core as core_module
 from main_logic.omni_offline_client import OmniOfflineClient
+from main_logic.omni_realtime_client import ImageStageResult
 from main_logic.proactive_delivery import (
     CALLBACK_EXPIRES_AT_KEY,
     DELIVERY_ACK_FUTURE_KEY,
@@ -1211,6 +1212,111 @@ async def test_drain_agent_callbacks_resolves_delivery_ack():
     assert future.done()
     assert future.result() is True
     assert mgr.pending_agent_callbacks == []
+
+
+async def test_passive_image_is_staged_before_text_drain_can_prune_callback():
+    session = _FakeOmniOffline(delivered=True)
+    session.stream_image = AsyncMock(return_value=None)
+    mgr = _make_mgr(session=session)
+    cb = {
+        "_callback_delivery_id": "id-passive-image-text",
+        "status": "completed",
+        "summary": "camera event",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "media_images": ["image-b64"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
+    assert mgr.pending_agent_callbacks == [cb]
+
+    await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+    rendered = core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr)
+
+    session.stream_image.assert_awaited_once_with(
+        "image-b64",
+        bypass_rate_limit=True,
+        cache_latest=False,
+        source="callback",
+        request_id="id-passive-image-text",
+    )
+    assert "camera event" in rendered
+    assert mgr.pending_agent_callbacks == []
+
+
+async def test_transient_passive_image_rejection_keeps_callback_for_retry():
+    session = _FakeOmniOffline(delivered=True)
+    session.stream_image = AsyncMock(
+        return_value=ImageStageResult(
+            accepted=False,
+            mode="native",
+            rejection_reason="raw_visual_delivery_blocked",
+        )
+    )
+    mgr = _make_mgr(session=session)
+    cb = {
+        "_callback_delivery_id": "id-passive-image-retry",
+        "status": "completed",
+        "summary": "camera event",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "media_images": ["image-b64"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+    rendered = core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr)
+
+    assert rendered == ""
+    assert mgr.pending_agent_callbacks == [cb]
+    assert cb["media_images"] == ["image-b64"]
+
+
+async def test_external_passive_image_description_rides_hot_swap_prime():
+    session = _make_voice_sess()
+    session.stream_image = AsyncMock(
+        return_value=ImageStageResult(
+            accepted=True,
+            mode="external_description",
+            description="桌上有一只白杯子",
+        )
+    )
+    mgr = _make_mgr(session=session)
+    mgr.pending_session = session
+    cb = {
+        "_callback_delivery_id": "id-passive-image-swap",
+        "status": "completed",
+        "summary": "camera event",
+        "detail": "",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "source_kind": "unknown",
+        "media_images": ["image-b64"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+    selected, rendered = (
+        core_module.LLMSessionManager._select_passive_callbacks_for_swap_prime(mgr)
+    )
+
+    assert selected == [cb]
+    assert "camera event" in rendered
+    assert "桌上有一只白杯子" in rendered
+    assert "media_images" not in cb
 
 
 async def test_drain_agent_callbacks_rechecks_topic_release_gate():

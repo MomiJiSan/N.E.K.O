@@ -536,6 +536,10 @@ class StreamingMixin:
                     _agent_cb_ctx = ""
                     if self.pending_agent_callbacks:
                         try:
+                            await self._stage_passive_callback_media(
+                                list(self.pending_agent_callbacks),
+                                self.session,
+                            )
                             _agent_cb_ctx = self.drain_agent_callbacks_for_llm() or ""
                         except Exception as _cb_err:
                             logger.warning(f"⚠️ Agent callback drain failed: {_cb_err}")

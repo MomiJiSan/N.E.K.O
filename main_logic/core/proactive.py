@@ -49,6 +49,10 @@ from ._shared import (
 from .callback_render import _build_callback_instruction, _select_callbacks_within_token_budget
 
 
+_PASSIVE_MEDIA_SESSION_KEY = "_passive_media_session_id"
+_PASSIVE_MEDIA_STAGED_COUNT_KEY = "_passive_media_staged_count"
+
+
 class ProactiveMixin:
     """Proactive delivery methods (see module docstring)."""
 
@@ -2152,6 +2156,151 @@ class ProactiveMixin:
                 session._inject_rejection_handlers.pop(event_id, None)
         return all_ok
 
+    @staticmethod
+    def _callback_media_ready_for_session(callback: dict, session: object) -> bool:
+        """Return whether callback media is already owned by ``session``."""
+
+        images = callback.get("media_images")
+        return not images or (
+            callback.get(_PASSIVE_MEDIA_SESSION_KEY) == id(session)
+            and int(callback.get(_PASSIVE_MEDIA_STAGED_COUNT_KEY, 0) or 0)
+            >= len(images)
+        )
+
+    async def _stage_passive_callback_media(
+        self,
+        callbacks: list,
+        session: object,
+    ) -> None:
+        """Stage retained callback images before a natural-turn consumer.
+
+        Passive consumers remove callbacks after rendering their text. Media
+        therefore needs an explicit ownership handoff first: native/offline
+        images are staged into the exact session that will consume the prompt,
+        while external visual descriptions are folded into the callback body.
+        A transient rejection leaves the callback unready and queued.
+        """
+
+        stream_image = getattr(session, "stream_image", None)
+        if session is None or not callable(stream_image):
+            return
+        session_id = id(session)
+        terminal_rejections = {
+            "analysis_empty",
+            "invalid_payload",
+            "payload_too_large",
+        }
+        for callback in callbacks:
+            if not isinstance(callback, dict):
+                continue
+            images = list(callback.get("media_images") or [])
+            if not images:
+                callback.pop(_PASSIVE_MEDIA_SESSION_KEY, None)
+                callback.pop(_PASSIVE_MEDIA_STAGED_COUNT_KEY, None)
+                continue
+            if self._callback_media_ready_for_session(callback, session):
+                continue
+            staged_count = 0
+            if callback.get(_PASSIVE_MEDIA_SESSION_KEY) == session_id:
+                staged_count = int(
+                    callback.get(_PASSIVE_MEDIA_STAGED_COUNT_KEY, 0) or 0
+                )
+            else:
+                callback[_PASSIVE_MEDIA_SESSION_KEY] = session_id
+                callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = 0
+
+            index = staged_count
+            while index < len(images):
+                image_b64 = images[index]
+                try:
+                    try:
+                        stage_result = await stream_image(
+                            image_b64,
+                            bypass_rate_limit=True,
+                            cache_latest=False,
+                            source="callback",
+                            request_id=callback.get("_callback_delivery_id"),
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        stage_result = await stream_image(
+                            image_b64,
+                            bypass_rate_limit=True,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] passive callback media staging failed; keeping callback queued: %s",
+                        self.lanlan_name,
+                        exc,
+                    )
+                    callback["media_images"] = images
+                    callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = index
+                    break
+
+                structured = hasattr(stage_result, "accepted")
+                accepted = (
+                    bool(stage_result.accepted) if structured else True
+                )
+                raw_mode = getattr(stage_result, "mode", None)
+                mode = getattr(raw_mode, "value", raw_mode)
+                description = getattr(stage_result, "description", None)
+                if not structured and isinstance(stage_result, str):
+                    mode = "external_description"
+                    description = stage_result
+                if not accepted:
+                    reason = getattr(stage_result, "rejection_reason", None)
+                    if reason not in terminal_rejections:
+                        callback["media_images"] = images
+                        callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = index
+                        break
+                    images.pop(index)
+                    callback["media_images"] = images
+                    logger.warning(
+                        "[%s] dropping permanently rejected passive callback image (%s)",
+                        self.lanlan_name,
+                        reason,
+                    )
+                    continue
+                if mode == "external_description":
+                    clean_description = str(description or "").strip()
+                    if not clean_description:
+                        images.pop(index)
+                        callback["media_images"] = images
+                        continue
+                    existing = str(
+                        callback.get("detail")
+                        or callback.get("summary")
+                        or ""
+                    ).strip()
+                    visual_context = (
+                        "[系统视觉感知结果，不是用户陈述]\n"
+                        f"当前画面：{clean_description}"
+                    )
+                    combined = (
+                        f"{existing}\n{visual_context}"
+                        if existing
+                        else visual_context
+                    )
+                    callback["detail"] = self._normalize_context_text_for_source(
+                        callback.get("source_kind") or "unknown",
+                        combined,
+                    )
+                    images.pop(index)
+                    callback["media_images"] = images
+                    continue
+                index += 1
+                callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = index
+            else:
+                if images:
+                    callback["media_images"] = images
+                    callback[_PASSIVE_MEDIA_SESSION_KEY] = session_id
+                    callback[_PASSIVE_MEDIA_STAGED_COUNT_KEY] = len(images)
+                else:
+                    callback.pop("media_images", None)
+                    callback.pop(_PASSIVE_MEDIA_SESSION_KEY, None)
+                    callback.pop(_PASSIVE_MEDIA_STAGED_COUNT_KEY, None)
+
     def on_voice_playback_signal(self, *, playing: bool, **meta) -> None:
         """Handle a FRONTEND-reported audio playback boundary.
 
@@ -2807,6 +2956,7 @@ class ProactiveMixin:
             callback
             for callback in self.filter_deliverable_callbacks(candidate_callbacks)
             if not callback.get(SWAP_PRIME_DELIVERY_CLAIM_KEY)
+            and self._callback_media_ready_for_session(callback, self.session)
         ]
         if not active_callbacks:
             return ""

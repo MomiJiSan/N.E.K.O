@@ -1595,6 +1595,7 @@ class LifecycleMixin:
                 tool_definitions=_initial_tool_defs,
                 livestream_mode=self._is_livestream_active(),
                 noise_reduction_enabled=nr_enabled,
+                turn_admission_lock=self._voice_proactive_inject_lock,
             )
             # Apply user's noise reduction preference to the AudioProcessor
             if hasattr(new_session, '_audio_processor') and new_session._audio_processor:
@@ -1906,6 +1907,7 @@ class LifecycleMixin:
                     tool_definitions=_pending_tool_defs,
                     livestream_mode=self._is_livestream_active(),
                     noise_reduction_enabled=nr_enabled,
+                    turn_admission_lock=self._voice_proactive_inject_lock,
                 )
                 # Apply user's noise reduction preference to the AudioProcessor
                 if hasattr(self.pending_session, '_audio_processor') and self.pending_session._audio_processor:
@@ -2121,12 +2123,19 @@ class LifecycleMixin:
         """
         try:
             candidates = [
-                cb for cb in (self.pending_agent_callbacks or [])
+                cb
+                for cb in (
+                    getattr(self, "pending_agent_callbacks", []) or []
+                )
                 if isinstance(cb, dict)
                 and cb.get("delivery_mode") == "passive"
                 and not cb.get(DELIVERY_RETRACTED_KEY)
                 and not cb.get(SWAP_PRIME_DELIVERY_CLAIM_KEY)
                 and cb.get("channel") != "topic_hook"
+                and self._callback_media_ready_for_session(
+                    cb,
+                    self.pending_session,
+                )
             ]
             if not candidates:
                 return [], ""
@@ -2413,6 +2422,10 @@ class LifecycleMixin:
                 # skip-guard 丢弃、内容留在上下文，read 语义不变。
                 if (isinstance(self.pending_session, OmniRealtimeClient)
                         and getattr(self.pending_session, "_is_gemini", False)):
+                    await self._stage_passive_callback_media(
+                        list(getattr(self, "pending_agent_callbacks", []) or []),
+                        self.pending_session,
+                    )
                     _passive_sel, _passive_swap_text = (
                         self._select_passive_callbacks_for_swap_prime()
                     )
@@ -2452,6 +2465,10 @@ class LifecycleMixin:
             # 不能继续 promote 后又把 cue 留队造成未来重试/双投。
             if (isinstance(self.pending_session, OmniRealtimeClient)
                     and not getattr(self.pending_session, "_is_gemini", False)):
+                await self._stage_passive_callback_media(
+                    list(getattr(self, "pending_agent_callbacks", []) or []),
+                    self.pending_session,
+                )
                 _passive_sel, _passive_swap_text = (
                     self._select_passive_callbacks_for_swap_prime(
                         extras_selected=_extras_for_budget,

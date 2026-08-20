@@ -386,20 +386,89 @@ class _ResponseMixin:
         stable_turn_id = str(turn_id or "").strip()
         if not stable_turn_id:
             raise ValueError("external voice turn_id must not be empty")
-        if self._is_gemini:
-            await self._cancel_gemini_proactive_submit()
-            await self._await_gemini_proactive_quarantine()
-        self._begin_external_visual_turn(stable_turn_id)
-        try:
-            if not self._is_gemini:
-                arbiter = self._ensure_response_arbiter()
-                self._external_voice_turn_pause_id = stable_turn_id
-                arbiter.pause_dispatch()
-                await arbiter.cancel_current()
-            await self.handle_interruption()
-        except BaseException:
-            self.abandon_external_voice_turn(stable_turn_id)
-            raise
+        async with self._ensure_turn_admission_lock():
+            if self._is_gemini:
+                self._start_gemini_external_submit_quarantine()
+                await self._await_gemini_external_quarantine()
+                await self._cancel_gemini_proactive_submit()
+                await self._await_gemini_proactive_quarantine()
+            self._begin_external_visual_turn(stable_turn_id)
+            try:
+                if not self._is_gemini:
+                    arbiter = self._ensure_response_arbiter()
+                    self._external_voice_turn_pause_id = stable_turn_id
+                    arbiter.pause_dispatch()
+                    await arbiter.cancel_current()
+                await self.handle_interruption()
+            except BaseException:
+                self.abandon_external_voice_turn(stable_turn_id)
+                raise
+
+    def _start_gemini_external_submit_quarantine(
+        self,
+        submit_task: Optional[asyncio.Task] = None,
+    ) -> None:
+        """Retire a Gemini session whose external turn send was cancelled."""
+
+        if submit_task is None:
+            submit_task = getattr(self, "_gemini_external_submit_task", None)
+        if (
+            submit_task is None
+            or submit_task is asyncio.current_task()
+            or submit_task.done()
+        ):
+            return
+        quarantine_task = getattr(
+            self,
+            "_gemini_external_quarantine_task",
+            None,
+        )
+        if quarantine_task is not None and not quarantine_task.done():
+            return
+        self._gemini_external_quarantine_task = self._fire_task(
+            self._quarantine_gemini_external_submit(submit_task)
+        )
+
+    async def _quarantine_gemini_external_submit(
+        self,
+        submit_task: asyncio.Task,
+    ) -> None:
+        """Join a cancelled SDK send, then close the ambiguous connection."""
+
+        if not submit_task.done():
+            submit_task.cancel()
+            await asyncio.gather(submit_task, return_exceptions=True)
+        if getattr(self, "_gemini_external_submit_task", None) is submit_task:
+            self._gemini_external_submit_task = None
+        # Cancellation only ends our await; Gemini may already have accepted
+        # the turn. The connection is the smallest scope that can prove no late
+        # transcript/response from that turn can cross into its successor.
+        self._fatal_error_occurred = True
+        await self._close_gemini()
+
+    async def _await_gemini_external_quarantine(self) -> None:
+        """Join external-submit quarantine and reconnect before a new turn."""
+
+        quarantine_task = getattr(
+            self,
+            "_gemini_external_quarantine_task",
+            None,
+        )
+        if quarantine_task is not None and quarantine_task is not asyncio.current_task():
+            await asyncio.shield(quarantine_task)
+            if (
+                quarantine_task.done()
+                and getattr(self, "_gemini_external_quarantine_task", None)
+                is quarantine_task
+            ):
+                self._gemini_external_quarantine_task = None
+        if getattr(self, "_gemini_session", None) is None:
+            instructions = str(getattr(self, "instructions", "") or "")
+            if instructions:
+                await self.connect(
+                    instructions,
+                    native_audio=getattr(self, "_native_audio", True),
+                )
 
     async def _await_gemini_proactive_quarantine(self) -> None:
         """Join stale Gemini proactive quarantine before opening a user turn."""
@@ -485,9 +554,13 @@ class _ResponseMixin:
                 )
             if visual_record is not None:
                 visual_record["submit_task"] = asyncio.current_task()
+            submit_task = asyncio.current_task()
+            self._gemini_external_submit_task = submit_task
             try:
                 await self.create_response(item_text)
             finally:
+                if getattr(self, "_gemini_external_submit_task", None) is submit_task:
+                    self._gemini_external_submit_task = None
                 if (
                     visual_record is not None
                     and self._external_visual_turns.get(stable_turn_id)

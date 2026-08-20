@@ -937,7 +937,12 @@ class _TransportMixin:
             return None
         return str(description).strip() or None
 
-    def _abandon_external_visual_turn(self, turn_id: str | None = None) -> None:
+    def _abandon_external_visual_turn(
+        self,
+        turn_id: str | None = None,
+        *,
+        quarantine_gemini_submit: bool = True,
+    ) -> None:
         turns = getattr(self, "_external_visual_turns", None)
         if not turns:
             return
@@ -960,7 +965,10 @@ class _TransportMixin:
                 and submit_task is not asyncio.current_task()
                 and not submit_task.done()
             ):
-                submit_task.cancel()
+                if self._is_gemini and quarantine_gemini_submit:
+                    self._start_gemini_external_submit_quarantine(submit_task)
+                else:
+                    submit_task.cancel()
 
     async def stream_image(
         self,
@@ -2416,20 +2424,25 @@ class _TransportMixin:
                     logger.info("input_audio_buffer.committed observed (total=%d)", self._input_audio_committed_total)
                 # Handle interruptions
                 elif event_type == "input_audio_buffer.speech_started":
-                    self._speech_started_total += 1
-                    logger.info("Speech detected")
-                    self._response_arbiter.notify_server_vad_started()
-                    self._audio_in_buffer = True
-                    # 重置静默计时器
-                    self._last_speech_time = time.time()
-                    # Priority 1: server VAD → sync to unified _client_vad_active
-                    self._client_vad_active = True
-                    self._client_vad_last_speech_time = self._last_speech_time
-                    # B: server-VAD 也喂给 _user_recent_activity，保持各 VAD 源对称。
-                    self._user_recent_activity_time = self._last_speech_time
-                    if self._is_responding:
-                        logger.info("Handling interruption")
-                        await self.handle_interruption()
+                    # A callback native-image write is irreversible. Admit VAD
+                    # under the same Core-provided lock held across callback
+                    # media+text injection so the image cannot be committed in
+                    # one turn and its label deferred into another.
+                    async with self._ensure_turn_admission_lock():
+                        self._speech_started_total += 1
+                        logger.info("Speech detected")
+                        self._response_arbiter.notify_server_vad_started()
+                        self._audio_in_buffer = True
+                        # 重置静默计时器
+                        self._last_speech_time = time.time()
+                        # Priority 1: server VAD → sync to unified _client_vad_active
+                        self._client_vad_active = True
+                        self._client_vad_last_speech_time = self._last_speech_time
+                        # B: server-VAD 也喂给 _user_recent_activity，保持各 VAD 源对称。
+                        self._user_recent_activity_time = self._last_speech_time
+                        if self._is_responding:
+                            logger.info("Handling interruption")
+                            await self.handle_interruption()
                 elif event_type == "input_audio_buffer.speech_stopped":
                     self._speech_stopped_total += 1
                     logger.info("Speech ended")
@@ -2900,7 +2913,7 @@ class _TransportMixin:
         # External visual turns belong to the connection being retired. Drop
         # their analysis, arbiter ticket, and submit task synchronously before
         # teardown can yield and a replacement connection can attach.
-        self._abandon_external_visual_turn()
+        self._abandon_external_visual_turn(quarantine_gemini_submit=False)
         generation = self._connection_generation
         ws, self.ws = self.ws, None
         # The manager is the one closing, so it already knows this session is
@@ -2914,6 +2927,11 @@ class _TransportMixin:
             "_gemini_proactive_submit_task",
             None,
         )
+        gemini_external_submit_task = getattr(
+            self,
+            "_gemini_external_submit_task",
+            None,
+        )
         return self._close_impl(
             generation,
             ws,
@@ -2921,6 +2939,7 @@ class _TransportMixin:
             gemini_context,
             gemini_close_task,
             gemini_proactive_submit_task,
+            gemini_external_submit_task,
         )
 
     async def _close_impl(
@@ -2931,11 +2950,22 @@ class _TransportMixin:
         gemini_context,
         gemini_close_task,
         gemini_proactive_submit_task,
+        gemini_external_submit_task,
     ) -> None:
         await self._cancel_gemini_proactive_submit(
             session_closing=True,
             submit_task=gemini_proactive_submit_task,
         )
+        if (
+            gemini_external_submit_task is not None
+            and gemini_external_submit_task is not asyncio.current_task()
+            and not gemini_external_submit_task.done()
+        ):
+            gemini_external_submit_task.cancel()
+            await asyncio.gather(
+                gemini_external_submit_task,
+                return_exceptions=True,
+            )
         response_arbiter = getattr(self, "_response_arbiter", None)
         if response_arbiter is not None and self._still_owns_connection(generation):
             # The arbiter is shared across connections, not owned by one. If a

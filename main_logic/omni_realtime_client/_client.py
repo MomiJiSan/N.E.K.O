@@ -121,6 +121,7 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         noise_reduction_enabled: bool = True,
         external_visual_join_timeout: float = 0.75,
         external_visual_frame_ttl: float = 5.0,
+        turn_admission_lock: Optional[asyncio.Lock] = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -296,6 +297,11 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
             0.01,
             float(external_visual_join_timeout),
         )
+        # Callback-owned native media and user turns share this boundary. Core
+        # passes its voice-proactive lock so the whole callback media+text
+        # transaction is mutually exclusive with both server-VAD and external
+        # ASR turn admission. Standalone clients keep an equivalent local lock.
+        self._turn_admission_lock = turn_admission_lock or asyncio.Lock()
 
         # Silence detection for auto-closing inactive sessions
         # 只在 GLM 和 free API 时启用90秒静默超时，Qwen 和 Step 放行
@@ -506,6 +512,12 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # while user speech was already being captured.
         self._gemini_proactive_submit_task: Optional[asyncio.Task] = None
         self._gemini_proactive_quarantine_task: Optional[asyncio.Task] = None
+        # External-ASR Gemini sends have the same accepted-before-cancellation
+        # ambiguity as proactive sends. Keep the submit identity after its
+        # visual record is abandoned so a successor turn can join quarantine
+        # and retire the owning SDK session before reconnecting.
+        self._gemini_external_submit_task: Optional[asyncio.Task] = None
+        self._gemini_external_quarantine_task: Optional[asyncio.Task] = None
 
     def _create_audio_processor(self) -> AudioProcessor:
         """Create session-owned audio state, including native RNNoise state."""
@@ -522,3 +534,12 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         return task
+
+    def _ensure_turn_admission_lock(self) -> asyncio.Lock:
+        """Return the shared callback/user-turn boundary, lazily for doubles."""
+
+        lock = getattr(self, "_turn_admission_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._turn_admission_lock = lock
+        return lock
