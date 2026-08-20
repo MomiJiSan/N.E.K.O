@@ -1,7 +1,7 @@
 import asyncio
 from collections import deque
 import queue
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -738,6 +738,7 @@ async def test_voice_live_vision_input_preserves_source_and_request_identity(
         "img-b64",
         source=input_type,
         request_id="req-vision-17",
+        captured_at=ANY,
     )
 
 

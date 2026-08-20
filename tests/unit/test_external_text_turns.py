@@ -3243,6 +3243,7 @@ async def test_prepare_external_voice_turn_failure_reopens_dispatch_gate():
 
     client = OmniRealtimeClient.__new__(OmniRealtimeClient)
     client._is_gemini = False
+    client._connection_generation = 0
     client._response_arbiter = RealtimeResponseArbiter(send)
     client.handle_interruption = AsyncMock(side_effect=RuntimeError("interrupt failed"))
 

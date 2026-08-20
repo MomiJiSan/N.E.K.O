@@ -4,7 +4,7 @@ import os
 import struct
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -156,10 +156,12 @@ def _hot_swap_frame(
     samples: int = 160,
     speech_probability: float | None = 0.5,
     rnnoise_available: bool = True,
+    captured_at: float = 0.0,
 ) -> HotSwapAudioFrame:
     return HotSwapAudioFrame(
         pcm16=b"\x01\x00" * samples,
         token=token,
+        captured_at=captured_at,
         speech_probability=speech_probability,
         rnnoise_available=rnnoise_available,
     )
@@ -331,6 +333,7 @@ async def test_audio_worker_leaves_runtime_generation_validation_to_submit():
         ingress_token=frame.token,
         audio_stream_epoch=frame.audio_stream_epoch,
         ingress_sequence=frame.ingress_sequence,
+        captured_at=frame.captured_at,
     )
     assert mgr._audio_stream_dropped_total == 0
 
@@ -375,6 +378,7 @@ async def test_audio_worker_does_not_wait_for_core_session_readiness():
         ingress_token=frame.token,
         audio_stream_epoch=frame.audio_stream_epoch,
         ingress_sequence=frame.ingress_sequence,
+        captured_at=frame.captured_at,
     )
 
 
@@ -526,6 +530,7 @@ async def test_independent_audio_route_precedes_omni_websocket_checks():
         rnnoise_available=True,
         rnnoise_evidence=None,
         ingress_token=token,
+        captured_at=ANY,
     )
     mgr.session.stream_audio.assert_not_awaited()
     mgr._record_omni_microphone_audio.assert_not_called()
@@ -564,6 +569,7 @@ async def test_independent_audio_route_does_not_require_omni_session_container()
         rnnoise_available=True,
         rnnoise_evidence=None,
         ingress_token=token,
+        captured_at=ANY,
     )
     mgr.start_session.assert_not_awaited()
     mgr.end_session.assert_not_awaited()
@@ -622,6 +628,7 @@ async def test_hot_swap_flush_preserves_identity_and_detector_metadata():
             token,
             speech_probability=0.75,
             rnnoise_available=True,
+            captured_at=1234.5,
         )
     )
 
@@ -635,6 +642,7 @@ async def test_hot_swap_flush_preserves_identity_and_detector_metadata():
         rnnoise_available=True,
         rnnoise_evidence=None,
         ingress_token=token,
+        captured_at=1234.5,
     )
     mgr.session.stream_audio.assert_not_awaited()
     mgr._record_omni_microphone_audio.assert_not_called()

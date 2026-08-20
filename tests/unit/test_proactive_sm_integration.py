@@ -970,9 +970,11 @@ async def test_voice_mode_rechecks_retracted_callbacks_before_inject():
         *,
         on_rejected=None,
         events_before_text=None,
+        on_session_unsafe=None,
     ):
         assert on_rejected is not None
         assert events_before_text == []
+        assert on_session_unsafe is not None
         cb[DELIVERY_RETRACTED_KEY] = True
         return True
     mgr._stream_cb_media = _stream_then_retract
