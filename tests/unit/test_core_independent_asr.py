@@ -9122,3 +9122,28 @@ async def test_independent_visual_sync_failure_blocks_raw_images_without_stoppin
 
     assert runtime._asr_route_mode == "independent"
     assert call_order == ["block", "sync"]
+
+
+@pytest.mark.unit
+async def test_native_visual_sync_failure_keeps_raw_images_blocked() -> None:
+    runtime = _Runtime()
+    call_order: list[str] = []
+
+    def allow_raw_visual_delivery() -> None:
+        call_order.append("allow")
+
+    def block_raw_visual_delivery() -> None:
+        call_order.append("block")
+
+    def fail_visual_mode_sync(_mode: str) -> None:
+        call_order.append("sync")
+        raise RuntimeError("stale realtime session")
+
+    runtime.session.allow_raw_visual_delivery = allow_raw_visual_delivery
+    runtime.session.block_raw_visual_delivery = block_raw_visual_delivery
+    runtime.session.set_visual_delivery_mode = fail_visual_mode_sync
+
+    runtime._set_microphone_route("native")
+
+    assert runtime._asr_route_mode == "native"
+    assert call_order == ["sync", "block"]

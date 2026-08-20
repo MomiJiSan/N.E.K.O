@@ -464,7 +464,8 @@ class AsrRuntimeMixin:
         try:
             if route_mode == "independent":
                 self._block_realtime_raw_visual_delivery()
-            elif route_mode == "native":
+            set_visual_delivery_mode(visual_mode)
+            if route_mode == "native":
                 allow_raw_visual_delivery = getattr(
                     session,
                     "allow_raw_visual_delivery",
@@ -472,10 +473,11 @@ class AsrRuntimeMixin:
                 )
                 if callable(allow_raw_visual_delivery):
                     allow_raw_visual_delivery()
-            set_visual_delivery_mode(visual_mode)
         except Exception as exc:
             # This setter only updates local session policy. A broken or stale
             # session must not take the independent-ASR microphone route down.
+            if route_mode == "native":
+                self._block_realtime_raw_visual_delivery()
             logger.warning(
                 "[%s] visual delivery mode sync failed: %s",
                 self.lanlan_name,

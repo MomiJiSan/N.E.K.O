@@ -409,7 +409,11 @@ class _ResponseMixin:
             if not quarantine_task.cancelled():
                 raise
         finally:
-            if getattr(self, "_gemini_proactive_quarantine_task", None) is quarantine_task:
+            if (
+                quarantine_task.done()
+                and getattr(self, "_gemini_proactive_quarantine_task", None)
+                is quarantine_task
+            ):
                 self._gemini_proactive_quarantine_task = None
 
         # A quarantine with no terminal lifecycle retires the old Gemini
@@ -873,7 +877,11 @@ class _ResponseMixin:
             and not quarantine_task.done()
         ):
             quarantine_task.cancel()
-        if quarantine_task is not asyncio.current_task():
+        if (
+            quarantine_task is not None
+            and quarantine_task is not asyncio.current_task()
+            and quarantine_task.done()
+        ):
             self._gemini_proactive_quarantine_task = None
         if getattr(self, "_proactive_inject_outcome_token", None) == token:
             self._proactive_inject_outcome_token = None

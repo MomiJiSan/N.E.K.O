@@ -866,6 +866,43 @@ async def test_gemini_cancelled_send_quarantines_until_terminal():
 
 
 @pytest.mark.unit
+async def test_cancelled_prepare_preserves_quarantine_for_next_external_turn():
+    client = _make_client(api_type="gemini", model="gemini-live")
+    client._gemini_session = AsyncMock()
+    quarantine_started = asyncio.Event()
+    release_quarantine = asyncio.Event()
+
+    async def quarantine():
+        quarantine_started.set()
+        await release_quarantine.wait()
+
+    quarantine_task = asyncio.create_task(quarantine())
+    client._gemini_proactive_quarantine_task = quarantine_task
+
+    first_prepare = asyncio.create_task(
+        client.prepare_external_voice_turn(turn_id="cancelled-prepare")
+    )
+    await quarantine_started.wait()
+    first_prepare.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_prepare
+
+    assert client._gemini_proactive_quarantine_task is quarantine_task
+    assert not quarantine_task.done()
+
+    next_prepare = asyncio.create_task(
+        client.prepare_external_voice_turn(turn_id="next-prepare")
+    )
+    await asyncio.sleep(0)
+    assert not next_prepare.done()
+
+    release_quarantine.set()
+    await next_prepare
+    assert client._gemini_proactive_quarantine_task is None
+    await client.close()
+
+
+@pytest.mark.unit
 async def test_gemini_send_conflict_cannot_clear_another_inject_outcome():
     client = _make_client(api_type="gemini", model="gemini-live")
     client._gemini_session = AsyncMock()
