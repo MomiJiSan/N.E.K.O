@@ -2323,11 +2323,16 @@ class ProactiveMixin:
                         callback["_passive_media_staged_count"] = staged_count
                     else:
                         callback["_passive_media_staged_count"] = index
-                        if websocket_native_delivery:
+                        if websocket_native_delivery or (
+                            realtime_session and index > 0
+                        ):
                             # A WebSocket send exception does not prove that no
                             # bytes crossed the transport boundary. Even image
-                            # zero may therefore already be irreversible in the
-                            # Provider session; retire it instead of promoting
+                            # zero may therefore already be irreversible. SDK
+                            # realtime sessions have a stronger boundary for a
+                            # completed send, but once any earlier image was
+                            # accepted their prefix is equally irreversible.
+                            # Retire either session instead of promoting
                             # ambiguous, unlabelled visual context.
                             outcome["safe_to_continue"] = False
                     break

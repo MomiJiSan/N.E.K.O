@@ -1385,6 +1385,23 @@ class _ResponseMixin:
                 )
                 return False
 
+            # SID rotation can yield long enough for Core to reconcile an
+            # independent/blocked visual route. A snapshot captured under the
+            # old mode must not cross that boundary into a different ASR turn;
+            # retry from the new route instead of sending it as either raw
+            # media or an external description.
+            current_external_visual_delivery = getattr(
+                self,
+                "_visual_delivery_mode",
+                VisualDeliveryMode.NATIVE,
+            ) == VisualDeliveryMode.EXTERNAL_DESCRIPTION
+            if current_external_visual_delivery != external_visual_delivery:
+                logger.info(
+                    "prompt_ephemeral: skipped — visual route changed during SID rotation"
+                )
+                return False
+            external_visual_delivery = current_external_visual_delivery
+
         if (
             has_vision
             and not self._is_gemini
@@ -1419,7 +1436,7 @@ class _ResponseMixin:
             # stream_image also owns the provider-specific wire event, including
             # the dedicated free-service input_image_buffer.append route.
             try:
-                await self.stream_image(
+                stage_result = await self.stream_image(
                     snapshot_image_b64,
                     bypass_rate_limit=True,
                     cache_latest=False,
@@ -1435,6 +1452,15 @@ class _ResponseMixin:
                     exc,
                 )
                 return False
+            if hasattr(stage_result, "accepted"):
+                raw_stage_mode = getattr(stage_result, "mode", None)
+                stage_mode = getattr(raw_stage_mode, "value", raw_stage_mode)
+                if not bool(stage_result.accepted) or stage_mode != "native":
+                    _remove_visual_rejection_handler()
+                    logger.info(
+                        "prompt_ephemeral: visual route changed during native image staging; keeping snapshot for retry"
+                    )
+                    return False
             if delivery_rejected:
                 _remove_visual_rejection_handler()
                 logger.info(

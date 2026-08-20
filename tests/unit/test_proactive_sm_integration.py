@@ -1512,6 +1512,40 @@ async def test_first_native_passive_media_exception_requires_session_retirement(
     assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
 
 
+async def test_partial_gemini_passive_media_staging_requires_session_retirement():
+    session = _make_voice_sess()
+    session._is_gemini = True
+    session._supports_native_image = True
+    session._visual_delivery_mode = "native"
+
+    async def stream_image(image_b64, **_kwargs):
+        if image_b64 == "callback-image-2":
+            raise RuntimeError("second Gemini image failed")
+        return ImageStageResult(accepted=True, mode="native")
+
+    session.stream_image = AsyncMock(side_effect=stream_image)
+    mgr = _make_mgr(session=session)
+    cb = {
+        "_callback_delivery_id": "id-gemini-partial-retire",
+        "status": "completed",
+        "summary": "two Gemini callback images",
+        "delivery_mode": "passive",
+        "origin": "event",
+        "media_images": ["callback-image-1", "callback-image-2"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    outcome = await core_module.LLMSessionManager._stage_passive_callback_media(
+        mgr,
+        [cb],
+        session,
+    )
+
+    assert outcome["safe_to_continue"] is False
+    assert cb["_passive_media_staged_count"] == 1
+    assert core_module.LLMSessionManager.drain_agent_callbacks_for_llm(mgr) == ""
+
+
 async def test_passive_native_async_rejection_invalidates_live_stage_outcome():
     session = _make_voice_sess()
     session._is_gemini = False

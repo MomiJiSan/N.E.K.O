@@ -404,6 +404,59 @@ async def test_external_proactive_snapshot_queues_description_without_raw_event(
 
 
 @pytest.mark.asyncio
+async def test_proactive_sid_rotation_revalidates_visual_route_before_staging():
+    client = _make_qwen_client()
+    client._ai_recent_activity_time = 0
+    client._user_recent_activity_time = 0
+    client._client_vad_active = False
+    client._client_vad_last_speech_time = 0
+    client._latest_image_b64 = DUMMY_IMAGE_B64
+    client._latest_image_generation = 7
+    client._proactive_image_consumed = False
+    client._analyze_image_with_vision_model = AsyncMock()
+
+    async def rotate_to_external():
+        client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
+
+    client.on_sid_rotate = rotate_to_external
+    client.inject_text_and_request_response = AsyncMock()
+
+    delivered = await client.prompt_ephemeral("主动看看屏幕")
+
+    assert delivered is False
+    client._analyze_image_with_vision_model.assert_not_awaited()
+    client.inject_text_and_request_response.assert_not_awaited()
+    client.ws.send.assert_not_awaited()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_sid_rotation_raw_fence_rejection_keeps_snapshot():
+    client = _make_qwen_client()
+    client._ai_recent_activity_time = 0
+    client._user_recent_activity_time = 0
+    client._client_vad_active = False
+    client._client_vad_last_speech_time = 0
+    client._latest_image_b64 = DUMMY_IMAGE_B64
+    client._latest_image_generation = 8
+    client._proactive_image_consumed = False
+
+    async def rotate_into_blocked_route():
+        client.block_raw_visual_delivery()
+
+    client.on_sid_rotate = rotate_into_blocked_route
+    client.inject_text_and_request_response = AsyncMock()
+
+    delivered = await client.prompt_ephemeral("主动看看屏幕")
+
+    assert delivered is False
+    assert client._proactive_image_consumed is False
+    client.inject_text_and_request_response.assert_not_awaited()
+    client.ws.send.assert_not_awaited()
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_external_proactive_transient_analysis_error_keeps_snapshot_for_retry():
     client = _make_qwen_client()
     client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
