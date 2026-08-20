@@ -2820,6 +2820,10 @@ class _TransportMixin:
         connection would have no one left to exit it.
         """
 
+        # External visual turns belong to the connection being retired. Drop
+        # their analysis, arbiter ticket, and submit task synchronously before
+        # teardown can yield and a replacement connection can attach.
+        self._abandon_external_visual_turn()
         generation = self._connection_generation
         ws, self.ws = self.ws, None
         # The manager is the one closing, so it already knows this session is

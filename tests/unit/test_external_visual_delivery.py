@@ -759,6 +759,38 @@ async def test_cancelled_visual_join_cancels_background_analysis_task():
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_pending_external_visual_turn():
+    client = _make_qwen_client()
+    client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
+    client.handle_interruption = AsyncMock()
+    analysis_started = asyncio.Event()
+    analysis_cancelled = asyncio.Event()
+
+    async def analyze(_image_b64, *, update_turn_state=False):
+        assert update_turn_state is False
+        analysis_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            analysis_cancelled.set()
+            raise
+
+    client._analyze_image_with_vision_model = AsyncMock(side_effect=analyze)
+    await client.prepare_external_voice_turn(turn_id="turn-close")
+    await client.stream_image(
+        DUMMY_IMAGE_B64,
+        source="screen",
+        request_id="close-frame",
+    )
+    await analysis_started.wait()
+
+    await client.close()
+
+    assert analysis_cancelled.is_set()
+    assert client._external_visual_turns == {}
+
+
+@pytest.mark.asyncio
 async def test_new_external_turn_cancels_superseded_transcript_before_enqueue():
     client = _make_qwen_client()
     client.set_visual_delivery_mode(VisualDeliveryMode.EXTERNAL_DESCRIPTION)
