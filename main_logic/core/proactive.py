@@ -1012,6 +1012,9 @@ class ProactiveMixin:
                         "[%s] trigger_agent_callbacks: activity started during SID rotation; deferring callback delivery",
                         self.lanlan_name,
                     )
+                    self._schedule_proactive_retry(
+                        self.proactive_manager.min_gap_s
+                    )
                     return False
                 # Rotation awaited outside the media-commit boundary. A newer
                 # same-key callback may have retracted this snapshot while the

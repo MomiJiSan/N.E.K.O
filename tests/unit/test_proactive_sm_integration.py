@@ -395,6 +395,7 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     )
     sess.stream_image = AsyncMock()
     mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
     cb = {
         "_callback_delivery_id": "id-vad-during-rotation",
         "status": "completed",
@@ -413,6 +414,9 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     assert sess.inject_calls == 0
     assert mgr.pending_agent_callbacks == [cb]
     assert cb.get("_voice_delivery_committed") is None
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
 
 
 async def test_external_callback_rechecks_user_activity_after_visual_analysis():

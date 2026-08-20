@@ -493,6 +493,60 @@ async def test_read_image_uses_one_shot_description_without_ambient_cache(
 
 
 @pytest.mark.unit
+async def test_read_image_rejection_keeps_callback_media_for_retry(monkeypatch):
+    from app import main_server
+
+    fake_mgr = MagicMock()
+    fake_mgr.session = MagicMock()
+    fake_mgr.session.stream_image = AsyncMock(
+        return_value=SimpleNamespace(
+            accepted=False,
+            mode="native",
+            rejection_reason="raw_visual_delivery_blocked",
+        )
+    )
+    fake_mgr.enqueue_agent_callback = MagicMock()
+    fake_mgr.submit_proactive_callback = MagicMock()
+    fake_mgr.websocket = None
+    fake_mgr._pending_agent_callback_task = None
+    monkeypatch.setattr(
+        "app.main_server.character_runtime._get_session_manager",
+        lambda _name: fake_mgr,
+    )
+    monkeypatch.setattr(
+        "app.main_server.character_runtime._is_websocket_connected",
+        lambda _ws: False,
+    )
+
+    await main_server._handle_agent_event(
+        {
+            "event_type": "proactive_message",
+            "lanlan_name": "Test",
+            "text": "",
+            "channel": "plugin:camera",
+            "task_id": "passive-image-retry",
+            "delivery_mode": "passive",
+            "ai_behavior": "read",
+            "visibility": [],
+            "source_kind": "plugin",
+            "source_name": "camera",
+            "media_parts": [
+                {
+                    "type": "image",
+                    "binary_base64": "retry-image-b64",
+                    "mime": "image/png",
+                }
+            ],
+        }
+    )
+
+    fake_mgr.enqueue_agent_callback.assert_called_once()
+    callback = fake_mgr.enqueue_agent_callback.call_args.args[0]
+    assert callback["media_images"] == ["retry-image-b64"]
+    fake_mgr.submit_proactive_callback.assert_not_called()
+
+
+@pytest.mark.unit
 async def test_blind_with_proactive_delivery_mode_does_not_enqueue_callback(monkeypatch):
     """Defensive contract: ``ai_behavior="blind"`` MUST never reach the
     LLM channel, even if the upstream emitter sets ``delivery_mode`` to

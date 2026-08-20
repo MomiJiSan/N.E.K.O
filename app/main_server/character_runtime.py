@@ -575,6 +575,9 @@ async def _handle_agent_event(event: dict):
             # by the manager — the eventual proactive response would then lack
             # its matching visual context.
             deferred_proactive_images: list[str] = []
+            # Passive/read images rejected during a temporary route/session
+            # handoff stay attached to the callback for the next natural turn.
+            deferred_callback_images: list[str] = []
             direct_visual_descriptions: list[str] = []
             if media_parts and ai_behavior_v2 in ("respond", "read"):
                 sess = getattr(mgr, "session", None)
@@ -614,6 +617,8 @@ async def _handle_agent_event(event: dict):
                                 "[EventBus] image media_part dropped: session=%s has no stream_image",
                                 type(sess).__name__ if sess else "None",
                             )
+                            if ai_behavior_v2 == "read":
+                                deferred_callback_images.append(b64)
                             continue
                         # ``stream_image`` takes a base64 STRING (not bytes); pass through
                         try:
@@ -651,6 +656,8 @@ async def _handle_agent_event(event: dict):
                                     "[EventBus] callback image was not accepted (mime=%s)",
                                     mime,
                                 )
+                                if ai_behavior_v2 == "read":
+                                    deferred_callback_images.append(b64)
                                 continue
                             description = getattr(stage_result, "description", None)
                             if isinstance(description, str) and description.strip():
@@ -667,6 +674,8 @@ async def _handle_agent_event(event: dict):
                             logger.warning(
                                 "[EventBus] image media_part stream_image failed: %s", e
                             )
+                            if ai_behavior_v2 == "read":
+                                deferred_callback_images.append(b64)
                     elif isinstance(url, str) and url:
                         # TODO(v0.9): fetch URL → bytes → base64 → stream_image.
                         # Until then plugin authors should inline-encode small
@@ -678,7 +687,12 @@ async def _handle_agent_event(event: dict):
                         )
                     # else: malformed part, silently skip
 
-            if text or deferred_proactive_images or direct_visual_descriptions:
+            if (
+                text
+                or deferred_proactive_images
+                or deferred_callback_images
+                or direct_visual_descriptions
+            ):
                 if text and event.get("direct_reply"):
                     detail_text = (event.get("detail") or text).strip()
                     # Plugin-supplied direct_reply text bypasses the LLM and
@@ -816,7 +830,9 @@ async def _handle_agent_event(event: dict):
                     "coalesce_key": cb_coalesce_key,
                     # Respond images stream at manager-release time. Read images
                     # already took the explicit one-shot path above.
-                    "media_images": deferred_proactive_images,
+                    "media_images": (
+                        deferred_proactive_images + deferred_callback_images
+                    ),
                     "timestamp": event.get("timestamp") or "",
                     "metadata": event_metadata,
                     "context_type": event_metadata.get("context_type") or "",

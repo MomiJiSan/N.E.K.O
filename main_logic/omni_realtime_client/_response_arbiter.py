@@ -175,6 +175,10 @@ class _QueuedResponse:
     # finish (or cancel) the same response lifecycle rather than orphaning the
     # persisted conversation item by suppressing response.create.
     item_committed: bool = field(default=False, compare=False)
+    # Client-assigned item ids that have completed their transport write. This
+    # is narrower than ``events_before_response``: a later prefix event may
+    # still be unsent when admission is invalidated.
+    committed_item_ids: list[str] = field(default_factory=list, compare=False)
     # Evidence this request collected for itself, so both the terminal path
     # and the started-timeout path judge an adoption from the same facts.
     adoption: _AdoptionEvidence = field(
@@ -432,17 +436,20 @@ class RealtimeResponseArbiter:
 
         current.interrupted = True
         current.interrupt_event.set()
-        if not current.ticket.sent.done() and not current.item_committed:
-            self._wake_current_with_error(
-                current,
-                RuntimeError("response dispatch interrupted before response.create"),
-            )
-        elif current.item_committed:
-            if current.item_ack is not None and not current.item_ack.done():
-                # Wake the worker so it can issue the compensating item delete;
-                # setting a result keeps connection-level failures distinct
-                # from a user interruption while preserving cleanup.
-                current.item_ack.set_result(None)
+        if not current.ticket.sent.done():
+            if current.item_committed:
+                if current.item_ack is not None and not current.item_ack.done():
+                    # Wake the worker so it can issue the compensating item
+                    # delete; setting a result keeps connection-level failures
+                    # distinct from a user interruption while preserving cleanup.
+                    current.item_ack.set_result(None)
+            else:
+                self._wake_current_with_error(
+                    current,
+                    RuntimeError(
+                        "response dispatch interrupted before response.create"
+                    ),
+                )
         else:
             await self._send_event({"type": "response.cancel"})
         assert current.completed is not None
@@ -1930,17 +1937,25 @@ class RealtimeResponseArbiter:
             await asyncio.gather(*waiters, return_exceptions=True)
 
     async def _delete_committed_item(self, queued: _QueuedResponse) -> None:
-        """Remove a pre-response item invalidated after its transport commit."""
+        """Remove every pre-response item invalidated after transport commit."""
 
-        item_id = queued.expected_item_id
-        if not item_id or not self._connection_available:
+        if not self._connection_available:
             return
-        await self._worker_send(
-            {
-                "type": "conversation.item.delete",
-                "item_id": item_id,
-            }
-        )
+        item_ids = list(queued.committed_item_ids)
+        if (
+            queued.expected_item_id
+            and queued.expected_item_id not in item_ids
+            and queued.item_committed
+            and not item_ids
+        ):
+            item_ids.append(queued.expected_item_id)
+        for item_id in item_ids:
+            await self._worker_send(
+                {
+                    "type": "conversation.item.delete",
+                    "item_id": item_id,
+                }
+            )
 
     async def _process(self, queued: _QueuedResponse) -> None:
         self._current = queued
@@ -1986,17 +2001,23 @@ class RealtimeResponseArbiter:
                 self._adoptable_serial, self._item_created_serial
             )
             for event in queued.events_before_response:
-                if not queued.item_committed and (
-                    queued.interrupted
-                    or (
-                        queued.admission_check is not None
-                        and not queued.admission_check()
-                    )
+                if queued.interrupted or (
+                    queued.admission_check is not None
+                    and not queued.admission_check()
                 ):
+                    if queued.item_committed:
+                        await self._delete_committed_item(queued)
                     raise RuntimeError("response dispatch interrupted")
-                if not queued.item_committed:
-                    queued.item_committed = True
+                queued.item_committed = True
                 await self._worker_send(event)
+                item = event.get("item")
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if (
+                    isinstance(item_id, str)
+                    and item_id
+                    and item_id not in queued.committed_item_ids
+                ):
+                    queued.committed_item_ids.append(item_id)
 
             admission_rejected = bool(
                 queued.admission_check is not None

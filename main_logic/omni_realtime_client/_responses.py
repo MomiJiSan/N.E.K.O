@@ -1364,6 +1364,7 @@ class _ResponseMixin:
                 visual_event = {
                     "type": "conversation.item.create",
                     "item": {
+                        "id": f"item_neko_visual_{uuid.uuid4().hex}",
                         "type": "message",
                         "role": "user",
                         "content": [{
@@ -1398,6 +1399,7 @@ class _ResponseMixin:
                 "type": "conversation.item.create",
                 "event_id": visual_event_id,
                 "item": {
+                    "id": f"item_neko_visual_{uuid.uuid4().hex}",
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": self._image_description}],
