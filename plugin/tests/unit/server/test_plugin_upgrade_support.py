@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from plugin.core.plugin_layout import resolve_plugin_layout
+from plugin.server.application.plugins import upgrade_support as upgrade_module
 from plugin.server.application.plugins.upgrade_support import (
     ReplacePluginError,
     plugin_is_running,
@@ -235,6 +236,39 @@ async def test_replace_plugin_rejects_invalid_preserve_target_before_side_effect
 
     assert events == []
     assert not storage_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_replace_plugin_rejects_persistent_state_target_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "plugins"
+    target = state_root / "demo"
+    target.mkdir(parents=True)
+    state_db = target / "data" / "study.db"
+    state_db.parent.mkdir()
+    state_db.write_bytes(b"state")
+    events: list[str] = []
+    monkeypatch.setattr(upgrade_module, "get_plugin_state_root", lambda: state_root)
+
+    async def is_running(plugin_id: str) -> bool:
+        events.append(f"running:{plugin_id}")
+        return False
+
+    with pytest.raises(ValueError, match="persistent state paths"):
+        await replace_plugin(
+            layout=resolve_plugin_layout("demo", target, storage_root=tmp_path),
+            install_new=lambda: _async_none(),  # type: ignore[arg-type]
+            validate_new=_async_none,
+            is_running=is_running,
+            stop=lambda _plugin_id: _async_none(),
+            start=lambda _plugin_id: _async_none(),
+            cleanup_backup=remove_directory,
+        )
+
+    assert events == []
+    assert state_db.read_bytes() == b"state"
 
 
 @pytest.mark.asyncio

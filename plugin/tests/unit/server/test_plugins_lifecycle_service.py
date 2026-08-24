@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -459,6 +460,120 @@ async def test_start_plugin_refreshes_registry_before_loading(
             module.state.event_handlers.update(handlers_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_user_override_restores_running_builtin_and_preserves_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    exec_root = tmp_path / "exec" / "plugins"
+    user_dir = exec_root / "study_companion"
+    user_config = user_dir / "plugin.toml"
+    user_dir.mkdir(parents=True)
+    user_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    builtin_config = tmp_path / "builtin" / "study_companion" / "plugin.toml"
+    builtin_config.parent.mkdir(parents=True)
+    builtin_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    state_dir = tmp_path / "state" / "plugins" / "study_companion" / "data"
+    state_files = {
+        state_dir / "study.db": b"persistent-db",
+        state_dir / "study.db-wal": b"persistent-wal",
+        state_dir / "study.db-shm": b"persistent-shm",
+    }
+    for path, content in state_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    hashes_before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in state_files
+    }
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    start_calls: list[str] = []
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["study_companion"] = {
+                "id": "study_companion",
+                "config_path": str(user_config),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["study_companion"] = object()
+
+        async def stop_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            with module.state.acquire_plugin_hosts_write_lock():
+                module.state.plugin_hosts.pop(plugin_id, None)
+            return {"success": True}
+
+        async def start_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            start_calls.append(plugin_id)
+            return {"success": True}
+
+        async def refresh_registry() -> dict[str, object]:
+            with module.state.acquire_plugins_write_lock():
+                module.state.plugins["study_companion"] = {
+                    "id": "study_companion",
+                    "config_path": str(builtin_config),
+                    "effective_source": "builtin",
+                }
+            return {"success": True}
+
+        monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: exec_root)
+        monkeypatch.setattr(module, "get_plugin_state_root", lambda: tmp_path / "state" / "plugins")
+        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (exec_root, builtin_config.parent.parent))
+        monkeypatch.setattr(module.PluginLifecycleService, "stop_plugin", stop_plugin)
+        monkeypatch.setattr(module.PluginLifecycleService, "start_plugin", start_plugin)
+        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", refresh_registry)
+        monkeypatch.setattr(module, "_stage_orphaned_package_profile_sync", lambda _path: None)
+        monkeypatch.setattr(module, "_mark_install_source_removed_sync", lambda _path: None)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("study_companion")
+
+        assert response["restored_builtin"] is True
+        assert start_calls == ["study_companion"]
+        assert user_dir.exists() is False
+        assert builtin_config.is_file()
+        assert {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in state_files
+        } == hashes_before
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+def test_delete_path_guard_rejects_builtin_and_state_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    exec_root = tmp_path / "exec"
+    builtin_root = tmp_path / "builtin"
+    state_root = tmp_path / "plugins"
+    monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: exec_root)
+    monkeypatch.setattr(module, "get_plugin_state_root", lambda: state_root)
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (exec_root, builtin_root))
+
+    assert module._path_within_plugin_roots_sync(exec_root / "demo") is True
+    assert module._path_within_plugin_roots_sync(builtin_root / "demo") is False
+    assert module._path_within_plugin_roots_sync(state_root / "demo") is False
+
+    monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: state_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (state_root, builtin_root))
+    assert module._path_within_plugin_roots_sync(state_root / "demo") is False
 
 
 @pytest.mark.plugin_unit

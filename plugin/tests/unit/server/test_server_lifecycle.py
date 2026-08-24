@@ -100,6 +100,16 @@ async def test_startup_uses_registry_refresh_then_autostart(monkeypatch: pytest.
         monkeypatch.setattr(module, "start_bridge", lambda: None)
         monkeypatch.setattr(module, "start_proactive_bridge", lambda: None)
 
+        async def _migrate_layout():
+            calls.append(("layout", "migrate"))
+            return type(
+                "MigrationResult",
+                (),
+                {"migrated": (), "blocked": ()},
+            )()
+
+        monkeypatch.setattr(module, "migrate_legacy_plugin_layout", _migrate_layout)
+
         async def _retry_deferred_profile_cleanup() -> int:
             calls.append(("profile_cleanup", "retry"))
             return 0
@@ -150,6 +160,7 @@ async def test_startup_uses_registry_refresh_then_autostart(monkeypatch: pytest.
         await service.startup()
 
         assert calls == [
+            ("layout", "migrate"),
             ("profile_cleanup", "retry"),
             ("registry", "refresh"),
             ("start", "auto_plugin:False"),

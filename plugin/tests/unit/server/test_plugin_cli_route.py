@@ -437,7 +437,7 @@ async def test_plugin_cli_route_workflow_pack_analyze_inspect_verify_and_unpack(
     profiles_root = tmp_path / "runtime_profiles"
     _patch_plugin_cli_settings(
         monkeypatch,
-        builtin_root=tmp_path,
+        builtin_root=tmp_path / "builtin_plugins",
         user_root=tmp_path,
         packages_root=tmp_path,
         profiles_root=profiles_root,
@@ -532,7 +532,7 @@ async def test_plugin_cli_unpack_route_uses_default_roots_when_fields_omitted(
     default_profiles_root = tmp_path / "default_user_profiles"
     _patch_plugin_cli_settings(
         monkeypatch,
-        builtin_root=tmp_path,
+        builtin_root=tmp_path / "builtin",
         user_root=default_plugins_root,
         packages_root=tmp_path,
         profiles_root=default_profiles_root,

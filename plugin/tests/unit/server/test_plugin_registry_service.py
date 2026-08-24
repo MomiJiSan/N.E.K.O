@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -723,6 +724,90 @@ async def test_refresh_registry_registers_duplicate_declared_plugin_ids_with_run
         assert Path(second_meta["config_path"]).parent.name == "demo_1"
         assert first_meta["id"] == "demo"
         assert second_meta["id"] == "demo_1"
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.asyncio
+async def test_user_source_shadows_builtin_without_suffix_and_builtin_recovers_after_uninstall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin" / "plugins"
+    user_root = tmp_path / "user" / "plugins"
+    (tmp_path / "shadow_entry.py").write_text(
+        "class Plugin:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    def write_source(root: Path, version: str) -> Path:
+        plugin_dir = root / "study_companion"
+        plugin_dir.mkdir(parents=True)
+        config = plugin_dir / "plugin.toml"
+        config.write_text(
+            "\n".join(
+                [
+                    "[plugin]",
+                    "id = 'study_companion'",
+                    "name = 'Study Companion'",
+                    "type = 'plugin'",
+                    "entry = 'shadow_entry:Plugin'",
+                    f"version = '{version}'",
+                    "",
+                    "[plugin_runtime]",
+                    "enabled = true",
+                    "auto_start = false",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return config
+
+    builtin_config = write_source(builtin_root, "0.1.5")
+    user_config = write_source(user_root, "0.1.6")
+    hidden_staging = user_root / ".neko_override_staging_test"
+    shutil.copytree(user_config.parent, hidden_staging)
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (user_root, builtin_root))
+
+        service = module.PluginRegistryService()
+        installed = await service.refresh_registry()
+
+        assert installed["success"] is True
+        assert installed["shadowed"] == [
+            {
+                "plugin_id": "study_companion",
+                "config_path": str(builtin_config),
+                "source": "builtin",
+            }
+        ]
+        with module.state.acquire_plugins_read_lock():
+            market_meta = dict(module.state.plugins["study_companion"])
+            assert "study_companion_1" not in module.state.plugins
+        assert market_meta["version"] == "0.1.6"
+        assert market_meta["effective_source"] == "user"
+        assert market_meta["builtin_version"] == "0.1.5"
+        assert Path(market_meta["config_path"]) == user_config
+
+        shutil.rmtree(user_config.parent)
+        restored = await service.refresh_registry()
+
+        assert restored["success"] is True
+        with module.state.acquire_plugins_read_lock():
+            builtin_meta = dict(module.state.plugins["study_companion"])
+            assert "study_companion_1" not in module.state.plugins
+        assert builtin_meta["version"] == "0.1.5"
+        assert builtin_meta["effective_source"] == "builtin"
+        assert Path(builtin_meta["config_path"]) == builtin_config
     finally:
         with module.state.acquire_plugins_write_lock():
             module.state.plugins.clear()
