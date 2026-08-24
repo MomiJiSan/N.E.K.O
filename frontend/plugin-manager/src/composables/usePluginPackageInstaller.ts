@@ -9,7 +9,7 @@ import {
   type PluginCliInstallPlanResponse,
   type PluginCliInstallResponse,
 } from '@/api/pluginCli'
-import { formatHttpError } from '@/utils/request'
+import { resolvePluginInstallErrorKey } from '@/utils/pluginInstallError'
 
 export type InstallPackagePathOptions = {
   pluginsRoot?: string
@@ -59,6 +59,12 @@ export function usePluginPackageInstaller() {
         )
         return null
       }
+      if (plan.action === 'override_builtin') {
+        // Builtin source switching is intentionally Market-only because the
+        // backend must bind the transaction to a Market-verified SHA256.
+        ElMessage.error(t('market.autoUpgradeBlocked'))
+        return null
+      }
 
       const request: PluginCliInstallRequest = {
         package: packagePath,
@@ -104,8 +110,10 @@ export function usePluginPackageInstaller() {
         ))
       } else if (!installPlan.value) {
         ElMessage.error(t('package.install.planFailed'))
+      } else if (errorCode) {
+        ElMessage.error(t(resolvePluginInstallErrorKey(errorCode)))
       } else {
-        ElMessage.error(t('package.install.installFailed', { error: formatHttpError(error) }))
+        ElMessage.error(t('market.installFailed'))
       }
       return null
     } finally {

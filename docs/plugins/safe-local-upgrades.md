@@ -6,15 +6,24 @@ This page is the canonical maintainer reference for local package replacement. P
 
 ## User flow
 
-The Plugin Manager always requests an install plan before changing files. The plan has one of three actions:
+The Plugin Manager always requests an install plan before changing files. The plan has one of four actions:
 
 | Action | Meaning | User-visible result |
 | --- | --- | --- |
 | `install` | No installed plugin occupies the target identity or directory. | Install immediately. |
 | `upgrade` | Exactly one installed plugin matches the packaged identity and target directory. | Show the current and target versions and require explicit confirmation. |
+| `override_builtin` | A single-plugin Market package safely replaces the effective built-in source with the same identity. | Show the built-in and Market versions and require explicit confirmation. |
 | `blocked` | The package cannot be installed without an ambiguous or unsafe replacement. | Stop before modifying the installation. |
 
 An upgrade confirmation includes a token derived from the package bytes, destination path, and installed `plugin.toml`. The server rebuilds the plan before installation. If the package or installed target changed after confirmation, the token no longer matches and the upgrade is rejected.
+
+## Code, state, and effective source
+
+User plugin code is installed under `.neko-plugin-installations/plugins`; runtime state remains under `plugins/<plugin_id>/{config,data,cache}`. Installation, upgrade, rollback, and ordinary uninstall never move, copy, replace, or delete that state directory. A configured executable root that resolves to the state root fails closed with `PLUGIN_EXEC_STATE_ROOT_COLLISION`.
+
+The registry selects exactly one effective source for each declared plugin ID: user installation first, then built-in. A Market override shadows the built-in plugin without renaming either source. Uninstalling the Market copy removes only user code and its package profile, then refreshes the registry so the built-in copy becomes effective again.
+
+Legacy user code found in the former state-root layout is copied through validated staging into the new executable root before registration. The source is retained, and an atomic layout ledger prevents an uninstalled migrated plugin from being resurrected on a later startup.
 
 ## Upgrade transaction
 
@@ -34,6 +43,8 @@ Backup cleanup failures are warnings after a successful upgrade; they do not rol
 ## Failure and rollback
 
 Failures during backup, installation, validation, profile preservation, or restart trigger reverse-order restoration of every transaction target. A plugin that was running before the upgrade is restarted from the restored installation when possible.
+
+Built-in source switching has its own transaction. It promotes user code and the package profile, records the Market source, refreshes the registry, and starts the Market version only after validating the plan again. Failure removes only artifacts created by that transaction, restores the lock snapshot and effective built-in source, and restores the previous running state. Runtime state is never a rollback target.
 
 The API reports rollback state separately from the upgrade failure:
 
@@ -91,6 +102,8 @@ Both endpoints require administrator authorization. User-facing errors must not 
 | Install orchestration and path policy | `plugin/server/application/plugin_cli/service.py` |
 | HTTP request/response models | `plugin/server/routes/plugin_cli.py` |
 | Plugin Manager confirmation and result messages | `frontend/plugin-manager/src/composables/usePackageManager.ts` |
+| Legacy layout migration | `plugin/server/application/plugins/layout_migration.py` |
+| Built-in source switching and rollback | `plugin/server/application/plugins/source_switch.py` |
 
 ## Validation
 

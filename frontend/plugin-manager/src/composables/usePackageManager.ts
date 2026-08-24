@@ -756,7 +756,7 @@ export function usePackageManager(options: UsePackageManagerOptions = {}) {
       return
     }
     setResult('install', response)
-    if (response.operation === 'upgrade') {
+    if (response.operation === 'upgrade' || response.operation === 'override_builtin') {
       const plan = installPlan.value
       ElMessage.success(t('package.install.upgradeSucceeded', {
         plugin: plan?.plugin_id || plan?.directory_name || '',

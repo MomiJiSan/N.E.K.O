@@ -7,7 +7,7 @@ import { API_BASE_URL } from '@/utils/constants'
 
 export type PluginCliConflictStrategy = 'fail'
 export type PluginCliBuildMode = 'selected' | 'single' | 'bundle' | 'all'
-export type PluginCliInstallAction = 'install' | 'upgrade' | 'blocked'
+export type PluginCliInstallAction = 'install' | 'upgrade' | 'override_builtin' | 'blocked'
 
 export interface PluginCliPluginRef {
   root_id: 'builtin' | 'user'
@@ -117,6 +117,8 @@ export interface PluginCliInstallPlanResponse {
   confirmation_token: string
   reason: string
   legacy_plugin_ids: string[]
+  current_source?: string
+  target_source?: string
 }
 
 export interface PluginCliInstalledPlugin {
@@ -139,7 +141,7 @@ export interface PluginCliInstallResponse {
   payload_hash_verified: boolean | null
   conflict_strategy: PluginCliConflictStrategy
   installed_plugin_count: number
-  operation: 'install' | 'upgrade'
+  operation: 'install' | 'upgrade' | 'override_builtin'
   restarted: boolean
   rollback_status: 'not_needed' | 'completed' | 'incomplete'
   install_source_warning?: string | null
