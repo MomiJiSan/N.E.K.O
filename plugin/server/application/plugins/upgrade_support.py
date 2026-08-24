@@ -11,6 +11,7 @@ from plugin.core.plugin_layout import PluginLayout
 from plugin.logging_config import get_logger
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure.config_paths import ensure_plugin_layout_runtime_config
+from plugin.settings import get_plugin_state_root
 
 logger = get_logger("server.application.plugins.upgrade_support")
 
@@ -210,6 +211,22 @@ def _notify_rollback_start(callback: Callable[[], None] | None) -> None:
         )
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    resolved_path = path.resolve(strict=False)
+    resolved_root = root.resolve(strict=False)
+    return resolved_path == resolved_root or resolved_root in resolved_path.parents
+
+
+def _validate_replacement_targets(targets: tuple[Path, ...]) -> None:
+    state_root = get_plugin_state_root()
+    forbidden = [target for target in targets if _path_is_within(target, state_root)]
+    if forbidden:
+        raise ValueError(
+            "plugin persistent state paths cannot be replacement targets: "
+            + ", ".join(str(path) for path in forbidden)
+        )
+
+
 async def replace_plugin(
     *,
     layout: PluginLayout,
@@ -232,6 +249,7 @@ async def replace_plugin(
     targets = (target_dir, *additional_targets)
     if any(target not in targets for target in preserve_targets):
         raise ValueError("preserve targets must also be replacement targets")
+    _validate_replacement_targets(targets)
 
     await asyncio.to_thread(
         ensure_plugin_layout_runtime_config,

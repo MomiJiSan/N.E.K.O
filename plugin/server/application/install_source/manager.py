@@ -17,10 +17,9 @@ the module-level helpers described in design §4.1 / §5.1 / §5.2 / §5.3:
 * :func:`_serialize_lock` — deterministic ``LockFile → bytes`` serializer
   following the field-order rules of design §5.2.
 
-Do NOT import :mod:`plugin.settings` at module top: reading the user plugin
-config root eagerly here would fight the test harness, which overrides the
-``PLUGIN_CONFIG_ROOT`` environment variable to point into ``tmp_path``.
-:func:`resolve_lock_path` performs the settings lookup lazily on each call.
+Do NOT import :mod:`plugin.settings` at module top: the application user/state
+root is runtime configuration and tests replace it with ``tmp_path``.
+:func:`resolve_lock_path` therefore performs the settings lookup lazily.
 """
 
 from __future__ import annotations
@@ -105,11 +104,11 @@ def resolve_lock_path() -> Path:
 
     1. If the environment variable ``NEKO_PLUGIN_INSTALL_LOCK_PATH`` is set to
        a non-empty value, expand ``~`` and return its resolved absolute path.
-    2. Otherwise return ``<USER_PLUGIN_CONFIG_ROOT parent>/plugins.lock.json``.
+    2. Otherwise return ``<N.E.K.O user root>/plugins.lock.json``.
 
-    The user-plugin-config-root lookup is performed lazily (see module
-    docstring) so that tests overriding ``PLUGIN_CONFIG_ROOT`` at runtime
-    take effect without needing to re-import this module.
+    The state-root lookup is performed lazily (see module docstring) so runtime
+    configuration and test overrides take effect without re-importing this
+    module. An execution-root override never moves the lock file.
     """
 
     env_val = os.environ.get("NEKO_PLUGIN_INSTALL_LOCK_PATH", "").strip()
@@ -117,9 +116,9 @@ def resolve_lock_path() -> Path:
         return Path(env_val).expanduser().resolve()
 
     # Imported lazily to avoid touching plugin.settings at module import time.
-    from plugin.settings import get_user_plugin_config_root
+    from plugin.settings import get_plugin_state_root
 
-    return (get_user_plugin_config_root().parent / "plugins.lock.json").resolve()
+    return (get_plugin_state_root().parent / "plugins.lock.json").resolve()
 
 
 # ---------------------------------------------------------------------------
