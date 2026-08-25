@@ -4,6 +4,7 @@
     :class="{
       'plugin-workbench--market-open': marketPanelVisible,
       'plugin-workbench--package-open': packagePanelVisible,
+      'plugin-workbench--mirror-open': mirrorPanelVisible,
     }"
     data-yui-guide-id="plugin-list-workbench"
   >
@@ -159,6 +160,15 @@
               </button>
               <button
                 class="header-btn"
+                :class="{ 'header-btn--active': mirrorPanelVisible }"
+                data-yui-guide-id="plugin-list-mirror-source-toggle"
+                @click="toggleMirrorPanel"
+              >
+                <el-icon><Connection /></el-icon>
+                <span>{{ mirrorPanelVisible ? $t('plugins.closeMirrorSource') : $t('plugins.openMirrorSource') }}</span>
+              </button>
+              <button
+                class="header-btn"
                 :class="{ 'header-btn--active header-btn--success': showMetrics }"
                 data-yui-guide-id="plugin-list-metrics-toggle"
                 @click="toggleMetrics"
@@ -251,6 +261,7 @@
               :selected-plugin-ids="selectedPluginIds"
               :show-metrics="showMetrics"
               :show-source-detail="showSourceDetail"
+              :identity-plugin-ids="duplicateDisplayNamePluginIds"
               :variant="section.variant"
               @item-click="handlePluginPrimaryAction"
               @item-open-ui="handlePluginUiAction"
@@ -274,6 +285,20 @@
           embedded
           :external-selected-plugin-ids="selectedPluginIds"
           @close="closePackagePanel"
+        />
+      </div>
+    </aside>
+
+    <aside
+      class="plugin-workbench__rail plugin-workbench__rail--mirror"
+      :aria-hidden="!mirrorPanelVisible"
+      :inert="!mirrorPanelVisible"
+    >
+      <div class="plugin-workbench__rail-inner">
+        <GithubMirrorSourcePanel
+          v-if="mirrorPanelEverOpened"
+          v-show="mirrorPanelVisible"
+          @close="closeMirrorPanel"
         />
       </div>
     </aside>
@@ -458,6 +483,7 @@ import PluginGridSection from '@/components/plugin/PluginGridSection.vue'
 import PluginContextMenu from '@/components/plugin/PluginContextMenu.vue'
 import PluginDangerConfirmDialog from '@/components/plugin/PluginDangerConfirmDialog.vue'
 import PackageManagerPanel from '@/components/plugin/PackageManagerPanel.vue'
+import GithubMirrorSourcePanel from '@/components/plugin/GithubMirrorSourcePanel.vue'
 import MarketPanel from '@/components/plugin/MarketPanel.vue'
 import LoadingSpinner from '@/components/common/LoadingSpinner.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
@@ -479,7 +505,9 @@ import { usePluginWorkbench } from '@/composables/usePluginWorkbench'
 import { useMarketAuth } from '@/composables/useMarketAuth'
 import { METRICS_REFRESH_INTERVAL } from '@/utils/constants'
 import { formatHttpError } from '@/utils/request'
+import { resolvePluginPackageErrorMessage } from '@/utils/pluginPackageError'
 import { resolveLocalizedText } from '@/utils/i18nLabel'
+import { findDuplicatePluginDisplayNameIds } from '@/utils/pluginDisplay'
 import { openExternalUrl } from '@/utils/openExternal'
 import { isOpenUiNavigationAction } from '@/utils/pluginListActions'
 import { useI18n } from 'vue-i18n'
@@ -503,6 +531,8 @@ const selectedImportFile = ref<File | null>(null)
 const importDropActive = ref(false)
 const packagePanelVisible = ref(false)
 const packagePanelEverOpened = ref(false)
+const mirrorPanelVisible = ref(false)
+const mirrorPanelEverOpened = ref(false)
 const marketPanelVisible = ref(false)
 const marketPanelEverOpened = ref(false)
 const contextMenuVisible = ref(false)
@@ -568,6 +598,9 @@ const dangerDialogMessage = computed(() => {
 
 const rawPlugins = computed(() => pluginStore.pluginsWithStatus)
 const rawNormalPlugins = computed(() => pluginStore.normalPlugins)
+const duplicateDisplayNamePluginIds = computed(() => [
+  ...findDuplicatePluginDisplayNameIds(rawPlugins.value, locale.value),
+])
 const {
   filterText,
   useRegex,
@@ -824,6 +857,7 @@ function togglePackagePanel() {
   if (next) {
     packagePanelEverOpened.value = true
     marketPanelVisible.value = false
+    mirrorPanelVisible.value = false
   }
 }
 
@@ -831,10 +865,25 @@ function openPackagePanel() {
   packagePanelVisible.value = true
   packagePanelEverOpened.value = true
   marketPanelVisible.value = false
+  mirrorPanelVisible.value = false
 }
 
 function closePackagePanel() {
   packagePanelVisible.value = false
+}
+
+function toggleMirrorPanel() {
+  const next = !mirrorPanelVisible.value
+  mirrorPanelVisible.value = next
+  if (next) {
+    mirrorPanelEverOpened.value = true
+    packagePanelVisible.value = false
+    marketPanelVisible.value = false
+  }
+}
+
+function closeMirrorPanel() {
+  mirrorPanelVisible.value = false
 }
 
 function toggleMarketPanel() {
@@ -843,6 +892,7 @@ function toggleMarketPanel() {
   if (next) {
     marketPanelEverOpened.value = true
     packagePanelVisible.value = false
+    mirrorPanelVisible.value = false
   }
 }
 
@@ -1066,7 +1116,10 @@ async function importSelectedPluginPackage() {
   importing.value = true
   try {
     const upload = await uploadPluginPackage(file)
-    const result = await installImportedPackage(upload.path, { installSource: 'imported' })
+    const result = await installImportedPackage(upload.path, {
+      installSource: 'imported',
+      discardOnFailure: true,
+    })
     if (!result) return
     const count = result.installed_plugin_count ?? 0
     ElMessage.success(t('plugins.importSuccess', { name: file.name, count }))
@@ -1074,8 +1127,7 @@ async function importSelectedPluginPackage() {
     await refreshAfterPluginChange()
   } catch (error: any) {
     console.error('Failed to import plugin package:', error)
-    const detail = formatHttpError(error)
-    ElMessage.error(detail ? t('plugins.importFailed') + ': ' + detail : t('plugins.importFailed'))
+    ElMessage.error(resolvePluginPackageErrorMessage(error, t, 'upload'))
   } finally {
     importing.value = false
   }
@@ -1293,6 +1345,7 @@ watch(
       if (shouldOpen) {
         packagePanelEverOpened.value = true
         marketPanelVisible.value = false
+        mirrorPanelVisible.value = false
       }
     }
   },
@@ -1369,9 +1422,11 @@ onUnmounted(() => {
 /* 收起时取消它那一侧的 gap，避免主列表多出一条空白 */
 .plugin-workbench__rail--market { margin-right: -20px; }
 .plugin-workbench__rail--package { margin-left: -20px; }
+.plugin-workbench__rail--mirror { margin-left: -20px; }
 
 .plugin-workbench--market-open .plugin-workbench__rail--market,
-.plugin-workbench--package-open .plugin-workbench__rail--package {
+.plugin-workbench--package-open .plugin-workbench__rail--package,
+.plugin-workbench--mirror-open .plugin-workbench__rail--mirror {
   flex-basis: var(--drawer-width);
   width: var(--drawer-width);
   margin: 0;
@@ -1398,8 +1453,14 @@ onUnmounted(() => {
   transform: translate3d(100%, 0, 0);
 }
 
+.plugin-workbench__rail--mirror .plugin-workbench__rail-inner {
+  right: 0;
+  transform: translate3d(100%, 0, 0);
+}
+
 .plugin-workbench--market-open .plugin-workbench__rail--market .plugin-workbench__rail-inner,
-.plugin-workbench--package-open .plugin-workbench__rail--package .plugin-workbench__rail-inner {
+.plugin-workbench--package-open .plugin-workbench__rail--package .plugin-workbench__rail-inner,
+.plugin-workbench--mirror-open .plugin-workbench__rail--mirror .plugin-workbench__rail-inner {
   transform: translate3d(0, 0, 0);
 }
 
