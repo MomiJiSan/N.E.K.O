@@ -678,6 +678,18 @@ class IndependentAsrRuntime:
                     metric_name=gate_metric_name,
                 )
 
+    def _reap_rejection_watchdog_task(self, task: asyncio.Task[None]) -> None:
+        """Consume watchdog completion without treating normal ``None`` as failure."""
+
+        self._asr_rejection_tasks.discard(task)
+        if task.cancelled():
+            self._speaker_rejection_metrics["rejection_task_cancelled_count"] += 1
+            return
+        try:
+            task.result()
+        except Exception:
+            self._speaker_rejection_metrics["rejection_task_failure_count"] += 1
+
     def _begin_asr_start_operation(self) -> int:
         self._asr_start_generation += 1
         return self._asr_start_generation
@@ -2854,7 +2866,7 @@ class IndependentAsrRuntime:
         )
         self._asr_rejection_watchdog_task = task
         self._asr_rejection_tasks.add(task)
-        task.add_done_callback(self._reap_rejection_task)
+        task.add_done_callback(self._reap_rejection_watchdog_task)
 
     async def _complete_candidate_rejection(
         self,

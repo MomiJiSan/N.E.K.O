@@ -59,6 +59,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import APIRouter
+from main_logic.voice_identity_service.diagnostics import (
+    VOICE_IDENTITY_DIAGNOSTIC_COUNTERS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +382,9 @@ def _safe_voice_identity_diagnostics() -> dict[str, int]:
     return {
         name: value
         for name, value in raw.items()
-        if type(name) is str and type(value) is int and value >= 0
+        if name in VOICE_IDENTITY_DIAGNOSTIC_COUNTERS
+        and type(value) is int
+        and value >= 0
     }
 
 

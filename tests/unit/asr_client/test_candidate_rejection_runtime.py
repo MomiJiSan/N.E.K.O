@@ -977,6 +977,7 @@ async def test_cleanup_failure_keeps_drop_and_watchdog_releases_suppression(
             await asyncio.sleep(0)
 
     await asyncio.wait_for(wait_until_released(), 1.0)
+    await asyncio.sleep(0)
 
     assert outcome is CandidateRejectionOutcome.APPLIED_CLEANUP_DEGRADED
     assert detector.lease is not None and detector.lease.commit_calls == 1
@@ -987,6 +988,7 @@ async def test_cleanup_failure_keeps_drop_and_watchdog_releases_suppression(
     ]
     assert detector.reset.await_count == 2
     assert runtime._asr_candidate_rejection is None
+    assert runtime._speaker_verifier_diagnostics()["rejection_task_failure_count"] == 0
     runtime._ensure_transport_restart_task.assert_called_once_with()
     await _close_dispatchers(runtime)
 

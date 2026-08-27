@@ -14,6 +14,7 @@ def test_debug_health_voice_identity_diagnostics_keep_only_safe_counters(
             "rejection_task_applied_count": 1,
             "similarity": 0.12,
             "embedding": [1.0, 0.0],
+            "unexpected": 99,
             "negative": -1,
             "boolean": True,
         },
