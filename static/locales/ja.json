@@ -2936,7 +2936,7 @@
         "profileSavedDisabled": "Owner 声紋は保存されています。フィルターはオフです",
         "profileMissing": "Owner 声紋はまだ登録されていません",
         "reasonDisabled": "Owner 声紋は保存されています。フィルターはオフです",
-        "reasonModelUnavailable": "声紋モデルを利用できないため、独立 ASR は通常どおり通過します",
+        "reasonModelUnavailable": "声紋モデル資産を利用できません。ソース実行では uv run python scripts/prepare_speaker_model.py を実行し、インストール版では修復または再インストールしてください。独立 ASR には影響しません。",
         "reasonProfileIncompatible": "現在のモデルと声紋に互換性がありません。再登録してください",
         "reasonSecureStorageUnavailable": "安全な保存領域を利用できないため、声紋フィルターは無効です",
         "reasonEnrollmentActive": "新しい声紋を登録中です。独立 ASR は一時的に通過します",
@@ -2946,6 +2946,7 @@
         "enrollmentComplete": "Owner 声紋を保存して有効化しました。",
         "microphoneDenied": "マイクを使用できません。権限とデバイスを確認してください。",
         "requestFailed": "操作に失敗しました。もう一度お試しください。",
+        "errorModelUnavailable": "声紋モデル資産を利用できないため、登録を開始できません。ソース実行では uv run python scripts/prepare_speaker_model.py を実行し、インストール版では修復または再インストールしてから、もう一度お試しください。",
         "errorInvalidPcm": "録音形式が無効です。もう一度登録してください。",
         "errorAudioTooLong": "録音が長すぎます。もう一度登録してください。",
         "deleteConfirm": "削除すると、声紋フィルターを使う前に再登録が必要です。"

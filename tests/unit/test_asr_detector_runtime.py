@@ -356,10 +356,13 @@ async def _prepare_candidate_rejection_fixture() -> tuple[
         rnnoise_available=True,
     )
     assert result.throttle_available is True
-    candidate = DetectorCandidateKey(
+    assert result.identity == DetectorIngressIdentity(
+        ingress_token=ingress,
         detector_epoch=detector.detector_epoch,
-        candidate_generation=detector._candidate_generation,
+        sequence_no=1,
     )
+    candidate = result.candidate
+    assert candidate is not None
     turn_token = VoiceTurnToken(ingress, turn_id=1)
     assert await detector.bind_candidate(candidate, turn_token) is not None
     detector.observe_provider_audio(b"\x02\x00" * 160, sample_rate_hz=16_000)
@@ -656,6 +659,9 @@ async def test_prepare_candidate_rejection_maps_only_authoritative_shadow_key() 
     )
 
     assert await detector.prepare_candidate_rejection(private_mismatch) is None
+    assert detector.speaker_rejection_diagnostics_snapshot()[
+        "rejection_prepare_shadow_mismatch_count"
+    ] == 1
     lease = await detector.prepare_candidate_rejection(shadow_candidate)
 
     assert isinstance(lease, DetectorCandidateRejectionLease)
@@ -666,23 +672,142 @@ async def test_prepare_candidate_rejection_maps_only_authoritative_shadow_key() 
     await detector.close()
 
 
-@pytest.mark.parametrize("advance", ["candidate_boundary", "detector_epoch"])
-async def test_candidate_rejection_lease_is_stale_after_authority_advances(
+async def test_sealed_provider_rejection_consumes_only_exact_speaker_authority() -> (
+    None
+):
+    detector, _shadow, candidate, shadow_candidate, turn_token = (
+        await _prepare_candidate_rejection_fixture()
+    )
+    open_lease = await detector.prepare_candidate_rejection(shadow_candidate)
+    assert open_lease is not None
+    assert open_lease.provider_fence is None
+
+    fence = await detector.seal_provider_candidate()
+    assert fence is not None
+    sealed_lease = await detector.prepare_candidate_rejection(shadow_candidate)
+
+    assert sealed_lease is not None
+    assert sealed_lease.provider_fence == fence
+    assert sealed_lease.candidate == candidate
+    assert sealed_lease.turn_token == turn_token
+    assert open_lease.commit() is False
+
+    successor = await detector.feed(
+        b"\x03\x00" * 160,
+        ingress_token=_ingress_token(),
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert successor.candidate == DetectorCandidateKey(0, 1)
+    generation_before = detector._candidate_generation
+    candidate_open_before = detector.candidate_open
+
+    assert sealed_lease.commit() is True
+    assert sealed_lease.commit() is False
+    assert detector._provider_candidate_fence == fence
+    assert detector._candidate_generation == generation_before
+    assert detector.candidate_open is candidate_open_before
+    assert detector._bound_turns[candidate].turn_token == turn_token
+    assert await detector.complete_provider_candidate(fence) is True
+    await detector.close()
+
+
+async def test_sealed_provider_rejection_rejects_wrong_shadow_fence_and_epoch() -> (
+    None
+):
+    detector, _shadow, _candidate, shadow_candidate, _turn_token = (
+        await _prepare_candidate_rejection_fixture()
+    )
+    fence = await detector.seal_provider_candidate()
+    assert fence is not None
+    sealed_lease = await detector.prepare_candidate_rejection(shadow_candidate)
+    assert sealed_lease is not None
+
+    wrong_shadow = SpeakerShadowCandidateKey(
+        shadow_candidate.detector_epoch,
+        shadow_candidate.shadow_generation + 1,
+        shadow_candidate.scope,
+    )
+    wrong_epoch = SpeakerShadowCandidateKey(
+        shadow_candidate.detector_epoch + 1,
+        shadow_candidate.shadow_generation,
+        shadow_candidate.scope,
+    )
+    wrong_fence_lease = DetectorCandidateRejectionLease(
+        candidate=sealed_lease.candidate,
+        shadow_candidate=sealed_lease.shadow_candidate,
+        turn_token=sealed_lease.turn_token,
+        _runtime=detector,
+        provider_fence=ProviderCandidateFence(
+            fence.detector_epoch,
+            fence.candidate_generation + 1,
+            fence.through_sequence_no,
+        ),
+    )
+
+    assert await detector.prepare_candidate_rejection(wrong_shadow) is None
+    assert await detector.prepare_candidate_rejection(wrong_epoch) is None
+    assert wrong_fence_lease.commit() is False
+    assert sealed_lease.commit() is True
+    await detector.close()
+
+
+@pytest.mark.parametrize(
+    "advance",
+    ["provider_final", "detector_reset", "verifier_replacement", "detector_close"],
+)
+async def test_sealed_provider_rejection_is_invalidated_by_lifecycle_boundary(
     advance: str,
 ) -> None:
     detector, _shadow, _candidate, shadow_candidate, _turn_token = (
         await _prepare_candidate_rejection_fixture()
     )
+    fence = await detector.seal_provider_candidate()
+    assert fence is not None
     lease = await detector.prepare_candidate_rejection(shadow_candidate)
     assert lease is not None
+    assert lease.provider_fence == fence
 
-    if advance == "candidate_boundary":
-        assert await detector.seal_provider_candidate() is not None
-    else:
+    if advance == "provider_final":
+        assert await detector.complete_provider_candidate(fence) is False
+    elif advance == "detector_reset":
         await detector.reset()
+    elif advance == "verifier_replacement":
+        await detector.replace_speaker_verifier(_SpeakerShadowSpy())
+    else:
+        await detector.close()
 
     assert lease.commit() is False
-    assert await detector.prepare_candidate_rejection(shadow_candidate) is None
+    await detector.close()
+
+
+async def test_smart_turn_rejection_lease_keeps_open_candidate_semantics() -> None:
+    shadow = _SpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_smart_turn_policy(),
+        coordinator=_SemanticCoordinator(),
+        speaker_shadow=shadow,
+        on_turn_complete=AsyncMock(),
+    )
+    ingress = _ingress_token()
+    candidate = DetectorCandidateKey(0, 0)
+    turn_token = VoiceTurnToken(ingress, turn_id=1)
+    detector._ingress_token = ingress
+    detector._candidate_open = True
+    assert await detector.bind_candidate(candidate, turn_token) is not None
+    shadow_candidate = detector._open_speaker_shadow_candidate("smart_turn_turn")
+    assert shadow_candidate is not None
+    lease = await detector.prepare_candidate_rejection(shadow_candidate)
+
+    assert lease is not None
+    assert lease.provider_fence is None
+    assert lease.commit() is True
+    assert detector.candidate_open is False
+    assert detector._candidate_generation == 1
+    assert candidate not in detector._bound_turns
+    assert shadow.finished == [shadow_candidate]
     await detector.close()
 
 
@@ -1448,25 +1573,28 @@ async def test_provider_candidate_fence_preserves_post_discard_successor() -> No
         provider_policy=_provider_endpoint_policy(),
     )
     evidence = RnnoiseEvidence.from_legacy_probability(0.9, available=True)
-    await detector.feed(
+    predecessor = await detector.feed(
         b"\x01\x00",
         rnnoise_evidence=evidence,
         ingress_token=_ingress_token(),
     )
+    assert predecessor.candidate == DetectorCandidateKey(0, 0)
     fence = await detector.seal_provider_candidate()
     assert isinstance(fence, ProviderCandidateFence)
 
-    await detector.feed(
+    successor = await detector.feed(
         b"\x02\x00",
         rnnoise_evidence=evidence,
         ingress_token=_ingress_token(),
     )
+    assert successor.candidate == DetectorCandidateKey(0, 1)
     assert await detector.discard_provider_successor(fence) is True
-    await detector.feed(
+    post_discard = await detector.feed(
         b"\x03\x00",
         rnnoise_evidence=evidence,
         ingress_token=_ingress_token(),
     )
+    assert post_discard.candidate == DetectorCandidateKey(0, 2)
 
     assert await detector.complete_provider_candidate(fence) is True
     assert await detector.complete_provider_candidate(fence) is None
@@ -1572,6 +1700,18 @@ async def test_detector_loads_silero_off_loop_and_returns_activity() -> None:
         events=(SpeechActivityEvent.SPEECH_STARTED,),
         throttle_available=True,
         throttle_action=ThrottleAction.OPEN_CANDIDATE,
+        identity=DetectorIngressIdentity(
+            ingress_token=VoiceIngressToken(
+                session_epoch=0,
+                connection_id="detector-feed-compat",
+                lease_generation=0,
+                route_generation=0,
+                audio_generation=0,
+            ),
+            detector_epoch=0,
+            sequence_no=1,
+        ),
+        candidate=DetectorCandidateKey(0, 0),
     )
     assert gate.inputs == [b"\x01\x00" * 160]
     assert vad.load_threads and vad.load_threads[0] != threading.get_ident()
@@ -1599,8 +1739,12 @@ async def test_rnnoise_soft_gate_skips_silero_until_probable_voice() -> None:
 
     assert quiet.events == ()
     assert quiet.throttle_available is True
+    assert quiet.identity is None
+    assert quiet.candidate is None
     assert gate.inputs == [b"\x02\x00"]
     assert speech.events == (SpeechActivityEvent.SPEECH_STARTED,)
+    assert speech.identity is not None
+    assert speech.candidate == DetectorCandidateKey(0, 0)
 
 
 async def test_disabled_resource_optimization_never_skips_quiet_silero_pcm() -> None:
@@ -2715,9 +2859,19 @@ async def test_detector_latches_load_and_inference_failures() -> None:
     load_failed = DetectorRuntime(vad=_FailingVad(), gate=_Gate())
     inference_failed = DetectorRuntime(vad=_Vad(), gate=_FailingGate())
 
-    assert (await load_failed.feed(b"\x00\x00")).throttle_available is False
-    assert (await inference_failed.feed(b"\x00\x00")).throttle_available is False
-    assert (await inference_failed.feed(b"\x00\x00")).events == ()
+    load_result = await load_failed.feed(b"\x00\x00")
+    inference_result = await inference_failed.feed(b"\x00\x00")
+    latched_result = await inference_failed.feed(b"\x00\x00")
+
+    assert load_result.throttle_available is False
+    assert load_result.identity is None
+    assert load_result.candidate is None
+    assert inference_result.throttle_available is False
+    assert inference_result.identity is None
+    assert inference_result.candidate is None
+    assert latched_result.events == ()
+    assert latched_result.identity is None
+    assert latched_result.candidate is None
 
 
 async def test_detector_reset_and_close_are_idempotent() -> None:

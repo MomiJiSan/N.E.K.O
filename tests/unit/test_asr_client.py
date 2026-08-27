@@ -2506,9 +2506,11 @@ def _patch_runtime_detector_start(
 def _install_pending_runtime_state(
     runtime: IndependentAsrRuntime,
     detector: _RuntimeDetectorStub,
+    *,
+    endpointing_mode: str = "manual",
 ) -> None:
     lifecycle = VoiceInputLifecycleController(
-        provider_policy=resolve_provider_policy("qwen", "manual"),
+        provider_policy=resolve_provider_policy("qwen", endpointing_mode),
         shadow_mode=False,
     )
     lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
@@ -2518,7 +2520,11 @@ def _install_pending_runtime_state(
     lifecycle.mark_pending_turn_speech()
     lifecycle.accept_audio(b"\x01\x00" * 160, sample_rate_hz=16_000)
     lifecycle.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
-    runtime._asr_session = SimpleNamespace(is_ready=True, close=AsyncMock())
+    runtime._asr_session = SimpleNamespace(
+        is_ready=True,
+        close=AsyncMock(),
+        stream_audio=AsyncMock(),
+    )
     runtime._asr_provider = "qwen"
     runtime._asr_lifecycle = lifecycle
     runtime._asr_detector = detector
@@ -2666,15 +2672,21 @@ async def test_stale_pending_candidate_bind_none_cannot_fail_new_runtime() -> No
     assert statuses == []
 
 
-async def test_current_pending_candidate_bind_none_fails_closed_once() -> None:
+@pytest.mark.parametrize("raises", [False, True])
+async def test_current_pending_candidate_bind_failure_fails_closed_once(
+    raises: bool,
+) -> None:
     failures = []
     statuses = []
     runtime = IndependentAsrRuntime(
         _runtime_callbacks(failures=failures, statuses=statuses)
     )
-    detector = _RuntimeDetectorStub(
-        bind_candidate=AsyncMock(return_value=None),
+    bind_candidate = (
+        AsyncMock(side_effect=RuntimeError("bind failed"))
+        if raises
+        else AsyncMock(return_value=None)
     )
+    detector = _RuntimeDetectorStub(bind_candidate=bind_candidate)
     _install_pending_runtime_state(runtime, detector)
 
     await runtime._activate_pending_independent_turn(runtime._asr_session_epoch)
@@ -2684,6 +2696,82 @@ async def test_current_pending_candidate_bind_none_fails_closed_once() -> None:
     assert runtime._asr_detector is None
     assert [event.code for event in failures] == ["ASR_ENDPOINTING_FAILED"]
     assert [event.code for event in statuses] == ["ASR_ENDPOINTING_FAILED"]
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_current_provider_pending_candidate_bind_failure_fails_open(
+    raises: bool,
+) -> None:
+    failures = []
+    statuses = []
+    runtime = IndependentAsrRuntime(
+        _runtime_callbacks(failures=failures, statuses=statuses)
+    )
+    bind_candidate = (
+        AsyncMock(side_effect=RuntimeError("bind failed"))
+        if raises
+        else AsyncMock(return_value=None)
+    )
+    detector = _RuntimeDetectorStub(bind_candidate=bind_candidate)
+    _install_pending_runtime_state(runtime, detector, endpointing_mode="provider")
+    session = runtime._asr_session
+    lifecycle = runtime._asr_lifecycle
+
+    await runtime._activate_pending_independent_turn(runtime._asr_session_epoch)
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    detector.bind_candidate.assert_awaited_once()
+    assert runtime._asr_session is session
+    assert runtime._asr_lifecycle is lifecycle
+    assert lifecycle.snapshot.state.value == "active"
+    assert failures == []
+    assert statuses == []
+    await runtime.close()
+
+
+async def test_provider_candidate_waits_for_confirmed_pending_turn() -> None:
+    runtime = IndependentAsrRuntime(_runtime_callbacks())
+    detector = _RuntimeDetectorStub()
+    detector.detector_epoch = 7
+    _install_pending_runtime_state(runtime, detector, endpointing_mode="provider")
+    lifecycle = runtime._asr_lifecycle
+    assert lifecycle is not None
+    lifecycle.discard_pending_turn()
+    runtime._asr_pending_detector_candidate = None
+    lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    lifecycle.transition(VoiceLifecycleEvent.TURN_SEALED)
+    ingress = runtime._asr_current_ingress_token
+    assert ingress is not None
+    detector_identity = SimpleNamespace(
+        ingress_token=ingress,
+        detector_epoch=7,
+    )
+    candidate = SimpleNamespace(detector_epoch=7)
+    identity = runtime._capture_runtime_identity(ingress_token=ingress)
+
+    assert await runtime._bind_provider_detector_candidate(
+        lifecycle,
+        detector,
+        detector_identity=detector_identity,
+        candidate=candidate,
+        expected_identity=identity,
+    )
+    assert runtime._asr_pending_detector_candidate is None
+    detector.bind_candidate.assert_not_awaited()
+
+    lifecycle.mark_pending_turn_speech()
+    assert await runtime._bind_provider_detector_candidate(
+        lifecycle,
+        detector,
+        detector_identity=detector_identity,
+        candidate=candidate,
+        expected_identity=identity,
+        pending_speech_confirmed=True,
+    )
+    assert runtime._asr_pending_detector_candidate is candidate
+    detector.bind_candidate.assert_not_awaited()
+    await runtime.close()
 
 
 async def test_stale_deferred_turn_release_error_cannot_fail_new_runtime() -> None:

@@ -352,6 +352,26 @@ def _safe_proactive_history_size() -> dict[str, int]:
     return out
 
 
+def _safe_voice_identity_diagnostics() -> dict[str, int]:
+    """Read aggregate voice-filter counters without biometric material."""
+
+    try:
+        from app.main_server.voice_identity_runtime import (
+            get_voice_identity_diagnostics,
+        )
+
+        raw = get_voice_identity_diagnostics()
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        name: value
+        for name, value in raw.items()
+        if type(name) is str and type(value) is int and value >= 0
+    }
+
+
 def _collect_snapshot(include_deep: bool = False, channel: str = "watchdog") -> dict[str, Any]:
     """Take a single snapshot. Every field is individually try-wrapped — one blowing up does not affect the others.
 
@@ -387,6 +407,7 @@ def _collect_snapshot(include_deep: bool = False, channel: str = "watchdog") -> 
     snap["is_responding"] = _safe_is_responding_map()
     snap["ack_waiters"] = _safe_ack_waiters_size()
     snap["proactive_history"] = _safe_proactive_history_size()
+    snap["voice_identity"] = _safe_voice_identity_diagnostics()
     try:
         from main_logic.widget_mode_runtime import widget_mode_coordinator
 

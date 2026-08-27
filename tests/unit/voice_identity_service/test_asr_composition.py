@@ -75,6 +75,50 @@ def _observation(
     )
 
 
+def _install_gate_spies(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: IndependentAsrRuntime,
+    *,
+    arm_result: bool = True,
+) -> tuple[
+    list[tuple[SpeakerShadowCandidateKey, str]],
+    list[tuple[SpeakerShadowCandidateKey, str, bool]],
+]:
+    armed: list[tuple[SpeakerShadowCandidateKey, str]] = []
+    resolved: list[tuple[SpeakerShadowCandidateKey, str, bool]] = []
+
+    async def arm(
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+    ) -> bool:
+        armed.append((candidate, activation_generation))
+        return arm_result
+
+    def resolve(
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+        rejected: bool = False,
+    ) -> bool:
+        resolved.append((candidate, activation_generation, rejected))
+        return True
+
+    monkeypatch.setattr(
+        runtime,
+        "_arm_speaker_candidate_decision",
+        arm,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        resolve,
+        raising=False,
+    )
+    return armed, resolved
+
+
 @pytest.mark.parametrize(
     ("enforce", "expected_requests"),
     [(True, 1), (False, 0)],
@@ -86,8 +130,10 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
     expected_requests: int,
 ) -> None:
     runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-7"
     profile = _profile()
     requests: list[tuple[SpeakerShadowCandidateKey, str]] = []
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
 
     def request_rejection(
         candidate: SpeakerShadowCandidateKey,
@@ -126,9 +172,230 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
         _observation(candidate, checkpoint_ms=3_000, similarity=0.20)
     )
 
+    assert factory.diagnostics_snapshot() == {
+        "observation_count": 2,
+        "first_checkpoint_count": 1,
+        "second_checkpoint_count": 1,
+        "low_checkpoint_count": 2,
+        "reject_decision_count": expected_requests,
+    }
     assert len(requests) == expected_requests
     if expected_requests:
         assert requests == [(candidate, "activation-7")]
+        assert armed == [(candidate, "activation-7")]
+    else:
+        assert armed == []
+    assert resolved == []
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_ms", "similarity"),
+    [(3_000, 0.80), (2_500, 0.20)],
+    ids=["owner", "invalid"],
+)
+async def test_second_forward_or_invalid_observation_resolves_armed_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_ms: int,
+    similarity: float,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-forward"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    requests: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda candidate, **_kwargs: requests.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-forward",
+        enforce=True,
+    )
+    shadow = factory()
+    callback = shadow._on_observation
+    assert callback is not None
+    candidate = SpeakerShadowCandidateKey(4, 2, "provider_candidate")
+
+    await callback(_observation(candidate, checkpoint_ms=1_500, similarity=0.20))
+    await callback(
+        _observation(
+            candidate,
+            checkpoint_ms=checkpoint_ms,
+            similarity=similarity,
+        )
+    )
+
+    assert armed == [(candidate, "activation-forward")]
+    assert resolved == [(candidate, "activation-forward", False)]
+    assert requests == []
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_rejection_schedule_failure_resolves_armed_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-failed-schedule"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda *_args, **_kwargs: False,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-failed-schedule",
+        enforce=True,
+    )
+    shadow = factory()
+    callback = shadow._on_observation
+    assert callback is not None
+    candidate = SpeakerShadowCandidateKey(5, 3, "provider_candidate")
+
+    await callback(_observation(candidate, checkpoint_ms=1_500, similarity=0.20))
+    await callback(_observation(candidate, checkpoint_ms=3_000, similarity=0.20))
+
+    assert armed == [(candidate, "activation-failed-schedule")]
+    assert resolved == [(candidate, "activation-failed-schedule", False)]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+@pytest.mark.parametrize("boundary", ["arm_failed", "degraded"])
+async def test_second_low_never_rejects_without_live_armed_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-no-gate"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(
+        monkeypatch,
+        runtime,
+        arm_result=boundary != "arm_failed",
+    )
+    requests: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda candidate, **_kwargs: requests.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-no-gate",
+        enforce=True,
+    )
+    shadow = factory()
+    callback = shadow._on_observation
+    assert callback is not None
+    candidate = SpeakerShadowCandidateKey(7, 5, "provider_candidate")
+
+    await callback(_observation(candidate, checkpoint_ms=1_500, similarity=0.20))
+    if boundary == "degraded":
+        shadow._mark_backend_degraded()
+    await callback(_observation(candidate, checkpoint_ms=3_000, similarity=0.20))
+
+    assert armed == [(candidate, "activation-no-gate")]
+    assert requests == []
+    assert resolved == (
+        [(candidate, "activation-no-gate", False)]
+        if boundary == "degraded"
+        else []
+    )
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_smart_turn_candidate_keeps_ungated_rejection_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-smart-turn"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    requests: list[tuple[SpeakerShadowCandidateKey, str]] = []
+
+    def request_rejection(
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+    ) -> bool:
+        requests.append((candidate, activation_generation))
+        return True
+
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        request_rejection,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-smart-turn",
+        enforce=True,
+    )
+    shadow = factory()
+    callback = shadow._on_observation
+    assert callback is not None
+    candidate = SpeakerShadowCandidateKey(8, 6, "smart_turn_turn")
+
+    await callback(_observation(candidate, checkpoint_ms=1_500, similarity=0.20))
+    await callback(_observation(candidate, checkpoint_ms=3_000, similarity=0.20))
+
+    assert armed == []
+    assert resolved == []
+    assert requests == [(candidate, "activation-smart-turn")]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+@pytest.mark.parametrize("boundary", ["degraded", "close", "activation"])
+async def test_gate_is_released_by_fail_open_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-boundary"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-boundary",
+        enforce=True,
+    )
+    shadow = factory()
+    callback = shadow._on_observation
+    assert callback is not None
+    candidate = SpeakerShadowCandidateKey(6, 4, "provider_candidate")
+    await callback(_observation(candidate, checkpoint_ms=1_500, similarity=0.20))
+
+    if boundary == "degraded":
+        shadow._mark_backend_degraded()
+    elif boundary == "close":
+        factory.close()
+    else:
+        runtime._speaker_verifier_activation_generation = "activation-replacement"
+        await callback(
+            _observation(candidate, checkpoint_ms=3_000, similarity=0.20)
+        )
+
+    assert armed == [(candidate, "activation-boundary")]
+    assert resolved == [(candidate, "activation-boundary", False)]
     await shadow.close()
     factory.close()
     profile.close()

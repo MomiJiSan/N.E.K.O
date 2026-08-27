@@ -2936,7 +2936,7 @@
         "profileSavedDisabled": "Owner voice profile is saved; filtering is off",
         "profileMissing": "No Owner voice profile enrolled",
         "reasonDisabled": "Owner voice profile is saved; filtering is off",
-        "reasonModelUnavailable": "The voice model is unavailable; independent ASR will pass through normally",
+        "reasonModelUnavailable": "The voice model assets are unavailable. For a source checkout, run uv run python scripts/prepare_speaker_model.py; for an installed build, repair or reinstall it. Independent ASR is unaffected.",
         "reasonProfileIncompatible": "This voice profile is incompatible with the current model; enroll again",
         "reasonSecureStorageUnavailable": "Secure storage is unavailable, so voice filtering is off",
         "reasonEnrollmentActive": "A new voice profile is being enrolled; independent ASR will temporarily pass through",
@@ -2946,6 +2946,7 @@
         "enrollmentComplete": "Owner voice profile is saved and enabled.",
         "microphoneDenied": "The microphone is unavailable. Check your permission and device.",
         "requestFailed": "The operation failed. Please try again.",
+        "errorModelUnavailable": "The voice model assets are unavailable, so enrollment cannot start. For a source checkout, run uv run python scripts/prepare_speaker_model.py; for an installed build, repair or reinstall it, then try again.",
         "errorInvalidPcm": "The recording format is invalid. Please enroll again.",
         "errorAudioTooLong": "The recording is too long. Please enroll again.",
         "deleteConfirm": "You will need to enroll again before using the voice filter."

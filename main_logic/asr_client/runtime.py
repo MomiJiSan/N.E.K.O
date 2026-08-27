@@ -37,6 +37,7 @@ from .endpointing.detector import (
     CoreDetectorEventEnvelope,
     DetectorActivityEvent,
     DetectorCandidateKey,
+    DetectorIngressIdentity,
     DetectorPrewarmEvent,
     DetectorRuntimeEvent,
     DetectorTransportPrewarmEvent,
@@ -93,6 +94,32 @@ ASR_CONNECT_TOTAL_BUDGET_SECONDS = _CONNECT_TOTAL_BUDGET_SECONDS
 _CANDIDATE_REJECTION_WATCHDOG_SECONDS = 10.0
 _CANDIDATE_REJECTION_RECOVERY_STEP_TIMEOUT_SECONDS = 1.0
 _CANDIDATE_REJECTION_REINSTALL_ATTEMPTS = 2
+_SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS = 0.2
+_SPEAKER_REJECTION_METRIC_NAMES = (
+    "rejection_request_failed_count",
+    "rejection_task_scheduled_count",
+    "rejection_task_applied_count",
+    "rejection_task_stale_count",
+    "rejection_stale_initial_count",
+    "rejection_stale_prepare_count",
+    "rejection_stale_runtime_fence_count",
+    "rejection_stale_candidate_fence_count",
+    "rejection_stale_smart_turn_count",
+    "rejection_stale_commit_count",
+    "rejection_task_cleanup_degraded_count",
+    "rejection_task_failure_count",
+    "rejection_task_cancelled_count",
+    "speaker_gate_armed_count",
+    "speaker_gate_waited_count",
+    "speaker_gate_resolved_forward_count",
+    "speaker_gate_resolved_reject_count",
+    "speaker_gate_timeout_count",
+    "speaker_gate_stale_count",
+)
+
+
+def _new_speaker_rejection_metrics() -> dict[str, int]:
+    return {name: 0 for name in _SPEAKER_REJECTION_METRIC_NAMES}
 
 
 def _uses_smart_turn_endpointing(provider_policy: Any) -> bool:
@@ -154,6 +181,24 @@ class _CandidateRejectionSuppression:
     final_key: FinalKey
     lifecycle: VoiceInputLifecycleController
     detector: DetectorRuntime
+
+
+@dataclass(slots=True)
+class _SpeakerCandidateDecisionGate:
+    candidate: SpeakerShadowCandidateKey
+    activation_generation: str
+    lease: DetectorCandidateRejectionLease
+    turn_token: VoiceTurnToken
+    final_key: FinalKey
+    session_epoch: int
+    audio_generation: int
+    transport_generation: int
+    lifecycle: VoiceInputLifecycleController
+    detector: DetectorRuntime
+    deadline: float | None
+    resolved: asyncio.Future[None]
+    rejection_task: asyncio.Task[CandidateRejectionOutcome | None] | None = None
+    wait_started: bool = False
 
 
 class IndependentAsrRuntime:
@@ -231,10 +276,7 @@ class IndependentAsrRuntime:
 
         if factory is not None and not callable(factory):
             raise TypeError("factory must be callable or None")
-        if (
-            type(activation_generation) is not str
-            or not activation_generation.strip()
-        ):
+        if type(activation_generation) is not str or not activation_generation.strip():
             raise ValueError("activation_generation must be a non-empty string")
         self._ensure_asr_runtime_state()
         async with self._speaker_verifier_lock:
@@ -252,8 +294,7 @@ class IndependentAsrRuntime:
         old_factory = self._speaker_verifier_factory
         if (
             factory is old_factory
-            and activation_generation
-            == self._speaker_verifier_activation_generation
+            and activation_generation == self._speaker_verifier_activation_generation
             and not self._speaker_verifier_degraded
         ):
             return True
@@ -300,18 +341,12 @@ class IndependentAsrRuntime:
                         if replacement_shadow is None:
                             return False
                     try:
-                        await replacement.replace_speaker_verifier(
-                            replacement_shadow
-                        )
+                        await replacement.replace_speaker_verifier(replacement_shadow)
                     except asyncio.CancelledError:
-                        await self._close_created_speaker_shadow(
-                            replacement_shadow
-                        )
+                        await self._close_created_speaker_shadow(replacement_shadow)
                         raise
                     except Exception:
-                        await self._close_created_speaker_shadow(
-                            replacement_shadow
-                        )
+                        await self._close_created_speaker_shadow(replacement_shadow)
                         return False
                     if self._asr_detector is not replacement:
                         return False
@@ -324,6 +359,160 @@ class IndependentAsrRuntime:
         self._speaker_verifier_degraded = False
         return True
 
+    async def _arm_speaker_candidate_decision(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+    ) -> bool:
+        """Bound one first-low decision window to exact Provider authority."""
+
+        self._ensure_asr_runtime_state()
+        if (
+            type(candidate) is not SpeakerShadowCandidateKey
+            or candidate.scope != "provider_candidate"
+            or type(activation_generation) is not str
+            or not activation_generation.strip()
+            or activation_generation != self._speaker_verifier_activation_generation
+        ):
+            return False
+        current_gate = self._asr_speaker_candidate_decision_gate
+        if current_gate is not None:
+            return bool(
+                current_gate.candidate == candidate
+                and current_gate.activation_generation == activation_generation
+                and not current_gate.resolved.done()
+            )
+
+        detector = self._asr_detector
+        lifecycle = self._asr_lifecycle
+        if detector is None or lifecycle is None or self._asr_session is None:
+            return False
+        snapshot = lifecycle.snapshot
+        if _uses_smart_turn_endpointing(
+            lifecycle.provider_policy
+        ) or snapshot.state not in {
+            VoiceLifecycleState.ACTIVE,
+            VoiceLifecycleState.DRAINING,
+        }:
+            return False
+        session_epoch = self._asr_session_epoch
+        audio_generation = self._asr_audio_generation
+        transport_generation = snapshot.transport_generation
+        try:
+            lease = await detector.prepare_candidate_rejection(candidate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        if lease is None:
+            return False
+
+        async with self._asr_final_lock:
+            snapshot = lifecycle.snapshot
+            turn_token = lease.turn_token
+            final_key = FinalKey.from_turn(turn_token)
+            common_authority = bool(
+                self._asr_speaker_candidate_decision_gate is None
+                and self._asr_session_epoch == session_epoch
+                and self._asr_audio_generation == audio_generation
+                and self._speaker_verifier_activation_generation
+                == activation_generation
+                and self._asr_lifecycle is lifecycle
+                and self._asr_detector is detector
+                and self._asr_session is not None
+                and lease.belongs_to(detector)
+                and lease.shadow_candidate == candidate
+                and turn_token == self._asr_partial_turn_token
+                and self._ingress_token_matches(turn_token.ingress)
+                and self._asr_turn_prepared
+                and self._asr_reserved_final_key == final_key
+                and final_key not in self._asr_accepted_final_keys
+                and snapshot.transport_generation == transport_generation
+                and snapshot.turn_id == turn_token.turn_id
+            )
+            if not common_authority:
+                return False
+            if snapshot.state is VoiceLifecycleState.ACTIVE:
+                if (
+                    lease.provider_fence is not None
+                    or self._asr_sealed_turn_token is not None
+                    or self._asr_provider_candidate_fence is not None
+                    or self._asr_audio_dispatcher.active_turn != turn_token
+                ):
+                    return False
+            elif snapshot.state is VoiceLifecycleState.DRAINING:
+                sealed_token = self._asr_sealed_turn_token
+                provider_fence = self._asr_provider_candidate_fence
+                if (
+                    sealed_token is None
+                    or sealed_token.turn != turn_token
+                    or sealed_token.transport_generation != transport_generation
+                    or provider_fence is None
+                    or lease.provider_fence != provider_fence
+                ):
+                    return False
+            else:
+                return False
+            self._asr_speaker_candidate_decision_gate = _SpeakerCandidateDecisionGate(
+                candidate=candidate,
+                activation_generation=activation_generation,
+                lease=lease,
+                turn_token=turn_token,
+                final_key=final_key,
+                session_epoch=session_epoch,
+                audio_generation=audio_generation,
+                transport_generation=transport_generation,
+                lifecycle=lifecycle,
+                detector=detector,
+                deadline=None,
+                resolved=asyncio.get_running_loop().create_future(),
+            )
+            self._speaker_rejection_metrics["speaker_gate_armed_count"] += 1
+            return True
+
+    def _release_speaker_candidate_decision_gate(
+        self,
+        gate: _SpeakerCandidateDecisionGate,
+        *,
+        metric_name: str,
+    ) -> bool:
+        if self._asr_speaker_candidate_decision_gate is not gate:
+            return False
+        self._asr_speaker_candidate_decision_gate = None
+        if not gate.resolved.done():
+            gate.resolved.set_result(None)
+        self._speaker_rejection_metrics[metric_name] += 1
+        return True
+
+    def _resolve_speaker_candidate_decision(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+        rejected: bool = False,
+    ) -> bool:
+        """Release only the exact first-low decision window, always fail-open."""
+
+        gate = getattr(self, "_asr_speaker_candidate_decision_gate", None)
+        if (
+            gate is None
+            or type(candidate) is not SpeakerShadowCandidateKey
+            or type(activation_generation) is not str
+            or gate.candidate != candidate
+            or gate.activation_generation != activation_generation
+        ):
+            return False
+        metric_name = (
+            "speaker_gate_resolved_reject_count"
+            if rejected
+            else "speaker_gate_resolved_forward_count"
+        )
+        return self._release_speaker_candidate_decision_gate(
+            gate,
+            metric_name=metric_name,
+        )
+
     def request_speaker_candidate_rejection(
         self,
         candidate: SpeakerShadowCandidateKey,
@@ -332,28 +521,97 @@ class IndependentAsrRuntime:
     ) -> bool:
         """Schedule one advisory rejection while retaining task ownership."""
 
+        if not hasattr(self, "_speaker_rejection_metrics"):
+            self._speaker_rejection_metrics = _new_speaker_rejection_metrics()
+
         if (
             type(candidate) is not SpeakerShadowCandidateKey
             or type(activation_generation) is not str
             or not activation_generation.strip()
-            or activation_generation
-            != self._speaker_verifier_activation_generation
+            or activation_generation != self._speaker_verifier_activation_generation
         ):
+            self._speaker_rejection_metrics["rejection_request_failed_count"] += 1
             return False
+        decision_gate = self._asr_speaker_candidate_decision_gate
+        if candidate.scope == "provider_candidate":
+            if (
+                decision_gate is None
+                or decision_gate.candidate != candidate
+                or decision_gate.activation_generation != activation_generation
+                or decision_gate.rejection_task is not None
+                or decision_gate.resolved.done()
+            ):
+                self._speaker_rejection_metrics["rejection_request_failed_count"] += 1
+                return False
+        else:
+            decision_gate = None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            self._speaker_rejection_metrics["rejection_request_failed_count"] += 1
             return False
         task = loop.create_task(
             self._reject_speaker_candidate(
                 candidate,
                 activation_generation=activation_generation,
+                decision_gate=decision_gate,
             ),
             name="owner-voice-candidate-rejection",
         )
+        if decision_gate is not None:
+            decision_gate.rejection_task = task
         self._asr_rejection_tasks.add(task)
-        task.add_done_callback(self._reap_rejection_task)
+        self._speaker_rejection_metrics["rejection_task_scheduled_count"] += 1
+        task.add_done_callback(
+            lambda completed, gate=decision_gate: self._reap_rejection_task(
+                completed,
+                decision_gate=gate,
+            )
+        )
         return True
+
+    def speaker_verifier_diagnostics(self) -> dict[str, int]:
+        """Return aggregate-only verifier diagnostics for local debugging."""
+
+        metrics = dict(getattr(self, "_speaker_rejection_metrics", {}))
+        factory = getattr(self, "_speaker_verifier_factory", None)
+        snapshot = getattr(factory, "diagnostics_snapshot", None)
+        if callable(snapshot):
+            try:
+                factory_metrics = snapshot()
+            except Exception:
+                factory_metrics = {}
+            if not isinstance(factory_metrics, dict):
+                factory_metrics = {}
+            for name, value in factory_metrics.items():
+                if type(name) is str and type(value) is int and value >= 0:
+                    metrics[name] = value
+        detector = getattr(self, "_asr_detector", None)
+        detector_snapshot = getattr(
+            detector,
+            "speaker_rejection_diagnostics_snapshot",
+            None,
+        )
+        if callable(detector_snapshot):
+            try:
+                detector_metrics = detector_snapshot()
+            except Exception:
+                detector_metrics = {}
+            if isinstance(detector_metrics, dict):
+                for name, value in detector_metrics.items():
+                    if type(name) is str and type(value) is int and value >= 0:
+                        metrics[name] = value
+        metrics["verifier_installed_count"] = int(factory is not None)
+        metrics["verifier_degraded_count"] = int(
+            bool(getattr(self, "_speaker_verifier_degraded", False))
+        )
+        metrics["rejection_task_pending_count"] = len(
+            getattr(self, "_asr_rejection_tasks", ())
+        )
+        metrics["rejection_in_progress_count"] = int(
+            getattr(self, "_asr_candidate_rejection", None) is not None
+        )
+        return metrics
 
     def _mark_speaker_verifier_degraded(self) -> None:
         """Expose Owner verifier health without changing ASR transport flow."""
@@ -380,14 +638,45 @@ class IndependentAsrRuntime:
     def _reap_rejection_task(
         self,
         task: asyncio.Task[CandidateRejectionOutcome | None],
+        *,
+        decision_gate: _SpeakerCandidateDecisionGate | None = None,
     ) -> None:
         self._asr_rejection_tasks.discard(task)
-        if task.cancelled():
-            return
+        gate_metric_name = "speaker_gate_stale_count"
         try:
-            task.exception()
-        except Exception:
-            return
+            if task.cancelled():
+                self._speaker_rejection_metrics["rejection_task_cancelled_count"] += 1
+                return
+            try:
+                outcome = task.result()
+            except Exception:
+                self._speaker_rejection_metrics["rejection_task_failure_count"] += 1
+                return
+            if outcome is CandidateRejectionOutcome.STALE:
+                self._speaker_rejection_metrics["rejection_task_stale_count"] += 1
+                return
+            if outcome in {
+                CandidateRejectionOutcome.APPLIED,
+                CandidateRejectionOutcome.APPLIED_CLEANUP_DEGRADED,
+            }:
+                self._speaker_rejection_metrics["rejection_task_applied_count"] += 1
+                gate_metric_name = "speaker_gate_resolved_reject_count"
+            if outcome is CandidateRejectionOutcome.APPLIED_CLEANUP_DEGRADED:
+                self._speaker_rejection_metrics[
+                    "rejection_task_cleanup_degraded_count"
+                ] += 1
+            elif outcome is None:
+                self._speaker_rejection_metrics["rejection_task_failure_count"] += 1
+        finally:
+            if (
+                decision_gate is not None
+                and decision_gate.rejection_task is task
+                and self._asr_speaker_candidate_decision_gate is decision_gate
+            ):
+                self._release_speaker_candidate_decision_gate(
+                    decision_gate,
+                    metric_name=gate_metric_name,
+                )
 
     def _begin_asr_start_operation(self) -> int:
         self._asr_start_generation += 1
@@ -612,14 +901,19 @@ class IndependentAsrRuntime:
         self._asr_partial_turn_token: VoiceTurnToken | None = None
         self._asr_accepted_final_keys: OrderedDict[FinalKey, None] = OrderedDict()
         self._asr_reserved_final_key: FinalKey | None = None
+        self._asr_suppressed_final_key: FinalKey | None = None
         self._speaker_verifier_factory: SpeakerShadowFactory | None = None
         self._speaker_verifier_activation_generation: str | None = None
         self._speaker_verifier_degraded = False
         self._speaker_verifier_lock = asyncio.Lock()
         self._asr_candidate_rejection: _CandidateRejectionSuppression | None = None
+        self._asr_speaker_candidate_decision_gate: (
+            _SpeakerCandidateDecisionGate | None
+        ) = None
         self._asr_rejection_tasks: set[
             asyncio.Task[CandidateRejectionOutcome | None]
         ] = set()
+        self._speaker_rejection_metrics = _new_speaker_rejection_metrics()
         self._asr_rejection_watchdog_task: asyncio.Task[None] | None = None
         self._asr_transcript_dispatcher = TranscriptDispatcher(
             self._dispatch_asr_transcript_envelope,
@@ -723,6 +1017,8 @@ class IndependentAsrRuntime:
         if not hasattr(self, "_asr_smart_turn_prepare_lock"):
             self._asr_smart_turn_prepare_lock = asyncio.Lock()
             self._asr_smart_turn_prepare_scope = None
+        if not hasattr(self, "_asr_suppressed_final_key"):
+            self._asr_suppressed_final_key = None
         if not hasattr(self, "_speaker_verifier_factory"):
             self._speaker_verifier_factory = None
             self._speaker_verifier_activation_generation = None
@@ -733,6 +1029,8 @@ class IndependentAsrRuntime:
             self._speaker_verifier_lock = asyncio.Lock()
         if not hasattr(self, "_asr_candidate_rejection"):
             self._asr_candidate_rejection = None
+        if not hasattr(self, "_asr_speaker_candidate_decision_gate"):
+            self._asr_speaker_candidate_decision_gate = None
         if not hasattr(self, "_asr_rejection_tasks"):
             self._asr_rejection_tasks = set()
             self._asr_rejection_watchdog_task = None
@@ -1221,10 +1519,67 @@ class IndependentAsrRuntime:
             expected_state=VoiceLifecycleState.PREWARMING,
         )
 
+    async def _bind_provider_detector_candidate(
+        self,
+        lifecycle: VoiceInputLifecycleController,
+        detector: DetectorRuntime,
+        *,
+        detector_identity: DetectorIngressIdentity | None,
+        candidate: DetectorCandidateKey | None,
+        expected_identity: _AsrRuntimeIdentity,
+        pending_speech_confirmed: bool = False,
+    ) -> bool:
+        """Bind advisory Provider identity and report whether the runtime is current."""
+
+        if detector_identity is None or candidate is None:
+            return self._runtime_identity_matches(expected_identity)
+        if (
+            not self._runtime_identity_matches(expected_identity)
+            or expected_identity.lifecycle is not lifecycle
+            or expected_identity.detector is not detector
+            or expected_identity.ingress_token is None
+            or detector_identity.ingress_token != expected_identity.ingress_token
+            or detector_identity.detector_epoch != detector.detector_epoch
+            or candidate.detector_epoch != detector_identity.detector_epoch
+        ):
+            # Speaker identity is a soft filter. Ambiguous authority never
+            # blocks the independent-ASR hard route.
+            return self._runtime_identity_matches(expected_identity)
+
+        state = lifecycle.snapshot.state
+        if state is VoiceLifecycleState.DRAINING:
+            if pending_speech_confirmed or lifecycle.has_pending_turn:
+                self._asr_pending_detector_candidate = candidate
+            return True
+        if state not in {
+            VoiceLifecycleState.PREWARMING,
+            VoiceLifecycleState.ACTIVE,
+        }:
+            return True
+
+        turn_token = self._capture_turn_token(lifecycle)
+        bind_identity = self._capture_runtime_identity(
+            ingress_token=turn_token.ingress,
+            turn_token=turn_token,
+        )
+        try:
+            await detector.bind_candidate(candidate, turn_token)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Binding is advisory for Provider endpoint authority. The later
+            # speaker verdict fails open when no exact detector turn exists.
+            return self._runtime_identity_matches(bind_identity)
+        return self._runtime_identity_matches(bind_identity)
+
     async def _ensure_continuous_provider_wake(
         self,
         lifecycle: VoiceInputLifecycleController,
         epoch: int,
+        *,
+        detector_identity: DetectorIngressIdentity | None = None,
+        candidate: DetectorCandidateKey | None = None,
+        expected_identity: _AsrRuntimeIdentity | None = None,
     ) -> bool:
         """Open a provider-owned streaming turn without fabricating VAD activity."""
 
@@ -1245,12 +1600,23 @@ class IndependentAsrRuntime:
 
         if not wake_is_current():
             return False
+        if expected_identity is None:
+            expected_identity = self._capture_runtime_identity(
+                ingress_token=ingress_token,
+            )
         state = lifecycle.snapshot.state
         if state is VoiceLifecycleState.DRAINING:
             lifecycle.mark_pending_turn_speech()
             if self._asr_pending_turn_onset_at is None:
                 self._asr_pending_turn_onset_at = detected_at
-            return wake_is_current()
+            return wake_is_current() and await self._bind_provider_detector_candidate(
+                lifecycle,
+                detector,
+                detector_identity=detector_identity,
+                candidate=candidate,
+                expected_identity=expected_identity,
+                pending_speech_confirmed=True,
+            )
         if state in {
             VoiceLifecycleState.LOCAL_LISTEN,
             VoiceLifecycleState.WARM_IDLE,
@@ -1274,6 +1640,14 @@ class IndependentAsrRuntime:
             )
             if not delivered or not wake_is_current():
                 return False
+        if not await self._bind_provider_detector_candidate(
+            lifecycle,
+            detector,
+            detector_identity=detector_identity,
+            candidate=candidate,
+            expected_identity=expected_identity,
+        ):
+            return False
         if lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE:
             return True
         if lifecycle.snapshot.state is not VoiceLifecycleState.PREWARMING:
@@ -1483,9 +1857,8 @@ class IndependentAsrRuntime:
         detector = self._asr_detector
         provider = self._asr_provider or "unknown"
         state = observed_state or lifecycle.snapshot.state
-        if (
-            state is VoiceLifecycleState.DRAINING
-            and not _uses_smart_turn_endpointing(lifecycle.provider_policy)
+        if state is VoiceLifecycleState.DRAINING and not _uses_smart_turn_endpointing(
+            lifecycle.provider_policy
         ):
             discard_failed = False
             discard_handled = False
@@ -1519,10 +1892,8 @@ class IndependentAsrRuntime:
                         discard_failed = True
                     else:
                         try:
-                            discard_handled = (
-                                await detector.discard_provider_successor(
-                                    provider_fence
-                                )
+                            discard_handled = await detector.discard_provider_successor(
+                                provider_fence
                             )
                         except asyncio.CancelledError:
                             raise
@@ -1640,9 +2011,7 @@ class IndependentAsrRuntime:
             )
             try:
                 lifecycle.invalidate_audio()
-                post_detach = await self._abort_transport(
-                    "detector_audio_backpressure"
-                )
+                post_detach = await self._abort_transport("detector_audio_backpressure")
                 if not self._runtime_identity_matches(
                     post_detach
                 ) or not self._asr_runtime_refs_match(
@@ -2151,6 +2520,7 @@ class IndependentAsrRuntime:
         shadow_candidate: SpeakerShadowCandidateKey,
         *,
         activation_generation: str,
+        decision_gate: _SpeakerCandidateDecisionGate | None = None,
     ) -> CandidateRejectionOutcome:
         """Prepare authority asynchronously, then commit without awaiting."""
 
@@ -2159,9 +2529,17 @@ class IndependentAsrRuntime:
         if (
             detector is None
             or lifecycle is None
-            or activation_generation
-            != self._speaker_verifier_activation_generation
+            or activation_generation != self._speaker_verifier_activation_generation
+            or (
+                decision_gate is not None
+                and (
+                    self._asr_speaker_candidate_decision_gate is not decision_gate
+                    or decision_gate.candidate != shadow_candidate
+                    or decision_gate.activation_generation != activation_generation
+                )
+            )
         ):
+            self._speaker_rejection_metrics["rejection_stale_initial_count"] += 1
             return CandidateRejectionOutcome.STALE
         initial_snapshot = lifecycle.snapshot
         initial_session_epoch = self._asr_session_epoch
@@ -2171,8 +2549,10 @@ class IndependentAsrRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._speaker_rejection_metrics["rejection_stale_prepare_count"] += 1
             return CandidateRejectionOutcome.STALE
         if lease is None:
+            self._speaker_rejection_metrics["rejection_stale_prepare_count"] += 1
             return CandidateRejectionOutcome.STALE
 
         request = CandidateRejectionRequest(
@@ -2200,11 +2580,67 @@ class IndependentAsrRuntime:
                 or not lease.belongs_to(detector)
                 or self._asr_session is None
                 or self._asr_candidate_rejection is not None
+                or (
+                    decision_gate is not None
+                    and (
+                        self._asr_speaker_candidate_decision_gate is not decision_gate
+                        or decision_gate.lifecycle is not lifecycle
+                        or decision_gate.detector is not detector
+                        or decision_gate.session_epoch != request.session_epoch
+                        or decision_gate.audio_generation != request.audio_generation
+                        or decision_gate.transport_generation
+                        != request.transport_generation
+                        or decision_gate.turn_token != lease.turn_token
+                        or decision_gate.final_key
+                        != FinalKey.from_turn(lease.turn_token)
+                        or decision_gate.lease.candidate != lease.candidate
+                        or lease.shadow_candidate != decision_gate.candidate
+                    )
+                )
             ):
+                self._speaker_rejection_metrics[
+                    "rejection_stale_runtime_fence_count"
+                ] += 1
                 return CandidateRejectionOutcome.STALE
             snapshot = lifecycle.snapshot
             turn_token = lease.turn_token
             final_key = FinalKey.from_turn(turn_token)
+            if snapshot.state is VoiceLifecycleState.DRAINING:
+                sealed_token = self._asr_sealed_turn_token
+                provider_fence = self._asr_provider_candidate_fence
+                if (
+                    _uses_smart_turn_endpointing(lifecycle.provider_policy)
+                    or request.transport_generation != snapshot.transport_generation
+                    or request.turn_id != snapshot.turn_id
+                    or sealed_token is None
+                    or sealed_token.turn != turn_token
+                    or sealed_token.transport_generation != request.transport_generation
+                    or provider_fence is None
+                    or lease.provider_fence != provider_fence
+                    or self._asr_partial_turn_token != turn_token
+                    or not self._ingress_token_matches(turn_token.ingress)
+                    or not self._asr_turn_prepared
+                    or self._asr_reserved_final_key != final_key
+                    or final_key in self._asr_accepted_final_keys
+                    or self._asr_suppressed_final_key is not None
+                    or (
+                        decision_gate is not None
+                        and decision_gate.deadline is not None
+                        and time.monotonic() >= decision_gate.deadline
+                    )
+                ):
+                    self._speaker_rejection_metrics[
+                        "rejection_stale_candidate_fence_count"
+                    ] += 1
+                    return CandidateRejectionOutcome.STALE
+                if not lease.commit():
+                    self._speaker_rejection_metrics["rejection_stale_commit_count"] += 1
+                    return CandidateRejectionOutcome.STALE
+                # The Provider final still owns fence completion and lifecycle
+                # progression. Suppress only this exact transcript identity;
+                # never tear down transport or mutate the pending successor.
+                self._asr_suppressed_final_key = final_key
+                return CandidateRejectionOutcome.APPLIED
             if (
                 request.transport_generation != snapshot.transport_generation
                 or request.turn_id != snapshot.turn_id
@@ -2218,14 +2654,16 @@ class IndependentAsrRuntime:
                 or self._asr_reserved_final_key != final_key
                 or final_key in self._asr_accepted_final_keys
             ):
+                self._speaker_rejection_metrics[
+                    "rejection_stale_candidate_fence_count"
+                ] += 1
                 return CandidateRejectionOutcome.STALE
             smart_turn_lease = self._asr_smart_turn_lease
-            if (
-                smart_turn_lease is not None
-                and smart_turn_lease.token != turn_token
-            ):
+            if smart_turn_lease is not None and smart_turn_lease.token != turn_token:
+                self._speaker_rejection_metrics["rejection_stale_smart_turn_count"] += 1
                 return CandidateRejectionOutcome.STALE
             if not lease.commit():
+                self._speaker_rejection_metrics["rejection_stale_commit_count"] += 1
                 return CandidateRejectionOutcome.STALE
 
             self._asr_transcript_dispatcher.release(final_key)
@@ -2371,9 +2809,7 @@ class IndependentAsrRuntime:
                         and self._asr_detector is suppression.detector
                     ):
                         reinstalled = False
-                        for _attempt in range(
-                            _CANDIDATE_REJECTION_REINSTALL_ATTEMPTS
-                        ):
+                        for _attempt in range(_CANDIDATE_REJECTION_REINSTALL_ATTEMPTS):
                             shadow = self._create_speaker_shadow(factory)
                             if shadow is None:
                                 break
@@ -2435,8 +2871,7 @@ class IndependentAsrRuntime:
                 watchdog.cancel()
             if (
                 suppression.request.session_epoch == self._asr_session_epoch
-                and suppression.request.audio_generation
-                == self._asr_audio_generation
+                and suppression.request.audio_generation == self._asr_audio_generation
                 and self._asr_lifecycle is suppression.lifecycle
                 and self._asr_detector is suppression.detector
             ):
@@ -2450,6 +2885,12 @@ class IndependentAsrRuntime:
     def _reset_asr_turn_state(self) -> None:
         """Reset per-turn bookkeeping shared by close/abort/error teardown."""
 
+        decision_gate = self._asr_speaker_candidate_decision_gate
+        if decision_gate is not None:
+            self._release_speaker_candidate_decision_gate(
+                decision_gate,
+                metric_name="speaker_gate_stale_count",
+            )
         self._asr_turn_prepared = False
         self._asr_received_audio = False
         self._asr_pending_speech_confirmed = False
@@ -2465,6 +2906,7 @@ class IndependentAsrRuntime:
         self._asr_partial_turn_token = None
         self._asr_accepted_final_keys.clear()
         self._asr_reserved_final_key = None
+        self._asr_suppressed_final_key = None
         self._asr_candidate_rejection = None
         self._asr_sealed_turn_token = None
         self._asr_provider_candidate_fence = None
@@ -2634,7 +3076,9 @@ class IndependentAsrRuntime:
 
             if lifecycle is not None and detector is not None:
                 submit_audio = getattr(detector, "submit_audio", None)
-                uses_smart_turn = _uses_smart_turn_endpointing(lifecycle.provider_policy)
+                uses_smart_turn = _uses_smart_turn_endpointing(
+                    lifecycle.provider_policy
+                )
                 if uses_smart_turn and callable(submit_audio):
                     detector_submit_started_at = time.perf_counter()
                     submitted = await submit_audio(
@@ -2756,24 +3200,48 @@ class IndependentAsrRuntime:
                             )
                             if not ingress_is_current():
                                 return AsrSubmitResult(AsrSubmitStatus.STALE)
-                    if (
+                    pending_speech_confirmed = bool(
+                        lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+                        and any(
+                            event
+                            in {
+                                SpeechActivityEvent.SPEECH_STARTED,
+                                SpeechActivityEvent.SPEECH_RESUMED,
+                            }
+                            for event in detector_result.events
+                        )
+                    )
+                    continuous_provider_wake = bool(
                         not detector_result.throttle_available
                         or not self._voice_input_resource_optimization_enabled
-                    ) and not await self._ensure_continuous_provider_wake(
+                    )
+                    if continuous_provider_wake:
+                        if not await self._ensure_continuous_provider_wake(
+                            lifecycle,
+                            identity.session_epoch,
+                            detector_identity=detector_result.identity,
+                            candidate=detector_result.candidate,
+                            expected_identity=identity,
+                        ):
+                            if not ingress_is_current():
+                                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                    elif not await self._bind_provider_detector_candidate(
                         lifecycle,
-                        identity.session_epoch,
+                        detector,
+                        detector_identity=detector_result.identity,
+                        candidate=detector_result.candidate,
+                        expected_identity=identity,
+                        pending_speech_confirmed=pending_speech_confirmed,
                     ):
-                        if not ingress_is_current():
-                            return AsrSubmitResult(AsrSubmitStatus.STALE)
-                        return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                        return AsrSubmitResult(AsrSubmitStatus.STALE)
             if lifecycle is not None and not ingress_is_current():
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
             suppression = self._asr_candidate_rejection
             if (
                 suppression is not None
                 and identity.session_epoch == suppression.request.session_epoch
-                and identity.audio_generation
-                == suppression.request.audio_generation
+                and identity.audio_generation == suppression.request.audio_generation
                 and identity.lifecycle is suppression.lifecycle
                 and identity.detector is suppression.detector
             ):
@@ -3241,8 +3709,7 @@ class IndependentAsrRuntime:
                 and self._asr_lifecycle is lifecycle
                 and self._asr_session is session_ref
                 and self._asr_detector is detector_ref
-                and lifecycle.snapshot.transport_generation
-                == transport_generation
+                and lifecycle.snapshot.transport_generation == transport_generation
             )
 
         async def expire() -> None:
@@ -3408,9 +3875,7 @@ class IndependentAsrRuntime:
             SpeechActivityEvent.SPEECH_RESUMED,
         }:
             ingress_token = self._asr_current_ingress_token
-            if ingress_token is None or not self._ingress_token_matches(
-                ingress_token
-            ):
+            if ingress_token is None or not self._ingress_token_matches(ingress_token):
                 # An idle ingress-backpressure bump keeps the provider session
                 # adopted, so a trailing session-side speech event can still
                 # reach this handler with a stale audio generation. The wake
@@ -3653,10 +4118,7 @@ class IndependentAsrRuntime:
                 SpeechActivityEvent.SPEECH_RESUMED,
                 epoch,
             )
-            if (
-                epoch != self._asr_session_epoch
-                or self._asr_lifecycle is not lifecycle
-            ):
+            if epoch != self._asr_session_epoch or self._asr_lifecycle is not lifecycle:
                 return
             if (
                 not pending_before
@@ -3929,10 +4391,17 @@ class IndependentAsrRuntime:
             return
         if pending_candidate is not None:
             assert detector is not None
-            bound = await detector.bind_candidate(pending_candidate, turn_token)
+            try:
+                bound = await detector.bind_candidate(pending_candidate, turn_token)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                bound = None
             if not self._runtime_identity_matches(identity):
                 return
-            if bound is None:
+            if bound is None and _uses_smart_turn_endpointing(
+                lifecycle.provider_policy
+            ):
                 await self._handle_independent_asr_error(
                     identity.session_epoch,
                     identity.provider or "unknown",
@@ -3995,6 +4464,98 @@ class IndependentAsrRuntime:
                 self.display_name,
             )
 
+    def _speaker_candidate_decision_matches_provider_final(
+        self,
+        gate: _SpeakerCandidateDecisionGate,
+        *,
+        epoch: int,
+    ) -> bool:
+        lifecycle = self._asr_lifecycle
+        sealed_token = self._asr_sealed_turn_token
+        provider_fence = self._asr_provider_candidate_fence
+        candidate = gate.lease.candidate
+        return bool(
+            self._asr_speaker_candidate_decision_gate is gate
+            and epoch == gate.session_epoch == self._asr_session_epoch
+            and gate.audio_generation == self._asr_audio_generation
+            and gate.activation_generation
+            == self._speaker_verifier_activation_generation
+            and lifecycle is gate.lifecycle
+            and self._asr_detector is gate.detector
+            and self._asr_session is not None
+            and lifecycle is not None
+            and not _uses_smart_turn_endpointing(lifecycle.provider_policy)
+            and lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+            and lifecycle.snapshot.turn_id == gate.turn_token.turn_id
+            and lifecycle.snapshot.transport_generation == gate.transport_generation
+            and sealed_token is not None
+            and sealed_token.turn == gate.turn_token
+            and sealed_token.transport_generation == gate.transport_generation
+            and provider_fence is not None
+            and provider_fence.detector_epoch == candidate.detector_epoch
+            and provider_fence.candidate_generation == candidate.candidate_generation
+            and (
+                gate.lease.provider_fence is None
+                or gate.lease.provider_fence == provider_fence
+            )
+            and self._asr_partial_turn_token == gate.turn_token
+            and self._ingress_token_matches(gate.turn_token.ingress)
+            and self._asr_turn_prepared
+            and self._asr_reserved_final_key == gate.final_key
+            and gate.final_key == FinalKey.from_turn(gate.turn_token)
+            and gate.final_key not in self._asr_accepted_final_keys
+        )
+
+    async def _wait_for_speaker_candidate_decision(self, epoch: int) -> None:
+        """Wait outside final serialization for one exact first-low decision."""
+
+        gate: _SpeakerCandidateDecisionGate | None = None
+        remaining = 0.0
+        async with self._asr_final_lock:
+            gate = self._asr_speaker_candidate_decision_gate
+            if gate is None:
+                return
+            if not self._speaker_candidate_decision_matches_provider_final(
+                gate,
+                epoch=epoch,
+            ):
+                self._release_speaker_candidate_decision_gate(
+                    gate,
+                    metric_name="speaker_gate_stale_count",
+                )
+                return
+            now = time.monotonic()
+            if gate.deadline is None:
+                gate.deadline = now + _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS
+            if not gate.wait_started:
+                gate.wait_started = True
+                self._speaker_rejection_metrics["speaker_gate_waited_count"] += 1
+            remaining = gate.deadline - now
+            if remaining <= 0:
+                self._release_speaker_candidate_decision_gate(
+                    gate,
+                    metric_name="speaker_gate_timeout_count",
+                )
+                return
+            resolution = gate.resolved
+
+        try:
+            await asyncio.wait_for(asyncio.shield(resolution), timeout=remaining)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            if self._asr_speaker_candidate_decision_gate is gate:
+                self._release_speaker_candidate_decision_gate(
+                    gate,
+                    metric_name="speaker_gate_timeout_count",
+                )
+        except Exception:
+            if self._asr_speaker_candidate_decision_gate is gate:
+                self._release_speaker_candidate_decision_gate(
+                    gate,
+                    metric_name="speaker_gate_stale_count",
+                )
+
     async def _handle_independent_asr_final(
         self,
         text: str,
@@ -4004,6 +4565,7 @@ class IndependentAsrRuntime:
         clean = str(text or "").strip()
         if epoch != self._asr_session_epoch:
             return
+        await self._wait_for_speaker_candidate_decision(epoch)
 
         lifecycle_ref: VoiceInputLifecycleController | None = None
         detector_ref: DetectorRuntime | None = None
@@ -4013,6 +4575,7 @@ class IndependentAsrRuntime:
         transcript_dispatcher: TranscriptDispatcher | None = None
         final_key: FinalKey | None = None
         final_identity: _AsrRuntimeIdentity | None = None
+        suppress_transcript = False
         ordering_failure_identity: _AsrRuntimeIdentity | None = None
         provider_failure_identity: _AsrRuntimeIdentity | None = None
         successor_present = False
@@ -4059,10 +4622,8 @@ class IndependentAsrRuntime:
                         )
                     else:
                         try:
-                            completion = (
-                                await detector_ref.complete_provider_candidate(
-                                    provider_fence
-                                )
+                            completion = await detector_ref.complete_provider_candidate(
+                                provider_fence
                             )
                         except asyncio.CancelledError:
                             raise
@@ -4079,9 +4640,7 @@ class IndependentAsrRuntime:
                         if (
                             self._asr_lifecycle is not lifecycle_ref
                             or self._asr_detector is not detector_ref
-                            or not self._runtime_identity_matches(
-                                completion_identity
-                            )
+                            or not self._runtime_identity_matches(completion_identity)
                         ):
                             transcript_dispatcher.release(final_key)
                             return
@@ -4093,6 +4652,9 @@ class IndependentAsrRuntime:
                 if provider_failure_identity is None:
                     if not self._accept_final_key(final_key):
                         return
+                    suppress_transcript = self._asr_suppressed_final_key == final_key
+                    if suppress_transcript:
+                        self._asr_suppressed_final_key = None
                     if self._asr_turn_endpointed_at is not None:
                         lifecycle_ref.metrics.final_latency_ms = int(
                             (time.monotonic() - self._asr_turn_endpointed_at) * 1_000
@@ -4111,11 +4673,14 @@ class IndependentAsrRuntime:
                     self._asr_final_watchdog_task = None
                     if watchdog is not None and watchdog is not asyncio.current_task():
                         watchdog.cancel()
-                    envelope = TranscriptEnvelope(
-                        turn_token=sealed_token.turn,
-                        provider=provider,
-                        text=clean,
-                    )
+                    if suppress_transcript:
+                        transcript_dispatcher.release(final_key)
+                    else:
+                        envelope = TranscriptEnvelope(
+                            turn_token=sealed_token.turn,
+                            provider=provider,
+                            text=clean,
+                        )
                     if not clean:
                         lifecycle_ref.metrics.false_wake_count += 1
                     if successor_present and not has_pending_turn:
@@ -4178,6 +4743,8 @@ class IndependentAsrRuntime:
             transcript_dispatcher.release(final_key)
             await self._notify_asr_turn_abandoned(accepted_turn_token)
             return
+        if suppress_transcript:
+            await self._notify_asr_turn_abandoned(accepted_turn_token)
         if envelope is not None:
             try:
                 transcript_dispatcher.submit(envelope)

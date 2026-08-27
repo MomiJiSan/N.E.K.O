@@ -2936,7 +2936,7 @@
         "profileSavedDisabled": "O perfil de voz do Owner está salvo; o filtro está desligado",
         "profileMissing": "Ainda não há um perfil de voz do Owner",
         "reasonDisabled": "O perfil de voz do Owner está salvo; o filtro está desligado",
-        "reasonModelUnavailable": "O modelo de voz está indisponível; o ASR independente seguirá sem filtro",
+        "reasonModelUnavailable": "Os recursos do modelo de voz estão indisponíveis. Ao executar pelo código-fonte, use uv run python scripts/prepare_speaker_model.py; em uma instalação, repare ou reinstale. O ASR independente não é afetado.",
         "reasonProfileIncompatible": "Este perfil não é compatível com o modelo atual; cadastre novamente",
         "reasonSecureStorageUnavailable": "O armazenamento seguro está indisponível, então o filtro de voz está desligado",
         "reasonEnrollmentActive": "Um novo perfil está sendo cadastrado; o ASR independente seguirá sem filtro temporariamente",
@@ -2946,6 +2946,7 @@
         "enrollmentComplete": "O perfil de voz do Owner está salvo e ativo.",
         "microphoneDenied": "Não foi possível usar o microfone. Verifique a permissão e o dispositivo.",
         "requestFailed": "A operação falhou. Tente novamente.",
+        "errorModelUnavailable": "Os recursos do modelo de voz estão indisponíveis, portanto o cadastro não pode começar. Ao executar pelo código-fonte, use uv run python scripts/prepare_speaker_model.py; em uma instalação, repare ou reinstale e tente novamente.",
         "errorInvalidPcm": "O formato da gravação é inválido. Faça o cadastro novamente.",
         "errorAudioTooLong": "A gravação é longa demais. Faça o cadastro novamente.",
         "deleteConfirm": "Após excluir, será necessário cadastrar novamente para usar o filtro de voz."

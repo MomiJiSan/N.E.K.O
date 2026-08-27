@@ -35,6 +35,37 @@ from main_logic.voice_input.suppression import VoiceInputSuppressionController
 logger = logging.getLogger(__name__)
 
 _WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS = 1.0
+_VOICE_IDENTITY_DIAGNOSTIC_COUNTERS = frozenset(
+    {
+        "observation_count",
+        "first_checkpoint_count",
+        "second_checkpoint_count",
+        "low_checkpoint_count",
+        "reject_decision_count",
+        "rejection_request_failed_count",
+        "rejection_task_scheduled_count",
+        "rejection_task_applied_count",
+        "rejection_task_stale_count",
+        "rejection_stale_initial_count",
+        "rejection_stale_prepare_count",
+        "rejection_stale_runtime_fence_count",
+        "rejection_stale_candidate_fence_count",
+        "rejection_stale_smart_turn_count",
+        "rejection_stale_commit_count",
+        "rejection_prepare_detector_closed_count",
+        "rejection_prepare_candidate_closed_count",
+        "rejection_prepare_epoch_mismatch_count",
+        "rejection_prepare_shadow_mismatch_count",
+        "rejection_prepare_unbound_count",
+        "rejection_task_cleanup_degraded_count",
+        "rejection_task_failure_count",
+        "rejection_task_cancelled_count",
+        "rejection_task_pending_count",
+        "rejection_in_progress_count",
+        "verifier_installed_count",
+        "verifier_degraded_count",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -393,6 +424,35 @@ class OwnerVoiceRuntimeRegistry:
             if manager_result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE:
                 result = manager_result
         return result
+
+    def diagnostics_snapshot(self) -> dict[str, int]:
+        """Aggregate verifier counters without exposing identity or scores."""
+
+        totals = {name: 0 for name in _VOICE_IDENTITY_DIAGNOSTIC_COUNTERS}
+        managers = tuple(self._managers)
+        seen_runtimes: set[int] = set()
+        for manager in managers:
+            runtime = getattr(manager, "_asr_runtime", None)
+            runtime_id = id(runtime)
+            if runtime is None or runtime_id in seen_runtimes:
+                continue
+            seen_runtimes.add(runtime_id)
+            snapshot = getattr(runtime, "speaker_verifier_diagnostics", None)
+            if not callable(snapshot):
+                continue
+            try:
+                runtime_metrics = snapshot()
+            except Exception:
+                continue
+            if not isinstance(runtime_metrics, dict):
+                continue
+            for name in _VOICE_IDENTITY_DIAGNOSTIC_COUNTERS:
+                value = runtime_metrics.get(name)
+                if type(value) is int and value >= 0:
+                    totals[name] += value
+        totals["registered_manager_count"] = len(managers)
+        totals["diagnostic_runtime_count"] = len(seen_runtimes)
+        return totals
 
     @staticmethod
     def _manager_activation_result(manager) -> VoiceIdentityActivationResult:
@@ -1007,9 +1067,20 @@ async def unregister_voice_identity_manager(manager) -> None:
         await registry.unregister_manager(manager)
 
 
+def get_voice_identity_diagnostics() -> dict[str, int]:
+    registry = _runtime_registry
+    if registry is None:
+        return {
+            "registered_manager_count": 0,
+            "diagnostic_runtime_count": 0,
+        }
+    return registry.diagnostics_snapshot()
+
+
 __all__ = [
     "OwnerVoiceRuntimeRegistry",
     "close_voice_identity_runtime",
+    "get_voice_identity_diagnostics",
     "initialize_voice_identity_runtime",
     "install_voice_identity_runtime",
     "register_voice_identity_manager",

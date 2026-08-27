@@ -374,6 +374,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "enrollmentComplete",
         "microphoneDenied",
         "requestFailed",
+        "errorModelUnavailable",
         "deleteConfirm",
     }
     removed_wizard_keys = {

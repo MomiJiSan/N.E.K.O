@@ -219,6 +219,38 @@ async def test_activation_status_tracks_live_route_and_runtime_degradation() -> 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runtime() -> None:
+    registry = OwnerVoiceRuntimeRegistry(enforce=True)
+    runtime = SimpleNamespace(
+        speaker_verifier_diagnostics=lambda: {
+            "observation_count": 4,
+            "low_checkpoint_count": 2,
+            "rejection_task_applied_count": 1,
+            "similarity": 0.12,
+            "unexpected": 99,
+        }
+    )
+    first = _Manager()
+    first._asr_runtime = runtime
+    duplicate = _Manager()
+    duplicate._asr_runtime = runtime
+    await registry.register_manager(first)
+    await registry.register_manager(duplicate)
+
+    diagnostics = registry.diagnostics_snapshot()
+
+    assert diagnostics["registered_manager_count"] == 2
+    assert diagnostics["diagnostic_runtime_count"] == 1
+    assert diagnostics["observation_count"] == 4
+    assert diagnostics["low_checkpoint_count"] == 2
+    assert diagnostics["rejection_task_applied_count"] == 1
+    assert "similarity" not in diagnostics
+    assert "unexpected" not in diagnostics
+    await registry.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_inactive_blocked_managers_do_not_override_active_route_status() -> None:
     registry = OwnerVoiceRuntimeRegistry(enforce=True)
     active = _Manager()

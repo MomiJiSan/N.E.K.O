@@ -2936,7 +2936,7 @@
         "profileSavedDisabled": "Owner 聲紋已保存，目前已關閉過濾",
         "profileMissing": "尚未錄入 Owner 聲紋",
         "reasonDisabled": "Owner 聲紋已保存，目前已關閉過濾",
-        "reasonModelUnavailable": "聲紋模型暫時不可用，獨立 ASR 將正常放行",
+        "reasonModelUnavailable": "聲紋模型資源不可用。原始碼執行請使用 uv run python scripts/prepare_speaker_model.py；正式版本請修復或重新安裝。獨立 ASR 不受影響。",
         "reasonProfileIncompatible": "目前聲紋與模型不相容，請重新錄入",
         "reasonSecureStorageUnavailable": "安全儲存不可用，聲紋過濾未啟用",
         "reasonEnrollmentActive": "正在錄入新聲紋，獨立 ASR 將暫時放行",
@@ -2946,6 +2946,7 @@
         "enrollmentComplete": "Owner 聲紋已保存並啟用。",
         "microphoneDenied": "無法使用麥克風，請檢查權限與裝置。",
         "requestFailed": "操作失敗，請稍後重試。",
+        "errorModelUnavailable": "聲紋模型資源不可用，無法開始錄入。原始碼執行請使用 uv run python scripts/prepare_speaker_model.py；正式版本請修復或重新安裝後再試一次。",
         "errorInvalidPcm": "錄音格式無效，請重新錄入。",
         "errorAudioTooLong": "錄音時間過長，請重新錄入。",
         "deleteConfirm": "刪除後需要重新錄入才能使用聲紋過濾。"

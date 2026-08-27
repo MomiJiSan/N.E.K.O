@@ -2936,7 +2936,7 @@
         "profileSavedDisabled": "Owner 음성 지문이 저장되었습니다. 필터는 꺼져 있습니다",
         "profileMissing": "등록된 Owner 음성 지문이 없습니다",
         "reasonDisabled": "Owner 음성 지문이 저장되었습니다. 필터는 꺼져 있습니다",
-        "reasonModelUnavailable": "음성 지문 모델을 사용할 수 없어 독립 ASR이 정상적으로 통과합니다",
+        "reasonModelUnavailable": "음성 지문 모델 리소스를 사용할 수 없습니다. 소스 실행 시 uv run python scripts/prepare_speaker_model.py를 실행하고, 설치 버전은 복구하거나 다시 설치하세요. 독립 ASR에는 영향이 없습니다.",
         "reasonProfileIncompatible": "현재 모델과 음성 지문이 호환되지 않습니다. 다시 등록해 주세요",
         "reasonSecureStorageUnavailable": "보안 저장소를 사용할 수 없어 음성 지문 필터가 꺼졌습니다",
         "reasonEnrollmentActive": "새 음성 지문을 등록하는 동안 독립 ASR이 일시적으로 통과합니다",
@@ -2946,6 +2946,7 @@
         "enrollmentComplete": "Owner 음성 지문이 저장되고 활성화되었습니다.",
         "microphoneDenied": "마이크를 사용할 수 없습니다. 권한과 장치를 확인해 주세요.",
         "requestFailed": "작업에 실패했습니다. 다시 시도해 주세요.",
+        "errorModelUnavailable": "음성 지문 모델 리소스를 사용할 수 없어 등록을 시작할 수 없습니다. 소스 실행 시 uv run python scripts/prepare_speaker_model.py를 실행하고, 설치 버전은 복구하거나 다시 설치한 뒤 다시 시도해 주세요.",
         "errorInvalidPcm": "녹음 형식이 올바르지 않습니다. 다시 등록해 주세요.",
         "errorAudioTooLong": "녹음이 너무 깁니다. 다시 등록해 주세요.",
         "deleteConfirm": "삭제하면 음성 지문 필터를 사용하기 전에 다시 등록해야 합니다."

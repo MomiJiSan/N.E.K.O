@@ -21,6 +21,10 @@
         shadow_mode: 'voiceIdentity.reasonShadowMode'
     });
     const ENROLLMENT_ERROR_MESSAGES = Object.freeze({
+        model_unavailable: [
+            'voiceIdentity.errorModelUnavailable',
+            '声纹模型资源不可用，无法开始录入。源码运行请执行 uv run python scripts/prepare_speaker_model.py；正式版本请修复或重新安装后重试。'
+        ],
         invalid_pcm: ['voiceIdentity.errorInvalidPcm', '录音格式无效，请重新录入。'],
         audio_too_long: ['voiceIdentity.errorAudioTooLong', '录音时间过长，请重新录入。']
     });
@@ -302,7 +306,9 @@
         const pending = !state.initialized || state.busy
             || state.cancelPending || state.filterPending;
         const enrollmentUnavailable = !state.profileAvailable
-            && state.effectiveReason === 'secure_storage_unavailable';
+            && ['model_unavailable', 'secure_storage_unavailable'].includes(
+                state.effectiveReason
+            );
         elements.start.hidden = state.profileAvailable || state.busy || state.cancelPending;
         elements.start.disabled = pending || enrollmentUnavailable;
         elements.cancel.hidden = !state.busy && !state.cancelPending && !state.enrollmentId;

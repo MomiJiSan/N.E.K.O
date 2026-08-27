@@ -1350,6 +1350,8 @@ class DetectorFeedResult:
     throttle_available: bool
     endpointing_available: bool = True
     throttle_action: ThrottleAction | None = None
+    identity: DetectorIngressIdentity | None = None
+    candidate: DetectorCandidateKey | None = None
 
 
 class SmartTurnReadiness(Enum):
@@ -1382,6 +1384,7 @@ class DetectorCandidateRejectionLease:
     shadow_candidate: SpeakerShadowCandidateKey
     turn_token: VoiceTurnToken
     _runtime: "DetectorRuntime"
+    provider_fence: ProviderCandidateFence | None = None
 
     def belongs_to(self, runtime: object) -> bool:
         """Return whether this lease was issued by ``runtime``."""
@@ -1392,6 +1395,16 @@ class DetectorCandidateRejectionLease:
         """Invalidate candidate authority without yielding the event loop."""
 
         return self._runtime._commit_candidate_rejection(self)
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedProviderCandidateRejection:
+    """Exact post-seal speaker authority retained until Provider final."""
+
+    provider_fence: ProviderCandidateFence
+    candidate: DetectorCandidateKey
+    shadow_candidate: SpeakerShadowCandidateKey
+    turn_token: VoiceTurnToken
 
 
 class DetectorRuntime:
@@ -1476,6 +1489,9 @@ class DetectorRuntime:
             tuple[int, int, int], SmartTurnCompletionFence
         ] = {}
         self._provider_candidate_fence: ProviderCandidateFence | None = None
+        self._sealed_provider_candidate_rejection: (
+            _SealedProviderCandidateRejection | None
+        ) = None
         self._provider_discarded_through_sequence_no: int | None = None
         self._speaker_shadow = speaker_shadow
         self._speaker_shadow_generation = 0
@@ -1483,6 +1499,13 @@ class DetectorRuntime:
         self._speaker_shadow_suppressed_candidate: (
             tuple[int, SpeakerShadowScope] | None
         ) = None
+        self._speaker_rejection_prepare_diagnostics = {
+            "rejection_prepare_detector_closed_count": 0,
+            "rejection_prepare_candidate_closed_count": 0,
+            "rejection_prepare_epoch_mismatch_count": 0,
+            "rejection_prepare_shadow_mismatch_count": 0,
+            "rejection_prepare_unbound_count": 0,
+        }
         if (
             provider_policy is not None
             and provider_policy.endpoint_authority == "smart_turn"
@@ -1706,12 +1729,38 @@ class DetectorRuntime:
         if type(shadow_candidate) is not SpeakerShadowCandidateKey:
             return None
         async with self._lock:
+            if self._closed:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_prepare_detector_closed_count"
+                ] += 1
+                return None
+            sealed = self._sealed_provider_candidate_rejection
             if (
-                self._closed
-                or not self._candidate_open
-                or shadow_candidate != self._speaker_shadow_candidate
-                or shadow_candidate.detector_epoch != self._detector_epoch
+                sealed is not None
+                and sealed.provider_fence == self._provider_candidate_fence
+                and shadow_candidate == sealed.shadow_candidate
             ):
+                return DetectorCandidateRejectionLease(
+                    candidate=sealed.candidate,
+                    shadow_candidate=sealed.shadow_candidate,
+                    turn_token=sealed.turn_token,
+                    _runtime=self,
+                    provider_fence=sealed.provider_fence,
+                )
+            if not self._candidate_open:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_prepare_candidate_closed_count"
+                ] += 1
+                return None
+            if shadow_candidate.detector_epoch != self._detector_epoch:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_prepare_epoch_mismatch_count"
+                ] += 1
+                return None
+            if shadow_candidate != self._speaker_shadow_candidate:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_prepare_shadow_mismatch_count"
+                ] += 1
                 return None
             candidate = DetectorCandidateKey(
                 self._detector_epoch,
@@ -1719,6 +1768,9 @@ class DetectorRuntime:
             )
             bound = self._bound_turns.get(candidate)
             if bound is None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_prepare_unbound_count"
+                ] += 1
                 return None
             return DetectorCandidateRejectionLease(
                 candidate=candidate,
@@ -1726,6 +1778,11 @@ class DetectorRuntime:
                 turn_token=bound.turn_token,
                 _runtime=self,
             )
+
+    def speaker_rejection_diagnostics_snapshot(self) -> dict[str, int]:
+        """Return aggregate-only rejection preparation counters."""
+
+        return dict(self._speaker_rejection_prepare_diagnostics)
 
     def _commit_candidate_rejection(
         self,
@@ -1741,6 +1798,32 @@ class DetectorRuntime:
         if self._lock.locked():
             return False
         candidate = lease.candidate
+        provider_fence = lease.provider_fence
+        if provider_fence is not None:
+            sealed = self._sealed_provider_candidate_rejection
+            bound = self._bound_turns.get(candidate)
+            if (
+                lease._runtime is not self
+                or self._closed
+                or sealed is None
+                or provider_fence != self._provider_candidate_fence
+                or provider_fence != sealed.provider_fence
+                or candidate
+                != DetectorCandidateKey(
+                    provider_fence.detector_epoch,
+                    provider_fence.candidate_generation,
+                )
+                or candidate != sealed.candidate
+                or candidate.detector_epoch != self._detector_epoch
+                or lease.shadow_candidate != sealed.shadow_candidate
+                or lease.turn_token != sealed.turn_token
+                or bound is None
+                or bound.turn_token != sealed.turn_token
+            ):
+                return False
+            self._sealed_provider_candidate_rejection = None
+            return True
+
         bound = self._bound_turns.get(candidate)
         if (
             lease._runtime is not self
@@ -1760,6 +1843,7 @@ class DetectorRuntime:
         self._candidate_open = False
         self._policy_event_candidate = None
         self._provider_candidate_fence = None
+        self._sealed_provider_candidate_rejection = None
         self._throttle_policy.reset_candidate_activity()
         self._finish_speaker_shadow_candidate(
             expected_scope=lease.shadow_candidate.scope,
@@ -2052,6 +2136,7 @@ class DetectorRuntime:
             self._deferred_completions.clear()
             self._completion_fences.clear()
             self._provider_candidate_fence = None
+            self._sealed_provider_candidate_rejection = None
             self._deferred_completion_identity_advanced = False
             self._provider_discarded_through_sequence_no = None
             # A deferred completion belongs to the invalidated epoch; keeping
@@ -2235,6 +2320,8 @@ class DetectorRuntime:
             events,
             True,
             throttle_action=throttle.action,
+            identity=identity,
+            candidate=candidate,
         )
 
     def observe_provider_audio(
@@ -2274,12 +2361,33 @@ class DetectorRuntime:
             existing = self._provider_candidate_fence
             if existing is not None:
                 return existing
+            candidate = DetectorCandidateKey(
+                self._detector_epoch,
+                self._candidate_generation,
+            )
             fence = ProviderCandidateFence(
                 detector_epoch=self._detector_epoch,
                 candidate_generation=self._candidate_generation,
                 through_sequence_no=self._sequence_no,
             )
             self._provider_candidate_fence = fence
+            shadow_candidate = self._speaker_shadow_candidate
+            bound = self._bound_turns.get(candidate)
+            self._sealed_provider_candidate_rejection = (
+                _SealedProviderCandidateRejection(
+                    provider_fence=fence,
+                    candidate=candidate,
+                    shadow_candidate=shadow_candidate,
+                    turn_token=bound.turn_token,
+                )
+                if (
+                    shadow_candidate is not None
+                    and shadow_candidate.scope == "provider_candidate"
+                    and shadow_candidate.detector_epoch == self._detector_epoch
+                    and bound is not None
+                )
+                else None
+            )
             self._provider_discarded_through_sequence_no = None
             self._candidate_generation += 1
             self._candidate_open = False
@@ -2335,6 +2443,7 @@ class DetectorRuntime:
             ):
                 return None
             self._provider_candidate_fence = None
+            self._sealed_provider_candidate_rejection = None
             successor_floor = max(
                 fence.through_sequence_no,
                 self._provider_discarded_through_sequence_no
@@ -2463,6 +2572,7 @@ class DetectorRuntime:
             self._deferred_completions.clear()
             self._completion_fences.clear()
             self._provider_candidate_fence = None
+            self._sealed_provider_candidate_rejection = None
             self._provider_discarded_through_sequence_no = None
             self._defer_turn_complete = False
             self._deferred_turn_complete = False
@@ -2573,6 +2683,7 @@ class DetectorRuntime:
                 self._deferred_completions.clear()
                 self._completion_fences.clear()
                 self._provider_candidate_fence = None
+                self._sealed_provider_candidate_rejection = None
                 self._provider_discarded_through_sequence_no = None
                 self._speech_active = False
                 self._prepare_token = None
@@ -2631,6 +2742,7 @@ class DetectorRuntime:
             elif new_shadow is self._speaker_shadow:
                 return
             else:
+                self._sealed_provider_candidate_rejection = None
                 suppressed = self._speaker_shadow_suppressed_candidate
                 if suppressed is not None and suppressed[0] != self._detector_epoch:
                     self._speaker_shadow_suppressed_candidate = None
@@ -2737,6 +2849,7 @@ class DetectorRuntime:
                 self._deferred_completions.clear()
                 self._completion_fences.clear()
                 self._provider_candidate_fence = None
+                self._sealed_provider_candidate_rejection = None
                 self._provider_discarded_through_sequence_no = None
                 watch_task, self._failure_watch_task = self._failure_watch_task, None
                 if watch_task is not None:
@@ -2915,6 +3028,7 @@ class DetectorRuntime:
             self._deferred_completions.clear()
             self._completion_fences.clear()
             self._provider_candidate_fence = None
+            self._sealed_provider_candidate_rejection = None
             self._provider_discarded_through_sequence_no = None
             self._smart_turn_readiness = SmartTurnReadiness.FAILED
             await self._reset_speaker_shadow(self._speaker_shadow)

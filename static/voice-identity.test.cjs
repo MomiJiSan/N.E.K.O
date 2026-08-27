@@ -114,6 +114,7 @@ function createHarness({
     initialRequested = false,
     statusGate,
     startGate,
+    startError,
     mediaGate,
     mediaError,
     audioChunks = FULL_AUDIO_CHUNKS,
@@ -181,6 +182,12 @@ function createHarness({
         }
         if (call.url === `${API_ROOT}/enrollment/start`) {
             if (startGate) await startGate.promise;
+            if (startError) {
+                return jsonResponse(
+                    { error_code: startError },
+                    { ok: false, status: 503 },
+                );
+            }
             enrollmentId = 'enrollment-1';
             return jsonResponse(statusPayload());
         }
@@ -287,12 +294,14 @@ function createHarness({
                 'voiceIdentity.profileReady': 'Owner voice profile is saved and enabled',
                 'voiceIdentity.profileSavedDisabled': 'Owner voice profile is saved; filtering is off',
                 'voiceIdentity.reasonRuntimeDegraded': 'Voice filtering is unavailable',
+                'voiceIdentity.reasonModelUnavailable': 'Prepare the voice model assets or repair the installation',
                 'voiceIdentity.reasonSecureStorageUnavailable': 'Secure storage is unavailable',
                 'voiceIdentity.recording': 'Recording...',
                 'voiceIdentity.saving': 'Saving...',
                 'voiceIdentity.enrollmentComplete': 'Enrollment complete.',
                 'voiceIdentity.microphoneDenied': 'Microphone unavailable.',
                 'voiceIdentity.requestFailed': 'Request failed.',
+                'voiceIdentity.errorModelUnavailable': 'Voice model unavailable; prepare assets or repair the installation.',
                 'voiceIdentity.errorInvalidPcm': 'Invalid recording format.',
                 'voiceIdentity.errorAudioTooLong': 'Recording is too long.',
                 'voiceIdentity.deleteConfirm': 'Delete the profile?',
@@ -575,6 +584,35 @@ test('backend degradation reason is preserved when no profile exists', async () 
         'Secure storage is unavailable',
     );
     assert.equal(harness.elements.get('voice-identity-start').disabled, true);
+});
+
+test('model unavailability disables enrollment and shows actionable status', async () => {
+    const harness = createHarness({
+        initialEffectiveReason: 'model_unavailable',
+    });
+    await harness.initialize();
+
+    assert.equal(
+        harness.elements.get('voice-identity-profile-status').textContent,
+        'Prepare the voice model assets or repair the installation',
+    );
+    assert.equal(harness.elements.get('voice-identity-start').disabled, true);
+});
+
+test('late model rejection shows its dedicated enrollment error', async () => {
+    const harness = createHarness({ startError: 'model_unavailable' });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.equal(
+        harness.elements.get('voice-identity-message').textContent,
+        'Voice model unavailable; prepare assets or repair the installation.',
+    );
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/profile`),
+        false,
+    );
 });
 
 test('filter toggle sends the requested boolean and adopts canonical state', async () => {
