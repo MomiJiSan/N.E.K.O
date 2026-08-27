@@ -12,6 +12,14 @@ def test_debug_health_voice_identity_diagnostics_keep_only_safe_counters(
         lambda: {
             "observation_count": 3,
             "rejection_task_applied_count": 1,
+            "speaker_gate_armed_count": 2,
+            "speaker_gate_armed_while_preparing_count": 1,
+            "speaker_gate_waited_count": 1,
+            "speaker_gate_resolved_forward_count": 1,
+            "speaker_gate_resolved_reject_count": 1,
+            "speaker_gate_timeout_count": 0,
+            "speaker_gate_stale_count": 0,
+            "speaker_gate_released_prepare_failure_count": 1,
             "similarity": 0.12,
             "embedding": [1.0, 0.0],
             "unexpected": 99,
@@ -23,4 +31,12 @@ def test_debug_health_voice_identity_diagnostics_keep_only_safe_counters(
     assert debug_router._safe_voice_identity_diagnostics() == {
         "observation_count": 3,
         "rejection_task_applied_count": 1,
+        "speaker_gate_armed_count": 2,
+        "speaker_gate_armed_while_preparing_count": 1,
+        "speaker_gate_waited_count": 1,
+        "speaker_gate_resolved_forward_count": 1,
+        "speaker_gate_resolved_reject_count": 1,
+        "speaker_gate_timeout_count": 0,
+        "speaker_gate_stale_count": 0,
+        "speaker_gate_released_prepare_failure_count": 1,
     }

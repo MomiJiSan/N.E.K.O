@@ -226,6 +226,14 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
             "observation_count": 4,
             "low_checkpoint_count": 2,
             "rejection_task_applied_count": 1,
+            "speaker_gate_armed_count": 2,
+            "speaker_gate_armed_while_preparing_count": 1,
+            "speaker_gate_waited_count": 1,
+            "speaker_gate_resolved_forward_count": 1,
+            "speaker_gate_resolved_reject_count": 1,
+            "speaker_gate_timeout_count": 0,
+            "speaker_gate_stale_count": 0,
+            "speaker_gate_released_prepare_failure_count": 1,
             "similarity": 0.12,
             "unexpected": 99,
         }
@@ -244,6 +252,14 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
     assert diagnostics["observation_count"] == 4
     assert diagnostics["low_checkpoint_count"] == 2
     assert diagnostics["rejection_task_applied_count"] == 1
+    assert diagnostics["speaker_gate_armed_count"] == 2
+    assert diagnostics["speaker_gate_armed_while_preparing_count"] == 1
+    assert diagnostics["speaker_gate_waited_count"] == 1
+    assert diagnostics["speaker_gate_resolved_forward_count"] == 1
+    assert diagnostics["speaker_gate_resolved_reject_count"] == 1
+    assert diagnostics["speaker_gate_timeout_count"] == 0
+    assert diagnostics["speaker_gate_stale_count"] == 0
+    assert diagnostics["speaker_gate_released_prepare_failure_count"] == 1
     assert "similarity" not in diagnostics
     assert "unexpected" not in diagnostics
     await registry.close()

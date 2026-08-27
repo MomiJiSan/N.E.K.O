@@ -186,6 +186,17 @@ def _smart_turn_shadow_candidate() -> SpeakerShadowCandidateKey:
     return SpeakerShadowCandidateKey(7, 3, "smart_turn_turn")
 
 
+def _rewind_installed_candidate_to_unprepared(
+    runtime: IndependentAsrRuntime,
+) -> None:
+    final_key = runtime._asr_reserved_final_key
+    assert final_key is not None
+    runtime._asr_transcript_dispatcher.release(final_key)
+    runtime._asr_reserved_final_key = None
+    runtime._asr_turn_prepared = False
+    runtime._asr_partial_turn_token = None
+
+
 def test_rejection_request_outside_event_loop_fails_open() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     runtime._speaker_verifier_activation_generation = "profile-generation"
@@ -443,6 +454,458 @@ async def test_first_low_provider_gate_waits_outside_final_lock_for_rejection() 
     assert diagnostics["speaker_gate_resolved_forward_count"] == 0
     assert diagnostics["speaker_gate_timeout_count"] == 0
     assert diagnostics["speaker_gate_stale_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_first_low_provider_gate_arms_while_turn_preparation_is_pending() -> None:
+    prepare_started = asyncio.Event()
+    prepare_release = asyncio.Event()
+    callbacks = _callbacks()
+
+    async def delayed_prepare(_turn_token: VoiceTurnToken) -> bool:
+        prepare_started.set()
+        await prepare_release.wait()
+        return True
+
+    callbacks.on_prepare_turn.side_effect = delayed_prepare  # type: ignore[attr-defined]
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    _rewind_installed_candidate_to_unprepared(runtime)
+    prepare_task = asyncio.create_task(
+        runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
+    )
+    await asyncio.wait_for(prepare_started.wait(), 1)
+
+    assert runtime._asr_turn_prepared is True
+    assert runtime._asr_partial_turn_token is None
+    assert runtime._asr_reserved_final_key == FinalKey.from_turn(turn_token)
+    assert await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None
+    assert gate.armed_while_preparing is True
+    assert gate.turn_token == turn_token
+    assert gate.final_key == FinalKey.from_turn(turn_token)
+
+    prepare_release.set()
+    await asyncio.wait_for(prepare_task, 1)
+
+    assert runtime._asr_partial_turn_token == turn_token
+    assert runtime._asr_speaker_candidate_decision_gate is gate
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_armed_count"] == 1
+    assert diagnostics["speaker_gate_armed_while_preparing_count"] == 1
+    assert diagnostics["speaker_gate_released_prepare_failure_count"] == 0
+    assert runtime._resolve_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+        rejected=False,
+    )
+    await _close_dispatchers(runtime)
+
+
+async def test_provisional_gate_holds_early_final_until_prepare_then_rejects() -> None:
+    prepare_started = asyncio.Event()
+    prepare_release = asyncio.Event()
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+
+    async def delayed_prepare(_turn_token: VoiceTurnToken) -> bool:
+        prepare_started.set()
+        await prepare_release.wait()
+        return True
+
+    callbacks.on_prepare_turn.side_effect = delayed_prepare  # type: ignore[attr-defined]
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    _rewind_installed_candidate_to_unprepared(runtime)
+    prepare_task = asyncio.create_task(
+        runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
+    )
+    await asyncio.wait_for(prepare_started.wait(), 1)
+    candidate = _shadow_candidate()
+    assert await runtime._arm_speaker_candidate_decision(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None and gate.armed_while_preparing is True
+    provider_fence = _seal_installed_provider_candidate(
+        runtime,
+        detector,
+        session,
+        lifecycle,
+        turn_token,
+    )
+
+    final_task = asyncio.create_task(
+        runtime._handle_independent_asr_final("not-owner-final", 0, "qwen")
+    )
+
+    async def wait_for_gate_waiter() -> None:
+        while not gate.wait_started:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_gate_waiter(), 0.2)
+    assert final_task.done() is False
+    callbacks.on_final.assert_not_awaited()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_waited_count"] == 1
+    assert diagnostics["speaker_gate_stale_count"] == 0
+
+    async def complete_preparation_and_reject() -> None:
+        prepare_release.set()
+        await prepare_task
+        assert runtime._asr_partial_turn_token == turn_token
+        assert runtime.request_speaker_candidate_rejection(
+            candidate,
+            activation_generation="profile-generation",
+        )
+        rejection_tasks = tuple(runtime._asr_rejection_tasks)
+        assert len(rejection_tasks) == 1
+        await asyncio.gather(*rejection_tasks)
+        await final_task
+        await runtime.wait_transcript_idle()
+
+    await asyncio.wait_for(complete_preparation_and_reject(), 0.2)
+
+    assert detector.lease is not None and detector.lease.commit_calls == 1
+    callbacks.on_final.assert_not_awaited()
+    detector.complete_provider_candidate.assert_awaited_once_with(provider_fence)
+    abandoned.assert_awaited_once_with(turn_token)
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_waited_count"] == 1
+    assert diagnostics["speaker_gate_resolved_reject_count"] == 1
+    assert diagnostics["speaker_gate_timeout_count"] == 0
+    assert diagnostics["speaker_gate_stale_count"] == 0
+    assert diagnostics["rejection_task_applied_count"] == 1
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    await _close_dispatchers(runtime)
+
+
+async def test_real_speaker_shadow_rejects_final_after_first_low_during_prepare(
+    monkeypatch,
+) -> None:
+    import numpy as np
+
+    from main_logic.asr_client.speaker_shadow.asset_manifest import (
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+    )
+    from main_logic.asr_client.speaker_shadow.campplus import (
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    from main_logic.voice_identity.contracts import SpeakerModelIdentity
+    from main_logic.voice_identity.profile import SpeakerProfile
+    from main_logic.voice_identity.reference import SpeakerReference
+    from main_logic.voice_identity_service.asr_composition import (
+        OwnerVoiceAsrCompositionFactory,
+    )
+
+    class _ScoringHost:
+        alive = True
+
+        async def score(
+            self,
+            _pcm16: bytes,
+            *,
+            timeout_seconds: float,
+        ) -> float:
+            assert timeout_seconds > 0
+            return 0.20
+
+    prepare_started = asyncio.Event()
+    prepare_release = asyncio.Event()
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+
+    async def delayed_prepare(_turn_token: VoiceTurnToken) -> bool:
+        prepare_started.set()
+        await prepare_release.wait()
+        return True
+
+    callbacks.on_prepare_turn.side_effect = delayed_prepare  # type: ignore[attr-defined]
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    _rewind_installed_candidate_to_unprepared(runtime)
+
+    model_identity = SpeakerModelIdentity(
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    embedding = np.arange(1, CAMPPLUS_EMBEDDING_DIM + 1, dtype=np.float32)
+    reference = SpeakerReference(model_identity, embedding)
+    embedding.fill(0.0)
+    try:
+        profile = SpeakerProfile("profile-generation", reference)
+    finally:
+        reference.close()
+    composition = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    shadow = composition()
+    monkeypatch.setattr(
+        shadow,
+        "_ensure_backend",
+        AsyncMock(return_value=_ScoringHost()),
+    )
+    candidate = _shadow_candidate()
+    checkpoint_pcm16 = b"\x21\x00" * (16_000 * 1_500 // 1_000)
+
+    prepare_task = asyncio.create_task(
+        runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
+    )
+    await asyncio.wait_for(prepare_started.wait(), 1)
+    assert shadow.submit(
+        checkpoint_pcm16,
+        sample_rate_hz=16_000,
+        candidate=candidate,
+    )
+    await shadow.wait_idle()
+
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None and gate.armed_while_preparing is True
+    assert runtime._asr_partial_turn_token is None
+
+    prepare_release.set()
+    await asyncio.wait_for(prepare_task, 1)
+    provider_fence = _seal_installed_provider_candidate(
+        runtime,
+        detector,
+        session,
+        lifecycle,
+        turn_token,
+    )
+    assert shadow.submit(
+        checkpoint_pcm16,
+        sample_rate_hz=16_000,
+        candidate=candidate,
+    )
+    await shadow.wait_idle()
+
+    async def wait_for_rejection() -> None:
+        while not runtime._speaker_verifier_diagnostics()[
+            "rejection_task_applied_count"
+        ]:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_rejection(), 1)
+    await runtime._handle_independent_asr_final("not-owner-final", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_armed_while_preparing_count"] == 1
+    assert diagnostics["rejection_task_scheduled_count"] == 1
+    assert diagnostics["rejection_task_applied_count"] == 1
+    assert diagnostics["rejection_task_stale_count"] == 0
+    assert diagnostics["speaker_gate_resolved_reject_count"] == 1
+    assert diagnostics["speaker_gate_timeout_count"] == 0
+    assert diagnostics["speaker_gate_stale_count"] == 0
+    callbacks.on_final.assert_not_awaited()
+    detector.complete_provider_candidate.assert_awaited_once_with(provider_fence)
+    abandoned.assert_awaited_once_with(turn_token)
+    assert runtime._asr_suppressed_final_key is None
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    shadow_metrics = shadow.snapshot()
+    assert shadow_metrics["callback_failure_count"] == 0
+    assert shadow_metrics["stale_result_count"] == 0
+
+    await shadow.close()
+    composition.close()
+    profile.close()
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_gate_never_treats_wrong_nonempty_partial_token_as_preparing() -> (
+    None
+):
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_partial_turn_token = VoiceTurnToken(
+        ingress=turn_token.ingress,
+        turn_id=turn_token.turn_id + 1,
+    )
+
+    assert not await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_armed_count"] == 0
+    assert diagnostics["speaker_gate_armed_while_preparing_count"] == 0
+    assert detector.lease is not None and detector.lease.commit_calls == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_provisional_gate_cannot_commit_before_partial_token_is_established() -> (
+    None
+):
+    prepare_started = asyncio.Event()
+    prepare_release = asyncio.Event()
+    callbacks = _callbacks()
+
+    async def delayed_prepare(_turn_token: VoiceTurnToken) -> bool:
+        prepare_started.set()
+        await prepare_release.wait()
+        return True
+
+    callbacks.on_prepare_turn.side_effect = delayed_prepare  # type: ignore[attr-defined]
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    _rewind_installed_candidate_to_unprepared(runtime)
+    prepare_task = asyncio.create_task(
+        runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
+    )
+    await asyncio.wait_for(prepare_started.wait(), 1)
+    candidate = _shadow_candidate()
+    assert await runtime._arm_speaker_candidate_decision(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None and gate.armed_while_preparing is True
+
+    outcome = await runtime._reject_speaker_candidate(
+        candidate,
+        activation_generation="profile-generation",
+        decision_gate=gate,
+    )
+
+    assert outcome is CandidateRejectionOutcome.STALE
+    assert detector.lease is not None and detector.lease.commit_calls == 0
+    assert runtime._asr_suppressed_final_key is None
+    assert runtime._asr_candidate_rejection is None
+    prepare_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await prepare_task
+    await _close_dispatchers(runtime)
+
+
+@pytest.mark.parametrize("prepare_outcome", ["rejected", "cancelled"])
+async def test_pending_prepare_failure_releases_only_its_provisional_gate(
+    prepare_outcome: str,
+) -> None:
+    prepare_started = asyncio.Event()
+    prepare_release = asyncio.Event()
+    callbacks = _callbacks()
+
+    async def delayed_prepare(_turn_token: VoiceTurnToken) -> bool:
+        prepare_started.set()
+        await prepare_release.wait()
+        return False
+
+    callbacks.on_prepare_turn.side_effect = delayed_prepare  # type: ignore[attr-defined]
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    _rewind_installed_candidate_to_unprepared(runtime)
+    prepare_task = asyncio.create_task(
+        runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
+    )
+    await asyncio.wait_for(prepare_started.wait(), 1)
+    assert await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None and gate.armed_while_preparing is True
+
+    if prepare_outcome == "cancelled":
+        prepare_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prepare_task
+    else:
+        prepare_release.set()
+        await asyncio.wait_for(prepare_task, 1)
+
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    assert runtime._asr_partial_turn_token is None
+    assert runtime._asr_turn_prepared is False
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_released_prepare_failure_count"] == 1
+    assert detector.lease is not None and detector.lease.commit_calls == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_authoritative_gate_does_not_downgrade_after_partial_token_is_cleared() -> (
+    None
+):
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    candidate = _shadow_candidate()
+    assert await runtime._arm_speaker_candidate_decision(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None and gate.armed_while_preparing is False
+    _seal_installed_provider_candidate(
+        runtime,
+        detector,
+        session,
+        lifecycle,
+        turn_token,
+    )
+    runtime._asr_partial_turn_token = None
+
+    await runtime._handle_independent_asr_final("forwarded", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    assert detector.lease is not None and detector.lease.commit_calls == 0
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_stale_count"] == 1
+    assert diagnostics["speaker_gate_waited_count"] == 0
     await _close_dispatchers(runtime)
 
 

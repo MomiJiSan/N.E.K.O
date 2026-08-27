@@ -110,11 +110,13 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "rejection_task_failure_count",
     "rejection_task_cancelled_count",
     "speaker_gate_armed_count",
+    "speaker_gate_armed_while_preparing_count",
     "speaker_gate_waited_count",
     "speaker_gate_resolved_forward_count",
     "speaker_gate_resolved_reject_count",
     "speaker_gate_timeout_count",
     "speaker_gate_stale_count",
+    "speaker_gate_released_prepare_failure_count",
 )
 
 
@@ -195,6 +197,7 @@ class _SpeakerCandidateDecisionGate:
     transport_generation: int
     lifecycle: VoiceInputLifecycleController
     detector: DetectorRuntime
+    armed_while_preparing: bool
     deadline: float | None
     resolved: asyncio.Future[None]
     rejection_task: asyncio.Task[CandidateRejectionOutcome | None] | None = None
@@ -412,6 +415,8 @@ class IndependentAsrRuntime:
             snapshot = lifecycle.snapshot
             turn_token = lease.turn_token
             final_key = FinalKey.from_turn(turn_token)
+            partial_turn_token = self._asr_partial_turn_token
+            armed_while_preparing = partial_turn_token is None
             common_authority = bool(
                 self._asr_speaker_candidate_decision_gate is None
                 and self._asr_session_epoch == session_epoch
@@ -423,7 +428,10 @@ class IndependentAsrRuntime:
                 and self._asr_session is not None
                 and lease.belongs_to(detector)
                 and lease.shadow_candidate == candidate
-                and turn_token == self._asr_partial_turn_token
+                and (
+                    partial_turn_token == turn_token
+                    or armed_while_preparing
+                )
                 and self._ingress_token_matches(turn_token.ingress)
                 and self._asr_turn_prepared
                 and self._asr_reserved_final_key == final_key
@@ -465,10 +473,15 @@ class IndependentAsrRuntime:
                 transport_generation=transport_generation,
                 lifecycle=lifecycle,
                 detector=detector,
+                armed_while_preparing=armed_while_preparing,
                 deadline=None,
                 resolved=asyncio.get_running_loop().create_future(),
             )
             self._speaker_rejection_metrics["speaker_gate_armed_count"] += 1
+            if armed_while_preparing:
+                self._speaker_rejection_metrics[
+                    "speaker_gate_armed_while_preparing_count"
+                ] += 1
             return True
 
     def _release_speaker_candidate_decision_gate(
@@ -4035,8 +4048,45 @@ class IndependentAsrRuntime:
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
         )
+
+        def unwind_preparation() -> None:
+            """Release only authority captured by this preparation attempt."""
+
+            transcript_dispatcher.release(final_key)
+            if (
+                self._runtime_identity_matches(identity)
+                and self._asr_transcript_dispatcher is transcript_dispatcher
+                and self._asr_reserved_final_key == final_key
+            ):
+                self._asr_reserved_final_key = None
+                self._asr_turn_prepared = False
+                if self._asr_partial_turn_token == turn_token:
+                    self._asr_partial_turn_token = None
+
+            decision_gate = self._asr_speaker_candidate_decision_gate
+            if (
+                decision_gate is not None
+                and decision_gate.armed_while_preparing
+                and decision_gate.session_epoch == identity.session_epoch
+                and decision_gate.audio_generation == identity.audio_generation
+                and decision_gate.transport_generation
+                == identity.transport_generation
+                and decision_gate.lifecycle is identity.lifecycle
+                and decision_gate.detector is identity.detector
+                and decision_gate.turn_token == turn_token
+                and decision_gate.lease.turn_token == turn_token
+                and decision_gate.final_key == final_key
+            ):
+                self._release_speaker_candidate_decision_gate(
+                    decision_gate,
+                    metric_name="speaker_gate_released_prepare_failure_count",
+                )
+
         try:
             accepted = await self._callbacks.on_prepare_turn(turn_token)
+        except asyncio.CancelledError:
+            unwind_preparation()
+            raise
         except Exception:
             accepted = False
             if self._runtime_identity_matches(identity):
@@ -4051,17 +4101,7 @@ class IndependentAsrRuntime:
             # happens to be current at callback time.
             self._asr_partial_turn_token = turn_token
             return
-        transcript_dispatcher.release(final_key)
-        if not self._runtime_identity_matches(identity):
-            return
-        if (
-            self._asr_transcript_dispatcher is transcript_dispatcher
-            and self._asr_reserved_final_key == final_key
-        ):
-            self._asr_reserved_final_key = None
-            self._asr_turn_prepared = False
-            if self._asr_partial_turn_token == turn_token:
-                self._asr_partial_turn_token = None
+        unwind_preparation()
 
     def _consume_overlap_completed_credit(self) -> None:
         """Retire one redeemed completed-overlap credit and its onset."""
@@ -4510,7 +4550,13 @@ class IndependentAsrRuntime:
                 gate.lease.provider_fence is None
                 or gate.lease.provider_fence == provider_fence
             )
-            and self._asr_partial_turn_token == gate.turn_token
+            and (
+                self._asr_partial_turn_token == gate.turn_token
+                or (
+                    gate.armed_while_preparing
+                    and self._asr_partial_turn_token is None
+                )
+            )
             and self._ingress_token_matches(gate.turn_token.ingress)
             and self._asr_turn_prepared
             and self._asr_reserved_final_key == gate.final_key
