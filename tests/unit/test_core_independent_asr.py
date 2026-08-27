@@ -9934,7 +9934,7 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     detector.observe_provider_audio(checkpoint_pcm16, sample_rate_hz=16_000)
     await shadow.wait_idle()
     for _attempt in range(100):
-        if runtime.speaker_verifier_diagnostics()[
+        if runtime._speaker_verifier_diagnostics()[
             "rejection_task_applied_count"
         ]:
             break
@@ -9951,7 +9951,7 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     assert type(detector_candidate) is contracts_module.SpeakerShadowCandidateKey
     assert type(detector_candidate) is detector_module.SpeakerShadowCandidateKey
     assert type(detector_candidate) is runtime_module.SpeakerShadowCandidateKey
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_task_applied_count"] == 1
     assert diagnostics["rejection_task_stale_count"] == 0
     assert diagnostics["rejection_stale_prepare_count"] == 0
@@ -10227,7 +10227,7 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
     assert submit_result.status is AsrSubmitStatus.ACCEPTED
     assert call_order[:2] == [("bind", 0, 0), ("observe", 0, 0)]
     assert provider_session.wire_pcm == [pcm16]
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_prepare_unbound_count"] == 0
 
     if rejection_timing == "submit":
@@ -10270,7 +10270,7 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
         await asyncio.wait_for(final_task, timeout=0.2)
         await runtime.wait_transcript_idle()
 
-        diagnostics = runtime.speaker_verifier_diagnostics()
+        diagnostics = runtime._speaker_verifier_diagnostics()
         assert diagnostics["rejection_task_applied_count"] == 1
         assert diagnostics["rejection_task_stale_count"] == 0
         assert diagnostics["speaker_gate_waited_count"] == 1

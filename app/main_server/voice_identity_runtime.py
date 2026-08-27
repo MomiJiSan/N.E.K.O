@@ -30,6 +30,7 @@ from main_logic.voice_identity_service.registry import (
 )
 from main_logic.voice_identity_service.service import VoiceIdentityService
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
+from main_routers.debug_router import set_voice_identity_diagnostics_provider
 
 
 logger = logging.getLogger(__name__)
@@ -437,7 +438,7 @@ class OwnerVoiceRuntimeRegistry:
             if runtime is None or runtime_id in seen_runtimes:
                 continue
             seen_runtimes.add(runtime_id)
-            snapshot = getattr(runtime, "speaker_verifier_diagnostics", None)
+            snapshot = getattr(runtime, "_speaker_verifier_diagnostics", None)
             if not callable(snapshot):
                 continue
             try:
@@ -1075,6 +1076,9 @@ def get_voice_identity_diagnostics() -> dict[str, int]:
             "diagnostic_runtime_count": 0,
         }
     return registry.diagnostics_snapshot()
+
+
+set_voice_identity_diagnostics_provider(get_voice_identity_diagnostics)
 
 
 __all__ = [

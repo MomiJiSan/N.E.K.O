@@ -194,7 +194,7 @@ def test_rejection_request_outside_event_loop_fails_open() -> None:
         _shadow_candidate(),
         activation_generation="profile-generation",
     )
-    assert runtime.speaker_verifier_diagnostics()["rejection_request_failed_count"] == 1
+    assert runtime._speaker_verifier_diagnostics()["rejection_request_failed_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -241,7 +241,7 @@ async def test_rejection_diagnostics_record_terminal_outcome(
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_task_scheduled_count"] == 1
     assert diagnostics["rejection_task_pending_count"] == 0
     for name, value in expected.items():
@@ -436,7 +436,7 @@ async def test_first_low_provider_gate_waits_outside_final_lock_for_rejection() 
     callbacks.on_final.assert_not_awaited()
     abandoned.assert_awaited_once_with(turn_token)
     assert runtime._asr_speaker_candidate_decision_gate is None
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["speaker_gate_armed_count"] == 1
     assert diagnostics["speaker_gate_waited_count"] == 1
     assert diagnostics["speaker_gate_resolved_reject_count"] == 1
@@ -485,7 +485,7 @@ async def test_provider_gate_timeout_forwards_final_and_rejects_late_request(
         candidate,
         activation_generation="profile-generation",
     )
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["speaker_gate_armed_count"] == 1
     assert diagnostics["speaker_gate_waited_count"] == 1
     assert diagnostics["speaker_gate_timeout_count"] == 1
@@ -532,7 +532,7 @@ async def test_provider_gate_forward_resolution_releases_waiting_final() -> None
     await runtime.wait_transcript_idle()
 
     callbacks.on_final.assert_awaited_once()
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["speaker_gate_resolved_forward_count"] == 1
     assert diagnostics["speaker_gate_timeout_count"] == 0
     await _close_dispatchers(runtime)
@@ -565,7 +565,7 @@ async def test_provider_gate_profile_change_is_stale_and_fails_open() -> None:
     await runtime.wait_transcript_idle()
 
     callbacks.on_final.assert_awaited_once()
-    assert runtime.speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
+    assert runtime._speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
     await _close_dispatchers(runtime)
 
 
@@ -608,7 +608,7 @@ async def test_provider_gate_runtime_or_turn_change_releases_without_rejection(
 
     assert runtime._asr_speaker_candidate_decision_gate is None
     assert detector.lease is not None and detector.lease.commit_calls == 0
-    assert runtime.speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
+    assert runtime._speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
     callbacks.on_final.assert_not_awaited()
     await _close_dispatchers(runtime)
 
@@ -642,7 +642,7 @@ async def test_provider_gate_resolution_exception_fails_open() -> None:
     await runtime.wait_transcript_idle()
 
     callbacks.on_final.assert_awaited_once()
-    assert runtime.speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
+    assert runtime._speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
     await _close_dispatchers(runtime)
 
 
@@ -682,7 +682,7 @@ async def test_provider_rejection_task_exception_releases_gate_fail_open() -> No
     await runtime.wait_transcript_idle()
 
     callbacks.on_final.assert_awaited_once()
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_task_failure_count"] == 1
     assert diagnostics["speaker_gate_stale_count"] == 1
     assert diagnostics["speaker_gate_resolved_reject_count"] == 0
@@ -724,7 +724,7 @@ async def test_provider_rejection_cannot_commit_after_gate_deadline() -> None:
 
     assert detector.lease is not None and detector.lease.commit_calls == 0
     assert runtime._asr_suppressed_final_key is None
-    assert runtime.speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
+    assert runtime._speaker_verifier_diagnostics()["speaker_gate_stale_count"] == 1
     await _close_dispatchers(runtime)
 
 
@@ -782,7 +782,7 @@ async def test_smart_turn_rejection_does_not_require_provider_gate() -> None:
     await asyncio.sleep(0)
 
     runtime._reject_speaker_candidate.assert_awaited_once()  # type: ignore[attr-defined]
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_task_applied_count"] == 1
     assert diagnostics["speaker_gate_armed_count"] == 0
     assert diagnostics["speaker_gate_resolved_reject_count"] == 0
@@ -910,7 +910,7 @@ async def test_candidate_rejection_forwards_when_authority_is_stale(
     )
 
     assert outcome is CandidateRejectionOutcome.STALE
-    diagnostics = runtime.speaker_verifier_diagnostics()
+    diagnostics = runtime._speaker_verifier_diagnostics()
     expected_counter = (
         "rejection_stale_initial_count"
         if stale_cause == "profile"

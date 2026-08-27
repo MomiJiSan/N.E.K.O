@@ -570,7 +570,7 @@ class IndependentAsrRuntime:
         )
         return True
 
-    def speaker_verifier_diagnostics(self) -> dict[str, int]:
+    def _speaker_verifier_diagnostics(self) -> dict[str, int]:
         """Return aggregate-only verifier diagnostics for local debugging."""
 
         metrics = dict(getattr(self, "_speaker_rejection_metrics", {}))

@@ -222,7 +222,7 @@ async def test_activation_status_tracks_live_route_and_runtime_degradation() -> 
 async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runtime() -> None:
     registry = OwnerVoiceRuntimeRegistry(enforce=True)
     runtime = SimpleNamespace(
-        speaker_verifier_diagnostics=lambda: {
+        _speaker_verifier_diagnostics=lambda: {
             "observation_count": 4,
             "low_checkpoint_count": 2,
             "rejection_task_applied_count": 1,
