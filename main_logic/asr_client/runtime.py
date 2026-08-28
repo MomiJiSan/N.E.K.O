@@ -117,6 +117,27 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "speaker_gate_timeout_count",
     "speaker_gate_stale_count",
     "speaker_gate_released_prepare_failure_count",
+    "speaker_gate_arm_invalid_count",
+    "speaker_gate_arm_conflict_count",
+    "speaker_gate_arm_runtime_unavailable_count",
+    "speaker_gate_arm_lifecycle_rejected_count",
+    "speaker_gate_arm_prepare_cancelled_count",
+    "speaker_gate_arm_prepare_failed_count",
+    "speaker_gate_arm_prepare_empty_count",
+    "speaker_gate_arm_final_lock_cancelled_count",
+    "speaker_gate_arm_common_authority_count",
+    "speaker_gate_arm_active_authority_count",
+    "speaker_gate_arm_draining_authority_count",
+    "speaker_gate_arm_unexpected_state_count",
+    "provider_candidate_bind_missing_identity_count",
+    "provider_candidate_bind_missing_candidate_count",
+    "provider_candidate_bind_identity_rejected_count",
+    "provider_candidate_bind_deferred_count",
+    "provider_candidate_bind_state_skipped_count",
+    "provider_candidate_bind_attempt_count",
+    "provider_candidate_bind_success_count",
+    "provider_candidate_bind_empty_count",
+    "provider_candidate_bind_failed_count",
 )
 
 
@@ -378,18 +399,27 @@ class IndependentAsrRuntime:
             or not activation_generation.strip()
             or activation_generation != self._speaker_verifier_activation_generation
         ):
+            self._speaker_rejection_metrics["speaker_gate_arm_invalid_count"] += 1
             return False
         current_gate = self._asr_speaker_candidate_decision_gate
         if current_gate is not None:
-            return bool(
+            matches_current = bool(
                 current_gate.candidate == candidate
                 and current_gate.activation_generation == activation_generation
                 and not current_gate.resolved.done()
             )
+            if not matches_current:
+                self._speaker_rejection_metrics[
+                    "speaker_gate_arm_conflict_count"
+                ] += 1
+            return matches_current
 
         detector = self._asr_detector
         lifecycle = self._asr_lifecycle
         if detector is None or lifecycle is None or self._asr_session is None:
+            self._speaker_rejection_metrics[
+                "speaker_gate_arm_runtime_unavailable_count"
+            ] += 1
             return False
         snapshot = lifecycle.snapshot
         if _uses_smart_turn_endpointing(
@@ -398,6 +428,9 @@ class IndependentAsrRuntime:
             VoiceLifecycleState.ACTIVE,
             VoiceLifecycleState.DRAINING,
         }:
+            self._speaker_rejection_metrics[
+                "speaker_gate_arm_lifecycle_rejected_count"
+            ] += 1
             return False
         session_epoch = self._asr_session_epoch
         audio_generation = self._asr_audio_generation
@@ -405,84 +438,113 @@ class IndependentAsrRuntime:
         try:
             lease = await detector.prepare_candidate_rejection(candidate)
         except asyncio.CancelledError:
+            self._speaker_rejection_metrics[
+                "speaker_gate_arm_prepare_cancelled_count"
+            ] += 1
             raise
         except Exception:
+            self._speaker_rejection_metrics[
+                "speaker_gate_arm_prepare_failed_count"
+            ] += 1
             return False
         if lease is None:
+            self._speaker_rejection_metrics[
+                "speaker_gate_arm_prepare_empty_count"
+            ] += 1
             return False
 
-        async with self._asr_final_lock:
-            snapshot = lifecycle.snapshot
-            turn_token = lease.turn_token
-            final_key = FinalKey.from_turn(turn_token)
-            partial_turn_token = self._asr_partial_turn_token
-            armed_while_preparing = partial_turn_token is None
-            common_authority = bool(
-                self._asr_speaker_candidate_decision_gate is None
-                and self._asr_session_epoch == session_epoch
-                and self._asr_audio_generation == audio_generation
-                and self._speaker_verifier_activation_generation
-                == activation_generation
-                and self._asr_lifecycle is lifecycle
-                and self._asr_detector is detector
-                and self._asr_session is not None
-                and lease.belongs_to(detector)
-                and lease.shadow_candidate == candidate
-                and (
-                    partial_turn_token == turn_token
-                    or armed_while_preparing
+        try:
+            async with self._asr_final_lock:
+                snapshot = lifecycle.snapshot
+                turn_token = lease.turn_token
+                final_key = FinalKey.from_turn(turn_token)
+                partial_turn_token = self._asr_partial_turn_token
+                armed_while_preparing = partial_turn_token is None
+                common_authority = bool(
+                    self._asr_speaker_candidate_decision_gate is None
+                    and self._asr_session_epoch == session_epoch
+                    and self._asr_audio_generation == audio_generation
+                    and self._speaker_verifier_activation_generation
+                    == activation_generation
+                    and self._asr_lifecycle is lifecycle
+                    and self._asr_detector is detector
+                    and self._asr_session is not None
+                    and lease.belongs_to(detector)
+                    and lease.shadow_candidate == candidate
+                    and (
+                        partial_turn_token == turn_token
+                        or armed_while_preparing
+                    )
+                    and self._ingress_token_matches(turn_token.ingress)
+                    and self._asr_turn_prepared
+                    and self._asr_reserved_final_key == final_key
+                    and final_key not in self._asr_accepted_final_keys
+                    and snapshot.transport_generation == transport_generation
+                    and snapshot.turn_id == turn_token.turn_id
                 )
-                and self._ingress_token_matches(turn_token.ingress)
-                and self._asr_turn_prepared
-                and self._asr_reserved_final_key == final_key
-                and final_key not in self._asr_accepted_final_keys
-                and snapshot.transport_generation == transport_generation
-                and snapshot.turn_id == turn_token.turn_id
-            )
-            if not common_authority:
-                return False
-            if snapshot.state is VoiceLifecycleState.ACTIVE:
-                if (
-                    lease.provider_fence is not None
-                    or self._asr_sealed_turn_token is not None
-                    or self._asr_provider_candidate_fence is not None
-                    or self._asr_audio_dispatcher.active_turn != turn_token
-                ):
+                if not common_authority:
+                    self._speaker_rejection_metrics[
+                        "speaker_gate_arm_common_authority_count"
+                    ] += 1
                     return False
-            elif snapshot.state is VoiceLifecycleState.DRAINING:
-                sealed_token = self._asr_sealed_turn_token
-                provider_fence = self._asr_provider_candidate_fence
-                if (
-                    sealed_token is None
-                    or sealed_token.turn != turn_token
-                    or sealed_token.transport_generation != transport_generation
-                    or provider_fence is None
-                    or lease.provider_fence != provider_fence
-                ):
+                if snapshot.state is VoiceLifecycleState.ACTIVE:
+                    if (
+                        lease.provider_fence is not None
+                        or self._asr_sealed_turn_token is not None
+                        or self._asr_provider_candidate_fence is not None
+                        or self._asr_audio_dispatcher.active_turn != turn_token
+                    ):
+                        self._speaker_rejection_metrics[
+                            "speaker_gate_arm_active_authority_count"
+                        ] += 1
+                        return False
+                elif snapshot.state is VoiceLifecycleState.DRAINING:
+                    sealed_token = self._asr_sealed_turn_token
+                    provider_fence = self._asr_provider_candidate_fence
+                    if (
+                        sealed_token is None
+                        or sealed_token.turn != turn_token
+                        or sealed_token.transport_generation != transport_generation
+                        or provider_fence is None
+                        or lease.provider_fence != provider_fence
+                    ):
+                        self._speaker_rejection_metrics[
+                            "speaker_gate_arm_draining_authority_count"
+                        ] += 1
+                        return False
+                else:
+                    self._speaker_rejection_metrics[
+                        "speaker_gate_arm_unexpected_state_count"
+                    ] += 1
                     return False
-            else:
-                return False
-            self._asr_speaker_candidate_decision_gate = _SpeakerCandidateDecisionGate(
-                candidate=candidate,
-                activation_generation=activation_generation,
-                lease=lease,
-                turn_token=turn_token,
-                final_key=final_key,
-                session_epoch=session_epoch,
-                audio_generation=audio_generation,
-                transport_generation=transport_generation,
-                lifecycle=lifecycle,
-                detector=detector,
-                armed_while_preparing=armed_while_preparing,
-                deadline=None,
-                resolved=asyncio.get_running_loop().create_future(),
-            )
-            self._speaker_rejection_metrics["speaker_gate_armed_count"] += 1
-            if armed_while_preparing:
-                self._speaker_rejection_metrics[
-                    "speaker_gate_armed_while_preparing_count"
-                ] += 1
-            return True
+                self._asr_speaker_candidate_decision_gate = (
+                    _SpeakerCandidateDecisionGate(
+                        candidate=candidate,
+                        activation_generation=activation_generation,
+                        lease=lease,
+                        turn_token=turn_token,
+                        final_key=final_key,
+                        session_epoch=session_epoch,
+                        audio_generation=audio_generation,
+                        transport_generation=transport_generation,
+                        lifecycle=lifecycle,
+                        detector=detector,
+                        armed_while_preparing=armed_while_preparing,
+                        deadline=None,
+                        resolved=asyncio.get_running_loop().create_future(),
+                    )
+                )
+                self._speaker_rejection_metrics["speaker_gate_armed_count"] += 1
+                if armed_while_preparing:
+                    self._speaker_rejection_metrics[
+                        "speaker_gate_armed_while_preparing_count"
+                    ] += 1
+                return True
+        except asyncio.CancelledError:
+            self._speaker_rejection_metrics[
+                "speaker_gate_arm_final_lock_cancelled_count"
+            ] += 1
+            raise
 
     def _release_speaker_candidate_decision_gate(
         self,
@@ -1556,7 +1618,15 @@ class IndependentAsrRuntime:
     ) -> bool:
         """Bind advisory Provider identity and report whether the runtime is current."""
 
-        if detector_identity is None or candidate is None:
+        if detector_identity is None:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_missing_identity_count"
+            ] += 1
+            return self._runtime_identity_matches(expected_identity)
+        if candidate is None:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_missing_candidate_count"
+            ] += 1
             return self._runtime_identity_matches(expected_identity)
         if (
             not self._runtime_identity_matches(expected_identity)
@@ -1567,12 +1637,18 @@ class IndependentAsrRuntime:
             or detector_identity.detector_epoch != detector.detector_epoch
             or candidate.detector_epoch != detector_identity.detector_epoch
         ):
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_identity_rejected_count"
+            ] += 1
             # Speaker identity is a soft filter. Ambiguous authority never
             # blocks the independent-ASR hard route.
             return self._runtime_identity_matches(expected_identity)
 
         state = lifecycle.snapshot.state
         if state is VoiceLifecycleState.DRAINING:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_deferred_count"
+            ] += 1
             if pending_speech_confirmed or lifecycle.has_pending_turn:
                 self._asr_pending_detector_candidate = candidate
             return True
@@ -1580,6 +1656,9 @@ class IndependentAsrRuntime:
             VoiceLifecycleState.PREWARMING,
             VoiceLifecycleState.ACTIVE,
         }:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_state_skipped_count"
+            ] += 1
             return True
 
         turn_token = self._capture_turn_token(lifecycle)
@@ -1587,14 +1666,28 @@ class IndependentAsrRuntime:
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
         )
+        self._speaker_rejection_metrics[
+            "provider_candidate_bind_attempt_count"
+        ] += 1
         try:
-            await detector.bind_candidate(candidate, turn_token)
+            bound = await detector.bind_candidate(candidate, turn_token)
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_failed_count"
+            ] += 1
             # Binding is advisory for Provider endpoint authority. The later
             # speaker verdict fails open when no exact detector turn exists.
             return self._runtime_identity_matches(bind_identity)
+        if bound is None:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_empty_count"
+            ] += 1
+        else:
+            self._speaker_rejection_metrics[
+                "provider_candidate_bind_success_count"
+            ] += 1
         return self._runtime_identity_matches(bind_identity)
 
     async def _ensure_continuous_provider_wake(

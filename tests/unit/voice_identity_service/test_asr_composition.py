@@ -14,7 +14,9 @@ from main_logic.asr_client.speaker_shadow.asset_manifest import (
 from main_logic.asr_client.speaker_shadow.campplus import CAMPPLUS_EMBEDDING_DIM
 from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
+    SpeakerShadowCompletion,
     SpeakerShadowObservation,
+    SpeakerShadowTerminalReason,
 )
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
@@ -72,6 +74,19 @@ def _observation(
         would_block=((0.40, similarity < 0.40),),
         audio_ms=checkpoint_ms,
         checkpoint_ms=checkpoint_ms,
+    )
+
+
+def _completion(
+    candidate: SpeakerShadowCandidateKey,
+    *,
+    last_checkpoint_ms: int | None,
+    terminal_reason: SpeakerShadowTerminalReason = "scored",
+) -> SpeakerShadowCompletion:
+    return SpeakerShadowCompletion(
+        candidate=candidate,
+        terminal_reason=terminal_reason,
+        last_checkpoint_ms=last_checkpoint_ms,
     )
 
 
@@ -178,6 +193,10 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
         "second_checkpoint_count": 1,
         "low_checkpoint_count": 2,
         "reject_decision_count": expected_requests,
+        "speaker_completion_count": 0,
+        "speaker_completion_before_first_checkpoint_count": 0,
+        "speaker_completion_after_first_checkpoint_count": 0,
+        "speaker_completion_stale_count": 0,
     }
     assert len(requests) == expected_requests
     if expected_requests:
@@ -358,6 +377,252 @@ async def test_smart_turn_candidate_keeps_ungated_rejection_contract(
     assert armed == []
     assert resolved == []
     assert requests == [(candidate, "activation-smart-turn")]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_completion_after_first_checkpoint_forgets_policy_and_resolves_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-completion"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    requests: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda candidate, **_kwargs: requests.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-completion",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(10, 1, "provider_candidate")
+
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+    )
+    await shadow._on_completion(
+        _completion(candidate, last_checkpoint_ms=1_500)
+    )
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=3_000, similarity=0.20)
+    )
+
+    assert armed == [(candidate, "activation-completion")]
+    assert resolved == [(candidate, "activation-completion", False)]
+    assert requests == []
+    assert candidate not in factory._armed_candidates
+    assert factory.diagnostics_snapshot() == {
+        "observation_count": 2,
+        "first_checkpoint_count": 1,
+        "second_checkpoint_count": 1,
+        "low_checkpoint_count": 2,
+        "reject_decision_count": 0,
+        "speaker_completion_count": 1,
+        "speaker_completion_before_first_checkpoint_count": 0,
+        "speaker_completion_after_first_checkpoint_count": 1,
+        "speaker_completion_stale_count": 0,
+    }
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_completion_does_not_release_a_different_candidate_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-exact"
+    profile = _profile()
+    _armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-exact",
+        enforce=True,
+    )
+    shadow = factory()
+    armed_candidate = SpeakerShadowCandidateKey(11, 1, "provider_candidate")
+    other_candidate = SpeakerShadowCandidateKey(11, 2, "provider_candidate")
+
+    await shadow._on_observation(
+        _observation(armed_candidate, checkpoint_ms=1_500, similarity=0.20)
+    )
+    await shadow._on_completion(
+        _completion(other_candidate, last_checkpoint_ms=None, terminal_reason="insufficient")
+    )
+
+    assert resolved == []
+    assert armed_candidate in factory._armed_candidates
+    await shadow._on_completion(
+        _completion(armed_candidate, last_checkpoint_ms=1_500)
+    )
+    assert resolved == [(armed_candidate, "activation-exact", False)]
+    assert factory.diagnostics_snapshot()[
+        "speaker_completion_before_first_checkpoint_count"
+    ] == 1
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+@pytest.mark.parametrize("boundary", ["activation", "closed"])
+async def test_stale_completion_is_counted_without_duplicate_gate_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-stale"
+    profile = _profile()
+    _armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-stale",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(12, 1, "provider_candidate")
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+    )
+
+    if boundary == "activation":
+        runtime._speaker_verifier_activation_generation = "activation-new"
+    else:
+        factory.close()
+    await shadow._on_completion(
+        _completion(candidate, last_checkpoint_ms=1_500)
+    )
+
+    assert resolved == [(candidate, "activation-stale", False)]
+    assert factory.diagnostics_snapshot()["speaker_completion_stale_count"] == 1
+    assert candidate not in factory._armed_candidates
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_smart_turn_completion_never_touches_provider_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-smart-completion"
+    profile = _profile()
+    _armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    requests: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda candidate, **_kwargs: requests.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-smart-completion",
+        enforce=True,
+    )
+    shadow = factory()
+    provider = SpeakerShadowCandidateKey(13, 1, "provider_candidate")
+    smart_turn = SpeakerShadowCandidateKey(13, 2, "smart_turn_turn")
+    await shadow._on_observation(
+        _observation(provider, checkpoint_ms=1_500, similarity=0.20)
+    )
+    await shadow._on_observation(
+        _observation(smart_turn, checkpoint_ms=1_500, similarity=0.20)
+    )
+
+    await shadow._on_completion(
+        _completion(smart_turn, last_checkpoint_ms=1_500)
+    )
+    await shadow._on_observation(
+        _observation(smart_turn, checkpoint_ms=3_000, similarity=0.20)
+    )
+
+    assert resolved == []
+    assert requests == []
+    assert provider in factory._armed_candidates
+    await shadow._on_completion(_completion(provider, last_checkpoint_ms=1_500))
+    assert resolved == [(provider, "activation-smart-completion", False)]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_armed_candidate_capacity_evicts_oldest_with_fail_open_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-capacity"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-capacity",
+        enforce=True,
+    )
+    shadow = factory()
+    candidates = [
+        SpeakerShadowCandidateKey(index, 1, "provider_candidate")
+        for index in range(factory._ARMED_CANDIDATE_CAPACITY + 1)
+    ]
+
+    for candidate in candidates:
+        await shadow._on_observation(
+            _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+        )
+
+    assert len(armed) == factory._ARMED_CANDIDATE_CAPACITY + 1
+    assert len(factory._armed_candidates) == factory._ARMED_CANDIDATE_CAPACITY
+    assert candidates[0] not in factory._armed_candidates
+    assert resolved == [(candidates[0], "activation-capacity", False)]
+
+    await shadow._on_completion(
+        _completion(candidates[0], last_checkpoint_ms=1_500)
+    )
+    assert resolved == [(candidates[0], "activation-capacity", False)]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_repeated_first_checkpoint_retires_same_key_before_rearming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-rearm"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-rearm",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(14, 1, "provider_candidate")
+    observation = _observation(
+        candidate,
+        checkpoint_ms=1_500,
+        similarity=0.20,
+    )
+
+    await shadow._on_observation(observation)
+    await shadow._on_observation(observation)
+
+    assert armed == [
+        (candidate, "activation-rearm"),
+        (candidate, "activation-rearm"),
+    ]
+    assert resolved == [(candidate, "activation-rearm", False)]
+    assert tuple(factory._armed_candidates) == (candidate,)
     await shadow.close()
     factory.close()
     profile.close()

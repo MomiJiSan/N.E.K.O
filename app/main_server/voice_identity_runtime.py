@@ -421,6 +421,24 @@ class OwnerVoiceRuntimeRegistry:
                 value = runtime_metrics.get(name)
                 if type(value) is int and value >= 0:
                     totals[name] += value
+            missing_identity = runtime_metrics.get(
+                "provider_candidate_bind_missing_identity_count"
+            )
+            seal_unbound = runtime_metrics.get(
+                "rejection_seal_snapshot_unbound_count"
+            )
+            has_missing_identity = bool(
+                type(missing_identity) is int and missing_identity > 0
+            )
+            has_seal_unbound = bool(type(seal_unbound) is int and seal_unbound > 0)
+            if has_missing_identity:
+                totals["diagnostic_runtime_missing_identity_count"] += 1
+            if has_seal_unbound:
+                totals["diagnostic_runtime_seal_unbound_count"] += 1
+            if has_missing_identity and has_seal_unbound:
+                totals[
+                    "diagnostic_runtime_missing_identity_and_seal_unbound_count"
+                ] += 1
         totals["registered_manager_count"] = len(managers)
         totals["diagnostic_runtime_count"] = len(seen_runtimes)
         return totals

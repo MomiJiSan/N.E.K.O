@@ -457,6 +457,91 @@ async def test_first_low_provider_gate_waits_outside_final_lock_for_rejection() 
     await _close_dispatchers(runtime)
 
 
+async def test_gate_arm_diagnostics_report_detector_prepare_cancellation() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    detector.block_prepare = True
+
+    task = asyncio.create_task(
+        runtime._arm_speaker_candidate_decision(
+            _shadow_candidate(),
+            activation_generation="profile-generation",
+        )
+    )
+    await asyncio.wait_for(detector.prepare_entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_arm_prepare_cancelled_count"] == 1
+    assert diagnostics["speaker_gate_arm_final_lock_cancelled_count"] == 0
+    assert diagnostics["speaker_gate_armed_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_gate_arm_diagnostics_report_final_lock_cancellation() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_final_lock.acquire()
+    try:
+        task = asyncio.create_task(
+            runtime._arm_speaker_candidate_decision(
+                _shadow_candidate(),
+                activation_generation="profile-generation",
+            )
+        )
+        await asyncio.wait_for(detector.prepare_entered.wait(), 1)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        runtime._asr_final_lock.release()
+
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_arm_prepare_cancelled_count"] == 0
+    assert diagnostics["speaker_gate_arm_final_lock_cancelled_count"] == 1
+    assert diagnostics["speaker_gate_armed_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_gate_arm_diagnostics_report_common_authority_failure() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_reserved_final_key = None
+
+    assert not await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_arm_common_authority_count"] == 1
+    assert diagnostics["speaker_gate_arm_prepare_cancelled_count"] == 0
+    assert diagnostics["speaker_gate_arm_final_lock_cancelled_count"] == 0
+    assert diagnostics["speaker_gate_armed_count"] == 0
+    await _close_dispatchers(runtime)
+
+
 async def test_first_low_provider_gate_arms_while_turn_preparation_is_pending() -> None:
     prepare_started = asyncio.Event()
     prepare_release = asyncio.Event()
@@ -733,6 +818,279 @@ async def test_real_speaker_shadow_rejects_final_after_first_low_during_prepare(
     shadow_metrics = shadow.snapshot()
     assert shadow_metrics["callback_failure_count"] == 0
     assert shadow_metrics["stale_result_count"] == 0
+
+    await shadow.close()
+    composition.close()
+    profile.close()
+    await _close_dispatchers(runtime)
+
+
+async def test_real_speaker_shadow_2999ms_completion_releases_waiting_final(
+    monkeypatch,
+) -> None:
+    import numpy as np
+
+    from main_logic.asr_client.speaker_shadow.asset_manifest import (
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+    )
+    from main_logic.asr_client.speaker_shadow.campplus import (
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    from main_logic.voice_identity.contracts import SpeakerModelIdentity
+    from main_logic.voice_identity.profile import SpeakerProfile
+    from main_logic.voice_identity.reference import SpeakerReference
+    from main_logic.voice_identity_service.asr_composition import (
+        OwnerVoiceAsrCompositionFactory,
+    )
+
+    class _ScoringHost:
+        alive = True
+
+        async def score(
+            self,
+            _pcm16: bytes,
+            *,
+            timeout_seconds: float,
+        ) -> float:
+            assert timeout_seconds > 0
+            return 0.20
+
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    model_identity = SpeakerModelIdentity(
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    embedding = np.arange(1, CAMPPLUS_EMBEDDING_DIM + 1, dtype=np.float32)
+    reference = SpeakerReference(model_identity, embedding)
+    embedding.fill(0.0)
+    try:
+        profile = SpeakerProfile("profile-generation", reference)
+    finally:
+        reference.close()
+    composition = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    shadow = composition()
+    monkeypatch.setattr(
+        shadow,
+        "_ensure_backend",
+        AsyncMock(return_value=_ScoringHost()),
+    )
+    candidate = _shadow_candidate()
+    first_checkpoint_pcm16 = b"\x21\x00" * (16_000 * 1_500 // 1_000)
+    below_second_checkpoint_pcm16 = b"\x22\x00" * (
+        16_000 * 1_499 // 1_000
+    )
+
+    assert shadow.submit(
+        first_checkpoint_pcm16,
+        sample_rate_hz=16_000,
+        candidate=candidate,
+    )
+    await shadow.wait_idle()
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None
+    _seal_installed_provider_candidate(
+        runtime,
+        detector,
+        session,
+        lifecycle,
+        turn_token,
+    )
+    final_task = asyncio.create_task(
+        runtime._handle_independent_asr_final("short-non-owner-final", 0, "qwen")
+    )
+    while not gate.wait_started:
+        await asyncio.sleep(0)
+
+    assert shadow.submit(
+        below_second_checkpoint_pcm16,
+        sample_rate_hz=16_000,
+        candidate=candidate,
+    )
+    assert shadow.finish_candidate(candidate)
+    await shadow.wait_idle()
+    await asyncio.wait_for(final_task, 1)
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_waited_count"] == 1
+    assert diagnostics["speaker_gate_resolved_forward_count"] == 1
+    assert diagnostics["speaker_gate_timeout_count"] == 0
+    assert diagnostics["rejection_request_failed_count"] == 0
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    assert not composition._armed_candidates
+    composition_diagnostics = composition.diagnostics_snapshot()
+    assert composition_diagnostics["speaker_completion_count"] == 1
+    assert (
+        composition_diagnostics[
+            "speaker_completion_after_first_checkpoint_count"
+        ]
+        == 1
+    )
+    shadow_metrics = shadow.snapshot()
+    assert shadow_metrics["completion_count"] == 1
+    assert shadow_metrics["completion_after_first_checkpoint_count"] == 1
+
+    await shadow.close()
+    composition.close()
+    profile.close()
+    await _close_dispatchers(runtime)
+
+
+async def test_late_short_candidate_completion_cannot_release_successor_gate(
+    monkeypatch,
+) -> None:
+    import numpy as np
+
+    from main_logic.asr_client.speaker_shadow.asset_manifest import (
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+    )
+    from main_logic.asr_client.speaker_shadow.campplus import (
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    from main_logic.voice_identity.contracts import SpeakerModelIdentity
+    from main_logic.voice_identity.profile import SpeakerProfile
+    from main_logic.voice_identity.reference import SpeakerReference
+    from main_logic.voice_identity_service.asr_composition import (
+        OwnerVoiceAsrCompositionFactory,
+    )
+
+    class _ScoringHost:
+        alive = True
+
+        async def score(
+            self,
+            _pcm16: bytes,
+            *,
+            timeout_seconds: float,
+        ) -> float:
+            assert timeout_seconds > 0
+            return 0.20
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    model_identity = SpeakerModelIdentity(
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    embedding = np.arange(1, CAMPPLUS_EMBEDDING_DIM + 1, dtype=np.float32)
+    reference = SpeakerReference(model_identity, embedding)
+    embedding.fill(0.0)
+    try:
+        profile = SpeakerProfile("profile-generation", reference)
+    finally:
+        reference.close()
+    composition = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    shadow = composition()
+    monkeypatch.setattr(
+        shadow,
+        "_ensure_backend",
+        AsyncMock(return_value=_ScoringHost()),
+    )
+    old_candidate = _shadow_candidate()
+    first_checkpoint_pcm16 = b"\x21\x00" * (16_000 * 1_500 // 1_000)
+    below_second_checkpoint_pcm16 = b"\x22\x00" * (
+        16_000 * 1_499 // 1_000
+    )
+    delayed_resolutions: list[SpeakerShadowCandidateKey] = []
+    resolve_candidates = composition._resolve_candidates
+
+    assert shadow.submit(
+        first_checkpoint_pcm16,
+        sample_rate_hz=16_000,
+        candidate=old_candidate,
+    )
+    await shadow.wait_idle()
+    _seal_installed_provider_candidate(
+        runtime,
+        detector,
+        session,
+        lifecycle,
+        turn_token,
+    )
+    await runtime._handle_independent_asr_final("timed-out-final", 0, "qwen")
+    await runtime.wait_transcript_idle()
+    assert runtime._speaker_verifier_diagnostics()["speaker_gate_timeout_count"] == 1
+
+    monkeypatch.setattr(
+        composition,
+        "_resolve_candidates",
+        lambda candidates: delayed_resolutions.extend(candidates),
+    )
+    assert shadow.submit(
+        below_second_checkpoint_pcm16,
+        sample_rate_hz=16_000,
+        candidate=old_candidate,
+    )
+    assert shadow.finish_candidate(old_candidate)
+    await shadow.wait_idle()
+    assert delayed_resolutions == [old_candidate]
+
+    successor_detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        successor_detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_accepted_final_keys.clear()
+    successor_candidate = SpeakerShadowCandidateKey(
+        old_candidate.detector_epoch + 1,
+        old_candidate.shadow_generation + 1,
+        "provider_candidate",
+    )
+    assert successor_detector.lease is not None
+    successor_detector.lease.shadow_candidate = successor_candidate
+    assert await runtime._arm_speaker_candidate_decision(
+        successor_candidate,
+        activation_generation="profile-generation",
+    )
+    successor_gate = runtime._asr_speaker_candidate_decision_gate
+    assert successor_gate is not None
+
+    resolve_candidates(tuple(delayed_resolutions))
+
+    assert runtime._asr_speaker_candidate_decision_gate is successor_gate
+    assert not successor_gate.resolved.done()
+    assert runtime._resolve_speaker_candidate_decision(
+        successor_candidate,
+        activation_generation="profile-generation",
+        rejected=False,
+    )
 
     await shadow.close()
     composition.close()

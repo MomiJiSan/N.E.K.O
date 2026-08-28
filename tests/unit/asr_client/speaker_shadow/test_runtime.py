@@ -14,6 +14,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES,
     SPEAKER_SHADOW_SAMPLE_RATE_HZ,
     SpeakerShadowCandidateKey,
+    SpeakerShadowCompletion,
     SpeakerShadowConfig,
     SpeakerShadowObservation,
 )
@@ -33,6 +34,7 @@ class _BackendFactory:
     load_ok: bool = True
     load_error: bool = False
     score_error: bool = False
+    score_error_after: int | None = None
     close_error: bool = False
     expected_pcm: bytes | None = None
     block_stage: str | None = None
@@ -53,6 +55,7 @@ class _BackendFactory:
 class _Backend:
     def __init__(self, settings: _BackendFactory) -> None:
         self._settings = settings
+        self._score_calls = 0
 
     def _maybe_block(self, stage: str) -> None:
         settings = self._settings
@@ -73,7 +76,12 @@ class _Backend:
 
     def score(self, pcm16: bytes, sample_rate_hz: int) -> float:
         self._maybe_block("score")
-        if self._settings.score_error:
+        should_fail = self._settings.score_error or (
+            self._settings.score_error_after is not None
+            and self._score_calls >= self._settings.score_error_after
+        )
+        self._score_calls += 1
+        if should_fail:
             raise RuntimeError("score failed")
         if self._settings.expected_pcm is not None:
             assert pcm16 == self._settings.expected_pcm
@@ -392,11 +400,16 @@ async def test_explicit_checkpoints_emit_1500ms_and_3000ms_observations() -> Non
     await runtime.close()
 
 
-async def test_short_candidate_emits_no_3000ms_confirmation() -> None:
-    observations: list[SpeakerShadowObservation] = []
+async def test_3000ms_completion_follows_both_observations() -> None:
+    events: list[tuple[str, int | None]] = []
+    completions: list[SpeakerShadowCompletion] = []
 
     async def observe(observation: SpeakerShadowObservation) -> None:
-        observations.append(observation)
+        events.append(("observation", observation.checkpoint_ms))
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+        events.append(("completion", completion.last_checkpoint_ms))
 
     runtime = SpeakerShadowRuntime(
         backend_factory=_BackendFactory(score_value=0.2),
@@ -406,6 +419,127 @@ async def test_short_candidate_emits_no_3000ms_confirmation() -> None:
             observation_checkpoints_ms=(1_500, 3_000),
         ),
         on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(147)
+
+    assert runtime.submit(
+        _pcm(3_000),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert events == [
+        ("observation", 1_500),
+        ("observation", 3_000),
+        ("completion", 3_000),
+    ]
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="scored",
+            last_checkpoint_ms=3_000,
+        )
+    ]
+    await runtime.close()
+
+
+async def test_duplicate_finish_emits_completion_once() -> None:
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(minimum_audio_ms=20),
+        on_completion=complete,
+    )
+    candidate = _candidate(148)
+
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+    assert runtime.finish_candidate(candidate)
+
+    assert len(completions) == 1
+    assert completions[0].candidate == candidate
+    assert runtime.snapshot()["completion_count"] == 1
+    await runtime.close()
+
+
+async def test_score_failure_completion_is_ordered_after_prior_checkpoint() -> None:
+    events: list[tuple[str, int | None, str | None]] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        events.append(("observation", observation.checkpoint_ms, None))
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        events.append(
+            (
+                "completion",
+                completion.last_checkpoint_ms,
+                completion.terminal_reason,
+            )
+        )
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_error_after=1),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+        ),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(149)
+
+    assert runtime.submit(
+        _pcm(3_000),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert events == [
+        ("observation", 1_500, None),
+        ("completion", 1_500, "failed"),
+    ]
+    assert runtime.snapshot()["completion_count"] == 1
+    await runtime.close()
+
+
+async def test_short_candidate_emits_no_3000ms_confirmation() -> None:
+    observations: list[SpeakerShadowObservation] = []
+    completions: list[SpeakerShadowCompletion] = []
+    event_order: list[str] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+        event_order.append(f"observation:{observation.checkpoint_ms}")
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+        event_order.append("completion")
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+        ),
+        on_observation=observe,
+        on_completion=complete,
     )
     candidate = _candidate(48)
 
@@ -418,11 +552,22 @@ async def test_short_candidate_emits_no_3000ms_confirmation() -> None:
     await runtime.wait_idle()
 
     assert [item.checkpoint_ms for item in observations] == [1_500]
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="scored",
+            last_checkpoint_ms=1_500,
+        )
+    ]
+    assert event_order == ["observation:1500", "completion"]
     metrics = runtime.snapshot()
     assert metrics["scored_candidate_count"] == 1
     assert metrics["insufficient_candidate_count"] == 0
     assert metrics["finished_candidate_count"] == 1
     assert metrics["evaluated_candidate_count"] == 1
+    assert metrics["completion_count"] == 1
+    assert metrics["completion_after_first_checkpoint_count"] == 1
+    assert metrics["completion_before_first_checkpoint_count"] == 0
     assert metrics["retained_pcm_bytes"] == 0
     await runtime.close()
 
@@ -527,14 +672,24 @@ async def test_intermediate_score_failure_wipes_buffer_and_fails_open() -> None:
 
 
 async def test_finish_releases_short_buffer_without_starting_host() -> None:
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
     runtime = SpeakerShadowRuntime(
         backend_factory=_BackendFactory(),
-        config=_config(minimum_audio_ms=20),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+        ),
+        on_completion=complete,
     )
     candidate = _candidate(3)
 
     assert runtime.submit(
-        _pcm(10),
+        _pcm(1_499),
         sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
         candidate=candidate,
     )
@@ -546,6 +701,16 @@ async def test_finish_releases_short_buffer_without_starting_host() -> None:
     assert metrics["finished_candidate_count"] == 1
     assert metrics["backend_process_count"] == 0
     assert metrics["buffered_audio_bytes"] == 0
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="insufficient",
+            last_checkpoint_ms=None,
+        )
+    ]
+    assert metrics["completion_count"] == 1
+    assert metrics["completion_before_first_checkpoint_count"] == 1
+    assert metrics["completion_after_first_checkpoint_count"] == 0
     await runtime.close()
 
 
@@ -662,6 +827,11 @@ async def test_invalid_or_oversized_frames_fail_open_without_starting_host(
 
 
 async def test_queue_saturation_drops_only_shadow_candidate() -> None:
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
     runtime = SpeakerShadowRuntime(
         backend_factory=_BackendFactory(),
         config=_config(
@@ -669,6 +839,7 @@ async def test_queue_saturation_drops_only_shadow_candidate() -> None:
             queue_capacity=1,
             finalized_candidate_capacity=2,
         ),
+        on_completion=complete,
     )
     candidate = _candidate(9)
 
@@ -689,6 +860,13 @@ async def test_queue_saturation_drops_only_shadow_candidate() -> None:
     assert metrics["dropped_frame_count"] == 1
     assert metrics["dropped_candidate_count"] == 1
     assert metrics["finished_candidate_count"] == 1
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="dropped",
+            last_checkpoint_ms=None,
+        )
+    ]
     assert metrics["backend_process_count"] == 0
     await runtime.close()
 
@@ -809,7 +987,7 @@ async def test_queued_work_ignores_evicted_candidate_watermark() -> None:
     runtime._record_evicted_candidate(candidate)
     before_work = runtime.snapshot()
 
-    runtime._process_finish(marker)
+    await runtime._process_finish(marker)
     await runtime._process_frame(frame)
 
     assert runtime.snapshot() == before_work
@@ -944,12 +1122,80 @@ async def test_reset_cancels_stale_observation_delivery() -> None:
     await runtime.close()
 
 
+async def test_reset_cancels_stale_completion_delivery() -> None:
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        callback_started.set()
+        await callback_release.wait()
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(minimum_audio_ms=20),
+        on_completion=complete,
+    )
+    candidate = _candidate(123)
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await asyncio.wait_for(callback_started.wait(), 2.0)
+
+    await runtime.reset()
+    callback_release.set()
+    await runtime.wait_idle()
+
+    assert completions == []
+    assert runtime.snapshot()["stale_result_count"] == 1
+    assert runtime.snapshot()["callback_task_count"] == 0
+    await runtime.close()
+
+
+async def test_completion_callback_failure_is_counted_and_contained() -> None:
+    async def complete(_completion: SpeakerShadowCompletion) -> None:
+        raise RuntimeError("completion failed")
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(minimum_audio_ms=20),
+        on_completion=complete,
+    )
+    candidate = _candidate(124)
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    metrics = runtime.snapshot()
+    assert metrics["completion_count"] == 1
+    assert metrics["completion_callback_failure_count"] == 1
+    assert metrics["callback_failure_count"] == 1
+    await runtime.close()
+
+
 def test_sync_observation_callback_is_rejected() -> None:
     with pytest.raises(TypeError, match="callback must be async"):
         SpeakerShadowRuntime(
             backend_factory=_BackendFactory(),
             config=_config(),
             on_observation=lambda _observation: None,  # type: ignore[arg-type]
+        )
+
+
+def test_sync_completion_callback_is_rejected() -> None:
+    with pytest.raises(TypeError, match="completion callback must be async"):
+        SpeakerShadowRuntime(
+            backend_factory=_BackendFactory(),
+            config=_config(),
+            on_completion=lambda _completion: None,  # type: ignore[arg-type]
         )
 
 

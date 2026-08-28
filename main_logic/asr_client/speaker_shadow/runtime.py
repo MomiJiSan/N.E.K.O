@@ -15,6 +15,7 @@ from multiprocessing.process import BaseProcess
 from typing import Any, Literal
 
 from .contracts import (
+    CompletionCallback,
     MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES,
     MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES,
     MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES,
@@ -23,6 +24,7 @@ from .contracts import (
     SpeakerShadowBackendFactory,
     SpeakerShadowCandidateKey,
     SpeakerShadowConfig,
+    SpeakerShadowCompletion,
     SpeakerShadowMetrics,
     SpeakerShadowObservation,
     SpeakerShadowScope,
@@ -380,6 +382,9 @@ class _CandidateToken:
     accepted_sample_count: int = 0
     terminal_reason: SpeakerShadowTerminalReason | None = None
     finish_seen: bool = False
+    finish_queued: bool = False
+    last_checkpoint_ms: int | None = None
+    completion_sent: bool = False
 
 
 @dataclass(slots=True)
@@ -422,6 +427,7 @@ class SpeakerShadowRuntime:
         backend_factory: SpeakerShadowBackendFactory | None,
         config: SpeakerShadowConfig | None = None,
         on_observation: ObservationCallback | None = None,
+        on_completion: CompletionCallback | None = None,
         on_backend_degraded: Callable[[], None] | None = None,
         on_backend_recovered: Callable[[], None] | None = None,
     ) -> None:
@@ -435,6 +441,12 @@ class SpeakerShadowRuntime:
         ):
             raise TypeError("SpeakerShadowRuntime observation callback must be async")
         self._on_observation = on_observation
+        if on_completion is not None and not (
+            inspect.iscoroutinefunction(on_completion)
+            or inspect.iscoroutinefunction(getattr(on_completion, "__call__", None))
+        ):
+            raise TypeError("SpeakerShadowRuntime completion callback must be async")
+        self._on_completion = on_completion
         self._metrics = SpeakerShadowMetrics()
         self._would_block_counts = {
             threshold: 0 for threshold in self._config.similarity_thresholds
@@ -666,24 +678,44 @@ class SpeakerShadowRuntime:
         if not isinstance(candidate, SpeakerShadowCandidateKey):
             return False
         finalized = self._finalized.get(candidate)
-        if finalized is not None:
-            self._record_finish(candidate, finalized)
+        if finalized is not None and finalized.finish_seen:
             return True
         if self._candidate_was_evicted(candidate):
             return True
         token = self._candidate_tokens.get(candidate)
+        if token is None and finalized is not None:
+            token = finalized.token
         if token is None:
             token = _CandidateToken(candidate, 0)
+            if finalized is not None:
+                token.terminal_reason = finalized.terminal_reason
+        if token.finish_queued:
+            return True
         marker = _CandidateFinished(self._generation, candidate, token)
         try:
             self._queue.put_nowait(marker)
         except asyncio.QueueFull:
-            self._drop_candidate(
-                candidate,
-                finish_seen=True,
-                token=token,
-            )
-            return False
+            admitted_after_discard = False
+            if finalized is not None and self._discard_queued_frames_for_token(token):
+                try:
+                    self._queue.put_nowait(marker)
+                except asyncio.QueueFull:
+                    pass
+                else:
+                    admitted_after_discard = True
+            if not admitted_after_discard and finalized is not None:
+                # Preserve the existing non-blocking contract if saturation is
+                # caused entirely by other candidates. Without queue order, a
+                # completion callback would not be authoritative.
+                self._record_finish(candidate, finalized)
+                return True
+            if not admitted_after_discard:
+                self._drop_candidate(
+                    candidate,
+                    finish_seen=True,
+                    token=token,
+                )
+                return False
         if not self._ensure_worker():
             self._drain_queue()
             self._metrics.worker_start_failure_count += 1
@@ -695,6 +727,7 @@ class SpeakerShadowRuntime:
             return False
         self._candidate_tokens[candidate] = token
         self._candidate_tokens.move_to_end(candidate)
+        token.finish_queued = True
         return True
 
     async def wait_idle(self) -> None:
@@ -784,7 +817,7 @@ class SpeakerShadowRuntime:
                 if item is _STOP:
                     return
                 if isinstance(item, _CandidateFinished):
-                    self._process_finish(item)
+                    await self._process_finish(item)
                 else:
                     assert isinstance(item, _AudioFrame)
                     await self._process_frame(item)
@@ -991,6 +1024,11 @@ class SpeakerShadowRuntime:
             would_block = tuple(
                 (threshold, similarity < threshold)
                 for threshold in self._config.similarity_thresholds
+            )
+            token.last_checkpoint_ms = (
+                checkpoint_ms
+                if checkpoint_ms is not None
+                else self._config.minimum_audio_ms
             )
             if terminal:
                 self._finalize_candidate(candidate, "scored", token=token)
@@ -1270,7 +1308,7 @@ class SpeakerShadowRuntime:
         except Exception:
             self._metrics.unload_failure_count += 1
 
-    def _process_finish(self, marker: _CandidateFinished) -> None:
+    async def _process_finish(self, marker: _CandidateFinished) -> None:
         if marker.generation != self._generation:
             return
         if self._candidate_was_evicted(
@@ -1280,10 +1318,23 @@ class SpeakerShadowRuntime:
             return
         if marker.token.terminal_reason is not None:
             self._record_token_finish(marker.token)
+            await self._deliver_completion(
+                marker,
+                terminal_reason=marker.token.terminal_reason,
+            )
             return
         finalized = self._finalized.get(marker.candidate)
         if finalized is not None:
             self._record_finish(marker.candidate, finalized)
+            completion_token = finalized.token or marker.token
+            await self._deliver_completion(
+                _CandidateFinished(
+                    marker.generation,
+                    marker.candidate,
+                    completion_token,
+                ),
+                terminal_reason=finalized.terminal_reason,
+            )
             return
         buffer = self._buffers.pop(marker.candidate, None)
         terminal_reason: SpeakerShadowTerminalReason = "insufficient"
@@ -1298,6 +1349,74 @@ class SpeakerShadowRuntime:
             finish_seen=True,
             token=marker.token,
         )
+        await self._deliver_completion(
+            marker,
+            terminal_reason=terminal_reason,
+        )
+
+    async def _deliver_completion(
+        self,
+        marker: _CandidateFinished,
+        *,
+        terminal_reason: SpeakerShadowTerminalReason,
+    ) -> None:
+        """Publish one terminal notice in finish-marker queue order."""
+
+        token = marker.token
+        if (
+            marker.generation != self._generation
+            or self._closed
+            or token.completion_sent
+        ):
+            return
+        token.completion_sent = True
+        self._metrics.completion_count += 1
+        if token.last_checkpoint_ms is None:
+            self._metrics.completion_before_first_checkpoint_count += 1
+        else:
+            self._metrics.completion_after_first_checkpoint_count += 1
+
+        callback = self._on_completion
+        if callback is None:
+            return
+        existing_callback_task = self._callback_task
+        if existing_callback_task is not None:
+            if not existing_callback_task.done():
+                self._metrics.callback_failure_count += 1
+                self._metrics.completion_callback_failure_count += 1
+                return
+            self._consume_callback_result(existing_callback_task)
+        completion = SpeakerShadowCompletion(
+            candidate=marker.candidate,
+            terminal_reason=terminal_reason,
+            last_checkpoint_ms=token.last_checkpoint_ms,
+        )
+        callback_task = asyncio.create_task(
+            callback(completion),
+            name="speaker-shadow-completion",
+        )
+        self._callback_task = callback_task
+        callback_task.add_done_callback(self._consume_callback_result)
+        try:
+            done, _ = await asyncio.wait(
+                {callback_task},
+                timeout=self._config.callback_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            await self._cancel_callback_bounded(callback_task)
+            raise
+        if not done:
+            self._metrics.callback_failure_count += 1
+            self._metrics.completion_callback_failure_count += 1
+            await self._cancel_callback_bounded(callback_task)
+            return
+        try:
+            callback_task.result()
+        except asyncio.CancelledError:
+            self._metrics.stale_result_count += 1
+        except Exception:
+            self._metrics.callback_failure_count += 1
+            self._metrics.completion_callback_failure_count += 1
 
     def _drop_candidate(
         self,
@@ -1439,6 +1558,8 @@ class SpeakerShadowRuntime:
         if token.finish_seen:
             return
         token.finish_seen = True
+        if self._candidate_tokens.get(token.candidate) is token:
+            self._candidate_tokens.pop(token.candidate, None)
         finalized = self._finalized.get(token.candidate)
         if finalized is not None:
             self._finalized.pop(token.candidate, None)
@@ -1477,6 +1598,30 @@ class SpeakerShadowRuntime:
                     )
                     self._wipe_bytearray(item.pcm16)
                 self._queue.task_done()
+
+    def _discard_queued_frames_for_token(self, token: _CandidateToken) -> bool:
+        """Remove already-stale PCM so its ordered finish marker can be queued."""
+
+        retained_items: list[_QueueItem] = []
+        discarded = False
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            if isinstance(item, _AudioFrame) and item.token is token:
+                discarded = True
+                self._queued_pcm_bytes = max(
+                    0,
+                    self._queued_pcm_bytes - len(item.pcm16),
+                )
+                self._wipe_bytearray(item.pcm16)
+                continue
+            retained_items.append(item)
+        for item in retained_items:
+            self._queue.put_nowait(item)
+        return discarded
 
     def _retained_pcm_bytes(self) -> int:
         host_pcm_bytes = (

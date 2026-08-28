@@ -17,6 +17,7 @@ from main_logic.asr_client.speaker_shadow.campplus import (
 )
 from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
+    SpeakerShadowCompletion,
     SpeakerShadowConfig,
     SpeakerShadowObservation,
 )
@@ -29,6 +30,8 @@ from .policy import OwnerVoiceDecision, OwnerVoicePolicy
 
 class OwnerVoiceAsrCompositionFactory:
     """Create repeatable observers for one runtime and activation generation."""
+
+    _ARMED_CANDIDATE_CAPACITY = 256
 
     def __init__(
         self,
@@ -52,13 +55,19 @@ class OwnerVoiceAsrCompositionFactory:
         self._enforce = enforce
         self._lock = threading.Lock()
         self._closed = False
-        self._armed_candidates: set[SpeakerShadowCandidateKey] = set()
+        # Insertion ordered so capacity eviction is deterministic. This remains
+        # bookkeeping only; IndependentAsrRuntime's exact gate owns authority.
+        self._armed_candidates: dict[SpeakerShadowCandidateKey, bool] = {}
         self._diagnostics = {
             "observation_count": 0,
             "first_checkpoint_count": 0,
             "second_checkpoint_count": 0,
             "low_checkpoint_count": 0,
             "reject_decision_count": 0,
+            "speaker_completion_count": 0,
+            "speaker_completion_before_first_checkpoint_count": 0,
+            "speaker_completion_after_first_checkpoint_count": 0,
+            "speaker_completion_stale_count": 0,
         }
 
     @property
@@ -120,6 +129,13 @@ class OwnerVoiceAsrCompositionFactory:
                 and observation.candidate.scope == "provider_candidate"
                 and result.reason == "awaiting_second_low_observation"
             ):
+                with self._lock:
+                    stale_same_key = self._armed_candidates.pop(
+                        observation.candidate,
+                        False,
+                    )
+                if stale_same_key:
+                    self._resolve_candidates((observation.candidate,))
                 try:
                     armed = await runtime._arm_speaker_candidate_decision(
                         observation.candidate,
@@ -133,6 +149,7 @@ class OwnerVoiceAsrCompositionFactory:
                     return
                 if not armed:
                     return
+                evicted_candidates: tuple[SpeakerShadowCandidateKey, ...] = ()
                 with self._lock:
                     keep_armed = bool(
                         not self._closed
@@ -140,14 +157,25 @@ class OwnerVoiceAsrCompositionFactory:
                         == generation
                     )
                     if keep_armed:
-                        self._armed_candidates.add(observation.candidate)
+                        self._armed_candidates[observation.candidate] = True
+                        if (
+                            len(self._armed_candidates)
+                            > self._ARMED_CANDIDATE_CAPACITY
+                        ):
+                            evicted = next(iter(self._armed_candidates))
+                            self._armed_candidates.pop(evicted, None)
+                            evicted_candidates = (evicted,)
                 if not keep_armed:
                     self._resolve_candidates((observation.candidate,))
+                elif evicted_candidates:
+                    self._resolve_candidates(evicted_candidates)
                 return
 
             with self._lock:
-                was_armed = observation.candidate in self._armed_candidates
-                self._armed_candidates.discard(observation.candidate)
+                was_armed = self._armed_candidates.pop(
+                    observation.candidate,
+                    False,
+                )
             if result.decision is OwnerVoiceDecision.REJECT:
                 with self._lock:
                     self._diagnostics["reject_decision_count"] += 1
@@ -168,6 +196,33 @@ class OwnerVoiceAsrCompositionFactory:
                 return
             if was_armed:
                 self._resolve_candidates((observation.candidate,))
+
+        async def on_completion(completion: SpeakerShadowCompletion) -> None:
+            policy.forget(completion.candidate)
+            activation_is_stale = bool(
+                runtime._speaker_verifier_activation_generation != generation
+            )
+            with self._lock:
+                factory_is_closed = self._closed
+                self._diagnostics["speaker_completion_count"] += 1
+                if completion.last_checkpoint_ms is None:
+                    self._diagnostics[
+                        "speaker_completion_before_first_checkpoint_count"
+                    ] += 1
+                else:
+                    self._diagnostics[
+                        "speaker_completion_after_first_checkpoint_count"
+                    ] += 1
+                if factory_is_closed or activation_is_stale:
+                    self._diagnostics["speaker_completion_stale_count"] += 1
+                was_armed = False
+                if completion.candidate.scope == "provider_candidate":
+                    was_armed = self._armed_candidates.pop(
+                        completion.candidate,
+                        False,
+                    )
+            if was_armed:
+                self._resolve_candidates((completion.candidate,))
 
         def on_backend_degraded() -> None:
             self._resolve_armed_candidates()
@@ -191,6 +246,7 @@ class OwnerVoiceAsrCompositionFactory:
                 ),
             ),
             on_observation=on_observation,
+            on_completion=on_completion,
             on_backend_degraded=on_backend_degraded,
             on_backend_recovered=on_backend_recovered,
         )

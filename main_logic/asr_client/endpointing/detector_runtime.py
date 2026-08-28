@@ -1500,11 +1500,26 @@ class DetectorRuntime:
             tuple[int, SpeakerShadowScope] | None
         ) = None
         self._speaker_rejection_prepare_diagnostics = {
+            "rejection_prepare_type_mismatch_count": 0,
             "rejection_prepare_detector_closed_count": 0,
             "rejection_prepare_candidate_closed_count": 0,
+            "rejection_prepare_closed_no_sealed_count": 0,
+            "rejection_prepare_closed_fence_mismatch_count": 0,
+            "rejection_prepare_closed_shadow_mismatch_count": 0,
+            "rejection_seal_snapshot_created_count": 0,
+            "rejection_seal_snapshot_missing_shadow_count": 0,
+            "rejection_seal_snapshot_invalid_shadow_count": 0,
+            "rejection_seal_snapshot_unbound_count": 0,
+            "rejection_complete_cleared_snapshot_count": 0,
             "rejection_prepare_epoch_mismatch_count": 0,
             "rejection_prepare_shadow_mismatch_count": 0,
             "rejection_prepare_unbound_count": 0,
+            "detector_feed_closed_count": 0,
+            "detector_feed_unavailable_count": 0,
+            "detector_feed_semantic_identity_omitted_count": 0,
+            "detector_vad_load_unavailable_count": 0,
+            "detector_vad_load_exception_count": 0,
+            "detector_gate_exception_count": 0,
         }
         if (
             provider_policy is not None
@@ -1727,6 +1742,9 @@ class DetectorRuntime:
         """
 
         if type(shadow_candidate) is not SpeakerShadowCandidateKey:
+            self._speaker_rejection_prepare_diagnostics[
+                "rejection_prepare_type_mismatch_count"
+            ] += 1
             return None
         async with self._lock:
             if self._closed:
@@ -1751,6 +1769,18 @@ class DetectorRuntime:
                 self._speaker_rejection_prepare_diagnostics[
                     "rejection_prepare_candidate_closed_count"
                 ] += 1
+                if sealed is None:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "rejection_prepare_closed_no_sealed_count"
+                    ] += 1
+                elif sealed.provider_fence != self._provider_candidate_fence:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "rejection_prepare_closed_fence_mismatch_count"
+                    ] += 1
+                elif shadow_candidate != sealed.shadow_candidate:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "rejection_prepare_closed_shadow_mismatch_count"
+                    ] += 1
                 return None
             if shadow_candidate.detector_epoch != self._detector_epoch:
                 self._speaker_rejection_prepare_diagnostics[
@@ -2229,13 +2259,24 @@ class DetectorRuntime:
                 for event in events
             ):
                 self._speech_active = True
+            self._speaker_rejection_prepare_diagnostics[
+                "detector_feed_semantic_identity_omitted_count"
+            ] += 1
             return DetectorFeedResult(
                 events,
                 adapter.throttle_available,
                 throttle_action=submitted.throttle_action,
             )
         async with self._lock:
-            if self._closed or not self._available:
+            if self._closed:
+                self._speaker_rejection_prepare_diagnostics[
+                    "detector_feed_closed_count"
+                ] += 1
+                return DetectorFeedResult((), False)
+            if not self._available:
+                self._speaker_rejection_prepare_diagnostics[
+                    "detector_feed_unavailable_count"
+                ] += 1
                 return DetectorFeedResult((), False)
             effective_ingress = ingress_token or VoiceIngressToken(
                 session_epoch=0,
@@ -2272,7 +2313,16 @@ class DetectorRuntime:
                     self._available = bool(await asyncio.to_thread(self._vad.load))
                 except Exception:
                     self._available = False
+                    self._speaker_rejection_prepare_diagnostics[
+                        "detector_vad_load_exception_count"
+                    ] += 1
                 if not self._available:
+                    if not self._speaker_rejection_prepare_diagnostics[
+                        "detector_vad_load_exception_count"
+                    ]:
+                        self._speaker_rejection_prepare_diagnostics[
+                            "detector_vad_load_unavailable_count"
+                        ] += 1
                     return DetectorFeedResult(
                         (),
                         False,
@@ -2282,6 +2332,9 @@ class DetectorRuntime:
                 events = tuple(await asyncio.to_thread(self._gate.feed, pcm16))
             except Exception:
                 self._available = False
+                self._speaker_rejection_prepare_diagnostics[
+                    "detector_gate_exception_count"
+                ] += 1
                 return DetectorFeedResult(
                     (),
                     False,
@@ -2373,21 +2426,35 @@ class DetectorRuntime:
             self._provider_candidate_fence = fence
             shadow_candidate = self._speaker_shadow_candidate
             bound = self._bound_turns.get(candidate)
-            self._sealed_provider_candidate_rejection = (
-                _SealedProviderCandidateRejection(
+            if shadow_candidate is None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_seal_snapshot_missing_shadow_count"
+                ] += 1
+                sealed_rejection = None
+            elif (
+                shadow_candidate.scope != "provider_candidate"
+                or shadow_candidate.detector_epoch != self._detector_epoch
+            ):
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_seal_snapshot_invalid_shadow_count"
+                ] += 1
+                sealed_rejection = None
+            elif bound is None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_seal_snapshot_unbound_count"
+                ] += 1
+                sealed_rejection = None
+            else:
+                sealed_rejection = _SealedProviderCandidateRejection(
                     provider_fence=fence,
                     candidate=candidate,
                     shadow_candidate=shadow_candidate,
                     turn_token=bound.turn_token,
                 )
-                if (
-                    shadow_candidate is not None
-                    and shadow_candidate.scope == "provider_candidate"
-                    and shadow_candidate.detector_epoch == self._detector_epoch
-                    and bound is not None
-                )
-                else None
-            )
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_seal_snapshot_created_count"
+                ] += 1
+            self._sealed_provider_candidate_rejection = sealed_rejection
             self._provider_discarded_through_sequence_no = None
             self._candidate_generation += 1
             self._candidate_open = False
@@ -2443,6 +2510,10 @@ class DetectorRuntime:
             ):
                 return None
             self._provider_candidate_fence = None
+            if self._sealed_provider_candidate_rejection is not None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "rejection_complete_cleared_snapshot_count"
+                ] += 1
             self._sealed_provider_candidate_rejection = None
             successor_floor = max(
                 fence.through_sequence_no,

@@ -234,6 +234,8 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
             "speaker_gate_timeout_count": 0,
             "speaker_gate_stale_count": 0,
             "speaker_gate_released_prepare_failure_count": 1,
+            "provider_candidate_bind_missing_identity_count": 3,
+            "rejection_seal_snapshot_unbound_count": 2,
             "similarity": 0.12,
             "unexpected": 99,
         }
@@ -260,6 +262,12 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
     assert diagnostics["speaker_gate_timeout_count"] == 0
     assert diagnostics["speaker_gate_stale_count"] == 0
     assert diagnostics["speaker_gate_released_prepare_failure_count"] == 1
+    assert diagnostics["diagnostic_runtime_missing_identity_count"] == 1
+    assert diagnostics["diagnostic_runtime_seal_unbound_count"] == 1
+    assert (
+        diagnostics["diagnostic_runtime_missing_identity_and_seal_unbound_count"]
+        == 1
+    )
     assert "similarity" not in diagnostics
     assert "unexpected" not in diagnostics
     await registry.close()

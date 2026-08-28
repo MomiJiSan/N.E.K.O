@@ -10229,6 +10229,10 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
     assert provider_session.wire_pcm == [pcm16]
     diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_prepare_unbound_count"] == 0
+    assert diagnostics["provider_candidate_bind_attempt_count"] == 1
+    assert diagnostics["provider_candidate_bind_success_count"] == 1
+    assert diagnostics["provider_candidate_bind_empty_count"] == 0
+    assert diagnostics["provider_candidate_bind_failed_count"] == 0
 
     if rejection_timing == "submit":
         assert diagnostics["rejection_task_scheduled_count"] == 1

@@ -672,6 +672,33 @@ async def test_prepare_candidate_rejection_maps_only_authoritative_shadow_key() 
     await detector.close()
 
 
+async def test_prepare_candidate_rejection_counts_candidate_class_mismatch() -> None:
+    detector, _shadow, _candidate, _shadow_candidate, _turn_token = (
+        await _prepare_candidate_rejection_fixture()
+    )
+
+    assert await detector.prepare_candidate_rejection(object()) is None  # type: ignore[arg-type]
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["rejection_prepare_type_mismatch_count"] == 1
+    assert diagnostics["rejection_prepare_shadow_mismatch_count"] == 0
+    await detector.close()
+
+
+async def test_prepare_candidate_rejection_explains_closed_candidate_without_seal() -> None:
+    detector, _shadow, _candidate, shadow_candidate, _turn_token = (
+        await _prepare_candidate_rejection_fixture()
+    )
+    detector._candidate_open = False
+
+    assert await detector.prepare_candidate_rejection(shadow_candidate) is None
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["rejection_prepare_candidate_closed_count"] == 1
+    assert diagnostics["rejection_prepare_closed_no_sealed_count"] == 1
+    assert diagnostics["rejection_prepare_closed_fence_mismatch_count"] == 0
+    assert diagnostics["rejection_prepare_closed_shadow_mismatch_count"] == 0
+    await detector.close()
+
+
 async def test_sealed_provider_rejection_consumes_only_exact_speaker_authority() -> (
     None
 ):
@@ -684,6 +711,11 @@ async def test_sealed_provider_rejection_consumes_only_exact_speaker_authority()
 
     fence = await detector.seal_provider_candidate()
     assert fence is not None
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["rejection_seal_snapshot_created_count"] == 1
+    assert diagnostics["rejection_seal_snapshot_missing_shadow_count"] == 0
+    assert diagnostics["rejection_seal_snapshot_invalid_shadow_count"] == 0
+    assert diagnostics["rejection_seal_snapshot_unbound_count"] == 0
     sealed_lease = await detector.prepare_candidate_rejection(shadow_candidate)
 
     assert sealed_lease is not None
@@ -709,6 +741,23 @@ async def test_sealed_provider_rejection_consumes_only_exact_speaker_authority()
     assert detector.candidate_open is candidate_open_before
     assert detector._bound_turns[candidate].turn_token == turn_token
     assert await detector.complete_provider_candidate(fence) is True
+    assert detector.speaker_rejection_diagnostics_snapshot()[
+        "rejection_complete_cleared_snapshot_count"
+    ] == 0
+    await detector.close()
+
+
+async def test_provider_final_counts_unconsumed_sealed_rejection_snapshot() -> None:
+    detector, _shadow, _candidate, _shadow_candidate, _turn_token = (
+        await _prepare_candidate_rejection_fixture()
+    )
+    fence = await detector.seal_provider_candidate()
+    assert fence is not None
+
+    assert await detector.complete_provider_candidate(fence) is False
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["rejection_seal_snapshot_created_count"] == 1
+    assert diagnostics["rejection_complete_cleared_snapshot_count"] == 1
     await detector.close()
 
 
@@ -1728,6 +1777,10 @@ async def test_detector_failure_requests_independent_asr_fail_open() -> None:
     assert first.throttle_available is False
     assert second.throttle_available is False
     assert first.events == second.events == ()
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["detector_vad_load_unavailable_count"] == 1
+    assert diagnostics["detector_vad_load_exception_count"] == 0
+    assert diagnostics["detector_feed_unavailable_count"] == 1
 
 
 async def test_rnnoise_soft_gate_skips_silero_until_probable_voice() -> None:
@@ -2872,6 +2925,14 @@ async def test_detector_latches_load_and_inference_failures() -> None:
     assert latched_result.events == ()
     assert latched_result.identity is None
     assert latched_result.candidate is None
+    load_diagnostics = load_failed.speaker_rejection_diagnostics_snapshot()
+    assert load_diagnostics["detector_vad_load_exception_count"] == 1
+    assert load_diagnostics["detector_vad_load_unavailable_count"] == 0
+    inference_diagnostics = (
+        inference_failed.speaker_rejection_diagnostics_snapshot()
+    )
+    assert inference_diagnostics["detector_gate_exception_count"] == 1
+    assert inference_diagnostics["detector_feed_unavailable_count"] == 1
 
 
 async def test_detector_reset_and_close_are_idempotent() -> None:

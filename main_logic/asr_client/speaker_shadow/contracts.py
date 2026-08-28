@@ -247,6 +247,21 @@ ObservationCallback = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowCompletion:
+    """Ordered terminal notice containing no ASR authority or private audio."""
+
+    candidate: SpeakerShadowCandidateKey
+    terminal_reason: SpeakerShadowTerminalReason
+    last_checkpoint_ms: int | None
+
+
+CompletionCallback = Callable[
+    [SpeakerShadowCompletion],
+    Awaitable[None],
+]
+
+
 @dataclass(slots=True)
 class SpeakerShadowMetrics:
     """Aggregate counters only; no identity, PCM, embedding, or score data."""
@@ -272,6 +287,10 @@ class SpeakerShadowMetrics:
     backend_process_termination_count: int = 0
     inference_failure_count: int = 0
     callback_failure_count: int = 0
+    completion_count: int = 0
+    completion_before_first_checkpoint_count: int = 0
+    completion_after_first_checkpoint_count: int = 0
+    completion_callback_failure_count: int = 0
     load_retry_suppressed_count: int = 0
     worker_start_failure_count: int = 0
     shutdown_timeout_count: int = 0
