@@ -599,6 +599,29 @@ test('model unavailability disables enrollment and shows actionable status', asy
     assert.equal(harness.elements.get('voice-identity-start').disabled, true);
 });
 
+test('model unavailability disables re-enrollment for an existing profile', async () => {
+    const statusGate = deferred();
+    const harness = createHarness({
+        initialProfile: true,
+        initialRequested: true,
+        statusGate,
+    });
+    const initializing = harness.startInitialization();
+    statusGate.resolve(jsonResponse({
+        requested_enabled: true,
+        effective_enabled: false,
+        effective_reason: 'model_unavailable',
+        has_profile: true,
+        enrollment: null,
+        profile_generation: 'profile-0',
+        runtime_mode: 'enforce',
+    }));
+    await initializing;
+
+    assert.equal(harness.elements.get('voice-identity-reenroll').disabled, true);
+    assert.equal(harness.elements.get('voice-identity-delete').disabled, false);
+});
+
 test('late model rejection shows its dedicated enrollment error', async () => {
     const harness = createHarness({ startError: 'model_unavailable' });
     await harness.initialize();

@@ -9933,12 +9933,13 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     assert detector_candidate is not None
     detector.observe_provider_audio(checkpoint_pcm16, sample_rate_hz=16_000)
     await shadow.wait_idle()
-    for _attempt in range(100):
-        if runtime._speaker_verifier_diagnostics()[
+    async def wait_for_rejection_applied() -> None:
+        while not runtime._speaker_verifier_diagnostics()[
             "rejection_task_applied_count"
         ]:
-            break
-        await asyncio.sleep(0)
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(wait_for_rejection_applied(), 1.0)
 
     assert len(observations) == 2
     observation_candidates = [

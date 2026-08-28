@@ -305,15 +305,15 @@
 
         const pending = !state.initialized || state.busy
             || state.cancelPending || state.filterPending;
-        const enrollmentUnavailable = !state.profileAvailable
-            && ['model_unavailable', 'secure_storage_unavailable'].includes(
-                state.effectiveReason
-            );
+        const enrollmentUnavailable = [
+            'model_unavailable',
+            'secure_storage_unavailable',
+        ].includes(state.effectiveReason);
         elements.start.hidden = state.profileAvailable || state.busy || state.cancelPending;
         elements.start.disabled = pending || enrollmentUnavailable;
         elements.cancel.hidden = !state.busy && !state.cancelPending && !state.enrollmentId;
         elements.cancel.disabled = state.cancelPending;
-        elements.reenroll.disabled = pending;
+        elements.reenroll.disabled = pending || enrollmentUnavailable;
         elements.delete.disabled = pending;
         if (!state.filterPending) elements.filter.checked = state.requestedEnabled;
         elements.filter.disabled = pending;
