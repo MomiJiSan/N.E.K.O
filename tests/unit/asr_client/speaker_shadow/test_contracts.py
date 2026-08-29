@@ -14,6 +14,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_THRESHOLDS,
     SpeakerShadowCandidateKey,
     SpeakerShadowConfig,
+    SpeakerShadowDecisionStatus,
     SpeakerShadowObservation,
 )
 
@@ -123,6 +124,8 @@ def test_config_is_default_off_and_caps_candidate_audio() -> None:
     assert config.maximum_audio_ms == 4_000
     assert config.observation_checkpoints_ms is None
     assert config.completion_confirmation_scopes == ()
+    assert config.pending_observation_gate_scopes == ()
+    assert config.backend_prewarm_scopes == ()
     assert MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES == 128_000
     assert MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES == 128_000
     assert MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES < 8 * 1024 * 1024
@@ -142,6 +145,92 @@ def test_config_preserves_legacy_positional_argument_order() -> None:
 
     assert config.idle_unload_seconds == 60.0
     assert config.completion_confirmation_scopes == ()
+    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-3:] == (
+        "completion_confirmation_scopes",
+        "pending_observation_gate_scopes",
+        "backend_prewarm_scopes",
+    )
+
+
+def test_config_accepts_nested_pending_gate_and_backend_prewarm_scopes() -> None:
+    config = SpeakerShadowConfig(
+        observation_checkpoints_ms=(1_500, 3_000),
+        completion_confirmation_scopes=(
+            "provider_candidate",
+            "smart_turn_turn",
+        ),
+        pending_observation_gate_scopes=("provider_candidate",),
+        backend_prewarm_scopes=("provider_candidate",),
+    )
+
+    assert config.pending_observation_gate_scopes == ("provider_candidate",)
+    assert config.backend_prewarm_scopes == ("provider_candidate",)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pending_observation_gate_scopes", ["provider_candidate"]),
+        ("pending_observation_gate_scopes", ("unsupported",)),
+        (
+            "pending_observation_gate_scopes",
+            ("provider_candidate", "provider_candidate"),
+        ),
+        ("backend_prewarm_scopes", ["provider_candidate"]),
+        ("backend_prewarm_scopes", ("unsupported",)),
+        (
+            "backend_prewarm_scopes",
+            ("provider_candidate", "provider_candidate"),
+        ),
+    ],
+)
+def test_config_rejects_invalid_pending_gate_or_prewarm_scopes(
+    field: str,
+    value: object,
+) -> None:
+    overrides: dict[str, object] = {
+        "observation_checkpoints_ms": (1_500, 3_000),
+        "completion_confirmation_scopes": ("provider_candidate",),
+        "pending_observation_gate_scopes": ("provider_candidate",),
+    }
+    overrides[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        SpeakerShadowConfig(**overrides)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "completion_confirmation_scopes": ("provider_candidate",),
+                "pending_observation_gate_scopes": ("smart_turn_turn",),
+            },
+            "pending_observation_gate_scopes",
+        ),
+        (
+            {
+                "completion_confirmation_scopes": (
+                    "provider_candidate",
+                    "smart_turn_turn",
+                ),
+                "pending_observation_gate_scopes": ("provider_candidate",),
+                "backend_prewarm_scopes": ("smart_turn_turn",),
+            },
+            "backend_prewarm_scopes",
+        ),
+    ],
+)
+def test_config_rejects_scope_relationships_outside_nested_subsets(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        SpeakerShadowConfig(
+            observation_checkpoints_ms=(1_500, 3_000),
+            **overrides,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
@@ -198,6 +287,23 @@ def test_observation_kind_defaults_to_checkpoint_and_accepts_confirmation() -> N
         ).observation_kind
         == "completion_confirmation"
     )
+
+
+def test_decision_status_is_an_optional_structural_read_only_protocol() -> None:
+    candidate = SpeakerShadowCandidateKey(4, 5, "provider_candidate")
+
+    class StatusOnly:
+        def requires_provisional_decision(
+            self,
+            requested_candidate: SpeakerShadowCandidateKey,
+        ) -> bool:
+            return requested_candidate == candidate
+
+    status = StatusOnly()
+
+    assert isinstance(status, SpeakerShadowDecisionStatus)
+    assert status.requires_provisional_decision(candidate) is True
+    assert not isinstance(object(), SpeakerShadowDecisionStatus)
 
 
 @pytest.mark.parametrize(

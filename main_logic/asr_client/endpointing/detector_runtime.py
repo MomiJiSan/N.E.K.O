@@ -48,6 +48,7 @@ from ..lifecycle import VoiceIngressToken, VoiceTurnToken
 from ..provider_policy import AsrProviderPolicy
 from ..speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
+    SpeakerShadowDecisionStatus,
     SpeakerShadowObserver,
     SpeakerShadowScope,
 )
@@ -1510,6 +1511,9 @@ class DetectorRuntime:
             "rejection_seal_snapshot_missing_shadow_count": 0,
             "rejection_seal_snapshot_invalid_shadow_count": 0,
             "rejection_seal_snapshot_unbound_count": 0,
+            "rejection_provisional_query_count": 0,
+            "rejection_provisional_pending_count": 0,
+            "rejection_provisional_stale_count": 0,
             "rejection_complete_cleared_snapshot_count": 0,
             "rejection_prepare_epoch_mismatch_count": 0,
             "rejection_prepare_shadow_mismatch_count": 0,
@@ -2463,6 +2467,52 @@ class DetectorRuntime:
             self._throttle_policy.reset_candidate_activity()
             self._finish_speaker_shadow_candidate(expected_scope="provider_candidate")
             return fence
+
+    def pending_provider_speaker_candidate(
+        self,
+        provider_fence: ProviderCandidateFence,
+    ) -> SpeakerShadowCandidateKey | None:
+        """Return one exact sealed candidate whose first decision is pending.
+
+        This is a non-authoritative, aggregate-free status query. The caller
+        still has to acquire a revocable rejection lease and revalidate every
+        ASR fence before installing a Provider-final gate.
+        """
+
+        self._speaker_rejection_prepare_diagnostics[
+            "rejection_provisional_query_count"
+        ] += 1
+        sealed = self._sealed_provider_candidate_rejection
+        shadow = self._speaker_shadow
+        if (
+            self._closed
+            or self._semantic_adapter is not None
+            or type(provider_fence) is not ProviderCandidateFence
+            or provider_fence != self._provider_candidate_fence
+            or sealed is None
+            or sealed.provider_fence != provider_fence
+            or sealed.shadow_candidate.scope != "provider_candidate"
+            or not isinstance(shadow, SpeakerShadowDecisionStatus)
+        ):
+            self._speaker_rejection_prepare_diagnostics[
+                "rejection_provisional_stale_count"
+            ] += 1
+            return None
+        try:
+            pending = shadow.requires_provisional_decision(
+                sealed.shadow_candidate
+            )
+        except Exception:
+            pending = False
+        if not pending:
+            self._speaker_rejection_prepare_diagnostics[
+                "rejection_provisional_stale_count"
+            ] += 1
+            return None
+        self._speaker_rejection_prepare_diagnostics[
+            "rejection_provisional_pending_count"
+        ] += 1
+        return sealed.shadow_candidate
 
     async def discard_provider_successor(
         self,

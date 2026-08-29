@@ -182,6 +182,12 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
     assert shadow._config.completion_confirmation_scopes == (
         ("provider_candidate",) if enforce else ()
     )
+    assert shadow._config.pending_observation_gate_scopes == (
+        ("provider_candidate",) if enforce else ()
+    )
+    assert shadow._config.backend_prewarm_scopes == (
+        ("provider_candidate",) if enforce else ()
+    )
     assert shadow._config.similarity_thresholds == (0.40,)
     callback = shadow._on_observation
     assert callback is not None
@@ -212,6 +218,34 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
     else:
         assert armed == []
     assert resolved == []
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_owner_observation_resolves_exact_provisional_provider_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-provisional-owner"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-provisional-owner",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(3, 11, "provider_candidate")
+
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=1_500, similarity=0.80)
+    )
+
+    assert armed == []
+    assert resolved == [(candidate, "activation-provisional-owner", False)]
+    assert candidate not in factory._armed_candidates
     await shadow.close()
     factory.close()
     profile.close()
@@ -478,7 +512,10 @@ async def test_completion_after_first_checkpoint_forgets_policy_and_resolves_gat
     )
 
     assert armed == [(candidate, "activation-completion")]
-    assert resolved == [(candidate, "activation-completion", False)]
+    assert resolved == [
+        (candidate, "activation-completion", False),
+        (candidate, "activation-completion", False),
+    ]
     assert requests == []
     assert candidate not in factory._armed_candidates
     assert factory.diagnostics_snapshot() == {
@@ -492,6 +529,101 @@ async def test_completion_after_first_checkpoint_forgets_policy_and_resolves_gat
         "speaker_completion_after_first_checkpoint_count": 1,
         "speaker_completion_stale_count": 0,
     }
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_completion_resolves_provider_gate_without_local_armed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-provisional-finish"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-provisional-finish",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(10, 2, "provider_candidate")
+
+    await shadow._on_completion(
+        _completion(candidate, last_checkpoint_ms=None, terminal_reason="insufficient")
+    )
+
+    assert armed == []
+    assert resolved == [(candidate, "activation-provisional-finish", False)]
+    assert candidate not in factory._armed_candidates
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_completion_cannot_forward_resolve_pending_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-pending-reject"
+    profile = _profile()
+    armed, _resolved = _install_gate_spies(monkeypatch, runtime)
+    rejection_pending = False
+    resolution_attempts: list[tuple[SpeakerShadowCandidateKey, str, bool]] = []
+    successful_resolutions: list[tuple[SpeakerShadowCandidateKey, str, bool]] = []
+
+    def request_rejection(
+        _candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+    ) -> bool:
+        nonlocal rejection_pending
+        assert activation_generation == "activation-pending-reject"
+        rejection_pending = True
+        return True
+
+    def resolve(
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+        rejected: bool = False,
+    ) -> bool:
+        resolution = (candidate, activation_generation, rejected)
+        resolution_attempts.append(resolution)
+        if rejection_pending and not rejected:
+            return False
+        successful_resolutions.append(resolution)
+        return True
+
+    monkeypatch.setattr(runtime, "request_speaker_candidate_rejection", request_rejection)
+    monkeypatch.setattr(runtime, "_resolve_speaker_candidate_decision", resolve)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-pending-reject",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(10, 3, "provider_candidate")
+
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+    )
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=3_000, similarity=0.20)
+    )
+    await shadow._on_completion(
+        _completion(candidate, last_checkpoint_ms=3_000)
+    )
+
+    assert armed == [(candidate, "activation-pending-reject")]
+    assert rejection_pending is True
+    assert resolution_attempts == [
+        (candidate, "activation-pending-reject", False)
+    ]
+    assert successful_resolutions == []
+    assert candidate not in factory._armed_candidates
     await shadow.close()
     factory.close()
     profile.close()
@@ -517,16 +649,37 @@ async def test_completion_does_not_release_a_different_candidate_gate(
     await shadow._on_observation(
         _observation(armed_candidate, checkpoint_ms=1_500, similarity=0.20)
     )
+    resolution_attempts: list[SpeakerShadowCandidateKey] = []
+
+    def resolve_exact(
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+        rejected: bool = False,
+    ) -> bool:
+        resolution_attempts.append(candidate)
+        if candidate != armed_candidate:
+            return False
+        resolved.append((candidate, activation_generation, rejected))
+        return True
+
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        resolve_exact,
+    )
     await shadow._on_completion(
         _completion(other_candidate, last_checkpoint_ms=None, terminal_reason="insufficient")
     )
 
     assert resolved == []
+    assert resolution_attempts == [other_candidate]
     assert armed_candidate in factory._armed_candidates
     await shadow._on_completion(
         _completion(armed_candidate, last_checkpoint_ms=1_500)
     )
     assert resolved == [(armed_candidate, "activation-exact", False)]
+    assert resolution_attempts == [other_candidate, armed_candidate]
     assert factory.diagnostics_snapshot()[
         "speaker_completion_before_first_checkpoint_count"
     ] == 1
@@ -564,7 +717,9 @@ async def test_stale_completion_is_counted_without_duplicate_gate_resolution(
         _completion(candidate, last_checkpoint_ms=1_500)
     )
 
-    assert resolved == [(candidate, "activation-stale", False)]
+    assert resolved == [
+        (candidate, "activation-stale", False),
+    ] * (2 if boundary == "closed" else 1)
     assert factory.diagnostics_snapshot()["speaker_completion_stale_count"] == 1
     assert candidate not in factory._armed_candidates
     await shadow.close()
@@ -650,7 +805,10 @@ async def test_armed_candidate_capacity_evicts_oldest_with_fail_open_resolution(
     await shadow._on_completion(
         _completion(candidates[0], last_checkpoint_ms=1_500)
     )
-    assert resolved == [(candidates[0], "activation-capacity", False)]
+    assert resolved == [
+        (candidates[0], "activation-capacity", False),
+        (candidates[0], "activation-capacity", False),
+    ]
     await shadow.close()
     factory.close()
     profile.close()

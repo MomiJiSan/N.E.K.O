@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 SPEAKER_SHADOW_SAMPLE_RATE_HZ = 16_000
 MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS = 4_000
@@ -111,6 +111,8 @@ class SpeakerShadowConfig:
     # Appended to preserve the positional order of the provider-neutral
     # configuration contract used before completion confirmation existed.
     completion_confirmation_scopes: tuple[SpeakerShadowScope, ...] = ()
+    pending_observation_gate_scopes: tuple[SpeakerShadowScope, ...] = ()
+    backend_prewarm_scopes: tuple[SpeakerShadowScope, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -183,6 +185,48 @@ class SpeakerShadowConfig:
             raise ValueError(
                 "completion_confirmation_scopes requires at least two explicit "
                 "observation_checkpoints_ms"
+            )
+        pending_gate_scopes = self.pending_observation_gate_scopes
+        if (
+            type(pending_gate_scopes) is not tuple
+            or any(
+                scope not in ("provider_candidate", "smart_turn_turn")
+                for scope in pending_gate_scopes
+            )
+            or any(
+                scope in pending_gate_scopes[index + 1 :]
+                for index, scope in enumerate(pending_gate_scopes)
+            )
+        ):
+            raise ValueError(
+                "pending_observation_gate_scopes must be a tuple of unique, "
+                "supported speaker-shadow scopes"
+            )
+        if any(scope not in confirmation_scopes for scope in pending_gate_scopes):
+            raise ValueError(
+                "pending_observation_gate_scopes must be a subset of "
+                "completion_confirmation_scopes"
+            )
+        prewarm_scopes = self.backend_prewarm_scopes
+        if (
+            type(prewarm_scopes) is not tuple
+            or any(
+                scope not in ("provider_candidate", "smart_turn_turn")
+                for scope in prewarm_scopes
+            )
+            or any(
+                scope in prewarm_scopes[index + 1 :]
+                for index, scope in enumerate(prewarm_scopes)
+            )
+        ):
+            raise ValueError(
+                "backend_prewarm_scopes must be a tuple of unique, supported "
+                "speaker-shadow scopes"
+            )
+        if any(scope not in pending_gate_scopes for scope in prewarm_scopes):
+            raise ValueError(
+                "backend_prewarm_scopes must be a subset of "
+                "pending_observation_gate_scopes"
             )
         if not math.isfinite(self.idle_unload_seconds) or self.idle_unload_seconds <= 0:
             raise ValueError("idle_unload_seconds must be positive")
@@ -351,3 +395,13 @@ class SpeakerShadowObserver(Protocol):
     async def reset(self) -> None: ...
 
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class SpeakerShadowDecisionStatus(Protocol):
+    """Optional read-only status with no authority over ASR execution."""
+
+    def requires_provisional_decision(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool: ...

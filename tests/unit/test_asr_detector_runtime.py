@@ -255,6 +255,7 @@ class _SpeakerShadowSpy:
         self.events: list[tuple[str, object]] = []
         self.reset_calls = 0
         self.close_calls = 0
+        self.provisional_pending = False
 
     @property
     def enabled(self) -> bool:
@@ -281,6 +282,12 @@ class _SpeakerShadowSpy:
         self.finished.append(candidate)
         self.events.append(("finish", candidate))
         return False
+
+    def requires_provisional_decision(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool:
+        return bool(self.provisional_pending and candidate in self.finished)
 
     def snapshot(self) -> dict[str, int]:
         return {"submitted_frame_count": len(self.frames)}
@@ -744,6 +751,31 @@ async def test_sealed_provider_rejection_consumes_only_exact_speaker_authority()
     assert detector.speaker_rejection_diagnostics_snapshot()[
         "rejection_complete_cleared_snapshot_count"
     ] == 0
+    await detector.close()
+
+
+async def test_sealed_provider_candidate_exposes_only_pending_speaker_decision() -> None:
+    detector, shadow, _candidate, shadow_candidate, _turn_token = (
+        await _prepare_candidate_rejection_fixture()
+    )
+    shadow.provisional_pending = True
+
+    fence = await detector.seal_provider_candidate()
+
+    assert fence is not None
+    assert detector.pending_provider_speaker_candidate(fence) == shadow_candidate
+    shadow.provisional_pending = False
+    assert detector.pending_provider_speaker_candidate(fence) is None
+    wrong_fence = ProviderCandidateFence(
+        fence.detector_epoch,
+        fence.candidate_generation + 1,
+        fence.through_sequence_no,
+    )
+    assert detector.pending_provider_speaker_candidate(wrong_fence) is None
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["rejection_provisional_query_count"] == 3
+    assert diagnostics["rejection_provisional_pending_count"] == 1
+    assert diagnostics["rejection_provisional_stale_count"] == 2
     await detector.close()
 
 

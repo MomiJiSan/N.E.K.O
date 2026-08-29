@@ -384,6 +384,7 @@ class _CandidateToken:
     finish_seen: bool = False
     finish_queued: bool = False
     last_checkpoint_ms: int | None = None
+    last_delivered_checkpoint_ms: int | None = None
     completion_sent: bool = False
 
 
@@ -498,6 +499,47 @@ class SpeakerShadowRuntime:
     @property
     def generation(self) -> int:
         return self._generation
+
+    def requires_provisional_decision(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool:
+        """Whether accepted PCM has reached a still-undelivered checkpoint."""
+
+        if (
+            not self.enabled
+            or not isinstance(candidate, SpeakerShadowCandidateKey)
+            or candidate.scope
+            not in self._config.pending_observation_gate_scopes
+            or candidate in self._finalized
+        ):
+            return False
+        token = self._candidate_tokens.get(candidate)
+        if (
+            token is None
+            or token.candidate != candidate
+            or token.terminal_reason is not None
+            or self._candidate_was_evicted(candidate, token=token)
+        ):
+            return False
+        explicit_checkpoints = self._config.observation_checkpoints_ms
+        first_checkpoint_ms = (
+            explicit_checkpoints[0]
+            if explicit_checkpoints is not None
+            else self._config.minimum_audio_ms
+        )
+        first_checkpoint_samples = math.ceil(
+            token.sample_rate_hz * first_checkpoint_ms / 1_000
+        )
+        delivered_checkpoint_ms = token.last_delivered_checkpoint_ms
+        return (
+            token.sample_rate_hz == SPEAKER_SHADOW_SAMPLE_RATE_HZ
+            and token.accepted_sample_count >= first_checkpoint_samples
+            and (
+                delivered_checkpoint_ms is None
+                or delivered_checkpoint_ms < first_checkpoint_ms
+            )
+        )
 
     def snapshot(self) -> dict[str, int]:
         buffered_audio_bytes = sum(
@@ -861,6 +903,7 @@ class SpeakerShadowRuntime:
         ):
             return
         buffer = self._buffers.get(frame.candidate)
+        first_frame = buffer is None
         if buffer is None:
             if len(self._buffers) >= self._config.buffered_candidate_capacity:
                 dropped_candidate, dropped_buffer = self._buffers.popitem(last=False)
@@ -902,6 +945,35 @@ class SpeakerShadowRuntime:
         if allowed_samples > 0:
             buffer.pcm16.extend(frame.pcm16[: allowed_samples * 2])
             buffer.sample_count += allowed_samples
+        if (
+            first_frame
+            and allowed_samples > 0
+            and frame.candidate.scope in self._config.backend_prewarm_scopes
+        ):
+            backend_host = await self._ensure_backend()
+            if not self._identity_is_current(
+                frame.generation,
+                frame.candidate,
+                frame.token,
+            ):
+                self._metrics.stale_result_count += 1
+                retained_buffer = self._buffers.get(frame.candidate)
+                if retained_buffer is buffer:
+                    self._buffers.pop(frame.candidate, None)
+                    self._wipe_bytearray(buffer.pcm16)
+                return
+            if backend_host is None:
+                self._mark_backend_degraded()
+                retained_buffer = self._buffers.get(frame.candidate)
+                if retained_buffer is buffer:
+                    self._buffers.pop(frame.candidate, None)
+                    self._wipe_bytearray(buffer.pcm16)
+                self._finalize_candidate(
+                    frame.candidate,
+                    "failed",
+                    token=frame.token,
+                )
+                return
         explicit_checkpoints = self._config.observation_checkpoints_ms
         checkpoints = explicit_checkpoints or (self._config.minimum_audio_ms,)
         while buffer.next_checkpoint_index < len(checkpoints):
@@ -1098,6 +1170,17 @@ class SpeakerShadowRuntime:
                 self._metrics.stale_result_count += 1
             except Exception:
                 self._metrics.callback_failure_count += 1
+            else:
+                if (
+                    observation_kind == "checkpoint"
+                    and checkpoint_ms is not None
+                    and self._identity_is_current(
+                        generation,
+                        candidate,
+                        token,
+                    )
+                ):
+                    token.last_delivered_checkpoint_ms = checkpoint_ms
             return blocked_at_any_threshold
         finally:
             if self._active_evaluation == (generation, candidate):

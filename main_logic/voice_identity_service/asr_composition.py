@@ -203,7 +203,10 @@ class OwnerVoiceAsrCompositionFactory:
                 if not scheduled:
                     self._resolve_candidates((observation.candidate,))
                 return
-            if was_armed:
+            if (
+                enforce
+                and observation.candidate.scope == "provider_candidate"
+            ) or was_armed:
                 self._resolve_candidates((observation.candidate,))
 
         async def on_completion(completion: SpeakerShadowCompletion) -> None:
@@ -230,7 +233,10 @@ class OwnerVoiceAsrCompositionFactory:
                         completion.candidate,
                         False,
                     )
-            if was_armed:
+            if (
+                enforce
+                and completion.candidate.scope == "provider_candidate"
+            ) or was_armed:
                 self._resolve_candidates((completion.candidate,))
 
         def on_backend_degraded() -> None:
@@ -254,6 +260,12 @@ class OwnerVoiceAsrCompositionFactory:
                     OwnerVoicePolicy.SECOND_CHECKPOINT_MS,
                 ),
                 completion_confirmation_scopes=(
+                    ("provider_candidate",) if enforce else ()
+                ),
+                pending_observation_gate_scopes=(
+                    ("provider_candidate",) if enforce else ()
+                ),
+                backend_prewarm_scopes=(
                     ("provider_candidate",) if enforce else ()
                 ),
             ),

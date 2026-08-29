@@ -127,6 +127,25 @@ def _config(**overrides: object) -> SpeakerShadowConfig:
     return SpeakerShadowConfig(**values)
 
 
+def _provider_gate_config(
+    *,
+    prewarm: bool = False,
+    **overrides: object,
+) -> SpeakerShadowConfig:
+    values: dict[str, object] = {
+        "minimum_audio_ms": 1_500,
+        "maximum_audio_ms": 4_000,
+        "observation_checkpoints_ms": (1_500, 3_000),
+        "completion_confirmation_scopes": ("provider_candidate",),
+        "pending_observation_gate_scopes": ("provider_candidate",),
+        "backend_prewarm_scopes": (
+            ("provider_candidate",) if prewarm else ()
+        ),
+    }
+    values.update(overrides)
+    return _config(**values)
+
+
 def _spawn_event() -> Any:
     return multiprocessing.get_context("spawn").Event()
 
@@ -930,6 +949,289 @@ async def test_reset_invalidates_in_flight_completion_confirmation() -> None:
     assert metrics["retained_pcm_bytes"] == 0
     assert metrics["buffered_candidate_count"] == 0
     await runtime.close()
+
+
+async def test_provisional_decision_tracks_first_checkpoint_delivery() -> None:
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def observe(_observation: SpeakerShadowObservation) -> None:
+        callback_started.set()
+        await callback_release.wait()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(callback_timeout_seconds=1.0),
+        on_observation=observe,
+    )
+    candidate = _candidate(353)
+
+    assert runtime.submit(
+        _pcm(1_499),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.requires_provisional_decision(candidate) is False
+    assert runtime.submit(
+        _pcm(1),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.requires_provisional_decision(candidate) is True
+
+    await asyncio.wait_for(callback_started.wait(), 2.0)
+    assert runtime.requires_provisional_decision(candidate) is True
+    callback_release.set()
+    await runtime.wait_idle()
+
+    assert runtime.requires_provisional_decision(candidate) is False
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+async def test_failed_checkpoint_callback_keeps_provisional_decision() -> None:
+    async def observe(_observation: SpeakerShadowObservation) -> None:
+        raise RuntimeError("checkpoint callback failed")
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+    )
+    candidate = _candidate(354)
+
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+
+    assert runtime.requires_provisional_decision(candidate) is True
+    assert runtime.snapshot()["callback_failure_count"] == 1
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+async def test_reset_prevents_late_callback_from_delivering_checkpoint() -> None:
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def observe(_observation: SpeakerShadowObservation) -> None:
+        callback_started.set()
+        try:
+            await callback_release.wait()
+        except asyncio.CancelledError:
+            await callback_release.wait()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(callback_timeout_seconds=1.0),
+        on_observation=observe,
+    )
+    candidate = _candidate(355)
+
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await asyncio.wait_for(callback_started.wait(), 2.0)
+    assert runtime.requires_provisional_decision(candidate) is True
+
+    await runtime.reset()
+    assert runtime.requires_provisional_decision(candidate) is False
+    callback_release.set()
+    await runtime.wait_idle()
+
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("config", "scope"),
+    [
+        (_config(minimum_audio_ms=1_500, maximum_audio_ms=4_000),
+         "provider_candidate"),
+        (_provider_gate_config(), "smart_turn_turn"),
+    ],
+    ids=["default-off", "smart-turn"],
+)
+async def test_provisional_decision_is_scope_gated(
+    config: SpeakerShadowConfig,
+    scope: str,
+) -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=config,
+    )
+    candidate = _candidate(356, scope)
+
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.wait_idle()
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+async def test_provider_prewarm_loads_once_without_scoring() -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(prewarm=True),
+        on_observation=observe,
+    )
+    candidate = _candidate(357)
+
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+
+    metrics = runtime.snapshot()
+    assert metrics["load_count"] == 1
+    assert metrics["evaluated_candidate_count"] == 0
+    assert metrics["would_block_count"] == 0
+    assert metrics["active_audio_bytes"] == 0
+    assert observations == []
+    await runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("config", "scope"),
+    [
+        (_provider_gate_config(), "provider_candidate"),
+        (_provider_gate_config(prewarm=True), "smart_turn_turn"),
+    ],
+    ids=["prewarm-default-off", "smart-turn"],
+)
+async def test_backend_prewarm_is_scope_gated(
+    config: SpeakerShadowConfig,
+    scope: str,
+) -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=config,
+    )
+    candidate = _candidate(358, scope)
+
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+
+    assert runtime.snapshot()["load_count"] == 0
+    assert runtime.snapshot()["backend_process_count"] == 0
+    await runtime.close()
+
+
+async def test_backend_prewarm_failure_finalizes_candidate_fail_open() -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(load_ok=False),
+        config=_provider_gate_config(prewarm=True),
+        on_observation=observe,
+    )
+    candidate = _candidate(359)
+
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+
+    metrics = runtime.snapshot()
+    assert metrics["failed_candidate_count"] == 1
+    assert metrics["retained_pcm_bytes"] == 0
+    assert observations == []
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+async def test_reset_invalidates_in_flight_backend_prewarm() -> None:
+    load_started = _spawn_event()
+    load_release = _spawn_event()
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(
+            block_stage="load",
+            stage_started=load_started,
+            stage_release=load_release,
+        ),
+        config=_provider_gate_config(prewarm=True),
+    )
+    candidate = _candidate(360)
+
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await _wait_until(load_started.is_set)
+
+    await runtime.reset()
+    load_release.set()
+    await runtime.wait_idle()
+
+    metrics = runtime.snapshot()
+    assert metrics["stale_result_count"] == 1
+    assert metrics["retained_pcm_bytes"] == 0
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+async def test_close_cancels_in_flight_backend_prewarm() -> None:
+    load_started = _spawn_event()
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(
+            block_stage="load",
+            stage_started=load_started,
+        ),
+        config=_provider_gate_config(
+            prewarm=True,
+            shutdown_grace_seconds=0.05,
+        ),
+    )
+
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=_candidate(361),
+    )
+    await _wait_until(load_started.is_set)
+
+    await asyncio.wait_for(runtime.close(), 2.0)
+
+    metrics = runtime.snapshot()
+    assert metrics["worker_task_count"] == 0
+    assert metrics["backend_process_count"] == 0
+    assert metrics["retained_pcm_bytes"] == 0
 
 
 async def test_checkpoint_callback_failure_does_not_block_confirmation() -> None:
