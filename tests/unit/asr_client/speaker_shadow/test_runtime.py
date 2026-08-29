@@ -829,6 +829,60 @@ async def test_uncooperative_confirmation_callback_cannot_suppress_completion() 
     await runtime.close()
 
 
+async def test_close_tracks_and_reaps_detached_confirmation_callback() -> None:
+    confirmation_started = asyncio.Event()
+    completion_delivered = asyncio.Event()
+    cancellation_count = 0
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        nonlocal cancellation_count
+        if observation.observation_kind != "completion_confirmation":
+            return
+        confirmation_started.set()
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_count += 1
+                if cancellation_count >= 4:
+                    raise
+
+    async def complete(_completion: SpeakerShadowCompletion) -> None:
+        completion_delivered.set()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+            callback_timeout_seconds=0.01,
+        ),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(354)
+
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await asyncio.wait_for(confirmation_started.wait(), 2.0)
+    await asyncio.wait_for(completion_delivered.wait(), 1.0)
+    await runtime.wait_idle()
+
+    assert cancellation_count == 2
+    assert runtime.snapshot()["callback_task_count"] == 1
+
+    await asyncio.wait_for(runtime.close(), 2.0)
+
+    assert cancellation_count >= 4
+    assert runtime.snapshot()["callback_task_count"] == 0
+
+
 async def test_reset_invalidates_in_flight_completion_confirmation() -> None:
     confirmation_started = asyncio.Event()
     completions: list[SpeakerShadowCompletion] = []

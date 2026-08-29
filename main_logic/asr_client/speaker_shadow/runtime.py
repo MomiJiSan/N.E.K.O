@@ -469,6 +469,7 @@ class SpeakerShadowRuntime:
         ] = OrderedDict()
         self._worker_task: asyncio.Task[None] | None = None
         self._callback_task: asyncio.Task[None] | None = None
+        self._detached_callback_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._host_start_task: asyncio.Task[_BackendProcessHost] | None = None
         self._active_evaluation: tuple[int, SpeakerShadowCandidateKey] | None = None
@@ -527,7 +528,8 @@ class SpeakerShadowRuntime:
             ),
             callback_task_count=int(
                 self._callback_task is not None and not self._callback_task.done()
-            ),
+            )
+            + sum(not task.done() for task in self._detached_callback_tasks),
             cleanup_task_count=int(
                 self._cleanup_task is not None and not self._cleanup_task.done()
             ),
@@ -773,6 +775,7 @@ class SpeakerShadowRuntime:
                 worker is not None
                 or self._backend_host is not None
                 or self._host_start_task is not None
+                or bool(self._detached_callback_tasks)
             )
             if needs_cleanup:
                 cleanup = asyncio.create_task(
@@ -1303,6 +1306,7 @@ class SpeakerShadowRuntime:
             if worker is not None and worker.done():
                 self._consume_worker_result(worker)
             await self._cancel_callback_bounded()
+            await self._cancel_detached_callbacks_bounded()
         finally:
             try:
                 await self._unload_backend()
@@ -1489,6 +1493,10 @@ class SpeakerShadowRuntime:
                 # ordered terminal notice from releasing downstream state.
                 # Its done callback retains ownership of eventual cleanup.
                 if self._callback_task is existing_callback_task:
+                    self._detached_callback_tasks.add(existing_callback_task)
+                    existing_callback_task.add_done_callback(
+                        self._detached_callback_tasks.discard
+                    )
                     self._callback_task = None
             else:
                 self._consume_callback_result(existing_callback_task)
@@ -1755,6 +1763,9 @@ class SpeakerShadowRuntime:
         callback_task = self._callback_task
         if callback_task is not None and not callback_task.done():
             callback_task.cancel()
+        for detached_task in tuple(self._detached_callback_tasks):
+            if not detached_task.done():
+                detached_task.cancel()
 
     async def _cancel_callback_bounded(
         self,
@@ -1776,6 +1787,18 @@ class SpeakerShadowRuntime:
                 self._consume_callback_result(callback_task)
                 return True
         return False
+
+    async def _cancel_detached_callbacks_bounded(self) -> bool:
+        detached_tasks = tuple(self._detached_callback_tasks)
+        if not detached_tasks:
+            return True
+        results = await asyncio.gather(
+            *(self._cancel_callback_bounded(task) for task in detached_tasks)
+        )
+        for task in detached_tasks:
+            if task.done():
+                self._detached_callback_tasks.discard(task)
+        return all(results)
 
     def _consume_callback_result(self, task: asyncio.Task[None]) -> None:
         try:
