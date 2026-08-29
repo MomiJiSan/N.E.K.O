@@ -50,6 +50,10 @@ from .endpointing.detector_runtime import (
     DetectorRuntime,
     SmartTurnLease,
 )
+from .endpointing.micro_event_policy import (
+    ProviderMicroEventConfig,
+    ProviderMicroEventDecision,
+)
 from .endpointing.throttle_policy import ThrottleAction
 from .lifecycle import (
     AudioDisposition,
@@ -95,6 +99,13 @@ _CANDIDATE_REJECTION_WATCHDOG_SECONDS = 10.0
 _CANDIDATE_REJECTION_RECOVERY_STEP_TIMEOUT_SECONDS = 1.0
 _CANDIDATE_REJECTION_REINSTALL_ATTEMPTS = 2
 _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS = 0.2
+_PROVIDER_MICRO_EVENT_SHADOW_CONFIG = ProviderMicroEventConfig(
+    mode="shadow",
+    calibration_revision=None,
+    maximum_silero_span_ms=384,
+    maximum_post_start_onset_windows=4,
+    maximum_rnnoise_active_run_upper_bound_ms=160,
+)
 _SPEAKER_REJECTION_METRIC_NAMES = (
     "rejection_request_failed_count",
     "rejection_task_scheduled_count",
@@ -143,6 +154,8 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "provider_candidate_bind_success_count",
     "provider_candidate_bind_empty_count",
     "provider_candidate_bind_failed_count",
+    "micro_event_suppressed_count",
+    "micro_event_shadow_forward_count",
 )
 
 
@@ -2734,6 +2747,11 @@ class IndependentAsrRuntime:
                         ),
                         on_event=on_detector_event,
                         speaker_shadow=speaker_shadow,
+                        provider_micro_event_config=(
+                            None
+                            if _uses_smart_turn_endpointing(policy)
+                            else _PROVIDER_MICRO_EVENT_SHADOW_CONFIG
+                        ),
                     )
                 except Exception:
                     await self._close_created_speaker_shadow(speaker_shadow)
@@ -5132,6 +5150,7 @@ class IndependentAsrRuntime:
         final_key: FinalKey | None = None
         final_identity: _AsrRuntimeIdentity | None = None
         suppress_transcript = False
+        micro_event_decision: ProviderMicroEventDecision | None = None
         ordering_failure_identity: _AsrRuntimeIdentity | None = None
         provider_failure_identity: _AsrRuntimeIdentity | None = None
         successor_present = False
@@ -5178,6 +5197,19 @@ class IndependentAsrRuntime:
                         )
                     else:
                         try:
+                            queried_micro_event_decision = (
+                                detector_ref.sealed_provider_micro_event_decision(
+                                    provider_fence
+                                )
+                            )
+                        except Exception:
+                            queried_micro_event_decision = None
+                        if (
+                            type(queried_micro_event_decision)
+                            is ProviderMicroEventDecision
+                        ):
+                            micro_event_decision = queried_micro_event_decision
+                        try:
                             completion = await detector_ref.complete_provider_candidate(
                                 provider_fence
                             )
@@ -5208,9 +5240,25 @@ class IndependentAsrRuntime:
                 if provider_failure_identity is None:
                     if not self._accept_final_key(final_key):
                         return
-                    suppress_transcript = self._asr_suppressed_final_key == final_key
-                    if suppress_transcript:
+                    speaker_suppress = self._asr_suppressed_final_key == final_key
+                    if speaker_suppress:
                         self._asr_suppressed_final_key = None
+                    micro_event_suppress = False
+                    if (
+                        clean
+                        and micro_event_decision is not None
+                        and micro_event_decision.would_suppress
+                    ):
+                        if micro_event_decision.suppress:
+                            micro_event_suppress = True
+                            self._speaker_rejection_metrics[
+                                "micro_event_suppressed_count"
+                            ] += 1
+                        else:
+                            self._speaker_rejection_metrics[
+                                "micro_event_shadow_forward_count"
+                            ] += 1
+                    suppress_transcript = speaker_suppress or micro_event_suppress
                     if self._asr_turn_endpointed_at is not None:
                         lifecycle_ref.metrics.final_latency_ms = int(
                             (time.monotonic() - self._asr_turn_endpointed_at) * 1_000

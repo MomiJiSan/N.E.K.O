@@ -35,7 +35,13 @@ from .detector import (
     ProviderCandidateFence,
     SmartTurnCompletionFence,
 )
-from .silero_vad import SileroActivityGate, SileroVad
+from .micro_event_policy import (
+    ProviderMicroEventConfig,
+    ProviderMicroEventDecision,
+    ProviderMicroEventEvidence,
+    ProviderMicroEventPolicy,
+)
+from .silero_vad import SileroActivityGate, SileroFeedResult, SileroVad
 from .smart_turn_audio_evidence import create_smart_turn_audio_evidence_recorder
 from .smart_turn_diagnostics import create_smart_turn_runtime_diagnostics
 from .smart_turn_v3 import SmartTurnV3
@@ -1408,6 +1414,188 @@ class _SealedProviderCandidateRejection:
     turn_token: VoiceTurnToken
 
 
+@dataclass(slots=True)
+class _ProviderMicroEventAggregate:
+    """Probability-free evidence owned by one detector candidate generation."""
+
+    candidate: DetectorCandidateKey
+    window_count: int = 0
+    onset_window_count: int = 0
+    offset_window_count: int = 0
+    ambiguous_window_count: int = 0
+    first_onset_window_index: int | None = None
+    last_onset_window_index: int | None = None
+    post_confirmation_onset_window_count: int = 0
+    speech_started_count: int = 0
+    speech_resumed_count: int = 0
+    candidate_pause_count: int = 0
+    event_count: int = 0
+    event_sequence_valid: bool = True
+    last_event: SpeechActivityEvent | None = None
+    silero_evidence_complete: bool = True
+    rnnoise_evidence_complete: bool = True
+    rnnoise_current_active_run_upper_bound_ms: int = 0
+    rnnoise_longest_active_run_upper_bound_ms: int = 0
+    candidate_local_start_kind: str | None = None
+
+    def observe_silero(
+        self,
+        result: SileroFeedResult | None,
+        events: tuple[SpeechActivityEvent, ...],
+    ) -> None:
+        normalize_initial_resume = bool(
+            self.event_count == 0
+            and events
+            and events[0] is SpeechActivityEvent.SPEECH_RESUMED
+        )
+        if result is None:
+            self.silero_evidence_complete = False
+        else:
+            integer_counts = (
+                result.window_count,
+                result.onset_window_count,
+                result.offset_window_count,
+                result.ambiguous_window_count,
+                result.post_confirmation_onset_window_count,
+            )
+            indices_valid = (
+                result.first_onset_window_index is None
+                and result.last_onset_window_index is None
+            ) or (
+                type(result.first_onset_window_index) is int
+                and type(result.last_onset_window_index) is int
+            )
+            if (
+                any(type(value) is not int or value < 0 for value in integer_counts)
+                or not indices_valid
+            ):
+                self.silero_evidence_complete = False
+                result = None
+        if result is not None:
+            window_offset = self.window_count
+            self.window_count += result.window_count
+            self.onset_window_count += result.onset_window_count
+            self.offset_window_count += result.offset_window_count
+            self.ambiguous_window_count += result.ambiguous_window_count
+            self.post_confirmation_onset_window_count += max(
+                0,
+                result.post_confirmation_onset_window_count
+                - int(normalize_initial_resume),
+            )
+            if result.first_onset_window_index is not None:
+                global_first = window_offset + result.first_onset_window_index
+                global_last = window_offset + result.last_onset_window_index
+                if self.first_onset_window_index is None:
+                    self.first_onset_window_index = global_first
+                self.last_onset_window_index = global_last
+
+        for event in events:
+            if self.event_count == 0:
+                event_valid = event in {
+                    SpeechActivityEvent.SPEECH_STARTED,
+                    SpeechActivityEvent.SPEECH_RESUMED,
+                }
+                if event is SpeechActivityEvent.SPEECH_STARTED:
+                    self.candidate_local_start_kind = "speech_started"
+                elif event is SpeechActivityEvent.SPEECH_RESUMED:
+                    self.candidate_local_start_kind = (
+                        "speech_resumed_at_candidate_boundary"
+                    )
+            elif self.last_event in {
+                SpeechActivityEvent.SPEECH_STARTED,
+                SpeechActivityEvent.SPEECH_RESUMED,
+            }:
+                event_valid = event is SpeechActivityEvent.CANDIDATE_PAUSE
+            else:
+                event_valid = event is SpeechActivityEvent.SPEECH_RESUMED
+            if not event_valid:
+                self.event_sequence_valid = False
+            self.event_count += 1
+            self.last_event = event
+            if event is SpeechActivityEvent.SPEECH_STARTED:
+                self.speech_started_count += 1
+            elif event is SpeechActivityEvent.SPEECH_RESUMED:
+                self.speech_resumed_count += 1
+            elif event is SpeechActivityEvent.CANDIDATE_PAUSE:
+                self.candidate_pause_count += 1
+
+    def observe_rnnoise(
+        self,
+        evidence: RnnoiseEvidence,
+        *,
+        onset_threshold: float,
+        chunk_duration_ms: int,
+    ) -> None:
+        complete = bool(
+            evidence.available
+            and evidence.frame_count > 0
+            and evidence.peak is not None
+        )
+        if not complete:
+            self.rnnoise_evidence_complete = False
+            self.rnnoise_current_active_run_upper_bound_ms = 0
+            return
+        if evidence.peak >= onset_threshold:
+            self.rnnoise_current_active_run_upper_bound_ms += chunk_duration_ms
+            self.rnnoise_longest_active_run_upper_bound_ms = max(
+                self.rnnoise_longest_active_run_upper_bound_ms,
+                self.rnnoise_current_active_run_upper_bound_ms,
+            )
+        else:
+            self.rnnoise_current_active_run_upper_bound_ms = 0
+
+    def freeze(self) -> ProviderMicroEventEvidence:
+        candidate_local_micro_event = bool(
+            self.event_sequence_valid
+            and self.event_count == 2
+            and self.speech_started_count + self.speech_resumed_count == 1
+            and self.candidate_pause_count == 1
+        )
+        events: tuple[SpeechActivityEvent, ...] = (
+            (
+                SpeechActivityEvent.SPEECH_STARTED,
+                SpeechActivityEvent.CANDIDATE_PAUSE,
+            )
+            if candidate_local_micro_event
+            else ()
+        )
+        silero = None
+        if self.silero_evidence_complete and self.window_count > 0:
+            silero = SileroFeedResult(
+                events=events,
+                window_count=self.window_count,
+                onset_window_count=self.onset_window_count,
+                offset_window_count=self.offset_window_count,
+                ambiguous_window_count=self.ambiguous_window_count,
+                first_onset_window_index=self.first_onset_window_index,
+                last_onset_window_index=self.last_onset_window_index,
+                post_confirmation_onset_window_count=(
+                    self.post_confirmation_onset_window_count
+                ),
+            )
+        return ProviderMicroEventEvidence(
+            silero=silero,
+            rnnoise_evidence_complete=self.rnnoise_evidence_complete,
+            rnnoise_longest_active_run_upper_bound_ms=(
+                self.rnnoise_longest_active_run_upper_bound_ms
+                if self.rnnoise_evidence_complete
+                else None
+            ),
+            speech_started_count=self.speech_started_count,
+            speech_resumed_count=self.speech_resumed_count,
+            candidate_pause_count=self.candidate_pause_count,
+            event_sequence_valid=self.event_sequence_valid,
+            candidate_local_start_kind=self.candidate_local_start_kind,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedProviderMicroEvent:
+    provider_fence: ProviderCandidateFence
+    evidence: ProviderMicroEventEvidence
+    decision: ProviderMicroEventDecision
+
+
 class DetectorRuntime:
     """Serialize Silero loading and inference without owning an ASR session."""
 
@@ -1421,6 +1609,7 @@ class DetectorRuntime:
         provider_policy: AsrProviderPolicy | None = None,
         coordinator: TurnCoordinator | None = None,
         throttle_policy: VoiceThrottlePolicy | None = None,
+        provider_micro_event_config: ProviderMicroEventConfig | None = None,
         speaker_shadow: SpeakerShadowObserver | None = None,
         on_turn_complete: Callable[[], Awaitable[None]] | None = None,
         on_endpointing_failure: Callable[[], Awaitable[None]] | None = None,
@@ -1493,6 +1682,16 @@ class DetectorRuntime:
         self._sealed_provider_candidate_rejection: (
             _SealedProviderCandidateRejection | None
         ) = None
+        self._provider_micro_event_policy = ProviderMicroEventPolicy(
+            provider_micro_event_config
+        )
+        self._provider_micro_event_enabled = (
+            self._provider_micro_event_policy.config.mode != "off"
+        )
+        self._provider_micro_event_aggregate: (
+            _ProviderMicroEventAggregate | None
+        ) = None
+        self._sealed_provider_micro_event: _SealedProviderMicroEvent | None = None
         self._provider_discarded_through_sequence_no: int | None = None
         self._speaker_shadow = speaker_shadow
         self._speaker_shadow_generation = 0
@@ -1524,6 +1723,13 @@ class DetectorRuntime:
             "detector_vad_load_unavailable_count": 0,
             "detector_vad_load_exception_count": 0,
             "detector_gate_exception_count": 0,
+            "micro_event_candidate_count": 0,
+            "micro_event_evidence_complete_count": 0,
+            "micro_event_evidence_unavailable_count": 0,
+            "micro_event_would_suppress_count": 0,
+            "micro_event_fail_open_count": 0,
+            "micro_event_stale_fence_count": 0,
+            "micro_event_rnnoise_unavailable_count": 0,
         }
         if (
             provider_policy is not None
@@ -1818,6 +2024,96 @@ class DetectorRuntime:
 
         return dict(self._speaker_rejection_prepare_diagnostics)
 
+    def _observe_provider_micro_event(
+        self,
+        candidate: DetectorCandidateKey,
+        *,
+        silero: SileroFeedResult | None,
+        events: tuple[SpeechActivityEvent, ...],
+        rnnoise: RnnoiseEvidence,
+        onset_threshold: float,
+        chunk_duration_ms: int,
+    ) -> None:
+        if not self._provider_micro_event_enabled:
+            return
+        aggregate = self._provider_micro_event_aggregate
+        if aggregate is None or aggregate.candidate != candidate:
+            aggregate = _ProviderMicroEventAggregate(candidate)
+            self._provider_micro_event_aggregate = aggregate
+        aggregate.observe_silero(silero, events)
+        aggregate.observe_rnnoise(
+            rnnoise,
+            onset_threshold=onset_threshold,
+            chunk_duration_ms=chunk_duration_ms,
+        )
+
+    def _seal_provider_micro_event(
+        self,
+        candidate: DetectorCandidateKey,
+        fence: ProviderCandidateFence,
+    ) -> None:
+        self._sealed_provider_micro_event = None
+        if not self._provider_micro_event_enabled:
+            self._provider_micro_event_aggregate = None
+            return
+
+        diagnostics = self._speaker_rejection_prepare_diagnostics
+        diagnostics["micro_event_candidate_count"] += 1
+        aggregate = self._provider_micro_event_aggregate
+        if aggregate is None or aggregate.candidate != candidate:
+            evidence = ProviderMicroEventEvidence(None, False, None)
+        else:
+            evidence = aggregate.freeze()
+        self._provider_micro_event_aggregate = None
+
+        if not evidence.rnnoise_evidence_complete:
+            diagnostics["micro_event_rnnoise_unavailable_count"] += 1
+
+        try:
+            decision = self._provider_micro_event_policy.decide(evidence)
+        except Exception:
+            decision = ProviderMicroEventDecision(
+                would_suppress=False,
+                suppress=False,
+                reason="policy_error",
+                fail_open=True,
+            )
+        if decision.fail_open:
+            diagnostics["micro_event_evidence_unavailable_count"] += 1
+            diagnostics["micro_event_fail_open_count"] += 1
+        else:
+            diagnostics["micro_event_evidence_complete_count"] += 1
+        if decision.would_suppress:
+            diagnostics["micro_event_would_suppress_count"] += 1
+        self._sealed_provider_micro_event = _SealedProviderMicroEvent(
+            provider_fence=fence,
+            evidence=evidence,
+            decision=decision,
+        )
+
+    def sealed_provider_micro_event_decision(
+        self,
+        fence: ProviderCandidateFence,
+    ) -> ProviderMicroEventDecision | None:
+        """Read the frozen decision for one exact Provider candidate fence."""
+
+        sealed = self._sealed_provider_micro_event
+        if not self._provider_micro_event_enabled:
+            return None
+        if (
+            self._closed
+            or self._semantic_adapter is not None
+            or type(fence) is not ProviderCandidateFence
+            or fence != self._provider_candidate_fence
+            or sealed is None
+            or sealed.provider_fence != fence
+        ):
+            self._speaker_rejection_prepare_diagnostics[
+                "micro_event_stale_fence_count"
+            ] += 1
+            return None
+        return sealed.decision
+
     def _commit_candidate_rejection(
         self,
         lease: DetectorCandidateRejectionLease,
@@ -1878,6 +2174,8 @@ class DetectorRuntime:
         self._policy_event_candidate = None
         self._provider_candidate_fence = None
         self._sealed_provider_candidate_rejection = None
+        self._provider_micro_event_aggregate = None
+        self._sealed_provider_micro_event = None
         self._throttle_policy.reset_candidate_activity()
         self._finish_speaker_shadow_candidate(
             expected_scope=lease.shadow_candidate.scope,
@@ -2171,6 +2469,8 @@ class DetectorRuntime:
             self._completion_fences.clear()
             self._provider_candidate_fence = None
             self._sealed_provider_candidate_rejection = None
+            self._provider_micro_event_aggregate = None
+            self._sealed_provider_micro_event = None
             self._deferred_completion_identity_advanced = False
             self._provider_discarded_through_sequence_no = None
             # A deferred completion belongs to the invalidated epoch; keeping
@@ -2321,6 +2621,8 @@ class DetectorRuntime:
                         "detector_vad_load_exception_count"
                     ] += 1
                 if not self._available:
+                    self._provider_micro_event_aggregate = None
+                    self._sealed_provider_micro_event = None
                     if not self._speaker_rejection_prepare_diagnostics[
                         "detector_vad_load_exception_count"
                     ]:
@@ -2332,10 +2634,33 @@ class DetectorRuntime:
                         False,
                         throttle_action=throttle.action,
                     )
+            silero_result: SileroFeedResult | None = None
             try:
-                events = tuple(await asyncio.to_thread(self._gate.feed, pcm16))
+                feed_with_evidence = getattr(
+                    self._gate,
+                    "feed_with_evidence",
+                    None,
+                )
+                if self._provider_micro_event_enabled and callable(
+                    feed_with_evidence
+                ):
+                    raw_silero_result = await asyncio.to_thread(
+                        feed_with_evidence,
+                        pcm16,
+                    )
+                    if type(raw_silero_result) is SileroFeedResult:
+                        silero_result = raw_silero_result
+                        events = tuple(raw_silero_result.events)
+                    else:
+                        events = tuple(
+                            getattr(raw_silero_result, "events", ())
+                        )
+                else:
+                    events = tuple(await asyncio.to_thread(self._gate.feed, pcm16))
             except Exception:
                 self._available = False
+                self._provider_micro_event_aggregate = None
+                self._sealed_provider_micro_event = None
                 self._speaker_rejection_prepare_diagnostics[
                     "detector_gate_exception_count"
                 ] += 1
@@ -2354,6 +2679,14 @@ class DetectorRuntime:
             candidate = DetectorCandidateKey(
                 self._detector_epoch,
                 self._candidate_generation,
+            )
+            self._observe_provider_micro_event(
+                candidate,
+                silero=silero_result,
+                events=events,
+                rnnoise=throttle.evidence.rnnoise,
+                onset_threshold=throttle.onset_threshold,
+                chunk_duration_ms=(len(pcm16) * 1_000 + 31_999) // 32_000,
             )
             if (
                 throttle.action is ThrottleAction.PREWARM
@@ -2459,6 +2792,7 @@ class DetectorRuntime:
                     "rejection_seal_snapshot_created_count"
                 ] += 1
             self._sealed_provider_candidate_rejection = sealed_rejection
+            self._seal_provider_micro_event(candidate, fence)
             self._provider_discarded_through_sequence_no = None
             self._candidate_generation += 1
             self._candidate_open = False
@@ -2532,6 +2866,7 @@ class DetectorRuntime:
             await asyncio.to_thread(self._gate.reset)
             self._provider_discarded_through_sequence_no = self._sequence_no
             self._candidate_generation += 1
+            self._provider_micro_event_aggregate = None
             self._candidate_open = False
             self._speech_active = False
             self._policy_event_candidate = None
@@ -2565,6 +2900,7 @@ class DetectorRuntime:
                     "rejection_complete_cleared_snapshot_count"
                 ] += 1
             self._sealed_provider_candidate_rejection = None
+            self._sealed_provider_micro_event = None
             successor_floor = max(
                 fence.through_sequence_no,
                 self._provider_discarded_through_sequence_no
@@ -2574,6 +2910,7 @@ class DetectorRuntime:
             successor_present = self._sequence_no > successor_floor
             successor_confirmed = successor_present and self._speech_active
             if not successor_confirmed:
+                self._provider_micro_event_aggregate = None
                 self._candidate_open = False
                 self._speech_active = False
                 self._policy_event_candidate = None
@@ -2694,6 +3031,8 @@ class DetectorRuntime:
             self._completion_fences.clear()
             self._provider_candidate_fence = None
             self._sealed_provider_candidate_rejection = None
+            self._provider_micro_event_aggregate = None
+            self._sealed_provider_micro_event = None
             self._provider_discarded_through_sequence_no = None
             self._defer_turn_complete = False
             self._deferred_turn_complete = False
@@ -2805,6 +3144,8 @@ class DetectorRuntime:
                 self._completion_fences.clear()
                 self._provider_candidate_fence = None
                 self._sealed_provider_candidate_rejection = None
+                self._provider_micro_event_aggregate = None
+                self._sealed_provider_micro_event = None
                 self._provider_discarded_through_sequence_no = None
                 self._speech_active = False
                 self._prepare_token = None
@@ -2971,6 +3312,8 @@ class DetectorRuntime:
                 self._completion_fences.clear()
                 self._provider_candidate_fence = None
                 self._sealed_provider_candidate_rejection = None
+                self._provider_micro_event_aggregate = None
+                self._sealed_provider_micro_event = None
                 self._provider_discarded_through_sequence_no = None
                 watch_task, self._failure_watch_task = self._failure_watch_task, None
                 if watch_task is not None:
@@ -3150,6 +3493,8 @@ class DetectorRuntime:
             self._completion_fences.clear()
             self._provider_candidate_fence = None
             self._sealed_provider_candidate_rejection = None
+            self._provider_micro_event_aggregate = None
+            self._sealed_provider_micro_event = None
             self._provider_discarded_through_sequence_no = None
             self._smart_turn_readiness = SmartTurnReadiness.FAILED
             await self._reset_speaker_shadow(self._speaker_shadow)

@@ -12,6 +12,9 @@ from main_logic.asr_client.endpointing.detector import (
     DetectorCandidateKey,
     ProviderCandidateFence,
 )
+from main_logic.asr_client.endpointing.micro_event_policy import (
+    ProviderMicroEventDecision,
+)
 from main_logic.asr_client.lifecycle import (
     FinalKey,
     VoiceInputLifecycleController,
@@ -62,6 +65,7 @@ class _RejectionDetector:
         self.replace_speaker_verifier = AsyncMock()
         self.close = AsyncMock()
         self.complete_provider_candidate = AsyncMock(return_value=False)
+        self.sealed_provider_micro_event_decision = MagicMock(return_value=None)
         self.release_deferred_turn = AsyncMock()
         self.provisional_pending = False
 
@@ -410,6 +414,360 @@ async def test_sealed_provider_rejection_suppresses_only_exact_final() -> None:
     assert runtime._asr_provider_candidate_fence is None
     session.close.assert_not_awaited()
     detector.reset.assert_not_awaited()
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_micro_event_shadow_forwards_non_empty_final() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token, provider_fence = (
+        _seal_provider_candidate(runtime, detector)
+    )
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, False, "micro_event_shadow")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    detector.sealed_provider_micro_event_decision.assert_called_once_with(
+        provider_fence
+    )
+    callbacks.on_final.assert_awaited_once()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_shadow_forward_count"] == 1
+    assert diagnostics["micro_event_suppressed_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_provider_micro_event_empty_final_is_never_suppressed_or_counted(
+    enforce: bool,
+) -> None:
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _seal_provider_candidate(runtime, detector)
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, enforce, "eligible_micro_event")
+    )
+
+    await runtime._handle_independent_asr_final("", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    abandoned.assert_not_awaited()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 0
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_micro_event_enforce_suppresses_exact_non_empty_final() -> None:
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, True, "micro_event_enforced")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    detector.sealed_provider_micro_event_decision.assert_called_once_with(
+        provider_fence
+    )
+    callbacks.on_final.assert_not_awaited()
+    abandoned.assert_awaited_once_with(turn_token)
+    assert runtime._asr_suppressed_final_key is None
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 1
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_exact_speaker_and_micro_event_suppress_only_once() -> None:
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+    final_key = FinalKey.from_turn(turn_token)
+    runtime._asr_suppressed_final_key = final_key
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, True, "micro_event_enforced")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    detector.sealed_provider_micro_event_decision.assert_called_once_with(
+        provider_fence
+    )
+    callbacks.on_final.assert_not_awaited()
+    abandoned.assert_awaited_once_with(turn_token)
+    assert runtime._asr_suppressed_final_key is None
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 1
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_micro_event_query_failure_fails_open() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _seal_provider_candidate(runtime, detector)
+    detector.sealed_provider_micro_event_decision.side_effect = RuntimeError(
+        "query failed"
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 0
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_micro_event_decision_is_stale_after_completion_drift() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, _provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, True, "micro_event_enforced")
+    )
+
+    async def drift_during_completion(_provider_fence) -> bool:
+        runtime._asr_audio_generation += 1
+        return False
+
+    detector.complete_provider_candidate.side_effect = drift_during_completion
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+
+    callbacks.on_final.assert_not_awaited()
+    assert runtime._asr_transcript_dispatcher.try_reserve(
+        FinalKey.from_turn(turn_token)
+    )
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 0
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_micro_event_waits_for_existing_speaker_gate() -> None:
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, _provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, True, "micro_event_enforced")
+    )
+    assert await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None
+
+    final_task = asyncio.create_task(
+        runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    )
+    while not gate.wait_started:
+        await asyncio.sleep(0)
+    assert final_task.done() is False
+    detector.sealed_provider_micro_event_decision.assert_not_called()
+
+    assert runtime._resolve_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+        rejected=False,
+    )
+    await asyncio.wait_for(final_task, 1)
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_not_awaited()
+    abandoned.assert_awaited_once_with(turn_token)
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_waited_count"] == 1
+    assert diagnostics["speaker_gate_timeout_count"] == 0
+    assert diagnostics["micro_event_suppressed_count"] == 1
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_micro_event_suppression_preserves_same_text_successor() -> (
+    None
+):
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, first_turn, _provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+    lifecycle.mark_pending_turn_speech()
+    pending_pcm = b"\x01\x00" * 320
+    buffered = lifecycle.accept_audio(pending_pcm, sample_rate_hz=16_000)
+    assert buffered.disposition.value == "buffer"
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, True, "micro_event_enforced")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    assert callbacks.on_final.await_count == 0
+    abandoned.assert_awaited_once_with(first_turn)
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    successor_turn = runtime._asr_partial_turn_token
+    assert successor_turn is not None and successor_turn != first_turn
+    detector.lease = _RejectionLease(detector, successor_turn)
+    await runtime._handle_independent_asr_endpoint(0)
+    assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(False, False, "silero_span_exceeded")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    assert callbacks.on_final.await_args.args[0].text == "嗯"
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 1
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_duplicate_micro_event_final_counts_once_and_preserves_next_turn(
+    enforce: bool,
+) -> None:
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, first_turn, provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+    lifecycle.mark_pending_turn_speech()
+    pending_pcm = b"\x02\x00" * 320
+    buffered = lifecycle.accept_audio(pending_pcm, sample_rate_hz=16_000)
+    assert buffered.disposition.value == "buffer"
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, enforce, "eligible_micro_event")
+    )
+    complete_entered = asyncio.Event()
+    complete_release = asyncio.Event()
+
+    async def blocked_complete(received_fence) -> bool:
+        assert received_fence == provider_fence
+        complete_entered.set()
+        await complete_release.wait()
+        return False
+
+    detector.complete_provider_candidate.side_effect = blocked_complete
+    first_final = asyncio.create_task(
+        runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    )
+    await asyncio.wait_for(complete_entered.wait(), 1)
+    duplicate_final = asyncio.create_task(
+        runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    )
+    await asyncio.sleep(0)
+    assert duplicate_final.done() is False
+    complete_release.set()
+
+    await asyncio.wait_for(asyncio.gather(first_final, duplicate_final), 1)
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    detector.sealed_provider_micro_event_decision.assert_called_once_with(
+        provider_fence
+    )
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == int(enforce)
+    assert diagnostics["micro_event_shadow_forward_count"] == int(not enforce)
+    assert callbacks.on_final.await_count == int(not enforce)
+    assert abandoned.await_count == int(enforce)
+    if enforce:
+        abandoned.assert_awaited_once_with(first_turn)
+
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    successor_turn = runtime._asr_partial_turn_token
+    assert successor_turn is not None and successor_turn != first_turn
+    detector.lease = _RejectionLease(detector, successor_turn)
+    detector.complete_provider_candidate.side_effect = None
+    detector.complete_provider_candidate.return_value = False
+    await runtime._handle_independent_asr_endpoint(0)
+    assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(False, False, "silero_span_exceeded")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    assert callbacks.on_final.await_count == int(not enforce) + 1
+    assert callbacks.on_final.await_args.args[0].text == "嗯"
+    assert detector.sealed_provider_micro_event_decision.call_count == 2
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == int(enforce)
+    assert diagnostics["micro_event_shadow_forward_count"] == int(not enforce)
+    await _close_dispatchers(runtime)
+
+
+async def test_smart_turn_final_does_not_query_provider_micro_event() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="manual",
+    )
+    _seal_installed_provider_candidate(
+        runtime,
+        detector,
+        session,
+        lifecycle,
+        turn_token,
+    )
+    detector.sealed_provider_micro_event_decision.return_value = (
+        ProviderMicroEventDecision(True, True, "micro_event_enforced")
+    )
+
+    await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await runtime.wait_transcript_idle()
+
+    detector.sealed_provider_micro_event_decision.assert_not_called()
+    callbacks.on_final.assert_awaited_once()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["micro_event_suppressed_count"] == 0
+    assert diagnostics["micro_event_shadow_forward_count"] == 0
     await _close_dispatchers(runtime)
 
 

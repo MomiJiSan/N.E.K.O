@@ -26,6 +26,10 @@ from main_logic.asr_client.endpointing.detector import (
     DetectorTurnEvent,
     ProviderCandidateFence,
 )
+from main_logic.asr_client.endpointing.micro_event_policy import (
+    ProviderMicroEventConfig,
+)
+from main_logic.asr_client.endpointing.silero_vad import SileroFeedResult
 from main_logic.asr_client.lifecycle import VoiceIngressToken, VoiceTurnToken
 from main_logic.asr_client.provider_policy import AsrProviderPolicy
 from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
@@ -67,6 +71,30 @@ class _Gate:
 
     def reset(self) -> None:
         return None
+
+
+class _EvidenceGate(_Gate):
+    def __init__(self, results: list[SileroFeedResult]) -> None:
+        super().__init__()
+        self.results = list(results)
+        self.feed_calls = 0
+        self.evidence_calls = 0
+        self.reset_calls = 0
+
+    def _next(self, pcm16: bytes) -> SileroFeedResult:
+        self.inputs.append(pcm16)
+        return self.results.pop(0)
+
+    def feed(self, pcm16: bytes):
+        self.feed_calls += 1
+        return self._next(pcm16).events
+
+    def feed_with_evidence(self, pcm16: bytes) -> SileroFeedResult:
+        self.evidence_calls += 1
+        return self._next(pcm16)
+
+    def reset(self) -> None:
+        self.reset_calls += 1
 
 
 class _FailingVad(_Vad):
@@ -339,6 +367,35 @@ def _provider_endpoint_policy() -> AsrProviderPolicy:
 
 def _ingress_token() -> VoiceIngressToken:
     return VoiceIngressToken(1, "socket", 1, 1, 1)
+
+
+def _silero_micro_result(
+    events: tuple[SpeechActivityEvent, ...],
+    *,
+    window_count: int = 4,
+    onset_window_count: int = 2,
+    offset_window_count: int = 2,
+    ambiguous_window_count: int = 0,
+    first_onset_window_index: int | None = 0,
+    last_onset_window_index: int | None = 1,
+    post_confirmation_onset_window_count: int = 0,
+) -> SileroFeedResult:
+    return SileroFeedResult(
+        events=events,
+        window_count=window_count,
+        onset_window_count=onset_window_count,
+        offset_window_count=offset_window_count,
+        ambiguous_window_count=ambiguous_window_count,
+        first_onset_window_index=first_onset_window_index,
+        last_onset_window_index=last_onset_window_index,
+        post_confirmation_onset_window_count=(
+            post_confirmation_onset_window_count
+        ),
+    )
+
+
+def _rnnoise_chunk(peak: float = 0.4) -> RnnoiseEvidence:
+    return RnnoiseEvidence(True, 4, peak, peak, peak, peak)
 
 
 async def _prepare_candidate_rejection_fixture() -> tuple[
@@ -2979,3 +3036,424 @@ async def test_detector_reset_and_close_are_idempotent() -> None:
 
     assert vad.closed is True
     assert (await detector.feed(b"\x00\x00")).throttle_available is False
+
+
+async def test_provider_micro_event_aggregates_global_silero_indices() -> None:
+    gate = _EvidenceGate(
+        [
+            _silero_micro_result(
+                (SpeechActivityEvent.SPEECH_STARTED,),
+            ),
+            _silero_micro_result(
+                (SpeechActivityEvent.CANDIDATE_PAUSE,),
+                onset_window_count=1,
+                offset_window_count=3,
+                first_onset_window_index=2,
+                last_onset_window_index=2,
+                post_confirmation_onset_window_count=1,
+            ),
+        ]
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+
+    for value in (1, 2):
+        result = await detector.feed(
+            bytes((value, 0)) * 512,
+            ingress_token=_ingress_token(),
+            rnnoise_evidence=_rnnoise_chunk(),
+        )
+        assert result.throttle_available is True
+    fence = await detector.seal_provider_candidate()
+
+    assert fence is not None
+    wrong_fence = ProviderCandidateFence(
+        fence.detector_epoch,
+        fence.candidate_generation + 1,
+        fence.through_sequence_no,
+    )
+    assert detector.sealed_provider_micro_event_decision(wrong_fence) is None
+    decision = detector.sealed_provider_micro_event_decision(fence)
+    assert decision is not None
+    assert decision.would_suppress is True
+    assert decision.suppress is False
+    assert decision.reason == "micro_event_shadow"
+    assert gate.evidence_calls == 2
+    assert gate.feed_calls == 0
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["micro_event_candidate_count"] == 1
+    assert diagnostics["micro_event_evidence_complete_count"] == 1
+    assert diagnostics["micro_event_would_suppress_count"] == 1
+    assert diagnostics["micro_event_fail_open_count"] == 0
+    assert diagnostics["micro_event_stale_fence_count"] == 1
+    await detector.close()
+
+
+async def test_provider_micro_event_rnnoise_active_upper_bound_is_inclusive() -> (
+    None
+):
+    config = ProviderMicroEventConfig(
+        mode="shadow",
+        maximum_rnnoise_active_run_upper_bound_ms=160,
+    )
+    decisions = []
+    for sample_count in (2_560, 2_576):
+        gate = _EvidenceGate(
+            [
+                _silero_micro_result(
+                    (
+                        SpeechActivityEvent.SPEECH_STARTED,
+                        SpeechActivityEvent.CANDIDATE_PAUSE,
+                    )
+                )
+            ]
+        )
+        detector = DetectorRuntime(
+            vad=_Vad(),
+            gate=gate,
+            provider_policy=_provider_endpoint_policy(),
+            provider_micro_event_config=config,
+        )
+        await detector.feed(
+            b"\x01\x00" * sample_count,
+            ingress_token=_ingress_token(),
+            rnnoise_evidence=_rnnoise_chunk(0.35),
+        )
+        fence = await detector.seal_provider_candidate()
+        assert fence is not None
+        decisions.append(detector.sealed_provider_micro_event_decision(fence))
+        await detector.close()
+
+    assert decisions[0] is not None and decisions[0].would_suppress is True
+    assert decisions[1] is not None and decisions[1].would_suppress is False
+    assert decisions[1].reason == "rnnoise_active_run_exceeded"
+
+
+async def test_provider_micro_event_normalizes_only_initial_resume() -> None:
+    micro_events = (
+        SpeechActivityEvent.SPEECH_STARTED,
+        SpeechActivityEvent.CANDIDATE_PAUSE,
+    )
+    gate = _EvidenceGate(
+        [
+            _silero_micro_result(micro_events),
+            _silero_micro_result(
+                (
+                    SpeechActivityEvent.SPEECH_RESUMED,
+                    SpeechActivityEvent.CANDIDATE_PAUSE,
+                ),
+                window_count=6,
+                onset_window_count=5,
+                offset_window_count=1,
+                first_onset_window_index=0,
+                last_onset_window_index=4,
+                post_confirmation_onset_window_count=5,
+            ),
+            _silero_micro_result(
+                (
+                    SpeechActivityEvent.SPEECH_RESUMED,
+                    SpeechActivityEvent.CANDIDATE_PAUSE,
+                    SpeechActivityEvent.SPEECH_RESUMED,
+                    SpeechActivityEvent.CANDIDATE_PAUSE,
+                )
+            ),
+        ]
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    first_fence = await detector.seal_provider_candidate()
+    assert first_fence is not None
+    assert await detector.complete_provider_candidate(first_fence) is False
+
+    await detector.feed(
+        b"\x02\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    second_fence = await detector.seal_provider_candidate()
+    assert second_fence is not None
+    second = detector.sealed_provider_micro_event_decision(second_fence)
+    assert second is not None and second.would_suppress is True
+    assert await detector.complete_provider_candidate(second_fence) is False
+
+    await detector.feed(
+        b"\x03\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    third_fence = await detector.seal_provider_candidate()
+    assert third_fence is not None
+    third = detector.sealed_provider_micro_event_decision(third_fence)
+    assert third is not None and third.would_suppress is False
+    assert third.reason == "multiple_or_resumed_speech_segments"
+    assert third.fail_open is False
+    await detector.close()
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (
+            SpeechActivityEvent.SPEECH_STARTED,
+            SpeechActivityEvent.SPEECH_STARTED,
+            SpeechActivityEvent.CANDIDATE_PAUSE,
+        ),
+        (
+            SpeechActivityEvent.SPEECH_STARTED,
+            SpeechActivityEvent.CANDIDATE_PAUSE,
+            SpeechActivityEvent.CANDIDATE_PAUSE,
+        ),
+    ],
+)
+async def test_provider_micro_event_rejects_duplicate_activity_transitions(
+    events: tuple[SpeechActivityEvent, ...],
+) -> None:
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_EvidenceGate([_silero_micro_result(events)]),
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    fence = await detector.seal_provider_candidate()
+
+    assert fence is not None
+    decision = detector.sealed_provider_micro_event_decision(fence)
+    assert decision is not None
+    assert decision.would_suppress is False
+    assert decision.reason == "unordered_silero_events"
+    assert decision.fail_open is True
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["micro_event_evidence_unavailable_count"] == 1
+    assert diagnostics["micro_event_fail_open_count"] == 1
+    await detector.close()
+
+
+async def test_provider_micro_event_preserves_sealed_snapshot_across_discard() -> (
+    None
+):
+    gate = _EvidenceGate(
+        [
+            _silero_micro_result(
+                (
+                    SpeechActivityEvent.SPEECH_STARTED,
+                    SpeechActivityEvent.CANDIDATE_PAUSE,
+                )
+            ),
+            _silero_micro_result(
+                (
+                    SpeechActivityEvent.SPEECH_RESUMED,
+                    SpeechActivityEvent.CANDIDATE_PAUSE,
+                )
+            ),
+        ]
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    fence = await detector.seal_provider_candidate()
+    assert fence is not None
+    await detector.feed(
+        b"\x02\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+
+    assert detector.sealed_provider_micro_event_decision(fence) is not None
+    assert await detector.discard_provider_successor(fence) is True
+    assert detector.sealed_provider_micro_event_decision(fence) is not None
+    assert await detector.complete_provider_candidate(fence) is False
+    assert detector.sealed_provider_micro_event_decision(fence) is None
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["micro_event_stale_fence_count"] == 1
+    await detector.close()
+
+
+async def test_provider_micro_event_custom_gate_fails_open_without_evidence() -> (
+    None
+):
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(
+            (
+                SpeechActivityEvent.SPEECH_STARTED,
+                SpeechActivityEvent.CANDIDATE_PAUSE,
+            )
+        ),
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    fence = await detector.seal_provider_candidate()
+
+    assert fence is not None
+    decision = detector.sealed_provider_micro_event_decision(fence)
+    assert decision is not None
+    assert decision.would_suppress is False
+    assert decision.reason == "incomplete_silero_evidence"
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["micro_event_evidence_unavailable_count"] == 1
+    assert diagnostics["micro_event_fail_open_count"] == 1
+    assert diagnostics["micro_event_rnnoise_unavailable_count"] == 0
+    await detector.close()
+
+
+async def test_provider_micro_event_missing_pause_and_rnnoise_fail_open() -> None:
+    gate = _EvidenceGate(
+        [_silero_micro_result((SpeechActivityEvent.SPEECH_STARTED,))]
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=RnnoiseEvidence.unavailable(),
+    )
+    fence = await detector.seal_provider_candidate()
+
+    assert fence is not None
+    decision = detector.sealed_provider_micro_event_decision(fence)
+    assert decision is not None
+    assert decision.would_suppress is False
+    assert decision.reason == "incomplete_rnnoise_evidence"
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["micro_event_evidence_unavailable_count"] == 1
+    assert diagnostics["micro_event_fail_open_count"] == 1
+    assert diagnostics["micro_event_rnnoise_unavailable_count"] == 1
+    await detector.close()
+
+
+async def test_provider_micro_event_default_off_uses_legacy_gate_feed() -> None:
+    gate = _EvidenceGate(
+        [
+            _silero_micro_result(
+                (
+                    SpeechActivityEvent.SPEECH_STARTED,
+                    SpeechActivityEvent.CANDIDATE_PAUSE,
+                )
+            )
+        ]
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_provider_endpoint_policy(),
+    )
+
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    fence = await detector.seal_provider_candidate()
+
+    assert fence is not None
+    assert gate.feed_calls == 1
+    assert gate.evidence_calls == 0
+    assert detector.sealed_provider_micro_event_decision(fence) is None
+    assert detector.speaker_rejection_diagnostics_snapshot()[
+        "micro_event_candidate_count"
+    ] == 0
+    await detector.close()
+
+
+async def test_smart_turn_uses_legacy_gate_feed_with_micro_event_config() -> None:
+    gate = _EvidenceGate(
+        [_silero_micro_result((SpeechActivityEvent.SPEECH_STARTED,))]
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_smart_turn_policy(),
+        coordinator=_SemanticCoordinator(),
+        on_turn_complete=AsyncMock(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+
+    await detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+
+    assert gate.feed_calls == 1
+    assert gate.evidence_calls == 0
+    assert detector.speaker_rejection_diagnostics_snapshot()[
+        "micro_event_candidate_count"
+    ] == 0
+    await detector.close()
+
+
+async def test_provider_micro_event_reset_and_close_clear_sealed_snapshot() -> None:
+    result = _silero_micro_result(
+        (
+            SpeechActivityEvent.SPEECH_STARTED,
+            SpeechActivityEvent.CANDIDATE_PAUSE,
+        )
+    )
+    reset_detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_EvidenceGate([result]),
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+    await reset_detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    reset_fence = await reset_detector.seal_provider_candidate()
+    assert reset_fence is not None
+    await reset_detector.reset()
+    assert reset_detector.sealed_provider_micro_event_decision(reset_fence) is None
+    await reset_detector.close()
+
+    close_detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_EvidenceGate([result]),
+        provider_policy=_provider_endpoint_policy(),
+        provider_micro_event_config=ProviderMicroEventConfig(mode="shadow"),
+    )
+    await close_detector.feed(
+        b"\x01\x00" * 512,
+        ingress_token=_ingress_token(),
+        rnnoise_evidence=_rnnoise_chunk(),
+    )
+    close_fence = await close_detector.seal_provider_candidate()
+    assert close_fence is not None
+    await close_detector.close()
+    assert close_detector.sealed_provider_micro_event_decision(close_fence) is None

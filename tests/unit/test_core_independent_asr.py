@@ -9245,11 +9245,19 @@ async def test_transport_restart_task_failure_is_logged(caplog) -> None:
     assert "restart boom" in caplog.text
 
 
-async def test_start_resolves_selection_off_event_loop(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("endpointing_mode", "expects_micro_event_config"),
+    [("provider", True), ("manual", False)],
+)
+async def test_start_resolves_selection_off_event_loop(
+    monkeypatch,
+    endpointing_mode: str,
+    expects_micro_event_config: bool,
+) -> None:
     import main_logic.asr_client.runtime as runtime_module
 
     runtime = _Runtime()
-    selection = _selection("qwen", "provider")
+    selection = _selection("qwen", endpointing_mode)
     resolver_threads: list[threading.Thread] = []
 
     def resolver(core_type: str):
@@ -9283,6 +9291,19 @@ async def test_start_resolves_selection_off_event_loop(monkeypatch) -> None:
         detector_factory.call_args.kwargs["resource_optimization_enabled"] is False
     )
     assert detector_factory.call_args.kwargs["speaker_shadow"] is None
+    micro_event_config = detector_factory.call_args.kwargs[
+        "provider_micro_event_config"
+    ]
+    if expects_micro_event_config:
+        assert micro_event_config.mode == "shadow"
+        assert micro_event_config.calibration_revision is None
+        assert micro_event_config.maximum_silero_span_ms == 384
+        assert micro_event_config.maximum_post_start_onset_windows == 4
+        assert (
+            micro_event_config.maximum_rnnoise_active_run_upper_bound_ms == 160
+        )
+    else:
+        assert micro_event_config is None
 
 
 @pytest.mark.parametrize("factory_fails", [False, True])

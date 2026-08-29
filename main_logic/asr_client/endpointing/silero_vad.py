@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable
@@ -70,6 +71,20 @@ class SileroVad(OnnxModelRuntime):
         return probabilities
 
 
+@dataclass(frozen=True, slots=True)
+class SileroFeedResult:
+    """Ordered activity plus non-biometric window-shape evidence."""
+
+    events: tuple[SpeechActivityEvent, ...]
+    window_count: int
+    onset_window_count: int
+    offset_window_count: int
+    ambiguous_window_count: int
+    first_onset_window_index: int | None
+    last_onset_window_index: int | None
+    post_confirmation_onset_window_count: int
+
+
 class SileroActivityGate:
     """Map Silero probabilities to activity events without committing a turn."""
 
@@ -93,14 +108,41 @@ class SileroActivityGate:
         self._candidate_emitted = False
 
     def feed(self, pcm16_le: bytes) -> tuple[SpeechActivityEvent, ...]:
-        return self.process_probabilities(self._vad.process_pcm16(pcm16_le))
+        return self.feed_with_evidence(pcm16_le).events
+
+    def feed_with_evidence(self, pcm16_le: bytes) -> SileroFeedResult:
+        """Run Silero once and return events with probability-free evidence."""
+
+        return self.process_probabilities_with_evidence(
+            self._vad.process_pcm16(pcm16_le)
+        )
 
     def process_probabilities(
         self, probabilities: Iterable[float]
     ) -> tuple[SpeechActivityEvent, ...]:
+        return self.process_probabilities_with_evidence(probabilities).events
+
+    def process_probabilities_with_evidence(
+        self,
+        probabilities: Iterable[float],
+    ) -> SileroFeedResult:
         events: list[SpeechActivityEvent] = []
-        for probability in probabilities:
+        window_count = 0
+        onset_window_count = 0
+        offset_window_count = 0
+        ambiguous_window_count = 0
+        first_onset_window_index: int | None = None
+        last_onset_window_index: int | None = None
+        post_confirmation_onset_window_count = 0
+        for window_index, probability in enumerate(probabilities):
+            window_count += 1
             if probability >= self._config.onset_probability:
+                onset_window_count += 1
+                if first_onset_window_index is None:
+                    first_onset_window_index = window_index
+                last_onset_window_index = window_index
+                if self._speech_confirmed:
+                    post_confirmation_onset_window_count += 1
                 was_paused = self._candidate_emitted
                 self._speech_windows += 1
                 self._silence_windows = 0
@@ -114,6 +156,7 @@ class SileroActivityGate:
                 elif self._speech_confirmed and was_paused:
                     events.append(SpeechActivityEvent.SPEECH_RESUMED)
             elif probability < self._config.offset_probability:
+                offset_window_count += 1
                 if not self._speech_confirmed:
                     self._speech_windows = 0
                     continue
@@ -124,4 +167,17 @@ class SileroActivityGate:
                 ):
                     self._candidate_emitted = True
                     events.append(SpeechActivityEvent.CANDIDATE_PAUSE)
-        return tuple(events)
+            else:
+                ambiguous_window_count += 1
+        return SileroFeedResult(
+            events=tuple(events),
+            window_count=window_count,
+            onset_window_count=onset_window_count,
+            offset_window_count=offset_window_count,
+            ambiguous_window_count=ambiguous_window_count,
+            first_onset_window_index=first_onset_window_index,
+            last_onset_window_index=last_onset_window_index,
+            post_confirmation_onset_window_count=(
+                post_confirmation_onset_window_count
+            ),
+        )
