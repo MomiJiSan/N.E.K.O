@@ -14,6 +14,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_THRESHOLDS,
     SpeakerShadowCandidateKey,
     SpeakerShadowConfig,
+    SpeakerShadowObservation,
 )
 
 
@@ -121,9 +122,82 @@ def test_config_is_default_off_and_caps_candidate_audio() -> None:
     assert config.enabled is False
     assert config.maximum_audio_ms == 4_000
     assert config.observation_checkpoints_ms is None
+    assert config.completion_confirmation_scopes == ()
     assert MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES == 128_000
     assert MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES == 128_000
     assert MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES < 8 * 1024 * 1024
+
+
+def test_config_accepts_provider_completion_confirmation_with_two_checkpoints() -> None:
+    config = SpeakerShadowConfig(
+        observation_checkpoints_ms=(1_500, 3_000),
+        completion_confirmation_scopes=("provider_candidate",),
+    )
+
+    assert config.completion_confirmation_scopes == ("provider_candidate",)
+
+
+def test_config_preserves_legacy_positional_argument_order() -> None:
+    config = SpeakerShadowConfig(False, (0.40,), 1_500, 4_000, None, 60.0)
+
+    assert config.idle_unload_seconds == 60.0
+    assert config.completion_confirmation_scopes == ()
+
+
+@pytest.mark.parametrize(
+    "completion_confirmation_scopes",
+    [
+        ["provider_candidate"],
+        ("unsupported",),
+        ("provider_candidate", "provider_candidate"),
+    ],
+)
+def test_config_rejects_invalid_completion_confirmation_scopes(
+    completion_confirmation_scopes: object,
+) -> None:
+    with pytest.raises(ValueError, match="completion_confirmation_scopes"):
+        SpeakerShadowConfig(
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=completion_confirmation_scopes,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "observation_checkpoints_ms",
+    [None, (1_500,)],
+)
+def test_completion_confirmation_requires_two_explicit_checkpoints(
+    observation_checkpoints_ms: tuple[int, ...] | None,
+) -> None:
+    with pytest.raises(ValueError, match="at least two explicit"):
+        SpeakerShadowConfig(
+            observation_checkpoints_ms=observation_checkpoints_ms,
+            completion_confirmation_scopes=("provider_candidate",),
+        )
+
+
+def test_observation_kind_defaults_to_checkpoint_and_accepts_confirmation() -> None:
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+    observation = SpeakerShadowObservation(
+        candidate=candidate,
+        similarity=0.2,
+        would_block=((0.4, True),),
+        audio_ms=1_500,
+        checkpoint_ms=1_500,
+    )
+
+    assert observation.observation_kind == "checkpoint"
+    assert (
+        SpeakerShadowObservation(
+            candidate=candidate,
+            similarity=0.2,
+            would_block=((0.4, True),),
+            audio_ms=2_999,
+            checkpoint_ms=1_500,
+            observation_kind="completion_confirmation",
+        ).observation_kind
+        == "completion_confirmation"
+    )
 
 
 @pytest.mark.parametrize(

@@ -394,6 +394,7 @@ class _CandidateBuffer:
     pcm16: bytearray
     sample_count: int = 0
     next_checkpoint_index: int = 0
+    completion_confirmation_checkpoint_ms: int | None = None
 
     @property
     def audio_ms(self) -> int:
@@ -921,7 +922,7 @@ class SpeakerShadowRuntime:
                 self._buffers.pop(frame.candidate, None)
                 self._wipe_bytearray(buffer.pcm16)
             try:
-                await self._evaluate_candidate(
+                would_block = await self._evaluate_candidate(
                     generation=frame.generation,
                     candidate=frame.candidate,
                     token=frame.token,
@@ -957,6 +958,15 @@ class SpeakerShadowRuntime:
                     self._buffers.pop(frame.candidate, None)
                     self._wipe_bytearray(buffer.pcm16)
                 return
+            if (
+                not terminal
+                and frame.candidate.scope
+                in self._config.completion_confirmation_scopes
+                and buffer.next_checkpoint_index < len(checkpoints)
+            ):
+                buffer.completion_confirmation_checkpoint_ms = (
+                    checkpoint_ms if would_block else None
+                )
 
     async def _evaluate_candidate(
         self,
@@ -969,7 +979,10 @@ class SpeakerShadowRuntime:
         audio_ms: int,
         checkpoint_ms: int | None,
         terminal: bool,
-    ) -> None:
+        observation_kind: Literal[
+            "checkpoint", "completion_confirmation"
+        ] = "checkpoint",
+    ) -> bool | None:
         self._active_evaluation = (generation, candidate)
         self._active_evaluation_terminal = terminal
         self._active_pcm_bytes = len(pcm16)
@@ -1025,6 +1038,9 @@ class SpeakerShadowRuntime:
                 (threshold, similarity < threshold)
                 for threshold in self._config.similarity_thresholds
             )
+            blocked_at_any_threshold = any(
+                blocked for _, blocked in would_block
+            )
             token.last_checkpoint_ms = (
                 checkpoint_ms
                 if checkpoint_ms is not None
@@ -1033,19 +1049,19 @@ class SpeakerShadowRuntime:
             if terminal:
                 self._finalize_candidate(candidate, "scored", token=token)
                 self._metrics.evaluated_candidate_count += 1
-            if any(blocked for _, blocked in would_block):
+            if blocked_at_any_threshold:
                 self._metrics.would_block_count += 1
             for threshold, blocked in would_block:
                 if blocked:
                     self._would_block_counts[threshold] += 1
             callback = self._on_observation
             if callback is None:
-                return
+                return blocked_at_any_threshold
             existing_callback_task = self._callback_task
             if existing_callback_task is not None:
                 if not existing_callback_task.done():
                     self._metrics.callback_failure_count += 1
-                    return
+                    return blocked_at_any_threshold
                 self._consume_callback_result(existing_callback_task)
             observation = SpeakerShadowObservation(
                 candidate=candidate,
@@ -1053,6 +1069,7 @@ class SpeakerShadowRuntime:
                 would_block=would_block,
                 audio_ms=audio_ms,
                 checkpoint_ms=checkpoint_ms,
+                observation_kind=observation_kind,
             )
             callback_task = asyncio.create_task(
                 callback(observation),
@@ -1071,13 +1088,14 @@ class SpeakerShadowRuntime:
             if not done:
                 self._metrics.callback_failure_count += 1
                 await self._cancel_callback_bounded(callback_task)
-                return
+                return blocked_at_any_threshold
             try:
                 callback_task.result()
             except asyncio.CancelledError:
                 self._metrics.stale_result_count += 1
             except Exception:
                 self._metrics.callback_failure_count += 1
+            return blocked_at_any_threshold
         finally:
             if self._active_evaluation == (generation, candidate):
                 self._active_evaluation = None
@@ -1336,6 +1354,88 @@ class SpeakerShadowRuntime:
                 terminal_reason=finalized.terminal_reason,
             )
             return
+        buffer = self._buffers.get(marker.candidate)
+        explicit_checkpoints = self._config.observation_checkpoints_ms
+        confirmation_checkpoint_ms = (
+            buffer.completion_confirmation_checkpoint_ms
+            if buffer is not None
+            else None
+        )
+        should_confirm = (
+            buffer is not None
+            and buffer.token is marker.token
+            and self._identity_is_current(
+                marker.generation,
+                marker.candidate,
+                marker.token,
+            )
+            and marker.candidate.scope
+            in self._config.completion_confirmation_scopes
+            and explicit_checkpoints is not None
+            and confirmation_checkpoint_ms is not None
+            and 0 < buffer.next_checkpoint_index < len(explicit_checkpoints)
+            and explicit_checkpoints[buffer.next_checkpoint_index - 1]
+            == confirmation_checkpoint_ms
+            and buffer.audio_ms > confirmation_checkpoint_ms
+            and buffer.audio_ms
+            < explicit_checkpoints[buffer.next_checkpoint_index]
+        )
+        if should_confirm:
+            assert buffer is not None
+            assert confirmation_checkpoint_ms is not None
+            candidate_pcm = bytearray(buffer.pcm16)
+            audio_ms = buffer.audio_ms
+            sample_rate_hz = buffer.sample_rate_hz
+            try:
+                try:
+                    await self._evaluate_candidate(
+                        generation=marker.generation,
+                        candidate=marker.candidate,
+                        token=marker.token,
+                        pcm16=candidate_pcm,
+                        sample_rate_hz=sample_rate_hz,
+                        audio_ms=audio_ms,
+                        checkpoint_ms=confirmation_checkpoint_ms,
+                        terminal=True,
+                        observation_kind="completion_confirmation",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if self._identity_is_current(
+                        marker.generation,
+                        marker.candidate,
+                        marker.token,
+                    ):
+                        self._finalize_candidate(
+                            marker.candidate,
+                            "failed",
+                            token=marker.token,
+                        )
+            finally:
+                self._wipe_bytearray(candidate_pcm)
+                retained_buffer = self._buffers.get(marker.candidate)
+                if retained_buffer is buffer:
+                    self._buffers.pop(marker.candidate, None)
+                self._wipe_bytearray(buffer.pcm16)
+
+            if marker.generation != self._generation or self._closed:
+                return
+            terminal_reason = marker.token.terminal_reason
+            if terminal_reason is None:
+                self._finalize_candidate(
+                    marker.candidate,
+                    "failed",
+                    token=marker.token,
+                )
+                terminal_reason = marker.token.terminal_reason or "failed"
+            self._record_token_finish(marker.token)
+            await self._deliver_completion(
+                marker,
+                terminal_reason=terminal_reason,
+            )
+            return
+
         buffer = self._buffers.pop(marker.candidate, None)
         terminal_reason: SpeakerShadowTerminalReason = "insufficient"
         if buffer is not None:
@@ -1384,8 +1484,14 @@ class SpeakerShadowRuntime:
             if not existing_callback_task.done():
                 self._metrics.callback_failure_count += 1
                 self._metrics.completion_callback_failure_count += 1
-                return
-            self._consume_callback_result(existing_callback_task)
+                # Observation callbacks are cancelled with a bounded wait. A
+                # callback that suppresses cancellation must not prevent the
+                # ordered terminal notice from releasing downstream state.
+                # Its done callback retains ownership of eventual cleanup.
+                if self._callback_task is existing_callback_task:
+                    self._callback_task = None
+            else:
+                self._consume_callback_result(existing_callback_task)
         completion = SpeakerShadowCompletion(
             candidate=marker.candidate,
             terminal_reason=terminal_reason,

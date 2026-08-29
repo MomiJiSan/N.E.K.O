@@ -38,6 +38,10 @@ MAX_SPEAKER_SHADOW_SHUTDOWN_GRACE_SECONDS = 2.0
 MAX_SPEAKER_SHADOW_CALLBACK_TIMEOUT_SECONDS = 2.0
 
 SpeakerShadowScope = Literal["provider_candidate", "smart_turn_turn"]
+SpeakerShadowObservationKind = Literal[
+    "checkpoint",
+    "completion_confirmation",
+]
 SpeakerShadowTerminalReason = Literal[
     "scored",
     "insufficient",
@@ -104,6 +108,9 @@ class SpeakerShadowConfig:
     backend_score_timeout_seconds: float = 2.0
     backend_close_timeout_seconds: float = 1.0
     process_terminate_timeout_seconds: float = 1.0
+    # Appended to preserve the positional order of the provider-neutral
+    # configuration contract used before completion confirmation existed.
+    completion_confirmation_scopes: tuple[SpeakerShadowScope, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -155,6 +162,27 @@ class SpeakerShadowConfig:
                 "observation_checkpoints_ms must contain at most "
                 f"{MAX_SPEAKER_SHADOW_CHECKPOINTS} unique, increasing integer "
                 "values within [minimum_audio_ms, maximum_audio_ms]"
+            )
+        confirmation_scopes = self.completion_confirmation_scopes
+        if (
+            type(confirmation_scopes) is not tuple
+            or any(
+                scope not in ("provider_candidate", "smart_turn_turn")
+                for scope in confirmation_scopes
+            )
+            or any(
+                scope in confirmation_scopes[index + 1 :]
+                for index, scope in enumerate(confirmation_scopes)
+            )
+        ):
+            raise ValueError(
+                "completion_confirmation_scopes must be a tuple of unique, "
+                "supported speaker-shadow scopes"
+            )
+        if confirmation_scopes and (checkpoints is None or len(checkpoints) < 2):
+            raise ValueError(
+                "completion_confirmation_scopes requires at least two explicit "
+                "observation_checkpoints_ms"
             )
         if not math.isfinite(self.idle_unload_seconds) or self.idle_unload_seconds <= 0:
             raise ValueError("idle_unload_seconds must be positive")
@@ -239,6 +267,7 @@ class SpeakerShadowObservation:
     would_block: tuple[tuple[float, bool], ...]
     audio_ms: int
     checkpoint_ms: int | None = None
+    observation_kind: SpeakerShadowObservationKind = "checkpoint"
 
 
 ObservationCallback = Callable[

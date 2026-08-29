@@ -572,6 +572,312 @@ async def test_short_candidate_emits_no_3000ms_confirmation() -> None:
     await runtime.close()
 
 
+@pytest.mark.parametrize(
+    ("duration_ms", "expected_kinds"),
+    [
+        (1_499, []),
+        (1_500, ["checkpoint"]),
+        (1_501, ["checkpoint", "completion_confirmation"]),
+        (2_999, ["checkpoint", "completion_confirmation"]),
+        (3_000, ["checkpoint", "checkpoint"]),
+    ],
+)
+async def test_provider_completion_confirmation_respects_checkpoint_boundaries(
+    duration_ms: int,
+    expected_kinds: list[str],
+) -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+        ),
+        on_observation=observe,
+    )
+    candidate = _candidate(248 + duration_ms)
+
+    assert runtime.submit(
+        _pcm(duration_ms),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert [item.observation_kind for item in observations] == expected_kinds
+    if "completion_confirmation" in expected_kinds:
+        confirmation = observations[-1]
+        assert confirmation.checkpoint_ms == 1_500
+        assert confirmation.audio_ms == duration_ms
+        assert confirmation.candidate == candidate
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_completion_confirmation_observation_precedes_single_completion() -> None:
+    events: list[tuple[str, str | None, int | None]] = []
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        events.append(
+            (
+                "observation",
+                observation.observation_kind,
+                observation.checkpoint_ms,
+            )
+        )
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+        events.append(("completion", None, completion.last_checkpoint_ms))
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+        ),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(349)
+
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert events == [
+        ("observation", "checkpoint", 1_500),
+        ("observation", "completion_confirmation", 1_500),
+        ("completion", None, 1_500),
+    ]
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="scored",
+            last_checkpoint_ms=1_500,
+        )
+    ]
+    assert runtime.snapshot()["completion_count"] == 1
+    await runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("scope", "score_value"),
+    [
+        ("provider_candidate", 0.9),
+        ("smart_turn_turn", 0.2),
+    ],
+    ids=["first-owner", "non-provider"],
+)
+async def test_completion_confirmation_does_not_rescore_unarmed_candidate(
+    scope: str,
+    score_value: float,
+) -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=score_value),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+        ),
+        on_observation=observe,
+    )
+    candidate = _candidate(350, scope)
+
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert [item.observation_kind for item in observations] == ["checkpoint"]
+    assert [item.checkpoint_ms for item in observations] == [1_500]
+    await runtime.close()
+
+
+async def test_completion_confirmation_score_failure_still_completes_fail_open() -> None:
+    events: list[tuple[str, str]] = []
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        events.append(("observation", observation.observation_kind))
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+        events.append(("completion", completion.terminal_reason))
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2, score_error_after=1),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+        ),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(351)
+
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert events == [
+        ("observation", "checkpoint"),
+        ("completion", "failed"),
+    ]
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="failed",
+            last_checkpoint_ms=1_500,
+        )
+    ]
+    metrics = runtime.snapshot()
+    assert metrics["completion_count"] == 1
+    assert metrics["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_uncooperative_confirmation_callback_cannot_suppress_completion() -> None:
+    confirmation_started = asyncio.Event()
+    release_confirmation = asyncio.Event()
+    completion_delivered = asyncio.Event()
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        if observation.observation_kind != "completion_confirmation":
+            return
+        confirmation_started.set()
+        while not release_confirmation.is_set():
+            try:
+                await release_confirmation.wait()
+            except asyncio.CancelledError:
+                continue
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+        completion_delivered.set()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+            callback_timeout_seconds=0.01,
+        ),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(353)
+
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await asyncio.wait_for(confirmation_started.wait(), 2.0)
+    await asyncio.wait_for(completion_delivered.wait(), 1.0)
+
+    release_confirmation.set()
+    await runtime.wait_idle()
+    await asyncio.sleep(0)
+
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="scored",
+            last_checkpoint_ms=1_500,
+        )
+    ]
+    metrics = runtime.snapshot()
+    assert metrics["completion_count"] == 1
+    assert metrics["completion_callback_failure_count"] == 1
+    assert metrics["retained_pcm_bytes"] == 0
+    assert metrics["callback_task_count"] == 0
+    await runtime.close()
+
+
+async def test_reset_invalidates_in_flight_completion_confirmation() -> None:
+    confirmation_started = asyncio.Event()
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        if observation.observation_kind == "completion_confirmation":
+            confirmation_started.set()
+            await asyncio.Event().wait()
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+            callback_timeout_seconds=1.0,
+        ),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(352)
+
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await asyncio.wait_for(confirmation_started.wait(), 2.0)
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    ) is False
+
+    await runtime.reset()
+    await runtime.wait_idle()
+
+    assert completions == []
+    metrics = runtime.snapshot()
+    assert metrics["retained_pcm_bytes"] == 0
+    assert metrics["buffered_candidate_count"] == 0
+    await runtime.close()
+
+
 async def test_checkpoint_callback_failure_does_not_block_confirmation() -> None:
     seen_checkpoints: list[int | None] = []
 

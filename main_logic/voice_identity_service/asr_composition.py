@@ -109,12 +109,19 @@ class OwnerVoiceAsrCompositionFactory:
         async def on_observation(observation: SpeakerShadowObservation) -> None:
             with self._lock:
                 self._diagnostics["observation_count"] += 1
-                if observation.checkpoint_ms == OwnerVoicePolicy.FIRST_CHECKPOINT_MS:
-                    self._diagnostics["first_checkpoint_count"] += 1
-                elif observation.checkpoint_ms == OwnerVoicePolicy.SECOND_CHECKPOINT_MS:
-                    self._diagnostics["second_checkpoint_count"] += 1
-                if any(blocked for _, blocked in observation.would_block):
-                    self._diagnostics["low_checkpoint_count"] += 1
+                if observation.observation_kind == "checkpoint":
+                    if (
+                        observation.checkpoint_ms
+                        == OwnerVoicePolicy.FIRST_CHECKPOINT_MS
+                    ):
+                        self._diagnostics["first_checkpoint_count"] += 1
+                    elif (
+                        observation.checkpoint_ms
+                        == OwnerVoicePolicy.SECOND_CHECKPOINT_MS
+                    ):
+                        self._diagnostics["second_checkpoint_count"] += 1
+                    if any(blocked for _, blocked in observation.would_block):
+                        self._diagnostics["low_checkpoint_count"] += 1
             if runtime._speaker_verifier_activation_generation != generation:
                 self._resolve_armed_candidates()
                 return
@@ -123,6 +130,8 @@ class OwnerVoiceAsrCompositionFactory:
                 checkpoint_ms=observation.checkpoint_ms,
                 similarity=observation.similarity,
                 enforce=enforce,
+                observation_kind=observation.observation_kind,
+                audio_ms=observation.audio_ms,
             )
             if (
                 enforce
@@ -243,6 +252,9 @@ class OwnerVoiceAsrCompositionFactory:
                 observation_checkpoints_ms=(
                     OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
                     OwnerVoicePolicy.SECOND_CHECKPOINT_MS,
+                ),
+                completion_confirmation_scopes=(
+                    ("provider_candidate",) if enforce else ()
                 ),
             ),
             on_observation=on_observation,

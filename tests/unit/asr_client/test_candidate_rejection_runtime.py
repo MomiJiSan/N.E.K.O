@@ -825,8 +825,15 @@ async def test_real_speaker_shadow_rejects_final_after_first_low_during_prepare(
     await _close_dispatchers(runtime)
 
 
-async def test_real_speaker_shadow_2999ms_completion_releases_waiting_final(
+@pytest.mark.parametrize(
+    ("completion_similarity", "expect_rejected"),
+    [(0.20, True), (0.80, False)],
+    ids=["stable-mismatch", "owner-recovery"],
+)
+async def test_real_speaker_shadow_2999ms_completion_confirms_waiting_final(
     monkeypatch,
+    completion_similarity: float,
+    expect_rejected: bool,
 ) -> None:
     import numpy as np
 
@@ -847,6 +854,9 @@ async def test_real_speaker_shadow_2999ms_completion_releases_waiting_final(
     class _ScoringHost:
         alive = True
 
+        def __init__(self) -> None:
+            self.score_count = 0
+
         async def score(
             self,
             _pcm16: bytes,
@@ -854,7 +864,10 @@ async def test_real_speaker_shadow_2999ms_completion_releases_waiting_final(
             timeout_seconds: float,
         ) -> float:
             assert timeout_seconds > 0
-            return 0.20
+            self.score_count += 1
+            if self.score_count == 1:
+                return 0.20
+            return completion_similarity
 
     callbacks = _callbacks()
     runtime = IndependentAsrRuntime(callbacks)
@@ -884,10 +897,11 @@ async def test_real_speaker_shadow_2999ms_completion_releases_waiting_final(
         enforce=True,
     )
     shadow = composition()
+    scoring_host = _ScoringHost()
     monkeypatch.setattr(
         shadow,
         "_ensure_backend",
-        AsyncMock(return_value=_ScoringHost()),
+        AsyncMock(return_value=scoring_host),
     )
     candidate = _shadow_candidate()
     first_checkpoint_pcm16 = b"\x21\x00" * (16_000 * 1_500 // 1_000)
@@ -926,12 +940,23 @@ async def test_real_speaker_shadow_2999ms_completion_releases_waiting_final(
     await asyncio.wait_for(final_task, 1)
     await runtime.wait_transcript_idle()
 
-    callbacks.on_final.assert_awaited_once()
+    assert scoring_host.score_count == 2
     diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["speaker_gate_waited_count"] == 1
-    assert diagnostics["speaker_gate_resolved_forward_count"] == 1
     assert diagnostics["speaker_gate_timeout_count"] == 0
     assert diagnostics["rejection_request_failed_count"] == 0
+    if expect_rejected:
+        callbacks.on_final.assert_not_awaited()
+        assert diagnostics["speaker_gate_resolved_reject_count"] == 1
+        assert diagnostics["speaker_gate_resolved_forward_count"] == 0
+        assert diagnostics["rejection_task_scheduled_count"] == 1
+        assert diagnostics["rejection_task_applied_count"] == 1
+        assert diagnostics["rejection_task_stale_count"] == 0
+    else:
+        callbacks.on_final.assert_awaited_once()
+        assert diagnostics["speaker_gate_resolved_reject_count"] == 0
+        assert diagnostics["speaker_gate_resolved_forward_count"] == 1
+        assert diagnostics["rejection_task_scheduled_count"] == 0
     assert runtime._asr_speaker_candidate_decision_gate is None
     assert not composition._armed_candidates
     composition_diagnostics = composition.diagnostics_snapshot()
@@ -971,8 +996,14 @@ async def test_late_short_candidate_completion_cannot_release_successor_gate(
         OwnerVoiceAsrCompositionFactory,
     )
 
+    confirmation_started = asyncio.Event()
+    confirmation_release = asyncio.Event()
+
     class _ScoringHost:
         alive = True
+
+        def __init__(self) -> None:
+            self.score_count = 0
 
         async def score(
             self,
@@ -981,6 +1012,10 @@ async def test_late_short_candidate_completion_cannot_release_successor_gate(
             timeout_seconds: float,
         ) -> float:
             assert timeout_seconds > 0
+            self.score_count += 1
+            if self.score_count == 2:
+                confirmation_started.set()
+                await confirmation_release.wait()
             return 0.20
 
     monkeypatch.setattr(
@@ -1026,9 +1061,6 @@ async def test_late_short_candidate_completion_cannot_release_successor_gate(
     below_second_checkpoint_pcm16 = b"\x22\x00" * (
         16_000 * 1_499 // 1_000
     )
-    delayed_resolutions: list[SpeakerShadowCandidateKey] = []
-    resolve_candidates = composition._resolve_candidates
-
     assert shadow.submit(
         first_checkpoint_pcm16,
         sample_rate_hz=16_000,
@@ -1042,23 +1074,18 @@ async def test_late_short_candidate_completion_cannot_release_successor_gate(
         lifecycle,
         turn_token,
     )
-    await runtime._handle_independent_asr_final("timed-out-final", 0, "qwen")
-    await runtime.wait_transcript_idle()
-    assert runtime._speaker_verifier_diagnostics()["speaker_gate_timeout_count"] == 1
-
-    monkeypatch.setattr(
-        composition,
-        "_resolve_candidates",
-        lambda candidates: delayed_resolutions.extend(candidates),
-    )
     assert shadow.submit(
         below_second_checkpoint_pcm16,
         sample_rate_hz=16_000,
         candidate=old_candidate,
     )
     assert shadow.finish_candidate(old_candidate)
-    await shadow.wait_idle()
-    assert delayed_resolutions == [old_candidate]
+    await asyncio.wait_for(confirmation_started.wait(), 1)
+
+    await runtime._handle_independent_asr_final("timed-out-final", 0, "qwen")
+    await runtime.wait_transcript_idle()
+    assert runtime._speaker_verifier_diagnostics()["speaker_gate_timeout_count"] == 1
+    callbacks.on_final.assert_awaited_once()
 
     successor_detector = _RejectionDetector()
     _install_active_candidate(
@@ -1082,7 +1109,11 @@ async def test_late_short_candidate_completion_cannot_release_successor_gate(
     successor_gate = runtime._asr_speaker_candidate_decision_gate
     assert successor_gate is not None
 
-    resolve_candidates(tuple(delayed_resolutions))
+    confirmation_release.set()
+    await shadow.wait_idle()
+    rejection_tasks = tuple(runtime._asr_rejection_tasks)
+    if rejection_tasks:
+        await asyncio.gather(*rejection_tasks)
 
     assert runtime._asr_speaker_candidate_decision_gate is successor_gate
     assert not successor_gate.resolved.done()

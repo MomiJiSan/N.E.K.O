@@ -6,7 +6,10 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 
-from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
+from main_logic.asr_client.speaker_shadow.contracts import (
+    SpeakerShadowCandidateKey,
+    SpeakerShadowObservationKind,
+)
 
 
 class OwnerVoiceDecision(StrEnum):
@@ -45,15 +48,16 @@ class OwnerVoicePolicy:
         checkpoint_ms: int | None,
         similarity: float,
         enforce: bool,
+        observation_kind: SpeakerShadowObservationKind = "checkpoint",
+        audio_ms: int | None = None,
     ) -> OwnerVoicePolicyResult:
         if type(candidate) is not SpeakerShadowCandidateKey:
             return OwnerVoicePolicyResult(
                 OwnerVoiceDecision.FORWARD, "invalid_candidate"
             )
         if (
-            type(checkpoint_ms) is not int
-            or checkpoint_ms
-            not in {self.FIRST_CHECKPOINT_MS, self.SECOND_CHECKPOINT_MS}
+            type(observation_kind) is not str
+            or observation_kind not in ("checkpoint", "completion_confirmation")
             or type(similarity) not in {int, float}
             or not math.isfinite(float(similarity))
             or not -1.0 <= float(similarity) <= 1.0
@@ -63,9 +67,30 @@ class OwnerVoicePolicy:
                 OwnerVoiceDecision.FORWARD, "invalid_observation"
             )
 
+        if observation_kind == "completion_confirmation":
+            return self._observe_completion_confirmation(
+                candidate=candidate,
+                checkpoint_ms=checkpoint_ms,
+                audio_ms=audio_ms,
+                similarity=float(similarity),
+                enforce=enforce,
+            )
+
+        if type(checkpoint_ms) is not int or checkpoint_ms not in {
+            self.FIRST_CHECKPOINT_MS,
+            self.SECOND_CHECKPOINT_MS,
+        }:
+            self._first_low.pop(candidate, None)
+            return OwnerVoicePolicyResult(
+                OwnerVoiceDecision.FORWARD, "invalid_observation"
+            )
+
         low = float(similarity) < self.SIMILARITY_THRESHOLD
         if checkpoint_ms == self.FIRST_CHECKPOINT_MS:
-            self._first_low.pop(candidate, None)
+            if self._first_low.pop(candidate, False):
+                return OwnerVoicePolicyResult(
+                    OwnerVoiceDecision.FORWARD, "invalid_observation"
+                )
             if low:
                 self._remember(candidate)
                 return OwnerVoicePolicyResult(
@@ -77,11 +102,45 @@ class OwnerVoicePolicy:
             )
 
         first_low = self._first_low.pop(candidate, False)
+        if not first_low:
+            return OwnerVoicePolicyResult(
+                OwnerVoiceDecision.FORWARD, "invalid_observation"
+            )
         if first_low and low and enforce is True:
             return OwnerVoicePolicyResult(
                 OwnerVoiceDecision.REJECT, "stable_clear_mismatch"
             )
         if first_low and low:
+            return OwnerVoicePolicyResult(OwnerVoiceDecision.FORWARD, "shadow_only")
+        return OwnerVoicePolicyResult(OwnerVoiceDecision.FORWARD, "owner_or_uncertain")
+
+    def _observe_completion_confirmation(
+        self,
+        *,
+        candidate: SpeakerShadowCandidateKey,
+        checkpoint_ms: int | None,
+        audio_ms: int | None,
+        similarity: float,
+        enforce: bool,
+    ) -> OwnerVoicePolicyResult:
+        first_low = self._first_low.pop(candidate, False)
+        if (
+            type(checkpoint_ms) is not int
+            or checkpoint_ms != self.FIRST_CHECKPOINT_MS
+            or type(audio_ms) is not int
+            or not self.FIRST_CHECKPOINT_MS < audio_ms < self.SECOND_CHECKPOINT_MS
+            or not first_low
+        ):
+            return OwnerVoicePolicyResult(
+                OwnerVoiceDecision.FORWARD, "invalid_observation"
+            )
+
+        low = similarity < self.SIMILARITY_THRESHOLD
+        if low and enforce is True:
+            return OwnerVoicePolicyResult(
+                OwnerVoiceDecision.REJECT, "stable_clear_mismatch"
+            )
+        if low:
             return OwnerVoicePolicyResult(OwnerVoiceDecision.FORWARD, "shadow_only")
         return OwnerVoicePolicyResult(OwnerVoiceDecision.FORWARD, "owner_or_uncertain")
 

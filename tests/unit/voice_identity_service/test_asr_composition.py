@@ -16,6 +16,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
     SpeakerShadowCompletion,
     SpeakerShadowObservation,
+    SpeakerShadowObservationKind,
     SpeakerShadowTerminalReason,
 )
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
@@ -67,13 +68,16 @@ def _observation(
     *,
     checkpoint_ms: int,
     similarity: float,
+    observation_kind: SpeakerShadowObservationKind = "checkpoint",
+    audio_ms: int | None = None,
 ) -> SpeakerShadowObservation:
     return SpeakerShadowObservation(
         candidate=candidate,
         similarity=similarity,
         would_block=((0.40, similarity < 0.40),),
-        audio_ms=checkpoint_ms,
+        audio_ms=checkpoint_ms if audio_ms is None else audio_ms,
         checkpoint_ms=checkpoint_ms,
+        observation_kind=observation_kind,
     )
 
 
@@ -175,6 +179,9 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
     assert shadow._config.minimum_audio_ms == 1_500
     assert shadow._config.maximum_audio_ms == 3_000
     assert shadow._config.observation_checkpoints_ms == (1_500, 3_000)
+    assert shadow._config.completion_confirmation_scopes == (
+        ("provider_candidate",) if enforce else ()
+    )
     assert shadow._config.similarity_thresholds == (0.40,)
     callback = shadow._on_observation
     assert callback is not None
@@ -205,6 +212,62 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
     else:
         assert armed == []
     assert resolved == []
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_completion_confirmation_rejects_without_counting_fixed_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-confirmation"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    requests: list[tuple[SpeakerShadowCandidateKey, str]] = []
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda candidate, *, activation_generation: (
+            requests.append((candidate, activation_generation)) or True
+        ),
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-confirmation",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(3, 10, "provider_candidate")
+
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+    )
+    await shadow._on_observation(
+        _observation(
+            candidate,
+            checkpoint_ms=1_500,
+            similarity=0.20,
+            observation_kind="completion_confirmation",
+            audio_ms=2_999,
+        )
+    )
+
+    assert requests == [(candidate, "activation-confirmation")]
+    assert armed == [(candidate, "activation-confirmation")]
+    assert resolved == []
+    assert factory.diagnostics_snapshot() == {
+        "observation_count": 2,
+        "first_checkpoint_count": 1,
+        "second_checkpoint_count": 0,
+        "low_checkpoint_count": 1,
+        "reject_decision_count": 1,
+        "speaker_completion_count": 0,
+        "speaker_completion_before_first_checkpoint_count": 0,
+        "speaker_completion_after_first_checkpoint_count": 0,
+        "speaker_completion_stale_count": 0,
+    }
     await shadow.close()
     factory.close()
     profile.close()
@@ -593,7 +656,7 @@ async def test_armed_candidate_capacity_evicts_oldest_with_fail_open_resolution(
     profile.close()
 
 
-async def test_repeated_first_checkpoint_retires_same_key_before_rearming(
+async def test_repeated_first_checkpoint_fails_open_without_rearming(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _runtime()
@@ -619,10 +682,9 @@ async def test_repeated_first_checkpoint_retires_same_key_before_rearming(
 
     assert armed == [
         (candidate, "activation-rearm"),
-        (candidate, "activation-rearm"),
     ]
     assert resolved == [(candidate, "activation-rearm", False)]
-    assert tuple(factory._armed_candidates) == (candidate,)
+    assert tuple(factory._armed_candidates) == ()
     await shadow.close()
     factory.close()
     profile.close()
