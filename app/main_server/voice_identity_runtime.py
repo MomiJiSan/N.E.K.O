@@ -1060,6 +1060,7 @@ def get_voice_identity_diagnostics() -> dict[str, int]:
     registry = _runtime_registry
     if registry is None:
         return {
+            **{name: 0 for name in _VOICE_IDENTITY_DIAGNOSTIC_COUNTERS},
             "registered_manager_count": 0,
             "diagnostic_runtime_count": 0,
         }

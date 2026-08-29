@@ -34,6 +34,7 @@ from .contracts import (
 
 _HOST_POLL_INTERVAL_SECONDS = 0.005
 _HostOperation = Literal["load", "score", "close"]
+_CallbackKind = Literal["observation", "completion"]
 
 
 class _BackendHostError(RuntimeError):
@@ -470,6 +471,7 @@ class SpeakerShadowRuntime:
         ] = OrderedDict()
         self._worker_task: asyncio.Task[None] | None = None
         self._callback_task: asyncio.Task[None] | None = None
+        self._callback_task_kind: _CallbackKind | None = None
         self._detached_callback_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._host_start_task: asyncio.Task[_BackendProcessHost] | None = None
@@ -741,13 +743,17 @@ class SpeakerShadowRuntime:
             self._queue.put_nowait(marker)
         except asyncio.QueueFull:
             admitted_after_discard = False
-            if finalized is not None and self._discard_queued_frames_for_token(token):
-                try:
-                    self._queue.put_nowait(marker)
-                except asyncio.QueueFull:
-                    pass
-                else:
-                    admitted_after_discard = True
+            if finalized is not None:
+                reserved_marker_slot = self._discard_queued_frames_for_token(
+                    token
+                ) or self._discard_newest_queued_audio_frame()
+                if reserved_marker_slot:
+                    try:
+                        self._queue.put_nowait(marker)
+                    except asyncio.QueueFull:
+                        pass
+                    else:
+                        admitted_after_discard = True
             if not admitted_after_discard and finalized is not None:
                 # Preserve the existing non-blocking contract if saturation is
                 # caused entirely by other candidates. Without queue order, a
@@ -1151,6 +1157,7 @@ class SpeakerShadowRuntime:
                 name="speaker-shadow-observation",
             )
             self._callback_task = callback_task
+            self._callback_task_kind = "observation"
             callback_task.add_done_callback(self._consume_callback_result)
             try:
                 done, _ = await asyncio.wait(
@@ -1569,18 +1576,29 @@ class SpeakerShadowRuntime:
         existing_callback_task = self._callback_task
         if existing_callback_task is not None:
             if not existing_callback_task.done():
-                self._metrics.callback_failure_count += 1
-                self._metrics.completion_callback_failure_count += 1
-                # Observation callbacks are cancelled with a bounded wait. A
-                # callback that suppresses cancellation must not prevent the
-                # ordered terminal notice from releasing downstream state.
-                # Its done callback retains ownership of eventual cleanup.
-                if self._callback_task is existing_callback_task:
+                if self._callback_task_kind == "observation":
+                    self._metrics.callback_failure_count += 1
+                    self._metrics.completion_callback_failure_count += 1
+                    # A stuck observation may be detached so the ordered
+                    # terminal notice can release downstream state. A prior
+                    # completion is never detached: completion callbacks must
+                    # not overlap or finish out of marker order.
                     self._detached_callback_tasks.add(existing_callback_task)
                     existing_callback_task.add_done_callback(
                         self._detached_callback_tasks.discard
                     )
                     self._callback_task = None
+                    self._callback_task_kind = None
+                else:
+                    done, _ = await asyncio.wait(
+                        {existing_callback_task},
+                        timeout=self._config.callback_timeout_seconds,
+                    )
+                    if not done:
+                        self._metrics.callback_failure_count += 1
+                        self._metrics.completion_callback_failure_count += 1
+                        return
+                    self._consume_callback_result(existing_callback_task)
             else:
                 self._consume_callback_result(existing_callback_task)
         completion = SpeakerShadowCompletion(
@@ -1593,6 +1611,7 @@ class SpeakerShadowRuntime:
             name="speaker-shadow-completion",
         )
         self._callback_task = callback_task
+        self._callback_task_kind = "completion"
         callback_task.add_done_callback(self._consume_callback_result)
         try:
             done, _ = await asyncio.wait(
@@ -1820,6 +1839,52 @@ class SpeakerShadowRuntime:
             self._queue.put_nowait(item)
         return discarded
 
+    def _discard_newest_queued_audio_frame(self) -> bool:
+        """Reserve bounded queue capacity for a terminal marker.
+
+        Terminal delivery is authoritative; queued shadow PCM is fail-open.
+        Dropping the newest queued frame preserves the order of every retained
+        item while ensuring a finalized candidate cannot lose completion just
+        because another candidate filled the queue.
+        """
+
+        queued_items: list[_QueueItem] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            queued_items.append(item)
+
+        discarded_frame: _AudioFrame | None = None
+        for index in range(len(queued_items) - 1, -1, -1):
+            item = queued_items[index]
+            if isinstance(item, _AudioFrame):
+                discarded_frame = item
+                del queued_items[index]
+                break
+        for item in queued_items:
+            self._queue.put_nowait(item)
+        if discarded_frame is None:
+            return False
+
+        self._queued_pcm_bytes = max(
+            0,
+            self._queued_pcm_bytes - len(discarded_frame.pcm16),
+        )
+        self._metrics.dropped_frame_count += 1
+        self._metrics.dropped_audio_ms += self._audio_ms(
+            discarded_frame.sample_count,
+            discarded_frame.sample_rate_hz,
+        )
+        self._wipe_bytearray(discarded_frame.pcm16)
+        self._drop_candidate(
+            discarded_frame.candidate,
+            token=discarded_frame.token,
+        )
+        return True
+
     def _retained_pcm_bytes(self) -> int:
         host_pcm_bytes = (
             self._backend_host.pcm_bytes_in_use
@@ -1891,6 +1956,7 @@ class SpeakerShadowRuntime:
         finally:
             if self._callback_task is task and task.done():
                 self._callback_task = None
+                self._callback_task_kind = None
 
     @staticmethod
     def _consume_worker_result(task: asyncio.Task[None]) -> None:

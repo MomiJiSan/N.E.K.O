@@ -1704,6 +1704,12 @@ async def test_real_speaker_shadow_pre_gate_race_rejects_before_final(
 ) -> None:
     import numpy as np
 
+    monkeypatch.setattr(
+        runtime_module,
+        "_SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS",
+        5.0,
+    )
+
     from main_logic.asr_client.speaker_shadow.asset_manifest import (
         CAMPPLUS_MODEL_ID,
         CAMPPLUS_MODEL_REVISION,

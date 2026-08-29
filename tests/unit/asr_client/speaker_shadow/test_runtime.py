@@ -1533,6 +1533,111 @@ async def test_queue_saturation_drops_only_shadow_candidate() -> None:
     await runtime.close()
 
 
+async def test_finalized_candidate_keeps_completion_when_other_pcm_fills_queue(
+) -> None:
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.8),
+        config=_config(minimum_audio_ms=10, queue_capacity=1),
+        on_completion=complete,
+    )
+    finalized_candidate = _candidate(91)
+    queued_candidate = _candidate(92)
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=finalized_candidate,
+    )
+    await runtime.wait_idle()
+
+    assert runtime.submit(
+        _pcm(1),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=queued_candidate,
+    )
+    assert runtime.finish_candidate(finalized_candidate)
+    await runtime.wait_idle()
+
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=finalized_candidate,
+            terminal_reason="scored",
+            last_checkpoint_ms=10,
+        )
+    ]
+    metrics = runtime.snapshot()
+    assert metrics["completion_count"] == 1
+    assert metrics["dropped_frame_count"] == 1
+    assert metrics["dropped_candidate_count"] == 1
+    await runtime.close()
+
+
+async def test_completion_callbacks_never_overlap_after_ignored_cancellation(
+) -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    active_callbacks = 0
+    maximum_active_callbacks = 0
+    order: list[tuple[str, int]] = []
+    first_candidate = _candidate(93)
+    second_candidate = _candidate(94)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        nonlocal active_callbacks, maximum_active_callbacks
+        active_callbacks += 1
+        maximum_active_callbacks = max(maximum_active_callbacks, active_callbacks)
+        order.append(("start", completion.candidate.shadow_generation))
+        try:
+            if completion.candidate == first_candidate:
+                first_started.set()
+                while not release_first.is_set():
+                    try:
+                        await release_first.wait()
+                    except asyncio.CancelledError:
+                        continue
+            else:
+                second_started.set()
+        finally:
+            order.append(("end", completion.candidate.shadow_generation))
+            active_callbacks -= 1
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            minimum_audio_ms=20,
+            queue_capacity=2,
+            callback_timeout_seconds=0.05,
+        ),
+        on_completion=complete,
+    )
+    assert runtime.finish_candidate(first_candidate)
+    await asyncio.wait_for(first_started.wait(), 1.0)
+    await runtime.wait_idle()
+    assert runtime._callback_task_kind == "completion"
+
+    assert runtime.finish_candidate(second_candidate)
+    await asyncio.sleep(0)
+    assert second_started.is_set() is False
+    assert maximum_active_callbacks == 1
+    release_first.set()
+    await runtime.wait_idle()
+
+    assert second_started.is_set()
+    assert maximum_active_callbacks == 1
+    assert order == [
+        ("start", first_candidate.shadow_generation),
+        ("end", first_candidate.shadow_generation),
+        ("start", second_candidate.shadow_generation),
+        ("end", second_candidate.shadow_generation),
+    ]
+    await runtime.close()
+
+
 async def test_buffers_and_tombstones_remain_bounded() -> None:
     runtime = SpeakerShadowRuntime(
         backend_factory=_BackendFactory(),

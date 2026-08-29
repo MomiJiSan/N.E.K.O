@@ -119,6 +119,19 @@ def _fake_composition_factory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime_module, "_service", None)
 
 
+def test_missing_registry_diagnostics_preserve_fixed_schema() -> None:
+    diagnostics = runtime_module.get_voice_identity_diagnostics()
+
+    assert diagnostics == {
+        **{
+            name: 0
+            for name in runtime_module._VOICE_IDENTITY_DIAGNOSTIC_COUNTERS
+        },
+        "registered_manager_count": 0,
+        "diagnostic_runtime_count": 0,
+    }
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_activation_updates_current_and_future_managers() -> None:
