@@ -398,6 +398,25 @@ class SpeakerShadowObserver(Protocol):
 
 
 @runtime_checkable
+class SpeakerShadowDeferredCandidateStatus(Protocol):
+    """Optional read-only capability query for deferred candidate buffering."""
+
+    def supports_deferred_candidate(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool: ...
+
+
+@runtime_checkable
+class SpeakerShadowDeferredCandidateControl(Protocol):
+    """Optional ordered control for candidate PCM admitted before scoring."""
+
+    def defer_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool: ...
+
+    def activate_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool: ...
+
+
+@runtime_checkable
 class SpeakerShadowDecisionStatus(Protocol):
     """Optional read-only status with no authority over ASR execution."""
 

@@ -376,6 +376,20 @@ class _CandidateFinished:
     token: _CandidateToken
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateDeferred:
+    generation: int
+    candidate: SpeakerShadowCandidateKey
+    token: _CandidateToken
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateActivated:
+    generation: int
+    candidate: SpeakerShadowCandidateKey
+    token: _CandidateToken
+
+
 @dataclass(slots=True)
 class _CandidateToken:
     candidate: SpeakerShadowCandidateKey
@@ -387,6 +401,10 @@ class _CandidateToken:
     last_checkpoint_ms: int | None = None
     last_delivered_checkpoint_ms: int | None = None
     completion_sent: bool = False
+    deferred_requested: bool = False
+    defer_processed: bool = False
+    scoring_deferred: bool = False
+    activation_queued: bool = False
 
 
 @dataclass(slots=True)
@@ -397,6 +415,7 @@ class _CandidateBuffer:
     sample_count: int = 0
     next_checkpoint_index: int = 0
     completion_confirmation_checkpoint_ms: int | None = None
+    backend_prewarm_attempted: bool = False
 
     @property
     def audio_ms(self) -> int:
@@ -411,7 +430,13 @@ class _FinalizedCandidate:
 
 
 _STOP = object()
-_QueueItem = _AudioFrame | _CandidateFinished | object
+_QueueItem = (
+    _AudioFrame
+    | _CandidateDeferred
+    | _CandidateActivated
+    | _CandidateFinished
+    | object
+)
 
 
 class SpeakerShadowRuntime:
@@ -502,6 +527,85 @@ class SpeakerShadowRuntime:
     def generation(self) -> int:
         return self._generation
 
+    def supports_deferred_candidate(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool:
+        """Whether this exact candidate scope may use buffer-only admission."""
+
+        return bool(
+            self.enabled
+            and isinstance(candidate, SpeakerShadowCandidateKey)
+            and candidate.scope in self._config.pending_observation_gate_scopes
+        )
+
+    def defer_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        """Predeclare one candidate as buffer-only before accepting its first PCM."""
+
+        if (
+            not self.supports_deferred_candidate(candidate)
+            or candidate in self._finalized
+            or self._candidate_was_evicted(candidate)
+        ):
+            return False
+        token = self._candidate_tokens.get(candidate)
+        if token is not None:
+            return bool(
+                token.deferred_requested
+                and token.terminal_reason is None
+                and not token.finish_queued
+            )
+        if len(self._candidate_tokens) >= self._config.buffered_candidate_capacity:
+            return False
+        token = _CandidateToken(
+            candidate,
+            0,
+            deferred_requested=True,
+            scoring_deferred=True,
+        )
+        marker = _CandidateDeferred(self._generation, candidate, token)
+        try:
+            self._queue.put_nowait(marker)
+        except asyncio.QueueFull:
+            return False
+        if not self._ensure_worker():
+            self._drain_queue()
+            self._metrics.worker_start_failure_count += 1
+            return False
+        self._candidate_tokens[candidate] = token
+        self._candidate_tokens.move_to_end(candidate)
+        return True
+
+    def activate_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        """Order scoring activation behind all PCM already accepted for a defer."""
+
+        if not self.enabled or not isinstance(candidate, SpeakerShadowCandidateKey):
+            return False
+        token = self._candidate_tokens.get(candidate)
+        if (
+            token is None
+            or not token.deferred_requested
+            or token.terminal_reason is not None
+            or token.finish_queued
+            or candidate in self._finalized
+            or self._candidate_was_evicted(candidate, token=token)
+        ):
+            return False
+        if not token.scoring_deferred or token.activation_queued:
+            return True
+        marker = _CandidateActivated(self._generation, candidate, token)
+        try:
+            self._queue.put_nowait(marker)
+        except asyncio.QueueFull:
+            return False
+        if not self._ensure_worker():
+            self._drain_queue()
+            self._metrics.worker_start_failure_count += 1
+            self._drop_candidate(candidate, token=token)
+            return False
+        token.activation_queued = True
+        return True
+
     def requires_provisional_decision(
         self,
         candidate: SpeakerShadowCandidateKey,
@@ -536,6 +640,7 @@ class SpeakerShadowRuntime:
         delivered_checkpoint_ms = token.last_delivered_checkpoint_ms
         return (
             token.sample_rate_hz == SPEAKER_SHADOW_SAMPLE_RATE_HZ
+            and (not token.scoring_deferred or token.activation_queued)
             and token.accepted_sample_count >= first_checkpoint_samples
             and (
                 delivered_checkpoint_ms is None
@@ -640,7 +745,10 @@ class SpeakerShadowRuntime:
             return False
 
         token = self._candidate_tokens.get(candidate)
-        if token is not None and token.sample_rate_hz != sample_rate_hz:
+        if token is not None and (
+            token.sample_rate_hz != sample_rate_hz
+            and not (token.sample_rate_hz == 0 and token.deferred_requested)
+        ):
             self._metrics.dropped_frame_count += 1
             self._metrics.dropped_audio_ms += self._audio_ms(
                 len(pcm16) // 2,
@@ -650,6 +758,8 @@ class SpeakerShadowRuntime:
             return False
         if token is None:
             token = _CandidateToken(candidate, sample_rate_hz)
+        elif token.sample_rate_hz == 0 and token.deferred_requested:
+            token.sample_rate_hz = sample_rate_hz
         accepted_sample_count = token.accepted_sample_count
         maximum_samples = (
             sample_rate_hz * self._config.maximum_audio_ms // 1_000
@@ -870,6 +980,10 @@ class SpeakerShadowRuntime:
                     return
                 if isinstance(item, _CandidateFinished):
                     await self._process_finish(item)
+                elif isinstance(item, _CandidateDeferred):
+                    self._process_defer(item)
+                elif isinstance(item, _CandidateActivated):
+                    await self._process_activate(item)
                 else:
                     assert isinstance(item, _AudioFrame)
                     await self._process_frame(item)
@@ -878,7 +992,15 @@ class SpeakerShadowRuntime:
             except Exception:
                 # A defensive final fence: shadow errors never reach ASR.
                 self._metrics.inference_failure_count += 1
-                if isinstance(item, (_AudioFrame, _CandidateFinished)):
+                if isinstance(
+                    item,
+                    (
+                        _AudioFrame,
+                        _CandidateDeferred,
+                        _CandidateActivated,
+                        _CandidateFinished,
+                    ),
+                ):
                     self._finalize_candidate(
                         item.candidate,
                         "failed",
@@ -896,6 +1018,48 @@ class SpeakerShadowRuntime:
             if self._queue.empty() and self._backend_host is None:
                 return
 
+    def _process_defer(self, marker: _CandidateDeferred) -> None:
+        if not self._identity_is_current(
+            marker.generation,
+            marker.candidate,
+            marker.token,
+        ):
+            return
+        marker.token.defer_processed = True
+
+    async def _process_activate(self, marker: _CandidateActivated) -> None:
+        token = marker.token
+        if not self._identity_is_current(
+            marker.generation,
+            marker.candidate,
+            token,
+        ):
+            return
+        token.activation_queued = False
+        if not token.deferred_requested or not token.defer_processed:
+            self._drop_candidate(marker.candidate, token=token)
+            return
+        token.scoring_deferred = False
+        buffer = self._buffers.get(marker.candidate)
+        if buffer is None:
+            return
+        if buffer.token is not token:
+            self._drop_candidate(marker.candidate, token=token)
+            return
+        if not await self._prewarm_candidate_backend(
+            generation=marker.generation,
+            candidate=marker.candidate,
+            token=token,
+            buffer=buffer,
+        ):
+            return
+        await self._process_buffer_checkpoints(
+            generation=marker.generation,
+            candidate=marker.candidate,
+            token=token,
+            buffer=buffer,
+        )
+
     async def _process_frame(self, frame: _AudioFrame) -> None:
         if frame.generation != self._generation:
             return
@@ -909,7 +1073,6 @@ class SpeakerShadowRuntime:
         ):
             return
         buffer = self._buffers.get(frame.candidate)
-        first_frame = buffer is None
         if buffer is None:
             if len(self._buffers) >= self._config.buffered_candidate_capacity:
                 dropped_candidate, dropped_buffer = self._buffers.popitem(last=False)
@@ -951,35 +1114,70 @@ class SpeakerShadowRuntime:
         if allowed_samples > 0:
             buffer.pcm16.extend(frame.pcm16[: allowed_samples * 2])
             buffer.sample_count += allowed_samples
-        if (
-            first_frame
-            and allowed_samples > 0
-            and frame.candidate.scope in self._config.backend_prewarm_scopes
+        if not await self._prewarm_candidate_backend(
+            generation=frame.generation,
+            candidate=frame.candidate,
+            token=frame.token,
+            buffer=buffer,
         ):
+            return
+        if frame.token.scoring_deferred:
+            return
+        await self._process_buffer_checkpoints(
+            generation=frame.generation,
+            candidate=frame.candidate,
+            token=frame.token,
+            buffer=buffer,
+        )
+
+    async def _prewarm_candidate_backend(
+        self,
+        *,
+        generation: int,
+        candidate: SpeakerShadowCandidateKey,
+        token: _CandidateToken,
+        buffer: _CandidateBuffer,
+    ) -> bool:
+        if (
+            buffer.sample_count > 0
+            and not buffer.backend_prewarm_attempted
+            and candidate.scope in self._config.backend_prewarm_scopes
+        ):
+            buffer.backend_prewarm_attempted = True
             backend_host = await self._ensure_backend()
             if not self._identity_is_current(
-                frame.generation,
-                frame.candidate,
-                frame.token,
+                generation,
+                candidate,
+                token,
             ):
                 self._metrics.stale_result_count += 1
-                retained_buffer = self._buffers.get(frame.candidate)
+                retained_buffer = self._buffers.get(candidate)
                 if retained_buffer is buffer:
-                    self._buffers.pop(frame.candidate, None)
+                    self._buffers.pop(candidate, None)
                     self._wipe_bytearray(buffer.pcm16)
-                return
+                return False
             if backend_host is None:
                 self._mark_backend_degraded()
-                retained_buffer = self._buffers.get(frame.candidate)
+                retained_buffer = self._buffers.get(candidate)
                 if retained_buffer is buffer:
-                    self._buffers.pop(frame.candidate, None)
+                    self._buffers.pop(candidate, None)
                     self._wipe_bytearray(buffer.pcm16)
                 self._finalize_candidate(
-                    frame.candidate,
+                    candidate,
                     "failed",
-                    token=frame.token,
+                    token=token,
                 )
-                return
+                return False
+        return True
+
+    async def _process_buffer_checkpoints(
+        self,
+        *,
+        generation: int,
+        candidate: SpeakerShadowCandidateKey,
+        token: _CandidateToken,
+        buffer: _CandidateBuffer,
+    ) -> None:
         explicit_checkpoints = self._config.observation_checkpoints_ms
         checkpoints = explicit_checkpoints or (self._config.minimum_audio_ms,)
         while buffer.next_checkpoint_index < len(checkpoints):
@@ -1000,13 +1198,13 @@ class SpeakerShadowRuntime:
             )
             candidate_pcm = bytearray(buffer.pcm16[: score_sample_count * 2])
             if terminal:
-                self._buffers.pop(frame.candidate, None)
+                self._buffers.pop(candidate, None)
                 self._wipe_bytearray(buffer.pcm16)
             try:
                 would_block = await self._evaluate_candidate(
-                    generation=frame.generation,
-                    candidate=frame.candidate,
-                    token=frame.token,
+                    generation=generation,
+                    candidate=candidate,
+                    token=token,
                     pcm16=candidate_pcm,
                     sample_rate_hz=buffer.sample_rate_hz,
                     audio_ms=(
@@ -1022,27 +1220,26 @@ class SpeakerShadowRuntime:
                     terminal=terminal,
                 )
             except BaseException:
-                retained_buffer = self._buffers.get(frame.candidate)
+                retained_buffer = self._buffers.get(candidate)
                 if retained_buffer is buffer:
-                    self._buffers.pop(frame.candidate, None)
+                    self._buffers.pop(candidate, None)
                     self._wipe_bytearray(buffer.pcm16)
                 raise
             finally:
                 self._wipe_bytearray(candidate_pcm)
             if not self._identity_is_current(
-                frame.generation,
-                frame.candidate,
-                frame.token,
+                generation,
+                candidate,
+                token,
             ):
-                retained_buffer = self._buffers.get(frame.candidate)
+                retained_buffer = self._buffers.get(candidate)
                 if retained_buffer is buffer:
-                    self._buffers.pop(frame.candidate, None)
+                    self._buffers.pop(candidate, None)
                     self._wipe_bytearray(buffer.pcm16)
                 return
             if (
                 not terminal
-                and frame.candidate.scope
-                in self._config.completion_confirmation_scopes
+                and candidate.scope in self._config.completion_confirmation_scopes
                 and buffer.next_checkpoint_index < len(checkpoints)
             ):
                 buffer.completion_confirmation_checkpoint_ms = (

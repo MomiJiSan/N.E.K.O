@@ -343,6 +343,59 @@ class _BlockingCloseSpeakerShadow(_SpeakerShadowSpy):
         await self.close_release.wait()
 
 
+class _DeferredSpeakerShadowSpy(_SpeakerShadowSpy):
+    def __init__(
+        self,
+        *,
+        support: bool = True,
+        support_error: Exception | None = None,
+        defer_result: bool = True,
+        activate_result: bool = True,
+    ) -> None:
+        super().__init__()
+        self.support = support
+        self.support_error = support_error
+        self.defer_result = defer_result
+        self.activate_result = activate_result
+        self.support_calls = 0
+
+    def supports_deferred_candidate(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool:
+        self.support_calls += 1
+        self.events.append(("supports", candidate))
+        if self.support_error is not None:
+            raise self.support_error
+        return self.support
+
+    def defer_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        self.events.append(("defer", candidate))
+        return self.defer_result
+
+    def activate_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        self.events.append(("activate", candidate))
+        return self.activate_result
+
+    def submit(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> bool:
+        super().submit(
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+            candidate=candidate,
+        )
+        return True
+
+    def finish_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        super().finish_candidate(candidate)
+        return True
+
+
 def _smart_turn_policy() -> AsrProviderPolicy:
     return AsrProviderPolicy(
         transport="segmented",
@@ -435,6 +488,29 @@ async def _prepare_candidate_rejection_fixture() -> tuple[
     return detector, shadow, candidate, shadow_candidate, turn_token
 
 
+async def _open_provider_candidate(
+    detector: DetectorRuntime,
+    *,
+    turn_id: int,
+) -> tuple[
+    DetectorCandidateKey,
+    DetectorIngressIdentity,
+    VoiceTurnToken,
+]:
+    ingress = _ingress_token()
+    result = await detector.feed(
+        b"\x01\x00" * 160,
+        ingress_token=ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result.candidate is not None
+    assert result.identity is not None
+    token = VoiceTurnToken(ingress, turn_id=turn_id)
+    assert await detector.bind_candidate(result.candidate, token) is not None
+    return result.candidate, result.identity, token
+
+
 async def test_speaker_shadow_default_none_keeps_smart_turn_callbacks_installed() -> None:
     detector = DetectorRuntime(
         vad=_Vad(),
@@ -513,6 +589,542 @@ async def test_provider_shadow_observes_admitted_pcm_until_explicit_seal() -> No
 
     await detector.close()
     assert shadow.close_calls == 1
+
+
+@pytest.mark.parametrize("status", ["missing", "false"])
+async def test_ordered_provider_api_keeps_default_legacy_observer_unchanged(
+    status: str,
+) -> None:
+    shadow = (
+        _SpeakerShadowSpy()
+        if status == "missing"
+        else _DeferredSpeakerShadowSpy(support=False)
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    first = b"\x11\x00" * 160
+    second = b"\x12\x00" * 160
+
+    await detector.observe_provider_audio_ordered(
+        first,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=40,
+        split_before_audio=False,
+    )
+    await detector.observe_provider_audio_ordered(
+        second,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=41,
+        split_before_audio=True,
+        evidence_complete=False,
+    )
+
+    legacy_candidate = SpeakerShadowCandidateKey(0, 0, "provider_candidate")
+    assert detector._provider_segment_ordered_mode is False
+    assert not detector._provider_speaker_segments
+    assert [frame[2] for frame in shadow.frames] == [
+        legacy_candidate,
+        legacy_candidate,
+    ]
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(legacy_candidate) is not None
+    await detector.close()
+
+
+async def test_ordered_provider_status_exception_latches_legacy_fail_open() -> None:
+    shadow = _DeferredSpeakerShadowSpy(
+        support_error=RuntimeError("status unavailable")
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+
+    await detector.observe_provider_audio_ordered(
+        b"\x21\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    shadow.support_error = None
+    shadow.support = True
+    await detector.observe_provider_audio_ordered(
+        b"\x22\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=2,
+        split_before_audio=False,
+    )
+
+    assert shadow.support_calls == 1
+    assert detector._provider_segment_deferred_support == "error"
+    assert detector._provider_segment_ordered_mode is False
+    legacy_candidate = SpeakerShadowCandidateKey(0, 0, "provider_candidate")
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(legacy_candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_overlap_preserves_exact_fifo_ownership() -> None:
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    candidate_a, identity_a, token_a = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x31\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_a,
+        sequence_no=10,
+        split_before_audio=False,
+    )
+    shadow_a = detector._provider_speaker_segments[0].candidate
+    assert shadow_a is not None
+    open_a = await detector.prepare_candidate_rejection(shadow_a)
+    assert open_a is not None
+
+    await detector.observe_provider_audio_ordered(
+        b"\x32\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_a,
+        sequence_no=11,
+        split_before_audio=True,
+    )
+    shadow_b = detector._provider_speaker_segments[1].candidate
+    assert shadow_b is not None
+    assert shadow.events.index(("defer", shadow_b)) < shadow.events.index(
+        ("submit", shadow_b)
+    )
+    assert open_a.commit() is False
+    assert await detector.prepare_candidate_rejection(shadow_a) is None
+    assert candidate_a in detector._provider_micro_event_ambiguous_candidates
+    assert DetectorCandidateKey(0, 1) in (
+        detector._provider_micro_event_ambiguous_candidates
+    )
+
+    fence_a = await detector.seal_provider_candidate(token_a)
+    assert fence_a is not None
+    assert await detector.prepare_candidate_rejection(shadow_a) is None
+    assert await detector.complete_provider_candidate(fence_a) is False
+
+    candidate_b, identity_b, token_b = await _open_provider_candidate(
+        detector,
+        turn_id=2,
+    )
+    assert candidate_b == DetectorCandidateKey(0, 1)
+    await detector.observe_provider_audio_ordered(
+        b"\x33\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_b,
+        sequence_no=12,
+        split_before_audio=False,
+    )
+    fence_b = await detector.seal_provider_candidate(token_b)
+
+    assert fence_b is not None
+    assert shadow.events.index(("activate", shadow_b)) < shadow.events.index(
+        ("finish", shadow_b)
+    )
+    sealed_b = await detector.prepare_candidate_rejection(shadow_b)
+    assert sealed_b is not None
+    assert sealed_b.provider_fence == fence_b
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["provider_speaker_segment_split_count"] == 1
+    assert diagnostics["provider_speaker_segment_deferred_count"] == 1
+    assert diagnostics["provider_speaker_segment_activated_count"] == 1
+    assert diagnostics["provider_speaker_segment_exact_snapshot_count"] == 1
+    await detector.close()
+
+
+async def test_ordered_provider_duplicate_stale_and_gap_are_bounded() -> None:
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    for sequence_no in (20, 20, 19, 22):
+        await detector.observe_provider_audio_ordered(
+            bytes([sequence_no, 0]) * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=sequence_no,
+            split_before_audio=False,
+        )
+
+    assert len(shadow.frames) == 2
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["provider_speaker_segment_sequence_stale_count"] == 2
+    assert diagnostics["provider_speaker_segment_sequence_gap_count"] == 1
+    shadow_candidate = detector._provider_speaker_segments[0].candidate
+    assert shadow_candidate is not None
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(shadow_candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_defer_failure_never_submits_or_activates_tail() -> (
+    None
+):
+    shadow = _DeferredSpeakerShadowSpy(defer_result=False)
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate_a, identity_a, token_a = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x39\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_a,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x3a\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_a,
+        sequence_no=2,
+        split_before_audio=True,
+    )
+    tail = detector._provider_speaker_segments[1]
+    assert tail.candidate is not None
+    assert ("submit", tail.candidate) not in shadow.events
+    assert tail.evidence_complete is False
+
+    fence_a = await detector.seal_provider_candidate(token_a)
+    assert fence_a is not None
+    assert await detector.complete_provider_candidate(fence_a) is False
+    _candidate_b, identity_b, token_b = await _open_provider_candidate(
+        detector,
+        turn_id=2,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x3b\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_b,
+        sequence_no=3,
+        split_before_audio=False,
+    )
+    fence_b = await detector.seal_provider_candidate(token_b)
+    assert fence_b is not None
+    assert ("activate", tail.candidate) not in shadow.events
+    assert await detector.prepare_candidate_rejection(tail.candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_seal_binds_once_and_preserves_fence_equality() -> (
+    None
+):
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    ingress = _ingress_token()
+    result = await detector.feed(
+        b"\x3c\x00" * 160,
+        ingress_token=ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result.identity is not None
+    await detector.observe_provider_audio_ordered(
+        b"\x3c\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=result.identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    shadow_candidate = detector._provider_speaker_segments[0].candidate
+    assert shadow_candidate is not None
+    token = VoiceTurnToken(ingress, turn_id=1)
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(shadow_candidate) is not None
+
+    wrong_token = VoiceTurnToken(ingress, turn_id=2)
+    assert await detector.seal_provider_candidate(wrong_token) == fence
+    assert await detector.prepare_candidate_rejection(shadow_candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_late_observation_cannot_cross_sealed_fence() -> None:
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    candidate, identity_1, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    result_2 = await detector.feed(
+        b"\x42\x00" * 160,
+        ingress_token=_ingress_token(),
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result_2.candidate == candidate
+    assert result_2.identity is not None
+    await detector.observe_provider_audio_ordered(
+        b"\x41\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_1,
+        sequence_no=100,
+        split_before_audio=False,
+    )
+    shadow_candidate = detector._provider_speaker_segments[0].candidate
+    assert shadow_candidate is not None
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(shadow_candidate) is not None
+
+    await detector.observe_provider_audio_ordered(
+        b"\x42\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=result_2.identity,
+        sequence_no=101,
+        split_before_audio=False,
+    )
+
+    assert len(shadow.frames) == 1
+    assert not detector._provider_speaker_segments
+    assert await detector.prepare_candidate_rejection(shadow_candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_preroll_ambiguity_carries_to_successor() -> None:
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate_a, identity_a, token_a = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x51\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_a,
+        sequence_no=1,
+        split_before_audio=False,
+        evidence_complete=False,
+    )
+    shadow_a = detector._provider_speaker_segments[0].candidate
+    assert shadow_a is not None
+    fence_a = await detector.seal_provider_candidate(token_a)
+    assert fence_a is not None
+    assert await detector.prepare_candidate_rejection(shadow_a) is None
+    assert await detector.complete_provider_candidate(fence_a) is False
+
+    _candidate_b, identity_b, token_b = await _open_provider_candidate(
+        detector,
+        turn_id=2,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x52\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_b,
+        sequence_no=2,
+        split_before_audio=False,
+    )
+    segment_b = detector._provider_speaker_segments[0]
+    assert segment_b.evidence_complete is False
+    assert segment_b.candidate is not None
+    fence_b = await detector.seal_provider_candidate(token_b)
+    assert fence_b is not None
+    assert await detector.prepare_candidate_rejection(segment_b.candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_expiry_never_activates_and_loses_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from main_logic.asr_client.endpointing import detector_runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_PROVIDER_SEGMENT_EXPIRY_SECONDS", 0.01)
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x61\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x62\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=2,
+        split_before_audio=True,
+    )
+    deferred = detector._provider_speaker_segments[1].candidate
+    assert deferred is not None
+
+    await asyncio.sleep(0.03)
+
+    assert not detector._provider_speaker_segments
+    assert ("activate", deferred) not in shadow.events
+    assert ("finish", deferred) in shadow.events
+    assert detector.speaker_rejection_diagnostics_snapshot()[
+        "provider_speaker_segment_expired_count"
+    ] == 2
+    await detector.observe_provider_audio_ordered(
+        b"\x63\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=3,
+        split_before_audio=False,
+    )
+    successor = detector._provider_speaker_segments[0]
+    assert successor.evidence_complete is False
+    assert successor.candidate is not None
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(successor.candidate) is None
+    await detector.close()
+
+
+async def test_ordered_provider_fifo_overflow_stays_fail_open_after_drain() -> None:
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    for sequence_no in range(1, 10):
+        await detector.observe_provider_audio_ordered(
+            bytes([sequence_no, 0]) * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=sequence_no,
+            split_before_audio=sequence_no > 1,
+        )
+
+    assert len(detector._provider_speaker_segments) == 8
+    assert detector.speaker_rejection_diagnostics_snapshot()[
+        "provider_speaker_segment_overflow_fail_open_count"
+    ] == 1
+    detector._expire_provider_segments(asyncio.get_running_loop().time() + 11.0)
+    assert not detector._provider_speaker_segments
+    await detector.observe_provider_audio_ordered(
+        b"\x0a\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=10,
+        split_before_audio=False,
+    )
+    successor = detector._provider_speaker_segments[0]
+    assert successor.evidence_complete is False
+    assert successor.candidate is not None
+    fence = await detector.seal_provider_candidate(token)
+    assert fence is not None
+    assert await detector.prepare_candidate_rejection(successor.candidate) is None
+    await detector.close()
+
+
+@pytest.mark.parametrize("boundary", ["reset", "replace", "close"])
+async def test_ordered_provider_lifecycle_finishes_deferred_without_activation(
+    boundary: str,
+) -> None:
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, _token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x71\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x72\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=2,
+        split_before_audio=True,
+    )
+    deferred = detector._provider_speaker_segments[1].candidate
+    assert deferred is not None
+
+    if boundary == "reset":
+        await detector.reset()
+    elif boundary == "replace":
+        await detector.replace_speaker_verifier(_DeferredSpeakerShadowSpy())
+    else:
+        await detector.close()
+
+    assert ("activate", deferred) not in shadow.events
+    assert ("finish", deferred) in shadow.events
+    assert detector._provider_segment_expiry_task is None
+    assert not detector._provider_segment_retired_expiry_tasks
+    await detector.close()
 
 
 async def test_speaker_shadow_reset_and_close_advance_generation_fail_open() -> None:
@@ -1015,10 +1627,6 @@ async def test_speaker_shadow_submit_finish_and_enabled_failures_are_ignored() -
 
 
 async def test_semantic_failure_invalidates_speaker_shadow_fail_open() -> None:
-    class _FailedAdapter:
-        async def wait_failure(self):
-            return SimpleNamespace(stage="smart_turn")
-
     shadow = _SpeakerShadowSpy()
     shadow.reset_error = RuntimeError("observer reset failed")
     on_failure = AsyncMock()
@@ -1032,8 +1640,13 @@ async def test_semantic_failure_invalidates_speaker_shadow_fail_open() -> None:
         on_endpointing_failure=on_failure,
     )
     assert detector._open_speaker_shadow_candidate("smart_turn_turn") is not None
+    adapter = detector._semantic_adapter
+    assert adapter is not None
+    adapter.wait_failure = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(stage="smart_turn")
+    )
 
-    await detector._watch_semantic_failure(_FailedAdapter())
+    await detector._watch_semantic_failure(adapter)
 
     assert detector.detector_epoch == 1
     assert detector._speaker_shadow_candidate is None
@@ -1041,6 +1654,39 @@ async def test_semantic_failure_invalidates_speaker_shadow_fail_open() -> None:
     assert shadow.reset_calls == 1
     assert detector.smart_turn_readiness is SmartTurnReadiness.FAILED
     on_failure.assert_awaited_once()
+    await detector.close()
+
+
+async def test_semantic_failure_wait_cannot_invalidate_reset_generation() -> None:
+    on_failure = AsyncMock()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_smart_turn_policy(),
+        coordinator=_SemanticCoordinator(),
+        on_turn_complete=AsyncMock(),
+        on_endpointing_failure=on_failure,
+    )
+    adapter = detector._semantic_adapter
+    assert adapter is not None
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wait_failure() -> SimpleNamespace:
+        started.set()
+        await release.wait()
+        return SimpleNamespace(stage="smart_turn")
+
+    adapter.wait_failure = wait_failure  # type: ignore[method-assign]
+    watch = asyncio.create_task(detector._watch_semantic_failure(adapter))
+    await started.wait()
+    await detector.reset()
+    reset_epoch = detector.detector_epoch
+    release.set()
+    await watch
+
+    assert detector.detector_epoch == reset_epoch
+    on_failure.assert_not_awaited()
     await detector.close()
 
 

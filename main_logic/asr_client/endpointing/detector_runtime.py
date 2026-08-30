@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -55,6 +56,8 @@ from ..provider_policy import AsrProviderPolicy
 from ..speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
     SpeakerShadowDecisionStatus,
+    SpeakerShadowDeferredCandidateControl,
+    SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowObserver,
     SpeakerShadowScope,
 )
@@ -67,6 +70,8 @@ _Identity: TypeAlias = tuple[int, int, int]
 _FallbackReason: TypeAlias = Literal["semantic_incomplete", "semantic_degraded"]
 _COMMIT_DRAIN_ON_CLOSE_SECONDS = 0.5
 _SPEAKER_SHADOW_REPLACEMENT_CLOSE_SECONDS = 2.0
+_PROVIDER_SEGMENT_FIFO_LIMIT = 8
+_PROVIDER_SEGMENT_EXPIRY_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1415,6 +1420,21 @@ class _SealedProviderCandidateRejection:
 
 
 @dataclass(slots=True)
+class _ProviderSpeakerSegment:
+    """PCM-free ownership record for one physical Provider segment."""
+
+    candidate: SpeakerShadowCandidateKey | None
+    detector_candidate: DetectorCandidateKey
+    first_identity: DetectorIngressIdentity
+    last_identity: DetectorIngressIdentity
+    created_at: float
+    evidence_complete: bool
+    deferred: bool
+    deferred_accepted: bool
+    ownership_ambiguous: bool = False
+
+
+@dataclass(slots=True)
 class _ProviderMicroEventAggregate:
     """Probability-free evidence owned by one detector candidate generation."""
 
@@ -1692,6 +1712,23 @@ class DetectorRuntime:
             _ProviderMicroEventAggregate | None
         ) = None
         self._sealed_provider_micro_event: _SealedProviderMicroEvent | None = None
+        self._provider_speaker_segments: deque[_ProviderSpeakerSegment] = deque()
+        self._provider_segment_last_sequence_no: int | None = None
+        self._provider_speaker_sealed_through_sequence_no: int | None = None
+        self._provider_segment_ordered_mode = False
+        self._provider_segment_deferred_support: (
+            bool | Literal["unsupported", "error"] | None
+        ) = None
+        self._provider_legacy_segment_evidence_complete = True
+        self._provider_segment_successor_evidence_incomplete = False
+        self._provider_segment_alignment_lost = False
+        self._provider_segment_expiry_task: asyncio.Task[None] | None = None
+        self._provider_segment_retired_expiry_tasks: set[
+            asyncio.Task[None]
+        ] = set()
+        self._provider_micro_event_ambiguous_candidates: set[
+            DetectorCandidateKey
+        ] = set()
         self._provider_discarded_through_sequence_no: int | None = None
         self._speaker_shadow = speaker_shadow
         self._speaker_shadow_generation = 0
@@ -1730,6 +1767,15 @@ class DetectorRuntime:
             "micro_event_fail_open_count": 0,
             "micro_event_stale_fence_count": 0,
             "micro_event_rnnoise_unavailable_count": 0,
+            "provider_speaker_segment_split_count": 0,
+            "provider_speaker_segment_deferred_count": 0,
+            "provider_speaker_segment_activated_count": 0,
+            "provider_speaker_segment_expired_count": 0,
+            "provider_speaker_segment_sequence_stale_count": 0,
+            "provider_speaker_segment_sequence_gap_count": 0,
+            "provider_speaker_segment_overflow_fail_open_count": 0,
+            "provider_speaker_segment_ownership_ambiguous_count": 0,
+            "provider_speaker_segment_exact_snapshot_count": 0,
         }
         if (
             provider_policy is not None
@@ -1940,6 +1986,187 @@ class DetectorRuntime:
             await self._publish_bound_completion(candidate, deferred)
         return bound
 
+    def _mark_provider_micro_event_ambiguous(
+        self,
+        candidate: DetectorCandidateKey,
+    ) -> None:
+        self._provider_micro_event_ambiguous_candidates.add(candidate)
+        aggregate = self._provider_micro_event_aggregate
+        if aggregate is not None and aggregate.candidate == candidate:
+            aggregate.silero_evidence_complete = False
+            aggregate.rnnoise_evidence_complete = False
+
+    def _mark_provider_segments_incomplete(self) -> None:
+        for segment in self._provider_speaker_segments:
+            segment.evidence_complete = False
+            self._mark_provider_segment_ownership_ambiguous(segment)
+            self._mark_provider_micro_event_ambiguous(
+                segment.detector_candidate
+            )
+
+    def _mark_provider_segment_ownership_ambiguous(
+        self,
+        segment: _ProviderSpeakerSegment,
+    ) -> None:
+        if segment.ownership_ambiguous:
+            return
+        segment.ownership_ambiguous = True
+        self._speaker_rejection_prepare_diagnostics[
+            "provider_speaker_segment_ownership_ambiguous_count"
+        ] += 1
+
+    def _allocate_provider_segment_candidate(
+        self,
+    ) -> SpeakerShadowCandidateKey | None:
+        suppressed = self._speaker_shadow_suppressed_candidate
+        if suppressed is not None:
+            if suppressed[0] != self._detector_epoch:
+                self._speaker_shadow_suppressed_candidate = None
+            elif suppressed[1] == "provider_candidate":
+                return None
+        shadow = self._speaker_shadow
+        if shadow is None:
+            return None
+        try:
+            if not shadow.enabled:
+                return None
+        except Exception:
+            return None
+        candidate = SpeakerShadowCandidateKey(
+            detector_epoch=self._detector_epoch,
+            shadow_generation=self._speaker_shadow_generation,
+            scope="provider_candidate",
+        )
+        # Ordered Provider segments may coexist. Reserve identity at creation,
+        # rather than at finish, so a deferred tail can never reuse its head's
+        # private observer key.
+        self._speaker_shadow_generation += 1
+        return candidate
+
+    def _finish_provider_segment(
+        self,
+        segment: _ProviderSpeakerSegment,
+        *,
+        activate_deferred: bool = True,
+    ) -> bool:
+        candidate = segment.candidate
+        shadow = self._speaker_shadow
+        if candidate is None or shadow is None:
+            return False
+        accepted = True
+        if segment.deferred:
+            if not activate_deferred or not segment.deferred_accepted:
+                accepted = False
+            elif not isinstance(shadow, SpeakerShadowDeferredCandidateControl):
+                accepted = False
+            else:
+                try:
+                    accepted = bool(shadow.activate_candidate(candidate))
+                except Exception:
+                    accepted = False
+                if accepted:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "provider_speaker_segment_activated_count"
+                    ] += 1
+        try:
+            finished = bool(shadow.finish_candidate(candidate))
+        except Exception:
+            finished = False
+        return bool(accepted and finished)
+
+    def _expire_provider_segments(self, now: float) -> None:
+        expired = False
+        while self._provider_speaker_segments and (
+            now - self._provider_speaker_segments[0].created_at
+            >= _PROVIDER_SEGMENT_EXPIRY_SECONDS
+        ):
+            segment = self._provider_speaker_segments.popleft()
+            segment.evidence_complete = False
+            self._mark_provider_micro_event_ambiguous(
+                segment.detector_candidate
+            )
+            self._finish_provider_segment(
+                segment,
+                activate_deferred=False,
+            )
+            self._speaker_rejection_prepare_diagnostics[
+                "provider_speaker_segment_expired_count"
+            ] += 1
+            expired = True
+        if expired:
+            self._provider_segment_alignment_lost = True
+            # Once one physical endpoint is missing, FIFO position no longer
+            # proves ownership for any surviving segment.
+            self._mark_provider_segments_incomplete()
+
+    def _schedule_provider_segment_expiry(self) -> None:
+        task = self._provider_segment_expiry_task
+        if task is not None and not task.done():
+            return
+        self._provider_segment_expiry_task = None
+        if self._closed or not self._provider_speaker_segments:
+            return
+        deadline = (
+            self._provider_speaker_segments[0].created_at
+            + _PROVIDER_SEGMENT_EXPIRY_SECONDS
+        )
+        delay = max(0.0, deadline - time.monotonic())
+        self._provider_segment_expiry_task = asyncio.create_task(
+            self._expire_provider_segments_after(delay),
+            name="provider-speaker-segment-expiry",
+        )
+
+    async def _expire_provider_segments_after(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            async with self._lock:
+                if self._closed:
+                    return
+                self._expire_provider_segments(time.monotonic())
+                self._provider_segment_expiry_task = None
+                self._schedule_provider_segment_expiry()
+        except asyncio.CancelledError:
+            return
+
+    def _retire_provider_segment_expiry_task(self) -> None:
+        task = self._provider_segment_expiry_task
+        self._provider_segment_expiry_task = None
+        if task is None or task is asyncio.current_task() or task.done():
+            return
+        task.cancel()
+        self._provider_segment_retired_expiry_tasks.add(task)
+        task.add_done_callback(
+            self._provider_segment_retired_expiry_tasks.discard
+        )
+
+    async def _drain_provider_segment_expiry_tasks(self) -> None:
+        tasks = tuple(self._provider_segment_retired_expiry_tasks)
+        if not tasks:
+            return
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _clear_provider_segment_state(
+        self,
+        *,
+        preserve_ordered_mode: bool = False,
+        preserve_last_sequence: bool = False,
+    ) -> None:
+        self._retire_provider_segment_expiry_task()
+        while self._provider_speaker_segments:
+            self._finish_provider_segment(
+                self._provider_speaker_segments.popleft(),
+                activate_deferred=False,
+            )
+        self._provider_micro_event_ambiguous_candidates.clear()
+        if not preserve_ordered_mode:
+            self._provider_segment_ordered_mode = False
+            self._provider_segment_deferred_support = None
+        self._provider_legacy_segment_evidence_complete = True
+        self._provider_segment_successor_evidence_incomplete = False
+        self._provider_segment_alignment_lost = False
+        if not preserve_last_sequence:
+            self._provider_segment_last_sequence_no = None
+
     async def prepare_candidate_rejection(
         self,
         shadow_candidate: SpeakerShadowCandidateKey,
@@ -1962,6 +2189,8 @@ class DetectorRuntime:
                     "rejection_prepare_detector_closed_count"
                 ] += 1
                 return None
+            if self._provider_segment_ordered_mode:
+                self._expire_provider_segments(time.monotonic())
             sealed = self._sealed_provider_candidate_rejection
             if (
                 sealed is not None
@@ -1974,6 +2203,45 @@ class DetectorRuntime:
                     turn_token=sealed.turn_token,
                     _runtime=self,
                     provider_fence=sealed.provider_fence,
+                )
+            if self._provider_segment_ordered_mode:
+                segment = next(
+                    (
+                        item
+                        for item in self._provider_speaker_segments
+                        if item.candidate == shadow_candidate
+                    ),
+                    None,
+                )
+                head = (
+                    self._provider_speaker_segments[0]
+                    if self._provider_speaker_segments
+                    else None
+                )
+                if (
+                    segment is None
+                    or segment is not head
+                    or len(self._provider_speaker_segments) != 1
+                    or not segment.evidence_complete
+                    or segment.ownership_ambiguous
+                    or segment.deferred
+                    or shadow_candidate.detector_epoch != self._detector_epoch
+                ):
+                    self._speaker_rejection_prepare_diagnostics[
+                        "rejection_prepare_shadow_mismatch_count"
+                    ] += 1
+                    return None
+                bound = self._bound_turns.get(segment.detector_candidate)
+                if bound is None:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "rejection_prepare_unbound_count"
+                    ] += 1
+                    return None
+                return DetectorCandidateRejectionLease(
+                    candidate=segment.detector_candidate,
+                    shadow_candidate=shadow_candidate,
+                    turn_token=bound.turn_token,
+                    _runtime=self,
                 )
             if not self._candidate_open:
                 self._speaker_rejection_prepare_diagnostics[
@@ -2040,6 +2308,9 @@ class DetectorRuntime:
         if aggregate is None or aggregate.candidate != candidate:
             aggregate = _ProviderMicroEventAggregate(candidate)
             self._provider_micro_event_aggregate = aggregate
+        if candidate in self._provider_micro_event_ambiguous_candidates:
+            aggregate.silero_evidence_complete = False
+            aggregate.rnnoise_evidence_complete = False
         aggregate.observe_silero(silero, events)
         aggregate.observe_rnnoise(
             rnnoise,
@@ -2060,7 +2331,11 @@ class DetectorRuntime:
         diagnostics = self._speaker_rejection_prepare_diagnostics
         diagnostics["micro_event_candidate_count"] += 1
         aggregate = self._provider_micro_event_aggregate
-        if aggregate is None or aggregate.candidate != candidate:
+        if (
+            candidate in self._provider_micro_event_ambiguous_candidates
+            or aggregate is None
+            or aggregate.candidate != candidate
+        ):
             evidence = ProviderMicroEventEvidence(None, False, None)
         else:
             evidence = aggregate.freeze()
@@ -2155,13 +2430,29 @@ class DetectorRuntime:
             return True
 
         bound = self._bound_turns.get(candidate)
+        ordered_segment: _ProviderSpeakerSegment | None = None
+        if self._provider_segment_ordered_mode:
+            if len(self._provider_speaker_segments) != 1:
+                return False
+            ordered_segment = self._provider_speaker_segments[0]
+            if (
+                ordered_segment.detector_candidate != candidate
+                or ordered_segment.candidate != lease.shadow_candidate
+                or not ordered_segment.evidence_complete
+                or ordered_segment.ownership_ambiguous
+                or ordered_segment.deferred
+            ):
+                return False
         if (
             lease._runtime is not self
             or self._closed
             or not self._candidate_open
             or candidate.detector_epoch != self._detector_epoch
             or candidate.candidate_generation != self._candidate_generation
-            or lease.shadow_candidate != self._speaker_shadow_candidate
+            or (
+                not self._provider_segment_ordered_mode
+                and lease.shadow_candidate != self._speaker_shadow_candidate
+            )
             or bound is None
             or bound.turn_token != lease.turn_token
         ):
@@ -2177,9 +2468,15 @@ class DetectorRuntime:
         self._provider_micro_event_aggregate = None
         self._sealed_provider_micro_event = None
         self._throttle_policy.reset_candidate_activity()
-        self._finish_speaker_shadow_candidate(
-            expected_scope=lease.shadow_candidate.scope,
-        )
+        if ordered_segment is not None:
+            self._provider_speaker_segments.popleft()
+            self._finish_provider_segment(ordered_segment)
+            if not self._provider_speaker_segments:
+                self._retire_provider_segment_expiry_task()
+        else:
+            self._finish_speaker_shadow_candidate(
+                expected_scope=lease.shadow_candidate.scope,
+            )
         return True
 
     async def _publish_bound_completion(
@@ -2471,6 +2768,8 @@ class DetectorRuntime:
             self._sealed_provider_candidate_rejection = None
             self._provider_micro_event_aggregate = None
             self._sealed_provider_micro_event = None
+            self._clear_provider_segment_state()
+            self._provider_speaker_sealed_through_sequence_no = None
             self._deferred_completion_identity_advanced = False
             self._provider_discarded_through_sequence_no = None
             # A deferred completion belongs to the invalidated epoch; keeping
@@ -2485,6 +2784,7 @@ class DetectorRuntime:
                 adapter.unpin_smart_turn()
             self._smart_turn_readiness = SmartTurnReadiness.UNLOADED
         await self._reset_speaker_shadow(speaker_shadow)
+        await self._drain_provider_segment_expiry_tasks()
 
     async def feed(
         self,
@@ -2623,6 +2923,7 @@ class DetectorRuntime:
                 if not self._available:
                     self._provider_micro_event_aggregate = None
                     self._sealed_provider_micro_event = None
+                    self._clear_provider_segment_state()
                     if not self._speaker_rejection_prepare_diagnostics[
                         "detector_vad_load_exception_count"
                     ]:
@@ -2661,6 +2962,7 @@ class DetectorRuntime:
                 self._available = False
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
+                self._clear_provider_segment_state()
                 self._speaker_rejection_prepare_diagnostics[
                     "detector_gate_exception_count"
                 ] += 1
@@ -2731,6 +3033,28 @@ class DetectorRuntime:
             or sample_rate_hz <= 0
         ):
             return
+        if self._provider_segment_ordered_mode:
+            # Mixing the legacy un-fenced entry point with ordered ownership
+            # makes the physical segment assignment unknowable. Keep ASR
+            # running, but revoke all speaker and micro-event evidence.
+            self._mark_provider_segments_incomplete()
+            candidate_key = DetectorCandidateKey(
+                self._detector_epoch,
+                self._candidate_generation,
+            )
+            self._mark_provider_micro_event_ambiguous(candidate_key)
+            return
+        self._observe_provider_audio_legacy(
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+        )
+
+    def _observe_provider_audio_legacy(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+    ) -> None:
         candidate = self._speaker_shadow_candidate
         if candidate is None:
             candidate = self._open_speaker_shadow_candidate("provider_candidate")
@@ -2742,14 +3066,280 @@ class DetectorRuntime:
             candidate=candidate,
         )
 
-    async def seal_provider_candidate(self) -> ProviderCandidateFence | None:
+    async def observe_provider_audio_ordered(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        identity: DetectorIngressIdentity,
+        sequence_no: int,
+        split_before_audio: bool,
+        evidence_complete: bool = True,
+    ) -> None:
+        """Assign admitted Provider PCM to a physical-segment FIFO.
+
+        Detector identity fences the source. ``sequence_no`` is the separate
+        Provider-dispatch admission sequence, so pre-roll and detector-only
+        quiet frames cannot manufacture gaps.
+        """
+
+        if (
+            not isinstance(pcm16, bytes)
+            or not pcm16
+            or len(pcm16) % 2
+            or sample_rate_hz <= 0
+            or type(identity) is not DetectorIngressIdentity
+            or type(sequence_no) is not int
+            or sequence_no <= 0
+            or type(split_before_audio) is not bool
+            or type(evidence_complete) is not bool
+        ):
+            return
+        async with self._lock:
+            if (
+                self._closed
+                or self._semantic_adapter is not None
+                or identity.detector_epoch != self._detector_epoch
+                or identity.ingress_token != self._ingress_token
+                or identity.sequence_no > self._sequence_no
+            ):
+                return
+            previous_sequence = self._provider_segment_last_sequence_no
+            if previous_sequence is not None and sequence_no <= previous_sequence:
+                self._speaker_rejection_prepare_diagnostics[
+                    "provider_speaker_segment_sequence_stale_count"
+                ] += 1
+                return
+            self._provider_segment_last_sequence_no = sequence_no
+            sequence_gap = bool(
+                previous_sequence is not None
+                and sequence_no != previous_sequence + 1
+            )
+            if sequence_gap:
+                self._speaker_rejection_prepare_diagnostics[
+                    "provider_speaker_segment_sequence_gap_count"
+                ] += 1
+
+            if not self._provider_segment_ordered_mode:
+                support = self._provider_segment_deferred_support
+                if support is None:
+                    shadow = self._speaker_shadow
+                    if isinstance(
+                        shadow,
+                        SpeakerShadowDeferredCandidateStatus,
+                    ):
+                        probe = SpeakerShadowCandidateKey(
+                            detector_epoch=self._detector_epoch,
+                            shadow_generation=self._speaker_shadow_generation,
+                            scope="provider_candidate",
+                        )
+                        try:
+                            support = bool(
+                                shadow.supports_deferred_candidate(probe)
+                            )
+                        except Exception:
+                            support = "error"
+                    else:
+                        support = "unsupported"
+                    self._provider_segment_deferred_support = support
+                if support is not True:
+                    if support == "error":
+                        self._provider_legacy_segment_evidence_complete = False
+                        self._mark_provider_micro_event_ambiguous(
+                            DetectorCandidateKey(
+                                self._detector_epoch,
+                                self._candidate_generation,
+                            )
+                        )
+                    self._observe_provider_audio_legacy(
+                        pcm16,
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                    return
+                self._provider_segment_ordered_mode = True
+
+            sealed_through = self._provider_speaker_sealed_through_sequence_no
+            if (
+                sealed_through is not None
+                and identity.sequence_no <= sealed_through
+            ):
+                fence = self._provider_candidate_fence
+                if (
+                    fence is not None
+                    and identity.sequence_no <= fence.through_sequence_no
+                ):
+                    self._sealed_provider_candidate_rejection = None
+                    self._sealed_provider_micro_event = None
+                return
+
+            self._expire_provider_segments(time.monotonic())
+            if sequence_gap:
+                self._mark_provider_segments_incomplete()
+                self._mark_provider_micro_event_ambiguous(
+                    DetectorCandidateKey(
+                        self._detector_epoch,
+                        self._candidate_generation,
+                    )
+                )
+            segment = (
+                self._provider_speaker_segments[-1]
+                if self._provider_speaker_segments
+                else None
+            )
+            create_segment = segment is None or split_before_audio
+            overlap = bool(split_before_audio and segment is not None)
+            if create_segment:
+                if len(self._provider_speaker_segments) >= (
+                    _PROVIDER_SEGMENT_FIFO_LIMIT
+                ):
+                    self._speaker_rejection_prepare_diagnostics[
+                        "provider_speaker_segment_overflow_fail_open_count"
+                    ] += 1
+                    self._provider_segment_alignment_lost = True
+                    self._mark_provider_segments_incomplete()
+                    self._mark_provider_micro_event_ambiguous(
+                        DetectorCandidateKey(
+                            self._detector_epoch,
+                            self._candidate_generation,
+                        )
+                    )
+                    return
+                if overlap:
+                    detector_candidate = DetectorCandidateKey(
+                        self._detector_epoch,
+                        segment.detector_candidate.candidate_generation + 1,
+                    )
+                    self._mark_provider_micro_event_ambiguous(
+                        segment.detector_candidate
+                    )
+                    self._mark_provider_segment_ownership_ambiguous(segment)
+                else:
+                    detector_candidate = DetectorCandidateKey(
+                        self._detector_epoch,
+                        self._candidate_generation,
+                    )
+                candidate = self._allocate_provider_segment_candidate()
+                shadow = self._speaker_shadow
+                control = (
+                    shadow
+                    if isinstance(shadow, SpeakerShadowDeferredCandidateControl)
+                    else None
+                )
+                segment_complete = bool(
+                    evidence_complete
+                    and candidate is not None
+                    and not sequence_gap
+                    and not self._provider_segment_alignment_lost
+                    and not self._provider_segment_successor_evidence_incomplete
+                )
+                carried_incomplete = (
+                    self._provider_segment_successor_evidence_incomplete
+                )
+                self._provider_segment_successor_evidence_incomplete = False
+                deferred = overlap
+                deferred_accepted = False
+                if candidate is not None and deferred:
+                    if control is not None:
+                        try:
+                            deferred_accepted = bool(
+                                control.defer_candidate(candidate)
+                            )
+                        except Exception:
+                            deferred_accepted = False
+                    segment_complete = bool(
+                        segment_complete and deferred_accepted
+                    )
+                segment = _ProviderSpeakerSegment(
+                    candidate=candidate,
+                    detector_candidate=detector_candidate,
+                    first_identity=identity,
+                    last_identity=identity,
+                    created_at=time.monotonic(),
+                    evidence_complete=segment_complete,
+                    deferred=deferred,
+                    deferred_accepted=deferred_accepted,
+                )
+                self._provider_speaker_segments.append(segment)
+                if overlap:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "provider_speaker_segment_split_count"
+                    ] += 1
+                    if deferred_accepted:
+                        self._speaker_rejection_prepare_diagnostics[
+                            "provider_speaker_segment_deferred_count"
+                        ] += 1
+                    self._mark_provider_micro_event_ambiguous(
+                        detector_candidate
+                    )
+                elif carried_incomplete:
+                    self._mark_provider_micro_event_ambiguous(
+                        detector_candidate
+                    )
+            else:
+                segment.last_identity = identity
+
+            if segment is None:
+                return
+            segment.last_identity = identity
+            if not evidence_complete:
+                segment.evidence_complete = False
+                if not split_before_audio:
+                    self._provider_segment_successor_evidence_incomplete = True
+                self._mark_provider_micro_event_ambiguous(
+                    segment.detector_candidate
+                )
+            candidate = segment.candidate
+            shadow = self._speaker_shadow
+            may_submit = bool(
+                not segment.deferred or segment.deferred_accepted
+            )
+            if candidate is not None and shadow is not None and may_submit:
+                try:
+                    submitted = bool(
+                        shadow.submit(
+                            pcm16,
+                            sample_rate_hz=sample_rate_hz,
+                            candidate=candidate,
+                        )
+                    )
+                except Exception:
+                    submitted = False
+                if not submitted:
+                    segment.evidence_complete = False
+                    self._mark_provider_micro_event_ambiguous(
+                        segment.detector_candidate
+                    )
+            else:
+                segment.evidence_complete = False
+                self._mark_provider_micro_event_ambiguous(
+                    segment.detector_candidate
+                )
+            self._schedule_provider_segment_expiry()
+
+    async def seal_provider_candidate(
+        self,
+        turn_token: VoiceTurnToken | None = None,
+    ) -> ProviderCandidateFence | None:
         """Seal local detector activity after a streaming Provider endpoint."""
 
         async with self._lock:
             if self._closed or self._semantic_adapter is not None:
                 return None
+            if turn_token is not None and type(turn_token) is not VoiceTurnToken:
+                return None
             existing = self._provider_candidate_fence
             if existing is not None:
+                sealed = self._sealed_provider_candidate_rejection
+                if (
+                    turn_token is not None
+                    and sealed is not None
+                    and sealed.turn_token != turn_token
+                ):
+                    # One physical endpoint cannot authorize two logical
+                    # owners. Preserve Provider fence equality but revoke all
+                    # optional suppression authority.
+                    self._sealed_provider_candidate_rejection = None
+                    self._sealed_provider_micro_event = None
                 return existing
             candidate = DetectorCandidateKey(
                 self._detector_epoch,
@@ -2761,8 +3351,63 @@ class DetectorRuntime:
                 through_sequence_no=self._sequence_no,
             )
             self._provider_candidate_fence = fence
-            shadow_candidate = self._speaker_shadow_candidate
+            self._provider_speaker_sealed_through_sequence_no = max(
+                self._provider_speaker_sealed_through_sequence_no or 0,
+                fence.through_sequence_no,
+            )
             bound = self._bound_turns.get(candidate)
+            if turn_token is not None:
+                if bound is None:
+                    bound = BoundDetectorTurn(candidate, turn_token)
+                    self._bound_turns[candidate] = bound
+                elif bound.turn_token != turn_token:
+                    bound = None
+
+            ordered_segment: _ProviderSpeakerSegment | None = None
+            ordered_finish_accepted = False
+            if self._provider_segment_ordered_mode:
+                self._expire_provider_segments(time.monotonic())
+                if self._provider_speaker_segments:
+                    ordered_segment = self._provider_speaker_segments.popleft()
+                    ordered_finish_accepted = self._finish_provider_segment(
+                        ordered_segment
+                    )
+                has_unclaimed_tail = bool(self._provider_speaker_segments)
+                self._schedule_provider_segment_expiry()
+                ordered_owner_exact = bool(
+                    ordered_segment is not None
+                    and turn_token is not None
+                    and bound is not None
+                    and bound.turn_token == turn_token
+                    and ordered_segment.detector_candidate == candidate
+                    and ordered_segment.first_identity.ingress_token
+                    == turn_token.ingress
+                    and ordered_segment.last_identity.ingress_token
+                    == turn_token.ingress
+                    and not ordered_segment.ownership_ambiguous
+                    and not has_unclaimed_tail
+                )
+                if not (
+                    ordered_owner_exact
+                    and ordered_segment is not None
+                    and ordered_segment.evidence_complete
+                    and ordered_finish_accepted
+                ):
+                    if ordered_segment is not None:
+                        self._mark_provider_segment_ownership_ambiguous(
+                            ordered_segment
+                        )
+                    self._mark_provider_micro_event_ambiguous(candidate)
+                    shadow_candidate = None
+                else:
+                    shadow_candidate = ordered_segment.candidate
+            else:
+                shadow_candidate = (
+                    self._speaker_shadow_candidate
+                    if self._provider_legacy_segment_evidence_complete
+                    else None
+                )
+
             if shadow_candidate is None:
                 self._speaker_rejection_prepare_diagnostics[
                     "rejection_seal_snapshot_missing_shadow_count"
@@ -2791,15 +3436,29 @@ class DetectorRuntime:
                 self._speaker_rejection_prepare_diagnostics[
                     "rejection_seal_snapshot_created_count"
                 ] += 1
+                if self._provider_segment_ordered_mode:
+                    self._speaker_rejection_prepare_diagnostics[
+                        "provider_speaker_segment_exact_snapshot_count"
+                    ] += 1
             self._sealed_provider_candidate_rejection = sealed_rejection
             self._seal_provider_micro_event(candidate, fence)
+            self._provider_micro_event_ambiguous_candidates.discard(candidate)
             self._provider_discarded_through_sequence_no = None
             self._candidate_generation += 1
             self._candidate_open = False
             self._speech_active = False
             self._policy_event_candidate = None
             self._throttle_policy.reset_candidate_activity()
-            self._finish_speaker_shadow_candidate(expected_scope="provider_candidate")
+            if not self._provider_segment_ordered_mode:
+                self._finish_speaker_shadow_candidate(
+                    expected_scope="provider_candidate"
+                )
+                self._provider_legacy_segment_evidence_complete = True
+            elif self._speaker_shadow_suppressed_candidate == (
+                self._detector_epoch,
+                "provider_candidate",
+            ):
+                self._speaker_shadow_suppressed_candidate = None
             return fence
 
     def pending_provider_speaker_candidate(
@@ -2865,8 +3524,16 @@ class DetectorRuntime:
                 return False
             await asyncio.to_thread(self._gate.reset)
             self._provider_discarded_through_sequence_no = self._sequence_no
+            self._provider_speaker_sealed_through_sequence_no = max(
+                self._provider_speaker_sealed_through_sequence_no or 0,
+                self._sequence_no,
+            )
             self._candidate_generation += 1
             self._provider_micro_event_aggregate = None
+            self._clear_provider_segment_state(
+                preserve_ordered_mode=True,
+                preserve_last_sequence=True,
+            )
             self._candidate_open = False
             self._speech_active = False
             self._policy_event_candidate = None
@@ -2879,6 +3546,7 @@ class DetectorRuntime:
                 self._speaker_shadow_suppressed_candidate = None
             speaker_shadow = self._speaker_shadow
         await self._reset_speaker_shadow(speaker_shadow)
+        await self._drain_provider_segment_expiry_tasks()
         return True
 
     async def complete_provider_candidate(
@@ -3033,6 +3701,8 @@ class DetectorRuntime:
             self._sealed_provider_candidate_rejection = None
             self._provider_micro_event_aggregate = None
             self._sealed_provider_micro_event = None
+            self._clear_provider_segment_state()
+            self._provider_speaker_sealed_through_sequence_no = None
             self._provider_discarded_through_sequence_no = None
             self._defer_turn_complete = False
             self._deferred_turn_complete = False
@@ -3110,11 +3780,14 @@ class DetectorRuntime:
             try:
                 await self._reset_speaker_shadow(speaker_shadow)
             finally:
-                async with self._lock:
-                    if self._overflow_reset_task is asyncio.current_task():
-                        self._overflow_reset_task = None
-                    if failed and not self._closed:
-                        self._smart_turn_readiness = SmartTurnReadiness.FAILED
+                try:
+                    await self._drain_provider_segment_expiry_tasks()
+                finally:
+                    async with self._lock:
+                        if self._overflow_reset_task is asyncio.current_task():
+                            self._overflow_reset_task = None
+                        if failed and not self._closed:
+                            self._smart_turn_readiness = SmartTurnReadiness.FAILED
 
     async def reset(self) -> None:
         overflow_reset_task = self._overflow_reset_task
@@ -3146,6 +3819,8 @@ class DetectorRuntime:
                 self._sealed_provider_candidate_rejection = None
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
+                self._clear_provider_segment_state()
+                self._provider_speaker_sealed_through_sequence_no = None
                 self._provider_discarded_through_sequence_no = None
                 self._speech_active = False
                 self._prepare_token = None
@@ -3180,7 +3855,10 @@ class DetectorRuntime:
                     utterance_id=semantic_identity[2],
                 )
         finally:
-            await self._reset_speaker_shadow(speaker_shadow)
+            try:
+                await self._reset_speaker_shadow(speaker_shadow)
+            finally:
+                await self._drain_provider_segment_expiry_tasks()
 
     async def replace_speaker_verifier(
         self,
@@ -3205,6 +3883,14 @@ class DetectorRuntime:
                 return
             else:
                 self._sealed_provider_candidate_rejection = None
+                self._sealed_provider_micro_event = None
+                self._clear_provider_segment_state()
+                self._mark_provider_micro_event_ambiguous(
+                    DetectorCandidateKey(
+                        self._detector_epoch,
+                        self._candidate_generation,
+                    )
+                )
                 suppressed = self._speaker_shadow_suppressed_candidate
                 if suppressed is not None and suppressed[0] != self._detector_epoch:
                     self._speaker_shadow_suppressed_candidate = None
@@ -3237,9 +3923,9 @@ class DetectorRuntime:
         cleanup_shadow = (
             detached_shadow if detached_shadow is not None else rejected_shadow
         )
-        if cleanup_shadow is None:
-            return
         try:
+            if cleanup_shadow is None:
+                return
             await asyncio.wait_for(
                 self._close_speaker_shadow(cleanup_shadow),
                 timeout=_SPEAKER_SHADOW_REPLACEMENT_CLOSE_SECONDS,
@@ -3251,6 +3937,8 @@ class DetectorRuntime:
             if current_task is not None and current_task.cancelling():
                 raise
             return
+        finally:
+            await self._drain_provider_segment_expiry_tasks()
 
     async def release_deferred_turn(self) -> None:
         """Release a deferred SmartTurn completion after the prior final."""
@@ -3314,6 +4002,8 @@ class DetectorRuntime:
                 self._sealed_provider_candidate_rejection = None
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
+                self._clear_provider_segment_state()
+                self._provider_speaker_sealed_through_sequence_no = None
                 self._provider_discarded_through_sequence_no = None
                 watch_task, self._failure_watch_task = self._failure_watch_task, None
                 if watch_task is not None:
@@ -3342,7 +4032,10 @@ class DetectorRuntime:
             else:
                 await asyncio.to_thread(vad.close)
         finally:
-            await self._close_speaker_shadow(speaker_shadow)
+            try:
+                await self._close_speaker_shadow(speaker_shadow)
+            finally:
+                await self._drain_provider_segment_expiry_tasks()
 
     def _observe_smart_turn_speaker_shadow(
         self,
@@ -3477,29 +4170,56 @@ class DetectorRuntime:
 
     async def _watch_semantic_failure(self, adapter: _VoiceTurnAdapter) -> None:
         try:
+            async with self._lock:
+                if self._closed or adapter is not self._semantic_adapter:
+                    return
+                watched_epoch = self._detector_epoch
+                watched_generation = self._semantic_generation
             failure = await adapter.wait_failure()
-            if getattr(failure, "stage", None) in {"vad_load", "vad_feed"}:
-                self._available = False
-                return
-            self._detector_epoch += 1
-            self._reset_speaker_shadow_identity()
-            self._candidate_generation = 0
-            self._candidate_open = False
-            self._policy_event_candidate = None
-            self._throttle_policy.reset_candidate_activity()
-            self._ingress_token = None
-            self._bound_turns.clear()
-            self._deferred_completions.clear()
-            self._completion_fences.clear()
-            self._provider_candidate_fence = None
-            self._sealed_provider_candidate_rejection = None
-            self._provider_micro_event_aggregate = None
-            self._sealed_provider_micro_event = None
-            self._provider_discarded_through_sequence_no = None
-            self._smart_turn_readiness = SmartTurnReadiness.FAILED
-            await self._reset_speaker_shadow(self._speaker_shadow)
-            callback = self._on_endpointing_failure
-            if callback is not None and not self._closed:
+            speaker_shadow: SpeakerShadowObserver | None = None
+            failure_epoch: int | None = None
+            async with self._lock:
+                if (
+                    self._closed
+                    or adapter is not self._semantic_adapter
+                    or self._detector_epoch != watched_epoch
+                    or self._semantic_generation != watched_generation
+                ):
+                    return
+                if getattr(failure, "stage", None) in {"vad_load", "vad_feed"}:
+                    self._available = False
+                    return
+                self._detector_epoch += 1
+                self._reset_speaker_shadow_identity()
+                self._candidate_generation = 0
+                self._candidate_open = False
+                self._policy_event_candidate = None
+                self._throttle_policy.reset_candidate_activity()
+                self._ingress_token = None
+                self._bound_turns.clear()
+                self._deferred_completions.clear()
+                self._completion_fences.clear()
+                self._provider_candidate_fence = None
+                self._sealed_provider_candidate_rejection = None
+                self._provider_micro_event_aggregate = None
+                self._sealed_provider_micro_event = None
+                self._clear_provider_segment_state()
+                self._provider_speaker_sealed_through_sequence_no = None
+                self._provider_discarded_through_sequence_no = None
+                self._smart_turn_readiness = SmartTurnReadiness.FAILED
+                speaker_shadow = self._speaker_shadow
+                failure_epoch = self._detector_epoch
+            await self._reset_speaker_shadow(speaker_shadow)
+            await self._drain_provider_segment_expiry_tasks()
+            async with self._lock:
+                if (
+                    self._closed
+                    or adapter is not self._semantic_adapter
+                    or self._detector_epoch != failure_epoch
+                ):
+                    return
+                callback = self._on_endpointing_failure
+            if callback is not None:
                 await callback()
         except asyncio.CancelledError:
             return

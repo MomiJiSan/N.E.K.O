@@ -271,6 +271,7 @@ class _ReadyDetector:
         )
         self.complete_provider_candidate = AsyncMock(return_value=False)
         self.discard_provider_successor = AsyncMock(return_value=True)
+        self.observe_provider_audio_ordered = AsyncMock()
         self.observe_provider_audio = MagicMock()
 
     async def prepare_endpointing(self, token):
@@ -5675,7 +5676,7 @@ async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payloa
         activate=activate,
     )
 
-    result = component._activate_asr_audio_dispatcher(
+    result = await component._activate_asr_audio_dispatcher(
         lifecycle,
         token,
         buffered_pcm16=payload,
@@ -5694,6 +5695,124 @@ async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payloa
         detector.observe_provider_audio.assert_not_called()
 
 
+async def test_buffered_resume_split_with_lost_pcm_boundary_is_incomplete() -> None:
+    runtime = _Runtime()
+    session = SimpleNamespace(
+        is_ready=True,
+        stream_audio=AsyncMock(),
+        close=AsyncMock(),
+        signal_user_activity_end=AsyncMock(),
+    )
+    runtime._asr_session = session
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    lifecycle = component._asr_lifecycle
+    detector = component._asr_detector
+    ingress = component._asr_current_ingress_token
+    assert lifecycle is not None
+    assert isinstance(detector, _ReadyDetector)
+    assert ingress is not None
+    token = component._capture_turn_token(lifecycle)
+    predecessor_identity = DetectorIngressIdentity(
+        ingress_token=ingress,
+        detector_epoch=1,
+        sequence_no=18,
+    )
+    successor_identity = DetectorIngressIdentity(
+        ingress_token=ingress,
+        detector_epoch=1,
+        sequence_no=19,
+    )
+    predecessor_pcm = b"\x01\x00" * 160
+    successor_pcm = b"\x02\x00" * 160
+    payload = predecessor_pcm + successor_pcm
+    component._record_buffered_provider_speaker_observation(
+        identity=predecessor_identity,
+        byte_count=len(predecessor_pcm),
+        split_before_audio=False,
+        evidence_complete=True,
+    )
+    component._record_buffered_provider_speaker_observation(
+        identity=successor_identity,
+        byte_count=len(successor_pcm),
+        split_before_audio=True,
+        evidence_complete=True,
+    )
+    component._asr_provider_speaker_sequence = 4
+
+    assert await component._activate_asr_audio_dispatcher(
+        lifecycle,
+        token,
+        buffered_pcm16=payload,
+    )
+    await component._asr_audio_dispatcher.wait_idle()
+
+    detector.observe_provider_audio_ordered.assert_awaited_once_with(
+        payload,
+        sample_rate_hz=16_000,
+        identity=successor_identity,
+        sequence_no=5,
+        split_before_audio=False,
+        evidence_complete=False,
+    )
+    detector.observe_provider_audio.assert_not_called()
+    session.stream_audio.assert_awaited_once_with(
+        payload,
+        sample_rate_hz=16_000,
+    )
+    await component._asr_audio_dispatcher.close()
+
+
+async def test_provider_speaker_sequence_remains_monotonic_across_turns() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    lifecycle = component._asr_lifecycle
+    detector = component._asr_detector
+    ingress = component._asr_current_ingress_token
+    assert lifecycle is not None
+    assert isinstance(detector, _ReadyDetector)
+    assert ingress is not None
+    lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    first_turn = component._capture_turn_token(lifecycle)
+    first_identity = DetectorIngressIdentity(ingress, 1, 21)
+
+    assert await component._observe_admitted_provider_audio(
+        lifecycle,
+        detector,
+        b"\x03\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=first_identity,
+        split_before_audio=False,
+        evidence_complete=True,
+        turn_token=first_turn,
+    )
+    lifecycle.transition(VoiceLifecycleEvent.TURN_SEALED)
+    lifecycle.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
+    lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    second_turn = component._capture_turn_token(lifecycle)
+    second_identity = DetectorIngressIdentity(ingress, 1, 22)
+
+    assert second_turn.turn_id > first_turn.turn_id
+    assert await component._observe_admitted_provider_audio(
+        lifecycle,
+        detector,
+        b"\x04\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=second_identity,
+        split_before_audio=False,
+        evidence_complete=True,
+        turn_token=second_turn,
+    )
+
+    assert [
+        observed.kwargs["sequence_no"]
+        for observed in detector.observe_provider_audio_ordered.await_args_list
+    ] == [1, 2]
+
+
 async def test_partial_preview_is_display_only_and_epoch_guarded() -> None:
     runtime = _Runtime()
     websocket = type("WebSocket", (), {})()
@@ -5705,7 +5824,10 @@ async def test_partial_preview_is_display_only_and_epoch_guarded() -> None:
     epoch = runtime._asr_session_epoch
     token = runtime._asr_runtime._asr_partial_turn_token
     assert token is not None
-    assert runtime._activate_asr_audio_dispatcher(runtime._asr_lifecycle, token)
+    assert await runtime._activate_asr_audio_dispatcher(
+        runtime._asr_lifecycle,
+        token,
+    )
 
     await runtime._send_independent_asr_preview(" draft ", epoch)
     await runtime._send_independent_asr_preview("stale", epoch + 1)
@@ -5733,7 +5855,7 @@ async def test_partial_preview_keeps_prepared_token_and_rejects_after_abort() ->
     epoch = runtime._asr_session_epoch
     captured_token = runtime._asr_runtime._asr_partial_turn_token
     assert captured_token is not None
-    assert runtime._activate_asr_audio_dispatcher(
+    assert await runtime._activate_asr_audio_dispatcher(
         runtime._asr_lifecycle,
         captured_token,
     )

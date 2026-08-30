@@ -22,6 +22,8 @@ from main_logic.asr_client.speaker_shadow.runtime import (
     SpeakerShadowRuntime,
     _AudioFrame,
     _BackendProcessHost,
+    _CandidateActivated,
+    _CandidateDeferred,
     _CandidateFinished,
     _CandidateToken,
     _backend_host_main,
@@ -158,6 +160,194 @@ def _speaker_host_pids() -> set[int]:
         and process.name == "speaker-shadow-backend"
         and process.is_alive()
     }
+
+
+async def test_deferred_candidate_buffers_then_scores_in_order_after_activation() -> (
+    None
+):
+    observations: list[SpeakerShadowObservation] = []
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(9_001)
+
+    assert runtime.defer_candidate(candidate)
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+
+    assert observations == []
+    assert runtime.requires_provisional_decision(candidate) is False
+    assert runtime.snapshot()["retained_pcm_bytes"] == len(_pcm(2_999))
+
+    assert runtime.activate_candidate(candidate)
+    assert runtime.requires_provisional_decision(candidate) is True
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert [item.observation_kind for item in observations] == [
+        "checkpoint",
+        "completion_confirmation",
+    ]
+    assert [item.audio_ms for item in observations] == [1_500, 2_999]
+    assert completions == [
+        SpeakerShadowCompletion(candidate, "scored", 1_500)
+    ]
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_deferred_finish_before_activation_is_fail_open_and_wipes_pcm() -> None:
+    observations: list[SpeakerShadowObservation] = []
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    candidate = _candidate(9_002)
+
+    assert runtime.defer_candidate(candidate)
+    assert runtime.submit(
+        _pcm(2_999),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    assert runtime.activate_candidate(candidate) is False
+    await runtime.wait_idle()
+
+    assert observations == []
+    assert completions == [
+        SpeakerShadowCompletion(candidate, "insufficient", None)
+    ]
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_defer_must_precede_first_pcm_and_reset_wipes_buffer() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    ordinary_candidate = _candidate(9_003)
+    deferred_candidate = _candidate(9_004)
+
+    assert runtime.submit(
+        _pcm(100),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=ordinary_candidate,
+    )
+    assert runtime.defer_candidate(ordinary_candidate) is False
+    assert runtime.defer_candidate(deferred_candidate)
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=deferred_candidate,
+    )
+    await runtime.wait_idle()
+    assert runtime.snapshot()["retained_pcm_bytes"] > 0
+
+    await runtime.reset()
+
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_defer_requires_scope_enabled_for_pending_observation_gate() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=SpeakerShadowConfig(
+            enabled=True,
+            minimum_audio_ms=1_500,
+            observation_checkpoints_ms=(1_500, 3_000),
+            completion_confirmation_scopes=("provider_candidate",),
+        ),
+    )
+    provider_candidate = _candidate(9_005)
+    smart_turn_candidate = SpeakerShadowCandidateKey(
+        detector_epoch=1,
+        shadow_generation=9_006,
+        scope="smart_turn_turn",
+    )
+
+    assert runtime.supports_deferred_candidate(provider_candidate) is False
+    assert runtime.supports_deferred_candidate(smart_turn_candidate) is False
+    assert runtime.defer_candidate(provider_candidate) is False
+    assert runtime.defer_candidate(smart_turn_candidate) is False
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_deferred_first_frame_prewarms_without_scoring() -> None:
+    score_started = _spawn_event()
+    score_release = _spawn_event()
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(
+            block_stage="score",
+            stage_started=score_started,
+            stage_release=score_release,
+        ),
+        config=_provider_gate_config(prewarm=True),
+    )
+    candidate = _candidate(9_005)
+
+    assert runtime.defer_candidate(candidate)
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await runtime.wait_idle()
+
+    assert runtime.snapshot()["backend_loaded_count"] == 1
+    assert score_started.is_set() is False
+    assert runtime.requires_provisional_decision(candidate) is False
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_deferred_predeclarations_are_bounded_without_evicting_owner() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(buffered_candidate_capacity=1),
+    )
+    retained = _candidate(9_006)
+    rejected = _candidate(9_007)
+
+    assert runtime.defer_candidate(retained)
+    assert runtime.defer_candidate(rejected) is False
+    assert runtime.activate_candidate(retained)
+    assert runtime.finish_candidate(retained)
+    await runtime.wait_idle()
+
+    assert runtime.snapshot()["finished_candidate_count"] == 1
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
 
 
 async def _wait_until(predicate: Any, timeout: float = 2.0) -> None:

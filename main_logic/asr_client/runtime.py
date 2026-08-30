@@ -215,6 +215,16 @@ class _AsrRuntimeIdentity:
     turn_token: VoiceTurnToken | None = None
 
 
+@dataclass(slots=True)
+class _BufferedProviderSpeakerObservation:
+    """PCM-free metadata for Provider audio retained by the lifecycle."""
+
+    identity: DetectorIngressIdentity | None
+    total_bytes: int
+    resume_split_count: int
+    evidence_complete: bool
+
+
 @dataclass(frozen=True, slots=True)
 class _CandidateRejectionSuppression:
     request: CandidateRejectionRequest
@@ -1214,6 +1224,10 @@ class IndependentAsrRuntime:
         self._asr_sealed_turn_token: VoiceTransportToken | None = None
         self._asr_provider_candidate_fence: ProviderCandidateFence | None = None
         self._asr_audio_sequence = 0
+        self._asr_provider_speaker_sequence = 0
+        self._asr_buffered_provider_speaker_observation: (
+            _BufferedProviderSpeakerObservation | None
+        ) = None
         self._asr_audio_generation = 0
         self._asr_current_ingress_token: VoiceIngressToken | None = None
         self._asr_partial_turn_token: VoiceTurnToken | None = None
@@ -1316,6 +1330,10 @@ class IndependentAsrRuntime:
             )
             self._asr_audio_sequence = 0
             self._asr_pending_detector_candidate = None
+        if not hasattr(self, "_asr_provider_speaker_sequence"):
+            self._asr_provider_speaker_sequence = 0
+        if not hasattr(self, "_asr_buffered_provider_speaker_observation"):
+            self._asr_buffered_provider_speaker_observation = None
         if not hasattr(self, "_asr_overlap_onset_token"):
             self._asr_overlap_onset_token = None
         if not hasattr(self, "_asr_overlap_onset_at"):
@@ -1615,7 +1633,7 @@ class IndependentAsrRuntime:
             if not self._detector_envelope_is_current(envelope):
                 return
             if lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE:
-                self._activate_asr_audio_dispatcher(lifecycle, turn_token)
+                await self._activate_asr_audio_dispatcher(lifecycle, turn_token)
             return
         if not isinstance(event, DetectorTurnEvent):
             return
@@ -1715,7 +1733,7 @@ class IndependentAsrRuntime:
         if bound is None or not event_is_current():
             return
         if lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE:
-            self._activate_asr_audio_dispatcher(lifecycle, turn_token)
+            await self._activate_asr_audio_dispatcher(lifecycle, turn_token)
             if event.kind == "continuous":
                 await self._prepare_independent_asr_turn(epoch)
             return
@@ -1778,7 +1796,7 @@ class IndependentAsrRuntime:
             return
         self._asr_turn_audio_started_at = time.monotonic()
         self._asr_first_partial_recorded = False
-        self._activate_asr_audio_dispatcher(lifecycle, turn_token)
+        await self._activate_asr_audio_dispatcher(lifecycle, turn_token)
         await self._prepare_independent_asr_turn(epoch)
 
     async def _handle_transport_prewarm_event(
@@ -2054,12 +2072,12 @@ class IndependentAsrRuntime:
         await self._prepare_independent_asr_turn(epoch)
         if not wake_is_current():
             return False
-        return self._activate_asr_audio_dispatcher(
+        return await self._activate_asr_audio_dispatcher(
             lifecycle,
             turn_token,
         )
 
-    def _activate_asr_audio_dispatcher(
+    async def _activate_asr_audio_dispatcher(
         self,
         lifecycle: VoiceInputLifecycleController,
         turn_token: VoiceTurnToken,
@@ -2078,6 +2096,8 @@ class IndependentAsrRuntime:
         if self._asr_audio_dispatcher.active_turn == turn_token:
             return True
         self._asr_audio_sequence = 0
+        buffered_observation = self._asr_buffered_provider_speaker_observation
+        self._asr_buffered_provider_speaker_observation = None
         payload = (
             lifecycle.drain_active_start_audio()
             if buffered_pcm16 is None
@@ -2090,12 +2110,125 @@ class IndependentAsrRuntime:
             sample_rate_hz=16_000,
         )
         if activated:
-            self._observe_provider_speaker_shadow(
+            evidence_complete = bool(
+                buffered_observation is not None
+                and buffered_observation.evidence_complete
+                and buffered_observation.total_bytes == len(payload)
+                and buffered_observation.resume_split_count == 0
+            )
+            observation_identity = (
+                buffered_observation.identity
+                if buffered_observation is not None
+                else None
+            )
+            if not await self._observe_admitted_provider_audio(
+                lifecycle,
                 detector,
                 payload,
                 sample_rate_hz=16_000,
-            )
+                identity=observation_identity,
+                # Aggregation deliberately keeps no PCM boundary. Even one
+                # resume marker may sit after already-buffered predecessor
+                # audio, so it cannot authorize a physical split here.
+                split_before_audio=False,
+                evidence_complete=evidence_complete,
+                turn_token=turn_token,
+            ):
+                return False
         return activated
+
+    def _record_buffered_provider_speaker_observation(
+        self,
+        *,
+        identity: DetectorIngressIdentity | None,
+        byte_count: int,
+        split_before_audio: bool,
+        evidence_complete: bool,
+    ) -> None:
+        if byte_count <= 0:
+            return
+        buffered = self._asr_buffered_provider_speaker_observation
+        if buffered is None:
+            self._asr_buffered_provider_speaker_observation = (
+                _BufferedProviderSpeakerObservation(
+                    identity=identity,
+                    total_bytes=byte_count,
+                    resume_split_count=int(split_before_audio),
+                    evidence_complete=bool(
+                        evidence_complete and identity is not None
+                    ),
+                )
+            )
+            return
+        previous_identity = buffered.identity
+        compatible = bool(
+            previous_identity is not None
+            and identity is not None
+            and previous_identity.ingress_token == identity.ingress_token
+            and previous_identity.detector_epoch == identity.detector_epoch
+            and previous_identity.sequence_no < identity.sequence_no
+        )
+        buffered.total_bytes += byte_count
+        buffered.resume_split_count += int(split_before_audio)
+        buffered.evidence_complete = bool(
+            buffered.evidence_complete and evidence_complete and compatible
+        )
+        if identity is not None:
+            buffered.identity = identity
+
+    async def _observe_admitted_provider_audio(
+        self,
+        lifecycle: VoiceInputLifecycleController,
+        detector: DetectorRuntime,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        identity: DetectorIngressIdentity | None,
+        split_before_audio: bool,
+        evidence_complete: bool,
+        turn_token: VoiceTurnToken,
+    ) -> bool:
+        if not pcm16:
+            return True
+        if _uses_smart_turn_endpointing(lifecycle.provider_policy):
+            self._observe_provider_speaker_shadow(
+                detector,
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+            return True
+        self._asr_provider_speaker_sequence += 1
+        sequence_no = self._asr_provider_speaker_sequence
+        observe_ordered = getattr(
+            detector,
+            "observe_provider_audio_ordered",
+            None,
+        )
+        observation_identity = self._capture_runtime_identity(
+            ingress_token=turn_token.ingress,
+            turn_token=turn_token,
+        )
+        if identity is not None and callable(observe_ordered):
+            try:
+                await observe_ordered(
+                    pcm16,
+                    sample_rate_hz=sample_rate_hz,
+                    identity=identity,
+                    sequence_no=sequence_no,
+                    split_before_audio=split_before_audio,
+                    evidence_complete=evidence_complete,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        else:
+            self._observe_provider_speaker_shadow(
+                detector,
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+        return self._runtime_identity_matches(observation_identity)
 
     @staticmethod
     def _observe_provider_speaker_shadow(
@@ -3372,6 +3505,8 @@ class IndependentAsrRuntime:
         self._asr_provider = None
         if lifecycle is not None:
             lifecycle.stop()
+        self._asr_provider_speaker_sequence = 0
+        self._asr_buffered_provider_speaker_observation = None
         self._reset_asr_turn_state()
         self._asr_session_factory = None
         self._asr_transport_selection = None
@@ -3431,6 +3566,9 @@ class IndependentAsrRuntime:
         speech_probability = frame.speech_probability
         rnnoise_available = frame.rnnoise_available
         rnnoise_evidence = frame.rnnoise_evidence
+        provider_detector_identity: DetectorIngressIdentity | None = None
+        split_before_provider_audio = False
+        uses_smart_turn = False
 
         try:
             lifecycle = identity.lifecycle
@@ -3558,10 +3696,14 @@ class IndependentAsrRuntime:
                     if not detector_result.throttle_available:
                         lifecycle.enable_independent_asr_fail_open()
                     else:
+                        provider_detector_identity = detector_result.identity
                         for event in detector_result.events:
-                            await self._handle_independent_asr_activity(
-                                event,
-                                identity.session_epoch,
+                            split_before_provider_audio = bool(
+                                await self._handle_independent_asr_activity(
+                                    event,
+                                    identity.session_epoch,
+                                )
+                                or split_before_provider_audio
                             )
                             if not ingress_is_current():
                                 return AsrSubmitResult(AsrSubmitStatus.STALE)
@@ -3628,6 +3770,16 @@ class IndependentAsrRuntime:
                 AudioDisposition.SUPPRESS,
             }:
                 if (
+                    decision.disposition is AudioDisposition.BUFFER
+                    and not uses_smart_turn
+                ):
+                    self._record_buffered_provider_speaker_observation(
+                        identity=provider_detector_identity,
+                        byte_count=len(pcm16),
+                        split_before_audio=split_before_provider_audio,
+                        evidence_complete=(provider_detector_identity is not None),
+                    )
+                if (
                     lifecycle is not None
                     and lifecycle.snapshot.state
                     in {
@@ -3676,7 +3828,10 @@ class IndependentAsrRuntime:
             if not ingress_is_current():
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
             if self._asr_audio_dispatcher.active_turn != turn_token:
-                if not self._activate_asr_audio_dispatcher(lifecycle, turn_token):
+                if not await self._activate_asr_audio_dispatcher(
+                    lifecycle,
+                    turn_token,
+                ):
                     await self._handle_independent_asr_error(
                         identity.session_epoch,
                         identity.provider or "unknown",
@@ -3699,11 +3854,24 @@ class IndependentAsrRuntime:
                     expected_identity=identity,
                 )
                 return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
-            self._observe_provider_speaker_shadow(
+            split_payload_is_ambiguous = bool(
+                split_before_provider_audio
+                and decision is not None
+                and decision.disposition is AudioDisposition.FORWARD_WITH_PRE_ROLL
+            )
+            if not await self._observe_admitted_provider_audio(
+                lifecycle,
                 detector,
                 payload,
                 sample_rate_hz=sample_rate_hz,
-            )
+                identity=provider_detector_identity,
+                split_before_audio=bool(
+                    split_before_provider_audio and not split_payload_is_ambiguous
+                ),
+                evidence_complete=not split_payload_is_ambiguous,
+                turn_token=turn_token,
+            ):
+                return AsrSubmitResult(AsrSubmitStatus.STALE)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3861,7 +4029,7 @@ class IndependentAsrRuntime:
                         )
                         if not self._runtime_identity_matches(connected_identity):
                             return
-                        if not self._activate_asr_audio_dispatcher(
+                        if not await self._activate_asr_audio_dispatcher(
                             lifecycle,
                             turn_token,
                             buffered_pcm16=payload,
@@ -3949,6 +4117,8 @@ class IndependentAsrRuntime:
         self._asr_transcript_dispatcher.invalidate_all()
         self._asr_detector_dispatcher.invalidate_all()
         self._asr_audio_dispatcher.abort()
+        self._asr_provider_speaker_sequence = 0
+        self._asr_buffered_provider_speaker_observation = None
         self._reset_asr_turn_state()
         lease, self._asr_smart_turn_lease = self._asr_smart_turn_lease, None
         for task_name in (
@@ -4201,11 +4371,11 @@ class IndependentAsrRuntime:
         self,
         event: SpeechActivityEvent,
         epoch: int,
-    ) -> None:
+    ) -> bool:
         # 同上：onset 是收到这个语音活动事件的时刻。
         detected_at = time.monotonic()
         if epoch != self._asr_session_epoch:
-            return
+            return False
         provider = self._asr_provider or "unknown"
         lifecycle = self._asr_lifecycle
         if (
@@ -4220,7 +4390,7 @@ class IndependentAsrRuntime:
             lifecycle.mark_pending_turn_speech()
             if self._asr_pending_turn_onset_at is None:
                 self._asr_pending_turn_onset_at = detected_at
-            return
+            return False
         if (
             lifecycle is not None
             and lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
@@ -4234,7 +4404,7 @@ class IndependentAsrRuntime:
             # The DRAINING path already confirmed this pending turn. Re-marking
             # it after PROVIDER_FINAL reaches WARM_IDLE violates the lifecycle
             # guard and can fail the replacement turn during activation.
-            return
+            return False
         if lifecycle is not None and event in {
             SpeechActivityEvent.SPEECH_STARTED,
             SpeechActivityEvent.SPEECH_RESUMED,
@@ -4248,7 +4418,7 @@ class IndependentAsrRuntime:
                 # ingress token, so drop the stale event cleanly instead of
                 # raising into the provider adapter. Genuinely new speech
                 # re-arms the current token through submit() first.
-                return
+                return False
             previous_state = lifecycle.snapshot.state
             state = previous_state
             if state in {
@@ -4266,7 +4436,7 @@ class IndependentAsrRuntime:
                 state = lifecycle.snapshot.state
             if state is VoiceLifecycleState.PREWARMING:
                 if not await self._ensure_smart_turn_ready(lifecycle, epoch):
-                    return
+                    return False
                 asr_session = self._asr_session
                 if asr_session is not None and getattr(asr_session, "is_ready", True):
                     lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
@@ -4295,7 +4465,7 @@ class IndependentAsrRuntime:
                     expected_identity=identity,
                 )
                 if not delivered:
-                    return
+                    return False
             if (
                 lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
                 and previous_state is not VoiceLifecycleState.ACTIVE
@@ -4337,7 +4507,7 @@ class IndependentAsrRuntime:
                         self._asr_overlap_completed_onsets.append(last)
                         self._asr_overlap_completed_token = onset_token
                         self._asr_overlap_completed_turns = 1
-            return
+            return False
         if self._asr_turn_prepared:
             if (
                 lifecycle is not None
@@ -4351,14 +4521,16 @@ class IndependentAsrRuntime:
                 # final can replay it instead of dropping the next turn.
                 self._asr_overlap_onset_token = self._asr_current_ingress_token
                 self._asr_overlap_onset_at = detected_at
-            return
+                return event is SpeechActivityEvent.SPEECH_RESUMED
+            return False
         if (
             lifecycle is not None
             and lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE
         ):
-            return
+            return False
 
         await self._prepare_independent_asr_turn(epoch)
+        return False
 
     async def _prepare_independent_asr_turn(self, epoch: int) -> None:
         """Prepare an identified turn without deciding its endpoint."""
@@ -4656,7 +4828,9 @@ class IndependentAsrRuntime:
                     turn_token=turn_token,
                 )
                 try:
-                    provider_fence = await detector.seal_provider_candidate()
+                    provider_fence = await detector.seal_provider_candidate(
+                        turn_token
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -4850,7 +5024,7 @@ class IndependentAsrRuntime:
                 return
         elif not self._runtime_identity_matches(identity):
             return
-        if not self._activate_asr_audio_dispatcher(
+        if not await self._activate_asr_audio_dispatcher(
             lifecycle,
             turn_token,
             buffered_pcm16=payload,
@@ -5209,6 +5383,10 @@ class IndependentAsrRuntime:
                             is ProviderMicroEventDecision
                         ):
                             micro_event_decision = queried_micro_event_decision
+                        completion_identity = self._capture_runtime_identity(
+                            ingress_token=sealed_token.turn.ingress,
+                            turn_token=sealed_token.turn,
+                        )
                         try:
                             completion = await detector_ref.complete_provider_candidate(
                                 provider_fence
@@ -5221,10 +5399,6 @@ class IndependentAsrRuntime:
                                 "[%s] provider candidate completion failed",
                                 self.display_name,
                             )
-                        completion_identity = self._capture_runtime_identity(
-                            ingress_token=sealed_token.turn.ingress,
-                            turn_token=sealed_token.turn,
-                        )
                         if (
                             self._asr_lifecycle is not lifecycle_ref
                             or self._asr_detector is not detector_ref
@@ -5598,6 +5772,8 @@ class IndependentAsrRuntime:
         self._asr_provider = None
         self._asr_session_factory = None
         self._asr_transport_selection = None
+        self._asr_provider_speaker_sequence = 0
+        self._asr_buffered_provider_speaker_observation = None
         self._reset_asr_turn_state()
         for task_name in (
             "_asr_transport_task",

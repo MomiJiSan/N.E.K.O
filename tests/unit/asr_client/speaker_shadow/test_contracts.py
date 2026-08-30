@@ -15,6 +15,8 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
     SpeakerShadowConfig,
     SpeakerShadowDecisionStatus,
+    SpeakerShadowDeferredCandidateControl,
+    SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowObservation,
 )
 
@@ -304,6 +306,41 @@ def test_decision_status_is_an_optional_structural_read_only_protocol() -> None:
     assert isinstance(status, SpeakerShadowDecisionStatus)
     assert status.requires_provisional_decision(candidate) is True
     assert not isinstance(object(), SpeakerShadowDecisionStatus)
+
+
+def test_deferred_candidate_control_is_an_optional_structural_protocol() -> None:
+    candidate = SpeakerShadowCandidateKey(6, 7, "provider_candidate")
+
+    class DeferredControlOnly:
+        def defer_candidate(self, requested: SpeakerShadowCandidateKey) -> bool:
+            return requested == candidate
+
+        def activate_candidate(self, requested: SpeakerShadowCandidateKey) -> bool:
+            return requested == candidate
+
+    control = DeferredControlOnly()
+
+    assert isinstance(control, SpeakerShadowDeferredCandidateControl)
+    assert control.defer_candidate(candidate) is True
+    assert control.activate_candidate(candidate) is True
+    assert not isinstance(object(), SpeakerShadowDeferredCandidateControl)
+
+
+def test_deferred_candidate_status_is_an_optional_read_only_protocol() -> None:
+    candidate = SpeakerShadowCandidateKey(8, 9, "provider_candidate")
+
+    class DeferredStatusOnly:
+        def supports_deferred_candidate(
+            self,
+            requested: SpeakerShadowCandidateKey,
+        ) -> bool:
+            return requested == candidate
+
+    status = DeferredStatusOnly()
+
+    assert isinstance(status, SpeakerShadowDeferredCandidateStatus)
+    assert status.supports_deferred_candidate(candidate) is True
+    assert not isinstance(object(), SpeakerShadowDeferredCandidateStatus)
 
 
 @pytest.mark.parametrize(

@@ -10,12 +10,18 @@ import main_logic.asr_client.runtime as runtime_module
 from main_logic.asr_client.candidate_control import CandidateRejectionOutcome
 from main_logic.asr_client.endpointing.detector import (
     DetectorCandidateKey,
+    DetectorIngressIdentity,
     ProviderCandidateFence,
+)
+from main_logic.asr_client.endpointing.detector_runtime import (
+    DetectorFeedResult,
+    DetectorRuntime,
 )
 from main_logic.asr_client.endpointing.micro_event_policy import (
     ProviderMicroEventDecision,
 )
 from main_logic.asr_client.lifecycle import (
+    AudioDisposition,
     FinalKey,
     VoiceInputLifecycleController,
     VoiceLifecycleEvent,
@@ -28,7 +34,12 @@ from main_logic.asr_client.runtime import AsrRuntimeCallbacks, IndependentAsrRun
 from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
 )
-from main_logic.voice_turn.contracts import VoiceTurnToken
+from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
+from main_logic.voice_turn.contracts import (
+    AsrSubmitStatus,
+    SpeechActivityEvent,
+    VoiceTurnToken,
+)
 
 
 class _RejectionLease:
@@ -67,7 +78,10 @@ class _RejectionDetector:
         self.complete_provider_candidate = AsyncMock(return_value=False)
         self.sealed_provider_micro_event_decision = MagicMock(return_value=None)
         self.release_deferred_turn = AsyncMock()
+        self.observe_provider_audio_ordered = AsyncMock()
+        self.observe_provider_audio = MagicMock()
         self.provisional_pending = False
+        self.seal_turn_tokens: list[VoiceTurnToken | None] = []
 
     async def prepare_candidate_rejection(self, _candidate):
         self.prepare_entered.set()
@@ -75,9 +89,15 @@ class _RejectionDetector:
             await self.prepare_release.wait()
         return self.lease
 
-    async def seal_provider_candidate(self):
+    async def seal_provider_candidate(
+        self,
+        turn_token: VoiceTurnToken | None = None,
+    ):
+        self.seal_turn_tokens.append(turn_token)
         lease = self.lease
         if lease is None:
+            return None
+        if turn_token is not None and turn_token != lease.turn_token:
             return None
         fence = ProviderCandidateFence(7, 11, 23)
         lease.provider_fence = fence
@@ -229,6 +249,310 @@ def test_rejection_request_outside_event_loop_fails_open() -> None:
         activation_generation="profile-generation",
     )
     assert runtime._speaker_verifier_diagnostics()["rejection_request_failed_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_split", "expected_evidence_complete"),
+    [
+        (SpeechActivityEvent.SPEECH_STARTED, False, True),
+        (SpeechActivityEvent.SPEECH_RESUMED, False, False),
+    ],
+)
+async def test_provider_submit_observes_admitted_audio_in_dispatch_order(
+    event: SpeechActivityEvent,
+    expected_split: bool,
+    expected_evidence_complete: bool,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._voice_input_resource_optimization_enabled = True
+    detector_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=41,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(event,),
+            throttle_available=True,
+            identity=detector_identity,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+    pcm16 = b"\x09\x00" * 160
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
+        ingress_token=turn_token.ingress,
+    )
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    detector.observe_provider_audio_ordered.assert_awaited_once_with(
+        pcm16,
+        sample_rate_hz=16_000,
+        identity=detector_identity,
+        sequence_no=1,
+        split_before_audio=expected_split,
+        evidence_complete=expected_evidence_complete,
+    )
+    detector.observe_provider_audio.assert_not_called()
+    session.stream_audio.assert_awaited_once_with(pcm16, sample_rate_hz=16_000)
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_resumed_audio_splits_after_initial_pre_roll() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._voice_input_resource_optimization_enabled = True
+    detector_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=41,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.SPEECH_STARTED,),
+            throttle_available=True,
+            identity=detector_identity,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+    ingress = turn_token.ingress
+
+    first = await runtime.submit(
+        ProcessedVoiceFrame(b"\x09\x00" * 160, 16_000, 0.9, True),
+        ingress_token=ingress,
+    )
+    detector.observe_provider_audio_ordered.reset_mock()
+    resumed_identity = DetectorIngressIdentity(
+        ingress_token=ingress,
+        detector_epoch=7,
+        sequence_no=42,
+    )
+    detector.feed.return_value = DetectorFeedResult(
+        events=(SpeechActivityEvent.SPEECH_RESUMED,),
+        throttle_available=True,
+        identity=resumed_identity,
+        candidate=DetectorCandidateKey(7, 11),
+    )
+    resumed_pcm = b"\x0a\x00" * 160
+
+    second = await runtime.submit(
+        ProcessedVoiceFrame(resumed_pcm, 16_000, 0.9, True),
+        ingress_token=ingress,
+    )
+
+    assert first.status is AsrSubmitStatus.ACCEPTED
+    assert second.status is AsrSubmitStatus.ACCEPTED
+    detector.observe_provider_audio_ordered.assert_awaited_once_with(
+        resumed_pcm,
+        sample_rate_hz=16_000,
+        identity=resumed_identity,
+        sequence_no=2,
+        split_before_audio=True,
+        evidence_complete=True,
+    )
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_split_with_pre_roll_marks_ordered_evidence_incomplete() -> (
+    None
+):
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._voice_input_resource_optimization_enabled = True
+    detector_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=42,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.SPEECH_RESUMED,),
+            throttle_available=True,
+            identity=detector_identity,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+    pre_roll = b"\x0c\x00" * 320
+    lifecycle.accept_audio = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            disposition=AudioDisposition.FORWARD_WITH_PRE_ROLL,
+            pre_roll=pre_roll,
+        )
+    )
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(b"\x0d\x00" * 160, 16_000, 0.9, True),
+        ingress_token=turn_token.ingress,
+    )
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    detector.observe_provider_audio_ordered.assert_awaited_once_with(
+        pre_roll,
+        sample_rate_hz=16_000,
+        identity=detector_identity,
+        sequence_no=1,
+        split_before_audio=False,
+        evidence_complete=False,
+    )
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_ordered_observation_drift_is_stale_after_audio_admission() -> (
+    None
+):
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._voice_input_resource_optimization_enabled = True
+    detector_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=51,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.SPEECH_STARTED,),
+            throttle_available=True,
+            identity=detector_identity,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+
+    async def drift_after_observation(*_args, **_kwargs) -> None:
+        runtime._asr_audio_generation += 1
+
+    detector.observe_provider_audio_ordered.side_effect = drift_after_observation
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(b"\x0a\x00" * 160, 16_000, 0.9, True),
+        ingress_token=turn_token.ingress,
+    )
+
+    assert result.status is AsrSubmitStatus.STALE
+    detector.observe_provider_audio_ordered.assert_awaited_once()
+    detector.observe_provider_audio.assert_not_called()
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_ordered_observation_missing_identity_uses_legacy_fallback() -> (
+    None
+):
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._voice_input_resource_optimization_enabled = True
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(),
+            throttle_available=True,
+            identity=None,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+    pcm16 = b"\x0b\x00" * 160
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
+        ingress_token=turn_token.ingress,
+    )
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    detector.observe_provider_audio_ordered.assert_not_awaited()
+    detector.observe_provider_audio.assert_called_once_with(
+        pcm16,
+        sample_rate_hz=16_000,
+    )
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_ordered_observation_failure_keeps_admitted_audio() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._voice_input_resource_optimization_enabled = True
+    detector_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=61,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.SPEECH_STARTED,),
+            throttle_available=True,
+            identity=detector_identity,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+    detector.observe_provider_audio_ordered.side_effect = RuntimeError(
+        "private observer failure"
+    )
+    pcm16 = b"\x0e\x00" * 160
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
+        ingress_token=turn_token.ingress,
+    )
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    detector.observe_provider_audio_ordered.assert_awaited_once()
+    detector.observe_provider_audio.assert_not_called()
+    session.stream_audio.assert_awaited_once_with(pcm16, sample_rate_hz=16_000)
+    await _close_dispatchers(runtime)
 
 
 @pytest.mark.parametrize(
@@ -572,6 +896,37 @@ async def test_provider_micro_event_decision_is_stale_after_completion_drift() -
     await _close_dispatchers(runtime)
 
 
+async def test_provider_completion_rejects_session_replacement_during_await() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, _provider_fence = _seal_provider_candidate(
+        runtime,
+        detector,
+    )
+
+    async def replace_session_during_completion(_provider_fence) -> bool:
+        runtime._asr_session = SimpleNamespace(
+            is_ready=True,
+            close=AsyncMock(),
+            signal_user_activity_end=AsyncMock(),
+            stream_audio=AsyncMock(),
+        )
+        return False
+
+    detector.complete_provider_candidate.side_effect = (
+        replace_session_during_completion
+    )
+
+    await runtime._handle_independent_asr_final("stale-final", 0, "qwen")
+
+    callbacks.on_final.assert_not_awaited()
+    final_key = FinalKey.from_turn(turn_token)
+    assert runtime._asr_transcript_dispatcher.try_reserve(final_key)
+    runtime._asr_transcript_dispatcher.release(final_key)
+    await _close_dispatchers(runtime)
+
+
 async def test_provider_micro_event_waits_for_existing_speaker_gate() -> None:
     abandoned = AsyncMock()
     callbacks = _callbacks(abandoned=abandoned)
@@ -903,6 +1258,7 @@ async def test_provider_endpoint_installs_provisional_gate_before_returning() ->
 
     await runtime._handle_independent_asr_endpoint(runtime._asr_session_epoch)
 
+    assert detector.seal_turn_tokens == [turn_token]
     gate = runtime._asr_speaker_candidate_decision_gate
     assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
     assert gate is not None
@@ -918,6 +1274,42 @@ async def test_provider_endpoint_installs_provisional_gate_before_returning() ->
         activation_generation="profile-generation",
         rejected=False,
     )
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_endpoint_seal_identity_drift_does_not_publish_fence() -> (
+    None
+):
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    final_key = FinalKey.from_turn(turn_token)
+    runtime._asr_transcript_dispatcher.release(final_key)
+    runtime._asr_reserved_final_key = None
+
+    async def drift_while_sealing(
+        observed_turn: VoiceTurnToken | None = None,
+    ) -> ProviderCandidateFence:
+        detector.seal_turn_tokens.append(observed_turn)
+        runtime._asr_audio_generation += 1
+        return ProviderCandidateFence(7, 11, 23)
+
+    detector.seal_provider_candidate = drift_while_sealing  # type: ignore[method-assign]
+
+    await runtime._handle_independent_asr_endpoint(runtime._asr_session_epoch)
+
+    assert detector.seal_turn_tokens == [turn_token]
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    assert runtime._asr_provider_candidate_fence is None
+    assert runtime._asr_sealed_turn_token is None
+    assert runtime._asr_reserved_final_key is None
+    assert runtime._asr_transcript_dispatcher.try_reserve(final_key)
+    runtime._asr_transcript_dispatcher.release(final_key)
     await _close_dispatchers(runtime)
 
 
@@ -1692,6 +2084,197 @@ async def test_real_speaker_shadow_2999ms_completion_confirms_waiting_final(
     assert shadow_metrics["completion_after_first_checkpoint_count"] == 1
 
     await shadow.close()
+    composition.close()
+    profile.close()
+    await _close_dispatchers(runtime)
+
+
+async def test_real_detector_fifo_2999ms_tail_rejects_only_second_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from main_logic.asr_client.speaker_shadow.asset_manifest import (
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+    )
+    from main_logic.asr_client.speaker_shadow.campplus import (
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    from main_logic.voice_identity.contracts import SpeakerModelIdentity
+    from main_logic.voice_identity.profile import SpeakerProfile
+    from main_logic.voice_identity.reference import SpeakerReference
+    from main_logic.voice_identity_service.asr_composition import (
+        OwnerVoiceAsrCompositionFactory,
+    )
+
+    class _Vad:
+        def load(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    class _Gate:
+        def feed(self, _pcm16: bytes) -> tuple[()]:
+            return ()
+
+        def reset(self) -> None:
+            return None
+
+    class _BlockingSecondScoreHost:
+        alive = True
+
+        def __init__(self) -> None:
+            self.score_count = 0
+            self.second_score_started = asyncio.Event()
+            self.second_score_release = asyncio.Event()
+
+        async def score(
+            self,
+            _pcm16: bytes,
+            *,
+            timeout_seconds: float,
+        ) -> float:
+            assert timeout_seconds > 0
+            self.score_count += 1
+            if self.score_count == 2:
+                self.second_score_started.set()
+                await self.second_score_release.wait()
+            return 0.20
+
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    placeholder = _RejectionDetector()
+    session, lifecycle, turn_1 = _install_active_candidate(
+        runtime,
+        placeholder,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    model_identity = SpeakerModelIdentity(
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    embedding = np.arange(1, CAMPPLUS_EMBEDDING_DIM + 1, dtype=np.float32)
+    reference = SpeakerReference(model_identity, embedding)
+    embedding.fill(0.0)
+    try:
+        profile = SpeakerProfile("profile-generation", reference)
+    finally:
+        reference.close()
+    composition = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    shadow = composition()
+    scoring_host = _BlockingSecondScoreHost()
+    monkeypatch.setattr(
+        shadow,
+        "_ensure_backend",
+        AsyncMock(return_value=scoring_host),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        speaker_shadow=shadow,
+    )
+    runtime._asr_detector = detector
+
+    result_a = await detector.feed(
+        b"\x11\x00" * 160,
+        ingress_token=turn_1.ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result_a.candidate is not None
+    assert result_a.identity is not None
+    assert await detector.bind_candidate(result_a.candidate, turn_1) is not None
+    await detector.observe_provider_audio_ordered(
+        b"\x11\x00" * 1_600,
+        sample_rate_hz=16_000,
+        identity=result_a.identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    pcm_2999ms = b"\x22\x00" * (16_000 * 2_999 // 1_000)
+    await detector.observe_provider_audio_ordered(
+        pcm_2999ms,
+        sample_rate_hz=16_000,
+        identity=result_a.identity,
+        sequence_no=2,
+        split_before_audio=True,
+    )
+    shadow_a = detector._provider_speaker_segments[0].candidate
+    shadow_b = detector._provider_speaker_segments[1].candidate
+    assert shadow_a is not None and shadow_b is not None
+
+    await runtime._handle_independent_asr_endpoint(runtime._asr_session_epoch)
+    await runtime._asr_audio_dispatcher.wait_idle()
+    await shadow.wait_idle()
+    fence_1 = runtime._asr_provider_candidate_fence
+    assert fence_1 is not None
+    assert detector._sealed_provider_candidate_rejection is None
+    await runtime._handle_independent_asr_final("turn-1-final", 0, "qwen")
+    await runtime.wait_transcript_idle()
+    callbacks.on_final.assert_awaited_once()
+    assert callbacks.on_final.await_args.args[0].text == "turn-1-final"
+
+    await runtime._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        runtime._asr_session_epoch,
+    )
+    turn_2 = runtime._asr_partial_turn_token
+    assert turn_2 is not None and turn_2 != turn_1
+    result_b = await detector.feed(
+        b"\x23\x00" * 160,
+        ingress_token=turn_2.ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result_b.candidate == DetectorCandidateKey(0, 1)
+    assert await detector.bind_candidate(result_b.candidate, turn_2) is not None
+
+    await runtime._handle_independent_asr_endpoint(runtime._asr_session_epoch)
+    fence_2 = runtime._asr_provider_candidate_fence
+    assert fence_2 is not None and fence_2 != fence_1
+    sealed_b = detector._sealed_provider_candidate_rejection
+    assert sealed_b is not None
+    assert sealed_b.shadow_candidate == shadow_b
+    assert sealed_b.turn_token == turn_2
+    await asyncio.wait_for(scoring_host.second_score_started.wait(), 1)
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None
+    assert gate.candidate == shadow_b
+    assert gate.turn_token == turn_2
+    assert gate.lease.provider_fence == fence_2
+    final_2 = asyncio.create_task(
+        runtime._handle_independent_asr_final("turn-2-final", 0, "qwen")
+    )
+    while not gate.wait_started:
+        await asyncio.sleep(0)
+    scoring_host.second_score_release.set()
+    await shadow.wait_idle()
+    await asyncio.wait_for(final_2, 1)
+    await runtime.wait_transcript_idle()
+
+    assert scoring_host.score_count == 2
+    assert callbacks.on_final.await_count == 1
+    abandoned.assert_awaited_once_with(turn_2)
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_waited_count"] == 1
+    assert diagnostics["speaker_gate_resolved_reject_count"] == 1
+    assert diagnostics["speaker_gate_timeout_count"] == 0
+    assert diagnostics["rejection_task_applied_count"] == 1
+    detector_diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert detector_diagnostics["provider_speaker_segment_exact_snapshot_count"] == 1
+
+    await detector.close()
     composition.close()
     profile.close()
     await _close_dispatchers(runtime)
