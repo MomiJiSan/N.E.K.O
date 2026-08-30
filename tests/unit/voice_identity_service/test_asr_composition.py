@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from unittest.mock import AsyncMock
 
@@ -123,6 +124,16 @@ def _install_gate_spies(
         resolved.append((candidate, activation_generation, rejected))
         return True
 
+    def is_armed(
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+    ) -> bool:
+        return bool(
+            arm_result
+            and (candidate, activation_generation) in armed
+        )
+
     monkeypatch.setattr(
         runtime,
         "_arm_speaker_candidate_decision",
@@ -133,6 +144,12 @@ def _install_gate_spies(
         runtime,
         "_resolve_speaker_candidate_decision",
         resolve,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_speaker_candidate_decision_is_armed",
+        is_armed,
         raising=False,
     )
     return armed, resolved
@@ -514,7 +531,6 @@ async def test_completion_after_first_checkpoint_forgets_policy_and_resolves_gat
     assert armed == [(candidate, "activation-completion")]
     assert resolved == [
         (candidate, "activation-completion", False),
-        (candidate, "activation-completion", False),
     ]
     assert requests == []
     assert candidate not in factory._armed_candidates
@@ -529,6 +545,197 @@ async def test_completion_after_first_checkpoint_forgets_policy_and_resolves_gat
         "speaker_completion_after_first_checkpoint_count": 1,
         "speaker_completion_stale_count": 0,
     }
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_completion_fences_observation_returning_from_late_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-late-arm"
+    profile = _profile()
+    arm_entered = asyncio.Event()
+    arm_release = asyncio.Event()
+    resolved: list[SpeakerShadowCandidateKey] = []
+
+    async def arm(candidate, *, activation_generation):
+        assert activation_generation == "activation-late-arm"
+        arm_entered.set()
+        await arm_release.wait()
+        return True
+
+    monkeypatch.setattr(runtime, "_arm_speaker_candidate_decision", arm)
+    monkeypatch.setattr(
+        runtime,
+        "_speaker_candidate_decision_is_armed",
+        lambda candidate, **_kwargs: candidate == late_candidate,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda candidate, **_kwargs: resolved.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-late-arm",
+        enforce=True,
+    )
+    shadow = factory()
+    late_candidate = SpeakerShadowCandidateKey(10, 101, "provider_candidate")
+
+    observation_task = asyncio.create_task(
+        shadow._on_observation(
+            _observation(late_candidate, checkpoint_ms=1_500, similarity=0.20)
+        )
+    )
+    await asyncio.wait_for(arm_entered.wait(), 1)
+    await shadow._on_completion(
+        _completion(late_candidate, last_checkpoint_ms=1_500)
+    )
+    arm_release.set()
+    await asyncio.wait_for(observation_task, 1)
+
+    assert late_candidate not in factory._armed_candidates
+    assert late_candidate in factory._terminal_candidates
+    assert resolved == [late_candidate, late_candidate]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+@pytest.mark.parametrize("boundary", ["activation", "degraded", "close"])
+async def test_arm_post_await_revalidates_factory_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-await-fence"
+    profile = _profile()
+    arm_entered = asyncio.Event()
+    arm_release = asyncio.Event()
+    resolved: list[SpeakerShadowCandidateKey] = []
+
+    async def arm(_candidate, *, activation_generation):
+        assert activation_generation == "activation-await-fence"
+        arm_entered.set()
+        await arm_release.wait()
+        return True
+
+    monkeypatch.setattr(runtime, "_arm_speaker_candidate_decision", arm)
+    monkeypatch.setattr(
+        runtime,
+        "_speaker_candidate_decision_is_armed",
+        lambda _candidate, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda candidate, **_kwargs: resolved.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-await-fence",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(10, 103, "provider_candidate")
+    observation_task = asyncio.create_task(
+        shadow._on_observation(
+            _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+        )
+    )
+    await asyncio.wait_for(arm_entered.wait(), 1)
+
+    if boundary == "activation":
+        runtime._speaker_verifier_activation_generation = "activation-replacement"
+    elif boundary == "degraded":
+        shadow._mark_backend_degraded()
+    else:
+        factory.close()
+    arm_release.set()
+    await asyncio.wait_for(observation_task, 1)
+
+    assert candidate not in factory._armed_candidates
+    assert resolved == [candidate]
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_backend_degraded_resets_policy_and_releases_local_armed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-policy-reset"
+    profile = _profile()
+    armed, resolved = _install_gate_spies(monkeypatch, runtime)
+    requests: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda candidate, **_kwargs: requests.append(candidate) or True,
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-policy-reset",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(10, 102, "provider_candidate")
+
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=1_500, similarity=0.20)
+    )
+    shadow._mark_backend_degraded()
+    shadow._mark_backend_recovered()
+    await shadow._on_observation(
+        _observation(candidate, checkpoint_ms=3_000, similarity=0.20)
+    )
+
+    assert armed == [(candidate, "activation-policy-reset")]
+    assert resolved == [
+        (candidate, "activation-policy-reset", False),
+        (candidate, "activation-policy-reset", False),
+    ]
+    assert requests == []
+    assert candidate not in factory._armed_candidates
+    await shadow.close()
+    factory.close()
+    profile.close()
+
+
+async def test_terminal_candidate_tombstones_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._speaker_verifier_activation_generation = "activation-tombstone"
+    profile = _profile()
+    _install_gate_spies(monkeypatch, runtime)
+    factory = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="activation-tombstone",
+        enforce=True,
+    )
+    shadow = factory()
+    candidates = [
+        SpeakerShadowCandidateKey(10, index, "provider_candidate")
+        for index in range(factory._TERMINAL_CANDIDATE_CAPACITY + 1)
+    ]
+
+    for candidate in candidates:
+        await shadow._on_completion(
+            _completion(candidate, last_checkpoint_ms=None)
+        )
+
+    assert len(factory._terminal_candidates) == factory._TERMINAL_CANDIDATE_CAPACITY
+    assert candidates[0] not in factory._terminal_candidates
+    assert candidates[-1] in factory._terminal_candidates
     await shadow.close()
     factory.close()
     profile.close()

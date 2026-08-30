@@ -10,6 +10,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import Any, Literal
@@ -34,7 +35,29 @@ from .contracts import (
 
 _HOST_POLL_INTERVAL_SECONDS = 0.005
 _HostOperation = Literal["load", "score", "close"]
-_CallbackKind = Literal["observation", "completion"]
+_DegradedCause = Literal[
+    "backend_unavailable",
+    "terminal_overflow",
+    "completion_overflow",
+    "completion_stalled",
+    "worker_start_failure",
+    "dispatcher_start_failure",
+]
+
+
+class _FinishState(StrEnum):
+    OPEN = "open"
+    QUEUED = "queued"
+    PROCESSED = "processed"
+    ABANDONED = "abandoned"
+
+
+class _CompletionState(StrEnum):
+    NONE = "none"
+    QUEUED = "queued"
+    DISPATCHED = "dispatched"
+    ATTEMPTED = "attempted"
+    ABANDONED = "abandoned"
 
 
 class _BackendHostError(RuntimeError):
@@ -396,11 +419,10 @@ class _CandidateToken:
     sample_rate_hz: int
     accepted_sample_count: int = 0
     terminal_reason: SpeakerShadowTerminalReason | None = None
-    finish_seen: bool = False
-    finish_queued: bool = False
+    finish_state: _FinishState = _FinishState.OPEN
     last_checkpoint_ms: int | None = None
     last_delivered_checkpoint_ms: int | None = None
-    completion_sent: bool = False
+    completion_state: _CompletionState = _CompletionState.NONE
     deferred_requested: bool = False
     defer_processed: bool = False
     scoring_deferred: bool = False
@@ -424,12 +446,25 @@ class _CandidateBuffer:
 
 @dataclass(frozen=True, slots=True)
 class _FinalizedCandidate:
-    finish_seen: bool
+    finish_state: _FinishState
     terminal_reason: SpeakerShadowTerminalReason
     token: _CandidateToken | None = None
 
+    @property
+    def finish_seen(self) -> bool:
+        return self.finish_state is _FinishState.PROCESSED
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletionEnvelope:
+    generation: int
+    candidate: SpeakerShadowCandidateKey
+    token: _CandidateToken
+    completion: SpeakerShadowCompletion
+
 
 _STOP = object()
+_COMPLETION_STOP = object()
 _QueueItem = (
     _AudioFrame
     | _CandidateDeferred
@@ -480,7 +515,16 @@ class SpeakerShadowRuntime:
             threshold: 0 for threshold in self._config.similarity_thresholds
         }
         self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue(
-            maxsize=self._config.queue_capacity
+            maxsize=(
+                self._config.queue_capacity
+                + self._config.terminal_queue_capacity
+                + 1
+            )
+        )
+        self._queued_data_item_count = 0
+        self._queued_terminal_count = 0
+        self._completion_queue: asyncio.Queue[_CompletionEnvelope | object] = (
+            asyncio.Queue(maxsize=self._config.completion_queue_capacity + 1)
         )
         self._queued_pcm_bytes = 0
         self._active_pcm_bytes = 0
@@ -495,9 +539,15 @@ class SpeakerShadowRuntime:
             SpeakerShadowCandidateKey, _CandidateToken
         ] = OrderedDict()
         self._worker_task: asyncio.Task[None] | None = None
-        self._callback_task: asyncio.Task[None] | None = None
-        self._callback_task_kind: _CallbackKind | None = None
+        self._completion_dispatcher_task: asyncio.Task[None] | None = None
+        self._completion_dispatch_in_progress = False
+        self._observation_task: asyncio.Task[None] | None = None
+        self._completion_callback_task: asyncio.Task[None] | None = None
+        self._completion_callback_token: _CandidateToken | None = None
         self._detached_callback_tasks: set[asyncio.Task[None]] = set()
+        self._detached_completion_tokens: dict[
+            asyncio.Task[None], _CandidateToken
+        ] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._host_start_task: asyncio.Task[_BackendProcessHost] | None = None
         self._active_evaluation: tuple[int, SpeakerShadowCandidateKey] | None = None
@@ -506,6 +556,8 @@ class SpeakerShadowRuntime:
         self._load_failure_streak = 0
         self._next_load_attempt_at = 0.0
         self._generation = 0
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
+        self._degraded_causes: set[_DegradedCause] = set()
         self._closed = False
         self._factory_closed = False
 
@@ -553,7 +605,7 @@ class SpeakerShadowRuntime:
             return bool(
                 token.deferred_requested
                 and token.terminal_reason is None
-                and not token.finish_queued
+                and token.finish_state is _FinishState.OPEN
             )
         if len(self._candidate_tokens) >= self._config.buffered_candidate_capacity:
             return False
@@ -564,13 +616,7 @@ class SpeakerShadowRuntime:
             scoring_deferred=True,
         )
         marker = _CandidateDeferred(self._generation, candidate, token)
-        try:
-            self._queue.put_nowait(marker)
-        except asyncio.QueueFull:
-            return False
-        if not self._ensure_worker():
-            self._drain_queue()
-            self._metrics.worker_start_failure_count += 1
+        if not self._admit_data_item(marker):
             return False
         self._candidate_tokens[candidate] = token
         self._candidate_tokens.move_to_end(candidate)
@@ -586,7 +632,7 @@ class SpeakerShadowRuntime:
             token is None
             or not token.deferred_requested
             or token.terminal_reason is not None
-            or token.finish_queued
+            or token.finish_state is not _FinishState.OPEN
             or candidate in self._finalized
             or self._candidate_was_evicted(candidate, token=token)
         ):
@@ -594,13 +640,7 @@ class SpeakerShadowRuntime:
         if not token.scoring_deferred or token.activation_queued:
             return True
         marker = _CandidateActivated(self._generation, candidate, token)
-        try:
-            self._queue.put_nowait(marker)
-        except asyncio.QueueFull:
-            return False
-        if not self._ensure_worker():
-            self._drain_queue()
-            self._metrics.worker_start_failure_count += 1
+        if not self._admit_data_item(marker):
             self._drop_candidate(candidate, token=token)
             return False
         token.activation_queued = True
@@ -671,14 +711,29 @@ class SpeakerShadowRuntime:
             ),
             finalized_tombstone_count=len(self._finalized),
             queued_item_count=self._queue.qsize(),
+            pending_terminal_count=self._queued_terminal_count,
+            pending_completion_count=self._completion_queue.qsize(),
+            detached_callback_task_count=sum(
+                not task.done() for task in self._detached_callback_tasks
+            ),
+            delivery_degraded_cause_count=len(self._degraded_causes),
             in_flight_candidate_count=int(self._active_evaluation is not None),
             worker_task_count=int(
                 self._worker_task is not None and not self._worker_task.done()
             ),
             callback_task_count=int(
-                self._callback_task is not None and not self._callback_task.done()
+                self._observation_task is not None
+                and not self._observation_task.done()
+            )
+            + int(
+                self._completion_callback_task is not None
+                and not self._completion_callback_task.done()
             )
             + sum(not task.done() for task in self._detached_callback_tasks),
+            completion_dispatcher_task_count=int(
+                self._completion_dispatcher_task is not None
+                and not self._completion_dispatcher_task.done()
+            ),
             cleanup_task_count=int(
                 self._cleanup_task is not None and not self._cleanup_task.done()
             ),
@@ -801,9 +856,7 @@ class SpeakerShadowRuntime:
             self._wipe_bytearray(bounded_pcm16)
             self._drop_candidate(candidate, token=token)
             return False
-        try:
-            self._queue.put_nowait(frame)
-        except asyncio.QueueFull:
+        if not self._admit_data_item(frame):
             self._metrics.dropped_frame_count += 1
             self._metrics.dropped_audio_ms += self._audio_ms(
                 sample_count, sample_rate_hz
@@ -812,12 +865,6 @@ class SpeakerShadowRuntime:
             self._drop_candidate(candidate, token=token)
             return False
         self._queued_pcm_bytes += len(bounded_pcm16)
-        if not self._ensure_worker():
-            self._drain_queue()
-            self._metrics.worker_start_failure_count += 1
-            self._metrics.dropped_frame_count += 1
-            self._drop_candidate(candidate, token=token)
-            return False
         token.accepted_sample_count = accepted_sample_count + sample_count
         self._candidate_tokens[candidate] = token
         self._candidate_tokens.move_to_end(candidate)
@@ -846,55 +893,100 @@ class SpeakerShadowRuntime:
             token = _CandidateToken(candidate, 0)
             if finalized is not None:
                 token.terminal_reason = finalized.terminal_reason
-        if token.finish_queued:
+        if token.finish_state in {
+            _FinishState.QUEUED,
+            _FinishState.PROCESSED,
+        }:
             return True
+        if token.finish_state is _FinishState.ABANDONED:
+            return False
         marker = _CandidateFinished(self._generation, candidate, token)
-        try:
-            self._queue.put_nowait(marker)
-        except asyncio.QueueFull:
-            admitted_after_discard = False
-            if finalized is not None:
-                reserved_marker_slot = self._discard_queued_frames_for_token(
-                    token
-                ) or self._discard_newest_queued_audio_frame()
-                if reserved_marker_slot:
-                    try:
-                        self._queue.put_nowait(marker)
-                    except asyncio.QueueFull:
-                        pass
-                    else:
-                        admitted_after_discard = True
-            if not admitted_after_discard and finalized is not None:
-                # Preserve the existing non-blocking contract if saturation is
-                # caused entirely by other candidates. Without queue order, a
-                # completion callback would not be authoritative.
-                self._record_finish(candidate, finalized)
-                return True
-            if not admitted_after_discard:
-                self._drop_candidate(
-                    candidate,
-                    finish_seen=True,
-                    token=token,
-                )
-                return False
-        if not self._ensure_worker():
-            self._drain_queue()
-            self._metrics.worker_start_failure_count += 1
-            self._drop_candidate(
-                candidate,
-                finish_seen=True,
-                token=token,
-            )
+        if not self._admit_terminal_item(marker):
+            self._abandon_terminal(candidate, token=token)
             return False
         self._candidate_tokens[candidate] = token
         self._candidate_tokens.move_to_end(candidate)
-        token.finish_queued = True
+        token.finish_state = _FinishState.QUEUED
+        self._metrics.terminal_queued_count += 1
         return True
+
+    def _admit_data_item(self, item: _QueueItem) -> bool:
+        if self._queued_data_item_count >= self._config.queue_capacity:
+            return False
+        if not self._ensure_worker():
+            self._metrics.worker_start_failure_count += 1
+            self._set_degraded_cause("worker_start_failure")
+            return False
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            return False
+        self._queued_data_item_count += 1
+        return True
+
+    def _admit_terminal_item(self, marker: _CandidateFinished) -> bool:
+        if self._queued_terminal_count >= self._config.terminal_queue_capacity:
+            self._metrics.terminal_overflow_count += 1
+            self._set_degraded_cause("terminal_overflow")
+            return False
+        if not self._ensure_worker():
+            self._metrics.worker_start_failure_count += 1
+            self._set_degraded_cause("worker_start_failure")
+            return False
+        try:
+            self._queue.put_nowait(marker)
+        except asyncio.QueueFull:
+            self._metrics.terminal_overflow_count += 1
+            self._set_degraded_cause("terminal_overflow")
+            return False
+        self._queued_terminal_count += 1
+        return True
+
+    def _abandon_terminal(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        token: _CandidateToken,
+    ) -> None:
+        if token.finish_state is _FinishState.ABANDONED:
+            return
+        token.finish_state = _FinishState.ABANDONED
+        self._metrics.terminal_abandoned_count += 1
+        self._drop_candidate(candidate, token=token)
 
     async def wait_idle(self) -> None:
         """Wait for accepted work, excluding the warm-backend idle timer."""
 
         await self._queue.join()
+        await asyncio.sleep(0)
+        while True:
+            callback = self._completion_callback_task
+            completion_idle = (
+                self._completion_queue.empty()
+                and not self._completion_dispatch_in_progress
+                and (callback is None or callback.done())
+            )
+            if completion_idle:
+                return
+            if "dispatcher_start_failure" in self._degraded_causes:
+                return
+            if (
+                "completion_stalled" in self._degraded_causes
+                and (
+                    (callback is not None and not callback.done())
+                    or bool(self._detached_completion_tokens)
+                )
+            ):
+                return
+            dispatcher = self._completion_dispatcher_task
+            if (
+                not self._completion_queue.empty()
+                and (dispatcher is None or dispatcher.done())
+                and not self._ensure_completion_dispatcher()
+            ):
+                self._set_degraded_cause("dispatcher_start_failure")
+                return
+            await asyncio.sleep(0)
 
     async def reset(self) -> None:
         """Invalidate queued/in-flight results while retaining a warm backend."""
@@ -902,13 +994,21 @@ class SpeakerShadowRuntime:
         if self._closed:
             return
         self._generation += 1
-        self._cancel_observation_callback()
+        observation = self._observation_task
+        if observation is not None and not observation.done():
+            cancelled = await self._cancel_callback_bounded(observation)
+            if not cancelled:
+                self._detach_callback(observation)
+        if self._observation_task is observation:
+            self._observation_task = None
+        await self._cancel_completion_dispatcher_bounded()
+        self._drain_completion_queue()
+        self._drain_queue()
         self._clear_buffers()
         self._retire_finalized_candidates()
         self._candidate_tokens.clear()
         self._load_failure_streak = 0
         self._next_load_attempt_at = 0.0
-        self._drain_queue()
 
     async def close(self) -> None:
         """Stop accepting work and release every tracked resource exactly once.
@@ -922,17 +1022,24 @@ class SpeakerShadowRuntime:
             self._closed = True
             self._generation += 1
             self._cancel_observation_callback()
+            self._drain_queue()
+            self._drain_completion_queue()
             self._clear_buffers()
             self._finalized.clear()
             self._candidate_tokens.clear()
-            self._drain_queue()
             worker = self._worker_task
             if worker is not None and not worker.done():
                 self._queue.put_nowait(_STOP)
+            dispatcher = self._completion_dispatcher_task
+            if dispatcher is not None and not dispatcher.done():
+                self._completion_queue.put_nowait(_COMPLETION_STOP)
             needs_cleanup = (
                 worker is not None
+                or dispatcher is not None
                 or self._backend_host is not None
                 or self._host_start_task is not None
+                or self._observation_task is not None
+                or self._completion_callback_task is not None
                 or bool(self._detached_callback_tasks)
             )
             if needs_cleanup:
@@ -949,17 +1056,22 @@ class SpeakerShadowRuntime:
         await asyncio.shield(cleanup)
 
     def _ensure_worker(self) -> bool:
-        if self._worker_task is not None and not self._worker_task.done():
-            return True
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
+        if self._owner_loop is None:
+            self._owner_loop = loop
+        elif self._owner_loop is not loop:
+            return False
+        if self._worker_task is not None and not self._worker_task.done():
+            return True
         worker = loop.create_task(
             self._run(), name="speaker-shadow-runtime"
         )
         worker.add_done_callback(self._consume_worker_result)
         self._worker_task = worker
+        self._clear_degraded_cause("worker_start_failure")
         return True
 
     async def _run(self) -> None:
@@ -988,18 +1100,22 @@ class SpeakerShadowRuntime:
                     assert isinstance(item, _AudioFrame)
                     await self._process_frame(item)
             except asyncio.CancelledError:
+                if not self._closed:
+                    self._metrics.worker_start_failure_count += 1
+                    self._set_degraded_cause("worker_start_failure")
+                    if isinstance(item, _CandidateFinished):
+                        if item.token.finish_state is _FinishState.QUEUED:
+                            self._abandon_terminal(item.candidate, token=item.token)
+                        self._abandon_completion(item.token)
                 raise
             except Exception:
                 # A defensive final fence: shadow errors never reach ASR.
                 self._metrics.inference_failure_count += 1
-                if isinstance(
+                if isinstance(item, _CandidateFinished):
+                    self._recover_failed_finish(item)
+                elif isinstance(
                     item,
-                    (
-                        _AudioFrame,
-                        _CandidateDeferred,
-                        _CandidateActivated,
-                        _CandidateFinished,
-                    ),
+                    (_AudioFrame, _CandidateDeferred, _CandidateActivated),
                 ):
                     self._finalize_candidate(
                         item.candidate,
@@ -1013,10 +1129,20 @@ class SpeakerShadowRuntime:
                         self._queued_pcm_bytes - len(item.pcm16),
                     )
                     self._wipe_bytearray(item.pcm16)
+                self._retire_queued_item(item)
                 self._queue.task_done()
                 item = None
             if self._queue.empty() and self._backend_host is None:
                 return
+
+    def _retire_queued_item(self, item: _QueueItem) -> None:
+        if isinstance(item, _CandidateFinished):
+            self._queued_terminal_count = max(0, self._queued_terminal_count - 1)
+            if self._queued_terminal_count == 0:
+                self._clear_degraded_cause("terminal_overflow")
+            return
+        if isinstance(item, (_AudioFrame, _CandidateDeferred, _CandidateActivated)):
+            self._queued_data_item_count = max(0, self._queued_data_item_count - 1)
 
     def _process_defer(self, marker: _CandidateDeferred) -> None:
         if not self._identity_is_current(
@@ -1335,7 +1461,7 @@ class SpeakerShadowRuntime:
             callback = self._on_observation
             if callback is None:
                 return blocked_at_any_threshold
-            existing_callback_task = self._callback_task
+            existing_callback_task = self._observation_task
             if existing_callback_task is not None:
                 if not existing_callback_task.done():
                     self._metrics.callback_failure_count += 1
@@ -1353,8 +1479,7 @@ class SpeakerShadowRuntime:
                 callback(observation),
                 name="speaker-shadow-observation",
             )
-            self._callback_task = callback_task
-            self._callback_task_kind = "observation"
+            self._observation_task = callback_task
             callback_task.add_done_callback(self._consume_callback_result)
             try:
                 done, _ = await asyncio.wait(
@@ -1362,11 +1487,19 @@ class SpeakerShadowRuntime:
                     timeout=self._config.callback_timeout_seconds,
                 )
             except asyncio.CancelledError:
-                await self._cancel_callback_bounded(callback_task)
+                cancelled = await self._cancel_callback_bounded(callback_task)
+                if not cancelled:
+                    self._detach_callback(callback_task)
+                if self._observation_task is callback_task:
+                    self._observation_task = None
                 raise
             if not done:
                 self._metrics.callback_failure_count += 1
-                await self._cancel_callback_bounded(callback_task)
+                cancelled = await self._cancel_callback_bounded(callback_task)
+                if not cancelled:
+                    self._detach_callback(callback_task)
+                    if self._observation_task is callback_task:
+                        self._observation_task = None
                 return blocked_at_any_threshold
             try:
                 callback_task.result()
@@ -1494,6 +1627,19 @@ class SpeakerShadowRuntime:
         self._mark_backend_degraded()
 
     def _mark_backend_degraded(self) -> None:
+        self._set_degraded_cause("backend_unavailable")
+
+    def _mark_backend_recovered(self) -> None:
+        self._clear_degraded_cause("backend_unavailable")
+
+    def _set_degraded_cause(self, cause: _DegradedCause) -> None:
+        if cause in self._degraded_causes:
+            return
+        notify = not self._degraded_causes
+        self._degraded_causes.add(cause)
+        if not notify:
+            return
+        self._metrics.delivery_degraded_count += 1
         callback = self._on_backend_degraded
         if callback is None:
             return
@@ -1502,7 +1648,14 @@ class SpeakerShadowRuntime:
         except Exception:
             self._metrics.callback_failure_count += 1
 
-    def _mark_backend_recovered(self) -> None:
+    def _clear_degraded_cause(self, cause: _DegradedCause) -> None:
+        if cause not in self._degraded_causes:
+            return
+        self._degraded_causes.discard(cause)
+        if self._degraded_causes:
+            return
+        if self._closed:
+            return
         callback = self._on_backend_recovered
         if callback is None:
             return
@@ -1592,7 +1745,14 @@ class SpeakerShadowRuntime:
                         await asyncio.wait({worker})
             if worker is not None and worker.done():
                 self._consume_worker_result(worker)
-            await self._cancel_callback_bounded()
+            observation = self._observation_task
+            if observation is not None:
+                cancelled = await self._cancel_callback_bounded(observation)
+                if not cancelled:
+                    self._detach_callback(observation)
+                if self._observation_task is observation:
+                    self._observation_task = None
+            await self._cancel_completion_dispatcher_bounded()
             await self._cancel_detached_callbacks_bounded()
         finally:
             try:
@@ -1619,15 +1779,20 @@ class SpeakerShadowRuntime:
 
     async def _process_finish(self, marker: _CandidateFinished) -> None:
         if marker.generation != self._generation:
+            if marker.token.finish_state is _FinishState.QUEUED:
+                marker.token.finish_state = _FinishState.ABANDONED
+                self._metrics.terminal_abandoned_count += 1
+            self._abandon_completion(marker.token)
             return
         if self._candidate_was_evicted(
             marker.candidate,
             token=marker.token,
         ):
             return
+        self._mark_finish_processed(marker.token)
         if marker.token.terminal_reason is not None:
             self._record_token_finish(marker.token)
-            await self._deliver_completion(
+            self._enqueue_completion(
                 marker,
                 terminal_reason=marker.token.terminal_reason,
             )
@@ -1636,7 +1801,7 @@ class SpeakerShadowRuntime:
         if finalized is not None:
             self._record_finish(marker.candidate, finalized)
             completion_token = finalized.token or marker.token
-            await self._deliver_completion(
+            self._enqueue_completion(
                 _CandidateFinished(
                     marker.generation,
                     marker.candidate,
@@ -1721,7 +1886,7 @@ class SpeakerShadowRuntime:
                 )
                 terminal_reason = marker.token.terminal_reason or "failed"
             self._record_token_finish(marker.token)
-            await self._deliver_completion(
+            self._enqueue_completion(
                 marker,
                 terminal_reason=terminal_reason,
             )
@@ -1737,92 +1902,224 @@ class SpeakerShadowRuntime:
         self._finalize_candidate(
             marker.candidate,
             terminal_reason,
-            finish_seen=True,
             token=marker.token,
         )
-        await self._deliver_completion(
+        self._record_token_finish(marker.token)
+        self._enqueue_completion(
             marker,
             terminal_reason=terminal_reason,
         )
 
-    async def _deliver_completion(
+    def _recover_failed_finish(self, marker: _CandidateFinished) -> None:
+        """Convert a consumed finish fault into one explicit failed completion."""
+
+        if marker.generation != self._generation or self._closed:
+            self._abandon_completion(marker.token)
+            return
+        self._mark_finish_processed(marker.token)
+        if marker.token.terminal_reason is None:
+            self._finalize_candidate(
+                marker.candidate,
+                "failed",
+                token=marker.token,
+            )
+        terminal_reason = marker.token.terminal_reason or "failed"
+        self._record_token_finish(marker.token)
+        self._enqueue_completion(marker, terminal_reason=terminal_reason)
+
+    def _enqueue_completion(
         self,
         marker: _CandidateFinished,
         *,
         terminal_reason: SpeakerShadowTerminalReason,
-    ) -> None:
-        """Publish one terminal notice in finish-marker queue order."""
+    ) -> bool:
+        """Accept one terminal notice into the bounded ordered outbox."""
 
         token = marker.token
         if (
             marker.generation != self._generation
             or self._closed
-            or token.completion_sent
         ):
-            return
-        token.completion_sent = True
-        self._metrics.completion_count += 1
-        if token.last_checkpoint_ms is None:
-            self._metrics.completion_before_first_checkpoint_count += 1
-        else:
-            self._metrics.completion_after_first_checkpoint_count += 1
-
-        callback = self._on_completion
-        if callback is None:
-            return
-        existing_callback_task = self._callback_task
-        if existing_callback_task is not None:
-            if not existing_callback_task.done():
-                if self._callback_task_kind == "observation":
-                    self._metrics.callback_failure_count += 1
-                    self._metrics.completion_callback_failure_count += 1
-                    # A stuck observation may be detached so the ordered
-                    # terminal notice can release downstream state. A prior
-                    # completion is never detached: completion callbacks must
-                    # not overlap or finish out of marker order.
-                    self._detached_callback_tasks.add(existing_callback_task)
-                    existing_callback_task.add_done_callback(
-                        self._detached_callback_tasks.discard
-                    )
-                    self._callback_task = None
-                    self._callback_task_kind = None
-                else:
-                    done, _ = await asyncio.wait(
-                        {existing_callback_task},
-                        timeout=self._config.callback_timeout_seconds,
-                    )
-                    if not done:
-                        self._metrics.callback_failure_count += 1
-                        self._metrics.completion_callback_failure_count += 1
-                        return
-                    self._consume_callback_result(existing_callback_task)
-            else:
-                self._consume_callback_result(existing_callback_task)
+            self._abandon_completion(token)
+            return False
+        if token.completion_state in {
+            _CompletionState.QUEUED,
+            _CompletionState.DISPATCHED,
+            _CompletionState.ATTEMPTED,
+        }:
+            return True
+        if token.completion_state is _CompletionState.ABANDONED:
+            return False
+        if self._completion_queue.qsize() >= self._config.completion_queue_capacity:
+            self._metrics.completion_overflow_count += 1
+            self._set_degraded_cause("completion_overflow")
+            self._abandon_completion(token)
+            return False
+        if not self._ensure_completion_dispatcher():
+            self._set_degraded_cause("dispatcher_start_failure")
+            self._abandon_completion(token)
+            return False
         completion = SpeakerShadowCompletion(
             candidate=marker.candidate,
             terminal_reason=terminal_reason,
             last_checkpoint_ms=token.last_checkpoint_ms,
         )
-        callback_task = asyncio.create_task(
-            callback(completion),
-            name="speaker-shadow-completion",
+        envelope = _CompletionEnvelope(
+            generation=marker.generation,
+            candidate=marker.candidate,
+            token=token,
+            completion=completion,
         )
-        self._callback_task = callback_task
-        self._callback_task_kind = "completion"
+        try:
+            self._completion_queue.put_nowait(envelope)
+        except asyncio.QueueFull:
+            self._metrics.completion_overflow_count += 1
+            self._set_degraded_cause("completion_overflow")
+            self._abandon_completion(token)
+            return False
+        token.completion_state = _CompletionState.QUEUED
+        self._metrics.completion_count += 1
+        if token.last_checkpoint_ms is None:
+            self._metrics.completion_before_first_checkpoint_count += 1
+        else:
+            self._metrics.completion_after_first_checkpoint_count += 1
+        return True
+
+    def _ensure_completion_dispatcher(self) -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if self._owner_loop is None:
+            self._owner_loop = loop
+        elif self._owner_loop is not loop:
+            return False
+        dispatcher = self._completion_dispatcher_task
+        if dispatcher is not None and not dispatcher.done():
+            return True
+        dispatcher = loop.create_task(
+            self._run_completion_dispatcher(),
+            name="speaker-shadow-completion-dispatcher",
+        )
+        dispatcher.add_done_callback(self._consume_completion_dispatcher_result)
+        self._completion_dispatcher_task = dispatcher
+        self._clear_degraded_cause("dispatcher_start_failure")
+        return True
+
+    async def _run_completion_dispatcher(self) -> None:
+        while True:
+            item = await self._completion_queue.get()
+            try:
+                if item is _COMPLETION_STOP:
+                    return
+                assert isinstance(item, _CompletionEnvelope)
+                self._completion_dispatch_in_progress = True
+                try:
+                    await self._dispatch_completion(item)
+                except asyncio.CancelledError:
+                    if item.token.completion_state is _CompletionState.QUEUED:
+                        self._abandon_completion(item.token)
+                    raise
+                except Exception:
+                    self._set_degraded_cause("dispatcher_start_failure")
+                    self._abandon_completion(item.token)
+            finally:
+                self._completion_dispatch_in_progress = False
+                self._completion_queue.task_done()
+            if self._completion_queue.empty():
+                self._clear_degraded_cause("completion_overflow")
+                if (
+                    self._completion_callback_task is None
+                    or self._completion_callback_task.done()
+                ):
+                    self._clear_degraded_cause("completion_stalled")
+
+    async def _dispatch_completion(self, envelope: _CompletionEnvelope) -> None:
+        token = envelope.token
+        if (
+            envelope.generation != self._generation
+            or self._closed
+            or token.completion_state is not _CompletionState.QUEUED
+        ):
+            self._abandon_completion(token)
+            return
+
+        await self._wait_for_detached_completion_callbacks()
+        if (
+            envelope.generation != self._generation
+            or self._closed
+            or token.completion_state is not _CompletionState.QUEUED
+        ):
+            self._abandon_completion(token)
+            return
+
+        observation_task = self._observation_task
+        if observation_task is not None and not observation_task.done():
+            observation_task.cancel()
+            self._detach_callback(observation_task)
+            self._observation_task = None
+
+        callback = self._on_completion
+        if callback is None:
+            token.completion_state = _CompletionState.ATTEMPTED
+            self._metrics.completion_attempted_count += 1
+            return
+        try:
+            callback_task = asyncio.create_task(
+                callback(envelope.completion),
+                name="speaker-shadow-completion",
+            )
+        except Exception:
+            self._set_degraded_cause("dispatcher_start_failure")
+            raise
+        self._completion_callback_task = callback_task
+        self._completion_callback_token = token
+        token.completion_state = _CompletionState.DISPATCHED
+        self._metrics.completion_dispatched_count += 1
         callback_task.add_done_callback(self._consume_callback_result)
         try:
             done, _ = await asyncio.wait(
                 {callback_task},
                 timeout=self._config.callback_timeout_seconds,
             )
+            if not done:
+                self._metrics.callback_failure_count += 1
+                self._metrics.completion_callback_failure_count += 1
+                self._metrics.completion_stall_count += 1
+                self._set_degraded_cause("completion_stalled")
+                cancelled = await self._cancel_callback_bounded(callback_task)
+                if not cancelled:
+                    try:
+                        await asyncio.shield(callback_task)
+                    except asyncio.CancelledError:
+                        self._detach_callback(
+                            callback_task,
+                            completion_token=token,
+                        )
+                        raise
+            self._consume_completion_callback_result(callback_task)
         except asyncio.CancelledError:
-            await self._cancel_callback_bounded(callback_task)
+            cancelled = await self._cancel_callback_bounded(callback_task)
+            if not cancelled:
+                self._detach_callback(
+                    callback_task,
+                    completion_token=token,
+                )
+            else:
+                self._consume_completion_callback_result(callback_task)
             raise
-        if not done:
-            self._metrics.callback_failure_count += 1
-            self._metrics.completion_callback_failure_count += 1
-            await self._cancel_callback_bounded(callback_task)
-            return
+        finally:
+            if token.completion_state is _CompletionState.DISPATCHED and callback_task.done():
+                token.completion_state = _CompletionState.ATTEMPTED
+                self._metrics.completion_attempted_count += 1
+            if self._completion_callback_task is callback_task and callback_task.done():
+                self._completion_callback_task = None
+                self._completion_callback_token = None
+
+    def _consume_completion_callback_result(
+        self,
+        callback_task: asyncio.Task[None],
+    ) -> None:
         try:
             callback_task.result()
         except asyncio.CancelledError:
@@ -1831,11 +2128,50 @@ class SpeakerShadowRuntime:
             self._metrics.callback_failure_count += 1
             self._metrics.completion_callback_failure_count += 1
 
+    def _abandon_completion(self, token: _CandidateToken) -> None:
+        if token.completion_state in {
+            _CompletionState.ATTEMPTED,
+            _CompletionState.ABANDONED,
+        }:
+            return
+        token.completion_state = _CompletionState.ABANDONED
+        self._metrics.completion_abandoned_count += 1
+
+    def _detach_callback(
+        self,
+        task: asyncio.Task[None],
+        *,
+        completion_token: _CandidateToken | None = None,
+    ) -> None:
+        if completion_token is not None:
+            if "completion_stalled" not in self._degraded_causes:
+                self._metrics.completion_stall_count += 1
+                self._set_degraded_cause("completion_stalled")
+            self._detached_completion_tokens[task] = completion_token
+            if self._completion_callback_task is task:
+                self._completion_callback_task = None
+                self._completion_callback_token = None
+        if self._observation_task is task:
+            self._observation_task = None
+        if task in self._detached_callback_tasks:
+            return
+        self._detached_callback_tasks.add(task)
+        task.add_done_callback(self._consume_detached_callback_result)
+
+    async def _wait_for_detached_completion_callbacks(self) -> None:
+        while self._detached_completion_tokens:
+            tasks = tuple(self._detached_completion_tokens)
+            done, _ = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                self._consume_detached_callback_result(task)
+
     def _drop_candidate(
         self,
         candidate: SpeakerShadowCandidateKey,
         *,
-        finish_seen: bool = False,
         token: _CandidateToken | None = None,
     ) -> None:
         buffer = self._buffers.pop(candidate, None)
@@ -1847,7 +2183,6 @@ class SpeakerShadowRuntime:
         self._finalize_candidate(
             candidate,
             "dropped",
-            finish_seen=finish_seen,
             token=token,
         )
 
@@ -1856,37 +2191,33 @@ class SpeakerShadowRuntime:
         candidate: SpeakerShadowCandidateKey,
         terminal_reason: SpeakerShadowTerminalReason,
         *,
-        finish_seen: bool = False,
         token: _CandidateToken | None = None,
     ) -> None:
         if token is None:
             token = self._candidate_tokens.get(candidate)
         if token is not None and token.terminal_reason is not None:
-            if finish_seen:
-                self._record_token_finish(token)
             return
         if token is not None:
             token.terminal_reason = terminal_reason
-            token.finish_seen = finish_seen
             if self._candidate_tokens.get(candidate) is token:
                 self._candidate_tokens.pop(candidate, None)
         previous = self._finalized.pop(candidate, None)
         if previous is not None:
             self._finalized[candidate] = _FinalizedCandidate(
-                finish_seen=previous.finish_seen or finish_seen,
+                finish_state=(
+                    _FinishState.PROCESSED
+                    if previous.finish_seen
+                    else token.finish_state if token is not None else previous.finish_state
+                ),
                 terminal_reason=previous.terminal_reason,
                 token=previous.token or token,
             )
-            if finish_seen and not previous.finish_seen:
-                self._metrics.finished_candidate_count += 1
             return
         self._finalized[candidate] = _FinalizedCandidate(
-            finish_seen=finish_seen,
+            finish_state=(token.finish_state if token is not None else _FinishState.OPEN),
             terminal_reason=terminal_reason,
             token=token,
         )
-        if finish_seen:
-            self._metrics.finished_candidate_count += 1
         counter_name = f"{terminal_reason}_candidate_count"
         setattr(
             self._metrics,
@@ -1905,6 +2236,7 @@ class SpeakerShadowRuntime:
     ) -> bool:
         current_token = self._candidate_tokens.get(candidate)
         buffer = self._buffers.get(candidate)
+        finalized = self._finalized.get(candidate)
         if token is None and (
             current_token is not None
             or buffer is not None
@@ -1914,6 +2246,7 @@ class SpeakerShadowRuntime:
         if token is not None and (
             current_token is token
             or (buffer is not None and buffer.token is token)
+            or (finalized is not None and finalized.token is token)
         ):
             return False
         finalized_through = self._finalized_through.get(candidate.scope)
@@ -1958,30 +2291,34 @@ class SpeakerShadowRuntime:
         if finalized.finish_seen:
             return
         if finalized.token is not None:
-            finalized.token.finish_seen = True
+            finalized.token.finish_state = _FinishState.PROCESSED
         self._finalized.pop(candidate, None)
         self._finalized[candidate] = _FinalizedCandidate(
-            finish_seen=True,
+            finish_state=_FinishState.PROCESSED,
             terminal_reason=finalized.terminal_reason,
             token=finalized.token,
         )
+
+    def _mark_finish_processed(self, token: _CandidateToken) -> None:
+        if token.finish_state is _FinishState.PROCESSED:
+            return
+        if token.finish_state is _FinishState.ABANDONED:
+            return
+        token.finish_state = _FinishState.PROCESSED
         self._metrics.finished_candidate_count += 1
 
     def _record_token_finish(self, token: _CandidateToken) -> None:
-        if token.finish_seen:
-            return
-        token.finish_seen = True
+        self._mark_finish_processed(token)
         if self._candidate_tokens.get(token.candidate) is token:
             self._candidate_tokens.pop(token.candidate, None)
         finalized = self._finalized.get(token.candidate)
         if finalized is not None:
             self._finalized.pop(token.candidate, None)
             self._finalized[token.candidate] = _FinalizedCandidate(
-                finish_seen=True,
+                finish_state=_FinishState.PROCESSED,
                 terminal_reason=finalized.terminal_reason,
                 token=finalized.token or token,
             )
-        self._metrics.finished_candidate_count += 1
 
     def _identity_is_current(
         self,
@@ -2010,77 +2347,21 @@ class SpeakerShadowRuntime:
                         self._queued_pcm_bytes - len(item.pcm16),
                     )
                     self._wipe_bytearray(item.pcm16)
+                elif isinstance(item, _CandidateFinished):
+                    self._abandon_terminal(item.candidate, token=item.token)
+                self._retire_queued_item(item)
                 self._queue.task_done()
 
-    def _discard_queued_frames_for_token(self, token: _CandidateToken) -> bool:
-        """Remove already-stale PCM so its ordered finish marker can be queued."""
-
-        retained_items: list[_QueueItem] = []
-        discarded = False
+    def _drain_completion_queue(self) -> None:
         while True:
             try:
-                item = self._queue.get_nowait()
+                item = self._completion_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            self._queue.task_done()
-            if isinstance(item, _AudioFrame) and item.token is token:
-                discarded = True
-                self._queued_pcm_bytes = max(
-                    0,
-                    self._queued_pcm_bytes - len(item.pcm16),
-                )
-                self._wipe_bytearray(item.pcm16)
-                continue
-            retained_items.append(item)
-        for item in retained_items:
-            self._queue.put_nowait(item)
-        return discarded
-
-    def _discard_newest_queued_audio_frame(self) -> bool:
-        """Reserve bounded queue capacity for a terminal marker.
-
-        Terminal delivery is authoritative; queued shadow PCM is fail-open.
-        Dropping the newest queued frame preserves the order of every retained
-        item while ensuring a finalized candidate cannot lose completion just
-        because another candidate filled the queue.
-        """
-
-        queued_items: list[_QueueItem] = []
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            self._queue.task_done()
-            queued_items.append(item)
-
-        discarded_frame: _AudioFrame | None = None
-        for index in range(len(queued_items) - 1, -1, -1):
-            item = queued_items[index]
-            if isinstance(item, _AudioFrame):
-                discarded_frame = item
-                del queued_items[index]
-                break
-        for item in queued_items:
-            self._queue.put_nowait(item)
-        if discarded_frame is None:
-            return False
-
-        self._queued_pcm_bytes = max(
-            0,
-            self._queued_pcm_bytes - len(discarded_frame.pcm16),
-        )
-        self._metrics.dropped_frame_count += 1
-        self._metrics.dropped_audio_ms += self._audio_ms(
-            discarded_frame.sample_count,
-            discarded_frame.sample_rate_hz,
-        )
-        self._wipe_bytearray(discarded_frame.pcm16)
-        self._drop_candidate(
-            discarded_frame.candidate,
-            token=discarded_frame.token,
-        )
-        return True
+            if isinstance(item, _CompletionEnvelope):
+                self._abandon_completion(item.token)
+            self._completion_queue.task_done()
+        self._clear_degraded_cause("completion_overflow")
 
     def _retained_pcm_bytes(self) -> int:
         host_pcm_bytes = (
@@ -2105,20 +2386,15 @@ class SpeakerShadowRuntime:
         value[:] = b"\x00" * len(value)
 
     def _cancel_observation_callback(self) -> None:
-        callback_task = self._callback_task
+        callback_task = self._observation_task
         if callback_task is not None and not callback_task.done():
             callback_task.cancel()
-        for detached_task in tuple(self._detached_callback_tasks):
-            if not detached_task.done():
-                detached_task.cancel()
 
     async def _cancel_callback_bounded(
         self,
-        task: asyncio.Task[None] | None = None,
+        task: asyncio.Task[None],
     ) -> bool:
-        callback_task = task if task is not None else self._callback_task
-        if callback_task is None:
-            return True
+        callback_task = task
         for _ in range(2):
             if callback_task.done():
                 self._consume_callback_result(callback_task)
@@ -2133,6 +2409,43 @@ class SpeakerShadowRuntime:
                 return True
         return False
 
+    async def _cancel_completion_dispatcher_bounded(self) -> bool:
+        dispatcher = self._completion_dispatcher_task
+        if dispatcher is None:
+            callback = self._completion_callback_task
+            if callback is None:
+                return True
+            token = self._completion_callback_token
+            cancelled = await self._cancel_callback_bounded(callback)
+            if not cancelled:
+                self._detach_callback(
+                    callback,
+                    completion_token=token,
+                )
+            elif token is not None:
+                self._consume_completion_callback_result(callback)
+                if token.completion_state is _CompletionState.DISPATCHED:
+                    token.completion_state = _CompletionState.ATTEMPTED
+                    self._metrics.completion_attempted_count += 1
+            if self._completion_callback_task is callback:
+                self._completion_callback_task = None
+                self._completion_callback_token = None
+            return cancelled
+        if not dispatcher.done():
+            dispatcher.cancel()
+            timeout = max(
+                self._config.callback_timeout_seconds * 3,
+                _HOST_POLL_INTERVAL_SECONDS,
+            )
+            done, _ = await asyncio.wait({dispatcher}, timeout=timeout)
+            if not done:
+                dispatcher.cancel()
+                done, _ = await asyncio.wait({dispatcher}, timeout=timeout)
+            if not done:
+                return False
+        self._consume_completion_dispatcher_result(dispatcher)
+        return True
+
     async def _cancel_detached_callbacks_bounded(self) -> bool:
         detached_tasks = tuple(self._detached_callback_tasks)
         if not detached_tasks:
@@ -2142,7 +2455,7 @@ class SpeakerShadowRuntime:
         )
         for task in detached_tasks:
             if task.done():
-                self._detached_callback_tasks.discard(task)
+                self._consume_detached_callback_result(task)
         return all(results)
 
     def _consume_callback_result(self, task: asyncio.Task[None]) -> None:
@@ -2151,16 +2464,52 @@ class SpeakerShadowRuntime:
         except asyncio.CancelledError:
             pass
         finally:
-            if self._callback_task is task and task.done():
-                self._callback_task = None
-                self._callback_task_kind = None
+            if self._observation_task is task and task.done():
+                self._observation_task = None
 
-    @staticmethod
-    def _consume_worker_result(task: asyncio.Task[None]) -> None:
+    def _consume_detached_callback_result(self, task: asyncio.Task[None]) -> None:
+        self._detached_callback_tasks.discard(task)
+        token = self._detached_completion_tokens.pop(task, None)
+        if token is None:
+            return
+        self._consume_completion_callback_result(task)
+        if token.completion_state is _CompletionState.DISPATCHED:
+            token.completion_state = _CompletionState.ATTEMPTED
+            self._metrics.completion_attempted_count += 1
+        if (
+            self._completion_callback_task is None
+            and not self._detached_completion_tokens
+            and self._completion_queue.empty()
+        ):
+            self._clear_degraded_cause("completion_stalled")
+
+    def _consume_completion_dispatcher_result(
+        self,
+        task: asyncio.Task[None],
+    ) -> None:
+        abnormal = False
         try:
-            task.exception()
+            abnormal = task.exception() is not None
         except asyncio.CancelledError:
             pass
+        if self._completion_dispatcher_task is task and task.done():
+            self._completion_dispatcher_task = None
+        if abnormal and not self._closed:
+            self._set_degraded_cause("dispatcher_start_failure")
+            self._drain_completion_queue()
+
+    def _consume_worker_result(self, task: asyncio.Task[None]) -> None:
+        abnormal = False
+        try:
+            abnormal = task.exception() is not None
+        except asyncio.CancelledError:
+            pass
+        if self._worker_task is task and task.done():
+            self._worker_task = None
+        if abnormal and not self._closed:
+            self._metrics.worker_start_failure_count += 1
+            self._set_degraded_cause("worker_start_failure")
+            self._drain_queue()
 
     @staticmethod
     def _audio_ms(sample_count: int, sample_rate_hz: int) -> int:

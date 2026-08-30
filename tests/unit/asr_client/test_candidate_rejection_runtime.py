@@ -1654,6 +1654,129 @@ async def test_gate_arm_diagnostics_report_common_authority_failure() -> None:
     await _close_dispatchers(runtime)
 
 
+async def test_degraded_verifier_blocks_new_gate_before_detector_prepare() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+
+    runtime._mark_speaker_verifier_degraded()
+
+    assert not await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    assert not detector.prepare_entered.is_set()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_arm_degraded_count"] == 1
+    assert diagnostics["speaker_gate_armed_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_degraded_health_transition_during_prepare_cannot_late_arm() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    detector.block_prepare = True
+    arm_task = asyncio.create_task(
+        runtime._arm_speaker_candidate_decision(
+            _shadow_candidate(),
+            activation_generation="profile-generation",
+        )
+    )
+    await asyncio.wait_for(detector.prepare_entered.wait(), 1)
+
+    runtime._mark_speaker_verifier_degraded()
+    runtime._mark_speaker_verifier_healthy()
+    detector.prepare_release.set()
+
+    assert not await asyncio.wait_for(arm_task, 1)
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_arm_degraded_count"] == 1
+    assert diagnostics["speaker_gate_armed_count"] == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_degraded_verifier_retires_preparation_and_unowned_gate() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token, _provider_fence = (
+        _seal_provider_candidate(runtime, detector)
+    )
+    candidate = _shadow_candidate()
+    preparation = runtime._begin_speaker_candidate_decision_preparation(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    assert preparation is not None
+
+    runtime._mark_speaker_verifier_degraded()
+
+    assert preparation.retired
+    assert preparation.resolved.done()
+    assert runtime._asr_speaker_candidate_decision_preparation is None
+    runtime._mark_speaker_verifier_healthy()
+    assert await runtime._arm_speaker_candidate_decision(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None
+
+    runtime._mark_speaker_verifier_degraded()
+
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    assert gate.resolved.done()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_released_verifier_degraded_count"] == 1
+    await _close_dispatchers(runtime)
+
+
+async def test_degraded_verifier_does_not_steal_rejection_owned_gate() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    assert await runtime._arm_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    gate = runtime._asr_speaker_candidate_decision_gate
+    assert gate is not None
+    rejection_owner = asyncio.create_task(asyncio.Event().wait())
+    gate.rejection_task = rejection_owner
+
+    runtime._mark_speaker_verifier_degraded()
+
+    assert runtime._asr_speaker_candidate_decision_gate is gate
+    assert not gate.resolved.done()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_gate_released_verifier_degraded_count"] == 0
+    rejection_owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await rejection_owner
+    gate.rejection_task = None
+    assert runtime._resolve_speaker_candidate_decision(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    await _close_dispatchers(runtime)
+
+
 async def test_first_low_provider_gate_arms_while_turn_preparation_is_pending() -> None:
     prepare_started = asyncio.Event()
     prepare_release = asyncio.Event()

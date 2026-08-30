@@ -32,6 +32,7 @@ class OwnerVoiceAsrCompositionFactory:
     """Create repeatable observers for one runtime and activation generation."""
 
     _ARMED_CANDIDATE_CAPACITY = 256
+    _TERMINAL_CANDIDATE_CAPACITY = 256
 
     def __init__(
         self,
@@ -58,6 +59,9 @@ class OwnerVoiceAsrCompositionFactory:
         # Insertion ordered so capacity eviction is deterministic. This remains
         # bookkeeping only; IndependentAsrRuntime's exact gate owns authority.
         self._armed_candidates: dict[SpeakerShadowCandidateKey, bool] = {}
+        # Bounded tombstones fence detached observations that finish after the
+        # same candidate's terminal callback has already cleaned policy state.
+        self._terminal_candidates: dict[SpeakerShadowCandidateKey, None] = {}
         self._diagnostics = {
             "observation_count": 0,
             "first_checkpoint_count": 0,
@@ -122,8 +126,19 @@ class OwnerVoiceAsrCompositionFactory:
                         self._diagnostics["second_checkpoint_count"] += 1
                     if any(blocked for _, blocked in observation.would_block):
                         self._diagnostics["low_checkpoint_count"] += 1
-            if runtime._speaker_verifier_activation_generation != generation:
+                ignore_terminal = bool(
+                    self._closed
+                    or observation.candidate in self._terminal_candidates
+                )
+            if ignore_terminal:
+                policy.forget(observation.candidate)
+                return
+            if (
+                runtime._speaker_verifier_activation_generation != generation
+                or runtime._speaker_verifier_degraded
+            ):
                 self._resolve_armed_candidates()
+                policy.forget(observation.candidate)
                 return
             result = policy.observe(
                 candidate=observation.candidate,
@@ -158,12 +173,25 @@ class OwnerVoiceAsrCompositionFactory:
                     return
                 if not armed:
                     return
+                try:
+                    exact_gate_is_armed = (
+                        runtime._speaker_candidate_decision_is_armed(
+                            observation.candidate,
+                            activation_generation=generation,
+                        )
+                    )
+                except Exception:
+                    exact_gate_is_armed = False
                 evicted_candidates: tuple[SpeakerShadowCandidateKey, ...] = ()
                 with self._lock:
                     keep_armed = bool(
                         not self._closed
                         and runtime._speaker_verifier_activation_generation
                         == generation
+                        and not runtime._speaker_verifier_degraded
+                        and observation.candidate
+                        not in self._terminal_candidates
+                        and exact_gate_is_armed
                     )
                     if keep_armed:
                         self._armed_candidates[observation.candidate] = True
@@ -175,6 +203,7 @@ class OwnerVoiceAsrCompositionFactory:
                             self._armed_candidates.pop(evicted, None)
                             evicted_candidates = (evicted,)
                 if not keep_armed:
+                    policy.forget(observation.candidate)
                     self._resolve_candidates((observation.candidate,))
                 elif evicted_candidates:
                     self._resolve_candidates(evicted_candidates)
@@ -216,6 +245,15 @@ class OwnerVoiceAsrCompositionFactory:
             )
             with self._lock:
                 factory_is_closed = self._closed
+                if not factory_is_closed:
+                    self._terminal_candidates.pop(completion.candidate, None)
+                    self._terminal_candidates[completion.candidate] = None
+                    while (
+                        len(self._terminal_candidates)
+                        > self._TERMINAL_CANDIDATE_CAPACITY
+                    ):
+                        oldest = next(iter(self._terminal_candidates))
+                        self._terminal_candidates.pop(oldest, None)
                 self._diagnostics["speaker_completion_count"] += 1
                 if completion.last_checkpoint_ms is None:
                     self._diagnostics[
@@ -240,9 +278,10 @@ class OwnerVoiceAsrCompositionFactory:
                 self._resolve_candidates((completion.candidate,))
 
         def on_backend_degraded() -> None:
-            self._resolve_armed_candidates()
+            policy.reset()
             if runtime._speaker_verifier_activation_generation == generation:
                 runtime._mark_speaker_verifier_degraded()
+            self._resolve_armed_candidates()
 
         def on_backend_recovered() -> None:
             if runtime._speaker_verifier_activation_generation == generation:
@@ -282,6 +321,7 @@ class OwnerVoiceAsrCompositionFactory:
             self._closed = True
             armed_candidates = tuple(self._armed_candidates)
             self._armed_candidates.clear()
+            self._terminal_candidates.clear()
             self._profile.close()
         self._resolve_candidates(armed_candidates)
 

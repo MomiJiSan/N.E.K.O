@@ -23,6 +23,8 @@ MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES = MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES
 MAX_SPEAKER_SHADOW_THRESHOLDS = 16
 MAX_SPEAKER_SHADOW_CHECKPOINTS = 16
 MAX_SPEAKER_SHADOW_QUEUE_CAPACITY = 512
+MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY = 1_024
+MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY = 1_024
 MAX_SPEAKER_SHADOW_BUFFERED_CANDIDATES = 32
 MAX_SPEAKER_SHADOW_FINALIZED_CANDIDATES = 4_096
 # This independent global budget keeps aggregate retained PCM below 8 MiB even
@@ -113,6 +115,10 @@ class SpeakerShadowConfig:
     completion_confirmation_scopes: tuple[SpeakerShadowScope, ...] = ()
     pending_observation_gate_scopes: tuple[SpeakerShadowScope, ...] = ()
     backend_prewarm_scopes: tuple[SpeakerShadowScope, ...] = ()
+    # Terminal and callback delivery have independent bounded capacity so PCM
+    # pressure cannot consume their reserved admission budget.
+    terminal_queue_capacity: int = 512
+    completion_queue_capacity: int = 512
 
     def __post_init__(self) -> None:
         if (
@@ -235,6 +241,16 @@ class SpeakerShadowConfig:
                 "queue_capacity must be within "
                 f"[1, {MAX_SPEAKER_SHADOW_QUEUE_CAPACITY}]"
             )
+        self._validate_capacity(
+            "terminal_queue_capacity",
+            self.terminal_queue_capacity,
+            MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY,
+        )
+        self._validate_capacity(
+            "completion_queue_capacity",
+            self.completion_queue_capacity,
+            MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY,
+        )
         if not (
             0
             < self.buffered_candidate_capacity
@@ -301,6 +317,11 @@ class SpeakerShadowConfig:
         if not math.isfinite(value) or not 0 < value <= maximum:
             raise ValueError(f"{name} must be finite and within (0, {maximum}]")
 
+    @staticmethod
+    def _validate_capacity(name: str, value: int, maximum: int) -> None:
+        if type(value) is not int or not 0 < value <= maximum:
+            raise ValueError(f"{name} must be an integer within [1, {maximum}]")
+
 
 @dataclass(frozen=True, slots=True)
 class SpeakerShadowObservation:
@@ -364,6 +385,18 @@ class SpeakerShadowMetrics:
     completion_before_first_checkpoint_count: int = 0
     completion_after_first_checkpoint_count: int = 0
     completion_callback_failure_count: int = 0
+    terminal_queued_count: int = 0
+    terminal_overflow_count: int = 0
+    terminal_abandoned_count: int = 0
+    completion_dispatched_count: int = 0
+    completion_attempted_count: int = 0
+    completion_overflow_count: int = 0
+    completion_abandoned_count: int = 0
+    completion_stall_count: int = 0
+    pending_terminal_count: int = 0
+    pending_completion_count: int = 0
+    detached_callback_task_count: int = 0
+    delivery_degraded_count: int = 0
     load_retry_suppressed_count: int = 0
     worker_start_failure_count: int = 0
     shutdown_timeout_count: int = 0

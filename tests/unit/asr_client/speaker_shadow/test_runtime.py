@@ -1032,7 +1032,8 @@ async def test_uncooperative_confirmation_callback_cannot_suppress_completion() 
     ]
     metrics = runtime.snapshot()
     assert metrics["completion_count"] == 1
-    assert metrics["completion_callback_failure_count"] == 1
+    assert metrics["callback_failure_count"] == 1
+    assert metrics["completion_callback_failure_count"] == 0
     assert metrics["retained_pcm_bytes"] == 0
     assert metrics["callback_task_count"] == 0
     await runtime.close()
@@ -1723,6 +1724,190 @@ async def test_queue_saturation_drops_only_shadow_candidate() -> None:
     await runtime.close()
 
 
+async def test_pcm_capacity_saturation_preserves_finish_admission() -> None:
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            minimum_audio_ms=20,
+            queue_capacity=1,
+            terminal_queue_capacity=1,
+            completion_queue_capacity=1,
+        ),
+        on_completion=complete,
+    )
+    candidate = _candidate(901)
+
+    assert runtime.submit(
+        _pcm(10),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    token = runtime._candidate_tokens[candidate]
+    assert runtime.snapshot()["queued_item_count"] == 1
+
+    assert runtime.finish_candidate(candidate)
+    assert token.finish_state == "queued"
+    queued = runtime.snapshot()
+    assert queued["pending_terminal_count"] == 1
+    assert queued["terminal_queued_count"] == 1
+    assert queued["terminal_overflow_count"] == 0
+
+    await runtime.wait_idle()
+
+    assert token.finish_state == "processed"
+    assert token.completion_state == "attempted"
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="insufficient",
+            last_checkpoint_ms=None,
+        )
+    ]
+    completed = runtime.snapshot()
+    assert completed["pending_terminal_count"] == 0
+    assert completed["pending_completion_count"] == 0
+    assert completed["completion_count"] == 1
+    assert completed["completion_dispatched_count"] == 1
+    assert completed["completion_attempted_count"] == 1
+    await runtime.close()
+
+
+async def test_terminal_capacity_overflow_never_claims_finish_processed() -> None:
+    degraded_calls = 0
+
+    def degraded() -> None:
+        nonlocal degraded_calls
+        degraded_calls += 1
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            queue_capacity=1,
+            terminal_queue_capacity=1,
+            completion_queue_capacity=1,
+        ),
+        on_backend_degraded=degraded,
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    queued_candidate = _candidate(902)
+    overflowed_candidate = _candidate(903)
+
+    try:
+        assert runtime.finish_candidate(queued_candidate)
+        queued_token = runtime._candidate_tokens[queued_candidate]
+        assert queued_token.finish_state == "queued"
+
+        assert runtime.finish_candidate(overflowed_candidate) is False
+        overflowed = runtime._finalized[overflowed_candidate]
+        assert overflowed.token is not None
+        assert overflowed.token.finish_state == "abandoned"
+        assert overflowed.token.finish_state != "processed"
+
+        metrics = runtime.snapshot()
+        assert metrics["pending_terminal_count"] == 1
+        assert metrics["terminal_queued_count"] == 1
+        assert metrics["terminal_overflow_count"] == 1
+        assert metrics["terminal_abandoned_count"] == 1
+        assert metrics["delivery_degraded_count"] == 1
+        assert metrics["delivery_degraded_cause_count"] == 1
+        assert metrics["completion_count"] == 0
+        assert degraded_calls == 1
+    finally:
+        hold_worker.set()
+        await fake_worker
+        await runtime.close()
+
+
+async def test_worker_start_failure_abandons_unaccepted_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    degraded_calls = 0
+
+    def degraded() -> None:
+        nonlocal degraded_calls
+        degraded_calls += 1
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            terminal_queue_capacity=1,
+            completion_queue_capacity=1,
+        ),
+        on_backend_degraded=degraded,
+    )
+    candidate = _candidate(909)
+    monkeypatch.setattr(runtime, "_ensure_worker", lambda: False)
+
+    assert runtime.finish_candidate(candidate) is False
+
+    finalized = runtime._finalized[candidate]
+    assert finalized.token is not None
+    assert finalized.token.finish_state == "abandoned"
+    metrics = runtime.snapshot()
+    assert metrics["terminal_queued_count"] == 0
+    assert metrics["pending_terminal_count"] == 0
+    assert metrics["terminal_overflow_count"] == 0
+    assert metrics["terminal_abandoned_count"] == 1
+    assert metrics["worker_start_failure_count"] == 1
+    assert metrics["delivery_degraded_count"] == 1
+    assert metrics["delivery_degraded_cause_count"] == 1
+    assert degraded_calls == 1
+    await runtime.close()
+
+
+async def test_finish_processing_exception_still_delivers_failed_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    async def fail_process_finish(_marker: _CandidateFinished) -> None:
+        raise RuntimeError("finish processing failed")
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            terminal_queue_capacity=1,
+            completion_queue_capacity=1,
+        ),
+        on_completion=complete,
+    )
+    monkeypatch.setattr(runtime, "_process_finish", fail_process_finish)
+    candidate = _candidate(910)
+
+    assert runtime.finish_candidate(candidate)
+    token = runtime._candidate_tokens[candidate]
+    await runtime.wait_idle()
+
+    assert token.finish_state == "processed"
+    assert token.completion_state == "attempted"
+    assert token.terminal_reason == "failed"
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="failed",
+            last_checkpoint_ms=None,
+        )
+    ]
+    metrics = runtime.snapshot()
+    assert metrics["inference_failure_count"] == 1
+    assert metrics["completion_count"] == 1
+    assert metrics["completion_dispatched_count"] == 1
+    assert metrics["completion_attempted_count"] == 1
+    assert metrics["pending_terminal_count"] == 0
+    assert metrics["pending_completion_count"] == 0
+    await runtime.close()
+
+
 async def test_finalized_candidate_keeps_completion_when_other_pcm_fills_queue(
 ) -> None:
     completions: list[SpeakerShadowCompletion] = []
@@ -1761,8 +1946,8 @@ async def test_finalized_candidate_keeps_completion_when_other_pcm_fills_queue(
     ]
     metrics = runtime.snapshot()
     assert metrics["completion_count"] == 1
-    assert metrics["dropped_frame_count"] == 1
-    assert metrics["dropped_candidate_count"] == 1
+    assert metrics["dropped_frame_count"] == 0
+    assert metrics["dropped_candidate_count"] == 0
     await runtime.close()
 
 
@@ -1808,7 +1993,7 @@ async def test_completion_callbacks_never_overlap_after_ignored_cancellation(
     assert runtime.finish_candidate(first_candidate)
     await asyncio.wait_for(first_started.wait(), 1.0)
     await runtime.wait_idle()
-    assert runtime._callback_task_kind == "completion"
+    assert runtime._completion_callback_task is not None
 
     assert runtime.finish_candidate(second_candidate)
     await asyncio.sleep(0)
@@ -1825,6 +2010,344 @@ async def test_completion_callbacks_never_overlap_after_ignored_cancellation(
         ("start", second_candidate.shadow_generation),
         ("end", second_candidate.shadow_generation),
     ]
+    await runtime.close()
+
+
+async def test_blocked_completion_keeps_next_completion_queued_until_fifo_turn(
+) -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    order: list[tuple[str, int]] = []
+    first_candidate = _candidate(904)
+    second_candidate = _candidate(905)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        generation = completion.candidate.shadow_generation
+        order.append(("start", generation))
+        try:
+            if completion.candidate == first_candidate:
+                first_started.set()
+                while not release_first.is_set():
+                    try:
+                        await release_first.wait()
+                    except asyncio.CancelledError:
+                        continue
+            else:
+                second_started.set()
+        finally:
+            order.append(("end", generation))
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            queue_capacity=2,
+            terminal_queue_capacity=2,
+            completion_queue_capacity=2,
+            callback_timeout_seconds=0.01,
+        ),
+        on_completion=complete,
+    )
+
+    assert runtime.finish_candidate(first_candidate)
+    first_token = runtime._candidate_tokens[first_candidate]
+    await asyncio.wait_for(first_started.wait(), 1.0)
+    assert runtime.finish_candidate(second_candidate)
+    second_token = runtime._candidate_tokens[second_candidate]
+
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+
+    stalled = runtime.snapshot()
+    assert first_token.completion_state == "dispatched"
+    assert second_token.completion_state == "queued"
+    assert second_started.is_set() is False
+    assert stalled["completion_count"] == 2
+    assert stalled["completion_dispatched_count"] == 1
+    assert stalled["completion_attempted_count"] == 0
+    assert stalled["completion_stall_count"] == 1
+    assert stalled["pending_completion_count"] == 1
+    assert stalled["delivery_degraded_cause_count"] == 1
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), 1.0)
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+
+    assert first_token.completion_state == "attempted"
+    assert second_token.completion_state == "attempted"
+    assert order == [
+        ("start", first_candidate.shadow_generation),
+        ("end", first_candidate.shadow_generation),
+        ("start", second_candidate.shadow_generation),
+        ("end", second_candidate.shadow_generation),
+    ]
+    delivered = runtime.snapshot()
+    assert delivered["completion_dispatched_count"] == 2
+    assert delivered["completion_attempted_count"] == 2
+    assert delivered["pending_completion_count"] == 0
+    await runtime.close()
+
+
+async def test_completion_outbox_overflow_is_explicit_and_never_dispatched() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    delivered_candidates: list[SpeakerShadowCandidateKey] = []
+    first_candidate = _candidate(906)
+    second_candidate = _candidate(907)
+    overflowed_candidate = _candidate(908)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        delivered_candidates.append(completion.candidate)
+        if completion.candidate == first_candidate:
+            first_started.set()
+            while not release_first.is_set():
+                try:
+                    await release_first.wait()
+                except asyncio.CancelledError:
+                    continue
+        elif completion.candidate == second_candidate:
+            second_started.set()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(
+            queue_capacity=3,
+            terminal_queue_capacity=3,
+            completion_queue_capacity=1,
+            callback_timeout_seconds=0.01,
+        ),
+        on_completion=complete,
+    )
+
+    assert runtime.finish_candidate(first_candidate)
+    await asyncio.wait_for(first_started.wait(), 1.0)
+    assert runtime.finish_candidate(second_candidate)
+    second_token = runtime._candidate_tokens[second_candidate]
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while second_token.completion_state != "queued":
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0)
+
+    assert runtime.finish_candidate(overflowed_candidate)
+    overflowed_token = runtime._candidate_tokens[overflowed_candidate]
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+
+    overflowed = runtime.snapshot()
+    assert overflowed_token.finish_state == "processed"
+    assert overflowed_token.completion_state == "abandoned"
+    assert second_token.completion_state == "queued"
+    assert second_started.is_set() is False
+    assert overflowed["completion_count"] == 2
+    assert overflowed["completion_dispatched_count"] == 1
+    assert overflowed["completion_overflow_count"] == 1
+    assert overflowed["completion_abandoned_count"] == 1
+    assert overflowed["pending_completion_count"] == 1
+    assert overflowed["delivery_degraded_count"] == 1
+    assert overflowed["delivery_degraded_cause_count"] >= 1
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), 1.0)
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+
+    assert delivered_candidates == [first_candidate, second_candidate]
+    assert overflowed_candidate not in delivered_candidates
+    assert runtime.snapshot()["completion_dispatched_count"] == 2
+    await runtime.close()
+
+
+async def test_reset_detaches_uncooperative_completion_without_false_busy() -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def complete(_completion: SpeakerShadowCompletion) -> None:
+        callback_started.set()
+        while not release_callback.is_set():
+            try:
+                await release_callback.wait()
+            except asyncio.CancelledError:
+                continue
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(callback_timeout_seconds=0.01),
+        on_completion=complete,
+    )
+    candidate = _candidate(912)
+    assert runtime.finish_candidate(candidate)
+    token = runtime._candidate_tokens[candidate]
+    await asyncio.wait_for(callback_started.wait(), 1.0)
+
+    await asyncio.wait_for(runtime.reset(), 1.0)
+    await asyncio.wait_for(runtime.wait_idle(), 0.2)
+
+    detached = runtime.snapshot()
+    assert token.completion_state == "dispatched"
+    assert detached["detached_callback_task_count"] == 1
+    assert detached["callback_task_count"] == 1
+
+    release_callback.set()
+    await _wait_until(lambda: token.completion_state == "attempted")
+    completed = runtime.snapshot()
+    assert completed["completion_attempted_count"] == 1
+    assert completed["detached_callback_task_count"] == 0
+    assert completed["callback_task_count"] == 0
+    await runtime.close()
+
+
+async def test_reset_stalled_completion_recovers_when_detached_task_finishes() -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    degraded_count = 0
+    recovered_count = 0
+
+    async def complete(_completion: SpeakerShadowCompletion) -> None:
+        callback_started.set()
+        while not release_callback.is_set():
+            try:
+                await release_callback.wait()
+            except asyncio.CancelledError:
+                continue
+
+    def on_degraded() -> None:
+        nonlocal degraded_count
+        degraded_count += 1
+
+    def on_recovered() -> None:
+        nonlocal recovered_count
+        recovered_count += 1
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(callback_timeout_seconds=0.01),
+        on_completion=complete,
+        on_backend_degraded=on_degraded,
+        on_backend_recovered=on_recovered,
+    )
+    candidate = _candidate(913)
+    assert runtime.finish_candidate(candidate)
+    token = runtime._candidate_tokens[candidate]
+    await asyncio.wait_for(callback_started.wait(), 1.0)
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+    assert runtime.snapshot()["delivery_degraded_cause_count"] == 1
+
+    await asyncio.wait_for(runtime.reset(), 1.0)
+    release_callback.set()
+    await _wait_until(lambda: token.completion_state == "attempted")
+
+    recovered = runtime.snapshot()
+    assert degraded_count == 1
+    assert recovered_count == 1
+    assert recovered["delivery_degraded_cause_count"] == 0
+    assert recovered["completion_attempted_count"] == 1
+    await runtime.close()
+
+
+async def test_new_generation_completion_waits_for_detached_predecessor() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    first_candidate = _candidate(915)
+    second_candidate = _candidate(916)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        if completion.candidate == first_candidate:
+            first_started.set()
+            while not release_first.is_set():
+                try:
+                    await release_first.wait()
+                except asyncio.CancelledError:
+                    continue
+            return
+        second_started.set()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(callback_timeout_seconds=0.01),
+        on_completion=complete,
+    )
+    assert runtime.finish_candidate(first_candidate)
+    await asyncio.wait_for(first_started.wait(), 1.0)
+    await asyncio.wait_for(runtime.reset(), 1.0)
+
+    assert runtime.finish_candidate(second_candidate)
+    second_token = runtime._candidate_tokens[second_candidate]
+    await asyncio.wait_for(runtime.wait_idle(), 0.2)
+
+    assert second_token.completion_state == "queued"
+    assert second_started.is_set() is False
+    assert runtime.snapshot()["detached_callback_task_count"] == 1
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), 1.0)
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+    assert second_token.completion_state == "attempted"
+    await runtime.close()
+
+
+async def test_unexpected_worker_cancel_abandons_consumed_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finish_started = asyncio.Event()
+
+    async def block_finish(_marker: _CandidateFinished) -> None:
+        finish_started.set()
+        await asyncio.Event().wait()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(terminal_queue_capacity=1),
+    )
+    monkeypatch.setattr(runtime, "_process_finish", block_finish)
+    candidate = _candidate(914)
+    assert runtime.finish_candidate(candidate)
+    token = runtime._candidate_tokens[candidate]
+    await asyncio.wait_for(finish_started.wait(), 1.0)
+
+    worker = runtime._worker_task
+    assert worker is not None
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    assert token.finish_state == "abandoned"
+    assert token.completion_state == "abandoned"
+    assert runtime.finish_candidate(candidate) is False
+    metrics = runtime.snapshot()
+    assert metrics["pending_terminal_count"] == 0
+    assert metrics["worker_start_failure_count"] == 1
+    assert metrics["delivery_degraded_cause_count"] == 1
+    await runtime.close()
+
+
+async def test_unexpected_worker_cancel_abandons_processed_finish_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finish_processed = asyncio.Event()
+
+    async def block_after_process(marker: _CandidateFinished) -> None:
+        runtime._mark_finish_processed(marker.token)
+        finish_processed.set()
+        await asyncio.Event().wait()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(terminal_queue_capacity=1),
+    )
+    monkeypatch.setattr(runtime, "_process_finish", block_after_process)
+    candidate = _candidate(917)
+    assert runtime.finish_candidate(candidate)
+    token = runtime._candidate_tokens[candidate]
+    await asyncio.wait_for(finish_processed.wait(), 1.0)
+
+    worker = runtime._worker_task
+    assert worker is not None
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    assert token.finish_state == "processed"
+    assert token.completion_state == "abandoned"
+    assert runtime.snapshot()["completion_abandoned_count"] == 1
     await runtime.close()
 
 
@@ -2386,7 +2909,7 @@ async def test_close_retries_after_callback_consumes_first_cancellation() -> Non
         assert profile == bytearray(len(profile))
     finally:
         force_release.set()
-        callback_task = runtime._callback_task
+        callback_task = runtime._observation_task
         if callback_task is not None and not callback_task.done():
             callback_task.cancel()
             await asyncio.wait({callback_task}, timeout=2.0)

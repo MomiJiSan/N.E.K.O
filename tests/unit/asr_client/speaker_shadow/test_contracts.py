@@ -6,11 +6,13 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_BUFFERED_CANDIDATES,
     MAX_SPEAKER_SHADOW_CALLBACK_TIMEOUT_SECONDS,
     MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES,
+    MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY,
     MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES,
     MAX_SPEAKER_SHADOW_FINALIZED_CANDIDATES,
     MAX_SPEAKER_SHADOW_QUEUE_CAPACITY,
     MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES,
     MAX_SPEAKER_SHADOW_SHUTDOWN_GRACE_SECONDS,
+    MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY,
     MAX_SPEAKER_SHADOW_THRESHOLDS,
     SpeakerShadowCandidateKey,
     SpeakerShadowConfig,
@@ -18,6 +20,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowDeferredCandidateControl,
     SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowObservation,
+    SpeakerShadowMetrics,
 )
 
 
@@ -49,6 +52,26 @@ from main_logic.asr_client.speaker_shadow.contracts import (
         (
             {"queue_capacity": MAX_SPEAKER_SHADOW_QUEUE_CAPACITY + 1},
             "queue_capacity",
+        ),
+        ({"terminal_queue_capacity": 0}, "terminal_queue_capacity"),
+        ({"terminal_queue_capacity": True}, "terminal_queue_capacity"),
+        (
+            {
+                "terminal_queue_capacity": (
+                    MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY + 1
+                )
+            },
+            "terminal_queue_capacity",
+        ),
+        ({"completion_queue_capacity": 0}, "completion_queue_capacity"),
+        ({"completion_queue_capacity": 1.5}, "completion_queue_capacity"),
+        (
+            {
+                "completion_queue_capacity": (
+                    MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY + 1
+                )
+            },
+            "completion_queue_capacity",
         ),
         ({"buffered_candidate_capacity": 0}, "buffered_candidate_capacity"),
         (
@@ -128,6 +151,8 @@ def test_config_is_default_off_and_caps_candidate_audio() -> None:
     assert config.completion_confirmation_scopes == ()
     assert config.pending_observation_gate_scopes == ()
     assert config.backend_prewarm_scopes == ()
+    assert config.terminal_queue_capacity == 512
+    assert config.completion_queue_capacity == 512
     assert MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES == 128_000
     assert MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES == 128_000
     assert MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES < 8 * 1024 * 1024
@@ -147,11 +172,61 @@ def test_config_preserves_legacy_positional_argument_order() -> None:
 
     assert config.idle_unload_seconds == 60.0
     assert config.completion_confirmation_scopes == ()
-    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-3:] == (
+    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-5:] == (
         "completion_confirmation_scopes",
         "pending_observation_gate_scopes",
         "backend_prewarm_scopes",
+        "terminal_queue_capacity",
+        "completion_queue_capacity",
     )
+
+
+def test_config_accepts_bounded_terminal_and_completion_capacity_limits() -> None:
+    config = SpeakerShadowConfig(
+        terminal_queue_capacity=MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY,
+        completion_queue_capacity=MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY,
+    )
+
+    assert (
+        config.terminal_queue_capacity
+        == MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY
+    )
+    assert (
+        config.completion_queue_capacity
+        == MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY
+    )
+
+
+def test_metrics_snapshot_exposes_terminal_delivery_aggregate_counters() -> None:
+    metrics = SpeakerShadowMetrics(
+        terminal_queued_count=1,
+        terminal_overflow_count=2,
+        terminal_abandoned_count=3,
+        completion_dispatched_count=4,
+        completion_attempted_count=5,
+        completion_overflow_count=6,
+        completion_abandoned_count=7,
+        completion_stall_count=8,
+        pending_terminal_count=9,
+        pending_completion_count=10,
+        detached_callback_task_count=11,
+        delivery_degraded_count=12,
+    )
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["terminal_queued_count"] == 1
+    assert snapshot["terminal_overflow_count"] == 2
+    assert snapshot["terminal_abandoned_count"] == 3
+    assert snapshot["completion_dispatched_count"] == 4
+    assert snapshot["completion_attempted_count"] == 5
+    assert snapshot["completion_overflow_count"] == 6
+    assert snapshot["completion_abandoned_count"] == 7
+    assert snapshot["completion_stall_count"] == 8
+    assert snapshot["pending_terminal_count"] == 9
+    assert snapshot["pending_completion_count"] == 10
+    assert snapshot["detached_callback_task_count"] == 11
+    assert snapshot["delivery_degraded_count"] == 12
 
 
 def test_config_accepts_nested_pending_gate_and_backend_prewarm_scopes() -> None:

@@ -134,6 +134,7 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "speaker_gate_stale_count",
     "speaker_gate_released_prepare_failure_count",
     "speaker_gate_arm_invalid_count",
+    "speaker_gate_arm_degraded_count",
     "speaker_gate_arm_conflict_count",
     "speaker_gate_arm_runtime_unavailable_count",
     "speaker_gate_arm_lifecycle_rejected_count",
@@ -145,6 +146,7 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "speaker_gate_arm_active_authority_count",
     "speaker_gate_arm_draining_authority_count",
     "speaker_gate_arm_unexpected_state_count",
+    "speaker_gate_released_verifier_degraded_count",
     "provider_candidate_bind_missing_identity_count",
     "provider_candidate_bind_missing_candidate_count",
     "provider_candidate_bind_identity_rejected_count",
@@ -453,6 +455,7 @@ class IndependentAsrRuntime:
             or _uses_smart_turn_endpointing(lifecycle.provider_policy)
             or activation_generation
             != self._speaker_verifier_activation_generation
+            or self._speaker_verifier_degraded
             or candidate.detector_epoch != provider_fence.detector_epoch
             or sealed_token.transport_generation
             != lifecycle.snapshot.transport_generation
@@ -562,6 +565,10 @@ class IndependentAsrRuntime:
         ):
             self._speaker_rejection_metrics["speaker_gate_arm_invalid_count"] += 1
             return False
+        if self._speaker_verifier_degraded:
+            self._speaker_rejection_metrics["speaker_gate_arm_degraded_count"] += 1
+            return False
+        verifier_health_generation = self._speaker_verifier_health_generation
         current_gate = self._asr_speaker_candidate_decision_gate
         if current_gate is not None:
             matches_current = bool(
@@ -629,6 +636,13 @@ class IndependentAsrRuntime:
                 "speaker_gate_arm_prepare_failed_count"
             ] += 1
             return False
+        if (
+            self._speaker_verifier_degraded
+            or self._speaker_verifier_health_generation
+            != verifier_health_generation
+        ):
+            self._speaker_rejection_metrics["speaker_gate_arm_degraded_count"] += 1
+            return False
         if lease is None:
             self._speaker_rejection_metrics[
                 "speaker_gate_arm_prepare_empty_count"
@@ -670,6 +684,9 @@ class IndependentAsrRuntime:
                     and self._asr_audio_generation == audio_generation
                     and self._speaker_verifier_activation_generation
                     == activation_generation
+                    and not self._speaker_verifier_degraded
+                    and self._speaker_verifier_health_generation
+                    == verifier_health_generation
                     and self._asr_lifecycle is lifecycle
                     and self._asr_detector is detector
                     and self._asr_session is not None
@@ -781,6 +798,25 @@ class IndependentAsrRuntime:
                 "speaker_gate_arm_final_lock_cancelled_count"
             ] += 1
             raise
+
+    def _speaker_candidate_decision_is_armed(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        activation_generation: str,
+    ) -> bool:
+        """Confirm exact live gate ownership after an asynchronous arm attempt."""
+
+        gate = getattr(self, "_asr_speaker_candidate_decision_gate", None)
+        return bool(
+            not getattr(self, "_speaker_verifier_degraded", False)
+            and gate is not None
+            and type(candidate) is SpeakerShadowCandidateKey
+            and type(activation_generation) is str
+            and gate.candidate == candidate
+            and gate.activation_generation == activation_generation
+            and not gate.resolved.done()
+        )
 
     def _release_speaker_candidate_decision_gate(
         self,
@@ -933,12 +969,28 @@ class IndependentAsrRuntime:
         """Expose Owner verifier health without changing ASR transport flow."""
 
         self._ensure_asr_runtime_state()
+        if not self._speaker_verifier_degraded:
+            self._speaker_verifier_health_generation += 1
         self._speaker_verifier_degraded = True
+        preparation = self._asr_speaker_candidate_decision_preparation
+        if preparation is not None:
+            preparation.retired = True
+            if not preparation.resolved.done():
+                preparation.resolved.set_result(None)
+            self._asr_speaker_candidate_decision_preparation = None
+        gate = self._asr_speaker_candidate_decision_gate
+        if gate is not None and gate.rejection_task is None:
+            self._release_speaker_candidate_decision_gate(
+                gate,
+                metric_name="speaker_gate_released_verifier_degraded_count",
+            )
 
     def _mark_speaker_verifier_healthy(self) -> None:
         """Clear transient Owner verifier health degradation after recovery."""
 
         self._ensure_asr_runtime_state()
+        if self._speaker_verifier_degraded:
+            self._speaker_verifier_health_generation += 1
         self._speaker_verifier_degraded = False
 
     @staticmethod
@@ -1237,6 +1289,7 @@ class IndependentAsrRuntime:
         self._speaker_verifier_factory: SpeakerShadowFactory | None = None
         self._speaker_verifier_activation_generation: str | None = None
         self._speaker_verifier_degraded = False
+        self._speaker_verifier_health_generation = 0
         self._speaker_verifier_lock = asyncio.Lock()
         self._asr_candidate_rejection: _CandidateRejectionSuppression | None = None
         self._asr_speaker_candidate_decision_gate: (
@@ -1362,8 +1415,11 @@ class IndependentAsrRuntime:
             self._speaker_verifier_factory = None
             self._speaker_verifier_activation_generation = None
             self._speaker_verifier_degraded = False
+            self._speaker_verifier_health_generation = 0
         elif not hasattr(self, "_speaker_verifier_degraded"):
             self._speaker_verifier_degraded = False
+        if not hasattr(self, "_speaker_verifier_health_generation"):
+            self._speaker_verifier_health_generation = 0
         if not hasattr(self, "_speaker_verifier_lock"):
             self._speaker_verifier_lock = asyncio.Lock()
         if not hasattr(self, "_asr_candidate_rejection"):
