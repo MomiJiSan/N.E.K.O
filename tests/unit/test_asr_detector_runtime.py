@@ -30,8 +30,15 @@ from main_logic.asr_client.endpointing.micro_event_policy import (
     ProviderMicroEventConfig,
 )
 from main_logic.asr_client.endpointing.silero_vad import SileroFeedResult
-from main_logic.asr_client.lifecycle import VoiceIngressToken, VoiceTurnToken
+from main_logic.asr_client.lifecycle import (
+    VoiceIngressToken,
+    VoiceInputLifecycleController,
+    VoiceLifecycleEvent,
+    VoiceRouteMode,
+    VoiceTurnToken,
+)
 from main_logic.asr_client.provider_policy import AsrProviderPolicy
+from main_logic.asr_client.runtime import AsrRuntimeCallbacks, IndependentAsrRuntime
 from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
 from main_logic.asr_client.endpointing.throttle_policy import (
     ThrottleAction,
@@ -758,6 +765,119 @@ async def test_ordered_provider_overlap_preserves_exact_fifo_ownership() -> None
     assert diagnostics["provider_speaker_segment_deferred_count"] == 1
     assert diagnostics["provider_speaker_segment_activated_count"] == 1
     assert diagnostics["provider_speaker_segment_exact_snapshot_count"] == 1
+    await detector.close()
+
+
+async def test_runtime_legacy_fallback_does_not_create_cross_candidate_gap() -> (
+    None
+):
+    policy = _provider_endpoint_policy()
+    shadow = _DeferredSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=policy,
+        speaker_shadow=shadow,
+    )
+    lifecycle = VoiceInputLifecycleController(
+        provider_policy=policy,
+        shadow_mode=False,
+    )
+    lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    runtime = IndependentAsrRuntime(
+        AsrRuntimeCallbacks(
+            display_name=lambda: "provider-sequence-test",
+            on_prepare_turn=AsyncMock(return_value=True),
+            on_partial=AsyncMock(),
+            on_final=AsyncMock(),
+            on_turn_abandoned=AsyncMock(),
+            on_failure=AsyncMock(),
+            on_status=AsyncMock(),
+            on_lifecycle=AsyncMock(),
+        )
+    )
+    runtime._asr_session_epoch = 1
+    runtime._asr_audio_generation = 1
+    runtime._asr_lifecycle = lifecycle
+    runtime._asr_detector = detector
+    runtime._asr_current_ingress_token = _ingress_token()
+
+    candidate_a, identity_a, token_a = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    assert await runtime._observe_admitted_provider_audio(
+        lifecycle,
+        detector,
+        b"\x41\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_a,
+        split_before_audio=False,
+        evidence_complete=True,
+        turn_token=token_a,
+    ) is True
+    segment_a = detector._provider_speaker_segments[0]
+    shadow_a = segment_a.candidate
+    assert shadow_a is not None
+
+    assert await runtime._observe_admitted_provider_audio(
+        lifecycle,
+        detector,
+        b"\x42\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=None,
+        split_before_audio=False,
+        evidence_complete=False,
+        turn_token=token_a,
+    ) is True
+
+    assert runtime._asr_provider_speaker_sequence == 1
+    assert segment_a.evidence_complete is False
+    assert segment_a.ownership_ambiguous is True
+    assert candidate_a in detector._provider_micro_event_ambiguous_candidates
+
+    fence_a = await detector.seal_provider_candidate(token_a)
+    assert fence_a is not None
+    assert await detector.prepare_candidate_rejection(shadow_a) is None
+    assert await detector.complete_provider_candidate(fence_a) is False
+    lifecycle.transition(VoiceLifecycleEvent.TURN_SEALED)
+    lifecycle.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
+    lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+
+    candidate_b, identity_b, token_b = await _open_provider_candidate(
+        detector,
+        turn_id=2,
+    )
+    assert candidate_b == DetectorCandidateKey(0, 1)
+    assert await runtime._observe_admitted_provider_audio(
+        lifecycle,
+        detector,
+        b"\x43\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity_b,
+        split_before_audio=False,
+        evidence_complete=True,
+        turn_token=token_b,
+    ) is True
+
+    assert runtime._asr_provider_speaker_sequence == 2
+    segment_b = detector._provider_speaker_segments[0]
+    assert segment_b.detector_candidate == candidate_b
+    assert segment_b.evidence_complete is True
+    assert segment_b.ownership_ambiguous is False
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["provider_speaker_segment_sequence_gap_count"] == 0
+
+    shadow_b = segment_b.candidate
+    assert shadow_b is not None
+    fence_b = await detector.seal_provider_candidate(token_b)
+    assert fence_b is not None
+    sealed_b = await detector.prepare_candidate_rejection(shadow_b)
+    assert sealed_b is not None
+    assert sealed_b.provider_fence == fence_b
     await detector.close()
 
 

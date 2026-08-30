@@ -2253,8 +2253,6 @@ class IndependentAsrRuntime:
                 sample_rate_hz=sample_rate_hz,
             )
             return True
-        self._asr_provider_speaker_sequence += 1
-        sequence_no = self._asr_provider_speaker_sequence
         observe_ordered = getattr(
             detector,
             "observe_provider_audio_ordered",
@@ -2265,6 +2263,10 @@ class IndependentAsrRuntime:
             turn_token=turn_token,
         )
         if identity is not None and callable(observe_ordered):
+            # Number ordered-observer dispatch attempts only. Explicit
+            # fallback revokes incomplete evidence directly.
+            self._asr_provider_speaker_sequence += 1
+            sequence_no = self._asr_provider_speaker_sequence
             try:
                 await observe_ordered(
                     pcm16,

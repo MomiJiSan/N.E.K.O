@@ -484,28 +484,78 @@ async def test_provider_ordered_observation_missing_identity_uses_legacy_fallbac
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    first_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=52,
+    )
+    third_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=54,
+    )
     detector.feed = AsyncMock(  # type: ignore[attr-defined]
-        return_value=DetectorFeedResult(
-            events=(),
-            throttle_available=True,
-            identity=None,
-            candidate=DetectorCandidateKey(7, 11),
+        side_effect=(
+            DetectorFeedResult(
+                events=(),
+                throttle_available=True,
+                identity=first_identity,
+                candidate=DetectorCandidateKey(7, 11),
+            ),
+            DetectorFeedResult(
+                events=(),
+                throttle_available=True,
+                identity=None,
+                candidate=DetectorCandidateKey(7, 11),
+            ),
+            DetectorFeedResult(
+                events=(),
+                throttle_available=True,
+                identity=third_identity,
+                candidate=DetectorCandidateKey(7, 11),
+            ),
         )
     )
     runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
         return_value=True
     )
-    pcm16 = b"\x0b\x00" * 160
+    first_pcm16 = b"\x0a\x00" * 160
+    fallback_pcm16 = b"\x0b\x00" * 160
+    third_pcm16 = b"\x0c\x00" * 160
 
-    result = await runtime.submit(
-        ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
-        ingress_token=turn_token.ingress,
-    )
+    results = [
+        await runtime.submit(
+            ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
+            ingress_token=turn_token.ingress,
+        )
+        for pcm16 in (first_pcm16, fallback_pcm16, third_pcm16)
+    ]
 
-    assert result.status is AsrSubmitStatus.ACCEPTED
-    detector.observe_provider_audio_ordered.assert_not_awaited()
+    assert [result.status for result in results] == [
+        AsrSubmitStatus.ACCEPTED,
+        AsrSubmitStatus.ACCEPTED,
+        AsrSubmitStatus.ACCEPTED,
+    ]
+    assert detector.observe_provider_audio_ordered.await_args_list == [
+        call(
+            first_pcm16,
+            sample_rate_hz=16_000,
+            identity=first_identity,
+            sequence_no=1,
+            split_before_audio=False,
+            evidence_complete=True,
+        ),
+        call(
+            third_pcm16,
+            sample_rate_hz=16_000,
+            identity=third_identity,
+            sequence_no=2,
+            split_before_audio=False,
+            evidence_complete=True,
+        ),
+    ]
     detector.observe_provider_audio.assert_called_once_with(
-        pcm16,
+        fallback_pcm16,
         sample_rate_hz=16_000,
     )
     await _close_dispatchers(runtime)
@@ -537,21 +587,107 @@ async def test_provider_ordered_observation_failure_keeps_admitted_audio() -> No
     runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
         return_value=True
     )
-    detector.observe_provider_audio_ordered.side_effect = RuntimeError(
-        "private observer failure"
+    detector.observe_provider_audio_ordered.side_effect = (
+        RuntimeError("first private observer failure"),
+        RuntimeError("second private observer failure"),
+        None,
     )
-    pcm16 = b"\x0e\x00" * 160
+    pcm_frames = (
+        b"\x0e\x00" * 160,
+        b"\x0f\x00" * 160,
+        b"\x10\x00" * 160,
+    )
 
-    result = await runtime.submit(
-        ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
-        ingress_token=turn_token.ingress,
-    )
+    results = [
+        await runtime.submit(
+            ProcessedVoiceFrame(pcm16, 16_000, 0.9, True),
+            ingress_token=turn_token.ingress,
+        )
+        for pcm16 in pcm_frames
+    ]
     await runtime._asr_audio_dispatcher.wait_idle()
 
-    assert result.status is AsrSubmitStatus.ACCEPTED
-    detector.observe_provider_audio_ordered.assert_awaited_once()
+    assert [result.status for result in results] == [
+        AsrSubmitStatus.ACCEPTED,
+        AsrSubmitStatus.ACCEPTED,
+        AsrSubmitStatus.ACCEPTED,
+    ]
+    assert [
+        awaited.kwargs["sequence_no"]
+        for awaited in detector.observe_provider_audio_ordered.await_args_list
+    ] == [1, 2, 3]
     detector.observe_provider_audio.assert_not_called()
-    session.stream_audio.assert_awaited_once_with(pcm16, sample_rate_hz=16_000)
+    assert session.stream_audio.await_args_list == [
+        call(pcm16, sample_rate_hz=16_000) for pcm16 in pcm_frames
+    ]
+    await _close_dispatchers(runtime)
+
+
+async def test_concurrent_ordered_observers_reserve_unique_sequences() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    entered_sequences: list[int] = []
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_observer(
+        _pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        identity: DetectorIngressIdentity,
+        sequence_no: int,
+        split_before_audio: bool,
+        evidence_complete: bool,
+    ) -> None:
+        assert sample_rate_hz == 16_000
+        assert identity.ingress_token == turn_token.ingress
+        assert split_before_audio is False
+        assert evidence_complete is True
+        entered_sequences.append(sequence_no)
+        if len(entered_sequences) == 2:
+            both_entered.set()
+        await release.wait()
+
+    detector.observe_provider_audio_ordered.side_effect = blocked_observer
+    identities = (
+        DetectorIngressIdentity(
+            ingress_token=turn_token.ingress,
+            detector_epoch=7,
+            sequence_no=71,
+        ),
+        DetectorIngressIdentity(
+            ingress_token=turn_token.ingress,
+            detector_epoch=7,
+            sequence_no=72,
+        ),
+    )
+    tasks = tuple(
+        asyncio.create_task(
+            runtime._observe_admitted_provider_audio(
+                lifecycle,
+                detector,
+                bytes((value, 0)) * 160,
+                sample_rate_hz=16_000,
+                identity=identity,
+                split_before_audio=False,
+                evidence_complete=True,
+                turn_token=turn_token,
+            )
+        )
+        for value, identity in zip((17, 18), identities, strict=True)
+    )
+
+    await asyncio.wait_for(both_entered.wait(), 1)
+    assert entered_sequences == [1, 2]
+    assert len(set(entered_sequences)) == 2
+    release.set()
+    assert await asyncio.wait_for(asyncio.gather(*tasks), 1) == [True, True]
     await _close_dispatchers(runtime)
 
 
