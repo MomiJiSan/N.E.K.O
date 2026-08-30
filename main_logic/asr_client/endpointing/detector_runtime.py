@@ -3513,7 +3513,6 @@ class DetectorRuntime:
     ) -> bool:
         """Discard only successor activity while preserving the sealed fence."""
 
-        speaker_shadow: SpeakerShadowObserver | None = None
         async with self._lock:
             if (
                 self._closed
@@ -3538,14 +3537,14 @@ class DetectorRuntime:
             self._speech_active = False
             self._policy_event_candidate = None
             self._throttle_policy.reset_candidate_activity()
-            self._reset_speaker_shadow_identity()
+            self._finish_speaker_shadow_candidate(
+                expected_scope="provider_candidate"
+            )
             if self._speaker_shadow_suppressed_candidate == (
                 self._detector_epoch,
                 "provider_candidate",
             ):
                 self._speaker_shadow_suppressed_candidate = None
-            speaker_shadow = self._speaker_shadow
-        await self._reset_speaker_shadow(speaker_shadow)
         await self._drain_provider_segment_expiry_tasks()
         return True
 

@@ -2348,6 +2348,164 @@ async def test_real_speaker_shadow_2999ms_completion_confirms_waiting_final(
     await _close_dispatchers(runtime)
 
 
+async def test_real_2999ms_reset_abandons_confirmation_and_forwards_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS",
+        5.0,
+    )
+
+    from main_logic.asr_client.speaker_shadow.asset_manifest import (
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+    )
+    from main_logic.asr_client.speaker_shadow.campplus import (
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    from main_logic.voice_identity.contracts import SpeakerModelIdentity
+    from main_logic.voice_identity.profile import SpeakerProfile
+    from main_logic.voice_identity.reference import SpeakerReference
+    from main_logic.voice_identity_service.asr_composition import (
+        OwnerVoiceAsrCompositionFactory,
+    )
+
+    class _BlockingConfirmationHost:
+        alive = True
+
+        def __init__(self) -> None:
+            self.score_count = 0
+            self.confirmation_started = asyncio.Event()
+            self.confirmation_release = asyncio.Event()
+
+        async def score(
+            self,
+            _pcm16: bytes,
+            *,
+            timeout_seconds: float,
+        ) -> float:
+            assert timeout_seconds > 0
+            self.score_count += 1
+            if self.score_count == 2:
+                self.confirmation_started.set()
+                await self.confirmation_release.wait()
+            return 0.20
+
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    model_identity = SpeakerModelIdentity(
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    embedding = np.arange(1, CAMPPLUS_EMBEDDING_DIM + 1, dtype=np.float32)
+    reference = SpeakerReference(model_identity, embedding)
+    embedding.fill(0.0)
+    try:
+        profile = SpeakerProfile("profile-generation", reference)
+    finally:
+        reference.close()
+    composition = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    shadow = composition()
+    scoring_host = _BlockingConfirmationHost()
+    monkeypatch.setattr(
+        shadow,
+        "_ensure_backend",
+        AsyncMock(return_value=scoring_host),
+    )
+    candidate = _shadow_candidate()
+    first_checkpoint_pcm16 = b"\x31\x00" * (16_000 * 1_500 // 1_000)
+    confirmation_tail_pcm16 = b"\x32\x00" * (16_000 * 1_499 // 1_000)
+    final_task: asyncio.Task[None] | None = None
+
+    try:
+        assert shadow.submit(
+            first_checkpoint_pcm16,
+            sample_rate_hz=16_000,
+            candidate=candidate,
+        )
+        await shadow.wait_idle()
+        gate = runtime._asr_speaker_candidate_decision_gate
+        assert gate is not None
+        assert candidate in composition._armed_candidates
+        _seal_installed_provider_candidate(
+            runtime,
+            detector,
+            session,
+            lifecycle,
+            turn_token,
+        )
+
+        assert shadow.submit(
+            confirmation_tail_pcm16,
+            sample_rate_hz=16_000,
+            candidate=candidate,
+        )
+        token = shadow._candidate_tokens[candidate]
+        assert shadow.finish_candidate(candidate)
+        await asyncio.wait_for(scoring_host.confirmation_started.wait(), 1.0)
+        assert token.finish_state == "processed"
+        assert token.completion_state == "none"
+
+        final_task = asyncio.create_task(
+            runtime._handle_independent_asr_final(
+                "reset-fail-open-final",
+                0,
+                "qwen",
+            )
+        )
+        while not gate.wait_started:
+            await asyncio.sleep(0)
+        callbacks.on_final.assert_not_awaited()
+
+        await asyncio.wait_for(shadow.reset(), 1.0)
+        await asyncio.wait_for(final_task, 0.5)
+        final_task = None
+        await runtime.wait_transcript_idle()
+
+        assert token.finish_state == "processed"
+        assert token.completion_state == "abandoned"
+        shadow_metrics = shadow.snapshot()
+        assert shadow_metrics["completion_abandoned_count"] == 1
+        assert shadow_metrics["completion_count"] == 0
+        assert not composition._armed_candidates
+        assert runtime._asr_speaker_candidate_decision_gate is None
+        diagnostics = runtime._speaker_verifier_diagnostics()
+        assert diagnostics["speaker_gate_waited_count"] == 1
+        assert diagnostics["speaker_gate_timeout_count"] == 0
+        assert diagnostics["speaker_gate_released_verifier_degraded_count"] == 1
+        assert diagnostics["rejection_task_scheduled_count"] == 0
+        assert diagnostics["rejection_task_applied_count"] == 0
+        callbacks.on_final.assert_awaited_once()
+        assert callbacks.on_final.await_args.args[0].text == "reset-fail-open-final"
+        assert detector.lease is not None and detector.lease.commit_calls == 0
+    finally:
+        scoring_host.confirmation_release.set()
+        if final_task is not None:
+            final_task.cancel()
+            await asyncio.gather(final_task, return_exceptions=True)
+        await shadow.wait_idle()
+        await shadow.close()
+        composition.close()
+        profile.close()
+        await _close_dispatchers(runtime)
+
+
 async def test_real_detector_fifo_2999ms_tail_rejects_only_second_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

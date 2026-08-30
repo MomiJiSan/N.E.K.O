@@ -2242,6 +2242,234 @@ async def test_reset_stalled_completion_recovers_when_detached_task_finishes() -
     await runtime.close()
 
 
+async def test_concurrent_reset_shares_cleanup_when_one_waiter_is_cancelled() -> None:
+    callback_started = asyncio.Event()
+    callback_cancelled = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def observe(_observation: SpeakerShadowObservation) -> None:
+        callback_started.set()
+        while not callback_release.is_set():
+            try:
+                await callback_release.wait()
+            except asyncio.CancelledError:
+                callback_cancelled.set()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(callback_timeout_seconds=0.05),
+        on_observation=observe,
+    )
+    candidate = _candidate(918)
+    assert runtime.submit(
+        _pcm(1_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    await asyncio.wait_for(callback_started.wait(), 1.0)
+    generation = runtime.generation
+
+    first_reset = asyncio.create_task(runtime.reset())
+    await asyncio.wait_for(callback_cancelled.wait(), 1.0)
+    second_reset = asyncio.create_task(runtime.reset())
+    await asyncio.sleep(0)
+    first_reset.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_reset
+
+    callback_release.set()
+    await asyncio.wait_for(second_reset, 1.0)
+    await asyncio.wait_for(runtime.wait_idle(), 1.0)
+
+    assert runtime.generation == generation + 1
+    snapshot = runtime.snapshot()
+    assert snapshot["retained_pcm_bytes"] == 0
+    assert snapshot["queued_item_count"] == 0
+    assert snapshot["pending_completion_count"] == 0
+    assert runtime.requires_provisional_decision(candidate) is False
+    await runtime.close()
+
+
+async def test_reset_blocks_admission_and_provisional_capability_until_done() -> None:
+    callback_started = asyncio.Event()
+    callback_cancelled = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def observe(_observation: SpeakerShadowObservation) -> None:
+        callback_started.set()
+        while not callback_release.is_set():
+            try:
+                await callback_release.wait()
+            except asyncio.CancelledError:
+                callback_cancelled.set()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(callback_timeout_seconds=0.05),
+        on_observation=observe,
+    )
+    reset_task: asyncio.Task[None] | None = None
+    try:
+        stale_candidate = _candidate(919)
+        new_candidate = _candidate(920)
+        deferred_candidate = _candidate(921)
+        assert runtime.submit(
+            _pcm(1_500),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=stale_candidate,
+        )
+        await asyncio.wait_for(callback_started.wait(), 1.0)
+        assert runtime.requires_provisional_decision(stale_candidate) is True
+        assert runtime.defer_candidate(deferred_candidate)
+
+        reset_task = asyncio.create_task(runtime.reset())
+        await asyncio.wait_for(callback_cancelled.wait(), 1.0)
+
+        assert runtime.requires_provisional_decision(stale_candidate) is False
+        assert runtime.supports_deferred_candidate(new_candidate) is True
+        assert runtime.defer_candidate(new_candidate) is False
+        assert runtime.activate_candidate(deferred_candidate) is False
+        assert runtime.submit(
+            _pcm(1),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=new_candidate,
+        ) is False
+        assert runtime.finish_candidate(new_candidate) is False
+
+        callback_release.set()
+        await asyncio.wait_for(reset_task, 1.0)
+        reset_task = None
+        assert runtime.supports_deferred_candidate(new_candidate) is True
+        assert runtime.submit(
+            _pcm(1),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=new_candidate,
+        )
+        await runtime.wait_idle()
+    finally:
+        callback_release.set()
+        if reset_task is not None:
+            await asyncio.gather(reset_task, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_reset_abandons_completion_after_finish_was_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finish_processed = asyncio.Event()
+    finish_release = asyncio.Event()
+
+    async def block_after_process(marker: _CandidateFinished) -> None:
+        runtime._mark_finish_processed(marker.token)
+        finish_processed.set()
+        await finish_release.wait()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(terminal_queue_capacity=1),
+    )
+    monkeypatch.setattr(runtime, "_process_finish", block_after_process)
+    candidate = _candidate(921)
+    try:
+        assert runtime.finish_candidate(candidate)
+        token = runtime._candidate_tokens[candidate]
+        await asyncio.wait_for(finish_processed.wait(), 1.0)
+        assert token.finish_state == "processed"
+        assert token.completion_state == "none"
+
+        await asyncio.wait_for(runtime.reset(), 1.0)
+
+        assert token.finish_state == "processed"
+        assert token.completion_state == "abandoned"
+        assert runtime.snapshot()["completion_abandoned_count"] == 1
+        finish_release.set()
+        await asyncio.wait_for(runtime.wait_idle(), 1.0)
+    finally:
+        finish_release.set()
+        await runtime.close()
+
+
+async def test_reset_abandons_completion_for_queued_terminal() -> None:
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(terminal_queue_capacity=1),
+    )
+    runtime._worker_task = fake_worker
+    candidate = _candidate(922)
+
+    try:
+        assert runtime.finish_candidate(candidate)
+        token = runtime._candidate_tokens[candidate]
+        assert token.finish_state == "queued"
+        assert token.completion_state == "none"
+
+        await asyncio.wait_for(runtime.reset(), 1.0)
+
+        assert token.finish_state == "abandoned"
+        assert token.completion_state == "abandoned"
+        snapshot = runtime.snapshot()
+        assert snapshot["terminal_abandoned_count"] == 1
+        assert snapshot["completion_abandoned_count"] == 1
+        assert snapshot["pending_terminal_count"] == 0
+    finally:
+        hold_worker.set()
+        await fake_worker
+        await runtime.close()
+
+
+async def test_finalized_tombstone_before_marker_still_delivers_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_processed = asyncio.Event()
+    frame_release = asyncio.Event()
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.8),
+        config=_config(minimum_audio_ms=20, queue_capacity=2),
+        on_completion=complete,
+    )
+    process_frame = runtime._process_frame
+
+    async def pause_after_frame(frame: _AudioFrame) -> None:
+        await process_frame(frame)
+        frame_processed.set()
+        await frame_release.wait()
+
+    monkeypatch.setattr(runtime, "_process_frame", pause_after_frame)
+    candidate = _candidate(923)
+    assert runtime.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    token = runtime._candidate_tokens[candidate]
+    assert runtime.finish_candidate(candidate)
+    await asyncio.wait_for(frame_processed.wait(), 2.0)
+
+    assert candidate in runtime._finalized
+    assert token.finish_state == "queued"
+    assert token.completion_state == "none"
+    frame_release.set()
+    await asyncio.wait_for(runtime.wait_idle(), 2.0)
+
+    assert token.finish_state == "processed"
+    assert token.completion_state == "attempted"
+    assert completions == [
+        SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="scored",
+            last_checkpoint_ms=20,
+        )
+    ]
+    await runtime.close()
+
+
 async def test_new_generation_completion_waits_for_detached_predecessor() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -2349,6 +2577,82 @@ async def test_unexpected_worker_cancel_abandons_processed_finish_completion(
     assert token.completion_state == "abandoned"
     assert runtime.snapshot()["completion_abandoned_count"] == 1
     await runtime.close()
+
+
+async def test_unexpected_worker_cancel_drains_following_terminals_and_idle_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_started = asyncio.Event()
+
+    async def block_first(_marker: _CandidateFinished) -> None:
+        first_started.set()
+        await asyncio.Event().wait()
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_config(queue_capacity=2, terminal_queue_capacity=2),
+    )
+    process_finish = runtime._process_finish
+    monkeypatch.setattr(runtime, "_process_finish", block_first)
+    first_candidate = _candidate(924)
+    second_candidate = _candidate(925)
+    queued_audio_candidate = _candidate(926)
+    restarted_candidate = _candidate(927)
+
+    try:
+        assert runtime.finish_candidate(first_candidate)
+        first_token = runtime._candidate_tokens[first_candidate]
+        await asyncio.wait_for(first_started.wait(), 1.0)
+        assert runtime.finish_candidate(second_candidate)
+        second_token = runtime._candidate_tokens[second_candidate]
+        assert second_token.finish_state == "queued"
+        assert runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=queued_audio_candidate,
+        )
+        queued_audio_token = runtime._candidate_tokens[queued_audio_candidate]
+        assert queued_audio_token.accepted_sample_count > 0
+
+        worker = runtime._worker_task
+        assert worker is not None
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        await asyncio.sleep(0)
+        await asyncio.wait_for(runtime.wait_idle(), 1.0)
+
+        assert first_token.finish_state == "abandoned"
+        assert first_token.completion_state == "abandoned"
+        assert second_token.finish_state == "abandoned"
+        assert second_token.completion_state == "abandoned"
+        assert queued_audio_token.terminal_reason == "dropped"
+        assert queued_audio_candidate in runtime._finalized
+        assert runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=queued_audio_candidate,
+        ) is False
+        snapshot = runtime.snapshot()
+        assert snapshot["queued_item_count"] == 0
+        assert snapshot["pending_terminal_count"] == 0
+        assert snapshot["retained_pcm_bytes"] == 0
+        assert snapshot["terminal_abandoned_count"] == 2
+        assert snapshot["completion_abandoned_count"] == 2
+
+        monkeypatch.setattr(runtime, "_process_finish", process_finish)
+        assert runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=restarted_candidate,
+        )
+        assert runtime.finish_candidate(restarted_candidate)
+        restarted_token = runtime._candidate_tokens[restarted_candidate]
+        await asyncio.wait_for(runtime.wait_idle(), 1.0)
+        assert restarted_token.finish_state == "processed"
+        assert restarted_token.completion_state == "attempted"
+    finally:
+        await runtime.close()
 
 
 async def test_buffers_and_tombstones_remain_bounded() -> None:

@@ -403,6 +403,24 @@ class _DeferredSpeakerShadowSpy(_SpeakerShadowSpy):
         return True
 
 
+class _PendingCompletionSpeakerShadowSpy(_DeferredSpeakerShadowSpy):
+    """Model terminal work that a whole-shadow reset would incorrectly erase."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending_completions: list[SpeakerShadowCandidateKey] = []
+
+    def finish_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        accepted = super().finish_candidate(candidate)
+        if accepted:
+            self.pending_completions.append(candidate)
+        return accepted
+
+    async def reset(self) -> None:
+        await super().reset()
+        self.pending_completions.clear()
+
+
 def _smart_turn_policy() -> AsrProviderPolicy:
     return AsrProviderPolicy(
         transport="segmented",
@@ -535,7 +553,7 @@ async def test_speaker_shadow_default_none_keeps_smart_turn_callbacks_installed(
 
 
 async def test_provider_shadow_observes_admitted_pcm_until_explicit_seal() -> None:
-    shadow = _SpeakerShadowSpy()
+    shadow = _PendingCompletionSpeakerShadowSpy()
     gate = _Gate((SpeechActivityEvent.CANDIDATE_PAUSE,))
     detector = DetectorRuntime(
         vad=_Vad(),
@@ -584,7 +602,14 @@ async def test_provider_shadow_observes_admitted_pcm_until_explicit_seal() -> No
     assert await detector.discard_provider_successor(fence) is True
     assert detector._speaker_shadow_candidate is None
     assert detector._speaker_shadow_generation == 2
-    assert shadow.reset_calls == 1
+    successor_candidate = SpeakerShadowCandidateKey(
+        0,
+        1,
+        "provider_candidate",
+    )
+    assert shadow.finished == [candidate, successor_candidate]
+    assert shadow.pending_completions == [candidate, successor_candidate]
+    assert shadow.reset_calls == 0
 
     replacement_pcm = b"\x04\x00" * 160
     detector.observe_provider_audio(replacement_pcm, sample_rate_hz=16_000)
@@ -596,6 +621,128 @@ async def test_provider_shadow_observes_admitted_pcm_until_explicit_seal() -> No
 
     await detector.close()
     assert shadow.close_calls == 1
+
+
+async def test_ordered_discard_finishes_only_successor_without_reset() -> None:
+    shadow = _PendingCompletionSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _predecessor, predecessor_identity, predecessor_token = (
+        await _open_provider_candidate(detector, turn_id=1)
+    )
+    predecessor_pcm = b"\x05\x00" * 160
+    await detector.observe_provider_audio_ordered(
+        predecessor_pcm,
+        sample_rate_hz=16_000,
+        identity=predecessor_identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    predecessor_shadow = detector._provider_speaker_segments[0].candidate
+    assert predecessor_shadow == SpeakerShadowCandidateKey(
+        0,
+        0,
+        "provider_candidate",
+    )
+    fence = await detector.seal_provider_candidate(predecessor_token)
+    assert fence is not None
+    assert shadow.pending_completions == [predecessor_shadow]
+    assert not detector._provider_speaker_segments
+
+    successor_pcm = b"\x06\x00" * 160
+    successor = await detector.feed(
+        successor_pcm,
+        ingress_token=_ingress_token(),
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert successor.identity is not None
+    await detector.observe_provider_audio_ordered(
+        successor_pcm,
+        sample_rate_hz=16_000,
+        identity=successor.identity,
+        sequence_no=2,
+        split_before_audio=False,
+    )
+    successor_shadow = detector._provider_speaker_segments[0].candidate
+    assert successor_shadow == SpeakerShadowCandidateKey(
+        0,
+        1,
+        "provider_candidate",
+    )
+    deferred_pcm = b"\x07\x00" * 160
+    deferred = await detector.feed(
+        deferred_pcm,
+        ingress_token=_ingress_token(),
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert deferred.identity is not None
+    await detector.observe_provider_audio_ordered(
+        deferred_pcm,
+        sample_rate_hz=16_000,
+        identity=deferred.identity,
+        sequence_no=3,
+        split_before_audio=True,
+    )
+    deferred_shadow = detector._provider_speaker_segments[1].candidate
+    assert deferred_shadow == SpeakerShadowCandidateKey(
+        0,
+        2,
+        "provider_candidate",
+    )
+
+    assert await detector.discard_provider_successor(fence) is True
+
+    assert shadow.finished == [
+        predecessor_shadow,
+        successor_shadow,
+        deferred_shadow,
+    ]
+    assert shadow.pending_completions == [
+        predecessor_shadow,
+        successor_shadow,
+        deferred_shadow,
+    ]
+    assert shadow.reset_calls == 0
+    assert detector._provider_candidate_fence == fence
+    assert detector._provider_segment_ordered_mode is True
+    assert detector._provider_segment_last_sequence_no == 3
+    assert detector._speaker_shadow_generation == 4
+    assert not detector._provider_speaker_segments
+    assert detector._provider_segment_expiry_task is None
+    assert not detector._provider_segment_retired_expiry_tasks
+
+    replacement_pcm = b"\x08\x00" * 160
+    replacement = await detector.feed(
+        replacement_pcm,
+        ingress_token=_ingress_token(),
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert replacement.identity is not None
+    await detector.observe_provider_audio_ordered(
+        replacement_pcm,
+        sample_rate_hz=16_000,
+        identity=replacement.identity,
+        sequence_no=4,
+        split_before_audio=False,
+    )
+    replacement_segment = detector._provider_speaker_segments[0]
+    assert replacement_segment.candidate == SpeakerShadowCandidateKey(
+        0,
+        4,
+        "provider_candidate",
+    )
+    assert replacement_segment.evidence_complete is True
+    assert replacement_segment.ownership_ambiguous is False
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["provider_speaker_segment_sequence_gap_count"] == 0
+    await detector.close()
 
 
 @pytest.mark.parametrize("status", ["missing", "false"])

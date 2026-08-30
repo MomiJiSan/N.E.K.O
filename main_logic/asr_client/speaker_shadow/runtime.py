@@ -42,6 +42,7 @@ _DegradedCause = Literal[
     "completion_stalled",
     "worker_start_failure",
     "dispatcher_start_failure",
+    "resetting",
 ]
 
 
@@ -548,16 +549,19 @@ class SpeakerShadowRuntime:
         self._detached_completion_tokens: dict[
             asyncio.Task[None], _CandidateToken
         ] = {}
+        self._reset_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._host_start_task: asyncio.Task[_BackendProcessHost] | None = None
         self._active_evaluation: tuple[int, SpeakerShadowCandidateKey] | None = None
         self._active_evaluation_terminal = False
+        self._active_terminal_token: _CandidateToken | None = None
         self._backend_host: _BackendProcessHost | None = None
         self._load_failure_streak = 0
         self._next_load_attempt_at = 0.0
         self._generation = 0
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._degraded_causes: set[_DegradedCause] = set()
+        self._resetting = False
         self._closed = False
         self._factory_closed = False
 
@@ -595,7 +599,8 @@ class SpeakerShadowRuntime:
         """Predeclare one candidate as buffer-only before accepting its first PCM."""
 
         if (
-            not self.supports_deferred_candidate(candidate)
+            self._resetting
+            or not self.supports_deferred_candidate(candidate)
             or candidate in self._finalized
             or self._candidate_was_evicted(candidate)
         ):
@@ -625,7 +630,11 @@ class SpeakerShadowRuntime:
     def activate_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
         """Order scoring activation behind all PCM already accepted for a defer."""
 
-        if not self.enabled or not isinstance(candidate, SpeakerShadowCandidateKey):
+        if (
+            self._resetting
+            or not self.enabled
+            or not isinstance(candidate, SpeakerShadowCandidateKey)
+        ):
             return False
         token = self._candidate_tokens.get(candidate)
         if (
@@ -653,7 +662,8 @@ class SpeakerShadowRuntime:
         """Whether accepted PCM has reached a still-undelivered checkpoint."""
 
         if (
-            not self.enabled
+            self._resetting
+            or not self.enabled
             or not isinstance(candidate, SpeakerShadowCandidateKey)
             or candidate.scope
             not in self._config.pending_observation_gate_scopes
@@ -770,7 +780,7 @@ class SpeakerShadowRuntime:
     ) -> bool:
         """Queue immutable PCM accepted by the current candidate fence."""
 
-        if not self.enabled:
+        if self._resetting or not self.enabled:
             return False
         if not isinstance(candidate, SpeakerShadowCandidateKey):
             return False
@@ -877,7 +887,7 @@ class SpeakerShadowRuntime:
     def finish_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
         """Order the terminal boundary behind all previously accepted PCM."""
 
-        if not self.enabled:
+        if self._resetting or not self.enabled:
             return False
         if not isinstance(candidate, SpeakerShadowCandidateKey):
             return False
@@ -911,6 +921,8 @@ class SpeakerShadowRuntime:
         return True
 
     def _admit_data_item(self, item: _QueueItem) -> bool:
+        if self._resetting or self._closed:
+            return False
         if self._queued_data_item_count >= self._config.queue_capacity:
             return False
         if not self._ensure_worker():
@@ -925,6 +937,8 @@ class SpeakerShadowRuntime:
         return True
 
     def _admit_terminal_item(self, marker: _CandidateFinished) -> bool:
+        if self._resetting or self._closed:
+            return False
         if self._queued_terminal_count >= self._config.terminal_queue_capacity:
             self._metrics.terminal_overflow_count += 1
             self._set_degraded_cause("terminal_overflow")
@@ -948,7 +962,11 @@ class SpeakerShadowRuntime:
         *,
         token: _CandidateToken,
     ) -> None:
-        if token.finish_state is _FinishState.ABANDONED:
+        self._abandon_completion(token)
+        if token.finish_state in {
+            _FinishState.PROCESSED,
+            _FinishState.ABANDONED,
+        }:
             return
         token.finish_state = _FinishState.ABANDONED
         self._metrics.terminal_abandoned_count += 1
@@ -957,6 +975,25 @@ class SpeakerShadowRuntime:
     async def wait_idle(self) -> None:
         """Wait for accepted work, excluding the warm-backend idle timer."""
 
+        reset_task = self._reset_task
+        if (
+            reset_task is not None
+            and reset_task is not asyncio.current_task()
+            and not reset_task.done()
+        ):
+            await asyncio.shield(reset_task)
+        while not self._queue.empty():
+            worker = self._worker_task
+            if worker is None or worker.done():
+                if self._closed or self._resetting:
+                    self._drain_queue()
+                    break
+                if not self._ensure_worker():
+                    self._metrics.worker_start_failure_count += 1
+                    self._set_degraded_cause("worker_start_failure")
+                    self._drain_queue()
+                    break
+            await asyncio.sleep(0)
         await self._queue.join()
         await asyncio.sleep(0)
         while True:
@@ -993,22 +1030,44 @@ class SpeakerShadowRuntime:
 
         if self._closed:
             return
-        self._generation += 1
+        reset_task = self._reset_task
+        if reset_task is None or reset_task.done():
+            self._resetting = True
+            self._generation += 1
+            self._set_degraded_cause("resetting")
+            reset_task = asyncio.create_task(
+                self._reset_impl(),
+                name="speaker-shadow-reset",
+            )
+            self._reset_task = reset_task
+            reset_task.add_done_callback(self._consume_reset_result)
+        await asyncio.shield(reset_task)
+
+    async def _reset_impl(self) -> None:
+        owned_tokens = list(self._owned_candidate_tokens())
         observation = self._observation_task
-        if observation is not None and not observation.done():
-            cancelled = await self._cancel_callback_bounded(observation)
-            if not cancelled:
-                self._detach_callback(observation)
-        if self._observation_task is observation:
-            self._observation_task = None
-        await self._cancel_completion_dispatcher_bounded()
-        self._drain_completion_queue()
-        self._drain_queue()
-        self._clear_buffers()
-        self._retire_finalized_candidates()
-        self._candidate_tokens.clear()
-        self._load_failure_streak = 0
-        self._next_load_attempt_at = 0.0
+        try:
+            if observation is not None and not observation.done():
+                cancelled = await self._cancel_callback_bounded(observation)
+                if not cancelled:
+                    self._detach_callback(observation)
+            if self._observation_task is observation:
+                self._observation_task = None
+            await self._cancel_completion_dispatcher_bounded()
+        finally:
+            try:
+                self._drain_completion_queue()
+                self._drain_queue()
+                owned_tokens.extend(self._owned_candidate_tokens())
+                self._sweep_reset_tokens(owned_tokens)
+                self._clear_buffers()
+                self._retire_finalized_candidates()
+                self._candidate_tokens.clear()
+                self._load_failure_streak = 0
+                self._next_load_attempt_at = 0.0
+            finally:
+                self._resetting = False
+                self._clear_degraded_cause("resetting")
 
     async def close(self) -> None:
         """Stop accepting work and release every tracked resource exactly once.
@@ -1018,42 +1077,60 @@ class SpeakerShadowRuntime:
         before joining the worker, so close has a hard resource boundary.
         """
 
+        cleanup = self._cleanup_task
         if not self._closed:
             self._closed = True
             self._generation += 1
-            self._cancel_observation_callback()
-            self._drain_queue()
-            self._drain_completion_queue()
-            self._clear_buffers()
-            self._finalized.clear()
-            self._candidate_tokens.clear()
-            worker = self._worker_task
-            if worker is not None and not worker.done():
-                self._queue.put_nowait(_STOP)
-            dispatcher = self._completion_dispatcher_task
-            if dispatcher is not None and not dispatcher.done():
-                self._completion_queue.put_nowait(_COMPLETION_STOP)
-            needs_cleanup = (
-                worker is not None
-                or dispatcher is not None
-                or self._backend_host is not None
-                or self._host_start_task is not None
-                or self._observation_task is not None
-                or self._completion_callback_task is not None
-                or bool(self._detached_callback_tasks)
+            reset_task = self._reset_task
+            cleanup = asyncio.create_task(
+                self._close_after_reset(reset_task),
+                name="speaker-shadow-cleanup",
             )
-            if needs_cleanup:
-                cleanup = asyncio.create_task(
-                    self._cleanup_after_worker(worker),
-                    name="speaker-shadow-cleanup",
-                )
-                self._cleanup_task = cleanup
-                cleanup.add_done_callback(self._consume_cleanup_result)
-        cleanup = self._cleanup_task
+            self._cleanup_task = cleanup
+            cleanup.add_done_callback(self._consume_cleanup_result)
         if cleanup is None:
             self._close_parent_factory()
             return
         await asyncio.shield(cleanup)
+
+    async def _close_after_reset(
+        self,
+        reset_task: asyncio.Task[None] | None,
+    ) -> None:
+        if reset_task is not None and not reset_task.done():
+            try:
+                await asyncio.shield(reset_task)
+            except asyncio.CancelledError:
+                if not reset_task.done():
+                    raise
+            except Exception:
+                # Reset already ran its mandatory local cleanup in ``finally``.
+                pass
+        self._cancel_observation_callback()
+        self._drain_queue()
+        self._drain_completion_queue()
+        self._clear_buffers()
+        self._finalized.clear()
+        self._candidate_tokens.clear()
+        worker = self._worker_task
+        if worker is not None and not worker.done():
+            self._queue.put_nowait(_STOP)
+        dispatcher = self._completion_dispatcher_task
+        if dispatcher is not None and not dispatcher.done():
+            self._completion_queue.put_nowait(_COMPLETION_STOP)
+        needs_cleanup = (
+            worker is not None
+            or dispatcher is not None
+            or self._backend_host is not None
+            or self._host_start_task is not None
+            or self._observation_task is not None
+            or self._completion_callback_task is not None
+            or bool(self._detached_callback_tasks)
+        )
+        if needs_cleanup:
+            await self._cleanup_after_worker(worker)
+        else:
+            self._close_parent_factory()
 
     def _ensure_worker(self) -> bool:
         try:
@@ -1091,6 +1168,7 @@ class SpeakerShadowRuntime:
                 if item is _STOP:
                     return
                 if isinstance(item, _CandidateFinished):
+                    self._active_terminal_token = item.token
                     await self._process_finish(item)
                 elif isinstance(item, _CandidateDeferred):
                     self._process_defer(item)
@@ -1100,13 +1178,16 @@ class SpeakerShadowRuntime:
                     assert isinstance(item, _AudioFrame)
                     await self._process_frame(item)
             except asyncio.CancelledError:
-                if not self._closed:
-                    self._metrics.worker_start_failure_count += 1
-                    self._set_degraded_cause("worker_start_failure")
+                if not self._closed and not self._resetting:
                     if isinstance(item, _CandidateFinished):
                         if item.token.finish_state is _FinishState.QUEUED:
                             self._abandon_terminal(item.candidate, token=item.token)
                         self._abandon_completion(item.token)
+                    elif isinstance(
+                        item,
+                        (_AudioFrame, _CandidateDeferred, _CandidateActivated),
+                    ):
+                        self._drop_candidate(item.candidate, token=item.token)
                 raise
             except Exception:
                 # A defensive final fence: shadow errors never reach ASR.
@@ -1131,6 +1212,11 @@ class SpeakerShadowRuntime:
                     self._wipe_bytearray(item.pcm16)
                 self._retire_queued_item(item)
                 self._queue.task_done()
+                if (
+                    isinstance(item, _CandidateFinished)
+                    and self._active_terminal_token is item.token
+                ):
+                    self._active_terminal_token = None
                 item = None
             if self._queue.empty() and self._backend_host is None:
                 return
@@ -1779,16 +1865,22 @@ class SpeakerShadowRuntime:
 
     async def _process_finish(self, marker: _CandidateFinished) -> None:
         if marker.generation != self._generation:
-            if marker.token.finish_state is _FinishState.QUEUED:
-                marker.token.finish_state = _FinishState.ABANDONED
-                self._metrics.terminal_abandoned_count += 1
+            self._abandon_terminal(marker.candidate, token=marker.token)
+            return
+        if marker.token.finish_state is _FinishState.ABANDONED:
             self._abandon_completion(marker.token)
             return
-        if self._candidate_was_evicted(
-            marker.candidate,
-            token=marker.token,
+        if marker.token.finish_state is _FinishState.PROCESSED:
+            return
+        if (
+            marker.token.finish_state is not _FinishState.QUEUED
+            and self._candidate_was_evicted(
+                marker.candidate,
+                token=marker.token,
+            )
         ):
             return
+        # Only an accepted QUEUED marker outranks the tombstone watermark.
         self._mark_finish_processed(marker.token)
         if marker.token.terminal_reason is not None:
             self._record_token_finish(marker.token)
@@ -1876,6 +1968,7 @@ class SpeakerShadowRuntime:
                 self._wipe_bytearray(buffer.pcm16)
 
             if marker.generation != self._generation or self._closed:
+                self._abandon_completion(marker.token)
                 return
             terminal_reason = marker.token.terminal_reason
             if terminal_reason is None:
@@ -2130,6 +2223,7 @@ class SpeakerShadowRuntime:
 
     def _abandon_completion(self, token: _CandidateToken) -> None:
         if token.completion_state in {
+            _CompletionState.DISPATCHED,
             _CompletionState.ATTEMPTED,
             _CompletionState.ABANDONED,
         }:
@@ -2329,12 +2423,49 @@ class SpeakerShadowRuntime:
         return (
             generation == self._generation
             and not self._closed
+            and not self._resetting
             and candidate not in self._finalized
             and token.terminal_reason is None
             and self._candidate_tokens.get(candidate) is token
         )
 
-    def _drain_queue(self) -> None:
+    def _owned_candidate_tokens(self) -> tuple[_CandidateToken, ...]:
+        tokens: list[_CandidateToken] = []
+        seen: set[int] = set()
+
+        def append(token: _CandidateToken | None) -> None:
+            if token is None or id(token) in seen:
+                return
+            seen.add(id(token))
+            tokens.append(token)
+
+        for token in self._candidate_tokens.values():
+            append(token)
+        for buffer in self._buffers.values():
+            append(buffer.token)
+        for finalized in self._finalized.values():
+            append(finalized.token)
+        append(self._active_terminal_token)
+        append(self._completion_callback_token)
+        for token in self._detached_completion_tokens.values():
+            append(token)
+        return tuple(tokens)
+
+    def _sweep_reset_tokens(self, tokens: list[_CandidateToken]) -> None:
+        seen: set[int] = set()
+        for token in tokens:
+            if id(token) in seen:
+                continue
+            seen.add(id(token))
+            if token.finish_state is _FinishState.QUEUED:
+                self._abandon_terminal(token.candidate, token=token)
+            elif token.finish_state in {
+                _FinishState.PROCESSED,
+                _FinishState.ABANDONED,
+            }:
+                self._abandon_completion(token)
+
+    def _drain_queue(self, *, abandon_data_candidates: bool = False) -> None:
         while True:
             try:
                 item = self._queue.get_nowait()
@@ -2347,6 +2478,11 @@ class SpeakerShadowRuntime:
                         self._queued_pcm_bytes - len(item.pcm16),
                     )
                     self._wipe_bytearray(item.pcm16)
+                    if abandon_data_candidates:
+                        self._drop_candidate(item.candidate, token=item.token)
+                elif isinstance(item, (_CandidateDeferred, _CandidateActivated)):
+                    if abandon_data_candidates:
+                        self._drop_candidate(item.candidate, token=item.token)
                 elif isinstance(item, _CandidateFinished):
                     self._abandon_terminal(item.candidate, token=item.token)
                 self._retire_queued_item(item)
@@ -2503,13 +2639,20 @@ class SpeakerShadowRuntime:
         try:
             abnormal = task.exception() is not None
         except asyncio.CancelledError:
-            pass
+            abnormal = True
         if self._worker_task is task and task.done():
             self._worker_task = None
-        if abnormal and not self._closed:
+        if self._closed or self._resetting:
+            return
+        if abnormal:
             self._metrics.worker_start_failure_count += 1
             self._set_degraded_cause("worker_start_failure")
-            self._drain_queue()
+            self._drain_queue(abandon_data_candidates=True)
+            return
+        if not self._queue.empty() and not self._ensure_worker():
+            self._metrics.worker_start_failure_count += 1
+            self._set_degraded_cause("worker_start_failure")
+            self._drain_queue(abandon_data_candidates=True)
 
     @staticmethod
     def _audio_ms(sample_count: int, sample_rate_hz: int) -> int:
@@ -2517,6 +2660,13 @@ class SpeakerShadowRuntime:
 
     @staticmethod
     def _consume_cleanup_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
+
+    @staticmethod
+    def _consume_reset_result(task: asyncio.Task[None]) -> None:
         try:
             task.exception()
         except asyncio.CancelledError:
