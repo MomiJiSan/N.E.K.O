@@ -13,10 +13,12 @@ import pytest
 from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES,
     SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+    SpeakerShadowBatchReconcileRequest,
     SpeakerShadowCandidateKey,
     SpeakerShadowCompletion,
     SpeakerShadowConfig,
     SpeakerShadowObservation,
+    SpeakerShadowReconcileSource,
 )
 from main_logic.asr_client.speaker_shadow.runtime import (
     SpeakerShadowRuntime,
@@ -97,9 +99,11 @@ class _Backend:
 
 
 def _pcm(duration_ms: int) -> bytes:
-    return b"\x01\x00" * (
-        SPEAKER_SHADOW_SAMPLE_RATE_HZ * duration_ms // 1_000
-    )
+    return b"\x01\x00" * (SPEAKER_SHADOW_SAMPLE_RATE_HZ * duration_ms // 1_000)
+
+
+def _tagged_pcm(duration_ms: int, tag: int) -> bytes:
+    return bytes((tag, 0)) * (SPEAKER_SHADOW_SAMPLE_RATE_HZ * duration_ms // 1_000)
 
 
 def _candidate(
@@ -107,6 +111,25 @@ def _candidate(
     scope: str = "provider_candidate",
 ) -> SpeakerShadowCandidateKey:
     return SpeakerShadowCandidateKey(1, generation, scope)  # type: ignore[arg-type]
+
+
+def _reconcile_source(
+    candidate: SpeakerShadowCandidateKey,
+    duration_ms: int,
+    *,
+    keep_start_ms: int = 0,
+    keep_end_ms: int | None = None,
+) -> SpeakerShadowReconcileSource:
+    samples_per_ms = SPEAKER_SHADOW_SAMPLE_RATE_HZ // 1_000
+    return SpeakerShadowReconcileSource(
+        candidate=candidate,
+        expected_sample_count=duration_ms * samples_per_ms,
+        keep_start_sample=keep_start_ms * samples_per_ms,
+        keep_end_sample=(
+            duration_ms if keep_end_ms is None else keep_end_ms
+        )
+        * samples_per_ms,
+    )
 
 
 def _config(**overrides: object) -> SpeakerShadowConfig:
@@ -140,9 +163,7 @@ def _provider_gate_config(
         "observation_checkpoints_ms": (1_500, 3_000),
         "completion_confirmation_scopes": ("provider_candidate",),
         "pending_observation_gate_scopes": ("provider_candidate",),
-        "backend_prewarm_scopes": (
-            ("provider_candidate",) if prewarm else ()
-        ),
+        "backend_prewarm_scopes": (("provider_candidate",) if prewarm else ()),
     }
     values.update(overrides)
     return _config(**values)
@@ -204,11 +225,1041 @@ async def test_deferred_candidate_buffers_then_scores_in_order_after_activation(
         "completion_confirmation",
     ]
     assert [item.audio_ms for item in observations] == [1_500, 2_999]
-    assert completions == [
-        SpeakerShadowCompletion(candidate, "scored", 1_500)
-    ]
+    assert completions == [SpeakerShadowCompletion(candidate, "scored", 1_500)]
     assert runtime.snapshot()["retained_pcm_bytes"] == 0
     await runtime.close()
+
+
+async def test_reconcile_deferred_tail_into_head_preserves_checkpoint_continuity() -> (
+    None
+):
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+    )
+    head = _candidate(9_101)
+    tail = _candidate(9_102)
+
+    assert runtime.submit(
+        _pcm(800),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    assert runtime.defer_candidate(tail)
+    assert runtime.submit(
+        _pcm(2_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=tail,
+    )
+    assert runtime.reconcile_candidate_prefix(
+        source=tail,
+        target=head,
+        prefix_sample_count=SPEAKER_SHADOW_SAMPLE_RATE_HZ * 2_500 // 1_000,
+    )
+    assert (
+        runtime.submit(
+            _pcm(1),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        is False
+    )
+    assert runtime.finish_candidate(head)
+    assert runtime.finish_candidate(tail)
+
+    await runtime.wait_idle()
+
+    assert [item.candidate for item in observations] == [head, head]
+    assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+    assert runtime._finalized[head].terminal_reason == "scored"
+    assert runtime._finalized[tail].terminal_reason == "dropped"
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_reconcile_marker_reserves_split_and_future_pcm_before_execution() -> (
+    None
+):
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    head = _candidate(9_103)
+    tail = _candidate(9_104)
+    suffix = _candidate(9_105)
+    head_pcm = _tagged_pcm(200, 0x11)
+    covered_tail_pcm = _tagged_pcm(300, 0x22)
+    successor_tail_pcm = _tagged_pcm(300, 0x33)
+    future_head_pcm = _tagged_pcm(400, 0x44)
+    future_suffix_pcm = _tagged_pcm(200, 0x55)
+
+    assert runtime.submit(
+        head_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    assert runtime.defer_candidate(tail)
+    assert runtime.submit(
+        covered_tail_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=tail,
+    )
+    assert runtime.submit(
+        successor_tail_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=tail,
+    )
+    assert runtime.reconcile_candidate_prefix(
+        source=tail,
+        target=head,
+        prefix_sample_count=len(covered_tail_pcm) // 2,
+        suffix=suffix,
+    )
+    # These submits race marker execution.  Their admission must already see
+    # the transferred prefix/remainder reservations.
+    assert runtime.submit(
+        future_head_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    assert runtime.submit(
+        future_suffix_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=suffix,
+    )
+    assert (
+        runtime.submit(
+            _pcm(1),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        is False
+    )
+
+    await runtime.wait_idle()
+
+    assert bytes(runtime._buffers[head].pcm16) == (
+        head_pcm + covered_tail_pcm + future_head_pcm
+    )
+    assert bytes(runtime._buffers[suffix].pcm16) == (
+        successor_tail_pcm + future_suffix_pcm
+    )
+    assert runtime._candidate_tokens[head].accepted_sample_count == (
+        len(head_pcm + covered_tail_pcm + future_head_pcm) // 2
+    )
+    assert runtime._candidate_tokens[suffix].accepted_sample_count == (
+        len(successor_tail_pcm + future_suffix_pcm) // 2
+    )
+    assert runtime._finalized[tail].terminal_reason == "dropped"
+
+    assert runtime.finish_candidate(head)
+    assert runtime.activate_candidate(suffix)
+    assert runtime.finish_candidate(suffix)
+    await runtime.wait_idle()
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_reconcile_in_place_splits_queued_pcm_sample_exactly() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    head = _candidate(9_106)
+    suffix = _candidate(9_107)
+    retained_pcm = _tagged_pcm(600, 0x61)
+    successor_pcm = _tagged_pcm(400, 0x72)
+
+    assert runtime.submit(
+        retained_pcm + successor_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    assert runtime.reconcile_candidate_prefix(
+        source=head,
+        target=head,
+        prefix_sample_count=len(retained_pcm) // 2,
+        suffix=suffix,
+    )
+    assert (
+        runtime.submit(
+            _pcm(1),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=head,
+        )
+        is False
+    )
+
+    await runtime.wait_idle()
+
+    assert bytes(runtime._buffers[head].pcm16) == retained_pcm
+    assert bytes(runtime._buffers[suffix].pcm16) == successor_pcm
+    assert runtime._candidate_tokens[head].pcm_frozen is True
+    assert runtime._candidate_tokens[suffix].scoring_deferred is True
+
+    assert runtime.finish_candidate(head)
+    assert runtime.activate_candidate(suffix)
+    assert runtime.finish_candidate(suffix)
+    await runtime.wait_idle()
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_reconcile_splits_deferred_head_after_activation_marker() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    head = _candidate(9_108)
+    suffix = _candidate(9_109)
+    retained_pcm = _tagged_pcm(600, 0x63)
+    successor_pcm = _tagged_pcm(400, 0x74)
+
+    assert runtime.defer_candidate(head)
+    assert runtime.submit(
+        retained_pcm + successor_pcm,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    assert runtime.activate_candidate(head)
+    assert runtime.reconcile_candidate_prefix(
+        source=head,
+        target=head,
+        prefix_sample_count=len(retained_pcm) // 2,
+        suffix=suffix,
+    )
+
+    await runtime.wait_idle()
+
+    assert bytes(runtime._buffers[head].pcm16) == retained_pcm
+    assert bytes(runtime._buffers[suffix].pcm16) == successor_pcm
+    assert runtime._candidate_tokens[head].scoring_deferred is False
+    assert runtime._candidate_tokens[suffix].scoring_deferred is True
+
+    assert runtime.finish_candidate(head)
+    assert runtime.activate_candidate(suffix)
+    assert runtime.finish_candidate(suffix)
+    await runtime.wait_idle()
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_reconcile_during_first_checkpoint_stops_second_until_split() -> None:
+    score_started = _spawn_event()
+    score_release = _spawn_event()
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(
+            score_value=0.2,
+            block_stage="score",
+            stage_started=score_started,
+            stage_release=score_release,
+        ),
+        config=_provider_gate_config(),
+        on_observation=observe,
+    )
+    head = _candidate(9_110)
+    suffix = _candidate(9_111)
+
+    assert runtime.submit(
+        _pcm(3_000),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    await _wait_until(score_started.is_set)
+    assert runtime.reconcile_candidate_prefix(
+        source=head,
+        target=head,
+        prefix_sample_count=SPEAKER_SHADOW_SAMPLE_RATE_HZ * 2_000 // 1_000,
+        suffix=suffix,
+    )
+
+    score_release.set()
+    await runtime.wait_idle()
+
+    assert [item.checkpoint_ms for item in observations] == [1_500]
+    assert runtime._buffers[head].sample_count == (
+        SPEAKER_SHADOW_SAMPLE_RATE_HZ * 2_000 // 1_000
+    )
+    assert runtime._buffers[suffix].sample_count == SPEAKER_SHADOW_SAMPLE_RATE_HZ
+
+    assert runtime.finish_candidate(head)
+    assert runtime.activate_candidate(suffix)
+    assert runtime.finish_candidate(suffix)
+    await runtime.wait_idle()
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_reconcile_into_terminal_scored_head_preserves_verdict_and_wipes_tail() -> (
+    None
+):
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+    )
+    head = _candidate(9_108)
+    tail = _candidate(9_109)
+
+    assert runtime.submit(
+        _pcm(3_000),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    await runtime.wait_idle()
+    assert runtime._finalized[head].terminal_reason == "scored"
+    assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+
+    assert runtime.defer_candidate(tail)
+    assert runtime.submit(
+        _pcm(500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=tail,
+    )
+    assert runtime.reconcile_candidate_prefix(
+        source=tail,
+        target=head,
+        prefix_sample_count=SPEAKER_SHADOW_SAMPLE_RATE_HZ * 500 // 1_000,
+    )
+    assert runtime.finish_candidate(tail)
+    await runtime.wait_idle()
+
+    assert runtime._finalized[head].terminal_reason == "scored"
+    assert runtime._finalized[tail].terminal_reason == "dropped"
+    assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+    assert (
+        runtime.submit(
+            _pcm(1),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        is False
+    )
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_reconcile_data_queue_full_preserves_original_sample_ownership() -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(
+            queue_capacity=3,
+            terminal_queue_capacity=2,
+        ),
+        on_observation=observe,
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    head = _candidate(9_112)
+    tail = _candidate(9_113)
+    suffix = _candidate(9_114)
+
+    try:
+        assert runtime.submit(
+            _pcm(800),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=head,
+        )
+        assert runtime.defer_candidate(tail)
+        assert runtime.submit(
+            _pcm(500),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        head_token = runtime._candidate_tokens[head]
+        tail_token = runtime._candidate_tokens[tail]
+        head_samples = head_token.accepted_sample_count
+        tail_samples = tail_token.accepted_sample_count
+        assert runtime.snapshot()["queued_item_count"] == 3
+
+        assert (
+            runtime.reconcile_candidate_prefix(
+                source=tail,
+                target=head,
+                prefix_sample_count=tail_samples // 2,
+                suffix=suffix,
+            )
+            is False
+        )
+
+        assert head_token.accepted_sample_count == head_samples
+        assert tail_token.accepted_sample_count == tail_samples
+        assert head_token.pcm_frozen is False
+        assert tail_token.pcm_frozen is False
+        assert suffix not in runtime._candidate_tokens
+        assert runtime.finish_candidate(head)
+        assert runtime.finish_candidate(tail)
+
+        hold_worker.set()
+        await fake_worker
+        await runtime.wait_idle()
+
+        assert observations == []
+        assert runtime._finalized[head].terminal_reason == "insufficient"
+        assert runtime._finalized[tail].terminal_reason == "insufficient"
+        assert suffix not in runtime._buffers
+        assert suffix not in runtime._finalized
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_reconcile_terminal_queue_full_drops_reserved_ownership_fail_open() -> (
+    None
+):
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(
+            queue_capacity=4,
+            terminal_queue_capacity=1,
+        ),
+        on_observation=observe,
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    blocker = _candidate(9_115)
+    head = _candidate(9_116)
+    tail = _candidate(9_117)
+
+    try:
+        assert runtime.finish_candidate(blocker)
+        assert runtime.submit(
+            _pcm(800),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=head,
+        )
+        assert runtime.defer_candidate(tail)
+        assert runtime.submit(
+            _pcm(500),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        assert runtime.reconcile_candidate_prefix(
+            source=tail,
+            target=head,
+            prefix_sample_count=SPEAKER_SHADOW_SAMPLE_RATE_HZ * 500 // 1_000,
+        )
+        assert runtime._candidate_tokens[tail].pcm_frozen is True
+
+        # The terminal channel is independently saturated. Rejecting head's
+        # finish must retire the reserved target instead of publishing a
+        # partially reconciled candidate.
+        assert runtime.finish_candidate(head) is False
+        assert runtime._finalized[head].terminal_reason == "dropped"
+
+        hold_worker.set()
+        await fake_worker
+        await runtime.wait_idle()
+
+        assert observations == []
+        assert runtime._finalized[head].terminal_reason == "dropped"
+        assert runtime._finalized[tail].terminal_reason == "dropped"
+        assert (
+            runtime.submit(
+                _pcm(1),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                candidate=head,
+            )
+            is False
+        )
+        assert (
+            runtime.submit(
+                _pcm(1),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                candidate=tail,
+            )
+            is False
+        )
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.parametrize("boundary", ["reset", "close"])
+async def test_pending_reconcile_marker_lifecycle_boundary_wipes_all_pcm(
+    boundary: str,
+) -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(queue_capacity=4),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    head = _candidate(9_118)
+    tail = _candidate(9_119)
+    suffix = _candidate(9_120)
+
+    try:
+        assert runtime.submit(
+            _tagged_pcm(800, 0x31),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=head,
+        )
+        assert runtime.defer_candidate(tail)
+        assert runtime.submit(
+            _tagged_pcm(500, 0x42),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        assert runtime.reconcile_candidate_prefix(
+            source=tail,
+            target=head,
+            prefix_sample_count=SPEAKER_SHADOW_SAMPLE_RATE_HZ * 250 // 1_000,
+            suffix=suffix,
+        )
+        queued_pcm = [
+            item.pcm16
+            for item in tuple(runtime._queue._queue)
+            if isinstance(item, _AudioFrame)
+        ]
+        assert len(queued_pcm) == 2
+        assert runtime._candidate_tokens[tail].pcm_frozen is True
+        assert suffix in runtime._candidate_tokens
+
+        if boundary == "reset":
+            await runtime.reset()
+        else:
+            await runtime.close()
+
+        assert not runtime._candidate_tokens
+        assert not runtime._buffers
+        assert not runtime._finalized
+        assert all(not any(pcm16) for pcm16 in queued_pcm)
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+        assert runtime.snapshot()["queued_audio_bytes"] == 0
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_batch_reconcile_merges_pause_and_owns_finish_checkpoint_order() -> None:
+    observations: list[SpeakerShadowObservation] = []
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+        on_completion=complete,
+    )
+    head = _candidate(9_201)
+    tail = _candidate(9_202)
+    assert runtime.submit(
+        _pcm(800),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=head,
+    )
+    assert runtime.defer_candidate(tail)
+    assert runtime.submit(
+        _pcm(2_500),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=tail,
+    )
+
+    receipt = runtime.reconcile_candidate_batch(
+        SpeakerShadowBatchReconcileRequest(
+            sources=(
+                _reconcile_source(head, 800),
+                _reconcile_source(tail, 2_500),
+            ),
+            target=head,
+        )
+    )
+    assert receipt is not None
+    assert runtime.reconciliation_status(receipt) == "pending"
+    assert runtime._candidate_tokens[head].finish_state == "queued"
+    assert runtime.snapshot()["pending_terminal_count"] == 1
+
+    await runtime.wait_idle()
+
+    assert runtime.reconciliation_status(receipt) == "applied"
+    assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+    assert completions == [SpeakerShadowCompletion(head, "scored", 3_000)]
+    assert runtime._finalized[head].terminal_reason == "scored"
+    assert runtime._finalized[tail].terminal_reason == "dropped"
+    assert runtime.snapshot()["pending_terminal_count"] == 0
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 1
+    assert runtime.snapshot()["reconciliation_batch_applied_count"] == 1
+    assert runtime.snapshot()["reconciliation_batch_failed_count"] == 0
+    assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 0
+    await runtime.close()
+
+
+async def test_batch_reconcile_double_split_preserves_suffix_pcm_submitted_after_marker() -> (
+    None
+):
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    source = _candidate(9_203)
+    target = _candidate(9_204)
+    suffix = _candidate(9_205)
+    finish_started = asyncio.Event()
+    finish_release = asyncio.Event()
+    original_process_finish = runtime._process_finish
+
+    async def hold_process_finish(marker: _CandidateFinished) -> None:
+        finish_started.set()
+        await finish_release.wait()
+        await original_process_finish(marker)
+
+    runtime._process_finish = hold_process_finish  # type: ignore[method-assign]
+    try:
+        assert runtime.submit(
+            _tagged_pcm(1_000, 0x44),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        receipt = runtime.reconcile_candidate_batch(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(
+                        source,
+                        1_000,
+                        keep_start_ms=200,
+                        keep_end_ms=700,
+                    ),
+                ),
+                target=target,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        assert runtime.submit(
+            _tagged_pcm(100, 0x55),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=suffix,
+        )
+
+        await asyncio.wait_for(finish_started.wait(), 2.0)
+        assert runtime.reconciliation_status(receipt) == "applied"
+        assert bytes(runtime._buffers[target].pcm16) == _tagged_pcm(500, 0x44)
+        assert bytes(runtime._buffers[suffix].pcm16) == _tagged_pcm(300, 0x44)
+        assert runtime._buffers[suffix].sample_count == 300 * 16
+
+        finish_release.set()
+        await runtime.wait_idle()
+        assert bytes(runtime._buffers[suffix].pcm16) == (
+            _tagged_pcm(300, 0x44) + _tagged_pcm(100, 0x55)
+        )
+        assert runtime._buffers[suffix].sample_count == 400 * 16
+        assert runtime._finalized[source].terminal_reason == "dropped"
+        assert runtime._finalized[target].terminal_reason == "insufficient"
+        assert runtime.activate_candidate(suffix)
+        assert runtime.finish_candidate(suffix)
+        await runtime.wait_idle()
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        finish_release.set()
+        await runtime.close()
+
+
+async def test_batch_successor_can_be_consumed_by_next_exact_batch() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    source = _candidate(9_215)
+    suffix = _candidate(9_216)
+    assert runtime.defer_candidate(source)
+    assert runtime.submit(
+        _tagged_pcm(1_000, 0x41),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=source,
+    )
+    first_receipt = runtime.reconcile_candidate_batch(
+        SpeakerShadowBatchReconcileRequest(
+            sources=(
+                _reconcile_source(source, 1_000, keep_end_ms=600),
+            ),
+            target=source,
+            suffix=suffix,
+        )
+    )
+    assert first_receipt is not None
+    await runtime.wait_idle()
+    assert runtime.reconciliation_status(first_receipt) == "applied"
+    assert runtime._candidate_tokens[suffix].reconciliation_batch_id is None
+    assert runtime._buffers[suffix].sample_count == 400 * 16
+
+    assert runtime.submit(
+        _tagged_pcm(400, 0x52),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=suffix,
+    )
+    second_receipt = runtime.reconcile_candidate_batch(
+        SpeakerShadowBatchReconcileRequest(
+            sources=(_reconcile_source(suffix, 800),),
+            target=suffix,
+        )
+    )
+    assert second_receipt is not None
+    await runtime.wait_idle()
+
+    assert runtime.reconciliation_status(second_receipt) == "applied"
+    assert runtime._finalized[source].terminal_reason == "insufficient"
+    assert runtime._finalized[suffix].terminal_reason == "insufficient"
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
+async def test_revoke_applied_batch_wipes_once_and_retires_queue_counts_once() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    source = _candidate(9_217)
+    target = _candidate(9_218)
+    suffix = _candidate(9_219)
+    finish_started = asyncio.Event()
+    finish_release = asyncio.Event()
+    original_process_finish = runtime._process_finish
+
+    async def hold_process_finish(marker: _CandidateFinished) -> None:
+        finish_started.set()
+        await finish_release.wait()
+        await original_process_finish(marker)
+
+    runtime._process_finish = hold_process_finish  # type: ignore[method-assign]
+    try:
+        assert runtime.submit(
+            _pcm(1_000),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        receipt = runtime.reconcile_candidate_batch(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(
+                        source,
+                        1_000,
+                        keep_start_ms=200,
+                        keep_end_ms=700,
+                    ),
+                ),
+                target=target,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        await asyncio.wait_for(finish_started.wait(), 2.0)
+        assert runtime.reconciliation_status(receipt) == "applied"
+        assert runtime._queued_data_item_count == 1
+        assert runtime._queued_terminal_count == 1
+
+        runtime.revoke_reconciliation(receipt)
+        assert runtime.reconciliation_status(receipt) == "failed"
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 1
+        assert runtime._finalized[target].terminal_reason == "dropped"
+        assert runtime._finalized[suffix].terminal_reason == "dropped"
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+        assert runtime._queued_data_item_count == 1
+        assert runtime._queued_terminal_count == 1
+
+        finish_release.set()
+        await runtime.wait_idle()
+        assert runtime._queued_data_item_count == 0
+        assert runtime._queued_terminal_count == 0
+        runtime.revoke_reconciliation(receipt)
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 1
+        assert runtime._queued_data_item_count == 0
+        assert runtime._queued_terminal_count == 0
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        finish_release.set()
+        await runtime.close()
+
+
+async def test_batch_reconcile_full_data_queue_has_no_partial_reservation() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(queue_capacity=3, terminal_queue_capacity=2),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    head = _candidate(9_206)
+    tail = _candidate(9_207)
+    try:
+        assert runtime.submit(
+            _pcm(800),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=head,
+        )
+        assert runtime.defer_candidate(tail)
+        assert runtime.submit(
+            _pcm(500),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        head_token = runtime._candidate_tokens[head]
+        tail_token = runtime._candidate_tokens[tail]
+        head_samples = head_token.accepted_sample_count
+        tail_samples = tail_token.accepted_sample_count
+
+        assert (
+            runtime.reconcile_candidate_batch(
+                SpeakerShadowBatchReconcileRequest(
+                    sources=(
+                        _reconcile_source(head, 800),
+                        _reconcile_source(tail, 500),
+                    ),
+                    target=head,
+                )
+            )
+            is None
+        )
+        assert head_token.accepted_sample_count == head_samples
+        assert tail_token.accepted_sample_count == tail_samples
+        assert head_token.pcm_frozen is False
+        assert tail_token.pcm_frozen is False
+        assert head_token.finish_state == "open"
+        assert not runtime._reconciliations
+        assert runtime.snapshot()["pending_terminal_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 0
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_batch_reconcile_full_terminal_queue_has_no_partial_reservation() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(queue_capacity=2, terminal_queue_capacity=1),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    blocker = _candidate(9_213)
+    source = _candidate(9_214)
+    try:
+        assert runtime.finish_candidate(blocker)
+        assert runtime.submit(
+            _pcm(800),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        token = runtime._candidate_tokens[source]
+        accepted_samples = token.accepted_sample_count
+        assert (
+            runtime.reconcile_candidate_batch(
+                SpeakerShadowBatchReconcileRequest(
+                    sources=(_reconcile_source(source, 800),),
+                    target=source,
+                )
+            )
+            is None
+        )
+        assert token.accepted_sample_count == accepted_samples
+        assert token.pcm_frozen is False
+        assert token.finish_state == "open"
+        assert not runtime._reconciliations
+        assert runtime.snapshot()["pending_terminal_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 0
+
+        hold_worker.set()
+        await fake_worker
+        await runtime.wait_idle()
+        assert runtime.finish_candidate(source)
+        await runtime.wait_idle()
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_batch_reconcile_worker_cas_failure_wipes_and_tombstones_all() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(queue_capacity=4),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    head = _candidate(9_208)
+    tail = _candidate(9_209)
+    try:
+        assert runtime.submit(
+            _pcm(800),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=head,
+        )
+        assert runtime.defer_candidate(tail)
+        assert runtime.submit(
+            _pcm(500),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=tail,
+        )
+        receipt = runtime.reconcile_candidate_batch(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(head, 800),
+                    _reconcile_source(tail, 500),
+                ),
+                target=head,
+            )
+        )
+        assert receipt is not None
+        runtime._candidate_tokens[head].accepted_sample_count += 1
+
+        hold_worker.set()
+        await fake_worker
+        await runtime.wait_idle()
+
+        assert runtime.reconciliation_status(receipt) == "failed"
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 0
+        assert runtime._finalized[head].terminal_reason == "dropped"
+        assert runtime._finalized[tail].terminal_reason == "dropped"
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+        assert (
+            runtime.submit(
+                _pcm(1),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                candidate=head,
+            )
+            is False
+        )
+        assert (
+            runtime.submit(
+                _pcm(1),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                candidate=tail,
+            )
+            is False
+        )
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.parametrize("boundary", ["revoke", "reset", "close"])
+async def test_pending_batch_lifecycle_boundary_is_fail_open_and_wipes_pcm(
+    boundary: str,
+) -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(queue_capacity=3),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    source = _candidate(9_210)
+    target = _candidate(9_211)
+    suffix = _candidate(9_212)
+    try:
+        assert runtime.submit(
+            _tagged_pcm(1_000, 0x31),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        receipt = runtime.reconcile_candidate_batch(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(
+                        source,
+                        1_000,
+                        keep_start_ms=100,
+                        keep_end_ms=900,
+                    ),
+                ),
+                target=target,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        queued_pcm = [
+            item.pcm16
+            for item in tuple(runtime._queue._queue)
+            if isinstance(item, _AudioFrame)
+        ]
+        if boundary == "revoke":
+            runtime.revoke_reconciliation(receipt)
+            assert runtime.reconciliation_status(receipt) == "failed"
+            hold_worker.set()
+            await fake_worker
+            await runtime.wait_idle()
+        elif boundary == "reset":
+            await runtime.reset()
+            assert runtime.reconciliation_status(receipt) == "stale"
+        else:
+            await runtime.close()
+            assert runtime.reconciliation_status(receipt) == "stale"
+
+        assert all(not any(pcm16) for pcm16 in queued_pcm)
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+        assert runtime.snapshot()["queued_audio_bytes"] == 0
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 1
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_applied_count"] == 0
+        assert runtime.snapshot()["reconciliation_batch_failed_count"] == 1
+        assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 1
 
 
 async def test_deferred_finish_before_activation_is_fail_open_and_wipes_pcm() -> None:
@@ -240,9 +1291,7 @@ async def test_deferred_finish_before_activation_is_fail_open_and_wipes_pcm() ->
     await runtime.wait_idle()
 
     assert observations == []
-    assert completions == [
-        SpeakerShadowCompletion(candidate, "insufficient", None)
-    ]
+    assert completions == [SpeakerShadowCompletion(candidate, "insufficient", None)]
     assert runtime.snapshot()["retained_pcm_bytes"] == 0
     await runtime.close()
 
@@ -495,11 +1544,14 @@ async def test_disabled_or_missing_factory_does_zero_work(
     candidate = _candidate(1)
 
     assert runtime.enabled is False
-    assert runtime.submit(
-        _pcm(20),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(20),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        is False
+    )
     assert runtime.finish_candidate(candidate) is False
     await runtime.wait_idle()
     await runtime.close()
@@ -561,11 +1613,14 @@ async def test_ordered_finish_scores_once_and_rejects_late_pcm() -> None:
             audio_ms=20,
         )
     ]
-    assert runtime.submit(
-        first,
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            first,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        is False
+    )
     assert runtime.finish_candidate(candidate)
     metrics = runtime.snapshot()
     assert metrics["scored_candidate_count"] == 1
@@ -927,7 +1982,9 @@ async def test_completion_confirmation_does_not_rescore_unarmed_candidate(
     await runtime.close()
 
 
-async def test_completion_confirmation_score_failure_still_completes_fail_open() -> None:
+async def test_completion_confirmation_score_failure_still_completes_fail_open() -> (
+    None
+):
     events: list[tuple[str, str]] = []
     completions: list[SpeakerShadowCompletion] = []
 
@@ -1126,11 +2183,14 @@ async def test_reset_invalidates_in_flight_completion_confirmation() -> None:
     )
     assert runtime.finish_candidate(candidate)
     await asyncio.wait_for(confirmation_started.wait(), 2.0)
-    assert runtime.submit(
-        _pcm(10),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        is False
+    )
 
     await runtime.reset()
     await runtime.wait_idle()
@@ -1246,8 +2306,7 @@ async def test_reset_prevents_late_callback_from_delivering_checkpoint() -> None
 @pytest.mark.parametrize(
     ("config", "scope"),
     [
-        (_config(minimum_audio_ms=1_500, maximum_audio_ms=4_000),
-         "provider_candidate"),
+        (_config(minimum_audio_ms=1_500, maximum_audio_ms=4_000), "provider_candidate"),
         (_provider_gate_config(), "smart_turn_turn"),
     ],
     ids=["default-off", "smart-turn"],
@@ -1585,11 +2644,14 @@ async def test_candidate_pcm_is_capped_at_four_seconds_across_frames() -> None:
             sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
             candidate=candidate,
         )
-    assert runtime.submit(
-        _pcm(10),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        is False
+    )
     await runtime.wait_idle()
 
     assert runtime.snapshot()["submitted_audio_ms"] == 4_000
@@ -1669,11 +2731,14 @@ async def test_invalid_or_oversized_frames_fail_open_without_starting_host(
         config=_config(),
     )
 
-    assert runtime.submit(  # type: ignore[arg-type]
-        pcm16,
-        sample_rate_hz=sample_rate_hz,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(  # type: ignore[arg-type]
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+            candidate=candidate,
+        )
+        is False
+    )
     await runtime.wait_idle()
     assert runtime.snapshot()["backend_process_count"] == 0
     await runtime.close()
@@ -1701,11 +2766,14 @@ async def test_queue_saturation_drops_only_shadow_candidate() -> None:
         sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
         candidate=candidate,
     )
-    assert runtime.submit(
-        _pcm(10),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        is False
+    )
     assert runtime.finish_candidate(candidate)
     await runtime.wait_idle()
 
@@ -1908,8 +2976,9 @@ async def test_finish_processing_exception_still_delivers_failed_completion(
     await runtime.close()
 
 
-async def test_finalized_candidate_keeps_completion_when_other_pcm_fills_queue(
-) -> None:
+async def test_finalized_candidate_keeps_completion_when_other_pcm_fills_queue() -> (
+    None
+):
     completions: list[SpeakerShadowCompletion] = []
 
     async def complete(completion: SpeakerShadowCompletion) -> None:
@@ -1951,8 +3020,7 @@ async def test_finalized_candidate_keeps_completion_when_other_pcm_fills_queue(
     await runtime.close()
 
 
-async def test_completion_callbacks_never_overlap_after_ignored_cancellation(
-) -> None:
+async def test_completion_callbacks_never_overlap_after_ignored_cancellation() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     second_started = asyncio.Event()
@@ -2013,8 +3081,9 @@ async def test_completion_callbacks_never_overlap_after_ignored_cancellation(
     await runtime.close()
 
 
-async def test_blocked_completion_keeps_next_completion_queued_until_fifo_turn(
-) -> None:
+async def test_blocked_completion_keeps_next_completion_queued_until_fifo_turn() -> (
+    None
+):
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     second_started = asyncio.Event()
@@ -2329,11 +3398,14 @@ async def test_reset_blocks_admission_and_provisional_capability_until_done() ->
         assert runtime.supports_deferred_candidate(new_candidate) is True
         assert runtime.defer_candidate(new_candidate) is False
         assert runtime.activate_candidate(deferred_candidate) is False
-        assert runtime.submit(
-            _pcm(1),
-            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-            candidate=new_candidate,
-        ) is False
+        assert (
+            runtime.submit(
+                _pcm(1),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                candidate=new_candidate,
+            )
+            is False
+        )
         assert runtime.finish_candidate(new_candidate) is False
 
         callback_release.set()
@@ -2628,11 +3700,14 @@ async def test_unexpected_worker_cancel_drains_following_terminals_and_idle_reco
         assert second_token.completion_state == "abandoned"
         assert queued_audio_token.terminal_reason == "dropped"
         assert queued_audio_candidate in runtime._finalized
-        assert runtime.submit(
-            _pcm(10),
-            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-            candidate=queued_audio_candidate,
-        ) is False
+        assert (
+            runtime.submit(
+                _pcm(10),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                candidate=queued_audio_candidate,
+            )
+            is False
+        )
         snapshot = runtime.snapshot()
         assert snapshot["queued_item_count"] == 0
         assert snapshot["pending_terminal_count"] == 0
@@ -2700,20 +3775,25 @@ async def test_evicted_tombstone_keeps_late_finish_idempotent() -> None:
     before_duplicate = runtime.snapshot()
 
     assert runtime.finish_candidate(evicted_candidate)
-    assert runtime.submit(
-        _pcm(10),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=evicted_candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=evicted_candidate,
+        )
+        is False
+    )
     await runtime.wait_idle()
 
     after_duplicate = runtime.snapshot()
-    assert after_duplicate["finished_candidate_count"] == before_duplicate[
-        "finished_candidate_count"
-    ]
-    assert after_duplicate["insufficient_candidate_count"] == before_duplicate[
-        "insufficient_candidate_count"
-    ]
+    assert (
+        after_duplicate["finished_candidate_count"]
+        == before_duplicate["finished_candidate_count"]
+    )
+    assert (
+        after_duplicate["insufficient_candidate_count"]
+        == before_duplicate["insufficient_candidate_count"]
+    )
     assert after_duplicate["finalized_tombstone_count"] == 1
     await runtime.close()
 
@@ -3228,11 +4308,14 @@ async def test_finish_without_audio_and_late_pcm_has_one_terminal_state() -> Non
     candidate = _candidate(44)
 
     assert runtime.finish_candidate(candidate)
-    assert runtime.submit(
-        _pcm(10),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=candidate,
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        is False
+    )
     await runtime.wait_idle()
 
     metrics = runtime.snapshot()
@@ -3254,11 +4337,14 @@ def test_submit_without_running_loop_fails_open_and_drains_pcm() -> None:
         config=_config(),
     )
 
-    assert runtime.submit(
-        _pcm(10),
-        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-        candidate=_candidate(45),
-    ) is False
+    assert (
+        runtime.submit(
+            _pcm(10),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=_candidate(45),
+        )
+        is False
+    )
 
     metrics = runtime.snapshot()
     assert metrics["worker_start_failure_count"] == 1

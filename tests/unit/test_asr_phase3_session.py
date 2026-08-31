@@ -12,6 +12,11 @@ from main_logic.asr_client._infra import (
     _CallbackItem,
     _RealtimeAsrSessionImpl,
 )
+from main_logic.asr_client._provider_events import (
+    ProviderAudioRange,
+    ProviderEndpointNotification,
+    ProviderUtteranceKey,
+)
 from main_logic.asr_client.endpointing.detector import (
     AsrDetectorDispatcher,
     CoreDetectorEventEnvelope,
@@ -1059,6 +1064,30 @@ async def test_provider_in_order_finals_keep_endpoint_before_each_final():
     await session.close()
 
 
+async def test_provider_completed_key_cannot_be_restarted_or_delivered_twice():
+    events: list[str] = []
+    session = _make_provider_endpoint_session(events)
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 160)
+    assert session._response_queue is not None
+    common = {
+        "generation": 0,
+        "buffer_epoch": 0,
+        "utterance_id": 10,
+    }
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(kind="final", text="first", **common),
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(kind="final", text="duplicate", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    assert events == ["endpoint", "final:first"]
+    await session.close()
+
+
 async def test_provider_expired_empty_final_releases_queued_endpoint():
     events: list[str] = []
     session = _make_provider_endpoint_session(events)
@@ -1111,6 +1140,709 @@ async def test_provider_clear_drops_queued_endpoint_for_invalidated_keys():
         await session._response_queue.put(event)
     await asyncio.wait_for(_wait_until(lambda: len(events) == 2), 1)
     assert events == ["endpoint", "final:hello"]
+    await session.close()
+
+
+def _make_rich_provider_session(
+    events: list[tuple],
+    legacy_events: list[tuple],
+) -> _RealtimeAsrSessionImpl:
+    async def on_legacy_transcript(text: str) -> None:
+        legacy_events.append(("final", text))
+
+    async def on_legacy_endpoint() -> None:
+        legacy_events.append(("endpoint",))
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        events.append(
+            (
+                "endpoint",
+                notification.phase,
+                notification.key,
+                notification.boundary_quality,
+                notification.audio_range,
+            )
+        )
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    return _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=on_legacy_transcript,
+        on_connection_error=AsyncMock(),
+        on_turn_endpointed=on_legacy_endpoint,
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+
+
+async def test_provider_rich_callbacks_carry_exact_key_without_legacy_duplicates():
+    events: list[tuple] = []
+    legacy_events: list[tuple] = []
+    session = _make_rich_provider_session(events, legacy_events)
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(100, 500),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="hello", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    key = ProviderUtteranceKey(0, 0, 10)
+    exact_range = ProviderAudioRange(100, 500)
+    assert events == [
+        ("endpoint", "boundary", key, "exact", exact_range),
+        ("endpoint", "ordered", key, "exact", exact_range),
+        ("final", key, "hello"),
+    ]
+    assert legacy_events == []
+    await session.close()
+
+
+async def test_provider_boundary_callback_never_blocks_response_consumer():
+    events: list[tuple] = []
+    boundary_started = asyncio.Event()
+    release_boundary = asyncio.Event()
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase == "boundary":
+            boundary_started.set()
+            await release_boundary.wait()
+        events.append(("endpoint", notification.phase, notification.key))
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    key = ProviderUtteranceKey(0, 0, 10)
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="hello", **common),
+    ):
+        await session._response_queue.put(event)
+
+    await asyncio.wait_for(boundary_started.wait(), 1)
+    await asyncio.wait_for(session._response_queue.join(), 0.2)
+    assert events == []
+
+    release_boundary.set()
+    await _drain_session_pipelines(session)
+    assert events == [
+        ("endpoint", "boundary", key),
+        ("endpoint", "ordered", key),
+        ("final", key, "hello"),
+    ]
+    await session.close()
+
+
+async def test_provider_boundary_callbacks_preserve_cross_key_worker_order():
+    boundary_started: list[ProviderUtteranceKey] = []
+    events: list[tuple] = []
+    release_first_boundary = asyncio.Event()
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase == "boundary":
+            boundary_started.append(notification.key)
+            if len(boundary_started) == 1:
+                await release_first_boundary.wait()
+        events.append(("endpoint", notification.phase, notification.key))
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0}
+    key_one = ProviderUtteranceKey(0, 0, 10)
+    key_two = ProviderUtteranceKey(0, 0, 11)
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", utterance_id=10, **common),
+        _AsrWorkerEvent(kind="utterance_started", utterance_id=11, **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            utterance_id=10,
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 400),
+            **common,
+        ),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            utterance_id=11,
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(400, 900),
+            **common,
+        ),
+    ):
+        await session._response_queue.put(event)
+
+    await asyncio.wait_for(_wait_until(lambda: bool(boundary_started)), 1)
+    await asyncio.wait_for(session._response_queue.join(), 0.2)
+    assert boundary_started == [key_one]
+
+    release_first_boundary.set()
+    await asyncio.wait_for(_wait_until(lambda: len(boundary_started) == 2), 1)
+    assert boundary_started == [key_one, key_two]
+
+    for event in (
+        _AsrWorkerEvent(kind="final", utterance_id=11, text="second", **common),
+        _AsrWorkerEvent(kind="final", utterance_id=10, text="first", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    assert events == [
+        ("endpoint", "boundary", key_one),
+        ("endpoint", "boundary", key_two),
+        ("endpoint", "ordered", key_one),
+        ("final", key_one, "first"),
+        ("endpoint", "ordered", key_two),
+        ("final", key_two, "second"),
+    ]
+    await session.close()
+
+
+async def test_provider_boundary_timeout_downgrades_and_delivers_final():
+    events: list[tuple] = []
+    boundary_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_cancelled_boundary = asyncio.Event()
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase == "boundary":
+            boundary_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_cancelled_boundary.wait()
+                return
+        events.append(
+            (
+                "endpoint",
+                notification.phase,
+                notification.key,
+                notification.boundary_quality,
+            )
+        )
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    key = ProviderUtteranceKey(0, 0, 10)
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="hello", **common),
+    ):
+        await session._response_queue.put(event)
+
+    await asyncio.wait_for(boundary_started.wait(), 1)
+    await asyncio.wait_for(cancellation_seen.wait(), 1)
+    await asyncio.wait_for(_wait_until(lambda: len(events) == 2), 1)
+    assert events == [
+        ("endpoint", "ordered", key, "unknown"),
+        ("final", key, "hello"),
+    ]
+
+    release_cancelled_boundary.set()
+    await session.close()
+
+
+async def test_provider_boundary_callback_failure_downgrades_ordered_exact():
+    events: list[tuple] = []
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase == "boundary":
+            raise RuntimeError("speaker reconciliation failed")
+        events.append(
+            (
+                "endpoint",
+                notification.phase,
+                notification.key,
+                notification.boundary_quality,
+            )
+        )
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    key = ProviderUtteranceKey(0, 0, 10)
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="still delivered", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    assert events == [
+        ("endpoint", "ordered", key, "unknown"),
+        ("final", key, "still delivered"),
+    ]
+    await session.close()
+
+
+async def test_close_recancels_retired_provider_boundary_task_without_hanging():
+    boundary_started = asyncio.Event()
+    first_cancellation = asyncio.Event()
+    shutdown_cancellation = asyncio.Event()
+    block_boundary = asyncio.Event()
+    block_retired_boundary = asyncio.Event()
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase != "boundary":
+            return
+        boundary_started.set()
+        try:
+            await block_boundary.wait()
+        except asyncio.CancelledError:
+            first_cancellation.set()
+            try:
+                await block_retired_boundary.wait()
+            except asyncio.CancelledError:
+                shutdown_cancellation.set()
+                raise
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=AsyncMock(),
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        ),
+    ):
+        await session._response_queue.put(event)
+
+    await asyncio.wait_for(boundary_started.wait(), 1)
+    await asyncio.wait_for(session.close(), 1)
+    assert first_cancellation.is_set()
+    assert shutdown_cancellation.is_set()
+    assert session._provider_boundary_retired_tasks == set()
+
+
+async def test_provider_boundary_task_overflow_fails_open_without_blocking_final():
+    events: list[tuple] = []
+    boundary_started: list[tuple[ProviderUtteranceKey, str]] = []
+    boundary_cancelled: list[tuple[ProviderUtteranceKey, str]] = []
+    release_boundaries = asyncio.Event()
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase == "boundary":
+            marker = (notification.key, notification.boundary_quality)
+            boundary_started.append(marker)
+            try:
+                await release_boundaries.wait()
+            except asyncio.CancelledError:
+                boundary_cancelled.append(marker)
+                raise
+        events.append(
+            (
+                "endpoint",
+                notification.phase,
+                notification.key,
+                notification.boundary_quality,
+            )
+        )
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0}
+    keys = [ProviderUtteranceKey(0, 0, value) for value in range(10, 20)]
+
+    for key in keys:
+        await session._response_queue.put(
+            _AsrWorkerEvent(
+                kind="utterance_started",
+                utterance_id=key.utterance_id,
+                **common,
+            )
+        )
+    for key in keys[:8]:
+        await session._response_queue.put(
+            _AsrWorkerEvent(
+                kind="provider_endpoint",
+                utterance_id=key.utterance_id,
+                boundary_quality="exact",
+                audio_range=ProviderAudioRange(0, 500),
+                **common,
+            )
+        )
+    await asyncio.wait_for(_wait_until(lambda: bool(boundary_started)), 1)
+    await asyncio.wait_for(session._response_queue.join(), 0.2)
+    assert boundary_started == [(keys[0], "exact")]
+
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            utterance_id=keys[8].utterance_id,
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        )
+    )
+    await asyncio.wait_for(session._response_queue.join(), 0.2)
+    await asyncio.wait_for(
+        _wait_until(lambda: len(boundary_started) == 2),
+        1,
+    )
+    assert boundary_started == [
+        (keys[0], "exact"),
+        (keys[0], "unknown"),
+    ]
+    assert boundary_cancelled == [(keys[0], "exact")]
+
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            utterance_id=keys[9].utterance_id,
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        )
+    )
+    await asyncio.wait_for(session._response_queue.join(), 0.2)
+    assert boundary_started == [
+        (keys[0], "exact"),
+        (keys[0], "unknown"),
+    ]
+    assert len(session._provider_boundary_tasks) == 8
+    assert {
+        ProviderUtteranceKey(*key): notification.boundary_quality
+        for key, notification in session._provider_endpoints.items()
+    } == {key: "unknown" for key in keys}
+
+    release_boundaries.set()
+    await asyncio.wait_for(
+        _wait_until(lambda: len(boundary_started) == len(keys[:8]) + 1),
+        1,
+    )
+    assert boundary_started == [
+        (keys[0], "exact"),
+        *((key, "unknown") for key in keys[:8]),
+    ]
+    assert events == [
+        ("endpoint", "boundary", key, "unknown") for key in keys[:8]
+    ]
+    assert len(session._provider_boundary_tasks) == 8
+
+    for index, key in enumerate(keys):
+        await session._response_queue.put(
+            _AsrWorkerEvent(
+                kind="final",
+                utterance_id=key.utterance_id,
+                text=f"delivered-{index}",
+                **common,
+            )
+        )
+    await _drain_session_pipelines(session)
+    assert events[len(keys[:8]) :] == [
+        item
+        for index, key in enumerate(keys)
+        for item in (
+            ("endpoint", "ordered", key, "unknown"),
+            ("final", key, f"delivered-{index}"),
+        )
+    ]
+
+    await asyncio.wait_for(session.close(), 1)
+
+
+async def test_provider_final_without_boundary_emits_unknown_before_ordered_final():
+    events: list[tuple] = []
+    session = _make_rich_provider_session(events, [])
+    await session.connect()
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="utterance_started", **common)
+    )
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="final", text="ok", **common)
+    )
+    await _drain_session_pipelines(session)
+
+    key = ProviderUtteranceKey(0, 0, 10)
+    assert events == [
+        ("endpoint", "boundary", key, "unknown", None),
+        ("endpoint", "ordered", key, "unknown", None),
+        ("final", key, "ok"),
+    ]
+    await session.close()
+
+
+async def test_provider_conflicting_boundary_revokes_exact_authority_monotonically():
+    events: list[tuple] = []
+    session = _make_rich_provider_session(events, [])
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    exact = _AsrWorkerEvent(
+        kind="provider_endpoint",
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 500),
+        **common,
+    )
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        exact,
+        exact,
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 600),
+            **common,
+        ),
+        exact,
+        _AsrWorkerEvent(kind="final", text="ok", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    key = ProviderUtteranceKey(0, 0, 10)
+    assert events == [
+        ("endpoint", "boundary", key, "exact", ProviderAudioRange(0, 500)),
+        ("endpoint", "boundary", key, "unknown", None),
+        ("endpoint", "ordered", key, "unknown", None),
+        ("final", key, "ok"),
+    ]
+    await session.close()
+
+
+async def test_provider_rich_out_of_order_finals_keep_each_keyed_boundary():
+    events: list[tuple] = []
+    session = _make_rich_provider_session(events, [])
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0}
+    key_one = ProviderUtteranceKey(0, 0, 10)
+    key_two = ProviderUtteranceKey(0, 0, 11)
+    range_one = ProviderAudioRange(0, 400)
+    range_two = ProviderAudioRange(400, 900)
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", utterance_id=10, **common),
+        _AsrWorkerEvent(kind="utterance_started", utterance_id=11, **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            utterance_id=10,
+            boundary_quality="exact",
+            audio_range=range_one,
+            **common,
+        ),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            utterance_id=11,
+            boundary_quality="exact",
+            audio_range=range_two,
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", utterance_id=11, text="second", **common),
+        _AsrWorkerEvent(kind="final", utterance_id=10, text="first", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    assert events == [
+        ("endpoint", "boundary", key_one, "exact", range_one),
+        ("endpoint", "boundary", key_two, "exact", range_two),
+        ("endpoint", "ordered", key_one, "exact", range_one),
+        ("final", key_one, "first"),
+        ("endpoint", "ordered", key_two, "exact", range_two),
+        ("final", key_two, "second"),
+    ]
+    await session.close()
+
+
+async def test_provider_boundary_beyond_epoch_wire_ledger_fails_open():
+    events: list[tuple] = []
+    session = _make_rich_provider_session(events, [])
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 100)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 101),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="safe", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    key = ProviderUtteranceKey(0, 0, 10)
+    assert events == [
+        ("endpoint", "boundary", key, "unknown", None),
+        ("endpoint", "ordered", key, "unknown", None),
+        ("final", key, "safe"),
+    ]
+    await session.close()
+
+
+async def test_provider_clear_rebases_exact_range_and_rejects_old_epoch_boundary():
+    events: list[tuple] = []
+    session = _make_rich_provider_session(events, [])
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    await session.clear_audio_buffer()
+    await session.stream_audio(b"\x00\x00" * 500)
+    assert session._response_queue is not None
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=10,
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 100),
+        )
+    )
+    common = {
+        "generation": 0,
+        "buffer_epoch": session._buffer_epoch,
+        "utterance_id": 20,
+    }
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(100, 400),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="fresh", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    key = ProviderUtteranceKey(0, session._buffer_epoch, 20)
+    rebased_range = ProviderAudioRange(1_100, 1_400)
+    assert events == [
+        ("endpoint", "boundary", key, "exact", rebased_range),
+        ("endpoint", "ordered", key, "exact", rebased_range),
+        ("final", key, "fresh"),
+    ]
     await session.close()
 
 

@@ -10,10 +10,7 @@ from typing import Literal, Protocol, runtime_checkable
 SPEAKER_SHADOW_SAMPLE_RATE_HZ = 16_000
 MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS = 4_000
 MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES = (
-    SPEAKER_SHADOW_SAMPLE_RATE_HZ
-    * MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS
-    // 1_000
-    * 2
+    SPEAKER_SHADOW_SAMPLE_RATE_HZ * MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS // 1_000 * 2
 )
 # Lifecycle pre-roll may arrive as one payload, so its per-submit ceiling must
 # match the candidate ceiling. The runtime still truncates to the configured
@@ -50,6 +47,12 @@ SpeakerShadowTerminalReason = Literal[
     "dropped",
     "failed",
 ]
+SpeakerShadowReconciliationStatus = Literal[
+    "pending",
+    "applied",
+    "failed",
+    "stale",
+]
 
 
 class SpeakerShadowBackend(Protocol):
@@ -84,6 +87,75 @@ class SpeakerShadowCandidateKey:
             raise ValueError("shadow_generation must be a non-negative integer")
         if self.scope not in ("provider_candidate", "smart_turn_turn"):
             raise ValueError("scope must be a supported speaker-shadow scope")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowReconcileSource:
+    """One synchronously fenced candidate slice consumed by a batch reconcile."""
+
+    candidate: SpeakerShadowCandidateKey
+    expected_sample_count: int
+    keep_start_sample: int
+    keep_end_sample: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, SpeakerShadowCandidateKey):
+            raise ValueError("candidate must be a SpeakerShadowCandidateKey")
+        if (
+            type(self.expected_sample_count) is not int
+            or type(self.keep_start_sample) is not int
+            or type(self.keep_end_sample) is not int
+            or self.expected_sample_count < 0
+            or self.keep_start_sample < 0
+            or self.keep_end_sample < self.keep_start_sample
+            or self.keep_end_sample > self.expected_sample_count
+        ):
+            raise ValueError("speaker-shadow reconcile source range is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowBatchReconcileRequest:
+    """Atomic split/merge request for one exact Provider audio range.
+
+    Empty source slices are wiped.  Non-empty slices are concatenated in order
+    into ``target``.  A remainder after the last kept slice requires ``suffix``
+    and is installed there as a deferred successor.
+    """
+
+    sources: tuple[SpeakerShadowReconcileSource, ...]
+    target: SpeakerShadowCandidateKey
+    suffix: SpeakerShadowCandidateKey | None = None
+    finish_target: bool = True
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.sources) is not tuple
+            or not self.sources
+            or not all(
+                isinstance(source, SpeakerShadowReconcileSource)
+                for source in self.sources
+            )
+            or not isinstance(self.target, SpeakerShadowCandidateKey)
+            or (
+                self.suffix is not None
+                and not isinstance(self.suffix, SpeakerShadowCandidateKey)
+            )
+            or type(self.finish_target) is not bool
+        ):
+            raise ValueError("speaker-shadow batch reconcile request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowBatchReconcileReceipt:
+    """Opaque reservation receipt returned only after atomic queue admission."""
+
+    runtime_generation: int
+    batch_id: int
+    target: SpeakerShadowCandidateKey
+    suffix: SpeakerShadowCandidateKey | None
+    target_sample_count: int
+    suffix_sample_count: int
+    _owner: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,10 +233,7 @@ class SpeakerShadowConfig:
                 or checkpoint > self.maximum_audio_ms
                 for checkpoint in checkpoints
             )
-            or any(
-                left >= right
-                for left, right in zip(checkpoints, checkpoints[1:])
-            )
+            or any(left >= right for left, right in zip(checkpoints, checkpoints[1:]))
         ):
             raise ValueError(
                 "observation_checkpoints_ms must contain at most "
@@ -388,6 +457,10 @@ class SpeakerShadowMetrics:
     terminal_queued_count: int = 0
     terminal_overflow_count: int = 0
     terminal_abandoned_count: int = 0
+    reconciliation_batch_admitted_count: int = 0
+    reconciliation_batch_applied_count: int = 0
+    reconciliation_batch_failed_count: int = 0
+    reconciliation_batch_revoked_count: int = 0
     completion_dispatched_count: int = 0
     completion_attempted_count: int = 0
     completion_overflow_count: int = 0
@@ -447,6 +520,48 @@ class SpeakerShadowDeferredCandidateControl(Protocol):
     def defer_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool: ...
 
     def activate_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool: ...
+
+
+@runtime_checkable
+class SpeakerShadowCandidateReconciliationControl(Protocol):
+    """Optional sample-exact ownership transfer between ordered candidates.
+
+    ``prefix_sample_count`` is measured in canonical 16 kHz samples from the
+    beginning of ``source``.  A distinct ``target`` receives the covered
+    prefix while ``source is target`` seals that candidate at the prefix.  If
+    samples remain, ``suffix`` must name a fresh deferred candidate that owns
+    them.  ``True`` means the ownership reservation and its same-queue control
+    marker were accepted; it does not grant authority over ASR delivery.
+    """
+
+    def reconcile_candidate_prefix(
+        self,
+        *,
+        source: SpeakerShadowCandidateKey,
+        target: SpeakerShadowCandidateKey,
+        prefix_sample_count: int,
+        suffix: SpeakerShadowCandidateKey | None = None,
+    ) -> bool: ...
+
+
+@runtime_checkable
+class SpeakerShadowBatchReconciliationControl(Protocol):
+    """Optional all-or-nothing ownership reconcile for one exact boundary."""
+
+    def reconcile_candidate_batch(
+        self,
+        request: SpeakerShadowBatchReconcileRequest,
+    ) -> SpeakerShadowBatchReconcileReceipt | None: ...
+
+    def reconciliation_status(
+        self,
+        receipt: SpeakerShadowBatchReconcileReceipt,
+    ) -> SpeakerShadowReconciliationStatus: ...
+
+    def revoke_reconciliation(
+        self,
+        receipt: SpeakerShadowBatchReconcileReceipt,
+    ) -> None: ...
 
 
 @runtime_checkable

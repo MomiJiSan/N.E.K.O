@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -29,6 +29,10 @@ from main_logic.voice_turn.contracts import (
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 
 from ._infra import logger, _READY_TIMEOUT_SECONDS
+from ._provider_events import (
+    ProviderEndpointNotification,
+    ProviderUtteranceKey,
+)
 from .audio import AsrAudioDispatcher
 from .candidate_control import CandidateRejectionOutcome, CandidateRejectionRequest
 from ._registry_meta import AsrProviderAvailability
@@ -44,6 +48,7 @@ from .endpointing.detector import (
     DetectorSubmitStatus,
     DetectorTurnEvent,
     ProviderCandidateFence,
+    ProviderSpeakerBoundarySnapshot,
 )
 from .endpointing.detector_runtime import (
     DetectorCandidateRejectionLease,
@@ -99,6 +104,9 @@ _CANDIDATE_REJECTION_WATCHDOG_SECONDS = 10.0
 _CANDIDATE_REJECTION_RECOVERY_STEP_TIMEOUT_SECONDS = 1.0
 _CANDIDATE_REJECTION_REINSTALL_ATTEMPTS = 2
 _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS = 0.2
+_PROVIDER_AUDIO_OBSERVATION_FENCE_TIMEOUT_SECONDS = 0.1
+_MAX_BUFFERED_PROVIDER_SPEAKER_SPANS = 8
+_MAX_PROVIDER_BOUNDARY_SNAPSHOTS = 8
 _PROVIDER_MICRO_EVENT_SHADOW_CONFIG = ProviderMicroEventConfig(
     mode="shadow",
     calibration_revision=None,
@@ -124,6 +132,7 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "speaker_gate_armed_while_preparing_count",
     "speaker_gate_provisional_armed_count",
     "speaker_gate_provisional_promoted_count",
+    "speaker_gate_preseal_replaced_count",
     "speaker_gate_final_before_first_observation_count",
     "speaker_gate_provisional_timeout_count",
     "speaker_gate_arm_provisional_stale_count",
@@ -156,6 +165,15 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "provider_candidate_bind_success_count",
     "provider_candidate_bind_empty_count",
     "provider_candidate_bind_failed_count",
+    "provider_boundary_preseal_started_count",
+    "provider_boundary_exact_ready_count",
+    "provider_boundary_unknown_ready_count",
+    "provider_boundary_conflict_count",
+    "provider_boundary_overflow_count",
+    "provider_boundary_stale_count",
+    "provider_boundary_ordered_jit_unknown_count",
+    "provider_preseal_rejection_consumed_count",
+    "provider_preseal_rejection_stale_count",
     "micro_event_suppressed_count",
     "micro_event_shadow_forward_count",
 )
@@ -218,13 +236,37 @@ class _AsrRuntimeIdentity:
 
 
 @dataclass(slots=True)
-class _BufferedProviderSpeakerObservation:
-    """PCM-free metadata for Provider audio retained by the lifecycle."""
+class _BufferedProviderSpeakerSpan:
+    """One PCM-free ordered span inside lifecycle-owned buffered audio."""
 
-    identity: DetectorIngressIdentity | None
-    total_bytes: int
-    resume_split_count: int
+    start_byte: int
+    end_byte: int
+    first_identity: DetectorIngressIdentity | None
+    last_identity: DetectorIngressIdentity | None
+    split_before_audio: bool
     evidence_complete: bool
+
+
+@dataclass(slots=True)
+class _BufferedProviderSpeakerObservation:
+    """Bounded span metadata for PCM retained only by the lifecycle."""
+
+    total_bytes: int
+    spans: list[_BufferedProviderSpeakerSpan]
+    overflowed: bool = False
+
+
+@dataclass(slots=True)
+class _ProviderBoundarySnapshotRecord:
+    notification: ProviderEndpointNotification
+    snapshot: ProviderSpeakerBoundarySnapshot | None
+    state: str = "presealing"
+    operation_version: int = 1
+    speaker_disposition: str = "pending"
+    preseal_settled: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +290,7 @@ class _SpeakerCandidateDecisionGate:
     transport_generation: int
     lifecycle: VoiceInputLifecycleController
     detector: DetectorRuntime
+    provider_key: ProviderUtteranceKey | None
     armed_while_preparing: bool
     first_observation_pending: bool
     deadline: float | None
@@ -268,6 +311,7 @@ class _SpeakerCandidateDecisionPreparation:
     transport_generation: int
     lifecycle: VoiceInputLifecycleController
     detector: DetectorRuntime
+    provider_key: ProviderUtteranceKey | None
     resolved: asyncio.Future[None]
     deadline: float | None = None
     wait_started: bool = False
@@ -365,6 +409,7 @@ class IndependentAsrRuntime:
         activation_generation: str,
     ) -> bool:
         old_factory = self._speaker_verifier_factory
+        old_degraded = self._speaker_verifier_degraded
         if (
             factory is old_factory
             and activation_generation == self._speaker_verifier_activation_generation
@@ -392,6 +437,7 @@ class IndependentAsrRuntime:
                     return False
                 if new_shadow is None:
                     return False
+            await self._revoke_runtime_speaker_authority_for_verifier_change()
             try:
                 await detector.replace_speaker_verifier(new_shadow)
             except asyncio.CancelledError:
@@ -399,6 +445,8 @@ class IndependentAsrRuntime:
                 raise
             except Exception:
                 await self._close_created_speaker_shadow(new_shadow)
+                if not revoking:
+                    self._speaker_verifier_degraded = old_degraded
                 return False
             if self._asr_detector is not detector:
                 # The detached detector owns and closes ``new_shadow``. Apply
@@ -410,8 +458,12 @@ class IndependentAsrRuntime:
                         try:
                             replacement_shadow = factory()
                         except Exception:
+                            if not revoking:
+                                self._speaker_verifier_degraded = old_degraded
                             return False
                         if replacement_shadow is None:
+                            if not revoking:
+                                self._speaker_verifier_degraded = old_degraded
                             return False
                     try:
                         await replacement.replace_speaker_verifier(replacement_shadow)
@@ -420,9 +472,15 @@ class IndependentAsrRuntime:
                         raise
                     except Exception:
                         await self._close_created_speaker_shadow(replacement_shadow)
+                        if not revoking:
+                            self._speaker_verifier_degraded = old_degraded
                         return False
                     if self._asr_detector is not replacement:
+                        if not revoking:
+                            self._speaker_verifier_degraded = old_degraded
                         return False
+        else:
+            await self._revoke_runtime_speaker_authority_for_verifier_change()
 
         if not revoking:
             self._speaker_verifier_factory = factory
@@ -432,11 +490,41 @@ class IndependentAsrRuntime:
         self._speaker_verifier_degraded = False
         return True
 
+    async def _revoke_runtime_speaker_authority_for_verifier_change(self) -> None:
+        """Linearize one verifier change against final speaker suppression."""
+
+        async with self._asr_final_lock:
+            if not self._speaker_verifier_degraded:
+                self._speaker_verifier_health_generation += 1
+            self._speaker_verifier_degraded = True
+            preparation = self._asr_speaker_candidate_decision_preparation
+            if preparation is not None:
+                preparation.retired = True
+                if not preparation.resolved.done():
+                    preparation.resolved.set_result(None)
+                self._asr_speaker_candidate_decision_preparation = None
+            gate = self._asr_speaker_candidate_decision_gate
+            if gate is not None:
+                rejection_task = gate.rejection_task
+                if rejection_task is not None and not rejection_task.done():
+                    rejection_task.cancel()
+                self._release_speaker_candidate_decision_gate(
+                    gate,
+                    metric_name=(
+                        "speaker_gate_released_verifier_degraded_count"
+                    ),
+                )
+            # Detector replacement revokes the corresponding lease.  Clear
+            # the Runtime half in the same linearization boundary so an old
+            # profile cannot suppress a final after the replacement.
+            self._asr_suppressed_final_key = None
+
     def _begin_speaker_candidate_decision_preparation(
         self,
         candidate: SpeakerShadowCandidateKey,
         *,
         activation_generation: str,
+        provider_key: ProviderUtteranceKey | None = None,
     ) -> _SpeakerCandidateDecisionPreparation | None:
         """Publish an exact bounded wait before detector lease preparation."""
 
@@ -444,6 +532,8 @@ class IndependentAsrRuntime:
         detector = self._asr_detector
         sealed_token = self._asr_sealed_turn_token
         provider_fence = self._asr_provider_candidate_fence
+        if provider_key is None:
+            provider_key = self._asr_sealed_provider_key
         if (
             type(candidate) is not SpeakerShadowCandidateKey
             or candidate.scope != "provider_candidate"
@@ -474,6 +564,7 @@ class IndependentAsrRuntime:
                 and current.activation_generation == activation_generation
                 and current.provider_fence == provider_fence
                 and current.turn_token == sealed_token.turn
+                and current.provider_key == provider_key
             ):
                 return current
             return None
@@ -488,6 +579,7 @@ class IndependentAsrRuntime:
             transport_generation=lifecycle.snapshot.transport_generation,
             lifecycle=lifecycle,
             detector=detector,
+            provider_key=provider_key,
             resolved=asyncio.get_running_loop().create_future(),
         )
         self._asr_speaker_candidate_decision_preparation = preparation
@@ -509,6 +601,7 @@ class IndependentAsrRuntime:
             and gate.candidate == preparation.candidate
             and gate.activation_generation == preparation.activation_generation
             and gate.final_key == preparation.final_key
+            and gate.provider_key == preparation.provider_key
         ):
             self._transfer_speaker_candidate_decision_preparation(gate)
         else:
@@ -530,6 +623,7 @@ class IndependentAsrRuntime:
             or gate.candidate != preparation.candidate
             or gate.activation_generation != preparation.activation_generation
             or gate.final_key != preparation.final_key
+            or gate.provider_key != preparation.provider_key
         ):
             return False
         if preparation.deadline is not None:
@@ -545,12 +639,40 @@ class IndependentAsrRuntime:
             preparation.resolved.set_result(None)
         return True
 
+    def _bind_speaker_candidate_decision_provider_key(
+        self,
+        provider_key: ProviderUtteranceKey,
+        provider_fence: ProviderCandidateFence,
+    ) -> None:
+        """Bind an early speaker result to the Provider key that later seals it."""
+
+        gate = self._asr_speaker_candidate_decision_gate
+        if (
+            gate is not None
+            and gate.provider_key is None
+            and gate.candidate.detector_epoch == provider_fence.detector_epoch
+            and gate.lease.candidate.candidate_generation
+            == provider_fence.candidate_generation
+        ):
+            gate.provider_key = provider_key
+        preparation = self._asr_speaker_candidate_decision_preparation
+        if (
+            preparation is not None
+            and preparation.provider_key is None
+            and preparation.provider_fence.detector_epoch
+            == provider_fence.detector_epoch
+            and preparation.provider_fence.candidate_generation
+            == provider_fence.candidate_generation
+        ):
+            preparation.provider_key = provider_key
+
     async def _arm_speaker_candidate_decision(
         self,
         candidate: SpeakerShadowCandidateKey,
         *,
         activation_generation: str,
         provisional: bool = False,
+        provider_key: ProviderUtteranceKey | None = None,
     ) -> bool:
         """Bound one pending speaker decision to exact Provider authority."""
 
@@ -569,11 +691,14 @@ class IndependentAsrRuntime:
             self._speaker_rejection_metrics["speaker_gate_arm_degraded_count"] += 1
             return False
         verifier_health_generation = self._speaker_verifier_health_generation
+        if provider_key is None:
+            provider_key = self._asr_sealed_provider_key
         current_gate = self._asr_speaker_candidate_decision_gate
         if current_gate is not None:
             matches_current = bool(
                 current_gate.candidate == candidate
                 and current_gate.activation_generation == activation_generation
+                and current_gate.provider_key == provider_key
                 and not current_gate.resolved.done()
             )
             if not matches_current:
@@ -596,6 +721,7 @@ class IndependentAsrRuntime:
             preparation is not None
             and preparation.candidate == candidate
             and preparation.activation_generation == activation_generation
+            and preparation.provider_key == provider_key
             and preparation.retired
         ):
             self._speaker_rejection_metrics[
@@ -648,6 +774,15 @@ class IndependentAsrRuntime:
                 "speaker_gate_arm_prepare_empty_count"
             ] += 1
             return False
+        provider_preseal_verdict = getattr(
+            lease,
+            "provider_preseal_verdict",
+            None,
+        )
+        preseal_authority = bool(
+            provider_preseal_verdict is not None
+            and getattr(lease, "provider_fence", None) is None
+        )
 
         try:
             async with self._asr_final_lock:
@@ -657,6 +792,7 @@ class IndependentAsrRuntime:
                         current_gate.candidate == candidate
                         and current_gate.activation_generation
                         == activation_generation
+                        and current_gate.provider_key == provider_key
                         and not current_gate.resolved.done()
                     )
                     if not matches_current:
@@ -698,7 +834,15 @@ class IndependentAsrRuntime:
                     )
                     and self._ingress_token_matches(turn_token.ingress)
                     and self._asr_turn_prepared
-                    and self._asr_reserved_final_key == final_key
+                    and (
+                        self._asr_reserved_final_key == final_key
+                        or (
+                            preseal_authority
+                            and provider_key is None
+                            and self._asr_reserved_final_key is None
+                            and self._asr_sealed_provider_key is None
+                        )
+                    )
                     and final_key not in self._asr_accepted_final_keys
                     and snapshot.transport_generation == transport_generation
                     and snapshot.turn_id == turn_token.turn_id
@@ -707,6 +851,7 @@ class IndependentAsrRuntime:
                         and preparation.candidate == candidate
                         and preparation.activation_generation
                         == activation_generation
+                        and preparation.provider_key == provider_key
                         and preparation.retired
                     )
                 )
@@ -772,6 +917,7 @@ class IndependentAsrRuntime:
                         transport_generation=transport_generation,
                         lifecycle=lifecycle,
                         detector=detector,
+                        provider_key=provider_key,
                         armed_while_preparing=armed_while_preparing,
                         first_observation_pending=provisional,
                         deadline=None,
@@ -1275,6 +1421,25 @@ class IndependentAsrRuntime:
         self._asr_overlap_completed_turns = 0
         self._asr_sealed_turn_token: VoiceTransportToken | None = None
         self._asr_provider_candidate_fence: ProviderCandidateFence | None = None
+        self._asr_provider_boundary_snapshots: OrderedDict[
+            ProviderUtteranceKey,
+            _ProviderBoundarySnapshotRecord,
+        ] = OrderedDict()
+        self._asr_provider_boundary_overflow_keys: OrderedDict[
+            ProviderUtteranceKey,
+            ProviderSpeakerBoundarySnapshot | None,
+        ] = OrderedDict()
+        self._asr_ordered_provider_keys: OrderedDict[
+            ProviderUtteranceKey,
+            None,
+        ] = OrderedDict()
+        self._asr_completed_provider_keys: OrderedDict[
+            ProviderUtteranceKey,
+            None,
+        ] = OrderedDict()
+        self._asr_sealed_provider_key: ProviderUtteranceKey | None = None
+        self._asr_provider_timeline: tuple[int, int] | None = None
+        self._asr_provider_exact_session: Any | None = None
         self._asr_audio_sequence = 0
         self._asr_provider_speaker_sequence = 0
         self._asr_buffered_provider_speaker_observation: (
@@ -1402,6 +1567,20 @@ class IndependentAsrRuntime:
             self._asr_start_generation = 0
         if not hasattr(self, "_asr_provider_candidate_fence"):
             self._asr_provider_candidate_fence = None
+        if not hasattr(self, "_asr_provider_boundary_snapshots"):
+            self._asr_provider_boundary_snapshots = OrderedDict()
+        if not hasattr(self, "_asr_provider_boundary_overflow_keys"):
+            self._asr_provider_boundary_overflow_keys = OrderedDict()
+        if not hasattr(self, "_asr_ordered_provider_keys"):
+            self._asr_ordered_provider_keys = OrderedDict()
+        if not hasattr(self, "_asr_completed_provider_keys"):
+            self._asr_completed_provider_keys = OrderedDict()
+        if not hasattr(self, "_asr_sealed_provider_key"):
+            self._asr_sealed_provider_key = None
+        if not hasattr(self, "_asr_provider_timeline"):
+            self._asr_provider_timeline = None
+        if not hasattr(self, "_asr_provider_exact_session"):
+            self._asr_provider_exact_session = None
         if not hasattr(self, "_asr_owned_cleanup_tasks"):
             self._asr_owned_cleanup_tasks = set()
         if not hasattr(self, "_asr_runtime_close_task"):
@@ -2166,31 +2345,55 @@ class IndependentAsrRuntime:
             sample_rate_hz=16_000,
         )
         if activated:
-            evidence_complete = bool(
-                buffered_observation is not None
-                and buffered_observation.evidence_complete
-                and buffered_observation.total_bytes == len(payload)
-                and buffered_observation.resume_split_count == 0
-            )
-            observation_identity = (
-                buffered_observation.identity
+            spans = (
+                buffered_observation.spans
                 if buffered_observation is not None
+                and buffered_observation.total_bytes == len(payload)
+                and buffered_observation.spans
                 else None
             )
-            if not await self._observe_admitted_provider_audio(
-                lifecycle,
-                detector,
-                payload,
-                sample_rate_hz=16_000,
-                identity=observation_identity,
-                # Aggregation deliberately keeps no PCM boundary. Even one
-                # resume marker may sit after already-buffered predecessor
-                # audio, so it cannot authorize a physical split here.
-                split_before_audio=False,
-                evidence_complete=evidence_complete,
-                turn_token=turn_token,
-            ):
-                return False
+            if spans is not None:
+                expected_start = 0
+                for span in spans:
+                    if (
+                        span.start_byte != expected_start
+                        or span.end_byte <= span.start_byte
+                        or span.end_byte > len(payload)
+                    ):
+                        spans = None
+                        break
+                    expected_start = span.end_byte
+                if expected_start != len(payload):
+                    spans = None
+            if spans is None and buffered_observation is None:
+                if not await self._observe_admitted_provider_audio(
+                    lifecycle,
+                    detector,
+                    payload,
+                    sample_rate_hz=16_000,
+                    identity=None,
+                    split_before_audio=False,
+                    evidence_complete=False,
+                    turn_token=turn_token,
+                ):
+                    return False
+            elif spans is not None:
+                for span in spans:
+                    span_payload = payload[span.start_byte : span.end_byte]
+                    if not await self._observe_admitted_provider_audio(
+                        lifecycle,
+                        detector,
+                        span_payload,
+                        sample_rate_hz=16_000,
+                        identity=span.last_identity,
+                        split_before_audio=span.split_before_audio,
+                        evidence_complete=bool(
+                            not buffered_observation.overflowed
+                            and span.evidence_complete
+                        ),
+                        turn_token=turn_token,
+                    ):
+                        return False
         return activated
 
     def _record_buffered_provider_speaker_observation(
@@ -2205,18 +2408,34 @@ class IndependentAsrRuntime:
             return
         buffered = self._asr_buffered_provider_speaker_observation
         if buffered is None:
-            self._asr_buffered_provider_speaker_observation = (
-                _BufferedProviderSpeakerObservation(
-                    identity=identity,
-                    total_bytes=byte_count,
-                    resume_split_count=int(split_before_audio),
-                    evidence_complete=bool(
-                        evidence_complete and identity is not None
-                    ),
-                )
+            self._asr_buffered_provider_speaker_observation = _BufferedProviderSpeakerObservation(
+                total_bytes=byte_count,
+                spans=[
+                    _BufferedProviderSpeakerSpan(
+                        start_byte=0,
+                        end_byte=byte_count,
+                        first_identity=identity,
+                        last_identity=identity,
+                        split_before_audio=bool(split_before_audio),
+                        evidence_complete=bool(
+                            evidence_complete and identity is not None
+                        ),
+                    )
+                ],
             )
             return
-        previous_identity = buffered.identity
+        start_byte = buffered.total_bytes
+        end_byte = start_byte + byte_count
+        buffered.total_bytes = end_byte
+        if buffered.overflowed:
+            collapsed = buffered.spans[0]
+            collapsed.end_byte = end_byte
+            collapsed.last_identity = identity
+            collapsed.evidence_complete = False
+            return
+
+        previous = buffered.spans[-1]
+        previous_identity = previous.last_identity
         compatible = bool(
             previous_identity is not None
             and identity is not None
@@ -2224,13 +2443,42 @@ class IndependentAsrRuntime:
             and previous_identity.detector_epoch == identity.detector_epoch
             and previous_identity.sequence_no < identity.sequence_no
         )
-        buffered.total_bytes += byte_count
-        buffered.resume_split_count += int(split_before_audio)
-        buffered.evidence_complete = bool(
-            buffered.evidence_complete and evidence_complete and compatible
+        if split_before_audio:
+            if len(buffered.spans) >= _MAX_BUFFERED_PROVIDER_SPEAKER_SPANS:
+                first = buffered.spans[0]
+                buffered.spans[:] = [
+                    _BufferedProviderSpeakerSpan(
+                        start_byte=0,
+                        end_byte=end_byte,
+                        first_identity=first.first_identity,
+                        last_identity=identity,
+                        split_before_audio=False,
+                        evidence_complete=False,
+                    )
+                ]
+                buffered.overflowed = True
+                return
+            buffered.spans.append(
+                _BufferedProviderSpeakerSpan(
+                    start_byte=start_byte,
+                    end_byte=end_byte,
+                    first_identity=identity,
+                    last_identity=identity,
+                    split_before_audio=True,
+                    evidence_complete=bool(
+                        evidence_complete and identity is not None and compatible
+                    ),
+                )
+            )
+            return
+        previous.end_byte = end_byte
+        previous.last_identity = identity
+        previous.evidence_complete = bool(
+            previous.evidence_complete
+            and evidence_complete
+            and identity is not None
+            and compatible
         )
-        if identity is not None:
-            buffered.identity = identity
 
     async def _observe_admitted_provider_audio(
         self,
@@ -2754,6 +3002,19 @@ class IndependentAsrRuntime:
                     text, epoch, candidate_provider
                 )
 
+            async def on_provider_final(
+                key: ProviderUtteranceKey,
+                text: str,
+            ) -> None:
+                if not is_adopted_candidate():
+                    return
+                await self._handle_provider_final(
+                    key,
+                    text,
+                    epoch,
+                    candidate_provider,
+                )
+
             async def on_error(_message: str) -> None:
                 if not is_adopted_candidate():
                     return
@@ -2773,6 +3034,16 @@ class IndependentAsrRuntime:
                     return
                 await self._handle_independent_asr_endpoint(epoch)
 
+            async def on_provider_endpoint(
+                notification: ProviderEndpointNotification,
+            ) -> None:
+                if not is_adopted_candidate():
+                    return
+                await self._handle_provider_endpoint_notification(
+                    notification,
+                    epoch,
+                )
+
             async def on_partial(text: str) -> None:
                 if not is_adopted_candidate():
                     return
@@ -2786,6 +3057,16 @@ class IndependentAsrRuntime:
                 on_status_message=on_status,
                 on_speech_activity=on_activity,
                 on_turn_endpointed=on_endpoint,
+                on_provider_endpoint=(
+                    on_provider_endpoint
+                    if candidate_policy.endpoint_authority == "provider"
+                    else None
+                ),
+                on_provider_final=(
+                    on_provider_final
+                    if candidate_policy.endpoint_authority == "provider"
+                    else None
+                ),
                 external_endpointing_runtime=(
                     _uses_smart_turn_endpointing(candidate_policy)
                 ),
@@ -2948,6 +3229,14 @@ class IndependentAsrRuntime:
                     await self._close_created_speaker_shadow(speaker_shadow)
                     raise
                 self._asr_detector = detector_ref
+                # The startup detector and Provider session share a fresh
+                # physical audio timeline. Reconnects earn this capability
+                # only after reset_provider_audio_timeline() succeeds.
+                self._asr_provider_exact_session = (
+                    asr_session
+                    if policy.endpoint_authority == "provider"
+                    else None
+                )
             self._asr_session_factory = create_candidate
             self._asr_transport_selection = selection
             self._schedule_transport_warm_expiry(
@@ -3113,6 +3402,74 @@ class IndependentAsrRuntime:
             candidate=lease.candidate,
             activation_generation=activation_generation,
         )
+
+        # An exact Provider range can finish both speaker checkpoints before
+        # its ordered endpoint reaches the text lifecycle.  In that window the
+        # lease owns only a detector-local, PCM-free pre-seal entry: committing
+        # it must record ``rejection_ready`` and do nothing else.  Keep this
+        # path await-free after lease acquisition so the ordered seal cannot
+        # consume the entry between validation and commit.
+        if getattr(lease, "provider_preseal_verdict", None) is not None:
+            current_lifecycle = self._asr_lifecycle
+            current_detector = self._asr_detector
+            turn_token = lease.turn_token
+            final_key = FinalKey.from_turn(turn_token)
+            decision_gate_is_current = bool(
+                decision_gate is not None
+                and self._asr_speaker_candidate_decision_gate is decision_gate
+                and decision_gate.lifecycle is current_lifecycle
+                and decision_gate.detector is current_detector
+                and decision_gate.session_epoch == request.session_epoch
+                and decision_gate.audio_generation == request.audio_generation
+                and decision_gate.transport_generation
+                == request.transport_generation
+                and decision_gate.turn_token == turn_token
+                and decision_gate.final_key == final_key
+                and decision_gate.provider_key is None
+                and decision_gate.lease.candidate == lease.candidate
+                and lease.shadow_candidate == decision_gate.candidate
+            )
+            current_snapshot = (
+                current_lifecycle.snapshot
+                if current_lifecycle is not None
+                else None
+            )
+            if (
+                request.session_epoch != self._asr_session_epoch
+                or request.audio_generation != self._asr_audio_generation
+                or request.activation_generation
+                != self._speaker_verifier_activation_generation
+                or current_lifecycle is None
+                or current_detector is None
+                or not lease.belongs_to(current_detector)
+                or self._asr_session is None
+                or self._asr_candidate_rejection is not None
+                or not decision_gate_is_current
+                or current_snapshot is None
+                or current_snapshot.state is not VoiceLifecycleState.ACTIVE
+                or current_snapshot.transport_generation
+                != request.transport_generation
+                or current_snapshot.turn_id != request.turn_id
+                or self._asr_sealed_turn_token is not None
+                or self._asr_provider_candidate_fence is not None
+                or self._asr_sealed_provider_key is not None
+                or self._asr_partial_turn_token != turn_token
+                or not self._ingress_token_matches(turn_token.ingress)
+                or not self._asr_turn_prepared
+                or self._asr_audio_dispatcher.active_turn != turn_token
+                or self._asr_reserved_final_key is not None
+                or final_key in self._asr_accepted_final_keys
+            ):
+                self._speaker_rejection_metrics[
+                    "rejection_stale_runtime_fence_count"
+                ] += 1
+                return CandidateRejectionOutcome.STALE
+            if not lease.commit():
+                self._speaker_rejection_metrics[
+                    "rejection_stale_commit_count"
+                ] += 1
+                return CandidateRejectionOutcome.STALE
+            return CandidateRejectionOutcome.APPLIED
 
         asr_session: Any = None
         smart_turn_lease: SmartTurnLease | None = None
@@ -3432,6 +3789,17 @@ class IndependentAsrRuntime:
             self._ensure_transport_restart_task()
         return True
 
+    def _reset_asr_provider_transport_namespace(self) -> None:
+        """Forget private state keyed to one physical Provider session."""
+
+        self._asr_provider_boundary_snapshots.clear()
+        self._asr_provider_boundary_overflow_keys.clear()
+        self._asr_ordered_provider_keys.clear()
+        self._asr_completed_provider_keys.clear()
+        self._asr_sealed_provider_key = None
+        self._asr_provider_timeline = None
+        self._asr_provider_exact_session = None
+
     def _reset_asr_turn_state(self) -> None:
         """Reset per-turn bookkeeping shared by close/abort/error teardown."""
 
@@ -3466,6 +3834,7 @@ class IndependentAsrRuntime:
         self._asr_candidate_rejection = None
         self._asr_sealed_turn_token = None
         self._asr_provider_candidate_fence = None
+        self._reset_asr_provider_transport_namespace()
         self._asr_turn_endpointed_at = None
         self._asr_turn_audio_started_at = None
         self._asr_turn_onset_at = None
@@ -3991,6 +4360,7 @@ class IndependentAsrRuntime:
                 return
             if existing is not None:
                 self._asr_session = None
+                self._asr_provider_exact_session = None
                 detached_identity = self._capture_runtime_identity()
                 await self._close_asr_session(existing)
                 if not self._runtime_identity_matches(detached_identity):
@@ -4038,6 +4408,43 @@ class IndependentAsrRuntime:
                         except Exception:
                             pass
                         return
+                    detector = self._asr_detector
+                    reset_provider_timeline = getattr(
+                        detector,
+                        "reset_provider_audio_timeline",
+                        None,
+                    )
+                    exact_timeline_ready = False
+                    if (
+                        policy.endpoint_authority == "provider"
+                        and callable(reset_provider_timeline)
+                    ):
+                        try:
+                            exact_timeline_ready = bool(
+                                await reset_provider_timeline()
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            # A speaker-only reset failure must not turn a
+                            # connected replacement into an ASR outage.
+                            exact_timeline_ready = False
+                    if not self._runtime_identity_matches(identity):
+                        try:
+                            await candidate.close()
+                        except Exception:
+                            pass
+                        return
+                    # No await is allowed between namespace retirement and
+                    # adoption. Provider callbacks are accepted only after
+                    # _asr_session points at this candidate.
+                    self._reset_asr_provider_transport_namespace()
+                    self._asr_provider_exact_session = (
+                        candidate
+                        if policy.endpoint_authority == "provider"
+                        and exact_timeline_ready
+                        else None
+                    )
                     self._asr_session = candidate
                     self._asr_last_provider_wire_audio_ms = 0
                     lifecycle.invalidate_transport()
@@ -4236,6 +4643,7 @@ class IndependentAsrRuntime:
             warm_task.cancel()
         self._asr_warm_expiry_task = None
         asr_session, self._asr_session = self._asr_session, None
+        self._asr_provider_exact_session = None
         session_close_task = None
         if asr_session is not None:
             async def close_transport() -> None:
@@ -4683,7 +5091,458 @@ class IndependentAsrRuntime:
             self._asr_overlap_completed_token = None
             self._asr_overlap_completed_onsets.clear()
 
-    async def _handle_independent_asr_endpoint(self, epoch: int) -> None:
+    @staticmethod
+    def _provider_key_namespace(
+        key: ProviderUtteranceKey,
+    ) -> tuple[int, int]:
+        return key.generation, key.buffer_epoch
+
+    def _accept_provider_timeline(self, key: ProviderUtteranceKey) -> bool:
+        """Accept one current/new Provider namespace and reject stale epochs."""
+
+        namespace = self._provider_key_namespace(key)
+        current = self._asr_provider_timeline
+        if current is not None and namespace < current:
+            return False
+        if current != namespace:
+            self._asr_provider_timeline = namespace
+            self._asr_provider_boundary_snapshots.clear()
+            self._asr_provider_boundary_overflow_keys.clear()
+            self._asr_ordered_provider_keys.clear()
+            self._asr_completed_provider_keys.clear()
+            self._asr_sealed_provider_key = None
+        return True
+
+    def _provider_key_timeline_is_current(
+        self,
+        key: ProviderUtteranceKey,
+    ) -> bool:
+        return self._asr_provider_timeline == self._provider_key_namespace(key)
+
+    @staticmethod
+    def _remember_bounded_provider_key(
+        keys: OrderedDict[ProviderUtteranceKey, None],
+        key: ProviderUtteranceKey,
+    ) -> None:
+        keys[key] = None
+        keys.move_to_end(key)
+        while len(keys) > _MAX_PROVIDER_BOUNDARY_SNAPSHOTS:
+            keys.popitem(last=False)
+
+    async def _retire_provider_speaker_boundary_unknown(
+        self,
+        detector: DetectorRuntime,
+        identity: _AsrRuntimeIdentity,
+        verdict: ProviderSpeakerBoundarySnapshot | None = None,
+    ) -> tuple[bool, ProviderSpeakerBoundarySnapshot | None]:
+        retire = getattr(
+            detector,
+            "retire_provider_speaker_boundary_unknown",
+            None,
+        )
+        retired: ProviderSpeakerBoundarySnapshot | None = None
+        if callable(retire):
+            try:
+                result = await retire(verdict)
+                if type(result) is ProviderSpeakerBoundarySnapshot:
+                    retired = result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Speaker ownership is advisory. A cleanup failure must not
+                # turn an unknown boundary into an ASR transport failure.
+                pass
+        return self._runtime_identity_matches(identity), retired
+
+    async def _handle_provider_endpoint_notification(
+        self,
+        notification: ProviderEndpointNotification,
+        epoch: int,
+    ) -> None:
+        """Reconcile raw boundaries early and seal keyed text turns in order."""
+
+        if (
+            type(notification) is not ProviderEndpointNotification
+            or epoch != self._asr_session_epoch
+        ):
+            return
+        if notification.phase == "boundary":
+            await self._handle_provider_boundary_notification(
+                notification,
+                epoch,
+            )
+            return
+        await self._handle_ordered_provider_endpoint(
+            notification,
+            epoch,
+        )
+
+    async def _handle_provider_boundary_notification(
+        self,
+        notification: ProviderEndpointNotification,
+        epoch: int,
+    ) -> None:
+        key = notification.key
+        if not self._accept_provider_timeline(key):
+            return
+        detector = self._asr_detector
+        if detector is None:
+            return
+        identity = self._capture_runtime_identity()
+        existing = self._asr_provider_boundary_snapshots.get(key)
+        if existing is not None:
+            if existing.notification == notification:
+                return
+            if existing.state == "presealing" and existing.snapshot is None:
+                # Normal session delivery serializes same-namespace boundary
+                # callbacks.  Keep the Runtime entry self-contained as well:
+                # a defensive concurrent conflict must wait until the first
+                # operation publishes its opaque detector verdict, otherwise
+                # an unkeyed unknown retirement can reserve generation N+1
+                # while the exact batch already owns generation N.
+                try:
+                    await asyncio.wait_for(
+                        existing.preseal_settled.wait(),
+                        timeout=(
+                            _PROVIDER_AUDIO_OBSERVATION_FENCE_TIMEOUT_SECONDS
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    self._speaker_rejection_metrics[
+                        "provider_boundary_stale_count"
+                    ] += 1
+                    return
+                if (
+                    not self._runtime_identity_matches(identity)
+                    or self._asr_provider_boundary_snapshots.get(key) is not existing
+                ):
+                    return
+            if existing.state in {"sealing", "sealed", "completed", "retired"}:
+                self._speaker_rejection_metrics[
+                    "provider_boundary_stale_count"
+                ] += 1
+                return
+            self._speaker_rejection_metrics[
+                "provider_boundary_conflict_count"
+            ] += 1
+            existing.operation_version += 1
+            operation_version = existing.operation_version
+            existing.state = "presealing"
+            current, retired = await self._retire_provider_speaker_boundary_unknown(
+                detector,
+                identity,
+                existing.snapshot,
+            )
+            if (
+                not current
+                or self._asr_provider_boundary_snapshots.get(key) is not existing
+                or existing.operation_version != operation_version
+            ):
+                return
+            existing.notification = ProviderEndpointNotification(
+                phase="boundary",
+                generation=key.generation,
+                buffer_epoch=key.buffer_epoch,
+                utterance_id=key.utterance_id,
+                boundary_quality="unknown",
+                audio_range=None,
+            )
+            existing.snapshot = retired
+            existing.state = "ready_unknown"
+            existing.speaker_disposition = "unknown"
+            existing.preseal_settled.set()
+            self._speaker_rejection_metrics[
+                "provider_boundary_unknown_ready_count"
+            ] += 1
+            return
+        if (
+            key in self._asr_ordered_provider_keys
+            or key in self._asr_completed_provider_keys
+        ):
+            self._speaker_rejection_metrics[
+                "provider_boundary_stale_count"
+            ] += 1
+            return
+        if (
+            len(self._asr_provider_boundary_snapshots)
+            >= _MAX_PROVIDER_BOUNDARY_SNAPSHOTS
+        ):
+            self._speaker_rejection_metrics[
+                "provider_boundary_overflow_count"
+            ] += 1
+            current, retired = await self._retire_provider_speaker_boundary_unknown(
+                detector,
+                identity,
+                None,
+            )
+            if not current:
+                return
+            self._asr_provider_boundary_overflow_keys[key] = retired
+            self._asr_provider_boundary_overflow_keys.move_to_end(key)
+            while (
+                len(self._asr_provider_boundary_overflow_keys)
+                > _MAX_PROVIDER_BOUNDARY_SNAPSHOTS
+            ):
+                self._asr_provider_boundary_overflow_keys.popitem(last=False)
+            return
+
+        record = _ProviderBoundarySnapshotRecord(
+            notification=notification,
+            snapshot=None,
+        )
+        self._asr_provider_boundary_snapshots[key] = record
+        self._speaker_rejection_metrics[
+            "provider_boundary_preseal_started_count"
+        ] += 1
+        operation_version = record.operation_version
+        snapshot: ProviderSpeakerBoundarySnapshot | None = None
+        if (
+            notification.boundary_quality == "exact"
+            and self._asr_session is not None
+            and self._asr_provider_exact_session is self._asr_session
+        ):
+            observation_ready = False
+            wait_observed_through = getattr(
+                detector,
+                "wait_provider_audio_observed_through",
+                None,
+            )
+            if (
+                callable(wait_observed_through)
+                and notification.audio_range is not None
+            ):
+                try:
+                    observation_ready = bool(
+                        await asyncio.wait_for(
+                            wait_observed_through(
+                                notification.audio_range.end_sample_16k
+                            ),
+                            timeout=(
+                                _PROVIDER_AUDIO_OBSERVATION_FENCE_TIMEOUT_SECONDS
+                            ),
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    observation_ready = False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    observation_ready = False
+                if (
+                    not self._runtime_identity_matches(identity)
+                    or not self._provider_key_timeline_is_current(key)
+                    or self._asr_provider_boundary_snapshots.get(key) is not record
+                    or record.operation_version != operation_version
+                ):
+                    return
+            reconcile = getattr(detector, "reconcile_provider_endpoint", None)
+            if (
+                observation_ready
+                and callable(reconcile)
+                and notification.audio_range is not None
+            ):
+                try:
+                    reconciled = await reconcile(notification.audio_range)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    reconciled = None
+                if (
+                    not self._runtime_identity_matches(identity)
+                    or self._asr_provider_boundary_snapshots.get(key) is not record
+                    or record.operation_version != operation_version
+                ):
+                    if type(reconciled) is ProviderSpeakerBoundarySnapshot:
+                        await self._retire_provider_speaker_boundary_unknown(
+                            detector,
+                            identity,
+                            reconciled,
+                        )
+                    return
+                if type(reconciled) is ProviderSpeakerBoundarySnapshot:
+                    snapshot = reconciled
+        if snapshot is None:
+            current, snapshot = await self._retire_provider_speaker_boundary_unknown(
+                detector,
+                identity,
+                None,
+            )
+            if not current:
+                return
+            notification = ProviderEndpointNotification(
+                phase="boundary",
+                generation=key.generation,
+                buffer_epoch=key.buffer_epoch,
+                utterance_id=key.utterance_id,
+                boundary_quality="unknown",
+                audio_range=None,
+            )
+        if (
+            key in self._asr_ordered_provider_keys
+            or key in self._asr_completed_provider_keys
+            or not self._provider_key_timeline_is_current(key)
+            or not self._runtime_identity_matches(identity)
+            or self._asr_provider_boundary_snapshots.get(key) is not record
+            or record.operation_version != operation_version
+        ):
+            return
+        exact = bool(
+            notification.boundary_quality == "exact"
+            and snapshot is not None
+            and getattr(snapshot, "boundary_exact", True)
+        )
+        if not exact:
+            notification = ProviderEndpointNotification(
+                phase="boundary",
+                generation=key.generation,
+                buffer_epoch=key.buffer_epoch,
+                utterance_id=key.utterance_id,
+                boundary_quality="unknown",
+                audio_range=None,
+            )
+        record.notification = notification
+        record.snapshot = snapshot
+        record.state = "ready_exact" if exact else "ready_unknown"
+        record.speaker_disposition = "pending" if exact else "unknown"
+        record.preseal_settled.set()
+        self._speaker_rejection_metrics[
+            "provider_boundary_exact_ready_count"
+            if exact
+            else "provider_boundary_unknown_ready_count"
+        ] += 1
+
+    async def _handle_ordered_provider_endpoint(
+        self,
+        notification: ProviderEndpointNotification,
+        epoch: int,
+    ) -> None:
+        key = notification.key
+        if (
+            not self._accept_provider_timeline(key)
+            or key in self._asr_completed_provider_keys
+            or key in self._asr_ordered_provider_keys
+        ):
+            return
+        record = self._asr_provider_boundary_snapshots.get(key)
+        verdict = (
+            record.snapshot
+            if record is not None
+            else self._asr_provider_boundary_overflow_keys.pop(key, None)
+        )
+        if record is None and verdict is None:
+            self._speaker_rejection_metrics[
+                "provider_boundary_ordered_jit_unknown_count"
+            ] += 1
+        snapshot = (
+            verdict
+            if notification.boundary_quality == "exact"
+            and record is not None
+            and record.state == "ready_exact"
+            and record.notification.boundary_quality == "exact"
+            and record.notification.audio_range == notification.audio_range
+            else None
+        )
+        detector = self._asr_detector
+        if detector is None:
+            return
+        identity = self._capture_runtime_identity()
+        operation_version: int | None = None
+        if record is not None:
+            record.operation_version += 1
+            operation_version = record.operation_version
+            record.state = "sealing"
+        if snapshot is None:
+            current, snapshot = await self._retire_provider_speaker_boundary_unknown(
+                detector,
+                identity,
+                verdict,
+            )
+            if not current:
+                return
+        if (
+            not self._runtime_identity_matches(identity)
+            or not self._provider_key_timeline_is_current(key)
+            or (
+                record is not None
+                and (
+                    self._asr_provider_boundary_snapshots.get(key) is not record
+                    or record.operation_version != operation_version
+                )
+            )
+        ):
+            return
+        self._remember_bounded_provider_key(
+            self._asr_ordered_provider_keys,
+            key,
+        )
+        await self._handle_independent_asr_endpoint(
+            epoch,
+            provider_key=key,
+            provider_snapshot=snapshot,
+        )
+        if (
+            epoch == self._asr_session_epoch
+            and self._asr_sealed_provider_key == key
+        ):
+            if record is not None:
+                record.snapshot = snapshot
+                record.state = "sealed"
+                record.speaker_disposition = (
+                    "pending"
+                    if self._asr_provider_candidate_fence is not None
+                    and self._asr_provider_candidate_fence.boundary_exact
+                    else "unknown"
+                )
+        elif epoch == self._asr_session_epoch:
+            if record is not None:
+                record.state = "retired"
+            self._asr_ordered_provider_keys.pop(key, None)
+
+    async def _handle_provider_final(
+        self,
+        key: ProviderUtteranceKey,
+        text: str,
+        epoch: int,
+        provider: str,
+    ) -> None:
+        if (
+            type(key) is not ProviderUtteranceKey
+            or epoch != self._asr_session_epoch
+            or key in self._asr_completed_provider_keys
+            or not self._accept_provider_timeline(key)
+        ):
+            return
+        if self._asr_sealed_provider_key != key:
+            await self._handle_ordered_provider_endpoint(
+                ProviderEndpointNotification(
+                    phase="ordered",
+                    generation=key.generation,
+                    buffer_epoch=key.buffer_epoch,
+                    utterance_id=key.utterance_id,
+                    boundary_quality="unknown",
+                    audio_range=None,
+                ),
+                epoch,
+            )
+        if (
+            epoch != self._asr_session_epoch
+            or self._asr_sealed_provider_key != key
+        ):
+            return
+        await self._handle_independent_asr_final(
+            text,
+            epoch,
+            provider,
+            provider_key=key,
+        )
+
+    async def _handle_independent_asr_endpoint(
+        self,
+        epoch: int,
+        *,
+        provider_key: ProviderUtteranceKey | None = None,
+        provider_snapshot: ProviderSpeakerBoundarySnapshot | None = None,
+    ) -> None:
         """Seal the current turn immediately at its semantic endpoint."""
 
         if epoch != self._asr_session_epoch:
@@ -4692,6 +5551,44 @@ class IndependentAsrRuntime:
         lifecycle = self._asr_lifecycle
         if lifecycle is None:
             return
+        provider_identity = (
+            self._capture_runtime_identity()
+            if provider_key is not None
+            else None
+        )
+
+        def provider_key_is_current() -> bool:
+            return bool(
+                provider_key is None
+                or (
+                    provider_identity is not None
+                    and self._runtime_identity_matches(provider_identity)
+                    and self._provider_key_timeline_is_current(provider_key)
+                )
+            )
+
+        if (
+            provider_key is not None
+            and lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+        ):
+            # The Provider key, not a local resume/pause credit, authorizes a
+            # new logical text turn. Existing onset metadata is only a timing
+            # hint; if it is absent or stale, wake the turn without it.
+            ingress_token = self._asr_current_ingress_token
+            if (
+                ingress_token is None
+                or not self._ingress_token_matches(ingress_token)
+            ):
+                return
+            if self._asr_overlap_completed_token != ingress_token:
+                self._asr_overlap_completed_token = ingress_token
+                self._asr_overlap_completed_onsets.clear()
+                self._asr_overlap_completed_turns = 0
+            if self._asr_overlap_completed_turns <= 0:
+                onset_at = self._asr_overlap_onset_at
+                if onset_at is not None:
+                    self._asr_overlap_completed_onsets.append(onset_at)
+                self._asr_overlap_completed_turns = 1
         if (
             lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
             and self._asr_overlap_completed_turns > 0
@@ -4740,7 +5637,11 @@ class IndependentAsrRuntime:
                 SpeechActivityEvent.SPEECH_RESUMED,
                 epoch,
             )
-            if epoch != self._asr_session_epoch or self._asr_lifecycle is not lifecycle:
+            if (
+                epoch != self._asr_session_epoch
+                or self._asr_lifecycle is not lifecycle
+                or not provider_key_is_current()
+            ):
                 return
             if (
                 not pending_before
@@ -4840,6 +5741,8 @@ class IndependentAsrRuntime:
             if not credit_consumed:
                 self._consume_overlap_completed_credit()
         if lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE:
+            if not provider_key_is_current():
+                return
             if not self._asr_turn_prepared:
                 # A rejected preparation keeps the lifecycle ACTIVE so the
                 # utterance can retry (SPEECH_RESUMED re-prepares), but Core
@@ -4852,6 +5755,7 @@ class IndependentAsrRuntime:
                     epoch != self._asr_session_epoch
                     or self._asr_lifecycle is not lifecycle
                     or lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE
+                    or not provider_key_is_current()
                 ):
                     return
                 if not self._asr_turn_prepared:
@@ -4886,9 +5790,15 @@ class IndependentAsrRuntime:
                     turn_token=turn_token,
                 )
                 try:
-                    provider_fence = await detector.seal_provider_candidate(
-                        turn_token
-                    )
+                    if provider_key is None:
+                        provider_fence = await detector.seal_provider_candidate(
+                            turn_token
+                        )
+                    else:
+                        provider_fence = await detector.seal_provider_candidate(
+                            turn_token,
+                            speaker_snapshot=provider_snapshot,
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -4898,6 +5808,10 @@ class IndependentAsrRuntime:
                         self.display_name,
                     )
                 if not self._runtime_identity_matches(endpoint_identity):
+                    transcript_dispatcher.release(final_key)
+                    self._asr_reserved_final_key = None
+                    return
+                if not provider_key_is_current():
                     transcript_dispatcher.release(final_key)
                     self._asr_reserved_final_key = None
                     return
@@ -4912,21 +5826,87 @@ class IndependentAsrRuntime:
                     )
                     return
                 self._asr_provider_candidate_fence = provider_fence
+                self._asr_sealed_provider_key = provider_key
+                if provider_key is not None:
+                    self._bind_speaker_candidate_decision_provider_key(
+                        provider_key,
+                        provider_fence,
+                    )
             lifecycle.transition(VoiceLifecycleEvent.TURN_SEALED)
             self._asr_sealed_turn_token = self._capture_transport_token(lifecycle)
             if not _uses_smart_turn_endpointing(lifecycle.provider_policy):
                 activation_generation = self._speaker_verifier_activation_generation
+                ready_speaker_candidate = None
+                provider_fence = self._asr_provider_candidate_fence
+                ready_rejection = getattr(
+                    detector,
+                    "ready_provider_speaker_rejection",
+                    None,
+                )
+                if provider_fence is not None and callable(ready_rejection):
+                    try:
+                        ready_speaker_candidate = ready_rejection(provider_fence)
+                    except Exception:
+                        ready_speaker_candidate = None
                 try:
                     pending_speaker_candidate = (
                         detector.pending_provider_speaker_candidate(
-                            self._asr_provider_candidate_fence
+                            provider_fence
                         )
-                        if self._asr_provider_candidate_fence is not None
+                        if provider_fence is not None
                         else None
                     )
                 except Exception:
                     pending_speaker_candidate = None
                 if (
+                    ready_speaker_candidate is not None
+                    and activation_generation is not None
+                ):
+                    preseal_gate = self._asr_speaker_candidate_decision_gate
+                    if (
+                        preseal_gate is not None
+                        and preseal_gate.candidate == ready_speaker_candidate
+                        and getattr(
+                            preseal_gate.lease,
+                            "provider_preseal_verdict",
+                            None,
+                        )
+                        is not None
+                        and getattr(
+                            preseal_gate.lease,
+                            "provider_fence",
+                            None,
+                        )
+                        is None
+                    ):
+                        # The pre-seal task can be done while its reaper is
+                        # still queued.  Never reuse that gate as sealed
+                        # authority: install a fresh fence-bound lease below.
+                        self._release_speaker_candidate_decision_gate(
+                            preseal_gate,
+                            metric_name=(
+                                "speaker_gate_preseal_replaced_count"
+                            ),
+                        )
+                    try:
+                        outcome = await self._reject_speaker_candidate(
+                            ready_speaker_candidate,
+                            activation_generation=activation_generation,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        outcome = CandidateRejectionOutcome.STALE
+                    self._speaker_rejection_metrics[
+                        "provider_preseal_rejection_consumed_count"
+                        if outcome
+                        in {
+                            CandidateRejectionOutcome.APPLIED,
+                            CandidateRejectionOutcome.APPLIED_CLEANUP_DEGRADED,
+                        }
+                        else "provider_preseal_rejection_stale_count"
+                    ] += 1
+                elif (
                     pending_speaker_candidate is not None
                     and activation_generation is not None
                 ):
@@ -4934,6 +5914,7 @@ class IndependentAsrRuntime:
                         self._begin_speaker_candidate_decision_preparation(
                             pending_speaker_candidate,
                             activation_generation=activation_generation,
+                            provider_key=provider_key,
                         )
                     )
                     armed = False
@@ -4942,6 +5923,7 @@ class IndependentAsrRuntime:
                             pending_speaker_candidate,
                             activation_generation=activation_generation,
                             provisional=True,
+                            provider_key=provider_key,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -4956,11 +5938,14 @@ class IndependentAsrRuntime:
                                 preparation,
                                 armed=armed,
                             )
-                    if not self._runtime_identity_matches(endpoint_identity):
-                        transcript_dispatcher.release(final_key)
-                        if self._asr_reserved_final_key == final_key:
-                            self._asr_reserved_final_key = None
-                        return
+                if (
+                    not self._runtime_identity_matches(endpoint_identity)
+                    or not provider_key_is_current()
+                ):
+                    transcript_dispatcher.release(final_key)
+                    if self._asr_reserved_final_key == final_key:
+                        self._asr_reserved_final_key = None
+                    return
             self._asr_turn_endpointed_at = time.monotonic()
             self._asr_last_turn_endpointed_at = self._asr_turn_endpointed_at
             # 与 Core 侧 record.turn_id 同构（asr_runtime.py 的
@@ -5140,6 +6125,7 @@ class IndependentAsrRuntime:
         gate: _SpeakerCandidateDecisionGate,
         *,
         epoch: int,
+        provider_key: ProviderUtteranceKey | None,
     ) -> bool:
         lifecycle = self._asr_lifecycle
         sealed_token = self._asr_sealed_turn_token
@@ -5147,6 +6133,8 @@ class IndependentAsrRuntime:
         candidate = gate.lease.candidate
         return bool(
             self._asr_speaker_candidate_decision_gate is gate
+            and gate.provider_key == provider_key
+            and self._asr_sealed_provider_key == provider_key
             and epoch == gate.session_epoch == self._asr_session_epoch
             and gate.audio_generation == self._asr_audio_generation
             and gate.activation_generation
@@ -5188,11 +6176,14 @@ class IndependentAsrRuntime:
         preparation: _SpeakerCandidateDecisionPreparation,
         *,
         epoch: int,
+        provider_key: ProviderUtteranceKey | None,
     ) -> bool:
         lifecycle = self._asr_lifecycle
         sealed_token = self._asr_sealed_turn_token
         return bool(
             self._asr_speaker_candidate_decision_preparation is preparation
+            and preparation.provider_key == provider_key
+            and self._asr_sealed_provider_key == provider_key
             and not preparation.retired
             and epoch == preparation.session_epoch == self._asr_session_epoch
             and preparation.audio_generation == self._asr_audio_generation
@@ -5225,7 +6216,12 @@ class IndependentAsrRuntime:
             and preparation.final_key not in self._asr_accepted_final_keys
         )
 
-    async def _wait_for_speaker_candidate_decision(self, epoch: int) -> None:
+    async def _wait_for_speaker_candidate_decision(
+        self,
+        epoch: int,
+        *,
+        provider_key: ProviderUtteranceKey | None = None,
+    ) -> None:
         """Wait outside final serialization for one exact first-low decision."""
 
         while True:
@@ -5235,9 +6231,12 @@ class IndependentAsrRuntime:
             async with self._asr_final_lock:
                 gate = self._asr_speaker_candidate_decision_gate
                 if gate is not None:
+                    if gate.provider_key != provider_key:
+                        return
                     if not self._speaker_candidate_decision_matches_provider_final(
                         gate,
                         epoch=epoch,
+                        provider_key=provider_key,
                     ):
                         self._release_speaker_candidate_decision_gate(
                             gate,
@@ -5276,9 +6275,12 @@ class IndependentAsrRuntime:
                     )
                     if preparation is None:
                         return
+                    if preparation.provider_key != provider_key:
+                        return
                     if not self._speaker_candidate_preparation_matches_provider_final(
                         preparation,
                         epoch=epoch,
+                        provider_key=provider_key,
                     ):
                         preparation.retired = True
                         if not preparation.resolved.done():
@@ -5367,11 +6369,16 @@ class IndependentAsrRuntime:
         text: str,
         epoch: int,
         provider: str,
+        *,
+        provider_key: ProviderUtteranceKey | None = None,
     ) -> None:
         clean = str(text or "").strip()
         if epoch != self._asr_session_epoch:
             return
-        await self._wait_for_speaker_candidate_decision(epoch)
+        await self._wait_for_speaker_candidate_decision(
+            epoch,
+            provider_key=provider_key,
+        )
 
         lifecycle_ref: VoiceInputLifecycleController | None = None
         detector_ref: DetectorRuntime | None = None
@@ -5406,6 +6413,10 @@ class IndependentAsrRuntime:
                 or sealed_token is None
                 or lifecycle_ref.snapshot.state is not VoiceLifecycleState.DRAINING
                 or not self._transport_token_matches(sealed_token, lifecycle_ref)
+                or (
+                    provider_key is not None
+                    and self._asr_sealed_provider_key != provider_key
+                )
             ):
                 return
             final_key = FinalKey.from_turn(sealed_token.turn)
@@ -5503,6 +6514,29 @@ class IndependentAsrRuntime:
                     self._asr_received_audio = False
                     self._asr_sealed_turn_token = None
                     self._asr_provider_candidate_fence = None
+                    self._asr_sealed_provider_key = None
+                    if provider_key is not None:
+                        provider_record = self._asr_provider_boundary_snapshots.get(
+                            provider_key
+                        )
+                        if provider_record is not None:
+                            provider_record.state = "completed"
+                            provider_record.speaker_disposition = (
+                                "suppress" if speaker_suppress else "allow"
+                            )
+                        self._remember_bounded_provider_key(
+                            self._asr_completed_provider_keys,
+                            provider_key,
+                        )
+                        self._asr_ordered_provider_keys.pop(provider_key, None)
+                        self._asr_provider_boundary_overflow_keys.pop(
+                            provider_key,
+                            None,
+                        )
+                        self._asr_provider_boundary_snapshots.pop(
+                            provider_key,
+                            None,
+                        )
                     self._asr_turn_endpointed_at = None
                     self._asr_reserved_final_key = None
                     preparation = (
@@ -5610,6 +6644,15 @@ class IndependentAsrRuntime:
             return
 
         await self._activate_pending_independent_turn(epoch)
+        if provider_key is not None:
+            # Local resume/onset bookkeeping is presentation metadata only on
+            # the keyed path. Never let an unmatched tentative tail wake a
+            # ghost text turn after this Provider utterance completes.
+            self._asr_overlap_onset_token = None
+            self._asr_overlap_onset_at = None
+            self._asr_overlap_completed_token = None
+            self._asr_overlap_completed_onsets.clear()
+            self._asr_overlap_completed_turns = 0
         overlap_token = self._asr_overlap_onset_token
         overlap_onset_at = self._asr_overlap_onset_at
         if overlap_token is not None and self._asr_overlap_completed_turns > 0:

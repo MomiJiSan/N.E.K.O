@@ -30,6 +30,11 @@ from main_logic.asr_client.runtime import (
     AsrStartStatus,
     IndependentAsrRuntime,
 )
+from main_logic.asr_client._provider_events import (
+    ProviderAudioRange,
+    ProviderEndpointNotification,
+    ProviderUtteranceKey,
+)
 from main_logic.asr_client.endpointing.detector_runtime import DetectorFeedResult, DetectorRuntime
 from main_logic.voice_input import VoiceInputDispatchResult
 from main_logic.voice_input.consumers import CoreChatTurnContext
@@ -64,6 +69,7 @@ from main_logic.asr_client.endpointing.detector import (
     DetectorCandidateKey,
     DetectorIngressIdentity,
     ProviderCandidateFence,
+    ProviderSpeakerBoundarySnapshot,
     DetectorRuntimeEvent,
     DetectorTurnEvent,
     DetectorSubmitResult,
@@ -273,6 +279,10 @@ class _ReadyDetector:
         self.discard_provider_successor = AsyncMock(return_value=True)
         self.observe_provider_audio_ordered = AsyncMock()
         self.observe_provider_audio = MagicMock()
+        self.wait_provider_audio_observed_through = AsyncMock(return_value=True)
+        self.reconcile_provider_endpoint = AsyncMock()
+        self.retire_provider_speaker_boundary_unknown = AsyncMock()
+        self.reset_provider_audio_timeline = AsyncMock(return_value=True)
 
     async def prepare_endpointing(self, token):
         self._token = token
@@ -417,6 +427,7 @@ def _install_ready_lifecycle(
     )
     runtime._asr_lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
     runtime._asr_detector = _ReadyDetector()
+    runtime._asr_provider_exact_session = runtime._asr_session
     runtime._asr_runtime._asr_current_ingress_token = runtime._capture_ingress_token()
 
 
@@ -1683,6 +1694,212 @@ async def test_turn_endpoint_seals_immediately_before_provider_final() -> None:
     await runtime._handle_independent_asr_endpoint(epoch)
 
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+
+
+async def test_keyed_exact_boundary_reconciles_before_ordered_final() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    detector = component._asr_detector
+    assert isinstance(detector, _ReadyDetector)
+    epoch = component._asr_session_epoch
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        epoch,
+    )
+    snapshot = ProviderSpeakerBoundarySnapshot(
+        detector_epoch=1,
+        candidate_generation=0,
+        through_sequence_no=7,
+        shadow_generation=3,
+        merged_resume_count=1,
+        successor_present=False,
+        evidence_complete=True,
+        _owner=object(),
+    )
+    detector.reconcile_provider_endpoint.return_value = snapshot
+    boundary = ProviderEndpointNotification(
+        phase="boundary",
+        generation=4,
+        buffer_epoch=2,
+        utterance_id=1,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 52_800),
+    )
+
+    await component._handle_provider_endpoint_notification(boundary, epoch)
+    assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    detector.reconcile_provider_endpoint.assert_awaited_once_with(
+        boundary.audio_range
+    )
+
+    ordered = replace(boundary, phase="ordered")
+    await component._handle_provider_endpoint_notification(ordered, epoch)
+
+    key = boundary.key
+    assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    assert component._asr_sealed_provider_key == key
+    detector.seal_provider_candidate.assert_awaited_once()
+    assert detector.seal_provider_candidate.await_args.kwargs == {
+        "speaker_snapshot": snapshot,
+    }
+
+    await component._handle_provider_final(key, "joined", epoch, "openai")
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+    assert component._asr_sealed_provider_key is None
+    assert key in component._asr_completed_provider_keys
+    assert key not in component._asr_provider_boundary_snapshots
+    runtime.handle_input_transcript.assert_awaited_once()
+    runtime.session.create_response.assert_awaited_once_with("joined")
+
+
+async def test_keyed_boundary_snapshot_overflow_fails_open_without_losing_final() -> (
+    None
+):
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    detector = component._asr_detector
+    assert isinstance(detector, _ReadyDetector)
+    epoch = component._asr_session_epoch
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        epoch,
+    )
+    snapshots = [
+        ProviderSpeakerBoundarySnapshot(
+            detector_epoch=detector.detector_epoch,
+            candidate_generation=index,
+            through_sequence_no=index,
+            shadow_generation=index,
+            merged_resume_count=0,
+            successor_present=False,
+            evidence_complete=True,
+            _owner=object(),
+        )
+        for index in range(8)
+    ]
+    detector.reconcile_provider_endpoint.side_effect = snapshots
+    boundaries = [
+        ProviderEndpointNotification(
+            phase="boundary",
+            generation=3,
+            buffer_epoch=4,
+            utterance_id=index,
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange((index - 1) * 160, index * 160),
+        )
+        for index in range(1, 10)
+    ]
+
+    for boundary in boundaries[:8]:
+        await component._handle_provider_endpoint_notification(boundary, epoch)
+
+    assert list(component._asr_provider_boundary_snapshots) == [
+        boundary.key for boundary in boundaries[:8]
+    ]
+    detector.retire_provider_speaker_boundary_unknown.assert_not_awaited()
+
+    overflow = boundaries[8]
+    await component._handle_provider_endpoint_notification(overflow, epoch)
+
+    assert list(component._asr_provider_boundary_snapshots) == [overflow.key]
+    overflow_record = component._asr_provider_boundary_snapshots[overflow.key]
+    assert overflow_record.notification.boundary_quality == "unknown"
+    assert overflow_record.snapshot is None
+    assert detector.reconcile_provider_endpoint.await_count == 8
+    # Overflow first revokes every stored snapshot, then the common unknown
+    # path idempotently confirms that the current key has no speaker authority.
+    assert detector.retire_provider_speaker_boundary_unknown.await_count == 2
+
+    await component._handle_provider_endpoint_notification(
+        replace(overflow, phase="ordered"),
+        epoch,
+    )
+
+    fence = component._asr_provider_candidate_fence
+    assert type(fence) is ProviderCandidateFence
+    assert component._asr_sealed_provider_key == overflow.key
+    detector.seal_provider_candidate.assert_awaited_once_with(
+        component._asr_sealed_turn_token.turn,
+        speaker_snapshot=None,
+    )
+    await component._handle_provider_final(
+        overflow.key,
+        "overflow kept",
+        epoch,
+        "openai",
+    )
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    runtime.handle_input_transcript.assert_awaited_once_with(
+        "overflow kept",
+        is_voice_source=True,
+        source="independent_asr",
+        metadata={"provider": "openai"},
+    )
+
+
+async def test_keyed_unknown_retires_tail_without_ghost_and_key2_still_delivers() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    detector = component._asr_detector
+    assert isinstance(detector, _ReadyDetector)
+    epoch = component._asr_session_epoch
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        epoch,
+    )
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_RESUMED,
+        epoch,
+    )
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.CANDIDATE_PAUSE,
+        epoch,
+    )
+    assert component._asr_overlap_completed_turns == 1
+
+    key1 = ProviderUtteranceKey(5, 0, 1)
+    ordered1 = ProviderEndpointNotification(
+        phase="ordered",
+        generation=key1.generation,
+        buffer_epoch=key1.buffer_epoch,
+        utterance_id=key1.utterance_id,
+        boundary_quality="unknown",
+        audio_range=None,
+    )
+    await component._handle_provider_endpoint_notification(ordered1, epoch)
+    await component._handle_provider_final(key1, "first", epoch, "openai")
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    detector.retire_provider_speaker_boundary_unknown.assert_awaited()
+    assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+    assert component._asr_overlap_completed_turns == 0
+    assert component._asr_overlap_onset_token is None
+
+    key2 = ProviderUtteranceKey(5, 0, 2)
+    ordered2 = ProviderEndpointNotification(
+        phase="ordered",
+        generation=key2.generation,
+        buffer_epoch=key2.buffer_epoch,
+        utterance_id=key2.utterance_id,
+        boundary_quality="unknown",
+        audio_range=None,
+    )
+    await component._handle_provider_endpoint_notification(ordered2, epoch)
+    assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    await component._handle_provider_final(key2, "second", epoch, "openai")
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    assert [
+        call.args[0]
+        for call in runtime.handle_input_transcript.await_args_list
+    ] == ["first", "second"]
+    assert runtime.session.create_response.await_count == 2
 
 
 async def test_rejected_prepare_fails_closed_instead_of_sealing_turn() -> None:
@@ -5188,6 +5405,125 @@ async def test_restart_closes_not_ready_session_before_replacement() -> None:
     candidate.connect.assert_awaited_once_with()
     candidate.close.assert_not_awaited()
     assert runtime._asr_session is candidate
+    runtime._asr_detector.reset_provider_audio_timeline.assert_not_awaited()
+    assert runtime._asr_provider_exact_session is None
+
+
+async def test_transport_restart_reuses_provider_key_in_fresh_physical_namespace(
+    monkeypatch,
+) -> None:
+    runtime, sessions, callbacks, detector = (
+        await _start_runtime_with_callback_candidates(monkeypatch)
+    )
+    component = runtime._asr_runtime
+    component._asr_current_ingress_token = runtime._capture_ingress_token()
+    key = ProviderUtteranceKey(0, 0, 1)
+    ordered = ProviderEndpointNotification(
+        phase="ordered",
+        generation=key.generation,
+        buffer_epoch=key.buffer_epoch,
+        utterance_id=key.utterance_id,
+        boundary_quality="unknown",
+        audio_range=None,
+    )
+
+    await callbacks[0]["on_speech_activity"](SpeechActivityEvent.SPEECH_STARTED)
+    await callbacks[0]["on_provider_endpoint"](ordered)
+    await callbacks[0]["on_provider_final"](key, "first")
+    await runtime._wait_asr_transcript_dispatch_idle()
+    assert key in component._asr_completed_provider_keys
+
+    await component._close_transport_only()
+    assert component._asr_provider_exact_session is None
+    events: list[str] = []
+
+    async def connect_replacement() -> None:
+        events.append("connect")
+
+    async def reset_provider_timeline() -> bool:
+        assert component._asr_session is None
+        events.append("reset")
+        return True
+
+    sessions[1].connect.side_effect = connect_replacement
+    detector.reset_provider_audio_timeline.side_effect = reset_provider_timeline
+
+    await component._restart_transport(max_attempts=1)
+
+    assert events == ["connect", "reset"]
+    assert component._asr_session is sessions[1]
+    assert component._asr_provider_exact_session is sessions[1]
+    assert key not in component._asr_completed_provider_keys
+    await callbacks[1]["on_speech_activity"](SpeechActivityEvent.SPEECH_STARTED)
+    await callbacks[1]["on_provider_endpoint"](ordered)
+    await callbacks[1]["on_provider_final"](key, "second")
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    assert [
+        call.args[0]
+        for call in runtime.handle_input_transcript.await_args_list
+    ] == ["first", "second"]
+
+
+@pytest.mark.parametrize("reset_outcome", ["missing", "false", "error"])
+async def test_transport_restart_timeline_reset_failure_disables_only_exact_speaker(
+    monkeypatch,
+    reset_outcome: str,
+) -> None:
+    runtime, sessions, callbacks, detector = (
+        await _start_runtime_with_callback_candidates(monkeypatch)
+    )
+    component = runtime._asr_runtime
+    component._asr_current_ingress_token = runtime._capture_ingress_token()
+    key = ProviderUtteranceKey(0, 0, 1)
+    unknown = ProviderEndpointNotification(
+        phase="ordered",
+        generation=key.generation,
+        buffer_epoch=key.buffer_epoch,
+        utterance_id=key.utterance_id,
+        boundary_quality="unknown",
+        audio_range=None,
+    )
+    await callbacks[0]["on_speech_activity"](SpeechActivityEvent.SPEECH_STARTED)
+    await callbacks[0]["on_provider_endpoint"](unknown)
+    await callbacks[0]["on_provider_final"](key, "first")
+    await runtime._wait_asr_transcript_dispatch_idle()
+    await component._close_transport_only()
+
+    if reset_outcome == "missing":
+        del detector.reset_provider_audio_timeline
+    elif reset_outcome == "error":
+        detector.reset_provider_audio_timeline.side_effect = RuntimeError(
+            "speaker reset failed"
+        )
+    else:
+        detector.reset_provider_audio_timeline.return_value = False
+    await component._restart_transport(max_attempts=1)
+
+    assert component._asr_session is sessions[1]
+    assert component._asr_provider_exact_session is None
+    assert key not in component._asr_completed_provider_keys
+    exact_boundary = ProviderEndpointNotification(
+        phase="boundary",
+        generation=key.generation,
+        buffer_epoch=key.buffer_epoch,
+        utterance_id=key.utterance_id,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 160),
+    )
+    await callbacks[1]["on_speech_activity"](SpeechActivityEvent.SPEECH_STARTED)
+    await callbacks[1]["on_provider_endpoint"](exact_boundary)
+    await callbacks[1]["on_provider_endpoint"](
+        replace(exact_boundary, phase="ordered")
+    )
+    await callbacks[1]["on_provider_final"](key, "second")
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    detector.reconcile_provider_endpoint.assert_not_awaited()
+    assert [
+        call.args[0]
+        for call in runtime.handle_input_transcript.await_args_list
+    ] == ["first", "second"]
 
 
 def _install_failing_restart_candidates(
@@ -5695,7 +6031,7 @@ async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payloa
         detector.observe_provider_audio.assert_not_called()
 
 
-async def test_buffered_resume_split_with_lost_pcm_boundary_is_incomplete() -> None:
+async def test_buffered_resume_spans_preserve_pcm_boundary() -> None:
     runtime = _Runtime()
     session = SimpleNamespace(
         is_ready=True,
@@ -5747,20 +6083,206 @@ async def test_buffered_resume_split_with_lost_pcm_boundary_is_incomplete() -> N
     )
     await component._asr_audio_dispatcher.wait_idle()
 
-    detector.observe_provider_audio_ordered.assert_awaited_once_with(
-        payload,
-        sample_rate_hz=16_000,
-        identity=successor_identity,
-        sequence_no=5,
-        split_before_audio=False,
-        evidence_complete=False,
-    )
+    assert detector.observe_provider_audio_ordered.await_args_list == [
+        call(
+            predecessor_pcm,
+            sample_rate_hz=16_000,
+            identity=predecessor_identity,
+            sequence_no=5,
+            split_before_audio=False,
+            evidence_complete=True,
+        ),
+        call(
+            successor_pcm,
+            sample_rate_hz=16_000,
+            identity=successor_identity,
+            sequence_no=6,
+            split_before_audio=True,
+            evidence_complete=True,
+        ),
+    ]
     detector.observe_provider_audio.assert_not_called()
     session.stream_audio.assert_awaited_once_with(
         payload,
         sample_rate_hz=16_000,
     )
     await component._asr_audio_dispatcher.close()
+
+
+async def _start_blocked_buffered_provider_span_replay() -> SimpleNamespace:
+    runtime = _Runtime()
+    provider_sent = asyncio.Event()
+
+    async def stream_audio(_pcm16: bytes, *, sample_rate_hz: int) -> None:
+        assert sample_rate_hz == 16_000
+        provider_sent.set()
+
+    session = SimpleNamespace(
+        is_ready=True,
+        stream_audio=AsyncMock(side_effect=stream_audio),
+        close=AsyncMock(),
+        signal_user_activity_end=AsyncMock(),
+    )
+    runtime._asr_session = session
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    lifecycle = component._asr_lifecycle
+    detector = component._asr_detector
+    ingress = component._asr_current_ingress_token
+    assert lifecycle is not None
+    assert isinstance(detector, _ReadyDetector)
+    assert ingress is not None
+    epoch = component._asr_session_epoch
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        epoch,
+    )
+    turn_token = component._capture_turn_token(lifecycle)
+    payload = b"\x31\x00" * 160
+    identity = DetectorIngressIdentity(
+        ingress_token=ingress,
+        detector_epoch=detector.detector_epoch,
+        sequence_no=1,
+    )
+    component._record_buffered_provider_speaker_observation(
+        identity=identity,
+        byte_count=len(payload),
+        split_before_audio=False,
+        evidence_complete=True,
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+    observation_caught_up = asyncio.Event()
+    wait_started = asyncio.Event()
+
+    async def block_observation(*_args, **_kwargs) -> None:
+        observation_started.set()
+        await release_observation.wait()
+        observation_caught_up.set()
+
+    async def wait_observed_through(end_sample_16k: int) -> bool:
+        assert end_sample_16k == 160
+        wait_started.set()
+        await observation_caught_up.wait()
+        return True
+
+    detector.observe_provider_audio_ordered.side_effect = block_observation
+    detector.wait_provider_audio_observed_through.side_effect = (
+        wait_observed_through
+    )
+    snapshot = ProviderSpeakerBoundarySnapshot(
+        detector_epoch=detector.detector_epoch,
+        candidate_generation=0,
+        through_sequence_no=1,
+        shadow_generation=1,
+        merged_resume_count=0,
+        successor_present=False,
+        evidence_complete=True,
+        _owner=object(),
+    )
+    detector.reconcile_provider_endpoint.return_value = snapshot
+    activation = asyncio.create_task(
+        component._activate_asr_audio_dispatcher(
+            lifecycle,
+            turn_token,
+            buffered_pcm16=payload,
+        )
+    )
+    await asyncio.wait_for(provider_sent.wait(), 1)
+    await asyncio.wait_for(observation_started.wait(), 1)
+    return SimpleNamespace(
+        runtime=runtime,
+        component=component,
+        detector=detector,
+        epoch=epoch,
+        session=session,
+        payload=payload,
+        snapshot=snapshot,
+        activation=activation,
+        release_observation=release_observation,
+        wait_started=wait_started,
+    )
+
+
+async def test_exact_boundary_waits_for_blocked_buffered_span_replay() -> None:
+    state = await _start_blocked_buffered_provider_span_replay()
+    key = ProviderUtteranceKey(0, 0, 1)
+    boundary = ProviderEndpointNotification(
+        phase="boundary",
+        generation=key.generation,
+        buffer_epoch=key.buffer_epoch,
+        utterance_id=key.utterance_id,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 160),
+    )
+    boundary_task = asyncio.create_task(
+        state.component._handle_provider_endpoint_notification(
+            boundary,
+            state.epoch,
+        )
+    )
+    await asyncio.wait_for(state.wait_started.wait(), 1)
+    state.detector.reconcile_provider_endpoint.assert_not_awaited()
+
+    state.release_observation.set()
+    assert await asyncio.wait_for(state.activation, 1) is True
+    await asyncio.wait_for(boundary_task, 1)
+
+    state.detector.reconcile_provider_endpoint.assert_awaited_once_with(
+        boundary.audio_range
+    )
+    record = state.component._asr_provider_boundary_snapshots[key]
+    assert record.notification.boundary_quality == "exact"
+    assert record.snapshot is state.snapshot
+    await state.component._asr_audio_dispatcher.close()
+
+
+async def test_blocked_buffered_span_replay_times_out_unknown_without_losing_final() -> (
+    None
+):
+    state = await _start_blocked_buffered_provider_span_replay()
+    key = ProviderUtteranceKey(0, 0, 1)
+    boundary = ProviderEndpointNotification(
+        phase="boundary",
+        generation=key.generation,
+        buffer_epoch=key.buffer_epoch,
+        utterance_id=key.utterance_id,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 160),
+    )
+    boundary_task = asyncio.create_task(
+        state.component._handle_provider_endpoint_notification(
+            boundary,
+            state.epoch,
+        )
+    )
+    await asyncio.wait_for(state.wait_started.wait(), 1)
+    await asyncio.wait_for(boundary_task, 1)
+
+    state.detector.reconcile_provider_endpoint.assert_not_awaited()
+    record = state.component._asr_provider_boundary_snapshots[key]
+    assert record.notification.boundary_quality == "unknown"
+    await state.component._handle_provider_endpoint_notification(
+        replace(boundary, phase="ordered"),
+        state.epoch,
+    )
+    await state.component._handle_provider_final(
+        key,
+        "kept transcript",
+        state.epoch,
+        "openai",
+    )
+    await state.runtime._wait_asr_transcript_dispatch_idle()
+
+    state.runtime.handle_input_transcript.assert_awaited_once_with(
+        "kept transcript",
+        is_voice_source=True,
+        source="independent_asr",
+        metadata={"provider": "openai"},
+    )
+    state.release_observation.set()
+    assert await asyncio.wait_for(state.activation, 1) is True
+    await state.component._asr_audio_dispatcher.close()
 
 
 async def test_provider_speaker_sequence_remains_monotonic_across_turns() -> None:

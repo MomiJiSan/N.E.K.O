@@ -14,12 +14,17 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_SHUTDOWN_GRACE_SECONDS,
     MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY,
     MAX_SPEAKER_SHADOW_THRESHOLDS,
+    SpeakerShadowCandidateReconciliationControl,
     SpeakerShadowCandidateKey,
+    SpeakerShadowBatchReconciliationControl,
+    SpeakerShadowBatchReconcileReceipt,
+    SpeakerShadowBatchReconcileRequest,
     SpeakerShadowConfig,
     SpeakerShadowDecisionStatus,
     SpeakerShadowDeferredCandidateControl,
     SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowObservation,
+    SpeakerShadowReconcileSource,
     SpeakerShadowMetrics,
 )
 
@@ -187,13 +192,9 @@ def test_config_accepts_bounded_terminal_and_completion_capacity_limits() -> Non
         completion_queue_capacity=MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY,
     )
 
+    assert config.terminal_queue_capacity == MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY
     assert (
-        config.terminal_queue_capacity
-        == MAX_SPEAKER_SHADOW_TERMINAL_QUEUE_CAPACITY
-    )
-    assert (
-        config.completion_queue_capacity
-        == MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY
+        config.completion_queue_capacity == MAX_SPEAKER_SHADOW_COMPLETION_QUEUE_CAPACITY
     )
 
 
@@ -399,6 +400,80 @@ def test_deferred_candidate_control_is_an_optional_structural_protocol() -> None
     assert control.defer_candidate(candidate) is True
     assert control.activate_candidate(candidate) is True
     assert not isinstance(object(), SpeakerShadowDeferredCandidateControl)
+
+
+def test_candidate_reconciliation_is_an_independent_optional_protocol() -> None:
+    source = SpeakerShadowCandidateKey(6, 8, "provider_candidate")
+    target = SpeakerShadowCandidateKey(6, 7, "provider_candidate")
+
+    class ReconciliationOnly:
+        def reconcile_candidate_prefix(
+            self,
+            *,
+            source: SpeakerShadowCandidateKey,
+            target: SpeakerShadowCandidateKey,
+            prefix_sample_count: int,
+            suffix: SpeakerShadowCandidateKey | None = None,
+        ) -> bool:
+            return source != target and prefix_sample_count == 160 and suffix is None
+
+    control = ReconciliationOnly()
+
+    assert isinstance(control, SpeakerShadowCandidateReconciliationControl)
+    assert control.reconcile_candidate_prefix(
+        source=source,
+        target=target,
+        prefix_sample_count=160,
+    )
+    assert not isinstance(control, SpeakerShadowDeferredCandidateControl)
+    assert not isinstance(object(), SpeakerShadowCandidateReconciliationControl)
+
+
+def test_batch_reconciliation_is_an_independent_optional_protocol() -> None:
+    source = SpeakerShadowCandidateKey(6, 9, "provider_candidate")
+    target = SpeakerShadowCandidateKey(6, 10, "provider_candidate")
+    request = SpeakerShadowBatchReconcileRequest(
+        sources=(SpeakerShadowReconcileSource(source, 320, 0, 320),),
+        target=target,
+    )
+    owner = object()
+    receipt = SpeakerShadowBatchReconcileReceipt(
+        runtime_generation=0,
+        batch_id=1,
+        target=target,
+        suffix=None,
+        target_sample_count=320,
+        suffix_sample_count=0,
+        _owner=owner,
+    )
+
+    class BatchOnly:
+        def reconcile_candidate_batch(
+            self,
+            requested: SpeakerShadowBatchReconcileRequest,
+        ) -> SpeakerShadowBatchReconcileReceipt | None:
+            return receipt if requested == request else None
+
+        def reconciliation_status(
+            self,
+            requested: SpeakerShadowBatchReconcileReceipt,
+        ) -> str:
+            return "pending" if requested is receipt else "stale"
+
+        def revoke_reconciliation(
+            self,
+            requested: SpeakerShadowBatchReconcileReceipt,
+        ) -> None:
+            assert requested is receipt
+
+    control = BatchOnly()
+
+    assert isinstance(control, SpeakerShadowBatchReconciliationControl)
+    assert control.reconcile_candidate_batch(request) is receipt
+    assert control.reconciliation_status(receipt) == "pending"
+    control.revoke_reconciliation(receipt)
+    assert not isinstance(control, SpeakerShadowCandidateReconciliationControl)
+    assert not isinstance(object(), SpeakerShadowBatchReconciliationControl)
 
 
 def test_deferred_candidate_status_is_an_optional_read_only_protocol() -> None:

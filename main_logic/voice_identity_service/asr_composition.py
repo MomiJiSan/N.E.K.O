@@ -16,6 +16,7 @@ from main_logic.asr_client.speaker_shadow.campplus import (
     CampPlusBackendFactory,
 )
 from main_logic.asr_client.speaker_shadow.contracts import (
+    MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS,
     SpeakerShadowCandidateKey,
     SpeakerShadowCompletion,
     SpeakerShadowConfig,
@@ -293,7 +294,11 @@ class OwnerVoiceAsrCompositionFactory:
                 enabled=True,
                 similarity_thresholds=(OwnerVoicePolicy.SIMILARITY_THRESHOLD,),
                 minimum_audio_ms=OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
-                maximum_audio_ms=OwnerVoicePolicy.SECOND_CHECKPOINT_MS,
+                # Exact Provider reconciliation may merge a short head with
+                # a longer tentative tail (for example 0.8s + 2.5s).  Keep
+                # the scoring checkpoints at 1.5s/3.0s while allowing the
+                # shared bounded runtime to retain the full reconciled range.
+                maximum_audio_ms=MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS,
                 observation_checkpoints_ms=(
                     OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
                     OwnerVoicePolicy.SECOND_CHECKPOINT_MS,

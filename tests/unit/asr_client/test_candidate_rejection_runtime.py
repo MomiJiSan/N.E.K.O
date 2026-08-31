@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 import main_logic.asr_client.runtime as runtime_module
+from main_logic.asr_client._provider_events import (
+    ProviderAudioRange,
+    ProviderEndpointNotification,
+    ProviderUtteranceKey,
+)
 from main_logic.asr_client.candidate_control import CandidateRejectionOutcome
 from main_logic.asr_client.endpointing.detector import (
     DetectorCandidateKey,
@@ -54,6 +59,7 @@ class _RejectionLease:
         self.shadow_candidate = _shadow_candidate()
         self.turn_token = turn_token
         self.provider_fence = provider_fence
+        self.provider_preseal_verdict = None
         self._detector = detector
         self.commit_calls = 0
         self.commit_result = True
@@ -81,6 +87,8 @@ class _RejectionDetector:
         self.observe_provider_audio_ordered = AsyncMock()
         self.observe_provider_audio = MagicMock()
         self.provisional_pending = False
+        self.ready_rejection = False
+        self.replace_preseal_lease_on_seal = False
         self.seal_turn_tokens: list[VoiceTurnToken | None] = []
 
     async def prepare_candidate_rejection(self, _candidate):
@@ -92,7 +100,10 @@ class _RejectionDetector:
     async def seal_provider_candidate(
         self,
         turn_token: VoiceTurnToken | None = None,
+        *,
+        speaker_snapshot=None,
     ):
+        del speaker_snapshot
         self.seal_turn_tokens.append(turn_token)
         lease = self.lease
         if lease is None:
@@ -100,8 +111,30 @@ class _RejectionDetector:
         if turn_token is not None and turn_token != lease.turn_token:
             return None
         fence = ProviderCandidateFence(7, 11, 23)
+        if (
+            self.replace_preseal_lease_on_seal
+            and lease.provider_preseal_verdict is not None
+        ):
+            sealed_lease = _RejectionLease(
+                self,
+                lease.turn_token,
+                provider_fence=fence,
+            )
+            self.lease = sealed_lease
+            return fence
         lease.provider_fence = fence
+        lease.provider_preseal_verdict = None
         return fence
+
+    def ready_provider_speaker_rejection(self, provider_fence):
+        lease = self.lease
+        if (
+            not self.ready_rejection
+            or lease is None
+            or lease.provider_fence != provider_fence
+        ):
+            return None
+        return lease.shadow_candidate
 
     def pending_provider_speaker_candidate(self, provider_fence):
         lease = self.lease
@@ -768,6 +801,47 @@ async def test_verifier_factory_hot_replaces_active_detector_and_closes_old() ->
     assert runtime._speaker_verifier_factory is factory
     assert runtime._speaker_verifier_activation_generation == "new-profile"
     old_factory.close.assert_called_once_with()
+
+
+async def test_verifier_hot_replace_revokes_sealed_suppression_fail_open() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token, _provider_fence = (
+        _seal_provider_candidate(runtime, detector)
+    )
+    old_factory = MagicMock()
+    old_factory.close = MagicMock()
+    runtime._speaker_verifier_factory = old_factory
+
+    outcome = await runtime._reject_speaker_candidate(
+        _shadow_candidate(),
+        activation_generation="profile-generation",
+    )
+    assert outcome is CandidateRejectionOutcome.APPLIED
+    assert runtime._asr_suppressed_final_key is not None
+
+    replacement_shadow = SimpleNamespace(close=AsyncMock())
+    replacement_factory = MagicMock(return_value=replacement_shadow)
+    assert await runtime.set_speaker_verifier_factory(
+        replacement_factory,
+        activation_generation="replacement-profile",
+    )
+    assert runtime._asr_suppressed_final_key is None
+
+    await runtime._handle_independent_asr_final(
+        "forward-after-verifier-swap",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    assert callbacks.on_final.await_args.args[0].text == (
+        "forward-after-verifier-swap"
+    )
+    old_factory.close.assert_called_once_with()
+    await _close_dispatchers(runtime)
 
 
 async def test_verifier_factory_failure_is_detached_and_preserves_activation() -> None:
@@ -1572,6 +1646,467 @@ async def test_provisional_prepare_timeout_forwards_without_late_rearm(
     diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["speaker_gate_timeout_count"] == 1
     assert diagnostics["speaker_gate_provisional_timeout_count"] == 1
+    await _close_dispatchers(runtime)
+
+
+async def test_preseal_two_low_rejection_is_upgraded_without_active_teardown() -> (
+    None
+):
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    lease = detector.lease
+    assert lease is not None
+    lease.provider_preseal_verdict = object()
+    detector.replace_preseal_lease_on_seal = True
+    final_key = FinalKey.from_turn(turn_token)
+    runtime._asr_transcript_dispatcher.release(final_key)
+    runtime._asr_reserved_final_key = None
+
+    assert await runtime._arm_speaker_candidate_decision(
+        lease.shadow_candidate,
+        activation_generation="profile-generation",
+    )
+    preseal_gate = runtime._asr_speaker_candidate_decision_gate
+    assert preseal_gate is not None
+    assert preseal_gate.provider_key is None
+    preseal_task = asyncio.create_task(
+        runtime._reject_speaker_candidate(
+            lease.shadow_candidate,
+            activation_generation="profile-generation",
+            decision_gate=preseal_gate,
+        )
+    )
+    preseal_gate.rejection_task = preseal_task
+    assert await preseal_task is CandidateRejectionOutcome.APPLIED
+
+    assert lease.commit_calls == 1
+    # Hold the done-task reaper until after ordered seal to reproduce the
+    # narrow production window where the old pre-seal gate is still installed.
+    assert runtime._asr_speaker_candidate_decision_gate is preseal_gate
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    assert runtime._asr_session is session
+    assert runtime._asr_audio_dispatcher.active_turn == turn_token
+    assert runtime._asr_provider_candidate_fence is None
+    assert runtime._asr_suppressed_final_key is None
+
+    detector.ready_rejection = True
+    provider_key = ProviderUtteranceKey(0, 0, 1)
+    runtime._asr_provider_timeline = (
+        provider_key.generation,
+        provider_key.buffer_epoch,
+    )
+    await runtime._handle_independent_asr_endpoint(
+        runtime._asr_session_epoch,
+        provider_key=provider_key,
+    )
+    sealed_lease = detector.lease
+    assert sealed_lease is not None and sealed_lease is not lease
+
+    assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    assert lease.commit_calls == 1
+    assert sealed_lease.commit_calls == 1
+    assert runtime._asr_suppressed_final_key == final_key
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    runtime._reap_rejection_task(
+        preseal_task,
+        decision_gate=preseal_gate,
+    )
+    assert runtime._asr_suppressed_final_key == final_key
+    wrong_key = ProviderUtteranceKey(0, 0, 2)
+    await runtime._handle_provider_final(
+        wrong_key,
+        "wrong-key-final",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    callbacks.on_final.assert_not_awaited()
+    assert runtime._asr_suppressed_final_key == final_key
+    assert runtime._asr_sealed_provider_key == provider_key
+    assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    await runtime._handle_provider_final(
+        provider_key,
+        "preseal-rejected-final",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_not_awaited()
+    abandoned.assert_awaited_once_with(turn_token)
+    assert runtime._asr_session is session
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["rejection_task_applied_count"] == 1
+    assert diagnostics["speaker_gate_preseal_replaced_count"] == 1
+    assert diagnostics["provider_preseal_rejection_consumed_count"] == 1
+    await _close_dispatchers(runtime)
+
+
+async def test_same_key_inflight_boundary_conflict_does_not_shift_preseal_generation() -> (
+    None
+):
+    from tests.unit.test_asr_detector_runtime import (
+        _Gate,
+        _ReconcilingSpeakerShadowSpy,
+        _Vad,
+    )
+
+    runtime = IndependentAsrRuntime(_callbacks())
+    placeholder = _RejectionDetector()
+    session, _lifecycle, turn_1 = _install_active_candidate(
+        runtime,
+        placeholder,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    shadow = _ReconcilingSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        speaker_shadow=shadow,
+    )
+    runtime._asr_detector = detector
+    runtime._asr_provider_exact_session = session
+    feed_1 = await detector.feed(
+        b"\x11\x00" * 160,
+        ingress_token=turn_1.ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert feed_1.candidate is not None and feed_1.identity is not None
+    assert await detector.bind_candidate(feed_1.candidate, turn_1) is not None
+    await detector.observe_provider_audio_ordered(
+        b"\x21\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=feed_1.identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+
+    original_reconcile = detector.reconcile_provider_endpoint
+    reconcile_admitted = asyncio.Event()
+    release_reconcile = asyncio.Event()
+
+    async def reconcile_then_block(boundary: ProviderAudioRange):
+        verdict = await original_reconcile(boundary)
+        reconcile_admitted.set()
+        await release_reconcile.wait()
+        return verdict
+
+    detector.reconcile_provider_endpoint = reconcile_then_block  # type: ignore[method-assign]
+    key_1 = ProviderUtteranceKey(0, 0, 1)
+    exact_1 = ProviderEndpointNotification(
+        phase="boundary",
+        generation=key_1.generation,
+        buffer_epoch=key_1.buffer_epoch,
+        utterance_id=key_1.utterance_id,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 160),
+    )
+    conflicting_1 = ProviderEndpointNotification(
+        phase="boundary",
+        generation=key_1.generation,
+        buffer_epoch=key_1.buffer_epoch,
+        utterance_id=key_1.utterance_id,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 159),
+    )
+
+    first_task = asyncio.create_task(
+        runtime._handle_provider_endpoint_notification(
+            exact_1,
+            runtime._asr_session_epoch,
+        )
+    )
+    try:
+        await asyncio.wait_for(reconcile_admitted.wait(), 1)
+        conflict_task = asyncio.create_task(
+            runtime._handle_provider_endpoint_notification(
+                conflicting_1,
+                runtime._asr_session_epoch,
+            )
+        )
+        await asyncio.sleep(0)
+        release_reconcile.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_task, conflict_task),
+            1,
+        )
+
+        record = runtime._asr_provider_boundary_snapshots[key_1]
+        race_generations = tuple(detector._provider_preseal_entries)
+        race_snapshot_generation = (
+            record.snapshot.candidate_generation
+            if record.snapshot is not None
+            else None
+        )
+        race_snapshot_exact = bool(
+            record.snapshot is not None and record.snapshot.boundary_exact
+        )
+
+        await runtime._handle_provider_endpoint_notification(
+            ProviderEndpointNotification(
+                phase="ordered",
+                generation=key_1.generation,
+                buffer_epoch=key_1.buffer_epoch,
+                utterance_id=key_1.utterance_id,
+                boundary_quality="unknown",
+                audio_range=None,
+            ),
+            runtime._asr_session_epoch,
+        )
+        fence_1 = runtime._asr_provider_candidate_fence
+        assert fence_1 is not None
+        remaining_after_seal = tuple(detector._provider_preseal_entries)
+        assert await detector.complete_provider_candidate(fence_1) is False
+
+        detector.reconcile_provider_endpoint = original_reconcile  # type: ignore[method-assign]
+        turn_2 = VoiceTurnToken(turn_1.ingress, turn_id=turn_1.turn_id + 1)
+        feed_2 = await detector.feed(
+            b"\x12\x00" * 160,
+            ingress_token=turn_2.ingress,
+            speech_probability=0.9,
+            rnnoise_available=True,
+        )
+        assert feed_2.candidate is not None and feed_2.identity is not None
+        assert await detector.bind_candidate(feed_2.candidate, turn_2) is not None
+        await detector.observe_provider_audio_ordered(
+            b"\x22\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=feed_2.identity,
+            sequence_no=2,
+            split_before_audio=False,
+        )
+        exact_2 = await original_reconcile(ProviderAudioRange(160, 320))
+        next_generation = (
+            exact_2.candidate_generation if exact_2 is not None else None
+        )
+    finally:
+        release_reconcile.set()
+        if not first_task.done():
+            first_task.cancel()
+            await asyncio.gather(first_task, return_exceptions=True)
+        await detector.close()
+        await _close_dispatchers(runtime)
+
+    assert race_generations == (0,)
+    assert race_snapshot_generation == 0
+    assert race_snapshot_exact is False
+    assert fence_1.candidate_generation == 0
+    assert remaining_after_seal == ()
+    assert next_generation == 1
+
+
+async def test_exact_pause_merge_scores_before_seal_and_suppresses_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from main_logic.asr_client.speaker_shadow.asset_manifest import (
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+    )
+    from main_logic.asr_client.speaker_shadow.campplus import (
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    from main_logic.voice_identity.contracts import SpeakerModelIdentity
+    from main_logic.voice_identity.profile import SpeakerProfile
+    from main_logic.voice_identity.reference import SpeakerReference
+    from main_logic.voice_identity_service.asr_composition import (
+        OwnerVoiceAsrCompositionFactory,
+    )
+
+    class _Vad:
+        def load(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    class _Gate:
+        def feed(self, _pcm16: bytes) -> tuple[()]:
+            return ()
+
+        def reset(self) -> None:
+            return None
+
+    class _LowScoreHost:
+        alive = True
+
+        def __init__(self) -> None:
+            self.score_count = 0
+
+        async def score(
+            self,
+            _pcm16: bytes,
+            *,
+            timeout_seconds: float,
+        ) -> float:
+            assert timeout_seconds > 0
+            self.score_count += 1
+            return 0.20
+
+    abandoned = AsyncMock()
+    callbacks = _callbacks(abandoned=abandoned)
+    runtime = IndependentAsrRuntime(callbacks)
+    placeholder = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        placeholder,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    final_key = FinalKey.from_turn(turn_token)
+    runtime._asr_transcript_dispatcher.release(final_key)
+    runtime._asr_reserved_final_key = None
+
+    model_identity = SpeakerModelIdentity(
+        CAMPPLUS_MODEL_ID,
+        CAMPPLUS_MODEL_REVISION,
+        CAMPPLUS_EMBEDDING_DIM,
+    )
+    embedding = np.arange(1, CAMPPLUS_EMBEDDING_DIM + 1, dtype=np.float32)
+    reference = SpeakerReference(model_identity, embedding)
+    embedding.fill(0.0)
+    try:
+        profile = SpeakerProfile("profile-generation", reference)
+    finally:
+        reference.close()
+    composition = OwnerVoiceAsrCompositionFactory(
+        runtime,
+        profile,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    shadow = composition()
+    scoring_host = _LowScoreHost()
+    monkeypatch.setattr(
+        shadow,
+        "_ensure_backend",
+        AsyncMock(return_value=scoring_host),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        speaker_shadow=shadow,
+    )
+    runtime._asr_detector = detector
+    runtime._asr_provider_exact_session = session
+
+    first_feed = await detector.feed(
+        b"\x01\x00" * 160,
+        ingress_token=turn_token.ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert first_feed.candidate is not None
+    assert first_feed.identity is not None
+    assert await detector.bind_candidate(
+        first_feed.candidate,
+        turn_token,
+    ) is not None
+    second_feed = await detector.feed(
+        b"\x02\x00" * 160,
+        ingress_token=turn_token.ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert second_feed.identity is not None
+    await detector.observe_provider_audio_ordered(
+        b"\x11\x00" * 12_800,
+        sample_rate_hz=16_000,
+        identity=first_feed.identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x12\x00" * 40_000,
+        sample_rate_hz=16_000,
+        identity=second_feed.identity,
+        sequence_no=2,
+        split_before_audio=True,
+    )
+
+    audio_range = ProviderAudioRange(0, 52_800)
+    key = ProviderUtteranceKey(0, 0, 1)
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase="boundary",
+            generation=key.generation,
+            buffer_epoch=key.buffer_epoch,
+            utterance_id=key.utterance_id,
+            boundary_quality="exact",
+            audio_range=audio_range,
+        ),
+        runtime._asr_session_epoch,
+    )
+    await shadow.wait_idle()
+    if runtime._asr_rejection_tasks:
+        await asyncio.gather(*tuple(runtime._asr_rejection_tasks))
+    await asyncio.sleep(0)
+
+    record = runtime._asr_provider_boundary_snapshots[key]
+    assert record.state == "ready_exact", (
+        record,
+        detector.speaker_rejection_diagnostics_snapshot(),
+        shadow.snapshot(),
+    )
+    assert record.snapshot is not None
+    assert record.snapshot.merged_resume_count == 1
+    assert scoring_host.score_count == 2
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    assert runtime._asr_session is session
+
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase="ordered",
+            generation=key.generation,
+            buffer_epoch=key.buffer_epoch,
+            utterance_id=key.utterance_id,
+            boundary_quality="exact",
+            audio_range=audio_range,
+        ),
+        runtime._asr_session_epoch,
+    )
+    if runtime._asr_rejection_tasks:
+        await asyncio.gather(*tuple(runtime._asr_rejection_tasks))
+    await asyncio.sleep(0)
+    assert runtime._asr_suppressed_final_key == final_key
+
+    await runtime._handle_provider_final(
+        key,
+        "pause-merged-rejected-final",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_not_awaited()
+    abandoned.assert_awaited_once_with(turn_token)
+    assert runtime._asr_session is session
+    diagnostics = detector.speaker_rejection_diagnostics_snapshot()
+    assert diagnostics["provider_speaker_segment_merged_resume_count"] == 1
+    assert diagnostics["provider_speaker_segment_exact_snapshot_count"] == 1
+    assert diagnostics["provider_preseal_verdict_stored_count"] == 1
+    assert diagnostics["provider_preseal_verdict_consumed_count"] == 1
+    assert diagnostics["provider_rejection_ready_count"] == 1
+    assert diagnostics["provider_rejection_applied_count"] == 1
+    assert diagnostics["reconciliation_batch_admitted_count"] == 1
+    assert diagnostics["reconciliation_batch_applied_count"] == 1
+    assert diagnostics["provider_namespace_poison_count"] == 0
+
+    await detector.close()
+    composition.close()
+    profile.close()
     await _close_dispatchers(runtime)
 
 
@@ -2506,7 +3041,7 @@ async def test_real_2999ms_reset_abandons_confirmation_and_forwards_final(
         await _close_dispatchers(runtime)
 
 
-async def test_real_detector_fifo_2999ms_tail_rejects_only_second_turn(
+async def test_unknown_provider_boundary_retires_tail_before_second_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import numpy as np
@@ -2661,35 +3196,27 @@ async def test_real_detector_fifo_2999ms_tail_rejects_only_second_turn(
     fence_2 = runtime._asr_provider_candidate_fence
     assert fence_2 is not None and fence_2 != fence_1
     sealed_b = detector._sealed_provider_candidate_rejection
-    assert sealed_b is not None
-    assert sealed_b.shadow_candidate == shadow_b
-    assert sealed_b.turn_token == turn_2
-    await asyncio.wait_for(scoring_host.second_score_started.wait(), 1)
-    gate = runtime._asr_speaker_candidate_decision_gate
-    assert gate is not None
-    assert gate.candidate == shadow_b
-    assert gate.turn_token == turn_2
-    assert gate.lease.provider_fence == fence_2
-    final_2 = asyncio.create_task(
-        runtime._handle_independent_asr_final("turn-2-final", 0, "qwen")
-    )
-    while not gate.wait_started:
-        await asyncio.sleep(0)
-    scoring_host.second_score_release.set()
+    assert sealed_b is None
+    assert runtime._asr_speaker_candidate_decision_gate is None
+    await runtime._handle_independent_asr_final("turn-2-final", 0, "qwen")
     await shadow.wait_idle()
-    await asyncio.wait_for(final_2, 1)
     await runtime.wait_transcript_idle()
 
-    assert scoring_host.score_count == 2
-    assert callbacks.on_final.await_count == 1
-    abandoned.assert_awaited_once_with(turn_2)
+    assert callbacks.on_final.await_count == 2
+    assert [
+        awaited.args[0].text for awaited in callbacks.on_final.await_args_list
+    ] == ["turn-1-final", "turn-2-final"]
+    abandoned.assert_not_awaited()
     diagnostics = runtime._speaker_verifier_diagnostics()
-    assert diagnostics["speaker_gate_waited_count"] == 1
-    assert diagnostics["speaker_gate_resolved_reject_count"] == 1
+    assert diagnostics["speaker_gate_waited_count"] == 0
+    assert diagnostics["speaker_gate_resolved_reject_count"] == 0
     assert diagnostics["speaker_gate_timeout_count"] == 0
-    assert diagnostics["rejection_task_applied_count"] == 1
+    assert diagnostics["rejection_task_applied_count"] == 0
     detector_diagnostics = detector.speaker_rejection_diagnostics_snapshot()
-    assert detector_diagnostics["provider_speaker_segment_exact_snapshot_count"] == 1
+    assert (
+        detector_diagnostics["provider_speaker_segment_unknown_retired_count"]
+        >= 1
+    )
 
     await detector.close()
     composition.close()
