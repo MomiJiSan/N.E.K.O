@@ -103,6 +103,32 @@ def test_ocr_pipeline_capture_target_uses_profile_and_resets_backends_on_config_
     assert pipeline._capture_backend is None
 
 
+def test_ocr_pipeline_language_change_closes_owned_rapidocr_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+
+    class _OwnedRapidOcrBackend:
+        def __init__(self, **kwargs: object) -> None:
+            self.lang_type = str(kwargs["lang_type"])
+
+        def close(self) -> None:
+            closed.append(self.lang_type)
+
+    monkeypatch.setattr(
+        "plugin.plugins._shared.rapidocr.ocr_backends.RapidOcrBackend",
+        _OwnedRapidOcrBackend,
+    )
+    pipeline = StudyOcrPipeline(logger=_Logger(), config=StudyConfig(rapidocr_lang_type="ch"))
+    first = pipeline._resolve_ocr_backend()
+
+    pipeline.update_config(StudyConfig(rapidocr_lang_type="japan"))
+
+    assert first.lang_type == "ch"
+    assert closed == ["ch"]
+    assert pipeline._resolve_ocr_backend().lang_type == "japan"
+
+
 def test_ocr_pipeline_capture_target_failure_and_fullscreen_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     target_pipeline = StudyOcrPipeline(
         logger=_Logger(),

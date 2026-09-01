@@ -21,6 +21,9 @@ StudyMode = Literal["companion", "interactive", "teaching"]
 STUDY_EXPORT_FORMATS = ("markdown", "pdf", "docx", "xmind")
 STUDY_EXPORT_STYLES = ("neko", "academic", "compact")
 _LOGGER = logging.getLogger(__name__)
+RAPIDOCR_LANG_TYPES = frozenset({"ch", "japan", "korean", "en"})
+RAPIDOCR_LANG_TYPE_FALLBACK = "ch"
+RAPIDOCR_LANG_TYPE_INVALID_DIAGNOSTIC = "rapidocr_language_invalid"
 OCR_SNIPPET_MAX_CHARS = 200
 PRIVATE_CURRENT_QUESTION_FIELDS = frozenset(
     {
@@ -36,6 +39,18 @@ PRIVATE_CURRENT_QUESTION_FIELDS = frozenset(
         "attempt_evaluated",
     }
 )
+
+
+def normalize_rapidocr_lang_type(value: object) -> tuple[str, str]:
+    normalized = str(value or "").strip().lower()
+    if normalized in RAPIDOCR_LANG_TYPES:
+        return normalized, ""
+    _LOGGER.warning(
+        "StudyConfig: invalid rapidocr_lang_type=%r, falling back to %r",
+        value,
+        RAPIDOCR_LANG_TYPE_FALLBACK,
+    )
+    return RAPIDOCR_LANG_TYPE_FALLBACK, RAPIDOCR_LANG_TYPE_INVALID_DIAGNOSTIC
 
 
 def public_current_question_payload(
@@ -344,12 +359,18 @@ class StudyConfig:
     # Deprecated compatibility field. Plugin lifecycle never opens external UI.
     auto_open_ui: bool = False
     ocr_enabled: bool = True
+    # Legacy rollback-only selection retained for one host release. The
+    # current study runtime always selects RapidOCR.
     ocr_backend_selection: str = "rapidocr"
     ocr_capture_backend: str = "auto"
+    # Legacy rollback-only Tesseract values. They remain serializable but are
+    # not read by the current runtime.
     ocr_tesseract_path: str = ""
     ocr_install_manifest_url: str = ""
     ocr_install_target_dir: str = ""
+    # Still active for RapidOCR model downloads.
     ocr_install_timeout_seconds: float = 300.0
+    # Legacy rollback-only language list; current OCR uses rapidocr_lang_type.
     ocr_languages: str = "chi_sim+jpn+eng"
     ocr_left_inset_ratio: float = 0.03
     ocr_right_inset_ratio: float = 0.03
@@ -360,6 +381,9 @@ class StudyConfig:
     rapidocr_lang_type: str = "ch"
     rapidocr_model_type: str = "mobile"
     rapidocr_ocr_version: str = "PP-OCRv4"
+    _rapidocr_lang_type_diagnostic: str = field(
+        default="", init=False, repr=False, compare=False
+    )
     llm_call_timeout_seconds: float = 30.0
     llm_vision_enabled: bool = False
     llm_vision_max_image_px: int = 768
@@ -380,6 +404,10 @@ class StudyConfig:
         self.language = str(self.language or "zh-CN").strip() or "zh-CN"
         self.history_limit = max(1, self._coerce_int(self.history_limit, 50))
         self.auto_open_ui = bool(self.auto_open_ui)
+        (
+            self.rapidocr_lang_type,
+            self._rapidocr_lang_type_diagnostic,
+        ) = normalize_rapidocr_lang_type(self.rapidocr_lang_type)
         self.ocr_install_timeout_seconds = self._clamp_float(
             self.ocr_install_timeout_seconds, 1.0, 3600.0, 300.0
         )
@@ -449,7 +477,9 @@ class StudyConfig:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("_rapidocr_lang_type_diagnostic", None)
+        return payload
 
     @staticmethod
     def _coerce_int(value: object, default: int) -> int:

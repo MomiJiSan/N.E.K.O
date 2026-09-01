@@ -84,7 +84,6 @@ from .tutor_llm_agent import diagnostic_code_for_exception
 from .ui_api import build_open_ui_payload
 from .ui_api import build_contribution_settings_payload, build_knowledge_map_payload
 from .ui_api import build_habit_dashboard_payload, build_pomodoro_status_payload
-from . import tesseract_support
 from plugin.plugins._shared.rapidocr import rapidocr_support
 from plugin.server.routes._install_task_store import update_install_task_state
 
@@ -310,7 +309,6 @@ __all__ = [
     "build_knowledge_map_payload",
     "build_habit_dashboard_payload",
     "build_pomodoro_status_payload",
-    "tesseract_support",
     "rapidocr_support",
     "update_install_task_state",
     "_validated_pomodoro_focus_minutes",

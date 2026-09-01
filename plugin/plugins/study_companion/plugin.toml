@@ -77,13 +77,8 @@ llm_vision_max_image_px = 768
 
 [ocr_reader]
 enabled = true
-backend_selection = "rapidocr"
 capture_backend = "auto"
-tesseract_path = ""
-install_manifest_url = ""
-install_target_dir = ""
 install_timeout_seconds = 300
-languages = "chi_sim+jpn+eng"
 left_inset_ratio = 0.03
 right_inset_ratio = 0.03
 top_ratio = 0.0

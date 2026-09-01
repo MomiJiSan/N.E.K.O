@@ -22,7 +22,9 @@ def _settings_config_payload(config: StudyConfig) -> dict:
         },
         "ocr_reader": {
             "enabled": config.ocr_enabled,
-            "languages": config.ocr_languages,
+        },
+        "rapidocr": {
+            "lang_type": config.rapidocr_lang_type,
         },
         "llm": {
             "llm_call_timeout_seconds": config.llm_call_timeout_seconds,
@@ -88,6 +90,7 @@ def _apply_settings_config(current: StudyConfig, raw: dict) -> StudyConfig:
     next_values = current.to_dict()
     study = raw.get("study") if isinstance(raw.get("study"), dict) else {}
     ocr = raw.get("ocr_reader") if isinstance(raw.get("ocr_reader"), dict) else {}
+    rapidocr = raw.get("rapidocr") if isinstance(raw.get("rapidocr"), dict) else {}
     llm = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
     communication = (
         raw.get("communication")
@@ -108,8 +111,8 @@ def _apply_settings_config(current: StudyConfig, raw: dict) -> StudyConfig:
         next_values["ocr_enabled"] = _coerce_bool(
             ocr.get("enabled"), current.ocr_enabled
         )
-    if "languages" in ocr:
-        next_values["ocr_languages"] = str(ocr.get("languages") or "").strip()
+    if "lang_type" in rapidocr:
+        next_values["rapidocr_lang_type"] = rapidocr.get("lang_type")
     if "llm_call_timeout_seconds" in llm:
         next_values["llm_call_timeout_seconds"] = llm.get(
             "llm_call_timeout_seconds"

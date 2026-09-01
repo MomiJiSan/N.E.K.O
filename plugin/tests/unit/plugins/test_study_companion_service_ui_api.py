@@ -11,7 +11,6 @@ from plugin.plugins._shared.rapidocr import rapidocr_support as shared_rapidocr_
 from plugin.plugins.study_companion.models import OcrSnapshot, StudyConfig, TutorReply
 from plugin.plugins.study_companion.service import (
     _build_ocr_readiness,
-    _available_tesseract_languages,
     build_dependency_status,
     build_explain_payload,
     build_ocr_payload,
@@ -42,7 +41,6 @@ def test_ocr_readiness_uses_selected_capture_backend(
             ocr_capture_backend="mss",
         ),
         rapidocr={"installed": True},
-        tesseract={"installed": False},
         dxcam={"installed": False},
     )
 
@@ -99,52 +97,15 @@ def test_status_payload_only_deepcopies_exposed_knowledge_fields() -> None:
     assert status["weak_topics"] == [{"topic_id": "limits"}]
 
 
-def test_dependency_status_uses_installability_and_tesseract_language_fallbacks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tessdata = tmp_path / "tessdata"
-    tessdata.mkdir()
-    (tessdata / "eng.traineddata").write_text("fake", encoding="utf-8")
-    detected = tmp_path / "tesseract.exe"
-    detected.write_text("fake", encoding="utf-8")
-
-    monkeypatch.setattr(
-        "plugin.plugins.study_companion.service._inspect_rapidocr",
-        lambda config: {"installed": False, "can_install": True},
-    )
-    monkeypatch.setattr(
-        "plugin.plugins.study_companion.service._inspect_tesseract",
-        lambda config: {"installed": True, "can_install": False},
-    )
-    monkeypatch.setattr(
-        "plugin.plugins.study_companion.service._inspect_dxcam",
-        lambda: {"installed": False, "can_install": True},
-    )
-    monkeypatch.setattr(
-        "plugin.plugins.study_companion.service.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr=""),
-    )
-
-    status = build_dependency_status(StudyConfig())
-    languages = _available_tesseract_languages(detected, tmp_path)
-
-    assert status["missing_installable"] == ["rapidocr", "dxcam"]
-    assert languages == {"eng"}
-
-
 def test_dependency_status_preserves_legacy_fields_and_adds_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         "plugin.plugins.study_companion.service._inspect_rapidocr",
-        lambda _config: {"installed": False, "can_install": True, "detail": "missing"},
-    )
-    monkeypatch.setattr(
-        "plugin.plugins.study_companion.service._inspect_tesseract",
         lambda _config: {
-            "installed": True,
-            "can_install": False,
-            "detail": "installed",
+            "installed": False,
+            "can_download_models": True,
+            "detail": "missing_model_files",
         },
     )
     monkeypatch.setattr(
@@ -156,19 +117,18 @@ def test_dependency_status_preserves_legacy_fields_and_adds_readiness(
 
     assert set(status) == {
         "rapidocr",
-        "tesseract",
         "dxcam",
         "missing_installable",
         "ocr_readiness",
     }
-    assert status["missing_installable"] == ["rapidocr", "dxcam"]
+    assert status["missing_installable"] == ["rapidocr_models"]
     assert status["ocr_readiness"] == {
         "enabled": True,
         "selected_backend": "rapidocr",
         "selected_backend_ready": False,
         "capture_ready": False,
         "ready": False,
-        "diagnostic": "rapidocr_runtime_missing",
+        "diagnostic": "rapidocr_models_missing",
     }
 
 
@@ -196,11 +156,11 @@ def test_dependency_status_preserves_legacy_fields_and_adds_readiness(
             {"installed": True, "detail": "installed"},
             {
                 "enabled": True,
-                "selected_backend": "tesseract",
-                "selected_backend_ready": True,
+                "selected_backend": "rapidocr",
+                "selected_backend_ready": False,
                 "capture_ready": True,
-                "ready": True,
-                "diagnostic": "ready",
+                "ready": False,
+                "diagnostic": "rapidocr_runtime_missing",
             },
         ),
         (
@@ -252,11 +212,11 @@ def test_dependency_status_preserves_legacy_fields_and_adds_readiness(
             {"installed": True, "detail": "installed"},
             {
                 "enabled": True,
-                "selected_backend": "tesseract",
-                "selected_backend_ready": False,
+                "selected_backend": "rapidocr",
+                "selected_backend_ready": True,
                 "capture_ready": True,
-                "ready": False,
-                "diagnostic": "tesseract_languages_missing",
+                "ready": True,
+                "diagnostic": "ready",
             },
         ),
         (
@@ -266,7 +226,7 @@ def test_dependency_status_preserves_legacy_fields_and_adds_readiness(
             {"installed": False, "detail": "missing"},
             {
                 "enabled": True,
-                "selected_backend": "tesseract",
+                "selected_backend": "rapidocr",
                 "selected_backend_ready": True,
                 "capture_ready": False,
                 "ready": False,
@@ -280,11 +240,11 @@ def test_dependency_status_preserves_legacy_fields_and_adds_readiness(
             {"installed": True, "detail": "installed"},
             {
                 "enabled": True,
-                "selected_backend": "unknown",
-                "selected_backend_ready": False,
+                "selected_backend": "rapidocr",
+                "selected_backend_ready": True,
                 "capture_ready": True,
-                "ready": False,
-                "diagnostic": "unsupported_ocr_backend",
+                "ready": True,
+                "diagnostic": "ready",
             },
         ),
     ],
@@ -302,10 +262,6 @@ def test_dependency_status_reports_selected_ocr_chain_readiness(
         lambda _config: rapidocr,
     )
     monkeypatch.setattr(
-        "plugin.plugins.study_companion.service._inspect_tesseract",
-        lambda _config: tesseract,
-    )
-    monkeypatch.setattr(
         "plugin.plugins.study_companion.service._inspect_dxcam", lambda: dxcam
     )
 
@@ -313,8 +269,38 @@ def test_dependency_status_reports_selected_ocr_chain_readiness(
 
     assert status["ocr_readiness"] == expected
     assert status["rapidocr"] is rapidocr
-    assert status["tesseract"] is tesseract
     assert status["dxcam"] is dxcam
+
+
+def test_invalid_rapidocr_language_is_not_reported_as_installed() -> None:
+    status = build_dependency_status(StudyConfig(rapidocr_lang_type=" invalid "))
+
+    assert status["rapidocr"]["installed"] is False
+    assert status["rapidocr"]["detail"] == "invalid_language"
+    assert status["ocr_readiness"]["diagnostic"] == "rapidocr_language_invalid"
+
+
+def test_legacy_tesseract_config_values_remain_serializable_for_rollback() -> None:
+    config = StudyConfig(
+        ocr_backend_selection="tesseract",
+        ocr_tesseract_path="C:/legacy/tesseract.exe",
+        ocr_install_manifest_url="https://legacy.invalid/manifest.json",
+        ocr_install_target_dir="C:/legacy/Tesseract-OCR",
+        ocr_languages="eng+jpn",
+    )
+
+    payload = config.to_dict()
+
+    assert payload["ocr_backend_selection"] == "tesseract"
+    assert payload["ocr_tesseract_path"] == "C:/legacy/tesseract.exe"
+    assert payload["ocr_install_manifest_url"] == "https://legacy.invalid/manifest.json"
+    assert payload["ocr_install_target_dir"] == "C:/legacy/Tesseract-OCR"
+    assert payload["ocr_languages"] == "eng+jpn"
+
+
+@pytest.mark.parametrize("lang_type", ["ch", "japan", "korean", "en"])
+def test_rapidocr_language_values_are_preserved(lang_type: str) -> None:
+    assert StudyConfig(rapidocr_lang_type=f" {lang_type.upper()} ").rapidocr_lang_type == lang_type
 
 
 def test_study_rapidocr_resolve_uses_galgame_runtime_fallback(

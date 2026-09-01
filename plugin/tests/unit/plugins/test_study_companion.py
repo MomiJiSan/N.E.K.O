@@ -134,12 +134,10 @@ from plugin.plugins.study_companion.study_ocr_pipeline import (
 )
 from plugin.plugins.study_companion._event_bus import StudyEvent
 from plugin.plugins.study_companion import service as study_service
-from plugin.plugins.study_companion import tesseract_support as study_tesseract_support
 from plugin.plugins.study_companion.screen_classifier import (
     ScreenClassification,
     classify_screen_from_ocr,
 )
-from plugin.plugins.study_companion.service import _available_tesseract_languages
 from plugin.plugins.study_companion.tutor_llm_agent import TutorLLMAgent, _JSONCorrector
 from plugin.plugins.study_companion.ui_api import (
     build_knowledge_map_payload,
@@ -1212,6 +1210,7 @@ async def test_study_settings_entry_persists_and_updates_runtime(
             config={
                 "study": {"default_mode": MODE_TEACHING, "auto_open_ui": True},
                 "ocr_reader": {"enabled": "false", "languages": "chi_sim+eng"},
+                "rapidocr": {"lang_type": " Japan "},
                 "llm": {
                     "llm_call_timeout_seconds": 90,
                     "llm_vision_enabled": True,
@@ -1224,14 +1223,15 @@ async def test_study_settings_entry_persists_and_updates_runtime(
         assert result.value["config"]["study"]["default_mode"] == MODE_TEACHING
         assert result.value["config"]["study"]["auto_open_ui"] is True
         assert result.value["config"]["ocr_reader"]["enabled"] is False
-        assert result.value["config"]["ocr_reader"]["languages"] == "chi_sim+eng"
+        assert result.value["config"]["rapidocr"]["lang_type"] == "japan"
         assert result.value["config"]["llm"]["llm_call_timeout_seconds"] == 90.0
         assert result.value["config"]["llm"]["llm_vision_enabled"] is True
         assert result.value["config"]["llm"]["llm_vision_max_image_px"] == 128
         assert plugin._cfg.default_mode == MODE_TEACHING
         assert plugin._cfg.auto_open_ui is True
         assert plugin._cfg.ocr_enabled is False
-        assert plugin._cfg.ocr_languages == "chi_sim+eng"
+        assert plugin._cfg.ocr_languages == "eng"
+        assert plugin._cfg.rapidocr_lang_type == "japan"
         assert plugin._cfg.llm_call_timeout_seconds == 90.0
         assert plugin._cfg.llm_vision_enabled is True
         assert plugin._cfg.llm_vision_max_image_px == 128
@@ -1239,7 +1239,8 @@ async def test_study_settings_entry_persists_and_updates_runtime(
         assert persisted.default_mode == MODE_TEACHING
         assert persisted.auto_open_ui is True
         assert persisted.ocr_enabled is False
-        assert persisted.ocr_languages == "chi_sim+eng"
+        assert persisted.ocr_languages == "eng"
+        assert persisted.rapidocr_lang_type == "japan"
         assert persisted.llm_call_timeout_seconds == 90.0
         assert persisted.llm_vision_enabled is True
         assert persisted.llm_vision_max_image_px == 128
@@ -6150,6 +6151,7 @@ let configPayload = {
     plugin: { id: 'study_companion', entry: 'plugin.plugins.study_companion:StudyCompanionPlugin' },
     study: { default_mode: 'interactive', language: 'en', history_limit: 50, auto_open_ui: false },
     ocr_reader: { enabled: false, backend_selection: 'rapidocr', languages: 'eng' },
+    rapidocr: { lang_type: 'en' },
     llm: { llm_call_timeout_seconds: 45, llm_vision_enabled: false, llm_vision_max_image_px: 1024 },
     doc_export: { enabled: false, pdf_backend: 'reportlab', default_style: 'compact', xmind_enabled: false },
   },
@@ -6161,7 +6163,6 @@ let statusPayload = {
   last_ocr_text: 'old OCR text',
   dependencies: {
     rapidocr: { available: true },
-    tesseract: { available: true },
     dxcam: { available: true },
   },
   knowledge_summary: { topic_count: 4, edge_count: 3 },
@@ -6295,8 +6296,8 @@ await waitFor(
 if (document.getElementById('settingsOcrEnabled').checked !== false) {
   throw new Error('OCR enabled checkbox did not load from config');
 }
-if (document.getElementById('settingsOcrLanguages').value !== 'eng') {
-  throw new Error(`OCR languages did not load from config: ${document.getElementById('settingsOcrLanguages').value}`);
+    if (document.getElementById('settingsOcrLanguages').value !== 'en') {
+      throw new Error(`recognition language did not load from config: ${document.getElementById('settingsOcrLanguages').value}`);
 }
 if (document.getElementById('settingsLlmTimeout').value !== '45') {
   throw new Error(`LLM timeout did not load from config: ${document.getElementById('settingsLlmTimeout').value}`);
@@ -6313,7 +6314,7 @@ if (settingsDocExportEnabled.checked !== false) {
 }
 document.getElementById('settingsDefaultMode').value = 'teaching';
 document.getElementById('settingsOcrEnabled').checked = true;
-document.getElementById('settingsOcrLanguages').value = 'chi_sim+eng';
+    document.getElementById('settingsOcrLanguages').value = 'japan';
 document.getElementById('settingsLlmTimeout').value = '90';
 document.getElementById('settingsLlmVisionEnabled').checked = true;
 settingsDocExportEnabled.checked = true;
@@ -6327,7 +6328,8 @@ if (
   savedConfig.study.default_mode !== 'teaching'
   || savedConfig.study.auto_open_ui !== false
   || savedConfig.ocr_reader.enabled !== true
-  || savedConfig.ocr_reader.languages !== 'chi_sim+eng'
+      || savedConfig.ocr_reader.languages !== 'eng'
+      || savedConfig.rapidocr.lang_type !== 'japan'
   || savedConfig.llm.llm_call_timeout_seconds !== 90
   || savedConfig.llm.llm_vision_enabled !== true
   || savedConfig.llm.llm_vision_max_image_px !== 1024
@@ -7567,7 +7569,7 @@ def test_ocr_pipeline_normalizes_box_objects_and_capture_failures() -> None:
     snapshot = pipeline.snapshot_from_image(object(), backend_name="fake")
 
     assert snapshot.status == "ok"
-    assert snapshot.backend == "fake"
+    assert snapshot.backend == "rapidocr"
     assert snapshot.text == "Box text Dict text Tail"
     assert snapshot.boxes == [
         {"text": "Box text", "x": 1},
@@ -7599,106 +7601,18 @@ def test_ocr_pipeline_reports_fullscreen_capture_errors(
     assert "capture boom" in snapshot.diagnostic
 
 
-def test_available_tesseract_languages_logs_timeout_and_falls_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    detected = tmp_path / "tesseract.exe"
-    target_dir = tmp_path / "install"
-    tessdata = target_dir / "tessdata"
-    tessdata.mkdir(parents=True)
-    (tessdata / "eng.traineddata").write_text("stub", encoding="utf-8")
-
-    def _timeout(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(
-            cmd=[str(detected), "--list-langs"], timeout=5.0
-        )
-
-    monkeypatch.setattr(subprocess, "run", _timeout)
-    with caplog.at_level("WARNING", logger=study_service._LOGGER.name):
-        languages = _available_tesseract_languages(detected, target_dir)
-
-    assert languages == {"eng"}
-    assert any("timed out" in record.message for record in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_study_install_tesseract_uses_local_support(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
-    calls: list[dict[str, object]] = []
-
-    async def _fake_install_tesseract(**kwargs):
-        calls.append(dict(kwargs))
-        progress_callback = kwargs.get("progress_callback")
-        if progress_callback is not None:
-            maybe_awaitable = progress_callback(
-                {
-                    "phase": "completed",
-                    "message": "Tesseract is ready",
-                    "progress": 1.0,
-                    "downloaded_bytes": 0,
-                    "total_bytes": 0,
-                    "resume_from": 0,
-                    "asset_name": "",
-                    "release_name": "",
-                }
-            )
-            if hasattr(maybe_awaitable, "__await__"):
-                await maybe_awaitable
-        return {
-            "summary": "Tesseract is ready",
-            "detected_path": "C:/Tesseract/tesseract.exe",
-        }
-
-    monkeypatch.setattr(
-        study_tesseract_support, "install_tesseract", _fake_install_tesseract
-    )
-    ctx = _Ctx(
-        tmp_path,
-        {
-            "study": {"language": "en", "auto_open_ui": False},
-            "ocr_reader": {
-                "enabled": True,
-                "install_target_dir": str(tmp_path / "Tesseract-OCR"),
-                "languages": "eng",
-            },
-            "rapidocr": {"lang_type": "ch"},
-        },
-    )
-    plugin = StudyCompanionPlugin(ctx)
-    result = await plugin.startup()
-    assert isinstance(result, Ok)
-
-    try:
-        install_result = await plugin.study_install_tesseract(
-            force=True, _ctx={"run_id": "run-study-install"}
-        )
-
-        assert isinstance(install_result, Ok)
-        assert install_result.value["summary"] == "Tesseract is ready"
-        assert calls
-        assert calls[0]["plugin_id"] == "study_companion"
-        assert calls[0]["task_id"] == "run-study-install"
-        assert calls[0]["force"] is True
-        assert ctx.run_updates
-        assert ctx.run_updates[-1]["run_id"] == "run-study-install"
-    finally:
-        await plugin.shutdown()
-
-
-def test_study_ocr_pipeline_uses_local_tesseract_backend(
+def test_study_ocr_pipeline_ignores_legacy_tesseract_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created: list[dict[str, object]] = []
 
-    class _FakeTesseractBackend:
+    class _FakeRapidOcrBackend:
         def __init__(self, **kwargs) -> None:
             created.append(dict(kwargs))
 
     monkeypatch.setattr(
-        study_tesseract_support, "TesseractOcrBackend", _FakeTesseractBackend
+        "plugin.plugins._shared.rapidocr.ocr_backends.RapidOcrBackend",
+        _FakeRapidOcrBackend,
     )
     pipeline = StudyOcrPipeline(
         logger=_Logger(),
@@ -7712,46 +7626,17 @@ def test_study_ocr_pipeline_uses_local_tesseract_backend(
 
     backend = pipeline._resolve_ocr_backend()
 
-    assert isinstance(backend, _FakeTesseractBackend)
+    assert isinstance(backend, _FakeRapidOcrBackend)
     assert created == [
         {
-            "tesseract_path": "C:/Tesseract/tesseract.exe",
-            "install_target_dir_raw": "C:/Tesseract",
-            "languages": "eng",
+            "install_target_dir_raw": "",
+            "engine_type": "onnxruntime",
+            "lang_type": "ch",
+            "model_type": "mobile",
+            "ocr_version": "PP-OCRv4",
+            "plugin_id": "study_companion",
         }
     ]
-
-
-def test_study_tesseract_backend_restores_global_tesseract_cmd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    executable = tmp_path / "tesseract.exe"
-    executable.write_text("", encoding="utf-8")
-    calls: list[tuple[object, str]] = []
-    fake_pytesseract = SimpleNamespace()
-    fake_pytesseract.pytesseract = SimpleNamespace(tesseract_cmd="original-cmd")
-
-    def image_to_string(candidate: object, *, lang: str, config: str) -> str:
-        calls.append((candidate, fake_pytesseract.pytesseract.tesseract_cmd))
-        return "recognized text"
-
-    fake_pytesseract.image_to_string = image_to_string
-    monkeypatch.setitem(sys.modules, "pytesseract", fake_pytesseract)
-    monkeypatch.setattr(
-        study_tesseract_support, "_prepare_ocr_image", lambda image: "prepared-image"
-    )
-
-    backend = study_tesseract_support.TesseractOcrBackend(
-        tesseract_path=str(executable),
-        languages="eng",
-    )
-
-    assert backend.extract_text("source-image") == "recognized text"
-    assert calls == [
-        ("source-image", str(executable)),
-        ("prepared-image", str(executable)),
-    ]
-    assert fake_pytesseract.pytesseract.tesseract_cmd == "original-cmd"
 
 
 @pytest.mark.asyncio

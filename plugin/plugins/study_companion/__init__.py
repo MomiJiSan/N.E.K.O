@@ -128,11 +128,6 @@ def _register_install_routes() -> None:
                 label="RapidOCR Models",
                 queued_message="RapidOCR model download queued",
             ),
-            "tesseract": InstallKindRegistration(
-                entry_id="study_install_tesseract",
-                label="Tesseract",
-                queued_message="Tesseract install queued",
-            ),
         },
         ui_i18n_dir=Path(__file__).resolve().parent / "i18n",
         tutorial_enabled=True,
@@ -225,7 +220,6 @@ class StudyCompanionPlugin(
         self._lock = asyncio.Lock()
         self._communication_settings_lock = asyncio.Lock()
         self._targeted_context_lock = threading.Lock()
-        self._install_in_progress = False
         self._rapidocr_models_in_progress = False
         self._cfg = StudyConfig()
         self._state = build_initial_state(mode=MODE_COMPANION)
