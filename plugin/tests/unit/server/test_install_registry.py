@@ -29,7 +29,7 @@ def test_builtin_install_registration_bootstraps_from_empty_registry(
     )
 
     assert study is not None
-    assert set(study.install_kinds) == {"rapidocr_models", "tesseract"}
+    assert set(study.install_kinds) == {"rapidocr_models"}
     assert study.tutorial_enabled is True
 
 

@@ -138,11 +138,6 @@ def bootstrap_builtin_install_plugins() -> None:
                         label="RapidOCR Models",
                         queued_message="RapidOCR model download queued",
                     ),
-                    "tesseract": InstallKindRegistration(
-                        entry_id="study_install_tesseract",
-                        label="Tesseract",
-                        queued_message="Tesseract install queued",
-                    ),
                 },
                 ui_i18n_dir=plugins_root / "study_companion" / "i18n",
                 tutorial_enabled=True,
