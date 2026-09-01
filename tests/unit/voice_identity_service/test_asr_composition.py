@@ -136,7 +136,7 @@ def _install_gate_spies(
 
     monkeypatch.setattr(
         runtime,
-        "request_speaker_candidate_decision_arm",
+        "_request_speaker_candidate_decision_arm",
         request_arm,
         raising=False,
     )

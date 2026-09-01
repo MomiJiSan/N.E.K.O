@@ -730,7 +730,7 @@ class IndependentAsrRuntime:
             )
         return True
 
-    def request_speaker_candidate_decision_arm(
+    def _request_speaker_candidate_decision_arm(
         self,
         candidate: SpeakerShadowCandidateKey,
         *,

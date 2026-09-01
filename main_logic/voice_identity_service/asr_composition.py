@@ -161,7 +161,7 @@ class OwnerVoiceAsrCompositionFactory:
                 if stale_same_key:
                     self._resolve_candidates((observation.candidate,))
                 try:
-                    armed = runtime.request_speaker_candidate_decision_arm(
+                    armed = runtime._request_speaker_candidate_decision_arm(
                         observation.candidate,
                         activation_generation=generation,
                     )
