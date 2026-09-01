@@ -37,7 +37,11 @@ from ._registry_meta import (
     AsrEndpointingMode as _AsrEndpointingMode,
     AsrProviderAvailability as _AsrProviderAvailability,
 )
-from ._provider_events import ProviderEndpointNotification, ProviderUtteranceKey
+from ._provider_events import (
+    ProviderEndpointNotification,
+    ProviderFinalNotification,
+    ProviderUtteranceKey,
+)
 from .endpointing.detector_runtime import _create_voice_turn_adapter
 from .provider_policy import resolve_provider_policy
 from .workers.dummy import dummy_asr_worker as _dummy_asr_worker
@@ -425,6 +429,10 @@ def _create_asr_session_from_selection(
     | None = None,
     on_provider_final: Callable[[ProviderUtteranceKey, str], Awaitable[None]]
     | None = None,
+    on_provider_final_ready: Callable[
+        [ProviderFinalNotification], Awaitable[None]
+    ]
+    | None = None,
     external_endpointing_runtime: bool = False,
     user_language: str | None = None,
 ) -> RealtimeAsrSession:
@@ -474,6 +482,7 @@ def _create_asr_session_from_selection(
         on_turn_endpointed=on_turn_endpointed,
         on_provider_endpoint=on_provider_endpoint,
         on_provider_final=on_provider_final,
+        on_provider_final_ready=on_provider_final_ready,
         voice_turn_factory=(
             partial(
                 _create_voice_turn_adapter,

@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Hashable
+from typing import Hashable, Literal
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
+from .admission.contracts import AdmissionDisposition
 from .lifecycle import FinalKey
 
 
@@ -183,6 +184,19 @@ class TranscriptEnvelope:
         return FinalKey.from_turn(self.turn_token)
 
 
+TranscriptCleanupKind = Literal["drop", "abandon", "invalidate_forward"]
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptTerminalSettlement:
+    final_key: FinalKey
+    admission_disposition: AdmissionDisposition
+    cleanup_kind: TranscriptCleanupKind
+
+
+_DispatchQueueItem = TranscriptEnvelope | TranscriptTerminalSettlement
+
+
 class TranscriptDispatcher:
     """Own bounded final delivery slots and one serial dispatch worker."""
 
@@ -191,17 +205,26 @@ class TranscriptDispatcher:
         dispatch: Callable[[TranscriptEnvelope], Awaitable[None]],
         *,
         capacity: int = 8,
+        settle_terminal: Callable[[TranscriptTerminalSettlement], Awaitable[None]]
+        | None = None,
+        require_terminal_settlement: bool = False,
     ) -> None:
         if capacity <= 0:
             raise ValueError("dispatcher capacity must be positive")
+        if require_terminal_settlement and settle_terminal is None:
+            raise ValueError("dispatcher terminal settlement callback is required")
         self._dispatch = dispatch
+        self._settle_terminal = settle_terminal
         self._capacity = capacity
-        self._queue: asyncio.Queue[TranscriptEnvelope] = asyncio.Queue(
+        self._queue: asyncio.Queue[_DispatchQueueItem] = asyncio.Queue(
             maxsize=capacity
         )
         self._reservations: set[FinalKey] = set()
+        self._resolved: set[FinalKey] = set()
+        self._terminal_settlement_pending: set[FinalKey] = set()
         self._worker: asyncio.Task[None] | None = None
-        self._active: TranscriptEnvelope | None = None
+        self._handoff_worker: asyncio.Task[None] | None = None
+        self._active: _DispatchQueueItem | None = None
         self._idle = asyncio.Event()
         self._idle.set()
 
@@ -216,12 +239,17 @@ class TranscriptDispatcher:
         )
 
     def try_reserve(self, key: FinalKey) -> bool:
+        if key in self._resolved:
+            return False
         if key in self._reservations:
             return True
         occupied = (
             len(self._reservations)
             + self._queue.qsize()
-            + int(self._active is not None)
+            + int(
+                self._active is not None
+                and self._handoff_worker is None
+            )
         )
         if occupied >= self._capacity:
             return False
@@ -236,33 +264,130 @@ class TranscriptDispatcher:
         key = envelope.final_key
         if key not in self._reservations:
             raise RuntimeError("ASR_TRANSCRIPT_SLOT_NOT_RESERVED")
-        self._reservations.remove(key)
-        self._queue.put_nowait(envelope)
-        self._idle.clear()
-        self._ensure_worker()
+        if not self.resolve_reserved(
+            key,
+            AdmissionDisposition.FORWARD,
+            envelope=envelope,
+        ):
+            raise RuntimeError("ASR_TRANSCRIPT_SLOT_NOT_RESERVED")
+
+    def resolve_reserved(
+        self,
+        final_key: FinalKey,
+        disposition: AdmissionDisposition,
+        *,
+        envelope: TranscriptEnvelope | None = None,
+    ) -> bool:
+        """Resolve one reservation exactly once as forward/drop/abandon."""
+
+        if type(disposition) is not AdmissionDisposition:
+            raise TypeError("ASR_TRANSCRIPT_DISPOSITION_INVALID")
+        if disposition is AdmissionDisposition.FORWARD:
+            if envelope is None or envelope.final_key != final_key:
+                raise ValueError("ASR_TRANSCRIPT_ENVELOPE_INVALID")
+        elif envelope is not None:
+            raise ValueError("ASR_TRANSCRIPT_TERMINAL_ENVELOPE_FORBIDDEN")
+        if final_key in self._resolved or final_key not in self._reservations:
+            return False
+
+        # Write the tombstone before relinquishing the reservation. No retry,
+        # timeout, or late callback can reserve this FinalKey again.
+        self._remember_resolution(final_key, disposition)
+        self._reservations.remove(final_key)
+        if disposition is AdmissionDisposition.FORWARD:
+            assert envelope is not None
+            self._queue.put_nowait(envelope)
+            self._idle.clear()
+            self._ensure_worker()
+        elif self._settle_terminal is not None:
+            self._enqueue_terminal(final_key, disposition)
+        else:
+            self._set_idle_if_empty()
+        return True
 
     def invalidate_all(self) -> None:
-        """Synchronously cancel active/queued Core work at an identity barrier."""
+        """Seize every slot and preserve one settlement for every owned turn."""
 
+        unresolved = tuple(self._reservations)
+        for final_key in unresolved:
+            self._remember_resolution(final_key, AdmissionDisposition.ABANDON)
         self._reservations.clear()
+        queued: list[_DispatchQueueItem] = []
         while True:
             try:
-                self._queue.get_nowait()
+                queued.append(self._queue.get_nowait())
                 self._queue.task_done()
             except asyncio.QueueEmpty:
                 break
-        worker, self._worker = self._worker, None
+        worker = self._worker
+        if worker is not None and worker.done():
+            worker = None
+        if worker is None:
+            handoff = self._handoff_worker
+            if handoff is not None and not handoff.done():
+                worker = handoff
+        self._worker = None
+        if worker is not None:
+            self._handoff_worker = worker
+
+        if self._settle_terminal is not None:
+            for item in queued:
+                if isinstance(item, TranscriptTerminalSettlement):
+                    # Its callback has not run yet; keep the exact terminal
+                    # control instead of silently discarding it.
+                    self._queue.put_nowait(item)
+                else:
+                    # Admission was already FORWARD. Invalidation cancels only
+                    # pending Core delivery and must not rewrite disposition.
+                    self._enqueue_terminal(
+                        item.final_key,
+                        AdmissionDisposition.FORWARD,
+                        cleanup_kind="invalidate_forward",
+                    )
+            for final_key in unresolved:
+                self._enqueue_terminal(
+                    final_key,
+                    AdmissionDisposition.ABANDON,
+                    cleanup_kind="abandon",
+                )
+            active = self._active
+            if (
+                worker is not None
+                and isinstance(active, TranscriptEnvelope)
+            ):
+                self._enqueue_terminal(
+                    active.final_key,
+                    AdmissionDisposition.FORWARD,
+                    cleanup_kind="invalidate_forward",
+                )
+            elif (
+                worker is not None
+                and worker is not asyncio.current_task()
+                and isinstance(active, TranscriptTerminalSettlement)
+            ):
+                # A terminal cleanup owns Core side effects. Let it finish;
+                # cancelling and replaying it could execute those effects twice.
+                pass
+
         if worker is not None and not worker.done():
-            # 不要取消调用者自己。收口路径（例如独立 ASR final 里发现会话不可用后
-            # 调 _close_independent_asr）本身就跑在这个 worker 上：取消它会让紧接着
-            # 的那个 await 抛 CancelledError，剩下的 detector/provider 清理和
-            # send_session_ended_by_server() 全部被跳过，前端也就收不到结束通知。
-            # 队列已经清空、_worker 也已置 None，所以不取消它也不会再接新活，
-            # 当前这一条 envelope 跑完就自然结束。
-            if worker is not asyncio.current_task():
+            # A self-invalidating Core callback must finish its cleanup before
+            # a replacement worker starts. External invalidation cancels the
+            # old callback, but handoff still waits for its unwind.
+            if (
+                worker is not asyncio.current_task()
+                and not isinstance(self._active, TranscriptTerminalSettlement)
+            ):
                 worker.cancel()
+            self._idle.clear()
+            return
+
+        self._handoff_worker = None
         self._active = None
-        self._idle.set()
+        if self._queue.empty():
+            self._idle.set()
+        else:
+            self._idle.clear()
+            self._ensure_worker()
 
     async def wait_idle(self) -> None:
         """Await dispatch quiescence: no queued and no active envelope.
@@ -274,6 +399,11 @@ class TranscriptDispatcher:
         await self._idle.wait()
 
     def _ensure_worker(self) -> None:
+        if (
+            self._handoff_worker is not None
+            and not self._handoff_worker.done()
+        ):
+            return
         if self._worker is not None and not self._worker.done():
             return
         self._worker = asyncio.create_task(
@@ -285,10 +415,13 @@ class TranscriptDispatcher:
         worker_task = asyncio.current_task()
         try:
             while True:
-                envelope = await self._queue.get()
-                self._active = envelope
+                item = await self._queue.get()
+                self._active = item
                 try:
-                    await self._dispatch(envelope)
+                    if isinstance(item, TranscriptEnvelope):
+                        await self._dispatch(item)
+                    elif self._settle_terminal is not None:
+                        await self._settle_terminal(item)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -298,10 +431,17 @@ class TranscriptDispatcher:
                 finally:
                     self._queue.task_done()
                     if (
-                        self._worker is worker_task
-                        and self._active is envelope
+                        (
+                            self._worker is worker_task
+                            or self._handoff_worker is worker_task
+                        )
+                        and self._active is item
                     ):
                         self._active = None
+                        if isinstance(item, TranscriptTerminalSettlement):
+                            self._terminal_settlement_pending.discard(
+                                item.final_key
+                            )
                         self._set_idle_if_empty()
                 if self._worker is not worker_task:
                     # invalidate_all() 已经把我们从 _worker 上摘掉了（而且刻意没有
@@ -311,6 +451,12 @@ class TranscriptDispatcher:
                     return
         except asyncio.CancelledError:
             return
+        finally:
+            if self._handoff_worker is worker_task:
+                self._handoff_worker = None
+                if self._worker is None and not self._queue.empty():
+                    self._ensure_worker()
+                self._set_idle_if_empty()
 
     def _set_idle_if_empty(self) -> None:
         # Reservations are deliberately NOT part of the idle predicate. A slot
@@ -320,3 +466,37 @@ class TranscriptDispatcher:
         # wait_idle() unsettleable for any back-to-back session.
         if self._queue.empty() and self._active is None:
             self._idle.set()
+
+    def _remember_resolution(
+        self,
+        final_key: FinalKey,
+        disposition: AdmissionDisposition,
+    ) -> None:
+        del disposition
+        self._resolved.add(final_key)
+
+    def _enqueue_terminal(
+        self,
+        final_key: FinalKey,
+        disposition: AdmissionDisposition,
+        *,
+        cleanup_kind: TranscriptCleanupKind | None = None,
+    ) -> None:
+        if final_key in self._terminal_settlement_pending:
+            return
+        if cleanup_kind is None:
+            cleanup_kind = (
+                "drop"
+                if disposition is AdmissionDisposition.DROP
+                else "abandon"
+            )
+        self._terminal_settlement_pending.add(final_key)
+        self._queue.put_nowait(
+            TranscriptTerminalSettlement(
+                final_key=final_key,
+                admission_disposition=disposition,
+                cleanup_kind=cleanup_kind,
+            )
+        )
+        self._idle.clear()
+        self._ensure_worker()

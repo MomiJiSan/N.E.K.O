@@ -31,9 +31,11 @@ from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from ._infra import logger, _READY_TIMEOUT_SECONDS
 from ._provider_events import (
     ProviderEndpointNotification,
+    ProviderFinalNotification,
     ProviderUtteranceKey,
 )
 from .audio import AsrAudioDispatcher
+from .admission.contracts import AdmissionDisposition
 from .candidate_control import CandidateRejectionOutcome, CandidateRejectionRequest
 from ._registry_meta import AsrProviderAvailability
 from .endpointing.detector import (
@@ -79,6 +81,7 @@ from .speaker_shadow.contracts import (
 from .transcript import (
     TranscriptDispatcher,
     TranscriptEnvelope,
+    TranscriptTerminalSettlement,
 )
 
 
@@ -1725,9 +1728,7 @@ class IndependentAsrRuntime:
         self._asr_speaker_candidate_arm_tasks: set[asyncio.Task[None]] = set()
         self._speaker_rejection_metrics = _new_speaker_rejection_metrics()
         self._asr_rejection_watchdog_task: asyncio.Task[None] | None = None
-        self._asr_transcript_dispatcher = TranscriptDispatcher(
-            self._dispatch_asr_transcript_envelope,
-        )
+        self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
         self._asr_detector_dispatcher = AsrDetectorDispatcher(
             self._dispatch_asr_detector_event,
             on_failure=self._handle_asr_detector_dispatcher_failure,
@@ -1789,8 +1790,8 @@ class IndependentAsrRuntime:
         if not hasattr(self, "_asr_session_epoch"):
             self._init_asr_runtime_state()
         elif not hasattr(self, "_asr_transcript_dispatcher"):
-            self._asr_transcript_dispatcher = TranscriptDispatcher(
-                self._dispatch_asr_transcript_envelope,
+            self._asr_transcript_dispatcher = (
+                self._new_asr_transcript_dispatcher()
             )
         if not hasattr(self, "_asr_detector_dispatcher"):
             self._asr_detector_dispatcher = AsrDetectorDispatcher(
@@ -1880,13 +1881,13 @@ class IndependentAsrRuntime:
         self,
         lifecycle: VoiceInputLifecycleController,
     ) -> VoiceTurnToken:
+        current_turn_token = lifecycle.current_turn_token
+        if current_turn_token is not None:
+            return current_turn_token
         ingress_token = self._asr_current_ingress_token
         if ingress_token is None or not self._ingress_token_matches(ingress_token):
             raise RuntimeError("ASR_INGRESS_TOKEN_REQUIRED")
-        return VoiceTurnToken(
-            ingress=ingress_token,
-            turn_id=lifecycle.snapshot.turn_id,
-        )
+        return lifecycle.bind_current_turn_token(ingress_token)
 
     def _capture_transport_token(
         self,
@@ -2194,7 +2195,9 @@ class IndependentAsrRuntime:
         state = lifecycle.snapshot.state
         if state is VoiceLifecycleState.DRAINING:
             if event.kind == "continuous":
-                lifecycle.mark_pending_turn_speech()
+                lifecycle.mark_pending_turn_speech(
+                    event.ingress.ingress_token
+                )
                 if self._asr_pending_turn_onset_at is None:
                     self._asr_pending_turn_onset_at = detected_at
                 self._asr_pending_detector_candidate = event.candidate
@@ -2210,7 +2213,7 @@ class IndependentAsrRuntime:
                 self._asr_warm_expiry_task = None
             if state is VoiceLifecycleState.WARM_IDLE:
                 lifecycle.metrics.warm_hit_count += 1
-            lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+            lifecycle.open_turn(event.ingress.ingress_token)
             prewarm_identity = self._capture_runtime_identity(
                 ingress_token=event.ingress.ingress_token,
             )
@@ -2333,7 +2336,7 @@ class IndependentAsrRuntime:
                 self._asr_warm_expiry_task = None
             if state is VoiceLifecycleState.WARM_IDLE:
                 lifecycle.metrics.warm_hit_count += 1
-            lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+            lifecycle.open_turn(event.ingress.ingress_token)
             prewarm_identity = self._capture_runtime_identity(
                 ingress_token=event.ingress.ingress_token,
             )
@@ -2478,7 +2481,7 @@ class IndependentAsrRuntime:
             )
         state = lifecycle.snapshot.state
         if state is VoiceLifecycleState.DRAINING:
-            lifecycle.mark_pending_turn_speech()
+            lifecycle.mark_pending_turn_speech(ingress_token)
             if self._asr_pending_turn_onset_at is None:
                 self._asr_pending_turn_onset_at = detected_at
             return wake_is_current() and await self._bind_provider_detector_candidate(
@@ -2500,7 +2503,7 @@ class IndependentAsrRuntime:
                 self._asr_warm_expiry_task = None
             if state is VoiceLifecycleState.WARM_IDLE:
                 lifecycle.metrics.warm_hit_count += 1
-            lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+            lifecycle.open_turn(ingress_token)
             prewarm_identity = self._capture_runtime_identity(
                 ingress_token=ingress_token,
             )
@@ -3267,18 +3270,30 @@ class IndependentAsrRuntime:
                     text, epoch, candidate_provider
                 )
 
-            async def on_provider_final(
-                key: ProviderUtteranceKey,
-                text: str,
+            async def on_provider_final_ready(
+                notification: ProviderFinalNotification,
             ) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_provider_final(
-                    key,
-                    text,
-                    epoch,
-                    candidate_provider,
-                )
+                if (
+                    candidate_policy.endpoint_authority == "provider"
+                    and notification.key is not None
+                ):
+                    await self._handle_provider_final(
+                        notification.key,
+                        notification.text,
+                        epoch,
+                        candidate_provider,
+                        received_at=notification.received_at,
+                        admission_deadline=notification.admission_deadline,
+                    )
+                else:
+                    await self._handle_independent_asr_final(
+                        notification.text,
+                        epoch,
+                        candidate_provider,
+                        deadline=notification.admission_deadline,
+                    )
 
             async def on_error(_message: str) -> None:
                 if not is_adopted_candidate():
@@ -3327,11 +3342,7 @@ class IndependentAsrRuntime:
                     if candidate_policy.endpoint_authority == "provider"
                     else None
                 ),
-                on_provider_final=(
-                    on_provider_final
-                    if candidate_policy.endpoint_authority == "provider"
-                    else None
-                ),
+                on_provider_final_ready=on_provider_final_ready,
                 external_endpointing_runtime=(
                     _uses_smart_turn_endpointing(candidate_policy)
                 ),
@@ -4183,6 +4194,27 @@ class IndependentAsrRuntime:
                 self.display_name,
             )
 
+    async def _settle_asr_transcript_terminal(
+        self,
+        settlement: TranscriptTerminalSettlement,
+    ) -> None:
+        """Settle Core ownership without revising the admission tombstone."""
+
+        if type(settlement.admission_disposition) is not AdmissionDisposition:
+            raise TypeError("ASR_TRANSCRIPT_DISPOSITION_INVALID")
+        await self._notify_asr_turn_abandoned(
+            settlement.final_key.turn_token
+        )
+
+    def _new_asr_transcript_dispatcher(self) -> TranscriptDispatcher:
+        """Construct the production dispatcher with mandatory settlement."""
+
+        return TranscriptDispatcher(
+            self._dispatch_asr_transcript_envelope,
+            settle_terminal=self._settle_asr_transcript_terminal,
+            require_terminal_settlement=True,
+        )
+
     async def _close_independent_asr(
         self,
         *,
@@ -4268,9 +4300,7 @@ class IndependentAsrRuntime:
         transcript_dispatcher.invalidate_all()
         detector_dispatcher.invalidate_all()
         audio_dispatcher.abort()
-        self._asr_transcript_dispatcher = TranscriptDispatcher(
-            self._dispatch_asr_transcript_envelope,
-        )
+        self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
         self._asr_detector_dispatcher = AsrDetectorDispatcher(
             self._dispatch_asr_detector_event,
             on_failure=self._handle_asr_detector_dispatcher_failure,
@@ -5280,7 +5310,12 @@ class IndependentAsrRuntime:
                 SpeechActivityEvent.SPEECH_RESUMED,
             }
         ):
-            lifecycle.mark_pending_turn_speech()
+            ingress_token = self._asr_current_ingress_token
+            if ingress_token is None or not self._ingress_token_matches(
+                ingress_token
+            ):
+                return False
+            lifecycle.mark_pending_turn_speech(ingress_token)
             if self._asr_pending_turn_onset_at is None:
                 self._asr_pending_turn_onset_at = detected_at
             return False
@@ -5325,7 +5360,7 @@ class IndependentAsrRuntime:
                     self._asr_warm_expiry_task = None
                 if state is VoiceLifecycleState.WARM_IDLE:
                     lifecycle.metrics.warm_hit_count += 1
-                lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+                lifecycle.open_turn(ingress_token)
                 state = lifecycle.snapshot.state
             if state is VoiceLifecycleState.PREWARMING:
                 if not await self._ensure_smart_turn_ready(lifecycle, epoch):
@@ -5992,10 +6027,23 @@ class IndependentAsrRuntime:
         text: str,
         epoch: int,
         provider: str,
+        *,
+        received_at: float | None = None,
+        admission_deadline: float | None = None,
     ) -> None:
-        final_deadline = (
-            time.monotonic() + _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS
-        )
+        # Compatibility for existing private test/integration callers. The
+        # production session callback always supplies the first-receipt pair;
+        # therefore an out-of-order final never regains this budget here.
+        if received_at is None and admission_deadline is None:
+            received_at = time.monotonic()
+            admission_deadline = (
+                received_at + _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS
+            )
+        if received_at is None or admission_deadline is None:
+            return
+        if admission_deadline < received_at:
+            return
+        final_deadline = admission_deadline
         if (
             type(key) is not ProviderUtteranceKey
             or epoch != self._asr_session_epoch
@@ -7609,9 +7657,7 @@ class IndependentAsrRuntime:
         transcript_dispatcher.invalidate_all()
         detector_dispatcher.invalidate_all()
         audio_dispatcher.abort()
-        self._asr_transcript_dispatcher = TranscriptDispatcher(
-            self._dispatch_asr_transcript_envelope,
-        )
+        self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
         self._asr_detector_dispatcher = AsrDetectorDispatcher(
             self._dispatch_asr_detector_event,
             on_failure=self._handle_asr_detector_dispatcher_failure,

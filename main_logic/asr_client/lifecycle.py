@@ -26,22 +26,11 @@ class VoiceTransportToken:
 class FinalKey:
     """Logical final identity; transport retries do not create a new turn."""
 
-    session_epoch: int
-    connection_id: str
-    lease_generation: int
-    route_generation: int
-    turn_id: int
+    turn_token: VoiceTurnToken
 
     @classmethod
     def from_turn(cls, token: VoiceTurnToken) -> "FinalKey":
-        ingress = token.ingress
-        return cls(
-            session_epoch=ingress.session_epoch,
-            connection_id=ingress.connection_id,
-            lease_generation=ingress.lease_generation,
-            route_generation=ingress.route_generation,
-            turn_id=token.turn_id,
-        )
+        return cls(turn_token=token)
 
 
 class VoiceRouteMode(Enum):
@@ -284,6 +273,7 @@ class VoiceInputLifecycleController:
         self._turn_sequence = 0
         self._turn_id = 0
         self._completed_turn_id = -1
+        self._current_turn_token: VoiceTurnToken | None = None
         self._pre_roll = AudioRingBuffer(
             capacity_ms=self.config.pre_roll_ms,
             sample_rate_hz=16_000,
@@ -295,6 +285,7 @@ class VoiceInputLifecycleController:
         )
         self._pending_turn_speech = False
         self._pending_turn_id: int | None = None
+        self._pending_turn_token: VoiceTurnToken | None = None
         self._pending_connect = AudioRingBuffer(
             capacity_ms=self.config.pending_audio_ms,
             sample_rate_hz=16_000,
@@ -336,6 +327,36 @@ class VoiceInputLifecycleController:
     def has_pending_turn(self) -> bool:
         return self._pending_turn_speech and self.pending_turn_bytes > 0
 
+    @property
+    def current_turn_token(self) -> VoiceTurnToken | None:
+        return self._current_turn_token
+
+    @property
+    def pending_turn_token(self) -> VoiceTurnToken | None:
+        return self._pending_turn_token
+
+    def bind_current_turn_token(
+        self,
+        ingress_token: VoiceIngressToken,
+    ) -> VoiceTurnToken:
+        """Bind the current lifecycle turn once to its complete ingress identity."""
+
+        if not isinstance(ingress_token, VoiceIngressToken):
+            raise TypeError("VOICE_TURN_INGRESS_TOKEN_INVALID")
+        current = self._current_turn_token
+        if current is None:
+            current = VoiceTurnToken(ingress=ingress_token, turn_id=self._turn_id)
+            self._current_turn_token = current
+        elif current.turn_id != self._turn_id or current.ingress != ingress_token:
+            raise RuntimeError("VOICE_TURN_TOKEN_ALREADY_BOUND")
+        return current
+
+    def open_turn(self, ingress_token: VoiceIngressToken) -> VoiceTurnToken:
+        """Allocate and bind one local candidate at speech onset."""
+
+        self.transition(VoiceLifecycleEvent.SOFT_WAKE)
+        return self.bind_current_turn_token(ingress_token)
+
     def open(self, *, route_mode: VoiceRouteMode) -> None:
         if self._state is not VoiceLifecycleState.OFF:
             raise RuntimeError("VOICE_LIFECYCLE_ALREADY_OPEN")
@@ -352,6 +373,7 @@ class VoiceInputLifecycleController:
         self._state = next_lifecycle_state(self._state, event)
         if event is VoiceLifecycleEvent.SOFT_WAKE:
             self._turn_id = self._allocate_turn_id()
+            self._current_turn_token = None
             self.metrics.wake_candidate_count += 1
             existing_pre_roll = self._pre_roll.drain()
             if existing_pre_roll:
@@ -359,6 +381,7 @@ class VoiceInputLifecycleController:
         elif event is VoiceLifecycleEvent.SPEECH_CONFIRMED:
             if self._turn_id <= self._completed_turn_id:
                 self._turn_id = self._allocate_turn_id()
+                self._current_turn_token = None
             self.metrics.wake_confirmed_count += 1
             if self._pre_roll.peek():
                 self._pending_connect.append(self._pre_roll.drain())
@@ -370,18 +393,21 @@ class VoiceInputLifecycleController:
             self._pre_roll_sent_for_turn = False
             self._pre_roll.clear()
         elif event is VoiceLifecycleEvent.PREWARM_EXPIRED:
+            self._current_turn_token = None
             self._pre_roll_sent_for_turn = False
             self._pre_roll.clear()
             self._pending_connect.clear()
             self._active_start_audio = b""
         elif event is VoiceLifecycleEvent.GAME_TAKEOVER:
             self._turn_id = self._allocate_turn_id()
+            self._current_turn_token = None
             self._completed_turn_id = self._turn_id
             self._pre_roll_sent_for_turn = False
             self._pre_roll.clear()
             self._pending_turn.clear()
             self._pending_turn_speech = False
             self._pending_turn_id = None
+            self._pending_turn_token = None
             self._pending_connect.clear()
             self._active_start_audio = b""
         return self._state
@@ -419,6 +445,7 @@ class VoiceInputLifecycleController:
                 self._pending_turn.clear()
                 self._pending_turn_speech = False
                 self._pending_turn_id = None
+                self._pending_turn_token = None
                 self.metrics.add_suppressed_audio(duration_ms)
                 return AudioDecision(
                     AudioDisposition.BLOCK,
@@ -487,14 +514,36 @@ class VoiceInputLifecycleController:
             self.metrics.stale_callback_count += 1
         return matches
 
-    def mark_pending_turn_speech(self) -> None:
+    def mark_pending_turn_speech(
+        self,
+        ingress_token: VoiceIngressToken | None = None,
+    ) -> VoiceTurnToken | None:
         """Mark confirmed next-turn speech while the previous turn drains."""
 
         if self._state is not VoiceLifecycleState.DRAINING:
             raise RuntimeError("VOICE_PENDING_TURN_REQUIRES_DRAINING")
         if not self._pending_turn_speech:
             self._pending_turn_id = self._allocate_turn_id()
+            if ingress_token is not None:
+                self._pending_turn_token = VoiceTurnToken(
+                    ingress=ingress_token,
+                    turn_id=self._pending_turn_id,
+                )
+        elif (
+            ingress_token is not None
+            and self._pending_turn_token is not None
+            and self._pending_turn_token.ingress != ingress_token
+        ):
+            raise RuntimeError("VOICE_PENDING_TURN_TOKEN_ALREADY_BOUND")
+        elif ingress_token is not None and self._pending_turn_token is None:
+            if self._pending_turn_id is None:
+                raise RuntimeError("VOICE_PENDING_TURN_ID_MISSING")
+            self._pending_turn_token = VoiceTurnToken(
+                ingress=ingress_token,
+                turn_id=self._pending_turn_id,
+            )
         self._pending_turn_speech = True
+        return self._pending_turn_token
 
     def begin_pending_turn(self) -> bytes:
         """Activate and drain the pending turn after the prior final."""
@@ -506,9 +555,14 @@ class VoiceInputLifecycleController:
         payload = self._pending_turn.drain()
         self._pending_turn_speech = False
         pending_turn_id, self._pending_turn_id = self._pending_turn_id, None
+        pending_turn_token, self._pending_turn_token = (
+            self._pending_turn_token,
+            None,
+        )
         if pending_turn_id is None:
             raise RuntimeError("VOICE_PENDING_TURN_ID_MISSING")
         self._turn_id = pending_turn_id
+        self._current_turn_token = pending_turn_token
         self.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
         self._pre_roll_sent_for_turn = True
         return payload
@@ -519,6 +573,7 @@ class VoiceInputLifecycleController:
         self._pending_turn.clear()
         self._pending_turn_speech = False
         self._pending_turn_id = None
+        self._pending_turn_token = None
 
     def discard_unconfirmed_pending_audio(self) -> None:
         """Discard post-seal audio that never became confirmed speech."""
@@ -550,11 +605,13 @@ class VoiceInputLifecycleController:
         self._route_generation += 1
         self._transport_generation += 1
         self._turn_id = self._allocate_turn_id()
+        self._current_turn_token = None
         self._pre_roll_sent_for_turn = False
         self._pre_roll.clear()
         self._pending_turn.clear()
         self._pending_turn_speech = False
         self._pending_turn_id = None
+        self._pending_turn_token = None
         self._pending_connect.clear()
         self._active_start_audio = b""
 
@@ -573,6 +630,7 @@ class VoiceInputLifecycleController:
         """Invalidate buffered PCM and turn identity after input suppression."""
 
         self._turn_id = self._allocate_turn_id()
+        self._current_turn_token = None
         self._completed_turn_id = self._turn_id
         self._pre_roll_sent_for_turn = False
         self._pre_roll.clear()
@@ -580,6 +638,7 @@ class VoiceInputLifecycleController:
         self._pending_turn.clear()
         self._pending_turn_speech = False
         self._pending_turn_id = None
+        self._pending_turn_token = None
         self._active_start_audio = b""
         if self._state not in {
             VoiceLifecycleState.OFF,

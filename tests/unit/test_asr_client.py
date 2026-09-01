@@ -2420,7 +2420,13 @@ async def test_stale_prepare_unwind_only_releases_old_reservation(raises) -> Non
 
     new_dispatcher = TranscriptDispatcher(runtime._dispatch_asr_transcript_envelope)
     runtime._asr_transcript_dispatcher = new_dispatcher
-    new_final_key = replace(old_final_key, turn_id=old_final_key.turn_id + 1)
+    new_final_key = replace(
+        old_final_key,
+        turn_token=replace(
+            old_final_key.turn_token,
+            turn_id=old_final_key.turn_token.turn_id + 1,
+        ),
+    )
     runtime._asr_reserved_final_key = new_final_key
     runtime._asr_turn_prepared = True
     release_prepare.set()

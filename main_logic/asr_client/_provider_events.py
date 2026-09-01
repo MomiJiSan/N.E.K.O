@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
@@ -31,6 +32,32 @@ class ProviderUtteranceKey:
             or self.utterance_id < 1
         ):
             raise ValueError("ASR_PROVIDER_ENDPOINT_KEY_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderFinalNotification:
+    """One logical Provider final with its first-receipt admission budget."""
+
+    key: ProviderUtteranceKey | None
+    text: str
+    received_at: float
+    admission_deadline: float
+
+    def __post_init__(self) -> None:
+        if self.key is not None and not isinstance(self.key, ProviderUtteranceKey):
+            raise TypeError("ASR_PROVIDER_FINAL_KEY_INVALID")
+        if not isinstance(self.text, str):
+            raise TypeError("ASR_PROVIDER_FINAL_TEXT_INVALID")
+        if (
+            isinstance(self.received_at, bool)
+            or not isinstance(self.received_at, (int, float))
+            or isinstance(self.admission_deadline, bool)
+            or not isinstance(self.admission_deadline, (int, float))
+            or not math.isfinite(float(self.received_at))
+            or not math.isfinite(float(self.admission_deadline))
+            or self.admission_deadline < self.received_at
+        ):
+            raise ValueError("ASR_PROVIDER_FINAL_DEADLINE_INVALID")
 
 
 @dataclass(frozen=True, slots=True)

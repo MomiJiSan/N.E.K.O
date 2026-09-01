@@ -10,9 +10,11 @@ from main_logic.asr_client.lifecycle import (
     VoiceIngressToken,
     VoiceTurnToken,
 )
+from main_logic.asr_client.admission.contracts import AdmissionDisposition
 from main_logic.asr_client.transcript import (
     TranscriptDispatcher,
     TranscriptEnvelope,
+    TranscriptTerminalSettlement,
 )
 
 
@@ -67,7 +69,7 @@ async def test_dispatcher_reserves_capacity_and_serializes_delivery() -> None:
 
     assert dispatcher.try_reserve(first.final_key) is True
     assert dispatcher.try_reserve(second.final_key) is True
-    assert dispatcher.try_reserve(FinalKey(1, "socket", 2, 3, 3)) is False
+    assert dispatcher.try_reserve(_envelope(3).final_key) is False
     dispatcher.submit(first)
     dispatcher.submit(second)
     await asyncio.sleep(0)
@@ -128,6 +130,13 @@ async def test_old_worker_unwind_cannot_clear_new_active_dispatch() -> None:
     assert dispatcher.try_reserve(new_envelope.final_key) is True
     dispatcher.submit(new_envelope)
     await asyncio.wait_for(old_cancelled.wait(), 1)
+    await asyncio.sleep(0)
+    assert new_started.is_set() is False
+    assert dispatcher._active is old_envelope
+
+    release_old.set()
+    assert old_worker is not None
+    await asyncio.wait_for(old_worker, 1)
     await asyncio.wait_for(new_started.wait(), 1)
     assert dispatcher._active is new_envelope
 
@@ -136,9 +145,6 @@ async def test_old_worker_unwind_cannot_clear_new_active_dispatch() -> None:
     assert wait_idle.done() is False
     assert dispatcher.try_reserve(third_envelope.final_key) is False
 
-    release_old.set()
-    assert old_worker is not None
-    await asyncio.wait_for(old_worker, 1)
     assert dispatcher._active is new_envelope
     assert wait_idle.done() is False
 
@@ -176,7 +182,14 @@ async def test_invalidate_all_from_inside_dispatch_does_not_cancel_its_caller() 
     cleanup and the frontend "session ended" notification never happen.
     """
     steps: list[str] = []
+    settlements: list[TranscriptTerminalSettlement] = []
     captured: dict[str, asyncio.Task] = {}
+
+    async def settle_terminal(
+        settlement: TranscriptTerminalSettlement,
+    ) -> None:
+        steps.append("settlement")
+        settlements.append(settlement)
 
     async def dispatch(_envelope: TranscriptEnvelope) -> None:
         steps.append("start")
@@ -188,7 +201,11 @@ async def test_invalidate_all_from_inside_dispatch_does_not_cancel_its_caller() 
         await asyncio.sleep(0)
         steps.append("cleanup-done")
 
-    dispatcher = TranscriptDispatcher(dispatch)
+    dispatcher = TranscriptDispatcher(
+        dispatch,
+        settle_terminal=settle_terminal,
+        require_terminal_settlement=True,
+    )
     envelope = _envelope(1)
     assert dispatcher.try_reserve(envelope.final_key) is True
     dispatcher.submit(envelope)
@@ -198,7 +215,20 @@ async def test_invalidate_all_from_inside_dispatch_does_not_cancel_its_caller() 
             break
         await asyncio.sleep(0.01)
 
-    assert steps == ["start", "after-await", "cleanup-done"]
+    await asyncio.wait_for(dispatcher.wait_idle(), 1)
+    assert steps == [
+        "start",
+        "after-await",
+        "cleanup-done",
+        "settlement",
+    ]
+    assert len(settlements) == 1
+    assert settlements[0].final_key == envelope.final_key
+    assert (
+        settlements[0].admission_disposition
+        is AdmissionDisposition.FORWARD
+    )
+    assert settlements[0].cleanup_kind == "invalidate_forward"
 
     # 跑完手头这条之后必须**退出**：再回去 await queue.get() 就成了和新 worker
     # 并存的僵尸，两个消费者抢同一个队列。
@@ -209,6 +239,115 @@ async def test_invalidate_all_from_inside_dispatch_does_not_cancel_its_caller() 
         await asyncio.sleep(0.01)
     assert worker.done(), "the self-invalidated worker must exit after its envelope"
     assert not worker.cancelled()
+
+
+async def test_resolve_reserved_is_exactly_once_for_forward_drop_and_abandon() -> None:
+    delivered: list[TranscriptEnvelope] = []
+    settlements: list[TranscriptTerminalSettlement] = []
+
+    async def dispatch(envelope: TranscriptEnvelope) -> None:
+        delivered.append(envelope)
+
+    async def settle(settlement: TranscriptTerminalSettlement) -> None:
+        settlements.append(settlement)
+
+    dispatcher = TranscriptDispatcher(
+        dispatch,
+        settle_terminal=settle,
+        require_terminal_settlement=True,
+    )
+    forward = _envelope(1)
+    dropped = _envelope(2)
+    abandoned = _envelope(3)
+    for envelope in (forward, dropped, abandoned):
+        assert dispatcher.try_reserve(envelope.final_key) is True
+
+    assert dispatcher.resolve_reserved(
+        forward.final_key,
+        AdmissionDisposition.FORWARD,
+        envelope=forward,
+    ) is True
+    assert dispatcher.resolve_reserved(
+        forward.final_key,
+        AdmissionDisposition.DROP,
+    ) is False
+    assert dispatcher.resolve_reserved(
+        dropped.final_key,
+        AdmissionDisposition.DROP,
+    ) is True
+    assert dispatcher.resolve_reserved(
+        abandoned.final_key,
+        AdmissionDisposition.ABANDON,
+    ) is True
+
+    await asyncio.wait_for(dispatcher.wait_idle(), 1)
+    assert delivered == [forward]
+    assert [item.cleanup_kind for item in settlements] == ["drop", "abandon"]
+    for envelope in (forward, dropped, abandoned):
+        assert dispatcher.try_reserve(envelope.final_key) is False
+
+
+async def test_out_of_order_resolution_does_not_tombstone_lower_reserved_key() -> None:
+    dispatcher = TranscriptDispatcher(AsyncMock(), capacity=2)
+    first = _envelope(1)
+    second = _envelope(2)
+    assert dispatcher.try_reserve(first.final_key) is True
+    assert dispatcher.try_reserve(second.final_key) is True
+
+    dispatcher.submit(second)
+    assert first.final_key in dispatcher._reservations
+    dispatcher.submit(first)
+    await asyncio.wait_for(dispatcher.wait_idle(), 1)
+
+
+async def test_invalidate_preserves_active_queued_terminal_and_reservation_settlement() -> None:
+    active_started = asyncio.Event()
+    active_cancelled = asyncio.Event()
+    settlements: list[TranscriptTerminalSettlement] = []
+
+    async def dispatch(_envelope: TranscriptEnvelope) -> None:
+        active_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active_cancelled.set()
+
+    async def settle(settlement: TranscriptTerminalSettlement) -> None:
+        settlements.append(settlement)
+
+    dispatcher = TranscriptDispatcher(
+        dispatch,
+        capacity=3,
+        settle_terminal=settle,
+        require_terminal_settlement=True,
+    )
+    active = _envelope(1)
+    dropped = _envelope(2)
+    unresolved = _envelope(3)
+    for envelope in (active, dropped, unresolved):
+        assert dispatcher.try_reserve(envelope.final_key) is True
+    dispatcher.submit(active)
+    await asyncio.wait_for(active_started.wait(), 1)
+    assert dispatcher.resolve_reserved(
+        dropped.final_key,
+        AdmissionDisposition.DROP,
+    ) is True
+
+    dispatcher.invalidate_all()
+    await asyncio.wait_for(active_cancelled.wait(), 1)
+    await asyncio.wait_for(dispatcher.wait_idle(), 1)
+
+    by_key = {item.final_key: item for item in settlements}
+    assert len(settlements) == 3
+    assert by_key[active.final_key].admission_disposition is AdmissionDisposition.FORWARD
+    assert by_key[active.final_key].cleanup_kind == "invalidate_forward"
+    assert by_key[dropped.final_key].admission_disposition is AdmissionDisposition.DROP
+    assert by_key[dropped.final_key].cleanup_kind == "drop"
+    assert (
+        by_key[unresolved.final_key].admission_disposition
+        is AdmissionDisposition.ABANDON
+    )
+    assert by_key[unresolved.final_key].cleanup_kind == "abandon"
 
 
 async def test_invalidate_all_still_cancels_a_worker_from_outside() -> None:

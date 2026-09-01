@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from main_logic.asr_client.lifecycle import (
+    FinalKey,
+    VoiceIngressToken,
     VoiceLifecycleEvent,
     VoiceLifecycleState,
     VoiceRouteMode,
+    VoiceTurnToken,
 )
 from main_logic.asr_client.lifecycle import (
     AudioDisposition,
@@ -14,6 +17,10 @@ from main_logic.asr_client.provider_policy import resolve_provider_policy
 
 def _pcm(milliseconds: int) -> bytes:
     return b"\x01\x00" * (16_000 * milliseconds // 1_000)
+
+
+def _ingress(audio_generation: int) -> VoiceIngressToken:
+    return VoiceIngressToken(1, "socket", 2, 3, audio_generation)
 
 
 def test_shadow_mode_observes_suppression_without_dropping_independent_asr_audio() -> None:
@@ -77,7 +84,7 @@ def test_prewarm_expiry_returns_to_local_listen_and_clears_buffer() -> None:
         shadow_mode=False,
     )
     controller.open(route_mode=VoiceRouteMode.INDEPENDENT)
-    controller.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    controller.open_turn(_ingress(4))
     controller.accept_audio(_pcm(10), sample_rate_hz=16_000)
     assert controller.pending_connect_bytes == len(_pcm(10))
 
@@ -85,6 +92,7 @@ def test_prewarm_expiry_returns_to_local_listen_and_clears_buffer() -> None:
 
     assert controller.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
     assert controller.pending_connect_bytes == 0
+    assert controller.current_turn_token is None
 
 
 def test_blocked_route_consumes_audio_without_buffer_or_forward() -> None:
@@ -122,6 +130,14 @@ def test_turn_identity_is_allocated_when_speech_starts_not_when_final_arrives() 
     assert controller.matches(identity) is False
 
 
+def test_final_key_wraps_complete_turn_token_including_audio_generation() -> None:
+    first = VoiceTurnToken(_ingress(4), turn_id=1)
+    second = VoiceTurnToken(_ingress(5), turn_id=1)
+
+    assert FinalKey.from_turn(first).turn_token is first
+    assert FinalKey.from_turn(first) != FinalKey.from_turn(second)
+
+
 def test_draining_audio_is_isolated_for_the_next_turn_until_old_final() -> None:
     controller = VoiceInputLifecycleController(
         provider_policy=resolve_provider_policy("qwen", "manual"),
@@ -147,6 +163,28 @@ def test_draining_audio_is_isolated_for_the_next_turn_until_old_final() -> None:
     assert controller.identity.turn_id == old_turn + 1
     assert pending == _pcm(400)
     assert controller.pending_turn_bytes == 0
+
+
+def test_pending_turn_token_keeps_ingress_captured_at_mark_time() -> None:
+    controller = VoiceInputLifecycleController(
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        shadow_mode=False,
+    )
+    controller.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    first = controller.open_turn(_ingress(4))
+    controller.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    controller.transition(VoiceLifecycleEvent.TURN_SEALED)
+    controller.accept_audio(_pcm(400), sample_rate_hz=16_000)
+
+    pending = controller.mark_pending_turn_speech(_ingress(5))
+    assert pending is not None
+    controller.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
+    payload = controller.begin_pending_turn()
+
+    assert payload == _pcm(400)
+    assert controller.current_turn_token is pending
+    assert controller.current_turn_token.ingress == _ingress(5)
+    assert controller.current_turn_token.turn_id > first.turn_id
 
 
 def test_pending_turn_overflow_discards_entire_candidate() -> None:
@@ -219,7 +257,7 @@ def test_game_takeover_suspends_active_turn_and_clears_audio() -> None:
     )
     controller.open(route_mode=VoiceRouteMode.INDEPENDENT)
     controller.accept_audio(_pcm(100), sample_rate_hz=16_000)
-    controller.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    controller.open_turn(_ingress(4))
     controller.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
     old_identity = controller.identity
 
@@ -230,6 +268,7 @@ def test_game_takeover_suspends_active_turn_and_clears_audio() -> None:
     assert controller.pre_roll_bytes == 0
     assert blocked.disposition is AudioDisposition.BLOCK
     assert controller.matches(old_identity) is False
+    assert controller.current_turn_token is None
 
     controller.transition(VoiceLifecycleEvent.GAME_RELEASED)
     assert controller.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN

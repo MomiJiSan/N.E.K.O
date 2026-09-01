@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
@@ -32,6 +33,7 @@ from ._provider_events import (
     ProviderAudioRange,
     ProviderBoundaryQuality,
     ProviderEndpointNotification,
+    ProviderFinalNotification,
     ProviderUtteranceKey,
 )
 from .provider_policy import AsrProviderPolicy
@@ -53,6 +55,7 @@ _RESPONSE_QUEUE_SIZE = 128
 _CALLBACK_QUEUE_SIZE = 64
 _MAX_PROVIDER_BOUNDARY_TASKS = 8
 _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS = 0.2
+_PROVIDER_FINAL_ADMISSION_TIMEOUT_SECONDS = 0.2
 
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 _OMNI_ONLY_FIELDS = frozenset(
@@ -283,6 +286,9 @@ ProviderEndpointCallback: TypeAlias = Callable[
 ProviderFinalCallback: TypeAlias = Callable[
     [ProviderUtteranceKey, str], Awaitable[None]
 ]
+ProviderFinalNotificationCallback: TypeAlias = Callable[
+    [ProviderFinalNotification], Awaitable[None]
+]
 
 
 class _VoiceTurnAdapterProtocol(Protocol):
@@ -326,6 +332,13 @@ class _SessionState(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingFinal:
+    text: str
+    received_at: float
+    admission_deadline: float
+
+
+@dataclass(frozen=True, slots=True)
 class _CallbackItem:
     text: str
     generation: int
@@ -339,6 +352,8 @@ class _CallbackItem:
     # earlier turn's final that is still queued for delivery.
     kind: Literal["transcript", "endpoint", "partial"] = "transcript"
     provider_endpoint: ProviderEndpointNotification | None = None
+    final_received_at: float | None = None
+    final_admission_deadline: float | None = None
 
 
 class _RealtimeAsrSessionImpl:
@@ -356,6 +371,7 @@ class _RealtimeAsrSessionImpl:
         on_turn_endpointed: Callable[[], Awaitable[None]] | None = None,
         on_provider_endpoint: ProviderEndpointCallback | None = None,
         on_provider_final: ProviderFinalCallback | None = None,
+        on_provider_final_ready: ProviderFinalNotificationCallback | None = None,
         voice_turn_factory: VoiceTurnFactory | None = None,
         provider_policy: AsrProviderPolicy | None = None,
     ) -> None:
@@ -377,6 +393,12 @@ class _RealtimeAsrSessionImpl:
             raise TypeError(
                 "ASR_INVALID_CONFIG: provider final callback must be callable"
             )
+        if on_provider_final_ready is not None and not callable(
+            on_provider_final_ready
+        ):
+            raise TypeError(
+                "ASR_INVALID_CONFIG: provider final-ready callback must be callable"
+            )
 
         self._worker_fn = worker_fn
         self._api_key = api_key
@@ -387,6 +409,7 @@ class _RealtimeAsrSessionImpl:
         self._on_turn_endpointed = on_turn_endpointed
         self._on_provider_endpoint = on_provider_endpoint
         self._on_provider_final = on_provider_final
+        self._on_provider_final_ready = on_provider_final_ready
         self._voice_turn_factory = voice_turn_factory
         self._provider_policy = provider_policy
         self._voice_turn_adapter: _VoiceTurnAdapterProtocol | None = None
@@ -404,7 +427,7 @@ class _RealtimeAsrSessionImpl:
         self._committed_utterance_keys: set[_UtteranceKey] = set()
         self._endpointed_turn_keys: set[_UtteranceKey] = set()
         self._utterance_order: deque[_UtteranceKey] = deque()
-        self._pending_finals: dict[_UtteranceKey, str] = {}
+        self._pending_finals: dict[_UtteranceKey, _PendingFinal] = {}
         # Latest preview text per turn that is NOT the current ordered turn;
         # coalesced (one entry per key) and flushed by
         # _drain_ready_partials_locked when the turn becomes current.
@@ -1145,8 +1168,8 @@ class _RealtimeAsrSessionImpl:
         self._segment_aggregator.complete_turn(completed_turn_id)
         ready_texts = self._collect_ready_segmented_transcripts_locked()
         ready_items: list[_CallbackItem] = [
-            _CallbackItem(
-                text=ready_text,
+            self._logical_final_callback_item(
+                ready_text,
                 generation=self._generation,
                 buffer_epoch=self._buffer_epoch,
             )
@@ -1187,6 +1210,26 @@ class _RealtimeAsrSessionImpl:
                 except ValueError:
                     pass
         return [transcript.text for transcript in ready_transcripts]
+
+    @staticmethod
+    def _logical_final_callback_item(
+        text: str,
+        *,
+        generation: int,
+        buffer_epoch: int,
+    ) -> _CallbackItem:
+        """Stamp one complete logical transcript at its first ready instant."""
+
+        received_at = time.monotonic()
+        return _CallbackItem(
+            text=text,
+            generation=generation,
+            buffer_epoch=buffer_epoch,
+            final_received_at=received_at,
+            final_admission_deadline=(
+                received_at + _PROVIDER_FINAL_ADMISSION_TIMEOUT_SECONDS
+            ),
+        )
 
     def _drain_ready_partials_locked(self) -> list[_CallbackItem]:
         """Flush queued previews whose turn became current; drop stale ones.
@@ -1390,7 +1433,7 @@ class _RealtimeAsrSessionImpl:
             if deadline is None:
                 await callback(notification)
             else:
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
                 callback_task = asyncio.create_task(
@@ -1487,7 +1530,7 @@ class _RealtimeAsrSessionImpl:
 
         predecessor = self._provider_boundary_chain_tail
         deadline = (
-            asyncio.get_running_loop().time()
+            time.monotonic()
             + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
         )
 
@@ -1552,6 +1595,8 @@ class _RealtimeAsrSessionImpl:
     async def _wait_provider_boundary_callback(
         self,
         key: _UtteranceKey,
+        *,
+        not_after: float | None = None,
     ) -> bool:
         task = self._provider_boundary_tasks.pop(key, None)
         deadline = self._provider_boundary_deadlines.pop(key, None)
@@ -1559,7 +1604,9 @@ class _RealtimeAsrSessionImpl:
             return False
         if deadline is None:
             return False
-        remaining = deadline - asyncio.get_running_loop().time()
+        if not_after is not None:
+            deadline = min(deadline, not_after)
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             self._revoke_provider_boundary_chain()
             return False
@@ -1653,11 +1700,12 @@ class _RealtimeAsrSessionImpl:
                             if item.utterance_id is not None:
                                 boundary_ready = (
                                     await self._wait_provider_boundary_callback(
-                                    (
-                                        item.generation,
-                                        item.buffer_epoch,
-                                        item.utterance_id,
-                                    )
+                                        (
+                                            item.generation,
+                                            item.buffer_epoch,
+                                            item.utterance_id,
+                                        ),
+                                        not_after=item.final_admission_deadline,
                                     )
                                 )
                             if (
@@ -1681,10 +1729,12 @@ class _RealtimeAsrSessionImpl:
                                             phase="ordered",
                                         )
                                     )
-                                ordered_deadline = (
-                                    asyncio.get_running_loop().time()
-                                    + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
-                                )
+                                ordered_deadline = item.final_admission_deadline
+                                if ordered_deadline is None:
+                                    ordered_deadline = (
+                                        time.monotonic()
+                                        + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
+                                    )
                                 await self._emit_provider_boundary(
                                     ordered_endpoint,
                                     deadline=ordered_deadline,
@@ -1700,8 +1750,34 @@ class _RealtimeAsrSessionImpl:
                         if partial_callback is not None:
                             await partial_callback(item.text)
                     else:
+                        provider_final_ready_callback = (
+                            self._on_provider_final_ready
+                        )
                         provider_final_callback = self._on_provider_final
                         if (
+                            provider_final_ready_callback is not None
+                            and item.final_received_at is not None
+                            and item.final_admission_deadline is not None
+                        ):
+                            await provider_final_ready_callback(
+                                ProviderFinalNotification(
+                                    key=(
+                                        ProviderUtteranceKey(
+                                            generation=item.generation,
+                                            buffer_epoch=item.buffer_epoch,
+                                            utterance_id=item.utterance_id,
+                                        )
+                                        if item.utterance_id is not None
+                                        else None
+                                    ),
+                                    text=item.text,
+                                    received_at=item.final_received_at,
+                                    admission_deadline=(
+                                        item.final_admission_deadline
+                                    ),
+                                )
+                            )
+                        elif (
                             provider_final_callback is not None
                             and item.utterance_id is not None
                         ):
@@ -1892,21 +1968,33 @@ class _RealtimeAsrSessionImpl:
                         return False
                     ready_texts = self._collect_ready_segmented_transcripts_locked()
                     ready_items = [
-                        _CallbackItem(
-                            text=ready_text,
+                        self._logical_final_callback_item(
+                            ready_text,
                             generation=event.generation,
                             buffer_epoch=event.buffer_epoch,
                         )
                         for ready_text in ready_texts
                     ]
                 else:
-                    self._pending_finals[key] = text
+                    # Capture the absolute admission budget at the first
+                    # valid Provider-final receipt. Out-of-order finals retain
+                    # this timestamp while waiting behind earlier keys.
+                    received_at = time.monotonic()
+                    self._pending_finals[key] = _PendingFinal(
+                        text=text,
+                        received_at=received_at,
+                        admission_deadline=(
+                            received_at
+                            + _PROVIDER_FINAL_ADMISSION_TIMEOUT_SECONDS
+                        ),
+                    )
                     ready_items = []
                     while (
                         self._utterance_order
                         and self._utterance_order[0] in self._pending_finals
                     ):
                         ready_key = self._utterance_order.popleft()
+                        pending_final = self._pending_finals.pop(ready_key)
                         if (
                             self._config.endpointing_mode == "provider"
                             and ready_key not in self._endpointed_turn_keys
@@ -1935,16 +2023,26 @@ class _RealtimeAsrSessionImpl:
                                         utterance_id=ready_key[2],
                                         kind="endpoint",
                                         provider_endpoint=ordered_endpoint,
+                                        final_received_at=(
+                                            pending_final.received_at
+                                        ),
+                                        final_admission_deadline=(
+                                            pending_final.admission_deadline
+                                        ),
                                     )
                                 )
                             else:
                                 self._provider_endpoints.pop(ready_key, None)
                         ready_items.append(
                             _CallbackItem(
-                                text=self._pending_finals.pop(ready_key),
+                                text=pending_final.text,
                                 generation=ready_key[0],
                                 buffer_epoch=ready_key[1],
                                 utterance_id=ready_key[2],
+                                final_received_at=pending_final.received_at,
+                                final_admission_deadline=(
+                                    pending_final.admission_deadline
+                                ),
                             )
                         )
                         self._active_utterance_keys.discard(ready_key)

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -17,6 +18,7 @@ from main_logic.asr_client._infra import (
 from main_logic.asr_client._provider_events import (
     ProviderAudioRange,
     ProviderEndpointNotification,
+    ProviderFinalNotification,
     ProviderUtteranceKey,
 )
 from main_logic.asr_client.endpointing.detector import (
@@ -49,6 +51,15 @@ from main_logic.voice_turn.contracts import (
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_public_turn_endpointed_callback_remains_keyless() -> None:
+    parameter = inspect.signature(create_asr_session).parameters[
+        "on_turn_endpointed"
+    ]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert "Callable[[], Awaitable[None]]" in str(parameter.annotation)
 
 
 class _FakeVoiceTurnAdapter:
@@ -516,6 +527,159 @@ async def test_segmented_forced_splits_wait_for_logical_turn_completion():
     await asyncio.wait_for(_wait_until(lambda: bool(callbacks)), 1)
     assert endpointed == ["sealed"]
     assert callbacks == ["part-1 part-2"]
+    await session.close()
+
+
+async def test_segmented_transcript_first_deadline_starts_at_logical_completion():
+    adapter = None
+    notifications: list[ProviderFinalNotification] = []
+
+    async def worker(request_queue, response_queue, api_key, config):
+        del api_key, config
+        await response_queue.put(_AsrWorkerEvent(kind="ready", generation=0))
+        while True:
+            request = await request_queue.get()
+            try:
+                if request.kind == "commit":
+                    await response_queue.put(
+                        _AsrWorkerEvent(
+                            kind="final",
+                            generation=request.generation,
+                            buffer_epoch=request.buffer_epoch,
+                            utterance_id=request.utterance_id,
+                            text="physical-final",
+                        )
+                    )
+                if request.kind == "shutdown":
+                    await response_queue.put(
+                        _AsrWorkerEvent(kind="closed", generation=request.generation)
+                    )
+                    return
+            finally:
+                request_queue.task_done()
+
+    def factory(on_commit):
+        nonlocal adapter
+        adapter = _FakeVoiceTurnAdapter(on_commit)
+        return adapter
+
+    async def on_ready(notification: ProviderFinalNotification) -> None:
+        notifications.append(notification)
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=worker,
+        api_key="",
+        config=AsrSessionConfig(),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_final_ready=on_ready,
+        voice_turn_factory=factory,
+        provider_policy=AsrProviderPolicy(
+            transport="segmented",
+            endpoint_authority="smart_turn",
+            smart_turn_required=True,
+            max_segment_ms=10,
+            warm_transport_ms=0,
+            replay_policy="none",
+        ),
+    )
+    await session.connect()
+    assert adapter is not None
+    await session.stream_audio(b"\x01\x00" * 160)
+    assert session._request_queue is not None
+    await asyncio.wait_for(session._request_queue.join(), 1)
+    assert session._response_queue is not None
+    await asyncio.wait_for(session._response_queue.join(), 1)
+    assert notifications == []
+
+    logical_ready_not_before = infra_module.time.monotonic()
+    await adapter.on_commit(0, 0, 1)
+    await asyncio.wait_for(_wait_until(lambda: bool(notifications)), 1)
+
+    notification = notifications[0]
+    assert notification.key is None
+    assert notification.text == "physical-final"
+    assert notification.received_at >= logical_ready_not_before
+    assert notification.admission_deadline - notification.received_at == pytest.approx(
+        0.2
+    )
+    await session.close()
+
+
+async def test_segmented_completion_first_deadline_starts_when_transcript_arrives():
+    adapter = None
+    commit_seen = asyncio.Event()
+    release_final = asyncio.Event()
+    notifications: list[ProviderFinalNotification] = []
+
+    async def worker(request_queue, response_queue, api_key, config):
+        del api_key, config
+        await response_queue.put(_AsrWorkerEvent(kind="ready", generation=0))
+        while True:
+            request = await request_queue.get()
+            try:
+                if request.kind == "commit":
+                    commit_seen.set()
+                    await release_final.wait()
+                    await response_queue.put(
+                        _AsrWorkerEvent(
+                            kind="final",
+                            generation=request.generation,
+                            buffer_epoch=request.buffer_epoch,
+                            utterance_id=request.utterance_id,
+                            text="physical-final",
+                        )
+                    )
+                if request.kind == "shutdown":
+                    await response_queue.put(
+                        _AsrWorkerEvent(kind="closed", generation=request.generation)
+                    )
+                    return
+            finally:
+                request_queue.task_done()
+
+    def factory(on_commit):
+        nonlocal adapter
+        adapter = _FakeVoiceTurnAdapter(on_commit)
+        return adapter
+
+    async def on_ready(notification: ProviderFinalNotification) -> None:
+        notifications.append(notification)
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=worker,
+        api_key="",
+        config=AsrSessionConfig(),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_final_ready=on_ready,
+        voice_turn_factory=factory,
+        provider_policy=AsrProviderPolicy(
+            transport="segmented",
+            endpoint_authority="smart_turn",
+            smart_turn_required=True,
+            max_segment_ms=10,
+            warm_transport_ms=0,
+            replay_policy="none",
+        ),
+    )
+    await session.connect()
+    assert adapter is not None
+    await session.stream_audio(b"\x01\x00" * 160)
+    await asyncio.wait_for(commit_seen.wait(), 1)
+    await adapter.on_commit(0, 0, 1)
+    assert notifications == []
+
+    transcript_ready_not_before = infra_module.time.monotonic()
+    release_final.set()
+    await asyncio.wait_for(_wait_until(lambda: bool(notifications)), 1)
+
+    notification = notifications[0]
+    assert notification.key is None
+    assert notification.received_at >= transcript_ready_not_before
+    assert notification.admission_deadline - notification.received_at == pytest.approx(
+        0.2
+    )
     await session.close()
 
 
@@ -1215,6 +1379,97 @@ async def test_provider_rich_callbacks_carry_exact_key_without_legacy_duplicates
     await session.close()
 
 
+async def test_provider_final_deadline_is_captured_at_receipt_before_fifo_wait():
+    notifications: list[ProviderFinalNotification] = []
+
+    async def on_ready(notification: ProviderFinalNotification) -> None:
+        notifications.append(notification)
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_final_ready=on_ready,
+    )
+    await session.connect()
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0}
+    for utterance_id in (10, 11):
+        await session._response_queue.put(
+            _AsrWorkerEvent(
+                kind="utterance_started",
+                utterance_id=utterance_id,
+                **common,
+            )
+        )
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="final",
+            utterance_id=11,
+            text="second",
+            **common,
+        )
+    )
+    await asyncio.wait_for(session._response_queue.join(), 1)
+    pending_second = session._pending_finals[(0, 0, 11)]
+
+    await asyncio.sleep(0.02)
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="final",
+            utterance_id=10,
+            text="first",
+            **common,
+        )
+    )
+    await _drain_session_pipelines(session)
+
+    assert [item.key for item in notifications] == [
+        ProviderUtteranceKey(0, 0, 10),
+        ProviderUtteranceKey(0, 0, 11),
+    ]
+    assert notifications[1].received_at == pending_second.received_at
+    assert (
+        notifications[1].admission_deadline
+        == pending_second.admission_deadline
+    )
+    await session.close()
+
+
+async def test_legacy_two_argument_provider_final_callback_still_receives_final():
+    received: list[tuple[ProviderUtteranceKey, str]] = []
+
+    async def on_provider_final(
+        key: ProviderUtteranceKey,
+        text: str,
+    ) -> None:
+        received.append((key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="utterance_started", **common)
+    )
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="final", text="hello", **common)
+    )
+    await _drain_session_pipelines(session)
+
+    assert received == [(ProviderUtteranceKey(0, 0, 10), "hello")]
+    await session.close()
+
+
 async def test_provider_boundary_callback_never_blocks_response_consumer():
     events: list[tuple] = []
     boundary_started = asyncio.Event()
@@ -1406,11 +1661,13 @@ async def test_provider_boundary_timeout_downgrades_and_delivers_final():
 
     await asyncio.wait_for(boundary_started.wait(), 1)
     await asyncio.wait_for(cancellation_seen.wait(), 1)
-    await asyncio.wait_for(_wait_until(lambda: len(events) == 2), 1)
-    assert events == [
-        ("endpoint", "ordered", key, "unknown"),
-        ("final", key, "hello"),
-    ]
+    await asyncio.wait_for(
+        _wait_until(lambda: events[-1:] == [("final", key, "hello")]),
+        1,
+    )
+    # The boundary callback consumed the final's absolute budget. Optional
+    # ordered speaker authority is skipped, while the transcript still flows.
+    assert events == [("final", key, "hello")]
 
     release_cancelled_boundary.set()
     await session.close()
