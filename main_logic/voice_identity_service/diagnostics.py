@@ -55,6 +55,7 @@ VOICE_IDENTITY_DIAGNOSTIC_COUNTERS = frozenset(
         "speaker_gate_arm_active_authority_count",
         "speaker_gate_arm_draining_authority_count",
         "speaker_gate_arm_unexpected_state_count",
+        "speaker_gate_arm_pending_count",
         "provider_candidate_bind_missing_identity_count",
         "provider_candidate_bind_missing_candidate_count",
         "provider_candidate_bind_identity_rejected_count",

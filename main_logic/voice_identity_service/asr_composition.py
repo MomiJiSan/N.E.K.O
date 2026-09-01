@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import threading
 
@@ -162,27 +161,15 @@ class OwnerVoiceAsrCompositionFactory:
                 if stale_same_key:
                     self._resolve_candidates((observation.candidate,))
                 try:
-                    armed = await runtime._arm_speaker_candidate_decision(
+                    armed = runtime.request_speaker_candidate_decision_arm(
                         observation.candidate,
                         activation_generation=generation,
                     )
-                except asyncio.CancelledError:
-                    self._resolve_candidates((observation.candidate,))
-                    raise
                 except Exception:
                     self._resolve_candidates((observation.candidate,))
                     return
                 if not armed:
                     return
-                try:
-                    exact_gate_is_armed = (
-                        runtime._speaker_candidate_decision_is_armed(
-                            observation.candidate,
-                            activation_generation=generation,
-                        )
-                    )
-                except Exception:
-                    exact_gate_is_armed = False
                 evicted_candidates: tuple[SpeakerShadowCandidateKey, ...] = ()
                 with self._lock:
                     keep_armed = bool(
@@ -192,7 +179,6 @@ class OwnerVoiceAsrCompositionFactory:
                         and not runtime._speaker_verifier_degraded
                         and observation.candidate
                         not in self._terminal_candidates
-                        and exact_gate_is_armed
                     )
                     if keep_armed:
                         self._armed_candidates[observation.candidate] = True

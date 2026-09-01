@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import main_logic.asr_client._infra as infra_module
+
 from main_logic.asr_client import create_asr_session
 from main_logic.asr_client._infra import (
     AsrSessionConfig,
@@ -1465,6 +1467,76 @@ async def test_provider_boundary_callback_failure_downgrades_ordered_exact():
         ("endpoint", "ordered", key, "unknown"),
         ("final", key, "still delivered"),
     ]
+    await session.close()
+
+
+async def test_ordered_provider_callback_deadline_retires_late_task_and_final_flows(
+    monkeypatch,
+):
+    """The ordered callback has its own hard budget and cannot hold final FIFO."""
+
+    monkeypatch.setattr(
+        infra_module,
+        "_PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS",
+        0.01,
+    )
+    events: list[tuple] = []
+    ordered_started = asyncio.Event()
+    ordered_cancelled = asyncio.Event()
+    release_cancelled_ordered = asyncio.Event()
+
+    async def on_provider_endpoint(
+        notification: ProviderEndpointNotification,
+    ) -> None:
+        if notification.phase == "ordered":
+            ordered_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                ordered_cancelled.set()
+                await release_cancelled_ordered.wait()
+                return
+        events.append(("endpoint", notification.phase, notification.key))
+
+    async def on_provider_final(key: ProviderUtteranceKey, text: str) -> None:
+        events.append(("final", key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_provider_endpoint,
+        on_provider_final=on_provider_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    key = ProviderUtteranceKey(0, 0, 10)
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", **common),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(0, 500),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="still-forwarded", **common),
+    ):
+        await session._response_queue.put(event)
+
+    await asyncio.wait_for(ordered_started.wait(), 1)
+    await asyncio.wait_for(ordered_cancelled.wait(), 1)
+    await asyncio.wait_for(
+        _wait_until(lambda: events[-1:] == [("final", key, "still-forwarded")]),
+        1,
+    )
+
+    assert events == [("endpoint", "boundary", key), ("final", key, "still-forwarded")]
+    assert session._provider_boundary_retired_tasks
+    release_cancelled_ordered.set()
     await session.close()
 
 

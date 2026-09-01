@@ -414,11 +414,12 @@ class _RealtimeAsrSessionImpl:
             _UtteranceKey,
             asyncio.Task[bool],
         ] = {}
+        self._provider_boundary_deadlines: dict[_UtteranceKey, float] = {}
         self._provider_boundary_chain_namespace: tuple[int, int] | None = None
         self._provider_boundary_failed_namespace: tuple[int, int] | None = None
         self._provider_boundary_chain_tail: asyncio.Task[bool] | None = None
         self._provider_boundary_chain_tasks: set[asyncio.Task[bool]] = set()
-        self._provider_boundary_retired_tasks: set[asyncio.Task[bool]] = set()
+        self._provider_boundary_retired_tasks: set[asyncio.Task[Any]] = set()
         self._logical_turn_id = 1
         self._physical_segment_audio_bytes = 0
         self._provider_wire_audio_bytes = 0
@@ -1378,13 +1379,35 @@ class _RealtimeAsrSessionImpl:
     async def _emit_provider_boundary(
         self,
         notification: ProviderEndpointNotification,
+        *,
+        deadline: float | None = None,
     ) -> bool:
         callback = self._on_provider_endpoint
         if callback is None:
             return True
+        callback_task: asyncio.Task[None] | None = None
         try:
-            await callback(notification)
+            if deadline is None:
+                await callback(notification)
+            else:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                callback_task = asyncio.create_task(
+                    callback(notification),
+                    name="asr-provider-boundary-settlement",
+                )
+                done, _ = await asyncio.wait(
+                    {callback_task},
+                    timeout=remaining,
+                )
+                if callback_task not in done:
+                    self._retire_provider_boundary_task(callback_task)
+                    return False
+                await callback_task
         except asyncio.CancelledError:
+            if callback_task is not None and not callback_task.done():
+                self._retire_provider_boundary_task(callback_task)
             raise
         except Exception:
             logger.exception("ASR provider boundary callback failed")
@@ -1463,6 +1486,10 @@ class _RealtimeAsrSessionImpl:
             return
 
         predecessor = self._provider_boundary_chain_tail
+        deadline = (
+            asyncio.get_running_loop().time()
+            + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
+        )
 
         async def emit_after_predecessor() -> bool:
             if predecessor is not None:
@@ -1472,13 +1499,17 @@ class _RealtimeAsrSessionImpl:
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         raise
-            return await self._emit_provider_boundary(notification)
+            return await self._emit_provider_boundary(
+                notification,
+                deadline=deadline,
+            )
 
         task = asyncio.create_task(
             emit_after_predecessor(),
             name="asr-provider-boundary-callback",
         )
         self._provider_boundary_tasks[key] = task
+        self._provider_boundary_deadlines[key] = deadline
         self._provider_boundary_chain_tail = task
         self._provider_boundary_chain_tasks.add(task)
         self._track_provider_boundary_chain_task(task)
@@ -1511,6 +1542,7 @@ class _RealtimeAsrSessionImpl:
                 )
         tasks = tuple(self._provider_boundary_chain_tasks)
         self._provider_boundary_tasks.clear()
+        self._provider_boundary_deadlines.clear()
         self._provider_boundary_chain_tasks.clear()
         self._provider_boundary_chain_tail = None
         self._provider_boundary_chain_namespace = None
@@ -1522,12 +1554,19 @@ class _RealtimeAsrSessionImpl:
         key: _UtteranceKey,
     ) -> bool:
         task = self._provider_boundary_tasks.pop(key, None)
+        deadline = self._provider_boundary_deadlines.pop(key, None)
         if task is None:
+            return False
+        if deadline is None:
+            return False
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            self._revoke_provider_boundary_chain()
             return False
         try:
             return await asyncio.wait_for(
                 asyncio.shield(task),
-                timeout=_PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS,
+                timeout=remaining,
             )
         except asyncio.TimeoutError:
             self._revoke_provider_boundary_chain()
@@ -1542,7 +1581,7 @@ class _RealtimeAsrSessionImpl:
 
     def _retire_provider_boundary_task(
         self,
-        task: asyncio.Task[bool],
+        task: asyncio.Task[Any],
     ) -> None:
         """Cancel optional speaker control without blocking transcript delivery."""
 
@@ -1555,7 +1594,7 @@ class _RealtimeAsrSessionImpl:
         task.cancel()
         self._provider_boundary_retired_tasks.add(task)
 
-        def reap(done: asyncio.Task[bool]) -> None:
+        def reap(done: asyncio.Task[Any]) -> None:
             self._provider_boundary_retired_tasks.discard(done)
             try:
                 done.exception()
@@ -1577,6 +1616,7 @@ class _RealtimeAsrSessionImpl:
             if task is not current and not task.done()
         })
         self._provider_boundary_tasks.clear()
+        self._provider_boundary_deadlines.clear()
         self._provider_boundary_chain_tasks.clear()
         self._provider_boundary_chain_tail = None
         self._provider_boundary_chain_namespace = None
@@ -1587,10 +1627,12 @@ class _RealtimeAsrSessionImpl:
             # Well-behaved callbacks observe cancellation immediately. A
             # third-party callback may suppress CancelledError; it must not
             # hold clear/close or the ordered transcript FIFO indefinitely.
-            await asyncio.wait(
+            _done, pending = await asyncio.wait(
                 tasks,
                 timeout=_PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS,
             )
+            for task in pending:
+                task.cancel()
 
     async def _dispatch_callbacks(self) -> None:
         assert self._callback_queue is not None
@@ -1639,7 +1681,14 @@ class _RealtimeAsrSessionImpl:
                                             phase="ordered",
                                         )
                                     )
-                                await provider_callback(ordered_endpoint)
+                                ordered_deadline = (
+                                    asyncio.get_running_loop().time()
+                                    + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
+                                )
+                                await self._emit_provider_boundary(
+                                    ordered_endpoint,
+                                    deadline=ordered_deadline,
+                                )
                         else:
                             endpoint_callback = self._on_turn_endpointed
                             if endpoint_callback is not None:
@@ -2220,6 +2269,7 @@ class _RealtimeAsrSessionImpl:
             }
         )
         self._provider_boundary_tasks.clear()
+        self._provider_boundary_deadlines.clear()
         self._provider_boundary_chain_tasks.clear()
         self._provider_boundary_retired_tasks.clear()
         self._provider_boundary_chain_tail = None

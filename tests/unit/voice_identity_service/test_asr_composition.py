@@ -107,7 +107,7 @@ def _install_gate_spies(
     armed: list[tuple[SpeakerShadowCandidateKey, str]] = []
     resolved: list[tuple[SpeakerShadowCandidateKey, str, bool]] = []
 
-    async def arm(
+    def request_arm(
         candidate: SpeakerShadowCandidateKey,
         *,
         activation_generation: str,
@@ -136,8 +136,8 @@ def _install_gate_spies(
 
     monkeypatch.setattr(
         runtime,
-        "_arm_speaker_candidate_decision",
-        arm,
+        "request_speaker_candidate_decision_arm",
+        request_arm,
         raising=False,
     )
     monkeypatch.setattr(
@@ -194,7 +194,7 @@ async def test_composition_uses_two_checkpoints_and_enforces_only_in_enforce_mod
     candidate = SpeakerShadowCandidateKey(3, 9, "provider_candidate")
 
     assert shadow._config.minimum_audio_ms == 1_500
-    assert shadow._config.maximum_audio_ms == 3_000
+    assert shadow._config.maximum_audio_ms == 4_000
     assert shadow._config.observation_checkpoints_ms == (1_500, 3_000)
     assert shadow._config.completion_confirmation_scopes == (
         ("provider_candidate",) if enforce else ()
@@ -592,15 +592,19 @@ async def test_completion_fences_observation_returning_from_late_arm(
         )
     )
     await asyncio.wait_for(arm_entered.wait(), 1)
+    # The observation callback owns no long-running arm await.
+    await asyncio.wait_for(observation_task, 1)
     await shadow._on_completion(
         _completion(late_candidate, last_checkpoint_ms=1_500)
     )
     arm_release.set()
-    await asyncio.wait_for(observation_task, 1)
+    operation = runtime._asr_speaker_candidate_arm_operation
+    if operation is not None:
+        await asyncio.wait_for(operation.resolved, 1)
 
     assert late_candidate not in factory._armed_candidates
     assert late_candidate in factory._terminal_candidates
-    assert resolved == [late_candidate, late_candidate]
+    assert resolved == [late_candidate]
     await shadow.close()
     factory.close()
     profile.close()
@@ -649,6 +653,7 @@ async def test_arm_post_await_revalidates_factory_boundaries(
         )
     )
     await asyncio.wait_for(arm_entered.wait(), 1)
+    await asyncio.wait_for(observation_task, 1)
 
     if boundary == "activation":
         runtime._speaker_verifier_activation_generation = "activation-replacement"
@@ -657,7 +662,13 @@ async def test_arm_post_await_revalidates_factory_boundaries(
     else:
         factory.close()
     arm_release.set()
-    await asyncio.wait_for(observation_task, 1)
+    operation = runtime._asr_speaker_candidate_arm_operation
+    if operation is not None:
+        await asyncio.wait_for(operation.resolved, 1)
+    if boundary == "activation":
+        await shadow._on_observation(
+            _observation(candidate, checkpoint_ms=3_000, similarity=0.20)
+        )
 
     assert candidate not in factory._armed_candidates
     assert resolved == [candidate]
