@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
 SPEAKER_SHADOW_SAMPLE_RATE_HZ = 16_000
@@ -53,6 +54,22 @@ SpeakerShadowReconciliationStatus = Literal[
     "failed",
     "stale",
 ]
+
+
+class SpeakerShadowCaptureDisposition(StrEnum):
+    """Whether ordered capture progressed, completed, or became unusable."""
+
+    ACCEPTED = "accepted"
+    COMPLETE = "complete"
+    UNAVAILABLE = "unavailable"
+
+
+class SpeakerShadowCaptureDecisionState(StrEnum):
+    """Non-sensitive lifecycle of the candidate's score decision."""
+
+    PENDING = "pending"
+    SCORED = "scored"
+    UNAVAILABLE = "unavailable"
 
 
 class SpeakerShadowBackend(Protocol):
@@ -156,6 +173,125 @@ class SpeakerShadowBatchReconcileReceipt:
     target_sample_count: int
     suffix_sample_count: int
     _owner: object
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowCaptureResult:
+    """Detailed capture result exposed only through an optional capability.
+
+    The result deliberately contains neither a score nor candidate identity.
+    ``accepted_sample_count`` describes this call, while
+    ``cumulative_sample_count`` describes all PCM admitted for the candidate.
+    ``completed_window_sample_count`` is the exact longest scoring window that
+    is complete or was scored; it never claims that the whole Provider range
+    remains buffered.
+    """
+
+    disposition: SpeakerShadowCaptureDisposition
+    accepted_sample_count: int
+    cumulative_sample_count: int
+    completed_window_sample_count: int
+    decision_state: SpeakerShadowCaptureDecisionState
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.disposition, SpeakerShadowCaptureDisposition)
+            or not isinstance(self.decision_state, SpeakerShadowCaptureDecisionState)
+            or type(self.accepted_sample_count) is not int
+            or type(self.cumulative_sample_count) is not int
+            or type(self.completed_window_sample_count) is not int
+            or self.accepted_sample_count < 0
+            or self.cumulative_sample_count < 0
+            or self.completed_window_sample_count < 0
+            or self.accepted_sample_count > self.cumulative_sample_count
+        ):
+            raise ValueError("speaker-shadow capture result is invalid")
+        if (self.decision_state is SpeakerShadowCaptureDecisionState.UNAVAILABLE) != (
+            self.disposition is SpeakerShadowCaptureDisposition.UNAVAILABLE
+        ):
+            raise ValueError(
+                "speaker-shadow capture unavailable decision and disposition "
+                "must be reported together"
+            )
+        if (
+            self.disposition is SpeakerShadowCaptureDisposition.ACCEPTED
+            and self.decision_state is not SpeakerShadowCaptureDecisionState.PENDING
+        ) or (
+            self.disposition is SpeakerShadowCaptureDisposition.COMPLETE
+            and self.decision_state
+            not in {
+                SpeakerShadowCaptureDecisionState.PENDING,
+                SpeakerShadowCaptureDecisionState.SCORED,
+            }
+        ):
+            raise ValueError("speaker-shadow capture state combination is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowTerminalCoverageRequest:
+    """Exact Provider coverage proposed for one finalized scored candidate.
+
+    Unlike batch reconciliation, this request never asks the runtime to
+    reconstruct the target PCM.  The first source must be ``target`` and its
+    retained scoring window must begin at sample zero and remain wholly inside
+    the kept exact Provider range. ``provider_exact_*`` and
+    ``scored_window_*`` are both half-open offsets in canonical 16 kHz samples
+    relative to the target candidate's evidence origin; the runtime requires
+    both starts to be exactly zero, so a length-preserving prefix trim cannot
+    pass. Later live sources may be retired, and a final-source remainder may
+    be assigned to a fresh deferred ``suffix``.
+    """
+
+    sources: tuple[SpeakerShadowReconcileSource, ...]
+    target: SpeakerShadowCandidateKey
+    provider_exact_start_sample: int
+    provider_exact_end_sample: int
+    scored_window_start_sample: int
+    scored_window_end_sample: int
+    suffix: SpeakerShadowCandidateKey | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.sources) is not tuple
+            or not self.sources
+            or not all(
+                isinstance(source, SpeakerShadowReconcileSource)
+                for source in self.sources
+            )
+            or not isinstance(self.target, SpeakerShadowCandidateKey)
+            or type(self.provider_exact_start_sample) is not int
+            or type(self.provider_exact_end_sample) is not int
+            or type(self.scored_window_start_sample) is not int
+            or type(self.scored_window_end_sample) is not int
+            or self.provider_exact_start_sample < 0
+            or self.provider_exact_end_sample <= self.provider_exact_start_sample
+            or self.scored_window_start_sample < 0
+            or self.scored_window_end_sample <= self.scored_window_start_sample
+            or (
+                self.suffix is not None
+                and not isinstance(self.suffix, SpeakerShadowCandidateKey)
+            )
+        ):
+            raise ValueError("speaker-shadow terminal coverage request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowTerminalCoverageReceipt:
+    """Opaque receipt for a strictly fenced finalized-verdict reservation."""
+
+    runtime_generation: int
+    batch_id: int
+    target: SpeakerShadowCandidateKey
+    suffix: SpeakerShadowCandidateKey | None
+    retained_sample_count: int
+    covered_sample_count: int
+    terminal_preserved: bool
+    _owner: object
+
+
+SpeakerShadowReconciliationReceipt = (
+    SpeakerShadowBatchReconcileReceipt | SpeakerShadowTerminalCoverageReceipt
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +640,19 @@ class SpeakerShadowObserver(Protocol):
 
 
 @runtime_checkable
+class SpeakerShadowCaptureStatus(Protocol):
+    """Optional single-submit capability with completion-aware disposition."""
+
+    def submit_capture(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> SpeakerShadowCaptureResult: ...
+
+
+@runtime_checkable
 class SpeakerShadowDeferredCandidateStatus(Protocol):
     """Optional read-only capability query for deferred candidate buffering."""
 
@@ -562,6 +711,38 @@ class SpeakerShadowBatchReconciliationControl(Protocol):
         self,
         receipt: SpeakerShadowBatchReconcileReceipt,
     ) -> None: ...
+
+
+@runtime_checkable
+class SpeakerShadowTerminalCoverageControl(Protocol):
+    """Optional exact coverage for an already-finalized scored candidate."""
+
+    def reconcile_finalized_candidate_coverage(
+        self,
+        request: SpeakerShadowTerminalCoverageRequest,
+    ) -> SpeakerShadowTerminalCoverageReceipt | None: ...
+
+    def terminal_coverage_status(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> SpeakerShadowReconciliationStatus: ...
+
+    def revoke_terminal_coverage(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> None: ...
+
+
+@runtime_checkable
+class SpeakerShadowReconciliationSettlement(Protocol):
+    """Event-driven wait using an absolute ``time.monotonic()`` deadline."""
+
+    async def wait_reconciliation_settled(
+        self,
+        receipt: SpeakerShadowReconciliationReceipt,
+        *,
+        deadline: float,
+    ) -> SpeakerShadowReconciliationStatus: ...
 
 
 @runtime_checkable

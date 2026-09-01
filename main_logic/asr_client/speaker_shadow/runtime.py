@@ -9,7 +9,7 @@ import multiprocessing
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -26,14 +26,20 @@ from .contracts import (
     SpeakerShadowBatchReconcileReceipt,
     SpeakerShadowBatchReconcileRequest,
     SpeakerShadowCandidateKey,
+    SpeakerShadowCaptureDecisionState,
+    SpeakerShadowCaptureDisposition,
+    SpeakerShadowCaptureResult,
     SpeakerShadowConfig,
     SpeakerShadowCompletion,
     SpeakerShadowMetrics,
     SpeakerShadowObservation,
     SpeakerShadowReconcileSource,
+    SpeakerShadowReconciliationReceipt,
     SpeakerShadowReconciliationStatus,
     SpeakerShadowScope,
     SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+    SpeakerShadowTerminalCoverageReceipt,
+    SpeakerShadowTerminalCoverageRequest,
     SpeakerShadowTerminalReason,
 )
 
@@ -451,6 +457,20 @@ class _CandidateBatchReconciliation:
     receipt: SpeakerShadowBatchReconcileReceipt
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateTerminalCoverage:
+    generation: int
+    batch_id: int
+    sources: tuple[SpeakerShadowReconcileSource, ...]
+    reserved_sources: tuple[_ReservedReconcileSource, ...]
+    target: SpeakerShadowCandidateKey
+    target_token: _CandidateToken
+    suffix: SpeakerShadowCandidateKey | None
+    suffix_token: _CandidateToken | None
+    suffix_sample_count: int
+    receipt: SpeakerShadowTerminalCoverageReceipt
+
+
 @dataclass(slots=True)
 class _CandidateToken:
     candidate: SpeakerShadowCandidateKey
@@ -459,6 +479,7 @@ class _CandidateToken:
     terminal_reason: SpeakerShadowTerminalReason | None = None
     finish_state: _FinishState = _FinishState.OPEN
     last_checkpoint_ms: int | None = None
+    scored_sample_count: int = 0
     last_delivered_checkpoint_ms: int | None = None
     completion_state: _CompletionState = _CompletionState.NONE
     deferred_requested: bool = False
@@ -473,6 +494,14 @@ class _CandidateToken:
 class _ReconciliationRecord:
     marker: _CandidateBatchReconciliation
     state: Literal["pending", "applied", "failed"] = "pending"
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(slots=True)
+class _TerminalCoverageRecord:
+    marker: _CandidateTerminalCoverage
+    state: Literal["pending", "applied", "failed"] = "pending"
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(slots=True)
@@ -517,6 +546,7 @@ _QueueItem = (
     | _CandidateActivated
     | _CandidatePrefixReconciliation
     | _CandidateBatchReconciliation
+    | _CandidateTerminalCoverage
     | _CandidateFinished
     | object
 )
@@ -585,8 +615,12 @@ class SpeakerShadowRuntime:
             SpeakerShadowCandidateKey, _CandidateToken
         ] = OrderedDict()
         self._reconciliation_owner = object()
+        self._terminal_coverage_owner = object()
         self._next_reconciliation_batch_id = 1
         self._reconciliations: OrderedDict[int, _ReconciliationRecord] = OrderedDict()
+        self._terminal_coverages: OrderedDict[int, _TerminalCoverageRecord] = (
+            OrderedDict()
+        )
         self._worker_task: asyncio.Task[None] | None = None
         self._completion_dispatcher_task: asyncio.Task[None] | None = None
         self._completion_dispatch_in_progress = False
@@ -1071,6 +1105,253 @@ class SpeakerShadowRuntime:
             return "stale"
         return record.state
 
+    def reconcile_finalized_candidate_coverage(
+        self,
+        request: SpeakerShadowTerminalCoverageRequest,
+    ) -> SpeakerShadowTerminalCoverageReceipt | None:
+        """Reserve exact coverage without reconstructing finalized target PCM."""
+
+        if (
+            self._resetting
+            or not self.enabled
+            or type(request) is not SpeakerShadowTerminalCoverageRequest
+        ):
+            return None
+        sources = request.sources
+        target = request.target
+        suffix = request.suffix
+        if (
+            target.scope not in self._config.pending_observation_gate_scopes
+            or sources[0].candidate != target
+            or request.provider_exact_start_sample != 0
+            or request.scored_window_start_sample != 0
+            or request.provider_exact_end_sample <= request.provider_exact_start_sample
+            or request.scored_window_end_sample <= request.scored_window_start_sample
+            or request.provider_exact_end_sample < request.scored_window_end_sample
+            or any(
+                source.candidate.scope != target.scope
+                or source.candidate.detector_epoch != target.detector_epoch
+                for source in sources
+            )
+            or (
+                suffix is not None
+                and (
+                    suffix.scope != target.scope
+                    or suffix.detector_epoch != target.detector_epoch
+                )
+            )
+        ):
+            return None
+        source_candidates = tuple(source.candidate for source in sources)
+        if len(set(source_candidates)) != len(source_candidates):
+            return None
+
+        # The exact Provider interval is expressed from the finalized target's
+        # evidence origin. Every later source is contiguous and fully covered,
+        # except that the last source may leave a suffix after the boundary.
+        if sources[0].keep_start_sample != 0:
+            return None
+        for index, source in enumerate(sources):
+            if index > 0 and source.keep_start_sample != 0:
+                return None
+            if index < len(sources) - 1 and (
+                source.keep_end_sample != source.expected_sample_count
+            ):
+                return None
+        covered_sample_count = sum(
+            source.keep_end_sample - source.keep_start_sample for source in sources
+        )
+        if (
+            request.provider_exact_end_sample - request.provider_exact_start_sample
+            != covered_sample_count
+        ):
+            return None
+
+        finalized = self._finalized.get(target)
+        target_token = finalized.token if finalized is not None else None
+        if (
+            finalized is None
+            or finalized.terminal_reason != "scored"
+            or target_token is None
+            or target_token.terminal_reason != "scored"
+            or target_token.scored_sample_count <= 0
+            or request.scored_window_end_sample != target_token.scored_sample_count
+            or sources[0].keep_end_sample < target_token.scored_sample_count
+            or self._candidate_was_evicted(target, token=target_token)
+        ):
+            return None
+
+        last_source = sources[-1]
+        suffix_sample_count = (
+            last_source.expected_sample_count - last_source.keep_end_sample
+        )
+        if (suffix_sample_count > 0) != (suffix is not None):
+            return None
+        if suffix is not None and suffix in {*source_candidates, target}:
+            return None
+        if suffix is not None and (
+            suffix in self._candidate_tokens
+            or suffix in self._buffers
+            or suffix in self._finalized
+            or self._candidate_was_evicted(suffix)
+        ):
+            return None
+
+        reserved_sources: list[_ReservedReconcileSource] = []
+        for source in sources[1:]:
+            token = self._candidate_tokens.get(source.candidate)
+            if (
+                token is None
+                or token.terminal_reason is not None
+                or token.finish_state is not _FinishState.OPEN
+                or token.pcm_frozen
+                or token.reconciliation_batch_id is not None
+                or source.candidate in self._finalized
+                or self._candidate_was_evicted(source.candidate, token=token)
+                or token.sample_rate_hz != SPEAKER_SHADOW_SAMPLE_RATE_HZ
+                or token.accepted_sample_count != source.expected_sample_count
+            ):
+                return None
+            reserved_sources.append(_ReservedReconcileSource(source, token))
+
+        suffix_from_live_source = bool(
+            suffix is not None and last_source.candidate != target
+        )
+        suffix_token = (
+            _CandidateToken(
+                suffix,
+                SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                accepted_sample_count=(
+                    suffix_sample_count if suffix_from_live_source else 0
+                ),
+                deferred_requested=True,
+                scoring_deferred=True,
+            )
+            if suffix is not None
+            else None
+        )
+        new_candidate_count = int(suffix is not None)
+        if (
+            len(self._candidate_tokens) + new_candidate_count
+            > self._config.buffered_candidate_capacity
+        ):
+            return None
+        while len(self._terminal_coverages) >= self._config.buffered_candidate_capacity:
+            oldest_id, oldest = next(iter(self._terminal_coverages.items()))
+            if oldest.state == "pending":
+                return None
+            self._terminal_coverages.pop(oldest_id, None)
+
+        batch_id = self._next_reconciliation_batch_id
+        receipt = SpeakerShadowTerminalCoverageReceipt(
+            runtime_generation=self._generation,
+            batch_id=batch_id,
+            target=target,
+            suffix=suffix,
+            retained_sample_count=target_token.scored_sample_count,
+            covered_sample_count=covered_sample_count,
+            terminal_preserved=True,
+            _owner=self._terminal_coverage_owner,
+        )
+        marker = _CandidateTerminalCoverage(
+            generation=self._generation,
+            batch_id=batch_id,
+            sources=sources,
+            reserved_sources=tuple(reserved_sources),
+            target=target,
+            target_token=target_token,
+            suffix=suffix,
+            suffix_token=suffix_token,
+            suffix_sample_count=suffix_sample_count,
+            receipt=receipt,
+        )
+        if not self._admit_batch_item(marker):
+            return None
+
+        self._next_reconciliation_batch_id += 1
+        for reserved in reserved_sources:
+            reserved.token.pcm_frozen = True
+            reserved.token.reconciliation_batch_id = batch_id
+        if suffix is not None and suffix_token is not None:
+            suffix_token.reconciliation_batch_id = batch_id
+            self._candidate_tokens[suffix] = suffix_token
+            self._candidate_tokens.move_to_end(suffix)
+        self._terminal_coverages[batch_id] = _TerminalCoverageRecord(marker)
+        self._metrics.terminal_queued_count += 1
+        self._metrics.reconciliation_batch_admitted_count += 1
+        return receipt
+
+    def terminal_coverage_status(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> SpeakerShadowReconciliationStatus:
+        if (
+            type(receipt) is not SpeakerShadowTerminalCoverageReceipt
+            or receipt._owner is not self._terminal_coverage_owner
+            or receipt.runtime_generation != self._generation
+        ):
+            return "stale"
+        record = self._terminal_coverages.get(receipt.batch_id)
+        if record is None or record.marker.receipt is not receipt:
+            return "stale"
+        return record.state
+
+    async def wait_reconciliation_settled(
+        self,
+        receipt: SpeakerShadowReconciliationReceipt,
+        *,
+        deadline: float,
+    ) -> SpeakerShadowReconciliationStatus:
+        """Wait on one owned receipt event until its monotonic deadline."""
+
+        if type(deadline) not in {int, float} or not math.isfinite(deadline):
+            return "stale"
+        record: _ReconciliationRecord | _TerminalCoverageRecord | None
+        if type(receipt) is SpeakerShadowBatchReconcileReceipt:
+            if (
+                receipt._owner is not self._reconciliation_owner
+                or receipt.runtime_generation != self._generation
+            ):
+                return "stale"
+            record = self._reconciliations.get(receipt.batch_id)
+        elif type(receipt) is SpeakerShadowTerminalCoverageReceipt:
+            if (
+                receipt._owner is not self._terminal_coverage_owner
+                or receipt.runtime_generation != self._generation
+            ):
+                return "stale"
+            record = self._terminal_coverages.get(receipt.batch_id)
+        else:
+            return "stale"
+        if record is None or record.marker.receipt is not receipt:
+            return "stale"
+        if record.state == "pending":
+            remaining = float(deadline) - time.monotonic()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(record.settled.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+        if receipt.runtime_generation != self._generation:
+            return "stale"
+        if type(receipt) is SpeakerShadowBatchReconcileReceipt:
+            current = self._reconciliations.get(receipt.batch_id)
+        else:
+            current = self._terminal_coverages.get(receipt.batch_id)
+        if current is not record or current.marker.receipt is not receipt:
+            return "stale"
+        return record.state
+
+    def revoke_terminal_coverage(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> None:
+        if self.terminal_coverage_status(receipt) == "stale":
+            return
+        record = self._terminal_coverages.get(receipt.batch_id)
+        if record is not None:
+            self._revoke_terminal_coverage_record(record.marker)
+
     def revoke_reconciliation(
         self,
         receipt: SpeakerShadowBatchReconcileReceipt,
@@ -1089,11 +1370,7 @@ class SpeakerShadowRuntime:
         """Revoke one owned batch exactly once, including reset/close drains."""
 
         record = self._reconciliations.get(marker.batch_id)
-        if (
-            record is None
-            or record.marker is not marker
-            or record.state == "failed"
-        ):
+        if record is None or record.marker is not marker or record.state == "failed":
             return
         self._metrics.reconciliation_batch_revoked_count += 1
         self._fail_candidate_batch_reconciliation(marker)
@@ -1103,6 +1380,20 @@ class SpeakerShadowRuntime:
 
         for record in tuple(self._reconciliations.values()):
             self._revoke_candidate_batch_reconciliation(record.marker)
+
+    def _revoke_terminal_coverage_record(
+        self,
+        marker: _CandidateTerminalCoverage,
+    ) -> None:
+        record = self._terminal_coverages.get(marker.batch_id)
+        if record is None or record.marker is not marker or record.state == "failed":
+            return
+        self._metrics.reconciliation_batch_revoked_count += 1
+        self._fail_terminal_coverage(marker)
+
+    def _revoke_all_terminal_coverages(self) -> None:
+        for record in tuple(self._terminal_coverages.values()):
+            self._revoke_terminal_coverage_record(record.marker)
 
     def _evaluated_through_samples(
         self,
@@ -1246,17 +1537,35 @@ class SpeakerShadowRuntime:
         sample_rate_hz: int,
         candidate: SpeakerShadowCandidateKey,
     ) -> bool:
-        """Queue immutable PCM accepted by the current candidate fence."""
+        """Queue PCM while preserving the original boolean observer contract."""
+
+        return (
+            self.submit_capture(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+                candidate=candidate,
+            ).accepted_sample_count
+            > 0
+        )
+
+    def submit_capture(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> SpeakerShadowCaptureResult:
+        """Submit once and report normal completion separately from data loss."""
 
         if self._resetting or not self.enabled:
-            return False
+            return self._capture_result(candidate, unavailable=True)
         if not isinstance(candidate, SpeakerShadowCandidateKey):
-            return False
+            return self._capture_result(candidate, unavailable=True)
         if not isinstance(pcm16, bytes) or not pcm16 or len(pcm16) % 2:
-            return False
+            return self._capture_result(candidate, unavailable=True)
         if sample_rate_hz != SPEAKER_SHADOW_SAMPLE_RATE_HZ:
             self._metrics.dropped_frame_count += 1
-            return False
+            return self._capture_result(candidate, unavailable=True)
         if len(pcm16) > MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES:
             self._metrics.dropped_frame_count += 1
             self._metrics.dropped_audio_ms += self._audio_ms(
@@ -1264,17 +1573,19 @@ class SpeakerShadowRuntime:
                 SPEAKER_SHADOW_SAMPLE_RATE_HZ,
             )
             self._drop_candidate(candidate)
-            return False
+            return self._capture_result(candidate, unavailable=True)
 
         identity = (self._generation, candidate)
-        if (
-            candidate in self._finalized
-            or self._candidate_was_evicted(candidate)
-            or (
-                identity == self._active_evaluation and self._active_evaluation_terminal
+        finalized = self._finalized.get(candidate)
+        if finalized is not None:
+            return self._capture_result(
+                candidate,
+                unavailable=finalized.terminal_reason != "scored",
             )
-        ):
-            return False
+        if self._candidate_was_evicted(candidate):
+            return self._capture_result(candidate, unavailable=True)
+        if identity == self._active_evaluation and self._active_evaluation_terminal:
+            return self._capture_result(candidate)
 
         token = self._candidate_tokens.get(candidate)
         if token is not None and (
@@ -1287,9 +1598,13 @@ class SpeakerShadowRuntime:
                 sample_rate_hz,
             )
             self._drop_candidate(candidate, token=token)
-            return False
+            return self._capture_result(candidate, unavailable=True, token=token)
         if token is not None and token.pcm_frozen:
-            return False
+            return self._capture_result(
+                candidate,
+                unavailable=not self._capture_is_complete(token),
+                token=token,
+            )
         if token is None:
             token = _CandidateToken(candidate, sample_rate_hz)
         elif token.sample_rate_hz == 0 and token.deferred_requested:
@@ -1303,11 +1618,11 @@ class SpeakerShadowRuntime:
                 len(pcm16) // 2,
                 sample_rate_hz,
             )
-            return False
+            return self._capture_result(candidate, token=token)
         input_sample_count = len(pcm16) // 2
         sample_count = min(input_sample_count, remaining_samples)
         if sample_count <= 0:
-            return False
+            return self._capture_result(candidate, token=token)
         if sample_count < input_sample_count:
             self._metrics.dropped_audio_ms += self._audio_ms(
                 input_sample_count - sample_count,
@@ -1332,7 +1647,7 @@ class SpeakerShadowRuntime:
             )
             self._wipe_bytearray(bounded_pcm16)
             self._drop_candidate(candidate, token=token)
-            return False
+            return self._capture_result(candidate, unavailable=True, token=token)
         if not self._admit_data_item(frame):
             self._metrics.dropped_frame_count += 1
             self._metrics.dropped_audio_ms += self._audio_ms(
@@ -1340,14 +1655,106 @@ class SpeakerShadowRuntime:
             )
             self._wipe_bytearray(bounded_pcm16)
             self._drop_candidate(candidate, token=token)
-            return False
+            return self._capture_result(candidate, unavailable=True, token=token)
         self._queued_pcm_bytes += len(bounded_pcm16)
         token.accepted_sample_count = accepted_sample_count + sample_count
         self._candidate_tokens[candidate] = token
         self._candidate_tokens.move_to_end(candidate)
         self._metrics.submitted_frame_count += 1
         self._metrics.submitted_audio_ms += self._audio_ms(sample_count, sample_rate_hz)
-        return True
+        return self._capture_result(
+            candidate,
+            accepted_sample_count=sample_count,
+            token=token,
+        )
+
+    def _capture_result(
+        self,
+        candidate: object,
+        *,
+        accepted_sample_count: int = 0,
+        unavailable: bool = False,
+        token: _CandidateToken | None = None,
+    ) -> SpeakerShadowCaptureResult:
+        if not isinstance(candidate, SpeakerShadowCandidateKey):
+            token = None
+        elif token is None:
+            token = self._candidate_tokens.get(candidate)
+            finalized = self._finalized.get(candidate)
+            if token is None and finalized is not None:
+                token = finalized.token
+        cumulative_sample_count = (
+            token.accepted_sample_count if token is not None else 0
+        )
+        completed_window_sample_count = (
+            self._completed_scoring_window_samples(token) if token is not None else 0
+        )
+        terminal_reason = token.terminal_reason if token is not None else None
+        if isinstance(candidate, SpeakerShadowCandidateKey):
+            finalized = self._finalized.get(candidate)
+            if finalized is not None:
+                terminal_reason = finalized.terminal_reason
+        if unavailable or terminal_reason in {"failed", "dropped", "insufficient"}:
+            disposition = SpeakerShadowCaptureDisposition.UNAVAILABLE
+            decision_state = SpeakerShadowCaptureDecisionState.UNAVAILABLE
+        elif terminal_reason == "scored":
+            disposition = SpeakerShadowCaptureDisposition.COMPLETE
+            decision_state = SpeakerShadowCaptureDecisionState.SCORED
+        elif token is not None and self._capture_is_complete(token):
+            disposition = SpeakerShadowCaptureDisposition.COMPLETE
+            decision_state = SpeakerShadowCaptureDecisionState.PENDING
+        else:
+            disposition = SpeakerShadowCaptureDisposition.ACCEPTED
+            decision_state = SpeakerShadowCaptureDecisionState.PENDING
+        return SpeakerShadowCaptureResult(
+            disposition=disposition,
+            accepted_sample_count=accepted_sample_count,
+            cumulative_sample_count=cumulative_sample_count,
+            completed_window_sample_count=completed_window_sample_count,
+            decision_state=decision_state,
+        )
+
+    def _capture_is_complete(self, token: _CandidateToken) -> bool:
+        if token.terminal_reason == "scored":
+            return True
+        terminal_window_samples = self._terminal_scoring_window_samples()
+        maximum_samples = (
+            SPEAKER_SHADOW_SAMPLE_RATE_HZ * self._config.maximum_audio_ms // 1_000
+        )
+        return bool(
+            (
+                terminal_window_samples > 0
+                and token.accepted_sample_count >= terminal_window_samples
+            )
+            or token.accepted_sample_count >= maximum_samples
+            or (
+                self._active_evaluation == (self._generation, token.candidate)
+                and self._active_evaluation_terminal
+            )
+        )
+
+    def _terminal_scoring_window_samples(self) -> int:
+        checkpoints = self._config.observation_checkpoints_ms
+        if checkpoints is None:
+            return 0
+        return math.ceil(SPEAKER_SHADOW_SAMPLE_RATE_HZ * checkpoints[-1] / 1_000)
+
+    def _completed_scoring_window_samples(self, token: _CandidateToken) -> int:
+        if token.scored_sample_count > 0:
+            return token.scored_sample_count
+        checkpoints = self._config.observation_checkpoints_ms
+        if checkpoints is None:
+            return 0
+        completed_ms = max(
+            (
+                checkpoint
+                for checkpoint in checkpoints
+                if token.accepted_sample_count
+                >= math.ceil(SPEAKER_SHADOW_SAMPLE_RATE_HZ * checkpoint / 1_000)
+            ),
+            default=0,
+        )
+        return math.ceil(SPEAKER_SHADOW_SAMPLE_RATE_HZ * completed_ms / 1_000)
 
     def finish_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
         """Order the terminal boundary behind all previously accepted PCM."""
@@ -1401,7 +1808,10 @@ class SpeakerShadowRuntime:
         self._queued_data_item_count += 1
         return True
 
-    def _admit_batch_item(self, marker: _CandidateBatchReconciliation) -> bool:
+    def _admit_batch_item(
+        self,
+        marker: _CandidateBatchReconciliation | _CandidateTerminalCoverage,
+    ) -> bool:
         """Reserve one physical marker against data and terminal budgets."""
 
         if self._resetting or self._closed:
@@ -1521,6 +1931,7 @@ class SpeakerShadowRuntime:
         if reset_task is None or reset_task.done():
             self._resetting = True
             self._revoke_all_candidate_batch_reconciliations()
+            self._revoke_all_terminal_coverages()
             self._generation += 1
             self._set_degraded_cause("resetting")
             reset_task = asyncio.create_task(
@@ -1552,6 +1963,7 @@ class SpeakerShadowRuntime:
                 self._retire_finalized_candidates()
                 self._candidate_tokens.clear()
                 self._reconciliations.clear()
+                self._terminal_coverages.clear()
                 self._load_failure_streak = 0
                 self._next_load_attempt_at = 0.0
             finally:
@@ -1570,6 +1982,7 @@ class SpeakerShadowRuntime:
         if not self._closed:
             self._closed = True
             self._revoke_all_candidate_batch_reconciliations()
+            self._revoke_all_terminal_coverages()
             self._generation += 1
             reset_task = self._reset_task
             cleanup = asyncio.create_task(
@@ -1603,6 +2016,7 @@ class SpeakerShadowRuntime:
         self._finalized.clear()
         self._candidate_tokens.clear()
         self._reconciliations.clear()
+        self._terminal_coverages.clear()
         worker = self._worker_task
         if worker is not None and not worker.done():
             self._queue.put_nowait(_STOP)
@@ -1664,6 +2078,8 @@ class SpeakerShadowRuntime:
                 elif isinstance(item, _CandidateBatchReconciliation):
                     self._active_terminal_token = item.target_token
                     await self._process_candidate_batch_reconciliation(item)
+                elif isinstance(item, _CandidateTerminalCoverage):
+                    await self._process_terminal_coverage(item)
                 elif isinstance(item, _CandidatePrefixReconciliation):
                     await self._process_prefix_reconciliation(item)
                 elif isinstance(item, _CandidateActivated):
@@ -1679,6 +2095,8 @@ class SpeakerShadowRuntime:
                         self._abandon_completion(item.token)
                     elif isinstance(item, _CandidateBatchReconciliation):
                         self._fail_candidate_batch_reconciliation(item)
+                    elif isinstance(item, _CandidateTerminalCoverage):
+                        self._fail_terminal_coverage(item)
                     elif isinstance(
                         item,
                         (
@@ -1700,6 +2118,8 @@ class SpeakerShadowRuntime:
                     self._recover_failed_finish(item)
                 elif isinstance(item, _CandidateBatchReconciliation):
                     self._fail_candidate_batch_reconciliation(item)
+                elif isinstance(item, _CandidateTerminalCoverage):
+                    self._fail_terminal_coverage(item)
                 elif isinstance(
                     item,
                     (
@@ -1726,14 +2146,12 @@ class SpeakerShadowRuntime:
                     self._wipe_bytearray(item.pcm16)
                 self._retire_queued_item(item)
                 self._queue.task_done()
-                if (
-                    isinstance(item, (_CandidateFinished, _CandidateBatchReconciliation))
-                    and self._active_terminal_token
-                    is (
-                        item.token
-                        if isinstance(item, _CandidateFinished)
-                        else item.target_token
-                    )
+                if isinstance(
+                    item, (_CandidateFinished, _CandidateBatchReconciliation)
+                ) and self._active_terminal_token is (
+                    item.token
+                    if isinstance(item, _CandidateFinished)
+                    else item.target_token
                 ):
                     self._active_terminal_token = None
                 item = None
@@ -1741,7 +2159,10 @@ class SpeakerShadowRuntime:
                 return
 
     def _retire_queued_item(self, item: _QueueItem) -> None:
-        if isinstance(item, _CandidateBatchReconciliation):
+        if isinstance(
+            item,
+            (_CandidateBatchReconciliation, _CandidateTerminalCoverage),
+        ):
             self._queued_data_item_count = max(0, self._queued_data_item_count - 1)
             self._queued_terminal_count = max(0, self._queued_terminal_count - 1)
             if self._queued_terminal_count == 0:
@@ -1811,6 +2232,157 @@ class SpeakerShadowRuntime:
             token=token,
             buffer=buffer,
         )
+
+    async def _process_terminal_coverage(
+        self,
+        marker: _CandidateTerminalCoverage,
+    ) -> None:
+        """Apply exact ownership retirement while preserving one scored tombstone."""
+
+        record = self._terminal_coverages.get(marker.batch_id)
+        finalized = self._finalized.get(marker.target)
+        if (
+            marker.generation != self._generation
+            or self._closed
+            or self._resetting
+            or record is None
+            or record.marker is not marker
+            or record.state != "pending"
+            or finalized is None
+            or finalized.terminal_reason != "scored"
+            or finalized.token is not marker.target_token
+            or marker.target_token.terminal_reason != "scored"
+            or marker.target_token.scored_sample_count
+            != marker.receipt.retained_sample_count
+        ):
+            self._fail_terminal_coverage(marker)
+            return
+
+        source_buffers: dict[SpeakerShadowCandidateKey, _CandidateBuffer] = {}
+        for reserved in marker.reserved_sources:
+            source = reserved.source
+            token = reserved.token
+            buffer = self._buffers.get(source.candidate)
+            if (
+                self._candidate_tokens.get(source.candidate) is not token
+                or token.terminal_reason is not None
+                or token.finish_state is not _FinishState.OPEN
+                or not token.pcm_frozen
+                or token.reconciliation_batch_id != marker.batch_id
+                or token.accepted_sample_count != source.expected_sample_count
+                or buffer is None
+                or buffer.token is not token
+                or buffer.sample_rate_hz != SPEAKER_SHADOW_SAMPLE_RATE_HZ
+                or buffer.sample_count != source.expected_sample_count
+                or len(buffer.pcm16) != source.expected_sample_count * 2
+            ):
+                self._fail_terminal_coverage(marker)
+                return
+            source_buffers[source.candidate] = buffer
+
+        suffix_token = marker.suffix_token
+        suffix_retained_sample_count = 0
+        if marker.suffix is None:
+            if suffix_token is not None or marker.suffix_sample_count != 0:
+                self._fail_terminal_coverage(marker)
+                return
+        else:
+            suffix_from_live_source = marker.sources[-1].candidate != marker.target
+            suffix_retained_sample_count = (
+                marker.suffix_sample_count if suffix_from_live_source else 0
+            )
+            maximum_samples = (
+                SPEAKER_SHADOW_SAMPLE_RATE_HZ * self._config.maximum_audio_ms // 1_000
+            )
+            if (
+                suffix_token is None
+                or self._candidate_tokens.get(marker.suffix) is not suffix_token
+                or suffix_token.terminal_reason is not None
+                or suffix_token.finish_state is not _FinishState.OPEN
+                or suffix_token.pcm_frozen
+                or suffix_token.reconciliation_batch_id != marker.batch_id
+                or not (
+                    suffix_retained_sample_count
+                    <= suffix_token.accepted_sample_count
+                    <= maximum_samples
+                )
+                or marker.suffix in self._buffers
+                or marker.suffix in self._finalized
+            ):
+                self._fail_terminal_coverage(marker)
+                return
+
+        suffix_pcm = bytearray()
+        try:
+            if marker.suffix is not None and suffix_retained_sample_count > 0:
+                last_source = marker.sources[-1]
+                last_buffer = source_buffers.get(last_source.candidate)
+                if last_buffer is None:
+                    raise ValueError("terminal coverage suffix source is unavailable")
+                suffix_pcm.extend(last_buffer.pcm16[last_source.keep_end_sample * 2 :])
+                if len(suffix_pcm) != suffix_retained_sample_count * 2:
+                    raise ValueError("terminal coverage suffix PCM length mismatch")
+                if self._retained_pcm_bytes() + len(suffix_pcm) > (
+                    MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES
+                ):
+                    raise ValueError("terminal coverage suffix exceeds PCM budget")
+        except asyncio.CancelledError:
+            self._wipe_bytearray(suffix_pcm)
+            self._fail_terminal_coverage(marker)
+            raise
+        except Exception:
+            self._wipe_bytearray(suffix_pcm)
+            self._fail_terminal_coverage(marker)
+            return
+
+        for reserved in marker.reserved_sources:
+            removed = self._buffers.pop(reserved.source.candidate, None)
+            if removed is not None:
+                self._wipe_bytearray(removed.pcm16)
+            self._finalize_candidate(
+                reserved.source.candidate,
+                "dropped",
+                token=reserved.token,
+            )
+        if marker.suffix is not None and suffix_token is not None:
+            suffix_token.defer_processed = True
+            suffix_token.reconciliation_batch_id = None
+            if suffix_retained_sample_count > 0:
+                self._buffers[marker.suffix] = _CandidateBuffer(
+                    token=suffix_token,
+                    sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                    pcm16=suffix_pcm,
+                    sample_count=suffix_retained_sample_count,
+                )
+                self._buffers.move_to_end(marker.suffix)
+                self._metrics.started_candidate_count += 1
+            else:
+                self._wipe_bytearray(suffix_pcm)
+        else:
+            self._wipe_bytearray(suffix_pcm)
+        record.state = "applied"
+        record.settled.set()
+        self._metrics.reconciliation_batch_applied_count += 1
+
+    def _fail_terminal_coverage(
+        self,
+        marker: _CandidateTerminalCoverage,
+    ) -> None:
+        """Invalidate coverage without deleting the finalized scored verdict."""
+
+        record = self._terminal_coverages.get(marker.batch_id)
+        if record is not None and record.marker is marker:
+            if record.state != "failed":
+                self._metrics.reconciliation_batch_failed_count += 1
+            record.state = "failed"
+            record.settled.set()
+        for reserved in marker.reserved_sources:
+            self._drop_candidate(
+                reserved.source.candidate,
+                token=reserved.token,
+            )
+        if marker.suffix is not None and marker.suffix_token is not None:
+            self._drop_candidate(marker.suffix, token=marker.suffix_token)
 
     async def _process_candidate_batch_reconciliation(
         self,
@@ -2007,6 +2579,7 @@ class SpeakerShadowRuntime:
             self._buffers.move_to_end(marker.suffix)
             self._metrics.started_candidate_count += 1
         record.state = "applied"
+        record.settled.set()
         self._metrics.reconciliation_batch_applied_count += 1
 
         ready = await self._prewarm_candidate_backend(
@@ -2039,6 +2612,7 @@ class SpeakerShadowRuntime:
             if record.state != "failed":
                 self._metrics.reconciliation_batch_failed_count += 1
             record.state = "failed"
+            record.settled.set()
         seen: set[SpeakerShadowCandidateKey] = set()
         for reserved in marker.sources:
             candidate = reserved.source.candidate
@@ -2519,6 +3093,7 @@ class SpeakerShadowRuntime:
                 if checkpoint_ms is not None
                 else self._config.minimum_audio_ms
             )
+            token.scored_sample_count = len(pcm16) // 2
             if terminal:
                 self._finalize_candidate(candidate, "scored", token=token)
                 self._metrics.evaluated_candidate_count += 1
@@ -3468,6 +4043,11 @@ class SpeakerShadowRuntime:
                         self._revoke_candidate_batch_reconciliation(item)
                     elif abandon_data_candidates:
                         self._fail_candidate_batch_reconciliation(item)
+                elif isinstance(item, _CandidateTerminalCoverage):
+                    if revoke_pending_batches:
+                        self._revoke_terminal_coverage_record(item)
+                    elif abandon_data_candidates:
+                        self._fail_terminal_coverage(item)
                 elif isinstance(item, _CandidateFinished):
                     self._abandon_terminal(item.candidate, token=item.token)
                 self._retire_queued_item(item)

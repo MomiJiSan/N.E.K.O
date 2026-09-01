@@ -19,13 +19,21 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowBatchReconciliationControl,
     SpeakerShadowBatchReconcileReceipt,
     SpeakerShadowBatchReconcileRequest,
+    SpeakerShadowCaptureDecisionState,
+    SpeakerShadowCaptureDisposition,
+    SpeakerShadowCaptureResult,
+    SpeakerShadowCaptureStatus,
     SpeakerShadowConfig,
     SpeakerShadowDecisionStatus,
     SpeakerShadowDeferredCandidateControl,
     SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowObservation,
     SpeakerShadowReconcileSource,
+    SpeakerShadowReconciliationSettlement,
     SpeakerShadowMetrics,
+    SpeakerShadowTerminalCoverageControl,
+    SpeakerShadowTerminalCoverageReceipt,
+    SpeakerShadowTerminalCoverageRequest,
 )
 
 
@@ -474,6 +482,140 @@ def test_batch_reconciliation_is_an_independent_optional_protocol() -> None:
     control.revoke_reconciliation(receipt)
     assert not isinstance(control, SpeakerShadowCandidateReconciliationControl)
     assert not isinstance(object(), SpeakerShadowBatchReconciliationControl)
+
+
+def test_capture_status_is_an_independent_single_submit_protocol() -> None:
+    candidate = SpeakerShadowCandidateKey(6, 11, "provider_candidate")
+    result = SpeakerShadowCaptureResult(
+        disposition=SpeakerShadowCaptureDisposition.COMPLETE,
+        accepted_sample_count=160,
+        cumulative_sample_count=48_000,
+        completed_window_sample_count=48_000,
+        decision_state=SpeakerShadowCaptureDecisionState.PENDING,
+    )
+
+    class CaptureOnly:
+        def submit_capture(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+            candidate: SpeakerShadowCandidateKey,
+        ) -> SpeakerShadowCaptureResult:
+            assert pcm16 and sample_rate_hz == 16_000 and candidate.scope
+            return result
+
+    control = CaptureOnly()
+
+    assert isinstance(control, SpeakerShadowCaptureStatus)
+    assert (
+        control.submit_capture(
+            b"\x01\x00",
+            sample_rate_hz=16_000,
+            candidate=candidate,
+        )
+        is result
+    )
+    assert not isinstance(object(), SpeakerShadowCaptureStatus)
+
+
+@pytest.mark.parametrize(
+    ("disposition", "decision"),
+    [
+        (
+            SpeakerShadowCaptureDisposition.ACCEPTED,
+            SpeakerShadowCaptureDecisionState.SCORED,
+        ),
+        (
+            SpeakerShadowCaptureDisposition.ACCEPTED,
+            SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+        ),
+        (
+            SpeakerShadowCaptureDisposition.COMPLETE,
+            SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+        ),
+        (
+            SpeakerShadowCaptureDisposition.UNAVAILABLE,
+            SpeakerShadowCaptureDecisionState.PENDING,
+        ),
+    ],
+)
+def test_capture_result_rejects_impossible_state_combinations(
+    disposition: SpeakerShadowCaptureDisposition,
+    decision: SpeakerShadowCaptureDecisionState,
+) -> None:
+    with pytest.raises(ValueError, match="capture"):
+        SpeakerShadowCaptureResult(
+            disposition=disposition,
+            accepted_sample_count=0,
+            cumulative_sample_count=0,
+            completed_window_sample_count=0,
+            decision_state=decision,
+        )
+
+
+def test_terminal_coverage_is_an_independent_optional_protocol() -> None:
+    target = SpeakerShadowCandidateKey(6, 12, "provider_candidate")
+    source = SpeakerShadowReconcileSource(target, 192_000, 0, 192_000)
+    request = SpeakerShadowTerminalCoverageRequest(
+        sources=(source,),
+        target=target,
+        provider_exact_start_sample=0,
+        provider_exact_end_sample=192_000,
+        scored_window_start_sample=0,
+        scored_window_end_sample=48_000,
+    )
+    receipt = SpeakerShadowTerminalCoverageReceipt(
+        runtime_generation=2,
+        batch_id=3,
+        target=target,
+        suffix=None,
+        retained_sample_count=48_000,
+        covered_sample_count=192_000,
+        terminal_preserved=True,
+        _owner=object(),
+    )
+
+    class TerminalOnly:
+        def reconcile_finalized_candidate_coverage(
+            self,
+            requested: SpeakerShadowTerminalCoverageRequest,
+        ) -> SpeakerShadowTerminalCoverageReceipt | None:
+            return receipt if requested == request else None
+
+        def terminal_coverage_status(
+            self,
+            requested: SpeakerShadowTerminalCoverageReceipt,
+        ) -> str:
+            return "applied" if requested is receipt else "stale"
+
+        def revoke_terminal_coverage(
+            self,
+            requested: SpeakerShadowTerminalCoverageReceipt,
+        ) -> None:
+            assert requested is receipt
+
+    control = TerminalOnly()
+
+    assert isinstance(control, SpeakerShadowTerminalCoverageControl)
+    assert control.reconcile_finalized_candidate_coverage(request) is receipt
+    assert control.terminal_coverage_status(receipt) == "applied"
+    control.revoke_terminal_coverage(receipt)
+    assert not isinstance(control, SpeakerShadowBatchReconciliationControl)
+    assert not isinstance(object(), SpeakerShadowTerminalCoverageControl)
+
+    class SettlementOnly:
+        async def wait_reconciliation_settled(
+            self,
+            requested: SpeakerShadowTerminalCoverageReceipt,
+            *,
+            deadline: float,
+        ) -> str:
+            assert requested is receipt and deadline > 0
+            return "applied"
+
+    assert isinstance(SettlementOnly(), SpeakerShadowReconciliationSettlement)
+    assert not isinstance(object(), SpeakerShadowReconciliationSettlement)
 
 
 def test_deferred_candidate_status_is_an_optional_read_only_protocol() -> None:
