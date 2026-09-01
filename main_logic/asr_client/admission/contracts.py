@@ -1,0 +1,581 @@
+"""Immutable facts and effects for transcript admission.
+
+These contracts intentionally contain no tasks, futures, runtime objects, or
+Detector instances.  Component adapters retain executable capabilities and
+refer to them here only through bounded immutable identifiers.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TypeAlias
+
+from main_logic.voice_turn.contracts import VoiceTurnToken
+
+from .._provider_events import ProviderUtteranceKey
+from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
+
+
+class ProviderBindingState(StrEnum):
+    UNBOUND = "unbound"
+    BOUND = "bound"
+    RETIRED = "retired"
+
+
+class CandidateBindingState(StrEnum):
+    UNBOUND = "unbound"
+    BOUND = "bound"
+    RETIRED = "retired"
+
+
+class BoundaryState(StrEnum):
+    OPEN = "open"
+    EXACT = "exact"
+    UNKNOWN = "unknown"
+    RETIRED = "retired"
+
+
+class CaptureState(StrEnum):
+    NONE = "none"
+    COLLECTING = "collecting"
+    CLOSED = "closed"
+    UNAVAILABLE = "unavailable"
+
+
+class EvidenceState(StrEnum):
+    NONE = "none"
+    FIRST_LOW = "first_low"
+    ALLOW = "allow"
+    REJECT_REQUESTED = "reject_requested"
+    UNAVAILABLE = "unavailable"
+
+
+class RejectionApplyState(StrEnum):
+    NOT_STARTED = "not_started"
+    IN_FLIGHT = "in_flight"
+    APPLIED_ACTIVE = "applied_active"
+    APPLIED_SEALED = "applied_sealed"
+    STALE = "stale"
+    FAILED = "failed"
+
+
+class MicroEventState(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    PENDING = "pending"
+    ALLOW = "allow"
+    SUPPRESS = "suppress"
+    UNAVAILABLE = "unavailable"
+
+
+class ProviderFinalState(StrEnum):
+    NOT_RECEIVED = "not_received"
+    RECEIVED = "received"
+    ABORTED = "aborted"
+    SETTLED = "settled"
+
+
+class AdmissionState(StrEnum):
+    RESERVED = "reserved"
+    PENDING = "pending"
+    FORWARDED = "forwarded"
+    DROPPED = "dropped"
+    ABANDONED = "abandoned"
+
+
+class SettlementState(StrEnum):
+    NOT_STARTED = "not_started"
+    PENDING = "pending"
+    SETTLED = "settled"
+    DEGRADED = "degraded"
+
+
+class AdmissionDisposition(StrEnum):
+    FORWARD = "forward"
+    DROP = "drop"
+    ABANDON = "abandon"
+
+
+class RejectionCapabilityKind(StrEnum):
+    ACTIVE = "active"
+    SEALED = "sealed"
+
+
+class AdmissionOperationKind(StrEnum):
+    APPLY_REJECTION = "apply_rejection"
+    FINAL_DEADLINE = "final_deadline"
+    REVOKE_CAPABILITY = "revoke_capability"
+    POISON_SPEAKER_NAMESPACE = "poison_speaker_namespace"
+
+
+class SpeakerCheckpointKind(StrEnum):
+    FIRST = "first"
+    SECOND = "second"
+    COMPLETION_CONFIRMATION = "completion_confirmation"
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryProof:
+    """Opaque ownership result captured before an ordered turn is bound."""
+
+    proof_id: int
+    owner_generation: int
+    provider_key: ProviderUtteranceKey
+
+    def __post_init__(self) -> None:
+        if type(self.proof_id) is not int or self.proof_id < 1:
+            raise ValueError("proof_id must be a positive integer")
+        if type(self.owner_generation) is not int or self.owner_generation < 0:
+            raise ValueError("owner_generation must be a non-negative integer")
+        if type(self.provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+
+
+@dataclass(frozen=True, slots=True)
+class RejectionCapability:
+    """Pure reference to executable rejection authority held by an adapter."""
+
+    capability_id: int
+    owner_generation: int
+    kind: RejectionCapabilityKind
+    turn_token: VoiceTurnToken
+    candidate: SpeakerShadowCandidateKey
+    provider_key: ProviderUtteranceKey | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.capability_id) is not int or self.capability_id < 1:
+            raise ValueError("capability_id must be a positive integer")
+        if type(self.owner_generation) is not int or self.owner_generation < 0:
+            raise ValueError("owner_generation must be a non-negative integer")
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.candidate) is not SpeakerShadowCandidateKey:
+            raise TypeError("candidate must be SpeakerShadowCandidateKey")
+        if self.provider_key is not None and type(self.provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey or None")
+
+
+@dataclass(frozen=True, slots=True)
+class PendingProviderFinal:
+    """One logical final with the receive-time budget fixed at ingress."""
+
+    provider_key: ProviderUtteranceKey | None
+    provider: str
+    text: str
+    received_at: float
+    admission_deadline: float
+
+    def __post_init__(self) -> None:
+        if self.provider_key is not None and type(self.provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey or None")
+        if type(self.provider) is not str or not self.provider.strip():
+            raise ValueError("provider must be a non-empty string")
+        if type(self.text) is not str:
+            raise TypeError("text must be a string")
+        if not math.isfinite(self.received_at) or not math.isfinite(
+            self.admission_deadline
+        ):
+            raise ValueError("final timing must be finite")
+        if self.admission_deadline < self.received_at:
+            raise ValueError("admission_deadline cannot precede received_at")
+        if not math.isclose(
+            self.admission_deadline - self.received_at,
+            0.2,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("admission deadline must be exactly 200ms after receipt")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionOperationTicket:
+    turn_token: VoiceTurnToken
+    record_generation: int
+    operation_kind: AdmissionOperationKind
+    operation_nonce: int
+    capability_id: int | None = None
+    capability_owner_generation: int | None = None
+    capability_kind: RejectionCapabilityKind | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.record_generation) is not int or self.record_generation < 1:
+            raise ValueError("record_generation must be a positive integer")
+        if type(self.operation_nonce) is not int or self.operation_nonce < 1:
+            raise ValueError("operation_nonce must be a positive integer")
+        capability_identity = (
+            self.capability_id,
+            self.capability_owner_generation,
+            self.capability_kind,
+        )
+        if self.operation_kind in {
+            AdmissionOperationKind.APPLY_REJECTION,
+            AdmissionOperationKind.REVOKE_CAPABILITY,
+        }:
+            if (
+                type(self.capability_id) is not int
+                or self.capability_id < 1
+                or type(self.capability_owner_generation) is not int
+                or self.capability_owner_generation < 0
+                or type(self.capability_kind) is not RejectionCapabilityKind
+            ):
+                raise ValueError("rejection ticket requires capability identity")
+        elif capability_identity != (None, None, None):
+            raise ValueError("non-rejection ticket cannot carry capability identity")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionResolutionTicket:
+    turn_token: VoiceTurnToken
+    record_generation: int
+    resolution_nonce: int
+    disposition: AdmissionDisposition
+
+    def __post_init__(self) -> None:
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.record_generation) is not int or self.record_generation < 1:
+            raise ValueError("record_generation must be a positive integer")
+        if type(self.resolution_nonce) is not int or self.resolution_nonce < 1:
+            raise ValueError("resolution_nonce must be a positive integer")
+        if type(self.disposition) is not AdmissionDisposition:
+            raise TypeError("disposition must be AdmissionDisposition")
+
+
+@dataclass(frozen=True, slots=True)
+class PendingCapabilityRevocation:
+    ticket: AdmissionOperationTicket
+    capability: RejectionCapability
+    degraded: bool = False
+
+    def __post_init__(self) -> None:
+        if self.ticket.operation_kind is not AdmissionOperationKind.REVOKE_CAPABILITY:
+            raise ValueError("revocation requires a revoke ticket")
+        if (
+            self.ticket.capability_id != self.capability.capability_id
+            or self.ticket.capability_owner_generation
+            != self.capability.owner_generation
+            or self.ticket.capability_kind is not self.capability.kind
+        ):
+            raise ValueError("revocation ticket capability mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceTurnAdmissionRecord:
+    turn_token: VoiceTurnToken
+    record_generation: int
+    logical_revision: int = 0
+    operation_nonce_sequence: int = 0
+
+    provider_binding_state: ProviderBindingState = ProviderBindingState.UNBOUND
+    candidate_binding_state: CandidateBindingState = CandidateBindingState.UNBOUND
+    boundary_state: BoundaryState = BoundaryState.OPEN
+    capture_state: CaptureState = CaptureState.NONE
+    evidence_state: EvidenceState = EvidenceState.NONE
+    rejection_apply_state: RejectionApplyState = RejectionApplyState.NOT_STARTED
+    micro_event_state: MicroEventState = MicroEventState.NOT_APPLICABLE
+    provider_final_state: ProviderFinalState = ProviderFinalState.NOT_RECEIVED
+    admission_state: AdmissionState = AdmissionState.RESERVED
+    core_settlement_state: SettlementState = SettlementState.NOT_STARTED
+    transport_settlement_state: SettlementState = SettlementState.NOT_STARTED
+    lifecycle_settlement_state: SettlementState = SettlementState.NOT_STARTED
+
+    provider_key: ProviderUtteranceKey | None = None
+    speaker_candidate: SpeakerShadowCandidateKey | None = None
+    rejection_capability: RejectionCapability | None = None
+    pending_final: PendingProviderFinal | None = None
+    resolution_ticket: AdmissionResolutionTicket | None = None
+
+    last_speaker_sequence_no: int = 0
+    capture_through_sequence_no: int | None = None
+    rejection_operation_nonce: int | None = None
+    rejection_operation_capability_id: int | None = None
+    rejection_operation_owner_generation: int | None = None
+    rejection_operation_kind: RejectionCapabilityKind | None = None
+    revoked_rejection_ticket: AdmissionOperationTicket | None = None
+    revoked_rejection_capability: RejectionCapability | None = None
+    pending_revocations: tuple[PendingCapabilityRevocation, ...] = ()
+    revocation_degraded: bool = False
+    namespace_poison_ticket: AdmissionOperationTicket | None = None
+    deadline_operation_nonce: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.record_generation) is not int or self.record_generation < 1:
+            raise ValueError("record_generation must be a positive integer")
+        for name in (
+            "logical_revision",
+            "operation_nonce_sequence",
+            "last_speaker_sequence_no",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+    @property
+    def terminal_disposition(self) -> AdmissionDisposition | None:
+        return {
+            AdmissionState.FORWARDED: AdmissionDisposition.FORWARD,
+            AdmissionState.DROPPED: AdmissionDisposition.DROP,
+            AdmissionState.ABANDONED: AdmissionDisposition.ABANDON,
+        }.get(self.admission_state)
+
+
+# Admission events.  Separate immutable payloads make invalid state/payload
+# combinations unrepresentable without a large optional-field envelope.
+@dataclass(frozen=True, slots=True)
+class TurnOpened:
+    turn_token: VoiceTurnToken
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderBound:
+    provider_key: ProviderUtteranceKey
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateBound:
+    candidate: SpeakerShadowCandidateKey
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLow:
+    candidate: SpeakerShadowCandidateKey
+    sequence_no: int
+    checkpoint_kind: SpeakerCheckpointKind
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerHigh:
+    candidate: SpeakerShadowCandidateKey
+    sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerUnavailable:
+    candidate: SpeakerShadowCandidateKey
+    sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureClosed:
+    candidate: SpeakerShadowCandidateKey
+    through_sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryExact:
+    capability: RejectionCapability
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryUnknown:
+    provider_key: ProviderUtteranceKey | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TurnSealed:
+    capability: RejectionCapability | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RejectionApplied:
+    ticket: AdmissionOperationTicket
+    kind: RejectionCapabilityKind
+
+
+@dataclass(frozen=True, slots=True)
+class RejectionStale:
+    ticket: AdmissionOperationTicket
+
+
+@dataclass(frozen=True, slots=True)
+class RejectionFailed:
+    ticket: AdmissionOperationTicket
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityRevoked:
+    ticket: AdmissionOperationTicket
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityRevokeFailed:
+    ticket: AdmissionOperationTicket
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAuthorityNamespacePoisoned:
+    ticket: AdmissionOperationTicket
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAuthorityNamespacePoisonFailed:
+    ticket: AdmissionOperationTicket
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderFinalReceived:
+    final: PendingProviderFinal
+
+
+@dataclass(frozen=True, slots=True)
+class FinalDeadlineExpired:
+    ticket: AdmissionOperationTicket
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class MicroEventPending:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MicroEventAllowed:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MicroEventSuppressed:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MicroEventUnavailable:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CoreSettled:
+    ticket: AdmissionResolutionTicket
+    degraded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TransportSettled:
+    ticket: AdmissionResolutionTicket
+    degraded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleSettled:
+    ticket: AdmissionResolutionTicket
+    degraded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Reset:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Close:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class RouteReplaced:
+    pass
+
+
+AdmissionEvent: TypeAlias = (
+    TurnOpened
+    | ProviderBound
+    | CandidateBound
+    | SpeakerLow
+    | SpeakerHigh
+    | SpeakerUnavailable
+    | CaptureClosed
+    | BoundaryExact
+    | BoundaryUnknown
+    | TurnSealed
+    | RejectionApplied
+    | RejectionStale
+    | RejectionFailed
+    | CapabilityRevoked
+    | CapabilityRevokeFailed
+    | SpeakerAuthorityNamespacePoisoned
+    | SpeakerAuthorityNamespacePoisonFailed
+    | ProviderFinalReceived
+    | FinalDeadlineExpired
+    | MicroEventPending
+    | MicroEventAllowed
+    | MicroEventSuppressed
+    | MicroEventUnavailable
+    | CoreSettled
+    | TransportSettled
+    | LifecycleSettled
+    | Reset
+    | Close
+    | RouteReplaced
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyRejection:
+    ticket: AdmissionOperationTicket
+    capability: RejectionCapability
+    absolute_deadline: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleFinalDeadline:
+    ticket: AdmissionOperationTicket
+    absolute_deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ConstrainRejectionDeadline:
+    ticket: AdmissionOperationTicket
+    absolute_deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveReserved:
+    ticket: AdmissionResolutionTicket
+    final: PendingProviderFinal | None
+
+    @property
+    def turn_token(self) -> VoiceTurnToken:
+        return self.ticket.turn_token
+
+    @property
+    def disposition(self) -> AdmissionDisposition:
+        return self.ticket.disposition
+
+
+@dataclass(frozen=True, slots=True)
+class RevokeRejectionCapability:
+    capability: RejectionCapability
+    ticket: AdmissionOperationTicket | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AbortProviderTransport:
+    turn_token: VoiceTurnToken
+
+
+@dataclass(frozen=True, slots=True)
+class PoisonSpeakerAuthorityNamespace:
+    turn_token: VoiceTurnToken
+    ticket: AdmissionOperationTicket | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CountDiagnostic:
+    name: str
+
+
+AdmissionEffect: TypeAlias = (
+    ApplyRejection
+    | ConstrainRejectionDeadline
+    | ScheduleFinalDeadline
+    | ResolveReserved
+    | RevokeRejectionCapability
+    | AbortProviderTransport
+    | PoisonSpeakerAuthorityNamespace
+    | CountDiagnostic
+)
