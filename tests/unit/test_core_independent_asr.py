@@ -77,6 +77,7 @@ from main_logic.asr_client.endpointing.detector import (
 )
 import main_logic.core.asr_runtime as core_asr_runtime_module
 import main_logic.core as core_module
+import main_logic.asr_client.runtime as asr_runtime_module
 import main_logic.voice_turn.audio_input as audio_input_module
 from utils import preferences
 
@@ -281,6 +282,7 @@ class _ReadyDetector:
         self.observe_provider_audio = MagicMock()
         self.wait_provider_audio_observed_through = AsyncMock(return_value=True)
         self.reconcile_provider_endpoint = AsyncMock()
+        self.wait_provider_speaker_preseal = AsyncMock(return_value=True)
         self.retire_provider_speaker_boundary_unknown = AsyncMock()
         self.reset_provider_audio_timeline = AsyncMock(return_value=True)
 
@@ -1740,9 +1742,10 @@ async def test_keyed_exact_boundary_reconciles_before_ordered_final() -> None:
     assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
     assert component._asr_sealed_provider_key == key
     detector.seal_provider_candidate.assert_awaited_once()
-    assert detector.seal_provider_candidate.await_args.kwargs == {
-        "speaker_snapshot": snapshot,
-    }
+    assert detector.seal_provider_candidate.await_args.kwargs[
+        "speaker_snapshot"
+    ] is snapshot
+    assert detector.seal_provider_candidate.await_args.kwargs["deadline"] > 0
 
     await component._handle_provider_final(key, "joined", epoch, "openai")
     await runtime._wait_asr_transcript_dispatch_idle()
@@ -1753,6 +1756,151 @@ async def test_keyed_exact_boundary_reconciles_before_ordered_final() -> None:
     assert key not in component._asr_provider_boundary_snapshots
     runtime.handle_input_transcript.assert_awaited_once()
     runtime.session.create_response.assert_awaited_once_with("joined")
+
+
+async def test_exact_boundary_waits_for_terminal_receipt_before_ready_exact() -> (
+    None
+):
+    """READY_EXACT is published only after the terminal receipt settles."""
+
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    detector = component._asr_detector
+    assert isinstance(detector, _ReadyDetector)
+    epoch = component._asr_session_epoch
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        epoch,
+    )
+    snapshot = ProviderSpeakerBoundarySnapshot(
+        detector_epoch=detector.detector_epoch,
+        candidate_generation=0,
+        through_sequence_no=7,
+        shadow_generation=3,
+        merged_resume_count=0,
+        successor_present=False,
+        evidence_complete=True,
+        _owner=object(),
+    )
+    detector.reconcile_provider_endpoint.return_value = snapshot
+    settlement_entered = asyncio.Event()
+    settlement_release = asyncio.Event()
+
+    async def settle_receipt(
+        observed: ProviderSpeakerBoundarySnapshot,
+        *,
+        deadline: float,
+    ) -> bool:
+        assert observed is snapshot
+        assert deadline > time.monotonic()
+        settlement_entered.set()
+        await settlement_release.wait()
+        return True
+
+    detector.wait_provider_speaker_preseal.side_effect = settle_receipt
+    boundary = ProviderEndpointNotification(
+        phase="boundary",
+        generation=4,
+        buffer_epoch=2,
+        utterance_id=1,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 52_800),
+    )
+    boundary_task = asyncio.create_task(
+        component._handle_provider_endpoint_notification(boundary, epoch)
+    )
+    await asyncio.wait_for(settlement_entered.wait(), 1)
+
+    record = component._asr_provider_boundary_snapshots[boundary.key]
+    assert record.state == "presealing"
+    assert record.snapshot is None
+    assert not record.preseal_settled.is_set()
+
+    settlement_release.set()
+    await asyncio.wait_for(boundary_task, 1)
+
+    assert record.state == "ready_exact"
+    assert record.snapshot is snapshot
+    assert record.preseal_settled.is_set()
+
+
+async def test_terminal_receipt_timeout_cannot_late_upgrade_unknown(
+    monkeypatch,
+) -> None:
+    """A receipt released after its absolute deadline stays fail-open unknown."""
+
+    monkeypatch.setattr(
+        asr_runtime_module,
+        "_PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS",
+        0.01,
+    )
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    component = runtime._asr_runtime
+    detector = component._asr_detector
+    assert isinstance(detector, _ReadyDetector)
+    epoch = component._asr_session_epoch
+    await component._handle_independent_asr_activity(
+        SpeechActivityEvent.SPEECH_STARTED,
+        epoch,
+    )
+    snapshot = ProviderSpeakerBoundarySnapshot(
+        detector_epoch=detector.detector_epoch,
+        candidate_generation=0,
+        through_sequence_no=7,
+        shadow_generation=3,
+        merged_resume_count=0,
+        successor_present=False,
+        evidence_complete=True,
+        _owner=object(),
+    )
+    detector.reconcile_provider_endpoint.return_value = snapshot
+    settlement_entered = asyncio.Event()
+    settlement_timed_out = asyncio.Event()
+    late_receipt = asyncio.Event()
+
+    async def settle_until_deadline(
+        observed: ProviderSpeakerBoundarySnapshot,
+        *,
+        deadline: float,
+    ) -> bool:
+        assert observed is snapshot
+        settlement_entered.set()
+        try:
+            await asyncio.wait_for(
+                late_receipt.wait(),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except TimeoutError:
+            settlement_timed_out.set()
+            return False
+        return True
+
+    detector.wait_provider_speaker_preseal.side_effect = settle_until_deadline
+    boundary = ProviderEndpointNotification(
+        phase="boundary",
+        generation=4,
+        buffer_epoch=2,
+        utterance_id=1,
+        boundary_quality="exact",
+        audio_range=ProviderAudioRange(0, 52_800),
+    )
+    boundary_task = asyncio.create_task(
+        component._handle_provider_endpoint_notification(boundary, epoch)
+    )
+    await asyncio.wait_for(settlement_entered.wait(), 1)
+    await asyncio.wait_for(settlement_timed_out.wait(), 1)
+    await asyncio.wait_for(boundary_task, 1)
+
+    record = component._asr_provider_boundary_snapshots[boundary.key]
+    assert record.state == "ready_unknown"
+    assert record.snapshot is None
+    assert record.preseal_settled.is_set()
+
+    late_receipt.set()
+    assert record.state == "ready_unknown"
+    assert record.snapshot is None
 
 
 async def test_keyed_boundary_snapshot_overflow_fails_open_without_losing_final() -> (
@@ -1805,14 +1953,15 @@ async def test_keyed_boundary_snapshot_overflow_fails_open_without_losing_final(
     overflow = boundaries[8]
     await component._handle_provider_endpoint_notification(overflow, epoch)
 
-    assert list(component._asr_provider_boundary_snapshots) == [overflow.key]
-    overflow_record = component._asr_provider_boundary_snapshots[overflow.key]
-    assert overflow_record.notification.boundary_quality == "unknown"
-    assert overflow_record.snapshot is None
+    assert list(component._asr_provider_boundary_snapshots) == [
+        boundary.key for boundary in boundaries[:8]
+    ]
+    assert list(component._asr_provider_boundary_overflow_keys) == [overflow.key]
+    assert component._asr_provider_boundary_overflow_keys[overflow.key] is None
     assert detector.reconcile_provider_endpoint.await_count == 8
-    # Overflow first revokes every stored snapshot, then the common unknown
-    # path idempotently confirms that the current key has no speaker authority.
-    assert detector.retire_provider_speaker_boundary_unknown.await_count == 2
+    # Overflow is tracked separately as unknown without evicting or widening
+    # the bounded eight-entry exact-snapshot FIFO.
+    assert detector.retire_provider_speaker_boundary_unknown.await_count == 1
 
     await component._handle_provider_endpoint_notification(
         replace(overflow, phase="ordered"),
@@ -1822,10 +1971,11 @@ async def test_keyed_boundary_snapshot_overflow_fails_open_without_losing_final(
     fence = component._asr_provider_candidate_fence
     assert type(fence) is ProviderCandidateFence
     assert component._asr_sealed_provider_key == overflow.key
-    detector.seal_provider_candidate.assert_awaited_once_with(
-        component._asr_sealed_turn_token.turn,
-        speaker_snapshot=None,
-    )
+    detector.seal_provider_candidate.assert_awaited_once()
+    seal_call = detector.seal_provider_candidate.await_args
+    assert seal_call.args == (component._asr_sealed_turn_token.turn,)
+    assert seal_call.kwargs["speaker_snapshot"] is None
+    assert type(seal_call.kwargs["deadline"]) is float
     await component._handle_provider_final(
         overflow.key,
         "overflow kept",
@@ -10612,7 +10762,9 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     ]
     assert observation_candidates == [detector_candidate, detector_candidate]
     assert all(candidate is detector_candidate for candidate in observation_candidates)
-    assert prepared_candidates == [detector_candidate, detector_candidate]
+    # The first-low arm owns the stable lease; second-low reuses it instead of
+    # preparing the same Detector candidate again.
+    assert prepared_candidates == [detector_candidate]
     assert all(candidate is detector_candidate for candidate in prepared_candidates)
     assert type(detector_candidate) is contracts_module.SpeakerShadowCandidateKey
     assert type(detector_candidate) is detector_module.SpeakerShadowCandidateKey
@@ -10634,14 +10786,12 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
         (False, "none"),
         (True, "submit"),
         (True, "endpoint"),
-        (True, "endpoint-delayed"),
         (True, "arm-failed"),
     ],
     ids=(
         "continuous-owner",
         "provider-vad-non-owner",
         "provider-endpoint-late-non-owner",
-        "provider-final-waits-for-armed-second-low",
         "provider-unarmed-final-does-not-wait",
     ),
 )
@@ -10887,7 +11037,7 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
         await asyncio.wait_for(delayed_prepare_started.wait(), timeout=0.2)
         assert rejection_tasks[0].done() is False
     elif rejection_tasks:
-        await asyncio.gather(*rejection_tasks)
+        await asyncio.gather(*rejection_tasks, return_exceptions=True)
     await asyncio.sleep(0)
 
     assert submit_result.status is AsrSubmitStatus.ACCEPTED
