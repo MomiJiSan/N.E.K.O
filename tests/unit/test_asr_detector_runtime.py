@@ -2394,6 +2394,149 @@ async def test_exact_preseal_rejection_ready_upgrades_on_ordered_seal() -> None:
     await detector.close()
 
 
+async def test_pending_exact_receipt_applies_before_final_deadline() -> None:
+    shadow = _BlockingSettlementSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    candidate, identity, _token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x61\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    shadow_candidate = detector._provider_speaker_segments[0].candidate
+    exact = await detector.reconcile_provider_endpoint(ProviderAudioRange(0, 160))
+    assert exact is not None and exact.boundary_exact is True
+    assert shadow.batch_status == "pending"
+
+    lease = await detector.prepare_candidate_rejection(shadow_candidate)
+    assert lease is not None
+    assert lease.candidate == candidate
+    assert lease.provider_preseal_verdict is exact
+    commit = asyncio.create_task(
+        lease.commit_async(deadline=asyncio.get_running_loop().time() + 1.0)
+    )
+    await asyncio.wait_for(shadow.settlement_started.wait(), 1.0)
+    assert not commit.done()
+
+    shadow.settlement_release.set()
+    result = await asyncio.wait_for(commit, 1.0)
+
+    assert result is DetectorCandidateRejectionCommitResult.PRESEAL_READY
+    assert detector._provider_preseal_entries[0].rejection_ready is True
+    await detector.close()
+
+
+async def test_pending_exact_receipt_applies_after_ordered_seal_before_deadline() -> (
+    None
+):
+    shadow = _BlockingSettlementSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x62\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    shadow_candidate = detector._provider_speaker_segments[0].candidate
+    exact = await detector.reconcile_provider_endpoint(ProviderAudioRange(0, 160))
+    assert exact is not None and exact.boundary_exact is True
+    assert shadow.batch_status == "pending"
+
+    lease = await detector.prepare_candidate_rejection(shadow_candidate)
+    assert lease is not None
+    assert lease.candidate == candidate
+    deadline = asyncio.get_running_loop().time() + 1.0
+    seal = asyncio.create_task(
+        detector.seal_provider_candidate(
+            token,
+            speaker_snapshot=exact,
+            deadline=deadline,
+        )
+    )
+    await asyncio.wait_for(shadow.settlement_started.wait(), 1.0)
+    commit = asyncio.create_task(lease.commit_async(deadline=deadline))
+    await asyncio.sleep(0)
+    assert not seal.done()
+    assert not commit.done()
+
+    shadow.settlement_release.set()
+    fence = await asyncio.wait_for(seal, 1.0)
+    result = await asyncio.wait_for(commit, 1.0)
+    if result is DetectorCandidateRejectionCommitResult.PRESEAL_READY:
+        # The rejection waiter may win the settlement lock immediately before
+        # ordered seal. Runtime's ordered lane then reuses the same lease once
+        # more against the sealed capability.
+        result = await asyncio.wait_for(
+            lease.commit_async(deadline=deadline),
+            1.0,
+        )
+
+    assert fence is not None and fence.boundary_exact is True
+    assert result is DetectorCandidateRejectionCommitResult.SEALED_APPLIED
+    await detector.close()
+
+
+async def test_pending_exact_seal_reset_during_settlement_cannot_mutate_successor() -> (
+    None
+):
+    shadow = _BlockingSettlementSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        b"\x63\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    exact = await detector.reconcile_provider_endpoint(ProviderAudioRange(0, 160))
+    assert exact is not None and exact.boundary_exact is True
+    seal = asyncio.create_task(
+        detector.seal_provider_candidate(
+            token,
+            speaker_snapshot=exact,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+    )
+    await asyncio.wait_for(shadow.settlement_started.wait(), 1.0)
+
+    await detector.reset()
+    shadow.settlement_release.set()
+
+    assert await asyncio.wait_for(seal, 1.0) is None
+    assert detector._provider_candidate_fence is None
+    assert not detector._provider_preseal_entries
+    await detector.close()
+
+
 async def test_batch_admission_failure_preserves_earlier_exact_entry() -> None:
     shadow = _ReconcilingSpeakerShadowSpy()
     detector = DetectorRuntime(

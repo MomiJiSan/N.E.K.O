@@ -2092,6 +2092,113 @@ async def test_3000ms_completion_follows_both_observations() -> None:
     await runtime.close()
 
 
+async def test_authoritative_evidence_sink_orders_two_observations_before_close() -> (
+    None
+):
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_evidence=evidence.append,
+    )
+    candidate = _candidate(9_401)
+
+    assert runtime.submit(
+        _pcm(3_000),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert [type(item) for item in evidence] == [
+        SpeakerShadowObservation,
+        SpeakerShadowObservation,
+        SpeakerShadowCompletion,
+    ]
+    observations = [
+        item for item in evidence if isinstance(item, SpeakerShadowObservation)
+    ]
+    closed = evidence[-1]
+    assert [item.sequence_no for item in observations] == [1, 2]
+    assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+    assert isinstance(closed, SpeakerShadowCompletion)
+    assert closed.through_sequence_no == 2
+    assert closed.evidence_complete is True
+    await runtime.close()
+
+
+async def test_legacy_callback_timeout_cannot_reorder_authoritative_evidence() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    release_legacy = asyncio.Event()
+
+    async def observe(_observation: SpeakerShadowObservation) -> None:
+        while not release_legacy.is_set():
+            try:
+                await release_legacy.wait()
+            except asyncio.CancelledError:
+                continue
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(callback_timeout_seconds=0.01),
+        on_evidence=evidence.append,
+        on_observation=observe,
+    )
+    candidate = _candidate(9_402)
+
+    assert runtime.submit(
+        _pcm(3_000),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert [
+        item.sequence_no
+        for item in evidence
+        if isinstance(item, SpeakerShadowObservation)
+    ] == [1, 2]
+    assert isinstance(evidence[-1], SpeakerShadowCompletion)
+    assert evidence[-1].through_sequence_no == 2
+    release_legacy.set()
+    await runtime.close()
+
+
+async def test_terminal_overflow_publishes_unavailable_then_closed() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(terminal_queue_capacity=1),
+        on_evidence=evidence.append,
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    blocker = _candidate(9_403)
+    candidate = _candidate(9_404)
+
+    try:
+        assert runtime.finish_candidate(blocker)
+        assert runtime.finish_candidate(candidate) is False
+
+        assert len(evidence) == 2
+        unavailable, closed = evidence
+        assert isinstance(unavailable, SpeakerShadowObservation)
+        assert unavailable.candidate == candidate
+        assert unavailable.sequence_no == 1
+        assert unavailable.evidence_available is False
+        assert isinstance(closed, SpeakerShadowCompletion)
+        assert closed.candidate == candidate
+        assert closed.through_sequence_no == 1
+        assert closed.evidence_complete is True
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
 async def test_duplicate_finish_emits_completion_once() -> None:
     completions: list[SpeakerShadowCompletion] = []
 

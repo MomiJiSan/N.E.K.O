@@ -538,6 +538,13 @@ class SpeakerShadowObservation:
     audio_ms: int
     checkpoint_ms: int | None = None
     observation_kind: SpeakerShadowObservationKind = "checkpoint"
+    # Per-candidate delivery sequence.  Zero is retained only for legacy test
+    # fixtures; production runtime events always start at one and increment by
+    # exactly one before the corresponding callback is scheduled.
+    sequence_no: int = 0
+    # False is an explicit fail-open placeholder emitted when scoring or
+    # callback delivery cannot preserve the candidate's ordered evidence.
+    evidence_available: bool = True
 
 
 ObservationCallback = Callable[
@@ -553,12 +560,24 @@ class SpeakerShadowCompletion:
     candidate: SpeakerShadowCandidateKey
     terminal_reason: SpeakerShadowTerminalReason
     last_checkpoint_ms: int | None
+    # Highest observation sequence assigned before this ordered close.  A
+    # consumer may trust the evidence only when every sequence through this
+    # value was delivered and ``evidence_complete`` is true.
+    through_sequence_no: int = 0
+    evidence_complete: bool = True
 
 
 CompletionCallback = Callable[
     [SpeakerShadowCompletion],
     Awaitable[None],
 ]
+
+# Production authority uses one synchronous, non-blocking sink for both facts
+# and close.  The serial speaker worker invokes it in candidate order, so no
+# callback task lifecycle can reorder evidence.  The two async callbacks above
+# remain observation-only compatibility seams.
+SpeakerShadowEvidenceEvent = SpeakerShadowObservation | SpeakerShadowCompletion
+EvidenceCallback = Callable[[SpeakerShadowEvidenceEvent], None]
 
 
 @dataclass(slots=True)

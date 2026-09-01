@@ -9,7 +9,7 @@ import multiprocessing
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from .contracts import (
     CompletionCallback,
+    EvidenceCallback,
     MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES,
     MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES,
     MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES,
@@ -488,6 +489,9 @@ class _CandidateToken:
     activation_queued: bool = False
     pcm_frozen: bool = False
     reconciliation_batch_id: int | None = None
+    evidence_sequence_no: int = 0
+    evidence_complete: bool = True
+    evidence_closed: bool = False
 
 
 @dataclass(slots=True)
@@ -569,6 +573,7 @@ class SpeakerShadowRuntime:
         config: SpeakerShadowConfig | None = None,
         on_observation: ObservationCallback | None = None,
         on_completion: CompletionCallback | None = None,
+        on_evidence: EvidenceCallback | None = None,
         on_backend_degraded: Callable[[], None] | None = None,
         on_backend_recovered: Callable[[], None] | None = None,
     ) -> None:
@@ -588,6 +593,13 @@ class SpeakerShadowRuntime:
         ):
             raise TypeError("SpeakerShadowRuntime completion callback must be async")
         self._on_completion = on_completion
+        if on_evidence is not None and (
+            not callable(on_evidence)
+            or inspect.iscoroutinefunction(on_evidence)
+            or inspect.iscoroutinefunction(getattr(on_evidence, "__call__", None))
+        ):
+            raise TypeError("SpeakerShadowRuntime evidence callback must be synchronous")
+        self._on_evidence = on_evidence
         self._metrics = SpeakerShadowMetrics()
         self._would_block_counts = {
             threshold: 0 for threshold in self._config.similarity_thresholds
@@ -1862,6 +1874,7 @@ class SpeakerShadowRuntime:
         *,
         token: _CandidateToken,
     ) -> None:
+        self._publish_terminal_admission_unavailable(candidate, token=token)
         self._abandon_completion(token)
         if token.finish_state in {
             _FinishState.PROCESSED,
@@ -1871,6 +1884,47 @@ class SpeakerShadowRuntime:
         token.finish_state = _FinishState.ABANDONED
         self._metrics.terminal_abandoned_count += 1
         self._drop_candidate(candidate, token=token)
+
+    def _publish_terminal_admission_unavailable(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+        *,
+        token: _CandidateToken,
+    ) -> None:
+        """Close speaker authority when its ordered terminal cannot be queued."""
+
+        current = self._candidate_tokens.get(candidate)
+        if (
+            self._closed
+            or self._resetting
+            or token.evidence_closed
+            or candidate in self._finalized
+            or (current is not None and current is not token)
+        ):
+            return
+        sequence_no = token.evidence_sequence_no + 1
+        token.evidence_sequence_no = sequence_no
+        unavailable = SpeakerShadowObservation(
+            candidate=candidate,
+            similarity=0.0,
+            would_block=(),
+            audio_ms=self._audio_ms(
+                token.accepted_sample_count,
+                token.sample_rate_hz or SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            ),
+            sequence_no=sequence_no,
+            evidence_available=False,
+        )
+        self._publish_evidence(unavailable, token=token)
+        completion = SpeakerShadowCompletion(
+            candidate=candidate,
+            terminal_reason="dropped",
+            last_checkpoint_ms=token.last_checkpoint_ms,
+            through_sequence_no=sequence_no,
+            evidence_complete=token.evidence_complete,
+        )
+        token.evidence_closed = True
+        self._publish_evidence(completion, token=token)
 
     async def wait_idle(self) -> None:
         """Wait for accepted work, excluding the warm-backend idle timer."""
@@ -3044,6 +3098,14 @@ class SpeakerShadowRuntime:
                 return
             if backend_host is None:
                 self._mark_backend_degraded()
+                self._publish_unavailable_observation(
+                    generation=generation,
+                    candidate=candidate,
+                    token=token,
+                    audio_ms=audio_ms,
+                    checkpoint_ms=checkpoint_ms,
+                    observation_kind=observation_kind,
+                )
                 self._finalize_candidate(candidate, "failed", token=token)
                 return
             started = time.perf_counter()
@@ -3065,6 +3127,14 @@ class SpeakerShadowRuntime:
                 self._metrics.inference_failure_count += 1
                 self._mark_backend_degraded()
                 if self._identity_is_current(generation, candidate, token):
+                    self._publish_unavailable_observation(
+                        generation=generation,
+                        candidate=candidate,
+                        token=token,
+                        audio_ms=audio_ms,
+                        checkpoint_ms=checkpoint_ms,
+                        observation_kind=observation_kind,
+                    )
                     self._finalize_candidate(candidate, "failed", token=token)
                 return
             except Exception:
@@ -3073,6 +3143,14 @@ class SpeakerShadowRuntime:
                 self._metrics.inference_failure_count += 1
                 self._mark_backend_degraded()
                 if self._identity_is_current(generation, candidate, token):
+                    self._publish_unavailable_observation(
+                        generation=generation,
+                        candidate=candidate,
+                        token=token,
+                        audio_ms=audio_ms,
+                        checkpoint_ms=checkpoint_ms,
+                        observation_kind=observation_kind,
+                    )
                     self._finalize_candidate(candidate, "failed", token=token)
                 return
             finally:
@@ -3102,6 +3180,26 @@ class SpeakerShadowRuntime:
             for threshold, blocked in would_block:
                 if blocked:
                     self._would_block_counts[threshold] += 1
+            if not token.evidence_complete:
+                return blocked_at_any_threshold
+            sequence_no = token.evidence_sequence_no + 1
+            token.evidence_sequence_no = sequence_no
+            observation = SpeakerShadowObservation(
+                candidate=candidate,
+                similarity=similarity,
+                would_block=would_block,
+                audio_ms=audio_ms,
+                checkpoint_ms=checkpoint_ms,
+                observation_kind=observation_kind,
+                sequence_no=sequence_no,
+            )
+            if not self._publish_evidence(observation, token=token):
+                return blocked_at_any_threshold
+
+            # The synchronous evidence sink above is the sole production
+            # authority.  This async callback remains a bounded compatibility
+            # seam; its timeout or cancellation cannot retract or reorder the
+            # already-published fact.
             callback = self._on_observation
             if callback is None:
                 return blocked_at_any_threshold
@@ -3111,16 +3209,8 @@ class SpeakerShadowRuntime:
                     self._metrics.callback_failure_count += 1
                     return blocked_at_any_threshold
                 self._consume_callback_result(existing_callback_task)
-            observation = SpeakerShadowObservation(
-                candidate=candidate,
-                similarity=similarity,
-                would_block=would_block,
-                audio_ms=audio_ms,
-                checkpoint_ms=checkpoint_ms,
-                observation_kind=observation_kind,
-            )
             callback_task = asyncio.create_task(
-                callback(observation),
+                callback(replace(observation, sequence_no=0)),
                 name="speaker-shadow-observation",
             )
             self._observation_task = callback_task
@@ -3142,8 +3232,8 @@ class SpeakerShadowRuntime:
                 cancelled = await self._cancel_callback_bounded(callback_task)
                 if not cancelled:
                     self._detach_callback(callback_task)
-                    if self._observation_task is callback_task:
-                        self._observation_task = None
+                if self._observation_task is callback_task:
+                    self._observation_task = None
                 return blocked_at_any_threshold
             try:
                 callback_task.result()
@@ -3168,6 +3258,57 @@ class SpeakerShadowRuntime:
                 self._active_evaluation = None
                 self._active_evaluation_terminal = False
                 self._active_pcm_bytes = 0
+
+    def _publish_evidence(
+        self,
+        event: SpeakerShadowObservation | SpeakerShadowCompletion,
+        *,
+        token: _CandidateToken,
+    ) -> bool:
+        """Publish one authoritative fact in the serial worker context."""
+
+        callback = self._on_evidence
+        if callback is None:
+            return True
+        try:
+            callback(event)
+        except Exception:
+            self._metrics.callback_failure_count += 1
+            token.evidence_complete = False
+            return False
+        return True
+
+    def _publish_unavailable_observation(
+        self,
+        *,
+        generation: int,
+        candidate: SpeakerShadowCandidateKey,
+        token: _CandidateToken,
+        audio_ms: int,
+        checkpoint_ms: int | None,
+        observation_kind: Literal["checkpoint", "completion_confirmation"],
+    ) -> None:
+        """Publish one explicit ordered fail-open fact after score failure."""
+
+        if (
+            generation != self._generation
+            or self._closed
+            or not token.evidence_complete
+        ):
+            return
+        sequence_no = token.evidence_sequence_no + 1
+        token.evidence_sequence_no = sequence_no
+        unavailable = SpeakerShadowObservation(
+            candidate=candidate,
+            similarity=0.0,
+            would_block=(),
+            audio_ms=audio_ms,
+            checkpoint_ms=checkpoint_ms,
+            observation_kind=observation_kind,
+            sequence_no=sequence_no,
+            evidence_available=False,
+        )
+        self._publish_evidence(unavailable, token=token)
 
     async def _ensure_backend(self) -> _BackendProcessHost | None:
         existing_host = self._backend_host
@@ -3588,6 +3729,21 @@ class SpeakerShadowRuntime:
             return True
         if token.completion_state is _CompletionState.ABANDONED:
             return False
+        completion = SpeakerShadowCompletion(
+            candidate=marker.candidate,
+            terminal_reason=terminal_reason,
+            last_checkpoint_ms=token.last_checkpoint_ms,
+            through_sequence_no=token.evidence_sequence_no,
+            evidence_complete=token.evidence_complete,
+        )
+        if not token.evidence_closed:
+            token.evidence_closed = True
+            self._publish_evidence(completion, token=token)
+        legacy_completion = SpeakerShadowCompletion(
+            candidate=marker.candidate,
+            terminal_reason=terminal_reason,
+            last_checkpoint_ms=token.last_checkpoint_ms,
+        )
         if self._completion_queue.qsize() >= self._config.completion_queue_capacity:
             self._metrics.completion_overflow_count += 1
             self._set_degraded_cause("completion_overflow")
@@ -3597,16 +3753,11 @@ class SpeakerShadowRuntime:
             self._set_degraded_cause("dispatcher_start_failure")
             self._abandon_completion(token)
             return False
-        completion = SpeakerShadowCompletion(
-            candidate=marker.candidate,
-            terminal_reason=terminal_reason,
-            last_checkpoint_ms=token.last_checkpoint_ms,
-        )
         envelope = _CompletionEnvelope(
             generation=marker.generation,
             candidate=marker.candidate,
             token=token,
-            completion=completion,
+            completion=legacy_completion,
         )
         try:
             self._completion_queue.put_nowait(envelope)
@@ -3690,12 +3841,6 @@ class SpeakerShadowRuntime:
         ):
             self._abandon_completion(token)
             return
-
-        observation_task = self._observation_task
-        if observation_task is not None and not observation_task.done():
-            observation_task.cancel()
-            self._detach_callback(observation_task)
-            self._observation_task = None
 
         callback = self._on_completion
         if callback is None:

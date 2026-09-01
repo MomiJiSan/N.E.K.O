@@ -2642,13 +2642,35 @@ class DetectorRuntime:
             )
             if (
                 self._closed
-                or entry is None
-                or entry.revoked
-                or entry.verdict is not verdict
                 or not verdict.boundary_exact
                 or verdict._owner is not self._provider_boundary_snapshot_owner
                 or verdict.detector_epoch != self._detector_epoch
             ):
+                return False
+            if entry is None:
+                # Ordered seal atomically consumes the pre-seal entry before
+                # Runtime reuses its stable lease. Preserve the same proof
+                # across that one-way phase transition when the sealed exact
+                # capability still identifies the candidate. The caller is
+                # itself the rejection request, so the sealed capability does
+                # not need a pre-existing rejection-ready bit.
+                sealed = self._sealed_provider_candidate_rejection
+                fence = self._provider_candidate_fence
+                return bool(
+                    time.monotonic() < float(deadline)
+                    and sealed is not None
+                    and fence is not None
+                    and fence.boundary_exact
+                    and sealed.provider_fence == fence
+                    and sealed.candidate
+                    == DetectorCandidateKey(
+                        verdict.detector_epoch,
+                        verdict.candidate_generation,
+                    )
+                    and sealed.shadow_candidate.shadow_generation
+                    == verdict.shadow_generation
+                )
+            if entry.revoked or entry.verdict is not verdict:
                 return False
             if self._provider_preseal_reconciliation_status_locked(entry) == "applied":
                 return time.monotonic() < float(deadline)
@@ -2699,6 +2721,24 @@ class DetectorRuntime:
                 raise
             acquired = True
             entry = self._provider_preseal_entries.get(verdict.candidate_generation)
+            if entry is None:
+                sealed = self._sealed_provider_candidate_rejection
+                fence = self._provider_candidate_fence
+                if (
+                    time.monotonic() < float(deadline)
+                    and sealed is not None
+                    and fence is not None
+                    and fence.boundary_exact
+                    and sealed.provider_fence == fence
+                    and sealed.candidate
+                    == DetectorCandidateKey(
+                        verdict.detector_epoch,
+                        verdict.candidate_generation,
+                    )
+                    and sealed.shadow_candidate.shadow_generation
+                    == verdict.shadow_generation
+                ):
+                    return True
             if (
                 time.monotonic() >= float(deadline)
                 or self._closed
@@ -2772,7 +2812,7 @@ class DetectorRuntime:
                 if (
                     pending_snapshot is not None
                     and pending_snapshot.boundary_exact
-                    and pending_status == "applied"
+                    and pending_status in {"pending", "applied"}
                     and pending_snapshot._owner
                     is self._provider_boundary_snapshot_owner
                     and pending_snapshot.shadow_generation
@@ -3145,6 +3185,23 @@ class DetectorRuntime:
             or not math.isfinite(float(deadline))
         ):
             return stale
+        provider_preseal = lease.provider_preseal_verdict
+        if provider_preseal is not None and deadline is not None:
+            # A second-low may arrive while the exact ownership batch is still
+            # queued.  Pending is not stale: wait event-driven within the one
+            # caller-owned absolute admission budget, then revalidate again
+            # under the detector lock before publishing rejection readiness.
+            try:
+                settled = await self.wait_provider_speaker_preseal(
+                    provider_preseal,
+                    deadline=float(deadline),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                settled = False
+            if not settled:
+                return stale
         acquired = False
         try:
             if deadline is None:
@@ -4514,6 +4571,25 @@ class DetectorRuntime:
             or not math.isfinite(float(deadline))
         ):
             return None
+        waited_snapshot_owner: object | None = None
+        if (
+            deadline is not None
+            and type(speaker_snapshot) is ProviderSpeakerBoundarySnapshot
+            and speaker_snapshot.boundary_exact
+        ):
+            # Do not retire a still-pending exact receipt merely because the
+            # ordered endpoint reached seal first. Both lanes share the same
+            # caller-owned absolute admission deadline; settlement failure or
+            # timeout still falls through to the existing unknown downgrade.
+            if (
+                speaker_snapshot._owner is self._provider_boundary_snapshot_owner
+                and speaker_snapshot.detector_epoch == self._detector_epoch
+            ):
+                waited_snapshot_owner = speaker_snapshot._owner
+            await self.wait_provider_speaker_preseal(
+                speaker_snapshot,
+                deadline=float(deadline),
+            )
         acquired = False
         try:
             if deadline is None:
@@ -4533,6 +4609,12 @@ class DetectorRuntime:
             if deadline is not None and time.monotonic() >= float(deadline):
                 return None
             if self._closed or self._semantic_adapter is not None:
+                return None
+            if waited_snapshot_owner is not None and (
+                waited_snapshot_owner is not self._provider_boundary_snapshot_owner
+                or speaker_snapshot is None
+                or speaker_snapshot.detector_epoch != self._detector_epoch
+            ):
                 return None
             if turn_token is not None and type(turn_token) is not VoiceTurnToken:
                 return None

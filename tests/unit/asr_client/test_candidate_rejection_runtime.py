@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 import main_logic.asr_client.runtime as runtime_module
+from main_logic.asr_client.admission.contracts import (
+    SpeakerCheckpointKind,
+    SpeakerHigh,
+    SpeakerLow,
+)
 from main_logic.asr_client._provider_events import (
     ProviderAudioRange,
     ProviderEndpointNotification,
@@ -341,6 +346,283 @@ def test_rejection_request_outside_event_loop_fails_open() -> None:
         activation_generation="profile-generation",
     )
     assert runtime._speaker_verifier_diagnostics()["rejection_request_failed_count"] == 1
+
+
+def test_evidence_bridge_high_then_second_low_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    resolved: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda item, **_kwargs: resolved.append(item) or True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda *_args, **_kwargs: pytest.fail("second-low must not reject after high"),
+    )
+
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerHigh(candidate, 1),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert not runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert resolved == [candidate]
+
+
+def test_evidence_bridge_first_low_high_then_second_low_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    resolved: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "_request_speaker_candidate_decision_arm",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda item, **_kwargs: resolved.append(item) or True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda *_args, **_kwargs: pytest.fail("high must absorb later second-low"),
+    )
+
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerHigh(candidate, 2),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert not runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 3, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert resolved == [candidate]
+
+
+def test_evidence_bridge_second_low_without_first_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    resolved: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda item, **_kwargs: resolved.append(item) or True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda *_args, **_kwargs: pytest.fail("second-low requires first-low"),
+    )
+
+    assert not runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert resolved == [candidate]
+
+
+def test_evidence_bridge_duplicate_first_low_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    armed: list[SpeakerShadowCandidateKey] = []
+    resolved: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "_request_speaker_candidate_decision_arm",
+        lambda item, **_kwargs: armed.append(item) or True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda item, **_kwargs: resolved.append(item) or True,
+    )
+
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert not runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+
+    assert armed == [candidate]
+    assert resolved == [candidate]
+
+
+def test_reject_requested_survives_backend_degraded_during_arming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    degraded: list[bool] = []
+    monkeypatch.setattr(
+        runtime,
+        "_request_speaker_candidate_decision_arm",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_mark_speaker_verifier_degraded",
+        lambda *, preserve_reject_requested=False: (
+            degraded.append(preserve_reject_requested),
+            setattr(runtime, "_speaker_verifier_degraded", True),
+        ),
+    )
+
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    runtime._mark_speaker_evidence_backend_degraded(
+        activation_generation="profile-generation"
+    )
+
+    assert degraded == [True]
+    assert runtime._speaker_verifier_degraded is True
+    record = runtime._speaker_evidence_bridge_records[candidate]
+    assert record.reject_requested is True
+    assert record.unavailable is False
+
+
+def test_evidence_bridge_capacity_never_evicts_sticky_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    monkeypatch.setattr(runtime_module, "_MAX_SPEAKER_EVIDENCE_BRIDGE_RECORDS", 2)
+    monkeypatch.setattr(
+        runtime,
+        "_request_speaker_candidate_decision_arm",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "request_speaker_candidate_rejection",
+        lambda *_args, **_kwargs: True,
+    )
+    resolved: list[SpeakerShadowCandidateKey] = []
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_speaker_candidate_decision",
+        lambda item, **_kwargs: resolved.append(item) or True,
+    )
+    sticky_candidates = tuple(
+        SpeakerShadowCandidateKey(7, generation, "provider_candidate")
+        for generation in (31, 32)
+    )
+    for candidate in sticky_candidates:
+        assert runtime._accept_speaker_evidence_fact(
+            SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+            activation_generation="profile-generation",
+            enforce=True,
+        )
+        assert runtime._accept_speaker_evidence_fact(
+            SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+            activation_generation="profile-generation",
+            enforce=True,
+        )
+
+    overflow = SpeakerShadowCandidateKey(7, 33, "provider_candidate")
+    assert not runtime._accept_speaker_evidence_fact(
+        SpeakerLow(overflow, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+
+    assert tuple(runtime._speaker_evidence_bridge_records) == sticky_candidates
+    assert all(
+        record.reject_requested
+        for record in runtime._speaker_evidence_bridge_records.values()
+    )
+    assert resolved == [overflow]
+
+
+async def test_second_low_survives_capture_completion_during_arming() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    operation = runtime_module._SpeakerCandidateArmOperation(
+        candidate=candidate,
+        activation_generation="profile-generation",
+        provider_key=None,
+        resolved=asyncio.get_running_loop().create_future(),
+        reject_pending=True,
+    )
+    runtime._asr_speaker_candidate_arm_operation = operation
+
+    assert not runtime._resolve_speaker_candidate_decision(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    assert runtime._asr_speaker_candidate_arm_operation is operation
+    assert operation.reject_pending is True
+    assert not operation.resolved.done()
+
+
+async def test_reject_requested_survives_completion_before_ordered_seal() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._speaker_verifier_activation_generation = "profile-generation"
+    candidate = _shadow_candidate()
+    gate = SimpleNamespace(
+        candidate=candidate,
+        activation_generation="profile-generation",
+        rejection_task=None,
+        rejection_pending_seal=True,
+        resolved=asyncio.get_running_loop().create_future(),
+        retired=False,
+    )
+    runtime._asr_speaker_candidate_decision_gate = gate
+
+    assert not runtime._resolve_speaker_candidate_decision(
+        candidate,
+        activation_generation="profile-generation",
+    )
+    assert runtime._asr_speaker_candidate_decision_gate is gate
+    assert gate.rejection_pending_seal is True
+    assert not gate.resolved.done()
 
 
 @pytest.mark.parametrize(
@@ -1770,7 +2052,21 @@ async def test_preseal_two_low_rejection_is_upgraded_without_active_teardown() -
 
     assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
     assert lease.commit_calls == 2
-    assert runtime._asr_suppressed_final_key == final_key
+    assert runtime._asr_suppressed_final_key == final_key, (
+        {
+            name: value
+            for name, value in runtime._speaker_verifier_diagnostics().items()
+            if value
+        },
+        runtime._asr_speaker_candidate_decision_gate,
+        runtime._asr_speaker_candidate_arm_operation,
+        runtime._speaker_evidence_bridge_records,
+        {
+            name: value
+            for name, value in detector.speaker_rejection_diagnostics_snapshot().items()
+            if value
+        },
+    )
     assert runtime._asr_speaker_candidate_decision_gate is None
     runtime._reap_rejection_task(
         preseal_task,
@@ -2391,7 +2687,13 @@ async def test_exact_pause_merge_scores_before_seal_and_suppresses_final(
     if runtime._asr_rejection_tasks:
         await asyncio.gather(*tuple(runtime._asr_rejection_tasks))
     await asyncio.sleep(0)
-    assert runtime._asr_suppressed_final_key == final_key
+    assert runtime._asr_suppressed_final_key == final_key, (
+        runtime._speaker_verifier_diagnostics(),
+        runtime._asr_speaker_candidate_decision_gate,
+        runtime._asr_speaker_candidate_arm_operation,
+        runtime._speaker_evidence_bridge_records,
+        detector.speaker_rejection_diagnostics_snapshot(),
+    )
 
     await runtime._handle_provider_final(
         key,
@@ -3175,7 +3477,8 @@ async def test_real_speaker_shadow_2999ms_completion_confirms_waiting_final(
         assert diagnostics["speaker_gate_resolved_forward_count"] == 1
         assert diagnostics["rejection_task_scheduled_count"] == 0
     assert runtime._asr_speaker_candidate_decision_gate is None
-    assert not composition._armed_candidates
+    evidence_record = runtime._speaker_evidence_bridge_records[candidate]
+    assert evidence_record.closed is True
     composition_diagnostics = composition.diagnostics_snapshot()
     assert composition_diagnostics["speaker_completion_count"] == 1
     assert (
@@ -3288,7 +3591,8 @@ async def test_real_2999ms_reset_abandons_confirmation_and_forwards_final(
         await shadow.wait_idle()
         gate = runtime._asr_speaker_candidate_decision_gate
         assert gate is not None
-        assert candidate in composition._armed_candidates
+        evidence_record = runtime._speaker_evidence_bridge_records[candidate]
+        assert evidence_record.first_low_observed is True
         _seal_installed_provider_candidate(
             runtime,
             detector,
@@ -3329,12 +3633,10 @@ async def test_real_2999ms_reset_abandons_confirmation_and_forwards_final(
         shadow_metrics = shadow.snapshot()
         assert shadow_metrics["completion_abandoned_count"] == 1
         assert shadow_metrics["completion_count"] == 0
-        assert not composition._armed_candidates
         assert runtime._asr_speaker_candidate_decision_gate is None
         diagnostics = runtime._speaker_verifier_diagnostics()
         assert diagnostics["speaker_gate_waited_count"] == 1
         assert diagnostics["speaker_gate_timeout_count"] == 0
-        assert diagnostics["speaker_gate_released_verifier_degraded_count"] == 1
         assert diagnostics["rejection_task_scheduled_count"] == 0
         assert diagnostics["rejection_task_applied_count"] == 0
         callbacks.on_final.assert_awaited_once()

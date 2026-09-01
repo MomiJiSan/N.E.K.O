@@ -35,7 +35,14 @@ from ._provider_events import (
     ProviderUtteranceKey,
 )
 from .audio import AsrAudioDispatcher
-from .admission.contracts import AdmissionDisposition
+from .admission.contracts import (
+    AdmissionDisposition,
+    CaptureClosed,
+    SpeakerCheckpointKind,
+    SpeakerHigh,
+    SpeakerLow,
+    SpeakerUnavailable,
+)
 from .candidate_control import CandidateRejectionOutcome, CandidateRejectionRequest
 from ._registry_meta import AsrProviderAvailability
 from .endpointing.detector import (
@@ -111,6 +118,7 @@ _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS = 0.2
 _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS = 0.2
 _MAX_BUFFERED_PROVIDER_SPEAKER_SPANS = 8
 _MAX_PROVIDER_BOUNDARY_SNAPSHOTS = 8
+_MAX_SPEAKER_EVIDENCE_BRIDGE_RECORDS = 256
 _PROVIDER_MICRO_EVENT_SHADOW_CONFIG = ProviderMicroEventConfig(
     mode="shadow",
     calibration_revision=None,
@@ -323,6 +331,18 @@ class _SpeakerCandidateArmOperation:
     deadline: float | None = None
     wait_started: bool = False
     retired: bool = False
+
+
+@dataclass(slots=True)
+class _SpeakerEvidenceBridgeRecord:
+    """Commit-3 one-way adapter state; it never owns final disposition."""
+
+    activation_generation: str
+    last_sequence_no: int = 0
+    first_low_observed: bool = False
+    reject_requested: bool = False
+    unavailable: bool = False
+    closed: bool = False
 
 
 @dataclass(slots=True)
@@ -561,6 +581,7 @@ class IndependentAsrRuntime:
             # the Runtime half in the same linearization boundary so an old
             # profile cannot suppress a final after the replacement.
             self._asr_suppressed_final_key = None
+            self._speaker_evidence_bridge_records.clear()
 
     def _begin_speaker_candidate_decision_preparation(
         self,
@@ -733,6 +754,237 @@ class IndependentAsrRuntime:
             )
         return True
 
+    def _accept_speaker_evidence_fact(
+        self,
+        fact: SpeakerLow | SpeakerHigh | SpeakerUnavailable,
+        *,
+        activation_generation: str,
+        enforce: bool,
+    ) -> bool:
+        """Translate one ordered fact into the legacy gate during Commit 3.
+
+        This synchronous bridge owns neither transcript reservations nor final
+        disposition.  Commit 4 replaces it with direct coordinator posting.
+        """
+
+        self._ensure_asr_runtime_state()
+        if (
+            not isinstance(fact, (SpeakerLow, SpeakerHigh, SpeakerUnavailable))
+            or type(activation_generation) is not str
+            or activation_generation != self._speaker_verifier_activation_generation
+            or type(enforce) is not bool
+        ):
+            return False
+        candidate = fact.candidate
+        sequence_no = fact.sequence_no
+        if (
+            type(candidate) is not SpeakerShadowCandidateKey
+            or type(sequence_no) is not int
+            or sequence_no < 1
+        ):
+            return False
+        records = self._speaker_evidence_bridge_records
+        record = records.get(candidate)
+        if record is None:
+            if sequence_no != 1:
+                if enforce:
+                    self._resolve_speaker_candidate_decision(
+                        candidate,
+                        activation_generation=activation_generation,
+                    )
+                return False
+            if len(records) >= _MAX_SPEAKER_EVIDENCE_BRIDGE_RECORDS:
+                evictable = next(
+                    (
+                        (stale_candidate, stale_record)
+                        for stale_candidate, stale_record in records.items()
+                        if not stale_record.reject_requested
+                    ),
+                    None,
+                )
+                if evictable is None:
+                    if enforce:
+                        self._resolve_speaker_candidate_decision(
+                            candidate,
+                            activation_generation=activation_generation,
+                        )
+                    return False
+                stale_candidate, stale_record = evictable
+                records.pop(stale_candidate, None)
+                self._resolve_speaker_candidate_decision(
+                    stale_candidate,
+                    activation_generation=stale_record.activation_generation,
+                )
+            record = _SpeakerEvidenceBridgeRecord(activation_generation)
+            records[candidate] = record
+        elif record.activation_generation != activation_generation or record.closed:
+            return False
+        elif record.unavailable:
+            return False
+        elif sequence_no != record.last_sequence_no + 1:
+            if enforce and not record.reject_requested:
+                self._resolve_speaker_candidate_decision(
+                    candidate,
+                    activation_generation=activation_generation,
+                )
+            if not record.reject_requested:
+                record.unavailable = True
+            return False
+        record.last_sequence_no = sequence_no
+
+        if record.reject_requested:
+            # Once second-low is recorded, later high/unavailable/duplicate
+            # facts cannot retract the rejection intent. Only its owned apply
+            # operation or absolute deadline may resolve the legacy gate.
+            return True
+        if isinstance(fact, SpeakerUnavailable):
+            record.unavailable = True
+            if enforce:
+                self._resolve_speaker_candidate_decision(
+                    candidate,
+                    activation_generation=activation_generation,
+                )
+            return True
+        if not enforce:
+            return True
+        if isinstance(fact, SpeakerHigh):
+            if not record.reject_requested:
+                record.unavailable = True
+                self._resolve_speaker_candidate_decision(
+                    candidate,
+                    activation_generation=activation_generation,
+                )
+            return True
+
+        assert isinstance(fact, SpeakerLow)
+        if fact.checkpoint_kind is SpeakerCheckpointKind.FIRST:
+            if record.first_low_observed:
+                record.unavailable = True
+                if enforce:
+                    self._resolve_speaker_candidate_decision(
+                        candidate,
+                        activation_generation=activation_generation,
+                    )
+                return False
+            record.first_low_observed = True
+            if candidate.scope != "provider_candidate":
+                return True
+            armed = self._request_speaker_candidate_decision_arm(
+                candidate,
+                activation_generation=activation_generation,
+            )
+            if not armed:
+                record.unavailable = True
+            return armed
+        if fact.checkpoint_kind not in {
+            SpeakerCheckpointKind.SECOND,
+            SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+        }:
+            record.unavailable = True
+            self._resolve_speaker_candidate_decision(
+                candidate,
+                activation_generation=activation_generation,
+            )
+            return False
+        if not record.first_low_observed:
+            record.unavailable = True
+            self._resolve_speaker_candidate_decision(
+                candidate,
+                activation_generation=activation_generation,
+            )
+            return False
+        record.reject_requested = True
+        scheduled = self.request_speaker_candidate_rejection(
+            candidate,
+            activation_generation=activation_generation,
+        )
+        if not scheduled:
+            record.reject_requested = False
+            record.unavailable = True
+            self._resolve_speaker_candidate_decision(
+                candidate,
+                activation_generation=activation_generation,
+            )
+        return scheduled
+
+    def _close_speaker_evidence(
+        self,
+        closed: CaptureClosed,
+        *,
+        activation_generation: str,
+        enforce: bool,
+        evidence_complete: bool,
+    ) -> bool:
+        """Close capture without allowing completion to erase second-low."""
+
+        self._ensure_asr_runtime_state()
+        if (
+            type(closed) is not CaptureClosed
+            or type(activation_generation) is not str
+            or activation_generation != self._speaker_verifier_activation_generation
+            or type(enforce) is not bool
+            or type(evidence_complete) is not bool
+        ):
+            return False
+        candidate = closed.candidate
+        record = self._speaker_evidence_bridge_records.get(candidate)
+        if record is None:
+            if closed.through_sequence_no != 0:
+                return False
+            record = _SpeakerEvidenceBridgeRecord(activation_generation)
+            self._speaker_evidence_bridge_records[candidate] = record
+        if (
+            record.activation_generation != activation_generation
+            or record.closed
+            or closed.through_sequence_no != record.last_sequence_no
+        ):
+            return False
+        record.closed = True
+        if not evidence_complete and not record.reject_requested:
+            record.unavailable = True
+        if enforce and (record.unavailable or not record.reject_requested):
+            self._resolve_speaker_candidate_decision(
+                candidate,
+                activation_generation=activation_generation,
+            )
+        return True
+
+    def _mark_speaker_evidence_backend_degraded(
+        self,
+        *,
+        activation_generation: str,
+    ) -> None:
+        if activation_generation != self._speaker_verifier_activation_generation:
+            return
+        sticky_records = {
+            candidate: record
+            for candidate, record in self._speaker_evidence_bridge_records.items()
+            if record.reject_requested
+        }
+        for candidate, record in tuple(self._speaker_evidence_bridge_records.items()):
+            if candidate in sticky_records:
+                continue
+            self._resolve_speaker_candidate_decision(
+                candidate,
+                activation_generation=record.activation_generation,
+            )
+        self._speaker_evidence_bridge_records.clear()
+        self._speaker_evidence_bridge_records.update(sticky_records)
+        # A backend fault after second-low cannot retract an already-recorded
+        # rejection intent while its arm/apply operation is still in flight.
+        self._mark_speaker_verifier_degraded(
+            preserve_reject_requested=bool(sticky_records),
+        )
+
+    def _mark_speaker_evidence_backend_healthy(
+        self,
+        *,
+        activation_generation: str,
+    ) -> None:
+        if activation_generation != self._speaker_verifier_activation_generation:
+            return
+        self._mark_speaker_verifier_healthy()
+
     def _request_speaker_candidate_decision_arm(
         self,
         candidate: SpeakerShadowCandidateKey,
@@ -895,7 +1147,11 @@ class IndependentAsrRuntime:
         ):
             self._speaker_rejection_metrics["speaker_gate_arm_invalid_count"] += 1
             return False
-        if self._speaker_verifier_degraded:
+        sticky_reject = self._speaker_evidence_reject_is_sticky(
+            candidate,
+            activation_generation,
+        )
+        if self._speaker_verifier_degraded and not sticky_reject:
             self._speaker_rejection_metrics["speaker_gate_arm_degraded_count"] += 1
             return False
         verifier_health_generation = self._speaker_verifier_health_generation
@@ -970,11 +1226,14 @@ class IndependentAsrRuntime:
                 "speaker_gate_arm_prepare_failed_count"
             ] += 1
             return False
+        sticky_reject = self._speaker_evidence_reject_is_sticky(
+            candidate,
+            activation_generation,
+        )
         if (
             self._speaker_verifier_degraded
-            or self._speaker_verifier_health_generation
-            != verifier_health_generation
-        ):
+            or self._speaker_verifier_health_generation != verifier_health_generation
+        ) and not sticky_reject:
             self._speaker_rejection_metrics["speaker_gate_arm_degraded_count"] += 1
             return False
         if lease is None:
@@ -982,6 +1241,20 @@ class IndependentAsrRuntime:
                 "speaker_gate_arm_prepare_empty_count"
             ] += 1
             return False
+        arm_operation = self._asr_speaker_candidate_arm_operation
+        if (
+            provider_key is None
+            and arm_operation is not None
+            and not arm_operation.retired
+            and arm_operation.candidate == candidate
+            and arm_operation.activation_generation == activation_generation
+            and arm_operation.provider_key is not None
+        ):
+            # The boundary lane may bind the exact Provider alias while lease
+            # preparation is awaiting Detector.  Adopt only this same owned
+            # arm operation's one-way None -> key transition so its sticky
+            # second-low transfers to the gate instead of being orphaned.
+            provider_key = arm_operation.provider_key
         provider_preseal_verdict = getattr(
             lease,
             "provider_preseal_verdict",
@@ -1028,9 +1301,14 @@ class IndependentAsrRuntime:
                     and self._asr_audio_generation == audio_generation
                     and self._speaker_verifier_activation_generation
                     == activation_generation
-                    and not self._speaker_verifier_degraded
-                    and self._speaker_verifier_health_generation
-                    == verifier_health_generation
+                    and (
+                        (
+                            not self._speaker_verifier_degraded
+                            and self._speaker_verifier_health_generation
+                            == verifier_health_generation
+                        )
+                        or sticky_reject
+                    )
                     and self._asr_lifecycle is lifecycle
                     and self._asr_detector is detector
                     and self._asr_session is not None
@@ -1209,6 +1487,8 @@ class IndependentAsrRuntime:
             and operation.candidate == candidate
             and operation.activation_generation == activation_generation
         ):
+            if not rejected and operation.reject_pending:
+                return False
             return self._retire_speaker_candidate_arm_operation(
                 operation,
                 cancel=True,
@@ -1222,7 +1502,9 @@ class IndependentAsrRuntime:
             or gate.activation_generation != activation_generation
         ):
             return False
-        if not rejected and gate.rejection_task is not None:
+        if not rejected and (
+            gate.rejection_task is not None or gate.rejection_pending_seal
+        ):
             # Once rejection owns the exact gate, only its reaper may resolve
             # the final. Completion must not race an applied rejection and
             # release the transcript as a false forward.
@@ -1350,7 +1632,23 @@ class IndependentAsrRuntime:
         )
         return metrics
 
-    def _mark_speaker_verifier_degraded(self) -> None:
+    def _speaker_evidence_reject_is_sticky(
+        self,
+        candidate: SpeakerShadowCandidateKey,
+        activation_generation: str,
+    ) -> bool:
+        record = self._speaker_evidence_bridge_records.get(candidate)
+        return bool(
+            record is not None
+            and record.activation_generation == activation_generation
+            and record.reject_requested
+        )
+
+    def _mark_speaker_verifier_degraded(
+        self,
+        *,
+        preserve_reject_requested: bool = False,
+    ) -> None:
         """Expose Owner verifier health without changing ASR transport flow."""
 
         self._ensure_asr_runtime_state()
@@ -1358,19 +1656,38 @@ class IndependentAsrRuntime:
             self._speaker_verifier_health_generation += 1
         self._speaker_verifier_degraded = True
         arm_operation = self._asr_speaker_candidate_arm_operation
-        if arm_operation is not None:
+        if arm_operation is not None and not (
+            preserve_reject_requested
+            and arm_operation.reject_pending
+            and self._speaker_evidence_reject_is_sticky(
+                arm_operation.candidate,
+                arm_operation.activation_generation,
+            )
+        ):
             self._retire_speaker_candidate_arm_operation(
                 arm_operation,
                 cancel=True,
             )
         preparation = self._asr_speaker_candidate_decision_preparation
-        if preparation is not None:
+        if preparation is not None and not (
+            preserve_reject_requested
+            and self._speaker_evidence_reject_is_sticky(
+                preparation.candidate,
+                preparation.activation_generation,
+            )
+        ):
             preparation.retired = True
             if not preparation.resolved.done():
                 preparation.resolved.set_result(None)
             self._asr_speaker_candidate_decision_preparation = None
         gate = self._asr_speaker_candidate_decision_gate
-        if gate is not None and gate.rejection_task is None:
+        if gate is not None and not (
+            preserve_reject_requested
+            and self._speaker_evidence_reject_is_sticky(
+                gate.candidate,
+                gate.activation_generation,
+            )
+        ) and gate.rejection_task is None and not gate.rejection_pending_seal:
             self._release_speaker_candidate_decision_gate(
                 gate,
                 metric_name="speaker_gate_released_verifier_degraded_count",
@@ -1726,6 +2043,10 @@ class IndependentAsrRuntime:
         ) = None
         self._asr_rejection_tasks: set[asyncio.Task[Any]] = set()
         self._asr_speaker_candidate_arm_tasks: set[asyncio.Task[None]] = set()
+        self._speaker_evidence_bridge_records: OrderedDict[
+            SpeakerShadowCandidateKey,
+            _SpeakerEvidenceBridgeRecord,
+        ] = OrderedDict()
         self._speaker_rejection_metrics = _new_speaker_rejection_metrics()
         self._asr_rejection_watchdog_task: asyncio.Task[None] | None = None
         self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
@@ -1876,6 +2197,8 @@ class IndependentAsrRuntime:
             self._asr_rejection_watchdog_task = None
         if not hasattr(self, "_asr_speaker_candidate_arm_tasks"):
             self._asr_speaker_candidate_arm_tasks = set()
+        if not hasattr(self, "_speaker_evidence_bridge_records"):
+            self._speaker_evidence_bridge_records = OrderedDict()
 
     def _capture_turn_token(
         self,
