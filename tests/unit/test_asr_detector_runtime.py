@@ -7,8 +7,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import main_logic.asr_client.endpointing.detector_runtime as detector_runtime_module
 from main_logic.asr_client._provider_events import ProviderAudioRange
 from main_logic.asr_client.endpointing.detector_runtime import (
+    DetectorCandidateRejectionCommitResult,
     DetectorCandidateRejectionLease,
     DetectorFeedResult,
     DetectorRuntime,
@@ -45,7 +47,15 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowBatchReconcileReceipt,
     SpeakerShadowBatchReconcileRequest,
     SpeakerShadowCandidateKey,
+    SpeakerShadowCaptureDecisionState,
+    SpeakerShadowCaptureDisposition,
+    SpeakerShadowCaptureResult,
+    SpeakerShadowConfig,
+    SpeakerShadowObservation,
+    SpeakerShadowTerminalCoverageReceipt,
+    SpeakerShadowTerminalCoverageRequest,
 )
+from main_logic.asr_client.speaker_shadow.runtime import SpeakerShadowRuntime
 from main_logic.asr_client.endpointing.throttle_policy import (
     ThrottleAction,
     VoiceThrottlePolicy,
@@ -83,6 +93,22 @@ class _Gate:
         return self.events
 
     def reset(self) -> None:
+        return None
+
+
+class _LowScoreSpeakerBackendFactory:
+    def __call__(self) -> "_LowScoreSpeakerBackend":
+        return _LowScoreSpeakerBackend()
+
+
+class _LowScoreSpeakerBackend:
+    def load(self) -> bool:
+        return True
+
+    def score(self, _pcm16: bytes, _sample_rate_hz: int) -> float:
+        return 0.2
+
+    def close(self) -> None:
         return None
 
 
@@ -582,7 +608,121 @@ class _ReconcilingSpeakerShadowSpy(_DeferredSpeakerShadowSpy):
         self,
         receipt: SpeakerShadowBatchReconcileReceipt,
     ) -> None:
-        self.revoked_receipts.append(receipt)
+        if receipt not in self.revoked_receipts:
+            self.revoked_receipts.append(receipt)
+
+
+class _MalformedBatchReceiptSpeakerShadowSpy(_ReconcilingSpeakerShadowSpy):
+    def reconcile_candidate_batch(
+        self,
+        request: SpeakerShadowBatchReconcileRequest,
+    ) -> SpeakerShadowBatchReconcileReceipt | None:
+        admitted = super().reconcile_candidate_batch(request)
+        if admitted is None:
+            return None
+        malformed = SpeakerShadowBatchReconcileReceipt(
+            runtime_generation=admitted.runtime_generation,
+            batch_id=admitted.batch_id,
+            target=admitted.target,
+            suffix=admitted.suffix,
+            target_sample_count=admitted.target_sample_count + 1,
+            suffix_sample_count=admitted.suffix_sample_count,
+            _owner=admitted._owner,
+        )
+        self.batch_receipts[-1] = malformed
+        return malformed
+
+
+class _MalformedTerminalReceiptSpeakerShadowSpy(_ReconcilingSpeakerShadowSpy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal_receipts: list[SpeakerShadowTerminalCoverageReceipt] = []
+        self.revoked_terminal_receipts: list[
+            SpeakerShadowTerminalCoverageReceipt
+        ] = []
+        self.terminal_receipt_statuses: dict[
+            SpeakerShadowTerminalCoverageReceipt, str
+        ] = {}
+        self._terminal_owner = object()
+
+    def submit_capture(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> SpeakerShadowCaptureResult:
+        assert self.submit(
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+            candidate=candidate,
+        )
+        accepted_sample_count = len(pcm16) // 2
+        cumulative_sample_count = self.sample_counts[candidate]
+        return SpeakerShadowCaptureResult(
+            disposition=SpeakerShadowCaptureDisposition.COMPLETE,
+            accepted_sample_count=accepted_sample_count,
+            cumulative_sample_count=cumulative_sample_count,
+            completed_window_sample_count=cumulative_sample_count,
+            decision_state=SpeakerShadowCaptureDecisionState.SCORED,
+        )
+
+    def reconcile_finalized_candidate_coverage(
+        self,
+        request: SpeakerShadowTerminalCoverageRequest,
+    ) -> SpeakerShadowTerminalCoverageReceipt:
+        malformed = SpeakerShadowTerminalCoverageReceipt(
+            runtime_generation=0,
+            batch_id=len(self.terminal_receipts) + 1,
+            target=request.target,
+            suffix=request.suffix,
+            retained_sample_count=request.scored_window_end_sample,
+            covered_sample_count=request.provider_exact_end_sample + 1,
+            terminal_preserved=True,
+            _owner=self._terminal_owner,
+        )
+        self.terminal_receipts.append(malformed)
+        return malformed
+
+    def terminal_coverage_status(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> str:
+        if receipt in self.revoked_terminal_receipts:
+            return "failed"
+        return self.terminal_receipt_statuses.get(receipt, "pending")
+
+    def revoke_terminal_coverage(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> None:
+        if receipt not in self.revoked_terminal_receipts:
+            self.revoked_terminal_receipts.append(receipt)
+
+
+class _BlockingSettlementSpeakerShadowSpy(_ReconcilingSpeakerShadowSpy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_status = "pending"
+        self.settlement_started = asyncio.Event()
+        self.settlement_release = asyncio.Event()
+        self.settlement_returning = asyncio.Event()
+
+    async def wait_reconciliation_settled(
+        self,
+        receipt: SpeakerShadowBatchReconcileReceipt,
+        *,
+        deadline: float,
+    ) -> str:
+        assert deadline > asyncio.get_running_loop().time()
+        self.settlement_started.set()
+        await self.settlement_release.wait()
+        if receipt in self.revoked_receipts:
+            self.settlement_returning.set()
+            return "failed"
+        self.receipt_statuses[receipt] = "applied"
+        self.settlement_returning.set()
+        return "applied"
 
 
 def _smart_turn_policy() -> AsrProviderPolicy:
@@ -605,6 +745,33 @@ def _provider_endpoint_policy() -> AsrProviderPolicy:
         warm_transport_ms=25_000,
         replay_policy="preconnect_only",
     )
+
+
+def _provider_speaker_config() -> SpeakerShadowConfig:
+    return SpeakerShadowConfig(
+        enabled=True,
+        minimum_audio_ms=1_500,
+        maximum_audio_ms=4_000,
+        observation_checkpoints_ms=(1_500, 3_000),
+        similarity_thresholds=(0.40,),
+        completion_confirmation_scopes=("provider_candidate",),
+        pending_observation_gate_scopes=("provider_candidate",),
+        queue_capacity=32,
+        terminal_queue_capacity=16,
+        buffered_candidate_capacity=8,
+        finalized_candidate_capacity=32,
+        idle_unload_seconds=60.0,
+        callback_timeout_seconds=0.1,
+        backend_load_timeout_seconds=3.0,
+        backend_score_timeout_seconds=1.0,
+        backend_close_timeout_seconds=1.0,
+        shutdown_grace_seconds=0.1,
+        process_terminate_timeout_seconds=0.5,
+    )
+
+
+def _speaker_pcm(duration_ms: int) -> bytes:
+    return b"\x21\x00" * (16_000 * duration_ms // 1_000)
 
 
 def _ingress_token() -> VoiceIngressToken:
@@ -696,6 +863,520 @@ async def _open_provider_candidate(
     token = VoiceTurnToken(ingress, turn_id=turn_id)
     assert await detector.bind_candidate(result.candidate, token) is not None
     return result.candidate, result.identity, token
+
+
+async def _open_real_terminal_provider_candidate(
+    *,
+    duration_ms: int,
+) -> tuple[
+    DetectorRuntime,
+    SpeakerShadowRuntime,
+    DetectorCandidateRejectionLease,
+    VoiceTurnToken,
+    list[SpeakerShadowObservation],
+]:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+        on_observation=observe,
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    _candidate, identity, token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    await detector.observe_provider_audio_ordered(
+        _speaker_pcm(1_500),
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=1,
+        split_before_audio=False,
+    )
+    await shadow.wait_idle()
+    segment = detector._provider_speaker_segments[0]
+    assert segment.candidate is not None
+    lease = await detector.prepare_candidate_rejection(segment.candidate)
+    assert lease is not None
+
+    await detector.observe_provider_audio_ordered(
+        _speaker_pcm(1_500),
+        sample_rate_hz=16_000,
+        identity=identity,
+        sequence_no=2,
+        split_before_audio=False,
+    )
+    await shadow.wait_idle()
+    remaining_ms = duration_ms - 3_000
+    sequence_no = 3
+    while remaining_ms > 0:
+        chunk_ms = min(1_000, remaining_ms)
+        await detector.observe_provider_audio_ordered(
+            _speaker_pcm(chunk_ms),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=sequence_no,
+            split_before_audio=False,
+        )
+        remaining_ms -= chunk_ms
+        sequence_no += 1
+    return detector, shadow, lease, token, observations
+
+
+async def test_real_terminal_capture_survives_twelve_second_exact_boundary() -> None:
+    detector, shadow, lease, token, observations = (
+        await _open_real_terminal_provider_candidate(duration_ms=12_000)
+    )
+    try:
+        assert [
+            (observation.checkpoint_ms, observation.similarity)
+            for observation in observations
+        ] == [(1_500, 0.2), (3_000, 0.2)]
+        segment = detector._provider_speaker_segments[0]
+        assert segment.ownership_complete is True
+        assert segment.shadow_capture_state.value == "complete"
+        assert segment.last_progress_at > segment.created_at
+        assert (
+            segment.detector_candidate
+            not in detector._provider_micro_event_ambiguous_candidates
+        )
+
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 12 * 16_000)
+        )
+        assert snapshot is not None
+        assert snapshot.boundary_exact is True
+        deadline = asyncio.get_running_loop().time() + 1.0
+        assert await detector.wait_provider_speaker_preseal(
+            snapshot,
+            deadline=deadline,
+        )
+        assert (
+            await lease.commit_async(
+                deadline=asyncio.get_running_loop().time() + 1.0
+            )
+            is DetectorCandidateRejectionCommitResult.PRESEAL_READY
+        )
+        fence = await detector.seal_provider_candidate(
+            token,
+            speaker_snapshot=snapshot,
+        )
+        assert fence is not None
+        assert fence.boundary_exact is True
+        assert (
+            await lease.commit_async(
+                deadline=asyncio.get_running_loop().time() + 1.0
+            )
+            is DetectorCandidateRejectionCommitResult.SEALED_APPLIED
+        )
+    finally:
+        await detector.close()
+
+
+async def test_terminal_coverage_suffix_is_unavailable_and_micro_event_ambiguous() -> (
+    None
+):
+    detector, _shadow, _lease, _token, _observations = (
+        await _open_real_terminal_provider_candidate(duration_ms=12_000)
+    )
+    try:
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 10 * 16_000)
+        )
+        assert snapshot is not None
+        assert snapshot.boundary_exact is True
+        assert await detector.wait_provider_speaker_preseal(
+            snapshot,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert len(detector._provider_speaker_segments) == 1
+        successor = detector._provider_speaker_segments[0]
+        assert successor.shadow_capture_state.value == "unavailable"
+        assert (
+            successor.detector_candidate
+            in detector._provider_micro_event_ambiguous_candidates
+        )
+    finally:
+        await detector.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary",),
+    [
+        (ProviderAudioRange(1_600, 48_000),),
+        (ProviderAudioRange(0, 46_400),),
+    ],
+    ids=("trimmed-prefix", "short-terminal-window"),
+)
+async def test_real_terminal_capture_rejects_trimmed_scoring_coverage(
+    boundary: ProviderAudioRange,
+) -> None:
+    detector, _shadow, _lease, _token, _observations = (
+        await _open_real_terminal_provider_candidate(duration_ms=3_000)
+    )
+    try:
+        snapshot = await detector.reconcile_provider_endpoint(boundary)
+        assert snapshot is not None
+        assert snapshot.boundary_exact is False
+        assert snapshot.evidence_complete is False
+    finally:
+        await detector.close()
+
+
+async def test_malformed_terminal_receipt_is_revoked_without_batch_fallback() -> (
+    None
+):
+    shadow = _MalformedTerminalReceiptSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x21\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 160)
+        )
+
+        assert snapshot is not None and snapshot.boundary_exact is False
+        assert len(shadow.terminal_receipts) == 1
+        receipt = shadow.terminal_receipts[0]
+        assert shadow.revoked_terminal_receipts == [receipt]
+        assert shadow.batch_requests == []
+        shadow.terminal_receipt_statuses[receipt] = "applied"
+        assert shadow.terminal_coverage_status(receipt) == "failed"
+        fence = await detector.seal_provider_candidate(
+            token,
+            speaker_snapshot=snapshot,
+        )
+        assert fence is not None and fence.boundary_exact is False
+    finally:
+        await detector.close()
+
+
+async def test_malformed_batch_receipt_is_revoked_before_unknown_fallback() -> None:
+    shadow = _MalformedBatchReceiptSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x31\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 160)
+        )
+
+        assert snapshot is not None and snapshot.boundary_exact is False
+        assert len(shadow.batch_receipts) == 1
+        receipt = shadow.batch_receipts[0]
+        assert shadow.revoked_receipts == [receipt]
+        shadow.receipt_statuses[receipt] = "applied"
+        assert shadow.reconciliation_status(receipt) == "failed"
+        fence = await detector.seal_provider_candidate(
+            token,
+            speaker_snapshot=snapshot,
+        )
+        assert fence is not None and fence.boundary_exact is False
+    finally:
+        await detector.close()
+
+
+async def test_provider_seal_deadline_expires_without_late_fence_mutation() -> None:
+    shadow = _ReconcilingSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        candidate, identity, token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x41\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 160)
+        )
+        assert snapshot is not None and snapshot.boundary_exact is True
+
+        await detector._lock.acquire()
+        try:
+            fence = await asyncio.wait_for(
+                detector.seal_provider_candidate(
+                    token,
+                    speaker_snapshot=snapshot,
+                    deadline=asyncio.get_running_loop().time() + 0.01,
+                ),
+                timeout=1.0,
+            )
+        finally:
+            detector._lock.release()
+
+        assert fence is None
+        assert detector._provider_candidate_fence is None
+        assert detector._candidate_generation == candidate.candidate_generation
+        assert detector._provider_preseal_entries[0].verdict is snapshot
+
+        fence = await detector.seal_provider_candidate(
+            token,
+            speaker_snapshot=snapshot,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert fence is not None and fence.boundary_exact is True
+    finally:
+        if detector._lock.locked():
+            detector._lock.release()
+        await detector.close()
+
+
+async def test_provider_segment_expiry_tracks_idle_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        detector_runtime_module,
+        "_PROVIDER_SEGMENT_EXPIRY_SECONDS",
+        0.05,
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=_ReconcilingSpeakerShadowSpy(),
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        for sequence_no in range(1, 5):
+            await detector.observe_provider_audio_ordered(
+                b"\x11\x00" * 160,
+                sample_rate_hz=16_000,
+                identity=identity,
+                sequence_no=sequence_no,
+                split_before_audio=False,
+            )
+            await asyncio.sleep(0.025)
+        assert detector._provider_speaker_segments
+
+        await asyncio.sleep(0.08)
+        assert not detector._provider_speaker_segments
+        assert detector._provider_segment_alignment_lost is True
+    finally:
+        await detector.close()
+
+
+async def test_provider_sequence_gap_does_not_renew_idle_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        detector_runtime_module,
+        "_PROVIDER_SEGMENT_EXPIRY_SECONDS",
+        0.08,
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=_ReconcilingSpeakerShadowSpy(),
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x11\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+        progress_at = detector._provider_speaker_segments[0].last_progress_at
+        await asyncio.sleep(0.05)
+        await detector.observe_provider_audio_ordered(
+            b"\x12\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=3,
+            split_before_audio=False,
+        )
+        assert detector._provider_speaker_segments[0].last_progress_at == progress_at
+
+        await asyncio.sleep(0.06)
+        assert not detector._provider_speaker_segments
+    finally:
+        await detector.close()
+
+
+async def test_provider_preseal_wait_cancelled_during_post_await_lock_revokes() -> (
+    None
+):
+    shadow = _BlockingSettlementSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x31\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 160)
+        )
+        assert snapshot is not None and snapshot.boundary_exact
+        wait_task = asyncio.create_task(
+            detector.wait_provider_speaker_preseal(
+                snapshot,
+                deadline=asyncio.get_running_loop().time() + 1.0,
+            )
+        )
+        await shadow.settlement_started.wait()
+        await detector._lock.acquire()
+        shadow.settlement_release.set()
+        await shadow.settlement_returning.wait()
+        wait_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+        assert shadow.revoked_receipts == shadow.batch_receipts
+        detector._lock.release()
+    finally:
+        if detector._lock.locked():
+            detector._lock.release()
+        await detector.close()
+
+
+async def test_provider_preseal_wait_reset_during_settlement_fails_open() -> None:
+    shadow = _BlockingSettlementSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x31\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 160)
+        )
+        assert snapshot is not None and snapshot.boundary_exact
+        wait_task = asyncio.create_task(
+            detector.wait_provider_speaker_preseal(
+                snapshot,
+                deadline=asyncio.get_running_loop().time() + 1.0,
+            )
+        )
+        await shadow.settlement_started.wait()
+        await detector.reset()
+        shadow.settlement_release.set()
+        assert await wait_task is False
+        assert shadow.revoked_receipts == shadow.batch_receipts
+    finally:
+        await detector.close()
+
+
+async def test_provider_preseal_late_applied_receipt_is_revoked_after_deadline() -> (
+    None
+):
+    shadow = _BlockingSettlementSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        await detector.observe_provider_audio_ordered(
+            b"\x31\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+        )
+        snapshot = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 160)
+        )
+        assert snapshot is not None and snapshot.boundary_exact
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 0.02
+        wait_task = asyncio.create_task(
+            detector.wait_provider_speaker_preseal(
+                snapshot,
+                deadline=deadline,
+            )
+        )
+        await shadow.settlement_started.wait()
+        loop.call_at(deadline + 0.01, shadow.settlement_release.set)
+
+        assert await asyncio.wait_for(wait_task, 1) is False
+        assert shadow.revoked_receipts == shadow.batch_receipts
+    finally:
+        await detector.close()
 
 
 async def test_speaker_shadow_default_none_keeps_smart_turn_callbacks_installed() -> (
@@ -1211,10 +1892,12 @@ async def test_exact_boundary_rejects_cursor_gap_after_late_sealed_chunk() -> No
         (segment.start_sample_16k, segment.end_sample_16k)
         for segment in detector._provider_speaker_segments
     ] == [(160, 320)]
-    assert (
-        await detector.reconcile_provider_endpoint(ProviderAudioRange(160, 480))
-        is None
+    cursor_gap = await detector.reconcile_provider_endpoint(
+        ProviderAudioRange(160, 480)
     )
+    assert type(cursor_gap) is ProviderSpeakerBoundarySnapshot
+    assert cursor_gap.boundary_exact is False
+    assert cursor_gap.evidence_complete is False
     assert not detector._provider_speaker_segments
     diagnostics = detector.speaker_rejection_diagnostics_snapshot()
     assert diagnostics["provider_speaker_segment_exact_reconcile_failed_count"] == 1
@@ -2831,6 +3514,61 @@ async def test_candidate_rejection_commit_fails_open_while_detector_lock_is_busy
         detector._lock.release()
 
     assert lease.commit() is True
+    await detector.close()
+
+
+async def test_candidate_rejection_async_commit_waits_for_short_lock_contention() -> (
+    None
+):
+    (
+        detector,
+        _shadow,
+        _candidate,
+        shadow_candidate,
+        _turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+    lease = await detector.prepare_candidate_rejection(shadow_candidate)
+    assert lease is not None
+
+    await detector._lock.acquire()
+    commit_task = asyncio.create_task(
+        lease.commit_async(deadline=asyncio.get_running_loop().time() + 1.0)
+    )
+    detector._lock.release()
+    assert (
+        await commit_task
+        is DetectorCandidateRejectionCommitResult.ACTIVE_APPLIED
+    )
+    await detector.close()
+
+
+async def test_candidate_rejection_async_commit_deadline_retires_late_authority() -> (
+    None
+):
+    (
+        detector,
+        _shadow,
+        _candidate,
+        shadow_candidate,
+        _turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+    lease = await detector.prepare_candidate_rejection(shadow_candidate)
+    assert lease is not None
+
+    await detector._lock.acquire()
+    try:
+        result = await lease.commit_async(
+            deadline=asyncio.get_running_loop().time() + 0.01
+        )
+    finally:
+        detector._lock.release()
+    assert result is DetectorCandidateRejectionCommitResult.STALE
+
+    await detector.reset()
+    assert (
+        await lease.commit_async(deadline=asyncio.get_running_loop().time() + 0.1)
+        is DetectorCandidateRejectionCommitResult.STALE
+    )
     await detector.close()
 
 
