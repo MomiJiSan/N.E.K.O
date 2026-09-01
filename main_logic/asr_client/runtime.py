@@ -5792,12 +5792,19 @@ class IndependentAsrRuntime:
                         and self._asr_provider_boundary_snapshots.get(key) is record
                         and record.operation_version == operation_version
                     ):
-                        exact_settled = bool(
-                            await wait_preseal(
-                                snapshot,
-                                deadline=record.absolute_deadline,
+                        remaining = record.absolute_deadline - time.monotonic()
+                        if remaining > 0:
+                            exact_settled = bool(
+                                await asyncio.wait_for(
+                                    wait_preseal(
+                                        snapshot,
+                                        deadline=record.absolute_deadline,
+                                    ),
+                                    timeout=remaining,
+                                )
                             )
-                        )
+                        if time.monotonic() >= record.absolute_deadline:
+                            exact_settled = False
         except TimeoutError:
             exact_settled = False
         except asyncio.CancelledError:
@@ -5832,7 +5839,6 @@ class IndependentAsrRuntime:
                 boundary_quality="unknown",
                 audio_range=None,
             )
-            snapshot = None
         if (
             key in self._asr_ordered_provider_keys
             or key in self._asr_completed_provider_keys

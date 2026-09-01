@@ -132,6 +132,25 @@ def test_missing_registry_diagnostics_preserve_fixed_schema() -> None:
     }
 
 
+def test_voice_identity_diagnostics_include_gate_and_completion_counters() -> None:
+    expected = {
+        "speaker_gate_provisional_armed_count",
+        "speaker_gate_provisional_promoted_count",
+        "speaker_gate_final_before_first_observation_count",
+        "speaker_gate_provisional_timeout_count",
+        "speaker_gate_arm_provisional_stale_count",
+        "speaker_gate_arm_degraded_count",
+        "speaker_gate_arm_pending_count",
+        "speaker_gate_released_verifier_degraded_count",
+        "speaker_completion_count",
+        "speaker_completion_before_first_checkpoint_count",
+        "speaker_completion_after_first_checkpoint_count",
+        "speaker_completion_stale_count",
+    }
+
+    assert expected <= runtime_module._VOICE_IDENTITY_DIAGNOSTIC_COUNTERS
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_activation_updates_current_and_future_managers() -> None:

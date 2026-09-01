@@ -1857,8 +1857,7 @@ async def test_terminal_receipt_timeout_cannot_late_upgrade_unknown(
     )
     detector.reconcile_provider_endpoint.return_value = snapshot
     settlement_entered = asyncio.Event()
-    settlement_timed_out = asyncio.Event()
-    late_receipt = asyncio.Event()
+    settlement_release = asyncio.Event()
 
     async def settle_until_deadline(
         observed: ProviderSpeakerBoundarySnapshot,
@@ -1867,14 +1866,7 @@ async def test_terminal_receipt_timeout_cannot_late_upgrade_unknown(
     ) -> bool:
         assert observed is snapshot
         settlement_entered.set()
-        try:
-            await asyncio.wait_for(
-                late_receipt.wait(),
-                timeout=max(0.0, deadline - time.monotonic()),
-            )
-        except TimeoutError:
-            settlement_timed_out.set()
-            return False
+        await settlement_release.wait()
         return True
 
     detector.wait_provider_speaker_preseal.side_effect = settle_until_deadline
@@ -1890,17 +1882,19 @@ async def test_terminal_receipt_timeout_cannot_late_upgrade_unknown(
         component._handle_provider_endpoint_notification(boundary, epoch)
     )
     await asyncio.wait_for(settlement_entered.wait(), 1)
-    await asyncio.wait_for(settlement_timed_out.wait(), 1)
+    record = component._asr_provider_boundary_snapshots[boundary.key]
+    record.absolute_deadline = time.monotonic() - 1
+    settlement_release.set()
     await asyncio.wait_for(boundary_task, 1)
 
-    record = component._asr_provider_boundary_snapshots[boundary.key]
     assert record.state == "ready_unknown"
-    assert record.snapshot is None
+    assert record.snapshot is snapshot
     assert record.preseal_settled.is_set()
 
-    late_receipt.set()
-    assert record.state == "ready_unknown"
-    assert record.snapshot is None
+    await component._handle_ordered_provider_endpoint(boundary, epoch)
+    detector.retire_provider_speaker_boundary_unknown.assert_awaited_once_with(
+        snapshot
+    )
 
 
 async def test_keyed_boundary_snapshot_overflow_fails_open_without_losing_final() -> (
