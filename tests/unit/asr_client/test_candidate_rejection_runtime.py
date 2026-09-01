@@ -16,6 +16,7 @@ from main_logic.asr_client.admission.contracts import (
     CandidateBound,
     CaptureClosed,
     FinalDeadlineExpired,
+    LifecycleSettled,
     MicroEventAllowed,
     MicroEventPending,
     MicroEventSuppressed,
@@ -31,6 +32,7 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerCheckpointKind,
     SpeakerHigh,
     SpeakerLow,
+    TransportSettled,
 )
 from main_logic.asr_client.admission.coordinator import (
     VoiceTurnAdmissionCoordinator,
@@ -293,7 +295,7 @@ def _install_active_candidate(
     return session, lifecycle, turn_token
 
 
-def _seal_provider_candidate(
+async def _seal_provider_candidate(
     runtime: IndependentAsrRuntime,
     detector: _RejectionDetector,
 ) -> tuple[
@@ -307,6 +309,13 @@ def _seal_provider_candidate(
         detector,
         provider="qwen",
         endpointing_mode="provider",
+    )
+    if not runtime._asr_admission_ingress_started:
+        await runtime._asr_admission_ingress.start()
+        runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    runtime._asr_admission_reservation_dispatchers[FinalKey.from_turn(turn_token)] = (
+        runtime._asr_transcript_dispatcher
     )
     provider_fence = _seal_installed_provider_candidate(
         runtime,
@@ -1250,8 +1259,8 @@ async def test_exact_speaker_and_micro_event_suppress_only_once() -> None:
             now=10.11,
         )
         assert sum(
-            isinstance(effect, ResolveReserved)
-            for effect in (*speaker_effects, *micro_effects)
+                isinstance(effect, ResolveReserved)
+                for effect in (*speaker_effects, *micro_effects)
         ) == 1
         record = await coordinator.get_record(turn_token)
         assert record is not None
@@ -1289,7 +1298,7 @@ async def test_provider_micro_event_decision_is_stale_after_completion_drift() -
     callbacks = _callbacks()
     runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
-    _session, _lifecycle, turn_token, _provider_fence = _seal_provider_candidate(
+    _session, _lifecycle, turn_token, _provider_fence = await _seal_provider_candidate(
         runtime,
         detector,
     )
@@ -1306,7 +1315,7 @@ async def test_provider_micro_event_decision_is_stale_after_completion_drift() -
     await runtime._handle_independent_asr_final("嗯", 0, "qwen")
 
     callbacks.on_final.assert_not_awaited()
-    assert runtime._asr_transcript_dispatcher.try_reserve(
+    assert not runtime._asr_transcript_dispatcher.try_reserve(
         FinalKey.from_turn(turn_token)
     )
     diagnostics = runtime._speaker_verifier_diagnostics()
@@ -1319,10 +1328,17 @@ async def test_provider_completion_rejects_session_replacement_during_await() ->
     callbacks = _callbacks()
     runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
-    _session, _lifecycle, turn_token, _provider_fence = _seal_provider_candidate(
-        runtime,
-        detector,
+    _session, lifecycle, turn_token, _provider_fence = await _seal_provider_candidate(
+        runtime, detector
     )
+    posted_events: list[object] = []
+    post_admission_event = runtime._post_admission_event
+
+    async def capture_admission_event(token, event, **kwargs):
+        posted_events.append(event)
+        return await post_admission_event(token, event, **kwargs)
+
+    runtime._post_admission_event = capture_admission_event
 
     async def replace_session_during_completion(_provider_fence) -> bool:
         runtime._asr_session = SimpleNamespace(
@@ -1337,12 +1353,27 @@ async def test_provider_completion_rejects_session_replacement_during_await() ->
         replace_session_during_completion
     )
 
-    await runtime._handle_independent_asr_final("stale-final", 0, "qwen")
+    settled = await runtime._handle_independent_asr_final(
+        "stale-final",
+        0,
+        "qwen",
+    )
+    assert settled is not None
+    await asyncio.wait_for(settled.wait(), 1)
+    await runtime.wait_transcript_idle()
 
-    callbacks.on_final.assert_not_awaited()
+    callbacks.on_final.assert_awaited_once()
+    assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    assert any(
+        isinstance(event, TransportSettled) and event.degraded
+        for event in posted_events
+    )
+    assert any(
+        isinstance(event, LifecycleSettled) and event.degraded
+        for event in posted_events
+    )
     final_key = FinalKey.from_turn(turn_token)
-    assert runtime._asr_transcript_dispatcher.try_reserve(final_key)
-    runtime._asr_transcript_dispatcher.release(final_key)
+    assert not runtime._asr_transcript_dispatcher.try_reserve(final_key)
     await _close_dispatchers(runtime)
 
 
@@ -1355,7 +1386,7 @@ async def test_provider_micro_event_suppression_preserves_same_text_successor() 
     callbacks = _callbacks(abandoned=abandoned)
     runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
-    session, lifecycle, first_turn, _provider_fence = _seal_provider_candidate(
+    session, lifecycle, first_turn, _provider_fence = await _seal_provider_candidate(
         runtime,
         detector,
     )
@@ -1401,7 +1432,7 @@ async def test_duplicate_micro_event_final_counts_once_and_preserves_next_turn(
     callbacks = _callbacks(abandoned=abandoned)
     runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
-    session, lifecycle, first_turn, provider_fence = _seal_provider_candidate(
+    session, lifecycle, first_turn, provider_fence = await _seal_provider_candidate(
         runtime,
         detector,
     )
@@ -1433,7 +1464,13 @@ async def test_duplicate_micro_event_final_counts_once_and_preserves_next_turn(
     assert duplicate_final.done() is False
     complete_release.set()
 
-    await asyncio.wait_for(asyncio.gather(first_final, duplicate_final), 1)
+    settlements = await asyncio.wait_for(
+        asyncio.gather(first_final, duplicate_final),
+        1,
+    )
+    assert sum(settled is not None for settled in settlements) == 1
+    settled = next(settled for settled in settlements if settled is not None)
+    await asyncio.wait_for(settled.wait(), 1)
     await runtime._asr_audio_dispatcher.wait_idle()
 
     detector.sealed_provider_micro_event_decision.assert_called_once_with(
@@ -1637,8 +1674,8 @@ async def test_exact_pause_merge_scores_before_seal_and_suppresses_final(
     assert first_feed.candidate is not None
     assert first_feed.identity is not None
     assert await detector.bind_candidate(
-        first_feed.candidate,
-        turn_token,
+            first_feed.candidate,
+            turn_token,
     ) is not None
     second_feed = await detector.feed(
         b"\x02\x00" * 160,

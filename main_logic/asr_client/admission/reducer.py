@@ -237,6 +237,7 @@ def _resolve(
         disposition=disposition,
     )
     effects: list[AdmissionEffect] = [
+        CountDiagnostic(f"admission_terminal_{disposition.value}"),
         ResolveReserved(
             ticket=resolution_ticket,
             final=record.pending_final,
@@ -308,6 +309,36 @@ def _release_active_authority_if_settled(
     )
 
 
+def _count_terminal_micro_event_if_settled(
+    record: VoiceTurnAdmissionRecord,
+) -> tuple[VoiceTurnAdmissionRecord, tuple[AdmissionEffect, ...]]:
+    """Count only a terminal micro-event whose turn settlement stayed valid."""
+
+    if record.micro_event_terminal_counted or record.terminal_disposition is None:
+        return record, ()
+    settlements = (
+        record.transport_settlement_state,
+        record.lifecycle_settlement_state,
+    )
+    terminal = {SettlementState.SETTLED, SettlementState.DEGRADED}
+    if any(state not in terminal for state in settlements):
+        return record, ()
+    record = _changed(record, micro_event_terminal_counted=True)
+    if any(state is SettlementState.DEGRADED for state in settlements):
+        return record, ()
+    if (
+        record.terminal_disposition is AdmissionDisposition.DROP
+        and record.micro_event_state is MicroEventState.SUPPRESS
+    ):
+        return record, (CountDiagnostic("micro_event_suppressed_count"),)
+    if (
+        record.terminal_disposition is AdmissionDisposition.FORWARD
+        and record.micro_event_shadow_would_suppress
+    ):
+        return record, (CountDiagnostic("micro_event_shadow_forward_count"),)
+    return record, ()
+
+
 def _rejection_can_still_be_confirmed(record: VoiceTurnAdmissionRecord) -> bool:
     if record.boundary_state not in {BoundaryState.OPEN, BoundaryState.EXACT}:
         return False
@@ -334,7 +365,8 @@ def maybe_resolve(
         return record, ()
     final = record.pending_final
     if final is not None and now >= final.admission_deadline:
-        return _resolve(record, AdmissionDisposition.FORWARD)
+        resolved, effects = _resolve(record, AdmissionDisposition.FORWARD)
+        return resolved, (CountDiagnostic("admission_deadline_forward"), *effects)
     if record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE:
         return _resolve(record, AdmissionDisposition.DROP)
     if final is not None and not final.text.strip():
@@ -725,6 +757,13 @@ def _reduce_untracked(
                 rejection_operation_owner_generation=None,
                 rejection_operation_kind=None,
             )
+            effects.append(
+                CountDiagnostic(
+                    "admission_rejection_applied_active"
+                    if event.kind is RejectionCapabilityKind.ACTIVE
+                    else "admission_rejection_applied_sealed"
+                )
+            )
     elif isinstance(event, (RejectionStale, RejectionFailed)):
         if event.ticket == record.revoked_rejection_ticket:
             record = _changed(
@@ -867,8 +906,24 @@ def _reduce_untracked(
         if record.micro_event_state is MicroEventState.NOT_APPLICABLE:
             record = _changed(record, micro_event_state=MicroEventState.PENDING)
     elif isinstance(event, MicroEventAllowed):
+        accepted = record.micro_event_state in {
+            MicroEventState.NOT_APPLICABLE,
+            MicroEventState.PENDING,
+        }
         record = _changed(
             record,
+            micro_event_shadow_would_suppress=(
+                event.shadow_would_suppress
+                if accepted
+                else (
+                    (
+                        record.micro_event_shadow_would_suppress
+                        or event.shadow_would_suppress
+                    )
+                    if record.micro_event_state is MicroEventState.ALLOW
+                    else False
+                )
+            ),
             micro_event_state=(
                 MicroEventState.ALLOW
                 if record.micro_event_state
@@ -883,6 +938,7 @@ def _reduce_untracked(
     elif isinstance(event, MicroEventSuppressed):
         record = _changed(
             record,
+            micro_event_shadow_would_suppress=False,
             micro_event_state=(
                 MicroEventState.SUPPRESS
                 if record.micro_event_state
@@ -895,7 +951,11 @@ def _reduce_untracked(
             ),
         )
     elif isinstance(event, MicroEventUnavailable):
-        record = _changed(record, micro_event_state=MicroEventState.UNAVAILABLE)
+        record = _changed(
+            record,
+            micro_event_state=MicroEventState.UNAVAILABLE,
+            micro_event_shadow_would_suppress=False,
+        )
     elif isinstance(event, CoreSettled):
         if event.ticket != record.resolution_ticket:
             return record, (CountDiagnostic("admission_stale_core_settlement"),)
@@ -905,6 +965,8 @@ def _reduce_untracked(
                 SettlementState.DEGRADED if event.degraded else SettlementState.SETTLED
             ),
         )
+        if event.degraded:
+            effects.append(CountDiagnostic("admission_core_settlement_degraded"))
     elif isinstance(event, TransportSettled):
         if event.ticket != record.resolution_ticket:
             return record, (CountDiagnostic("admission_stale_transport_settlement"),)
@@ -914,6 +976,10 @@ def _reduce_untracked(
                 SettlementState.DEGRADED if event.degraded else SettlementState.SETTLED
             ),
         )
+        if event.degraded:
+            effects.append(
+                CountDiagnostic("admission_transport_settlement_degraded")
+            )
     elif isinstance(event, LifecycleSettled):
         if event.ticket != record.resolution_ticket:
             return record, (CountDiagnostic("admission_stale_lifecycle_settlement"),)
@@ -923,9 +989,15 @@ def _reduce_untracked(
                 SettlementState.DEGRADED if event.degraded else SettlementState.SETTLED
             ),
         )
+        if event.degraded:
+            effects.append(
+                CountDiagnostic("admission_lifecycle_settlement_degraded")
+            )
 
     record, authority_effects = _release_active_authority_if_settled(record)
     effects.extend(authority_effects)
+    record, micro_event_effects = _count_terminal_micro_event_if_settled(record)
+    effects.extend(micro_event_effects)
     record, apply_effects = _start_rejection_if_ready(record, now=now)
     effects.extend(apply_effects)
     record, resolution_effects = maybe_resolve(record, now)

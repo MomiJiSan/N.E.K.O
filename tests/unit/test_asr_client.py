@@ -13,6 +13,7 @@ import main_logic.asr_client as asr_client
 import main_logic.asr_client._infra as asr_infra
 import main_logic.asr_client.runtime as asr_runtime_module
 from main_logic.asr_client import AsrSessionConfig, create_asr_session
+from main_logic.asr_client.admission.contracts import AdmissionDisposition
 from main_logic.asr_client._infra import (
     _AsrRequestQueue,
     _AsrWorkerEvent,
@@ -2415,8 +2416,14 @@ async def test_stale_prepare_unwind_only_releases_old_reservation(raises) -> Non
         runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
     )
     await asyncio.wait_for(prepare_entered.wait(), 1)
-    old_final_key = runtime._asr_reserved_final_key
-    assert old_final_key is not None
+    old_turn_token = runtime._capture_turn_token(runtime._asr_lifecycle)
+    old_final_key = asr_runtime_module.FinalKey.from_turn(old_turn_token)
+    assert runtime._asr_admission_reservation_dispatchers[old_final_key] is (
+        old_dispatcher
+    )
+    old_dispatcher.resolve_reserved = MagicMock(
+        wraps=old_dispatcher.resolve_reserved
+    )
 
     new_dispatcher = TranscriptDispatcher(runtime._dispatch_asr_transcript_envelope)
     runtime._asr_transcript_dispatcher = new_dispatcher
@@ -2427,15 +2434,30 @@ async def test_stale_prepare_unwind_only_releases_old_reservation(raises) -> Non
             turn_id=old_final_key.turn_token.turn_id + 1,
         ),
     )
-    runtime._asr_reserved_final_key = new_final_key
+    assert new_dispatcher.try_reserve(new_final_key)
+    runtime._asr_admission_reservation_dispatchers[new_final_key] = new_dispatcher
     runtime._asr_turn_prepared = True
     release_prepare.set()
     await asyncio.wait_for(prepare_task, 1)
 
+    async def wait_for_old_resolution() -> None:
+        while old_final_key not in old_dispatcher._resolved:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_old_resolution(), 1)
+    await old_dispatcher.wait_idle()
+
     assert runtime._asr_transcript_dispatcher is new_dispatcher
-    assert runtime._asr_reserved_final_key == new_final_key
+    assert runtime._asr_admission_reservation_dispatchers[new_final_key] is (
+        new_dispatcher
+    )
     assert runtime._asr_turn_prepared is True
     assert old_final_key not in old_dispatcher._reservations
+    assert old_final_key not in runtime._asr_admission_reservation_dispatchers
+    assert new_final_key in new_dispatcher._reservations
+    resolution = old_dispatcher.resolve_reserved.call_args
+    assert resolution.args == (old_final_key, AdmissionDisposition.ABANDON)
+    assert resolution.kwargs == {"envelope": None}
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -2450,12 +2472,23 @@ async def test_current_prepare_failure_releases_current_reservation(raises) -> N
     dispatcher = runtime._asr_transcript_dispatcher
     turn_token = runtime._capture_turn_token(runtime._asr_lifecycle)
     final_key = asr_runtime_module.FinalKey.from_turn(turn_token)
+    dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
 
     await runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
 
-    assert runtime._asr_reserved_final_key is None
+    async def wait_for_resolution() -> None:
+        while final_key not in dispatcher._resolved:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_resolution(), 1)
+    await dispatcher.wait_idle()
+
     assert runtime._asr_turn_prepared is False
     assert final_key not in dispatcher._reservations
+    assert final_key not in runtime._asr_admission_reservation_dispatchers
+    resolution = dispatcher.resolve_reserved.call_args
+    assert resolution.args == (final_key, AdmissionDisposition.ABANDON)
+    assert resolution.kwargs == {"envelope": None}
 
 
 class _RuntimeDetectorStub:
@@ -2992,10 +3025,17 @@ async def test_stale_final_lease_unwind_uses_old_dispatcher_only() -> None:
     )
     await runtime._handle_independent_asr_endpoint(epoch)
     old_dispatcher = runtime._asr_transcript_dispatcher
-    old_final_key = runtime._asr_reserved_final_key
+    sealed_token = runtime._asr_sealed_turn_token
+    assert sealed_token is not None
+    old_final_key = asr_runtime_module.FinalKey.from_turn(sealed_token.turn)
     old_lease = runtime._asr_smart_turn_lease
-    assert old_final_key is not None
     assert old_lease is not None
+    assert runtime._asr_admission_reservation_dispatchers[old_final_key] is (
+        old_dispatcher
+    )
+    old_dispatcher.resolve_reserved = MagicMock(
+        wraps=old_dispatcher.resolve_reserved
+    )
     release_started = asyncio.Event()
     release_lease = asyncio.Event()
 
@@ -3008,23 +3048,30 @@ async def test_stale_final_lease_unwind_uses_old_dispatcher_only() -> None:
         runtime._handle_independent_asr_final("final", epoch, "glm")
     )
     await asyncio.wait_for(release_started.wait(), 1)
-    await runtime.abort("hard_mute")
+    detached_cleanup = runtime._detach_independent_asr()
+    assert detached_cleanup is not None
+    new_dispatcher = runtime._asr_transcript_dispatcher
+    new_dispatcher.resolve_reserved = MagicMock(
+        wraps=new_dispatcher.resolve_reserved
+    )
     new_session, new_lifecycle, new_detector = _replace_runtime_identity_same_epoch(
         runtime
     )
-    new_dispatcher = TranscriptDispatcher(runtime._dispatch_asr_transcript_envelope)
-    new_dispatcher.submit = MagicMock(wraps=new_dispatcher.submit)
-    runtime._asr_transcript_dispatcher = new_dispatcher
     lifecycle_callback.reset_mock()
 
     release_lease.set()
-    await asyncio.wait_for(final, 1)
+    await asyncio.wait_for(asyncio.gather(final, detached_cleanup), 1)
 
     assert runtime._asr_session is new_session
     assert runtime._asr_lifecycle is new_lifecycle
     assert runtime._asr_detector is new_detector
     assert old_final_key not in old_dispatcher._reservations
-    new_dispatcher.submit.assert_not_called()
+    assert old_final_key in old_dispatcher._resolved
+    assert old_final_key not in runtime._asr_admission_reservation_dispatchers
+    old_resolution = old_dispatcher.resolve_reserved.call_args
+    assert old_resolution.args[0] == old_final_key
+    assert old_resolution.args[1] is AdmissionDisposition.FORWARD
+    new_dispatcher.resolve_reserved.assert_not_called()
     lifecycle_callback.assert_not_awaited()
     assert failures == []
     assert statuses == []

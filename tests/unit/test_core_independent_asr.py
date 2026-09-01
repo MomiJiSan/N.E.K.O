@@ -14,6 +14,10 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 import pytest
 
 from main_logic.asr_client import VoiceIdentityActivationResult
+from main_logic.asr_client.admission.contracts import (
+    AdmissionDisposition,
+    EvidenceState,
+)
 from main_logic.core import LLMSessionManager
 from main_logic.core.asr_runtime import (
     AsrRuntimeMixin,
@@ -40,6 +44,7 @@ from main_logic.voice_input import VoiceInputDispatchResult
 from main_logic.voice_input.consumers import CoreChatTurnContext
 from main_logic.asr_client.lifecycle import (
     AudioDisposition,
+    FinalKey,
     VoiceLifecycleConfig,
     VoiceLifecycleEvent,
     VoiceLifecycleState,
@@ -739,6 +744,10 @@ async def test_async_detector_orders_pre_roll_before_smart_turn_seal() -> None:
     await detector.close()
 
 
+# The former submit/endpoint/arm-failed variants asserted the deleted Runtime
+# gate implementation. Their rejection/deadline behavior now lives in the
+# focused admission reducer and candidate-rejection runtime suites; this case
+# retains the still-relevant cross-component identity/order contract.
 @pytest.mark.parametrize(
     "provider",
     ["dummy", "glm", "gemini"],
@@ -10342,7 +10351,7 @@ async def test_provider_final_preserves_unconfirmed_successor_pcm_as_pre_roll() 
     detector.complete_provider_candidate.assert_awaited_once()
 
 
-async def test_provider_fence_failure_does_not_accept_final() -> None:
+async def test_provider_fence_failure_forwards_final_without_speaker_authority() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
     detector = runtime._asr_detector
@@ -10353,6 +10362,11 @@ async def test_provider_fence_failure_does_not_accept_final() -> None:
         SpeechActivityEvent.SPEECH_STARTED,
         epoch,
     )
+    turn_token = runtime._asr_lifecycle.current_turn_token
+    assert turn_token is not None
+    final_key = FinalKey.from_turn(turn_token)
+    dispatcher = runtime._asr_transcript_dispatcher
+    dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
     await runtime._handle_independent_asr_endpoint(epoch)
 
     await runtime._handle_independent_asr_final(
@@ -10360,29 +10374,55 @@ async def test_provider_fence_failure_does_not_accept_final() -> None:
         epoch,
         "openai",
     )
+    await runtime._wait_asr_transcript_dispatch_idle()
 
     statuses = [json.loads(call.args[0]) for call in runtime.send_status.await_args_list]
     codes = [payload["code"] for payload in statuses]
-    assert codes.count("ASR_ENDPOINTING_FAILED") == 1
-    assert runtime._asr_accepted_final_keys == {}
-    runtime.handle_input_transcript.assert_not_awaited()
-    assert runtime._asr_route_mode == "blocked"
+    assert "ASR_ENDPOINTING_FAILED" not in codes
+    runtime.handle_input_transcript.assert_awaited_once_with(
+        "must-not-publish",
+        is_voice_source=True,
+        source="independent_asr",
+        metadata={"provider": "openai"},
+    )
+    assert final_key in dispatcher._resolved
+    assert final_key not in dispatcher._reservations
+    resolution = dispatcher.resolve_reserved.call_args
+    assert resolution.args == (final_key, AdmissionDisposition.FORWARD)
+    assert resolution.kwargs["envelope"].final_key == final_key
+    assert runtime._asr_route_mode == "independent"
 
 
-async def test_stale_provider_endpoint_releases_local_final_reservation() -> None:
+async def test_stale_provider_endpoint_abandons_local_final_reservation() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
     component = runtime._asr_runtime
+    dispatcher = component._asr_transcript_dispatcher
+    dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
     component._runtime_identity_matches = MagicMock(return_value=False)
     epoch = component._asr_session_epoch
     await runtime._handle_independent_asr_activity(
         SpeechActivityEvent.SPEECH_STARTED,
         epoch,
     )
+    turn_token = component._asr_lifecycle.current_turn_token
+    assert turn_token is not None
+    final_key = FinalKey.from_turn(turn_token)
 
     await runtime._handle_independent_asr_endpoint(epoch)
 
-    assert component._asr_reserved_final_key is None
+    async def wait_for_resolution() -> None:
+        while final_key not in dispatcher._resolved:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_resolution(), 1)
+    await dispatcher.wait_idle()
+
+    assert final_key not in dispatcher._reservations
+    assert final_key not in component._asr_admission_reservation_dispatchers
+    resolution = dispatcher.resolve_reserved.call_args
+    assert resolution.args == (final_key, AdmissionDisposition.ABANDON)
+    assert resolution.kwargs == {"envelope": None}
     assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
 
 
@@ -10506,6 +10546,11 @@ async def test_provider_overflow_lock_then_final_preserves_accepted_final() -> N
         epoch,
     )
     await runtime._handle_independent_asr_endpoint(epoch)
+    sealed_token = runtime._asr_sealed_turn_token
+    assert sealed_token is not None
+    final_key = FinalKey.from_turn(sealed_token.turn)
+    dispatcher = runtime._asr_transcript_dispatcher
+    dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
     ingress_token = runtime._asr_runtime._asr_current_ingress_token
     assert ingress_token is not None
 
@@ -10535,7 +10580,11 @@ async def test_provider_overflow_lock_then_final_preserves_accepted_final() -> N
         source_game_route_identity=None,
     )
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
-    assert runtime._asr_accepted_final_keys
+    assert final_key in dispatcher._resolved
+    assert final_key not in dispatcher._reservations
+    resolution = dispatcher.resolve_reserved.call_args
+    assert resolution.args == (final_key, AdmissionDisposition.FORWARD)
+    assert resolution.kwargs["envelope"].final_key == final_key
 
 
 @pytest.mark.parametrize("replacement", ["epoch", "lifecycle", "detector"])
@@ -10592,7 +10641,6 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     import main_logic.asr_client.endpointing.detector_runtime as detector_module
     import main_logic.asr_client.runtime as runtime_module
     import main_logic.asr_client.speaker_shadow.contracts as contracts_module
-    from main_logic.asr_client.lifecycle import FinalKey
     from main_logic.asr_client.speaker_shadow.asset_manifest import (
         CAMPPLUS_MODEL_ID,
         CAMPPLUS_MODEL_REVISION,
@@ -10674,14 +10722,15 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
         enforce=True,
     )
     shadow = composition()
-    original_observation_callback = shadow._on_observation
-    assert original_observation_callback is not None
+    original_evidence_callback = shadow._on_evidence
+    assert original_evidence_callback is not None
 
-    async def capture_observation(observation) -> None:
-        observations.append(observation)
-        await original_observation_callback(observation)
+    def capture_evidence(event) -> None:
+        if isinstance(event, contracts_module.SpeakerShadowObservation):
+            observations.append(event)
+        original_evidence_callback(event)
 
-    monkeypatch.setattr(shadow, "_on_observation", capture_observation)
+    monkeypatch.setattr(shadow, "_on_evidence", capture_evidence)
     monkeypatch.setattr(
         shadow,
         "_ensure_backend",
@@ -10728,12 +10777,20 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     )
     assert feed_result.candidate is not None
     turn_token = runtime._capture_turn_token(lifecycle)
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
     assert await detector.bind_candidate(feed_result.candidate, turn_token) is not None
     runtime._asr_turn_prepared = True
     runtime._asr_partial_turn_token = turn_token
     final_key = FinalKey.from_turn(turn_token)
     assert runtime._asr_transcript_dispatcher.try_reserve(final_key)
-    runtime._asr_reserved_final_key = final_key
+    runtime._asr_admission_reservation_dispatchers[final_key] = (
+        runtime._asr_transcript_dispatcher
+    )
+    runtime._asr_transcript_dispatcher.resolve_reserved = MagicMock(
+        wraps=runtime._asr_transcript_dispatcher.resolve_reserved
+    )
     assert runtime._asr_audio_dispatcher.activate(turn_token, session, b"")
 
     checkpoint_pcm16 = b"\x21\x00" * (16_000 * 1_500 // 1_000)
@@ -10742,13 +10799,27 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     assert detector_candidate is not None
     detector.observe_provider_audio(checkpoint_pcm16, sample_rate_hz=16_000)
     await shadow.wait_idle()
-    async def wait_for_rejection_applied() -> None:
-        while not runtime._speaker_verifier_diagnostics()[
-            "rejection_task_applied_count"
-        ]:
+    async def wait_for_reject_requested() -> None:
+        for _ in range(200):
+            admission_record = await runtime._asr_admission.get_record(turn_token)
+            if (
+                admission_record is not None
+                and admission_record.evidence_state is EvidenceState.REJECT_REQUESTED
+                and prepared_candidates
+            ):
+                return
             await asyncio.sleep(0.005)
+        admission_record = await runtime._asr_admission.get_record(turn_token)
+        raise AssertionError(
+            (
+                runtime._speaker_verifier_diagnostics(),
+                observations,
+                admission_record,
+                runtime._asr_admission_candidate_turns,
+            )
+        )
 
-    await asyncio.wait_for(wait_for_rejection_applied(), 1.0)
+    await asyncio.wait_for(wait_for_reject_requested(), 5.0)
 
     assert len(observations) == 2
     observation_candidates = [
@@ -10764,52 +10835,33 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     assert type(detector_candidate) is detector_module.SpeakerShadowCandidateKey
     assert type(detector_candidate) is runtime_module.SpeakerShadowCandidateKey
     diagnostics = runtime._speaker_verifier_diagnostics()
-    assert diagnostics["rejection_task_applied_count"] == 1
+    assert diagnostics["rejection_task_applied_count"] == 0
     assert diagnostics["rejection_task_stale_count"] == 0
     assert diagnostics["rejection_stale_prepare_count"] == 0
     assert diagnostics["rejection_prepare_unbound_count"] == 0
+    admission_record = await runtime._asr_admission.get_record(turn_token)
+    assert admission_record is not None
+    assert admission_record.evidence_state is EvidenceState.REJECT_REQUESTED
+    assert admission_record.rejection_capability is None
+    runtime._asr_transcript_dispatcher.resolve_reserved.assert_not_called()
+    assert final_key in runtime._asr_transcript_dispatcher._reservations
 
     await runtime.close()
     composition.close()
     profile.close()
 
 
-@pytest.mark.parametrize(
-    ("resource_optimization_enabled", "rejection_timing"),
-    [
-        (False, "none"),
-        (True, "submit"),
-        (True, "endpoint"),
-        (True, "arm-failed"),
-    ],
-    ids=(
-        "continuous-owner",
-        "provider-vad-non-owner",
-        "provider-endpoint-late-non-owner",
-        "provider-unarmed-final-does-not-wait",
-    ),
-)
-async def test_provider_candidate_is_bound_before_speaker_filter_decision(
+async def test_provider_candidate_is_bound_before_speaker_observation(
     monkeypatch,
-    resource_optimization_enabled: bool,
-    rejection_timing: str,
 ) -> None:
     import main_logic.asr_client.runtime as runtime_module
 
     pcm16 = b"\x31\x00" * 160
     call_order: list[tuple[str, int, int]] = []
     finals: list[VoiceTranscriptEvent] = []
-    partials: list[VoicePartialEvent] = []
-    abandoned_turns: list[VoiceTurnToken] = []
-    prepared_turns: list[VoiceTurnToken] = []
     sessions: list[object] = []
-    runtime_ref: IndependentAsrRuntime | None = None
     detector_ref: DetectorRuntime | None = None
     selection = _selection("qwen", "provider")
-    reject_candidate = rejection_timing != "none"
-    prepare_call_count = 0
-    delayed_prepare_started = asyncio.Event()
-    delayed_prepare_release = asyncio.Event()
 
     class _Vad:
         def load(self) -> bool:
@@ -10820,11 +10872,7 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
 
     class _Gate:
         def feed(self, _pcm16: bytes):
-            return (
-                (SpeechActivityEvent.SPEECH_STARTED,)
-                if reject_candidate
-                else ()
-            )
+            return ()
 
         def reset(self) -> None:
             return None
@@ -10859,7 +10907,6 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
         enabled = True
 
         def __init__(self) -> None:
-            self.rejection_requested = False
             self.candidate = None
 
         def submit(
@@ -10878,23 +10925,11 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
                 )
             )
             self.candidate = candidate
-            return reject_candidate
+            return False
 
         def finish_candidate(self, candidate) -> bool:
-            if rejection_timing in {"endpoint", "endpoint-delayed", "arm-failed"}:
-                self._request_rejection(candidate)
-            return reject_candidate
-
-        def _request_rejection(self, candidate) -> None:
-            if self.rejection_requested:
-                return
-            self.rejection_requested = True
-            assert runtime_ref is not None
-            scheduled = runtime_ref.request_speaker_candidate_rejection(
-                candidate,
-                activation_generation="provider-profile",
-            )
-            assert scheduled is (rejection_timing != "arm-failed")
+            del candidate
+            return False
 
         async def reset(self) -> None:
             return None
@@ -10902,18 +10937,8 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
         async def close(self) -> None:
             return None
 
-    async def on_partial(event: VoicePartialEvent) -> None:
-        partials.append(event)
-
     async def on_final(event: VoiceTranscriptEvent) -> None:
         finals.append(event)
-
-    async def on_turn_abandoned(turn_token: VoiceTurnToken) -> None:
-        abandoned_turns.append(turn_token)
-
-    async def on_prepare_turn(turn_token: VoiceTurnToken) -> bool:
-        prepared_turns.append(turn_token)
-        return True
 
     def create_session(_core_type: str, **kwargs) -> _ProviderSession:
         session = _ProviderSession(kwargs)
@@ -10935,22 +10960,7 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
             )
             return await original_bind(candidate, turn_token)
 
-        original_prepare_rejection = detector.prepare_candidate_rejection
-
-        async def traced_prepare_rejection(candidate):
-            nonlocal prepare_call_count
-            prepare_call_count += 1
-            if rejection_timing == "arm-failed":
-                return None
-            if rejection_timing == "endpoint-delayed" and prepare_call_count == 2:
-                delayed_prepare_started.set()
-                await delayed_prepare_release.wait()
-            return await original_prepare_rejection(candidate)
-
         detector.bind_candidate = traced_bind  # type: ignore[method-assign]
-        detector.prepare_candidate_rejection = (  # type: ignore[method-assign]
-            traced_prepare_rejection
-        )
         detector_ref = detector
         return detector
 
@@ -10972,20 +10982,19 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
 
     runtime = IndependentAsrRuntime(
         AsrRuntimeCallbacks(
-            display_name=lambda: "provider-speaker-filter",
-            on_prepare_turn=on_prepare_turn,
-            on_partial=on_partial,
+            display_name=lambda: "provider-speaker-observation-order",
+            on_prepare_turn=AsyncMock(return_value=True),
+            on_partial=AsyncMock(),
             on_final=on_final,
-            on_turn_abandoned=on_turn_abandoned,
+            on_turn_abandoned=AsyncMock(),
             on_failure=AsyncMock(),
             on_status=AsyncMock(),
             on_lifecycle=AsyncMock(),
         )
     )
-    runtime_ref = runtime
     start_result = await runtime.start(
         route_key="qwen",
-        resource_optimization_enabled=resource_optimization_enabled,
+        resource_optimization_enabled=False,
         speaker_shadow_factory=_SpeakerShadow,
     )
     assert start_result.status is AsrStartStatus.READY
@@ -10993,11 +11002,8 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
     assert len(sessions) == 1
     provider_session = sessions[0]
     assert isinstance(provider_session, _ProviderSession)
-    if reject_candidate:
-        runtime._speaker_verifier_activation_generation = "provider-profile"
-        runtime._ensure_transport_restart_task = MagicMock()  # type: ignore[method-assign]
     ingress_token = runtime.capture_ingress_token(
-        connection_id="speaker-filter",
+        connection_id="speaker-observation-order",
         lease_generation=7,
         route_generation=11,
     )
@@ -11006,33 +11012,15 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
         ProcessedVoiceFrame(
             pcm16,
             16_000,
-            0.9 if reject_candidate else 0.0,
-            reject_candidate,
+            0.0,
+            False,
         ),
         ingress_token=ingress_token,
     )
     await runtime._asr_audio_dispatcher.wait_idle()
     speaker_shadow = detector_ref._speaker_shadow
     assert isinstance(speaker_shadow, _SpeakerShadow)
-    if reject_candidate:
-        assert speaker_shadow.candidate is not None
-        armed = await runtime._arm_speaker_candidate_decision(
-            speaker_shadow.candidate,
-            activation_generation="provider-profile",
-        )
-        assert armed is (rejection_timing != "arm-failed")
-        if rejection_timing == "submit":
-            speaker_shadow._request_rejection(speaker_shadow.candidate)
-    if rejection_timing in {"endpoint", "endpoint-delayed", "arm-failed"}:
-        await provider_session.callbacks["on_turn_endpointed"]()
-    rejection_tasks = tuple(runtime._asr_rejection_tasks)
-    if rejection_timing == "endpoint-delayed":
-        assert len(rejection_tasks) == 1
-        await asyncio.wait_for(delayed_prepare_started.wait(), timeout=0.2)
-        assert rejection_tasks[0].done() is False
-    elif rejection_tasks:
-        await asyncio.gather(*rejection_tasks, return_exceptions=True)
-    await asyncio.sleep(0)
+    assert speaker_shadow.candidate is not None
 
     assert submit_result.status is AsrSubmitStatus.ACCEPTED
     assert call_order[:2] == [("bind", 0, 0), ("observe", 0, 0)]
@@ -11044,119 +11032,11 @@ async def test_provider_candidate_is_bound_before_speaker_filter_decision(
     assert diagnostics["provider_candidate_bind_empty_count"] == 0
     assert diagnostics["provider_candidate_bind_failed_count"] == 0
 
-    if rejection_timing == "submit":
-        assert diagnostics["rejection_task_scheduled_count"] == 1
-        assert diagnostics["rejection_task_applied_count"] == 1
-        assert diagnostics["rejection_task_stale_count"] == 0
-        assert provider_session.close_count == 1
-        assert len(abandoned_turns) == 1
-        assert provider_session.partial_callback is not None
-        await provider_session.partial_callback("rejected-partial")
-        await provider_session.callbacks["on_input_transcript"]("rejected-final")
-        await runtime.wait_transcript_idle()
-        assert partials == []
-        assert finals == []
-        runtime._ensure_transport_restart_task.assert_called_once_with()
-    elif rejection_timing == "endpoint-delayed":
-        gate = runtime._asr_speaker_candidate_decision_gate
-        assert gate is not None
-        assert diagnostics["speaker_gate_armed_count"] == 1
-        assert diagnostics["rejection_task_scheduled_count"] == 1
-        assert diagnostics["rejection_task_applied_count"] == 0
-
-        final_task = asyncio.create_task(
-            provider_session.callbacks["on_input_transcript"]("not-owner-final")
-        )
-
-        async def wait_for_gate_waiter() -> None:
-            while not gate.wait_started:
-                await asyncio.sleep(0)
-
-        await asyncio.wait_for(wait_for_gate_waiter(), timeout=0.2)
-        assert final_task.done() is False
-        await asyncio.wait_for(runtime._asr_final_lock.acquire(), timeout=0.05)
-        runtime._asr_final_lock.release()
-
-        delayed_prepare_release.set()
-        await asyncio.wait_for(asyncio.gather(*rejection_tasks), timeout=0.2)
-        assert provider_session.partial_callback is not None
-        await provider_session.partial_callback("not-owner-partial")
-        await asyncio.wait_for(final_task, timeout=0.2)
-        await runtime.wait_transcript_idle()
-
-        diagnostics = runtime._speaker_verifier_diagnostics()
-        assert diagnostics["rejection_task_applied_count"] == 1
-        assert diagnostics["rejection_task_stale_count"] == 0
-        assert diagnostics["speaker_gate_waited_count"] == 1
-        assert diagnostics["speaker_gate_resolved_reject_count"] == 1
-        assert partials == []
-        assert finals == []
-    elif rejection_timing == "endpoint":
-        assert diagnostics["rejection_task_scheduled_count"] == 1
-        assert diagnostics["rejection_task_applied_count"] == 1
-        assert diagnostics["rejection_task_stale_count"] == 0
-        assert provider_session.close_count == 0
-        assert len(prepared_turns) == 1
-        predecessor_turn = prepared_turns[0]
-        successor_pcm16 = b"\x41\x00" * 160
-
-        successor_submit = await runtime.submit(
-            ProcessedVoiceFrame(successor_pcm16, 16_000, 0.9, True),
-            ingress_token=ingress_token,
-        )
-        await runtime._asr_audio_dispatcher.wait_idle()
-        assert successor_submit.status is AsrSubmitStatus.ACCEPTED
-        assert runtime._asr_lifecycle is not None
-        assert runtime._asr_lifecycle.has_pending_turn is True
-        assert provider_session.wire_pcm == [pcm16]
-
-        assert provider_session.partial_callback is not None
-        await provider_session.partial_callback("rejected-late-partial")
-        await provider_session.callbacks["on_input_transcript"](
-            "rejected-late-final"
-        )
-        await runtime._asr_audio_dispatcher.wait_idle()
-        await runtime.wait_transcript_idle()
-
-        assert partials == []
-        assert finals == []
-        assert abandoned_turns == [predecessor_turn]
-        assert len(prepared_turns) == 2
-        successor_turn = prepared_turns[1]
-        assert successor_turn.turn_id > predecessor_turn.turn_id
-        assert successor_turn.ingress == predecessor_turn.ingress
-        assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
-        assert provider_session.wire_pcm == [pcm16, successor_pcm16]
-
-        await provider_session.callbacks["on_turn_endpointed"]()
-        await provider_session.callbacks["on_input_transcript"](
-            "successor-owner-final"
-        )
-        await runtime.wait_transcript_idle()
-        assert [(event.text, event.turn_token) for event in finals] == [
-            ("successor-owner-final", successor_turn)
-        ]
-    elif rejection_timing == "arm-failed":
-        assert diagnostics["speaker_gate_armed_count"] == 0
-        assert diagnostics["rejection_request_failed_count"] == 1
-        assert diagnostics["rejection_task_scheduled_count"] == 0
-        assert diagnostics["rejection_task_applied_count"] == 0
-        assert rejection_tasks == ()
-
-        final_task = asyncio.create_task(
-            provider_session.callbacks["on_input_transcript"]("owner-final")
-        )
-        await asyncio.wait_for(asyncio.shield(final_task), timeout=0.5)
-        await runtime.wait_transcript_idle()
-
-        assert [event.text for event in finals] == ["owner-final"]
-        assert runtime._asr_speaker_candidate_decision_gate is None
-    else:
-        await provider_session.callbacks["on_turn_endpointed"]()
-        await provider_session.callbacks["on_input_transcript"]("owner-final")
-        await runtime.wait_transcript_idle()
-        assert [event.text for event in finals] == ["owner-final"]
-        assert diagnostics["rejection_task_applied_count"] == 0
+    await provider_session.callbacks["on_turn_endpointed"]()
+    await provider_session.callbacks["on_input_transcript"]("owner-final")
+    await runtime.wait_transcript_idle()
+    assert [event.text for event in finals] == ["owner-final"]
+    assert diagnostics["rejection_task_applied_count"] == 0
 
     await runtime.close()
 

@@ -85,6 +85,43 @@ async def test_provider_namespace_reset_retires_every_owned_proof() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_namespace_retirement_counts_actual_proof_ownership_once(
+) -> None:
+    runtime = object.__new__(IndependentAsrRuntime)
+    proof = BoundaryProof(
+        proof_id=8,
+        owner_generation=3,
+        provider_key=ProviderUtteranceKey(1, 2, 5),
+    )
+    correlator = MagicMock()
+    correlator.retire_namespace.return_value = SimpleNamespace(
+        retired_proofs=(proof, proof)
+    )
+    runtime._asr_provider_correlator = correlator
+    runtime._asr_provider_correlator_namespace = (1, 2)
+    runtime._asr_provider_boundary_proofs = {proof.proof_id: object()}
+    runtime._asr_detector = None
+    runtime._asr_admission_effect_tasks = set()
+    runtime._asr_admission_effect_task_turns = {}
+    runtime._asr_sealed_provider_key = None
+    runtime._asr_provider_exact_session = None
+    runtime._speaker_rejection_metrics = runtime_module._new_speaker_rejection_metrics()
+    runtime._admission_effect_done = runtime._asr_admission_effect_tasks.discard
+
+    runtime._reset_asr_provider_transport_namespace(retire_owned_proofs=True)
+    await asyncio.gather(*runtime._asr_admission_effect_tasks)
+
+    assert runtime._asr_provider_boundary_proofs == {}
+    assert (
+        runtime._speaker_rejection_metrics[
+            "admission_boundary_proof_retired_count"
+        ]
+        == 1
+    )
+    correlator.retire_namespace.assert_called_once_with((1, 2))
+
+
+@pytest.mark.asyncio
 async def test_speaker_alias_is_retained_until_capture_closed_is_queued() -> None:
     runtime = object.__new__(IndependentAsrRuntime)
     candidate = SpeakerShadowCandidateKey(2, 3, "provider_candidate")

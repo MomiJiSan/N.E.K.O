@@ -189,34 +189,44 @@ _SPEAKER_REJECTION_METRIC_NAMES = (
     "rejection_task_cleanup_degraded_count",
     "rejection_task_failure_count",
     "rejection_task_cancelled_count",
-    "speaker_gate_armed_count",
-    "speaker_gate_armed_while_preparing_count",
-    "speaker_gate_provisional_armed_count",
-    "speaker_gate_provisional_promoted_count",
-    "speaker_gate_preseal_replaced_count",
-    "speaker_gate_final_before_first_observation_count",
-    "speaker_gate_provisional_timeout_count",
-    "speaker_gate_arm_provisional_stale_count",
-    "speaker_gate_waited_count",
-    "speaker_gate_resolved_forward_count",
-    "speaker_gate_resolved_reject_count",
-    "speaker_gate_timeout_count",
-    "speaker_gate_stale_count",
-    "speaker_gate_released_prepare_failure_count",
-    "speaker_gate_arm_invalid_count",
-    "speaker_gate_arm_degraded_count",
-    "speaker_gate_arm_conflict_count",
-    "speaker_gate_arm_runtime_unavailable_count",
-    "speaker_gate_arm_lifecycle_rejected_count",
-    "speaker_gate_arm_prepare_cancelled_count",
-    "speaker_gate_arm_prepare_failed_count",
-    "speaker_gate_arm_prepare_empty_count",
-    "speaker_gate_arm_final_lock_cancelled_count",
-    "speaker_gate_arm_common_authority_count",
-    "speaker_gate_arm_active_authority_count",
-    "speaker_gate_arm_draining_authority_count",
-    "speaker_gate_arm_unexpected_state_count",
-    "speaker_gate_released_verifier_degraded_count",
+    "admission_terminal_forward_count",
+    "admission_terminal_drop_count",
+    "admission_terminal_abandon_count",
+    "admission_deadline_forward_count",
+    "admission_rejection_applied_active_count",
+    "admission_rejection_applied_sealed_count",
+    "admission_core_settlement_degraded_count",
+    "admission_transport_settlement_degraded_count",
+    "admission_lifecycle_settlement_degraded_count",
+    "admission_boundary_proof_retired_count",
+    "admission_boundary_proof_overflow_count",
+    "admission_late_boundary_ignored_count",
+    "admission_late_fact_ignored_count",
+    "admission_stale_turn_opened_count",
+    "admission_provider_alias_conflict_count",
+    "admission_candidate_alias_conflict_count",
+    "admission_stale_speaker_fact_count",
+    "admission_stale_capture_close_count",
+    "admission_speaker_sequence_gap_count",
+    "admission_late_exact_after_unknown_count",
+    "admission_foreign_capability_ignored_count",
+    "admission_capability_conflict_count",
+    "admission_stale_boundary_unknown_count",
+    "admission_revoked_operation_applied_late_count",
+    "admission_late_operation_ignored_count",
+    "admission_rejection_kind_mismatch_count",
+    "admission_revoked_operation_settled_count",
+    "admission_late_revoke_ack_ignored_count",
+    "admission_late_revoke_failure_ignored_count",
+    "admission_late_namespace_poison_ack_count",
+    "admission_late_namespace_poison_failure_count",
+    "admission_final_after_retirement_ignored_count",
+    "admission_stale_provider_final_count",
+    "admission_conflicting_provider_final_count",
+    "admission_late_deadline_ignored_count",
+    "admission_stale_core_settlement_count",
+    "admission_stale_transport_settlement_count",
+    "admission_stale_lifecycle_settlement_count",
     "provider_candidate_bind_missing_identity_count",
     "provider_candidate_bind_missing_candidate_count",
     "provider_candidate_bind_identity_rejected_count",
@@ -816,7 +826,6 @@ class IndependentAsrRuntime:
         metrics["rejection_task_pending_count"] = len(
             getattr(self, "_asr_admission_rejection_executions", ())
         )
-        metrics["speaker_gate_arm_pending_count"] = 0
         metrics["rejection_in_progress_count"] = int(
             bool(getattr(self, "_asr_admission_rejection_executions", ()))
         )
@@ -1485,8 +1494,13 @@ class IndependentAsrRuntime:
 
     async def _execute_admission_effect(self, effect: AdmissionEffect) -> None:
         if isinstance(effect, CountDiagnostic):
-            self._speaker_rejection_metrics[effect.name] = (
-                self._speaker_rejection_metrics.get(effect.name, 0) + 1
+            metric_name = (
+                effect.name
+                if effect.name.endswith("_count")
+                else f"{effect.name}_count"
+            )
+            self._speaker_rejection_metrics[metric_name] = (
+                self._speaker_rejection_metrics.get(metric_name, 0) + 1
             )
             return
         if isinstance(effect, ScheduleFinalDeadline):
@@ -1870,7 +1884,14 @@ class IndependentAsrRuntime:
     ) -> None:
         if detector is None:
             for proof in proofs:
-                self._asr_provider_boundary_proofs.pop(proof.proof_id, None)
+                snapshot = self._asr_provider_boundary_proofs.pop(
+                    proof.proof_id,
+                    None,
+                )
+                if snapshot is not None:
+                    self._speaker_rejection_metrics[
+                        "admission_boundary_proof_retired_count"
+                    ] += 1
             return
         identity = self._capture_runtime_identity()
         for proof in proofs:
@@ -1879,6 +1900,9 @@ class IndependentAsrRuntime:
                 None,
             )
             if snapshot is not None:
+                self._speaker_rejection_metrics[
+                    "admission_boundary_proof_retired_count"
+                ] += 1
                 await self._retire_provider_speaker_boundary_unknown(
                     detector,
                     identity,
@@ -5348,18 +5372,20 @@ class IndependentAsrRuntime:
                 audio_range=notification.audio_range,
                 proof=proof,
             )
+        existing_boundary = correlator.record_for(key)
         recorded = correlator.record_boundary_result(key, result)
-        for retired in recorded.retired_proofs:
-            retired_snapshot = self._asr_provider_boundary_proofs.pop(
-                retired.proof_id,
-                None,
-            )
-            if retired_snapshot is not None:
-                await self._retire_provider_speaker_boundary_unknown(
-                    detector,
-                    identity,
-                    retired_snapshot,
-                )
+        if (
+            result.quality == "exact"
+            and recorded.quality == "unknown"
+            and existing_boundary is None
+        ):
+            self._speaker_rejection_metrics[
+                "admission_boundary_proof_overflow_count"
+            ] += 1
+        await self._retire_admission_boundary_proofs(
+            recorded.retired_proofs,
+            detector,
+        )
         self._speaker_rejection_metrics[
             "provider_boundary_exact_ready_count"
             if recorded.quality == "exact"
@@ -6151,7 +6177,9 @@ class IndependentAsrRuntime:
                         (
                             MicroEventSuppressed()
                             if micro.suppress
-                            else MicroEventAllowed()
+                            else MicroEventAllowed(
+                                shadow_would_suppress=micro.would_suppress
+                            )
                         ),
                     )
                 else:

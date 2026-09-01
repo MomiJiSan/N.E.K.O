@@ -290,6 +290,8 @@ class VoiceTurnAdmissionRecord:
 
     last_speaker_sequence_no: int = 0
     capture_through_sequence_no: int | None = None
+    micro_event_shadow_would_suppress: bool = False
+    micro_event_terminal_counted: bool = False
     rejection_operation_nonce: int | None = None
     rejection_operation_capability_id: int | None = None
     rejection_operation_owner_generation: int | None = None
@@ -314,6 +316,10 @@ class VoiceTurnAdmissionRecord:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.micro_event_shadow_would_suppress) is not bool:
+            raise TypeError("micro_event_shadow_would_suppress must be bool")
+        if type(self.micro_event_terminal_counted) is not bool:
+            raise TypeError("micro_event_terminal_counted must be bool")
 
     @property
     def terminal_disposition(self) -> AdmissionDisposition | None:
@@ -435,7 +441,11 @@ class MicroEventPending:
 
 @dataclass(frozen=True, slots=True)
 class MicroEventAllowed:
-    pass
+    shadow_would_suppress: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.shadow_would_suppress) is not bool:
+            raise TypeError("shadow_would_suppress must be bool")
 
 
 @dataclass(frozen=True, slots=True)

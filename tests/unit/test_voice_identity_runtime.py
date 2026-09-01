@@ -132,16 +132,20 @@ def test_missing_registry_diagnostics_preserve_fixed_schema() -> None:
     }
 
 
-def test_voice_identity_diagnostics_include_gate_and_completion_counters() -> None:
+def test_voice_identity_diagnostics_include_admission_and_completion_counters() -> None:
     expected = {
-        "speaker_gate_provisional_armed_count",
-        "speaker_gate_provisional_promoted_count",
-        "speaker_gate_final_before_first_observation_count",
-        "speaker_gate_provisional_timeout_count",
-        "speaker_gate_arm_provisional_stale_count",
-        "speaker_gate_arm_degraded_count",
-        "speaker_gate_arm_pending_count",
-        "speaker_gate_released_verifier_degraded_count",
+        "admission_terminal_forward_count",
+        "admission_terminal_drop_count",
+        "admission_terminal_abandon_count",
+        "admission_deadline_forward_count",
+        "admission_rejection_applied_active_count",
+        "admission_rejection_applied_sealed_count",
+        "admission_core_settlement_degraded_count",
+        "admission_transport_settlement_degraded_count",
+        "admission_lifecycle_settlement_degraded_count",
+        "admission_boundary_proof_retired_count",
+        "admission_boundary_proof_overflow_count",
+        "admission_late_operation_ignored_count",
         "speaker_completion_count",
         "speaker_completion_before_first_checkpoint_count",
         "speaker_completion_after_first_checkpoint_count",
@@ -258,14 +262,12 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
             "observation_count": 4,
             "low_checkpoint_count": 2,
             "rejection_task_applied_count": 1,
-            "speaker_gate_armed_count": 2,
-            "speaker_gate_armed_while_preparing_count": 1,
-            "speaker_gate_waited_count": 1,
-            "speaker_gate_resolved_forward_count": 1,
-            "speaker_gate_resolved_reject_count": 1,
-            "speaker_gate_timeout_count": 0,
-            "speaker_gate_stale_count": 0,
-            "speaker_gate_released_prepare_failure_count": 1,
+            "admission_terminal_forward_count": 2,
+            "admission_terminal_drop_count": 1,
+            "admission_deadline_forward_count": 1,
+            "admission_rejection_applied_sealed_count": 1,
+            "admission_core_settlement_degraded_count": 0,
+            "admission_late_operation_ignored_count": 1,
             "provider_candidate_bind_missing_identity_count": 3,
             "rejection_seal_snapshot_unbound_count": 2,
             "similarity": 0.12,
@@ -286,14 +288,12 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
     assert diagnostics["observation_count"] == 4
     assert diagnostics["low_checkpoint_count"] == 2
     assert diagnostics["rejection_task_applied_count"] == 1
-    assert diagnostics["speaker_gate_armed_count"] == 2
-    assert diagnostics["speaker_gate_armed_while_preparing_count"] == 1
-    assert diagnostics["speaker_gate_waited_count"] == 1
-    assert diagnostics["speaker_gate_resolved_forward_count"] == 1
-    assert diagnostics["speaker_gate_resolved_reject_count"] == 1
-    assert diagnostics["speaker_gate_timeout_count"] == 0
-    assert diagnostics["speaker_gate_stale_count"] == 0
-    assert diagnostics["speaker_gate_released_prepare_failure_count"] == 1
+    assert diagnostics["admission_terminal_forward_count"] == 2
+    assert diagnostics["admission_terminal_drop_count"] == 1
+    assert diagnostics["admission_deadline_forward_count"] == 1
+    assert diagnostics["admission_rejection_applied_sealed_count"] == 1
+    assert diagnostics["admission_core_settlement_degraded_count"] == 0
+    assert diagnostics["admission_late_operation_ignored_count"] == 1
     assert diagnostics["diagnostic_runtime_missing_identity_count"] == 1
     assert diagnostics["diagnostic_runtime_seal_unbound_count"] == 1
     assert (
