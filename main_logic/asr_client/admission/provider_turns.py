@@ -6,7 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
-from main_logic.voice_turn.contracts import VoiceTurnToken
+from main_logic.voice_turn.contracts import VoiceIngressToken, VoiceTurnToken
 
 from .._provider_events import ProviderAudioRange, ProviderUtteranceKey
 from .contracts import AdmissionResolutionTicket, BoundaryProof, PendingProviderFinal
@@ -55,6 +55,43 @@ class ProviderAliasCompletionResult:
     retired_proofs: tuple[BoundaryProof, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderBoundaryRecordResult:
+    """Normalized boundary authority plus every proof the caller must retire."""
+
+    boundary_result: ProviderBoundaryResult
+    retired_proofs: tuple[BoundaryProof, ...] = ()
+
+    @property
+    def quality(self) -> BoundaryResultQuality:
+        return self.boundary_result.quality
+
+    @property
+    def audio_range(self) -> ProviderAudioRange | None:
+        return self.boundary_result.audio_range
+
+    @property
+    def proof(self) -> BoundaryProof | None:
+        return self.boundary_result.proof
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAliasRetirementResult:
+    retired: bool
+    provider_keys: tuple[ProviderUtteranceKey, ...] = ()
+    bound_turn_tokens: tuple[VoiceTurnToken, ...] = ()
+    retired_proofs: tuple[BoundaryProof, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderNamespaceRetirementResult:
+    namespace: tuple[int, int]
+    retired: bool
+    provider_keys: tuple[ProviderUtteranceKey, ...] = ()
+    bound_turn_tokens: tuple[VoiceTurnToken, ...] = ()
+    retired_proofs: tuple[BoundaryProof, ...] = ()
+
+
 class ProviderTurnCorrelator:
     """Bind aliases only in the ordered lane; optional exact proof is bounded."""
 
@@ -85,7 +122,9 @@ class ProviderTurnCorrelator:
         ] = OrderedDict()
         self._completed: OrderedDict[ProviderUtteranceKey, None] = OrderedDict()
         self._namespace = namespace
+        self._namespace_retired = False
         self._completed_high_water = 0
+        self._retired_turn_high_water: dict[VoiceIngressToken, int] = {}
 
     @property
     def completed_tombstone_count(self) -> int:
@@ -95,7 +134,8 @@ class ProviderTurnCorrelator:
         if type(key) is not ProviderUtteranceKey:
             raise TypeError("key must be ProviderUtteranceKey")
         return bool(
-            key in self._completed
+            (self._namespace_retired and self._accept_namespace(key))
+            or key in self._completed
             or (
                 self._namespace == (key.generation, key.buffer_epoch)
                 and key.utterance_id <= self._completed_high_water
@@ -107,6 +147,8 @@ class ProviderTurnCorrelator:
         return namespace == self._namespace
 
     def record_for(self, key: ProviderUtteranceKey) -> ProviderAliasRecord | None:
+        if type(key) is not ProviderUtteranceKey:
+            raise TypeError("key must be ProviderUtteranceKey")
         return self._records.get(key)
 
     def _record(self, key: ProviderUtteranceKey) -> ProviderAliasRecord:
@@ -120,7 +162,7 @@ class ProviderTurnCorrelator:
         self,
         key: ProviderUtteranceKey,
         result: ProviderBoundaryResult,
-    ) -> ProviderBoundaryResult:
+    ) -> ProviderBoundaryRecordResult:
         """Record ownership only; this API deliberately accepts no turn token."""
 
         if type(key) is not ProviderUtteranceKey:
@@ -128,35 +170,59 @@ class ProviderTurnCorrelator:
         if type(result) is not ProviderBoundaryResult:
             raise TypeError("result must be ProviderBoundaryResult")
         if not self._accept_namespace(key) or self.is_completed(key):
-            return ProviderBoundaryResult.unknown()
-        if (
-            key not in self._records
-            and sum(not record.ordered_seen for record in self._records.values())
-            >= self._proof_capacity
-        ):
-            return ProviderBoundaryResult.unknown()
-        record = self._record(key)
+            retired = (result.proof,) if result.proof is not None else ()
+            return ProviderBoundaryRecordResult(
+                ProviderBoundaryResult.unknown(),
+                retired,
+            )
+        record = self._records.get(key)
         if (
             result.quality == "exact"
             and result.proof is not None
             and result.proof.provider_key != key
         ):
+            retired = (result.proof,)
             result = ProviderBoundaryResult.unknown()
+        else:
+            retired = ()
+        if record is None and result.quality == "unknown":
+            return ProviderBoundaryRecordResult(result, retired)
+        if (
+            record is None
+            and result.quality == "exact"
+            and len(self._exact_proofs) >= self._proof_capacity
+        ):
+            assert result.proof is not None
+            return ProviderBoundaryRecordResult(
+                ProviderBoundaryResult.unknown(),
+                _unique_proofs(retired, (result.proof,)),
+            )
+        if record is None:
+            record = self._record(key)
         existing = record.boundary_result
         if existing is not None:
             if existing == result:
-                return existing
+                return ProviderBoundaryRecordResult(existing, retired)
             # Authority never recovers after a duplicate/conflicting boundary.
             self._exact_proofs.pop(key, None)
             record.boundary_result = ProviderBoundaryResult.unknown()
-            return record.boundary_result
+            retired = _unique_proofs(
+                retired,
+                (existing.proof,) if existing.proof is not None else (),
+                (result.proof,) if result.proof is not None else (),
+            )
+            return ProviderBoundaryRecordResult(record.boundary_result, retired)
         if result.quality == "exact" and len(self._exact_proofs) >= self._proof_capacity:
             record.boundary_result = ProviderBoundaryResult.unknown()
-            return record.boundary_result
+            assert result.proof is not None
+            return ProviderBoundaryRecordResult(
+                record.boundary_result,
+                _unique_proofs(retired, (result.proof,)),
+            )
         record.boundary_result = result
         if result.quality == "exact":
             self._exact_proofs[key] = result
-        return record.boundary_result
+        return ProviderBoundaryRecordResult(record.boundary_result, retired)
 
     def mark_ordered(self, key: ProviderUtteranceKey) -> ProviderAliasRecord:
         if type(key) is not ProviderUtteranceKey:
@@ -188,6 +254,11 @@ class ProviderTurnCorrelator:
         if record.bound_turn_token not in {None, turn_token}:
             raise ProviderAliasConflictError("PROVIDER_KEY_ALREADY_BOUND")
         existing_key = self._token_bindings.get(turn_token)
+        if turn_token.turn_id <= self._retired_turn_high_water.get(
+            turn_token.ingress,
+            0,
+        ):
+            raise ProviderAliasConflictError("VOICE_TURN_ALREADY_BOUND")
         if existing_key not in {None, key}:
             raise ProviderAliasConflictError("VOICE_TURN_ALREADY_BOUND")
         record.bound_turn_token = turn_token
@@ -245,24 +316,94 @@ class ProviderTurnCorrelator:
             for candidate_key in self._records
             if candidate_key.utterance_id <= key.utterance_id
         )
-        retired_proofs = tuple(
-            proof_result.proof
-            for retired_key in retired_keys
-            if (proof_result := self._exact_proofs.get(retired_key)) is not None
-            and proof_result.proof is not None
+        retired = self._retire_keys(retired_keys)
+        return ProviderAliasCompletionResult(True, retired.retired_proofs)
+
+    def abandon_turn(
+        self,
+        turn_token: VoiceTurnToken,
+    ) -> ProviderAliasRetirementResult:
+        """Retire an ACTIVE-DROP alias even when no Provider final can arrive."""
+
+        if type(turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        key = self._token_bindings.get(turn_token)
+        if key is None:
+            return ProviderAliasRetirementResult(False)
+        if any(
+            other.provider_key.utterance_id < key.utterance_id
+            for other in self._records.values()
+            if other.provider_key != key and other.ordered_seen
+        ):
+            return ProviderAliasRetirementResult(False)
+        retired_keys = tuple(
+            candidate_key
+            for candidate_key in self._records
+            if candidate_key.utterance_id <= key.utterance_id
         )
-        for retired_key in retired_keys:
-            retired = self._records.pop(retired_key)
-            self._exact_proofs.pop(retired_key, None)
-            retired_token = retired.bound_turn_token
-            if (
-                retired_token is not None
-                and self._token_bindings.get(retired_token) == retired_key
-            ):
-                self._token_bindings.pop(retired_token, None)
-        token = record.bound_turn_token
-        if token is not None and self._token_bindings.get(token) == key:
-            self._token_bindings.pop(token, None)
+        return self._retire_keys(retired_keys)
+
+    def retire_namespace(
+        self,
+        namespace: tuple[int, int],
+    ) -> ProviderNamespaceRetirementResult:
+        """Fence a complete Provider timeline and return all cleanup ownership."""
+
+        if (
+            type(namespace) is not tuple
+            or len(namespace) != 2
+            or any(type(value) is not int or value < 0 for value in namespace)
+        ):
+            raise ValueError("namespace must be a non-negative generation/epoch pair")
+        if namespace != self._namespace:
+            raise ProviderAliasConflictError("PROVIDER_NAMESPACE_MISMATCH")
+        if self._namespace_retired:
+            return ProviderNamespaceRetirementResult(namespace, False)
+        retired = self._retire_keys(tuple(self._records))
+        self._namespace_retired = True
+        self._completed.clear()
+        self._retired_turn_high_water.clear()
+        return ProviderNamespaceRetirementResult(
+            namespace=namespace,
+            retired=True,
+            provider_keys=retired.provider_keys,
+            bound_turn_tokens=retired.bound_turn_tokens,
+            retired_proofs=retired.retired_proofs,
+        )
+
+    def _retire_keys(
+        self,
+        keys: tuple[ProviderUtteranceKey, ...],
+    ) -> ProviderAliasRetirementResult:
+        retired_keys: list[ProviderUtteranceKey] = []
+        retired_tokens: list[VoiceTurnToken] = []
+        retired_proofs: list[BoundaryProof] = []
+        for key in sorted(keys, key=lambda candidate: candidate.utterance_id):
+            record = self._records.pop(key, None)
+            if record is None:
+                continue
+            retired_keys.append(key)
+            proof_result = self._exact_proofs.pop(key, None)
+            if proof_result is not None and proof_result.proof is not None:
+                retired_proofs.append(proof_result.proof)
+            token = record.bound_turn_token
+            if token is not None:
+                retired_tokens.append(token)
+                self._retired_turn_high_water[token.ingress] = max(
+                    self._retired_turn_high_water.get(token.ingress, 0),
+                    token.turn_id,
+                )
+                if self._token_bindings.get(token) == key:
+                    self._token_bindings.pop(token, None)
+            self._remember_retired_key(key)
+        return ProviderAliasRetirementResult(
+            retired=bool(retired_keys),
+            provider_keys=tuple(retired_keys),
+            bound_turn_tokens=tuple(retired_tokens),
+            retired_proofs=_unique_proofs(tuple(retired_proofs)),
+        )
+
+    def _remember_retired_key(self, key: ProviderUtteranceKey) -> None:
         self._completed[key] = None
         self._completed_high_water = max(
             self._completed_high_water,
@@ -270,13 +411,28 @@ class ProviderTurnCorrelator:
         )
         while len(self._completed) > self._completed_capacity:
             self._completed.popitem(last=False)
-        return ProviderAliasCompletionResult(True, retired_proofs)
+
+
+def _unique_proofs(
+    *groups: tuple[BoundaryProof, ...],
+) -> tuple[BoundaryProof, ...]:
+    seen: set[BoundaryProof] = set()
+    ordered: list[BoundaryProof] = []
+    for group in groups:
+        for proof in group:
+            if proof not in seen:
+                seen.add(proof)
+                ordered.append(proof)
+    return tuple(ordered)
 
 
 __all__ = [
     "ProviderAliasConflictError",
     "ProviderAliasCompletionResult",
     "ProviderAliasRecord",
+    "ProviderAliasRetirementResult",
+    "ProviderBoundaryRecordResult",
     "ProviderBoundaryResult",
+    "ProviderNamespaceRetirementResult",
     "ProviderTurnCorrelator",
 ]

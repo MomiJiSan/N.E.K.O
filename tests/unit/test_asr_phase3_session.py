@@ -1211,6 +1211,56 @@ async def test_provider_out_of_order_finals_seal_each_turn_in_order():
     await session.close()
 
 
+async def test_provider_ordered_lane_waits_first_settlement_before_second_endpoint():
+    events: list[str] = []
+    first_entered = asyncio.Event()
+    first_settled = asyncio.Event()
+
+    async def on_transcript(text: str) -> None:
+        if text == "first":
+            events.append("final:first:waiting")
+            first_entered.set()
+            await first_settled.wait()
+        events.append(f"final:{text}")
+
+    async def on_endpoint() -> None:
+        events.append("endpoint")
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=on_transcript,
+        on_connection_error=AsyncMock(),
+        on_turn_endpointed=on_endpoint,
+    )
+    await session.connect()
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0}
+    for event in (
+        _AsrWorkerEvent(kind="utterance_started", utterance_id=10, **common),
+        _AsrWorkerEvent(kind="final", utterance_id=10, text="first", **common),
+        _AsrWorkerEvent(kind="utterance_started", utterance_id=11, **common),
+        _AsrWorkerEvent(kind="final", utterance_id=11, text="second", **common),
+    ):
+        await session._response_queue.put(event)
+
+    await asyncio.wait_for(first_entered.wait(), 1)
+    await asyncio.sleep(0)
+    assert events == ["endpoint", "final:first:waiting"]
+
+    first_settled.set()
+    await asyncio.wait_for(_wait_until(lambda: len(events) == 5), 1)
+    assert events == [
+        "endpoint",
+        "final:first:waiting",
+        "final:first",
+        "endpoint",
+        "final:second",
+    ]
+    await session.close()
+
+
 async def test_provider_in_order_finals_keep_endpoint_before_each_final():
     events: list[str] = []
     session = _make_provider_endpoint_session(events)

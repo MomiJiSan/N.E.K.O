@@ -96,8 +96,11 @@ def test_optional_proof_overflow_downgrades_new_key_without_dropping_final():
     correlator = ProviderTurnCorrelator(namespace=(1, 0), proof_capacity=1)
     first_key, second_key = _key(1), _key(2)
     correlator.record_boundary_result(first_key, _exact(first_key, 1))
-    result = correlator.record_boundary_result(second_key, _exact(second_key, 2))
+    second_exact = _exact(second_key, 2)
+    result = correlator.record_boundary_result(second_key, second_exact)
     assert result.quality == "unknown"
+    assert result.retired_proofs == (second_exact.proof,)
+    assert correlator.record_for(second_key) is None
 
     correlator.mark_ordered(second_key)
     correlator.bind_ordered(second_key, _token(2))
@@ -165,3 +168,148 @@ def test_pending_final_requires_exact_absolute_200ms_budget():
         PendingProviderFinal(key, "qwen", "too short", 10.0, 10.0)
     with pytest.raises(ValueError, match="exactly 200ms"):
         PendingProviderFinal(key, "qwen", "too long", 10.0, 40.0)
+
+
+def test_conflicting_exact_boundary_returns_both_proofs_for_retirement():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0))
+    key = _key(1)
+    first = _exact(key, 1)
+    second = ProviderBoundaryResult(
+        quality="exact",
+        audio_range=ProviderAudioRange(1, 100),
+        proof=BoundaryProof(2, 7, key),
+    )
+    assert correlator.record_boundary_result(key, first).quality == "exact"
+
+    conflict = correlator.record_boundary_result(key, second)
+
+    assert conflict.quality == "unknown"
+    assert conflict.retired_proofs == (first.proof, second.proof)
+    assert correlator.record_for(key).boundary_result.quality == "unknown"
+
+
+def test_active_drop_abandons_alias_without_final_and_prevents_resurrection():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0))
+    key = _key(1)
+    token = _token(1)
+    exact = _exact(key, 1)
+    correlator.record_boundary_result(key, exact)
+    correlator.mark_ordered(key)
+    correlator.bind_ordered(key, token)
+
+    retired = correlator.abandon_turn(token)
+
+    assert retired.retired is True
+    assert retired.provider_keys == (key,)
+    assert retired.bound_turn_tokens == (token,)
+    assert retired.retired_proofs == (exact.proof,)
+    assert correlator.is_completed(key) is True
+    assert correlator.record_for(key) is None
+    assert correlator.abandon_turn(token).retired is False
+    with pytest.raises(ProviderAliasConflictError, match="ALREADY_COMPLETED"):
+        correlator.mark_ordered(key)
+
+    successor = _key(2)
+    correlator.mark_ordered(successor)
+    with pytest.raises(ProviderAliasConflictError, match="VOICE_TURN_ALREADY_BOUND"):
+        correlator.bind_ordered(successor, token)
+
+
+def test_active_drop_can_only_retire_the_oldest_ordered_key():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0), completed_capacity=1)
+    first_key, second_key = _key(1), _key(2)
+    correlator.mark_ordered(first_key)
+    correlator.bind_ordered(first_key, _token(1))
+    correlator.mark_ordered(second_key)
+    correlator.bind_ordered(second_key, _token(2))
+
+    assert correlator.abandon_turn(_token(2)).retired is False
+    assert correlator.is_completed(first_key) is False
+    assert correlator.record_for(first_key) is not None
+    assert correlator.abandon_turn(_token(1)).retired is True
+    assert correlator.is_completed(first_key) is True
+    assert correlator.abandon_turn(_token(2)).retired is True
+    assert correlator.is_completed(second_key) is True
+
+
+def test_active_drop_retires_earlier_boundary_only_proof_without_leak():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0))
+    first_key, second_key = _key(1), _key(2)
+    first_exact, second_exact = _exact(first_key, 1), _exact(second_key, 2)
+    correlator.record_boundary_result(first_key, first_exact)
+    correlator.record_boundary_result(second_key, second_exact)
+    correlator.mark_ordered(second_key)
+    correlator.bind_ordered(second_key, _token(2))
+
+    retired = correlator.abandon_turn(_token(2))
+
+    assert retired.retired is True
+    assert retired.provider_keys == (first_key, second_key)
+    assert retired.retired_proofs == (first_exact.proof, second_exact.proof)
+    assert correlator.record_for(first_key) is None
+    assert correlator.record_for(second_key) is None
+    assert correlator.is_completed(first_key) is True
+    assert correlator.is_completed(second_key) is True
+
+
+def test_namespace_retirement_fences_every_alias_and_returns_cleanup_ownership():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0))
+    first_key, second_key = _key(1), _key(2)
+    first_exact, second_exact = _exact(first_key, 1), _exact(second_key, 2)
+    correlator.record_boundary_result(first_key, first_exact)
+    correlator.record_boundary_result(second_key, second_exact)
+    correlator.mark_ordered(first_key)
+    correlator.bind_ordered(first_key, _token(1))
+    correlator.mark_ordered(second_key)
+    correlator.bind_ordered(second_key, _token(2))
+
+    retired = correlator.retire_namespace((1, 0))
+
+    assert retired.retired is True
+    assert retired.provider_keys == (first_key, second_key)
+    assert retired.bound_turn_tokens == (_token(1), _token(2))
+    assert retired.retired_proofs == (first_exact.proof, second_exact.proof)
+    assert correlator.retire_namespace((1, 0)).retired is False
+    late_exact = _exact(_key(3), 3)
+    late = correlator.record_boundary_result(_key(3), late_exact)
+    assert late.quality == "unknown"
+    assert late.retired_proofs == (late_exact.proof,)
+    with pytest.raises(ProviderAliasConflictError, match="ALREADY_COMPLETED"):
+        correlator.mark_ordered(_key(3))
+
+
+def test_unknown_boundaries_do_not_consume_optional_proof_or_alias_capacity():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0), proof_capacity=1)
+    for utterance_id in range(1, 20):
+        key = _key(utterance_id)
+        result = correlator.record_boundary_result(
+            key,
+            ProviderBoundaryResult.unknown(),
+        )
+        assert result.quality == "unknown"
+        assert correlator.record_for(key) is None
+
+    exact_key = _key(20)
+    assert correlator.record_boundary_result(exact_key, _exact(exact_key, 20)).quality == (
+        "exact"
+    )
+
+
+def test_completed_key_and_turn_tombstones_remain_bounded_without_resurrection():
+    correlator = ProviderTurnCorrelator(namespace=(1, 0), completed_capacity=1)
+    ingress = _token(1).ingress
+    for utterance_id in range(1, 20):
+        key = _key(utterance_id)
+        token = _token(utterance_id)
+        correlator.mark_ordered(key)
+        correlator.bind_ordered(key, token)
+        correlator.record_final(key, _final(key, str(utterance_id), 10.0))
+        assert correlator.complete(key, _resolution(utterance_id)).completed is True
+
+    assert correlator.completed_tombstone_count == 1
+    assert correlator._retired_turn_high_water == {ingress: 19}
+    assert correlator.is_completed(_key(1)) is True
+    new_key = _key(20)
+    correlator.mark_ordered(new_key)
+    with pytest.raises(ProviderAliasConflictError, match="VOICE_TURN_ALREADY_BOUND"):
+        correlator.bind_ordered(new_key, _token(1))

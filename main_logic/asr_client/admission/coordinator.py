@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
@@ -17,6 +18,9 @@ from .contracts import (
     CaptureState,
     ProviderBindingState,
     SettlementState,
+    Close,
+    Reset,
+    RouteReplaced,
     VoiceTurnAdmissionRecord,
 )
 from .reducer import reduce
@@ -28,6 +32,14 @@ class AdmissionCapacityError(RuntimeError):
 
 class AdmissionIdentityError(RuntimeError):
     """A logical turn token or one of its aliases was reused inconsistently."""
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionBulkResult:
+    """Effects produced for one turn by an atomic bulk invalidation snapshot."""
+
+    turn_token: VoiceTurnToken
+    effects: tuple[AdmissionEffect, ...]
 
 
 class VoiceTurnAdmissionCoordinator:
@@ -135,6 +147,36 @@ class VoiceTurnAdmissionCoordinator:
         async with self._lock:
             return self._records.get(turn_token)
 
+    async def live_turn_tokens(self) -> tuple[VoiceTurnToken, ...]:
+        """Return one insertion-ordered snapshot without exposing the record table."""
+
+        async with self._lock:
+            return tuple(self._records)
+
+    async def invalidate_all(
+        self,
+        event: Reset | Close | RouteReplaced,
+        *,
+        now: float | None = None,
+    ) -> tuple[AdmissionBulkResult, ...]:
+        """Reduce one route invalidation against the complete live snapshot.
+
+        The reducer is run for every record while this coordinator remains the
+        single writer.  Effects are only returned after the lock is released;
+        callers execute them and post their acknowledgements through ingress.
+        """
+
+        if type(event) not in {Reset, Close, RouteReplaced}:
+            raise TypeError("event must be Reset, Close, or RouteReplaced")
+        effective_now = self._clock() if now is None else now
+        async with self._lock:
+            results: list[AdmissionBulkResult] = []
+            for turn_token, record in self._records.items():
+                reduced, effects = reduce(record, event, effective_now)
+                self._records[turn_token] = reduced
+                results.append(AdmissionBulkResult(turn_token, effects))
+            return tuple(results)
+
     async def retire(self, turn_token: VoiceTurnToken) -> bool:
         """Remove only an already-settled record; never evict live admission."""
 
@@ -170,6 +212,7 @@ class VoiceTurnAdmissionCoordinator:
 
 
 __all__ = [
+    "AdmissionBulkResult",
     "AdmissionCapacityError",
     "AdmissionIdentityError",
     "VoiceTurnAdmissionCoordinator",

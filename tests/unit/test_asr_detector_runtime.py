@@ -842,6 +842,77 @@ async def _prepare_candidate_rejection_fixture() -> tuple[
     return detector, shadow, candidate, shadow_candidate, turn_token
 
 
+async def test_speaker_candidate_binding_snapshot_publishes_when_turn_binds_first() -> (
+    None
+):
+    (
+        detector,
+        _shadow,
+        _candidate,
+        shadow_candidate,
+        turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+
+    assert (
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+        == turn_token
+    )
+    await detector.close()
+
+
+async def test_speaker_candidate_binding_snapshot_publishes_when_shadow_opens_first() -> (
+    None
+):
+    shadow = _SpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    ingress = _ingress_token()
+    result = await detector.feed(
+        b"\x01\x00" * 160,
+        ingress_token=ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result.candidate is not None
+    detector.observe_provider_audio(b"\x02\x00" * 160, sample_rate_hz=16_000)
+    shadow_candidate = detector._speaker_shadow_candidate
+    assert shadow_candidate is not None
+    assert detector._bound_turn_token_for_speaker_candidate(shadow_candidate) is None
+
+    turn_token = VoiceTurnToken(ingress, turn_id=1)
+    assert await detector.bind_candidate(result.candidate, turn_token) is not None
+    assert (
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+        == turn_token
+    )
+    await detector.close()
+
+
+async def test_speaker_candidate_binding_snapshot_reset_fences_stale_candidate() -> (
+    None
+):
+    (
+        detector,
+        _shadow,
+        _candidate,
+        shadow_candidate,
+        turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+    assert (
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+        == turn_token
+    )
+
+    await detector.reset()
+
+    assert detector._bound_turn_token_for_speaker_candidate(shadow_candidate) is None
+    await detector.close()
+
+
 async def _open_provider_candidate(
     detector: DetectorRuntime,
     *,

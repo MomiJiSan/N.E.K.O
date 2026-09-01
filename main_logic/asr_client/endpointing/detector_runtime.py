@@ -1813,6 +1813,10 @@ class DetectorRuntime:
         self._speaker_shadow = speaker_shadow
         self._speaker_shadow_generation = 0
         self._speaker_shadow_candidate: SpeakerShadowCandidateKey | None = None
+        self._speaker_candidate_turn_bindings: dict[
+            SpeakerShadowCandidateKey,
+            VoiceTurnToken,
+        ] = {}
         self._speaker_shadow_suppressed_candidate: (
             tuple[int, SpeakerShadowScope] | None
         ) = None
@@ -2070,13 +2074,59 @@ class DetectorRuntime:
             return None
         existing = self._bound_turns.get(candidate)
         if existing is not None:
+            shadow_candidate = next(
+                (
+                    segment.candidate
+                    for segment in self._provider_speaker_segments
+                    if segment.detector_candidate == candidate
+                    and segment.candidate is not None
+                ),
+                self._speaker_shadow_candidate,
+            )
+            if shadow_candidate is not None:
+                self._publish_speaker_candidate_binding(
+                    shadow_candidate,
+                    candidate,
+                )
             return existing if existing.turn_token == turn_token else None
         bound = BoundDetectorTurn(candidate, turn_token)
         self._bound_turns[candidate] = bound
+        shadow_candidate = next(
+            (
+                segment.candidate
+                for segment in self._provider_speaker_segments
+                if segment.detector_candidate == candidate
+                and segment.candidate is not None
+            ),
+            None,
+        )
+        if (
+            shadow_candidate is None
+            and candidate.candidate_generation == self._candidate_generation
+        ):
+            shadow_candidate = self._speaker_shadow_candidate
+        if shadow_candidate is not None:
+            self._publish_speaker_candidate_binding(
+                shadow_candidate,
+                candidate,
+            )
         deferred = self._deferred_completions.pop(candidate, None)
         if deferred is not None:
             await self._publish_bound_completion(candidate, deferred)
         return bound
+
+    def _publish_speaker_candidate_binding(
+        self,
+        shadow_candidate: SpeakerShadowCandidateKey,
+        detector_candidate: DetectorCandidateKey,
+    ) -> None:
+        bound = self._bound_turns.get(detector_candidate)
+        if bound is None:
+            return
+        self._speaker_candidate_turn_bindings = {
+            **self._speaker_candidate_turn_bindings,
+            shadow_candidate: bound.turn_token,
+        }
 
     def _mark_provider_micro_event_ambiguous(
         self,
@@ -2140,6 +2190,10 @@ class DetectorRuntime:
         activate_deferred: bool = True,
     ) -> bool:
         candidate = segment.candidate
+        if candidate is not None:
+            bindings = dict(self._speaker_candidate_turn_bindings)
+            bindings.pop(candidate, None)
+            self._speaker_candidate_turn_bindings = bindings
         shadow = self._speaker_shadow
         if candidate is None or shadow is None:
             return False
@@ -2914,6 +2968,26 @@ class DetectorRuntime:
                 turn_token=bound.turn_token,
                 _runtime=self,
             )
+
+    def _bound_turn_token_for_speaker_candidate(
+        self,
+        shadow_candidate: SpeakerShadowCandidateKey,
+    ) -> VoiceTurnToken | None:
+        """Resolve the already-bound turn without yielding the callback loop.
+
+        Speaker observation callbacks use this only to reserve their FIFO
+        position before returning.  It grants no rejection authority; the
+        separately locked ``prepare_candidate_rejection`` remains the sole
+        capability issuer.
+        """
+
+        if (
+            type(shadow_candidate) is not SpeakerShadowCandidateKey
+            or self._closed
+            or shadow_candidate.detector_epoch != self._detector_epoch
+        ):
+            return None
+        return self._speaker_candidate_turn_bindings.get(shadow_candidate)
 
     def speaker_rejection_diagnostics_snapshot(self) -> dict[str, int]:
         """Return aggregate-only rejection preparation counters."""
@@ -4123,6 +4197,11 @@ class DetectorRuntime:
                     tentative=overlap,
                 )
                 self._provider_speaker_segments.append(segment)
+                if candidate is not None:
+                    self._publish_speaker_candidate_binding(
+                        candidate,
+                        detector_candidate,
+                    )
                 if overlap:
                     self._speaker_rejection_prepare_diagnostics[
                         "provider_speaker_segment_split_count"
@@ -5186,6 +5265,7 @@ class DetectorRuntime:
                 self._policy_event_candidate = None
                 self._throttle_policy.reset_candidate_activity()
                 self._bound_turns.clear()
+                self._speaker_candidate_turn_bindings = {}
                 self._deferred_completions.clear()
                 self._completion_fences.clear()
                 self._provider_candidate_fence = None
@@ -5470,6 +5550,13 @@ class DetectorRuntime:
             scope=scope,
         )
         self._speaker_shadow_candidate = candidate
+        self._publish_speaker_candidate_binding(
+            candidate,
+            DetectorCandidateKey(
+                self._detector_epoch,
+                self._candidate_generation,
+            ),
+        )
         return candidate
 
     def _submit_speaker_shadow(
@@ -5498,6 +5585,10 @@ class DetectorRuntime:
     ) -> None:
         candidate = self._speaker_shadow_candidate
         self._speaker_shadow_candidate = None
+        if candidate is not None:
+            bindings = dict(self._speaker_candidate_turn_bindings)
+            bindings.pop(candidate, None)
+            self._speaker_candidate_turn_bindings = bindings
         self._speaker_shadow_generation += 1
         suppressed = self._speaker_shadow_suppressed_candidate
         if suppressed is not None and (
@@ -5517,6 +5608,7 @@ class DetectorRuntime:
     def _reset_speaker_shadow_identity(self) -> None:
         self._speaker_shadow_generation += 1
         self._speaker_shadow_candidate = None
+        self._speaker_candidate_turn_bindings = {}
 
     @staticmethod
     async def _reset_speaker_shadow(

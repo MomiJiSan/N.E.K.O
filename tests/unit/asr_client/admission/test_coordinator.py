@@ -10,6 +10,7 @@ from main_logic.asr_client.admission.contracts import (
     PendingProviderFinal,
     ProviderFinalReceived,
     ResolveReserved,
+    RouteReplaced,
     TransportSettled,
 )
 from main_logic.asr_client.admission.coordinator import (
@@ -81,3 +82,35 @@ async def test_reopening_live_token_cannot_silently_add_or_replace_aliases():
     await coordinator.open_turn(token)
     with pytest.raises(AdmissionIdentityError, match="ALIAS_CONFLICT"):
         await coordinator.open_turn(token, provider_key=ProviderUtteranceKey(1, 0, 1))
+
+
+async def test_live_snapshot_and_bulk_route_replacement_are_atomic_and_ordered():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 12.5)
+    first, second = _token(1), _token(2)
+    await coordinator.open_turn(first)
+    await coordinator.open_turn(second)
+
+    assert await coordinator.live_turn_tokens() == (first, second)
+    results = await coordinator.invalidate_all(RouteReplaced())
+
+    assert tuple(result.turn_token for result in results) == (first, second)
+    assert all(
+        any(
+            isinstance(effect, ResolveReserved)
+            and effect.disposition is AdmissionDisposition.ABANDON
+            for effect in result.effects
+        )
+        for result in results
+    )
+    assert (await coordinator.get_record(first)).admission_state is AdmissionState.ABANDONED
+    assert (await coordinator.get_record(second)).admission_state is AdmissionState.ABANDONED
+
+
+async def test_bulk_invalidation_rejects_non_route_control_event():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    with pytest.raises(TypeError, match="Reset, Close, or RouteReplaced"):
+        await coordinator.invalidate_all(  # type: ignore[arg-type]
+            ProviderFinalReceived(
+                PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)
+            )
+        )

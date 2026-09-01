@@ -113,7 +113,7 @@ def _deadline_effect(effects) -> ScheduleFinalDeadline:
     return next(effect for effect in effects if isinstance(effect, ScheduleFinalDeadline))
 
 
-def test_first_low_then_final_then_second_low_and_exact_before_deadline_drops():
+def test_final_then_second_low_and_exact_before_deadline_drops():
     record, capability = _record()
     record, _ = _step(
         record,
@@ -142,7 +142,7 @@ def test_first_low_then_final_then_second_low_and_exact_before_deadline_drops():
     ]
 
 
-def test_exact_then_first_low_then_final_then_second_low_before_deadline_drops():
+def test_exact_final_then_second_low_before_deadline_drops():
     record, capability = _record()
     record, _ = _step(record, BoundaryExact(capability))
     record, _ = _step(
