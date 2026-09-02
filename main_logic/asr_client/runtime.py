@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -165,6 +166,9 @@ _CANDIDATE_REJECTION_RECOVERY_STEP_TIMEOUT_SECONDS = 1.0
 _CANDIDATE_REJECTION_REINSTALL_ATTEMPTS = 2
 _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS = 0.2
 _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS = 0.2
+_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS = 1.0
+_ASR_TERMINAL_HARD_CLOSE_RESERVE_SECONDS = 0.6
+_ASR_TERMINAL_CLOSE_JOIN_SLICE_SECONDS = 0.1
 _MAX_BUFFERED_PROVIDER_SPEAKER_SPANS = 8
 _MAX_PROVIDER_BOUNDARY_SNAPSHOTS = 8
 _MAX_SPEAKER_EVIDENCE_BRIDGE_RECORDS = 256
@@ -393,28 +397,42 @@ class IndependentAsrRuntime:
         return self._callbacks.display_name()
 
     async def close(self) -> None:
+        """Permanently dispose this runtime and its admission ingress."""
+
+        self._ensure_asr_runtime_state()
+        close_task = self._asr_terminal_close_task
+        if close_task is None:
+            self._asr_terminal_close_requested = True
+            self._begin_asr_start_operation()
+            close_task = asyncio.create_task(
+                self._finish_terminal_asr_close(),
+                name="independent-asr-terminal-close",
+            )
+            # stop_session() snapshots the ordinary owned-cleanup registry, so
+            # the terminal owner must stay outside it to avoid waiting itself.
+            close_task.add_done_callback(self._log_asr_background_task_failure)
+            self._asr_terminal_close_task = close_task
+        await asyncio.shield(close_task)
+
+    async def stop_session(self) -> None:
+        """Stop one ASR session while keeping the admission lane reusable."""
+
         self._ensure_asr_runtime_state()
         close_task = self._asr_runtime_close_task
         if close_task is None:
-            # Explicit close owns a different operation from start's detached
+            # A session stop owns a different operation from start's detached
             # predecessor cleanup. Invalidate the in-flight start before
             # awaiting either cleanup, then wait for both under one explicit
-            # close latch so cancellation/retry retains the same owner.
+            # latch so cancellation/retry retains the same owner.
             operation_generation = self._begin_asr_start_operation()
             predecessor_cleanups = tuple(self._asr_owned_cleanup_tasks)
             cleanup = self._detach_independent_asr(
                 operation_generation=operation_generation,
             )
-            # Started HERE, not inside the joiner below. The resources this
-            # close just detached are its own and independent of any retired
-            # teardown; sequencing them behind a predecessor that never
-            # returns -- a retired provider stuck in session.close(), say --
-            # would keep this generation's detector and session physically
-            # open for as long as that lasts.
             cleanup_task = (
                 self._schedule_owned_cleanup(
                     cleanup,
-                    name="independent-asr-close-detached",
+                    name="independent-asr-stop-session-detached",
                 )
                 if cleanup is not None
                 else None
@@ -424,13 +442,271 @@ class IndependentAsrRuntime:
                     predecessor_cleanups,
                     cleanup_task,
                 ),
-                name="independent-asr-close",
+                name="independent-asr-stop-session",
             )
             self._asr_runtime_close_task = close_task
         await asyncio.shield(close_task)
+
+    async def _finish_terminal_asr_close(self) -> None:
+        """Bounded terminal drain followed by permanent hard-close fences."""
+
+        deadline = time.monotonic() + _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS
+        drain_deadline = deadline - _ASR_TERMINAL_HARD_CLOSE_RESERVE_SECONDS
+        stop_waiter = asyncio.create_task(
+            self.stop_session(),
+            name="independent-asr-terminal-stop-session",
+        )
+        stop_pending = await self._bounded_terminal_task_join(
+            {stop_waiter},
+            deadline=drain_deadline,
+            label="session stop",
+            cancel_first=False,
+        )
+        if (
+            stop_pending
+            or stop_waiter.cancelled()
+            or any(not task.done() for task in self._asr_owned_cleanup_tasks)
+        ):
+            owned_cleanups = set(self._asr_owned_cleanup_tasks)
+            await self._bounded_terminal_task_join(
+                owned_cleanups,
+                deadline=drain_deadline,
+                label="owned cleanup",
+                cancel_first=True,
+            )
+
+        await self._quiesce_terminal_admission_tasks(drain_deadline)
+
+        transcript_dispatcher = self._asr_transcript_dispatcher
+        detector_dispatcher = self._asr_detector_dispatcher
+        audio_dispatcher = self._asr_audio_dispatcher
+        transcript_dispatcher.invalidate_all()
+        detector_dispatcher.invalidate_all()
+        audio_dispatcher.abort()
+        dispatcher_closes = {
+            asyncio.create_task(
+                detector_dispatcher.close(),
+                name="independent-asr-terminal-detector-dispatcher-close",
+            ),
+            asyncio.create_task(
+                audio_dispatcher.close(),
+                name="independent-asr-terminal-audio-dispatcher-close",
+            ),
+        }
+        self._track_terminal_close_tasks(dispatcher_closes)
+        await self._bounded_terminal_task_join(
+            dispatcher_closes,
+            deadline=deadline,
+            label="idle dispatcher close",
+            cancel_first=False,
+            cancel_on_timeout=False,
+        )
+
+        async def close_speaker_factory() -> None:
+            async with self._speaker_verifier_lock:
+                factory = self._speaker_verifier_factory
+                self._speaker_verifier_factory = None
+                self._speaker_verifier_activation_generation = None
+                self._speaker_verifier_degraded = False
+                if factory is not None:
+                    self._close_speaker_verifier_factory(factory)
+
+        speaker_close = asyncio.create_task(
+            close_speaker_factory(),
+            name="independent-asr-terminal-speaker-factory-close",
+        )
+        self._track_terminal_close_tasks({speaker_close})
+        await self._bounded_terminal_task_join(
+            {speaker_close},
+            deadline=deadline,
+            label="speaker factory close",
+            cancel_first=False,
+            cancel_on_timeout=False,
+        )
+
+        # A settlement may have scheduled one final producer before observing
+        # the terminal generation. Re-snapshot without consuming hard-close
+        # reserve, then publish the lane's permanent closing fence.
+        await self._quiesce_terminal_admission_tasks(drain_deadline)
         if self._asr_admission_ingress_started:
-            await self._asr_admission_ingress.close()
-            self._asr_admission_ingress_started = False
+            ingress_close = asyncio.create_task(
+                self._asr_admission_ingress.close(),
+                name="independent-asr-terminal-admission-ingress-close",
+            )
+            self._track_terminal_close_tasks({ingress_close})
+
+            def finish_ingress_close(done: asyncio.Task[Any]) -> None:
+                if not done.cancelled() and done.exception() is None:
+                    self._asr_admission_ingress_started = False
+
+            ingress_close.add_done_callback(finish_ingress_close)
+            ingress_pending = await self._bounded_terminal_task_join(
+                {ingress_close},
+                deadline=deadline,
+                label="admission ingress close",
+                cancel_first=False,
+                cancel_on_timeout=False,
+            )
+            if (
+                not ingress_pending
+                and not ingress_close.cancelled()
+                and ingress_close.exception() is None
+            ):
+                self._asr_admission_ingress_started = False
+            else:
+                logger.warning(
+                    "[%s] admission ingress terminal owner remains active",
+                    self.display_name,
+                )
+
+    def _track_terminal_close_tasks(
+        self,
+        tasks: set[asyncio.Task[Any]],
+    ) -> None:
+        """Retain timed-out hard-close owners until their actual completion."""
+
+        for task in tasks:
+            self._asr_close_tasks.add(task)
+
+            def reap(done: asyncio.Task[Any]) -> None:
+                self._asr_close_tasks.discard(done)
+                self._log_asr_background_task_failure(done)
+
+            task.add_done_callback(reap)
+
+    async def _bounded_terminal_task_join(
+        self,
+        tasks: set[asyncio.Task[Any]],
+        *,
+        deadline: float,
+        label: str,
+        cancel_first: bool,
+        cancel_on_timeout: bool = True,
+    ) -> set[asyncio.Task[Any]]:
+        """Join one owned task set within the absolute terminal deadline."""
+
+        current = asyncio.current_task()
+        pending = {
+            task for task in tasks if task is not current and not task.done()
+        }
+        if not pending:
+            return set()
+        owned = set(pending)
+        if cancel_first:
+            for task in pending:
+                if task not in self._asr_terminal_cancel_requested_tasks:
+                    self._asr_terminal_cancel_requested_tasks.add(task)
+                    task.cancel()
+
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining > 0:
+            _, pending = await asyncio.wait(
+                pending,
+                timeout=min(
+                    remaining / 2,
+                    _ASR_TERMINAL_CLOSE_JOIN_SLICE_SECONDS,
+                ),
+            )
+        else:
+            # This schedules fresh hard-close tasks once so their synchronous
+            # ownership fence can publish before timeout cancellation.
+            _, pending = await asyncio.wait(pending, timeout=0)
+        if pending and not cancel_first and cancel_on_timeout:
+            for task in pending:
+                if task not in self._asr_terminal_cancel_requested_tasks:
+                    self._asr_terminal_cancel_requested_tasks.add(task)
+                    task.cancel()
+        remaining = max(0.0, deadline - time.monotonic())
+        if pending and remaining > 0:
+            _, pending = await asyncio.wait(
+                pending,
+                timeout=min(
+                    remaining,
+                    _ASR_TERMINAL_CLOSE_JOIN_SLICE_SECONDS,
+                ),
+            )
+        elif pending:
+            _, pending = await asyncio.wait(pending, timeout=0)
+        if pending:
+            logger.warning(
+                "[%s] independent ASR terminal %s exceeded %.1fs deadline",
+                self.display_name,
+                label,
+                _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS,
+            )
+        for task in owned - pending:
+            self._log_asr_background_task_failure(task)
+        return pending
+
+    async def _quiesce_terminal_admission_tasks(self, deadline: float) -> None:
+        """Cancel producers, then allow settlement owners to finish."""
+
+        current = asyncio.current_task()
+        producers = {
+            task
+            for task in (
+                *tuple(self._asr_admission_candidate_owned_tasks),
+                *tuple(self._asr_admission_deadline_tasks.values()),
+            )
+            if task is not current and not task.done()
+        }
+        pending_producers = await self._bounded_terminal_task_join(
+            producers,
+            deadline=deadline,
+            label="admission producer drain",
+            cancel_first=True,
+        )
+        completed_producers = producers - pending_producers
+        self._asr_admission_candidate_owned_tasks.difference_update(
+            completed_producers
+        )
+        for candidate, task in tuple(self._asr_admission_candidate_tasks.items()):
+            if task in completed_producers:
+                self._asr_admission_candidate_tasks.pop(candidate, None)
+        for ticket, task in tuple(self._asr_admission_deadline_tasks.items()):
+            if task in completed_producers:
+                self._asr_admission_deadline_tasks.pop(ticket, None)
+
+        settlements = {
+            task
+            for task in tuple(self._asr_admission_effect_tasks)
+            if task is not current and not task.done()
+        }
+        pending_settlements = await self._bounded_terminal_task_join(
+            settlements,
+            deadline=deadline,
+            label="admission settlement drain",
+            cancel_first=False,
+        )
+        completed_settlements = settlements - pending_settlements
+        self._asr_admission_effect_tasks.difference_update(completed_settlements)
+        for task in completed_settlements:
+            self._asr_admission_effect_task_turns.pop(task, None)
+
+        late_producers = {
+            task
+            for task in (
+                *tuple(self._asr_admission_candidate_owned_tasks),
+                *tuple(self._asr_admission_deadline_tasks.values()),
+            )
+            if task is not current and not task.done()
+        }
+        pending_late_producers = await self._bounded_terminal_task_join(
+            late_producers,
+            deadline=deadline,
+            label="late admission producer drain",
+            cancel_first=True,
+        )
+        completed_late_producers = late_producers - pending_late_producers
+        self._asr_admission_candidate_owned_tasks.difference_update(
+            completed_late_producers
+        )
+        for candidate, task in tuple(self._asr_admission_candidate_tasks.items()):
+            if task in completed_late_producers:
+                self._asr_admission_candidate_tasks.pop(candidate, None)
+        for ticket, task in tuple(self._asr_admission_deadline_tasks.items()):
+            if task in completed_late_producers:
+                self._asr_admission_deadline_tasks.pop(ticket, None)
 
     @staticmethod
     async def _finish_explicit_asr_close(
@@ -463,6 +739,16 @@ class IndependentAsrRuntime:
             raise ValueError("activation_generation must be a non-empty string")
         self._ensure_asr_runtime_state()
         async with self._speaker_verifier_lock:
+            if self._asr_terminal_close_requested:
+                if factory is not None:
+                    return False
+                old_factory = self._speaker_verifier_factory
+                self._speaker_verifier_factory = None
+                self._speaker_verifier_activation_generation = activation_generation
+                self._speaker_verifier_degraded = False
+                if old_factory is not None:
+                    self._close_speaker_verifier_factory(old_factory)
+                return True
             return await self._set_speaker_verifier_factory_locked(
                 factory,
                 activation_generation=activation_generation,
@@ -548,6 +834,13 @@ class IndependentAsrRuntime:
         else:
             await self._revoke_runtime_speaker_authority_for_verifier_change()
 
+        if self._asr_terminal_close_requested:
+            self._speaker_verifier_factory = None
+            self._speaker_verifier_activation_generation = None
+            self._speaker_verifier_degraded = False
+            if old_factory is not None and not revoking:
+                self._close_speaker_verifier_factory(old_factory)
+            return revoking
         if not revoking:
             self._speaker_verifier_factory = factory
             self._speaker_verifier_activation_generation = activation_generation
@@ -586,6 +879,8 @@ class IndependentAsrRuntime:
         """Queue one ordered speaker fact; only the coordinator may resolve final."""
 
         self._ensure_asr_runtime_state()
+        if self._asr_terminal_close_requested:
+            return False
         if (
             not isinstance(fact, (SpeakerLow, SpeakerHigh, SpeakerUnavailable))
             or activation_generation
@@ -761,6 +1056,10 @@ class IndependentAsrRuntime:
         candidate: SpeakerShadowCandidateKey,
         awaitable: Awaitable[None],
     ) -> bool:
+        if self._asr_terminal_close_requested:
+            if hasattr(awaitable, "close"):
+                awaitable.close()  # type: ignore[attr-defined]
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -779,8 +1078,10 @@ class IndependentAsrRuntime:
 
         task = loop.create_task(run(), name="voice-turn-speaker-admission")
         self._asr_admission_candidate_tasks[candidate] = task
+        self._asr_admission_candidate_owned_tasks.add(task)
 
         def reap(done: asyncio.Task[None]) -> None:
+            self._asr_admission_candidate_owned_tasks.discard(done)
             if self._asr_admission_candidate_tasks.get(candidate) is done:
                 self._asr_admission_candidate_tasks.pop(candidate, None)
             self._log_asr_background_task_failure(done)
@@ -1068,6 +1369,9 @@ class IndependentAsrRuntime:
             SpeakerShadowCandidateKey,
             asyncio.Task[None],
         ] = {}
+        self._asr_admission_candidate_owned_tasks: set[
+            asyncio.Task[None]
+        ] = set()
         self._asr_admission_deadline_tasks: dict[
             AdmissionOperationTicket,
             asyncio.Task[None],
@@ -1113,6 +1417,11 @@ class IndependentAsrRuntime:
         self._asr_close_tasks: set[asyncio.Task[None]] = set()
         self._asr_owned_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._asr_runtime_close_task: asyncio.Task[None] | None = None
+        self._asr_terminal_close_requested = False
+        self._asr_terminal_close_task: asyncio.Task[None] | None = None
+        self._asr_terminal_cancel_requested_tasks: weakref.WeakSet[
+            asyncio.Task[Any]
+        ] = weakref.WeakSet()
         self._asr_lifecycle: VoiceInputLifecycleController | None = None
         self._asr_detector: DetectorRuntime | None = None
         self._asr_smart_turn_lease: SmartTurnLease | None = None
@@ -1252,6 +1561,7 @@ class IndependentAsrRuntime:
             self._asr_admission_capabilities = {}
             self._asr_admission_candidate_turns = {}
             self._asr_admission_candidate_tasks = {}
+            self._asr_admission_candidate_owned_tasks = set()
             self._asr_admission_deadline_tasks = {}
             self._asr_admission_effect_tasks = set()
             self._asr_admission_effect_task_turns = {}
@@ -1277,6 +1587,10 @@ class IndependentAsrRuntime:
             self._asr_admission_reservation_dispatchers = {}
         if not hasattr(self, "_asr_admission_effect_task_turns"):
             self._asr_admission_effect_task_turns = {}
+        if not hasattr(self, "_asr_admission_candidate_owned_tasks"):
+            self._asr_admission_candidate_owned_tasks = set(
+                self._asr_admission_candidate_tasks.values()
+            )
         if not hasattr(self, "_asr_provider_speaker_sequence"):
             self._asr_provider_speaker_sequence = 0
         if not hasattr(self, "_asr_buffered_provider_speaker_observation"):
@@ -1306,6 +1620,12 @@ class IndependentAsrRuntime:
             self._asr_owned_cleanup_tasks = set()
         if not hasattr(self, "_asr_runtime_close_task"):
             self._asr_runtime_close_task = None
+        if not hasattr(self, "_asr_terminal_close_requested"):
+            self._asr_terminal_close_requested = False
+        if not hasattr(self, "_asr_terminal_close_task"):
+            self._asr_terminal_close_task = None
+        if not hasattr(self, "_asr_terminal_cancel_requested_tasks"):
+            self._asr_terminal_cancel_requested_tasks = weakref.WeakSet()
         if not hasattr(self, "_asr_smart_turn_prepare_lock"):
             self._asr_smart_turn_prepare_lock = asyncio.Lock()
             self._asr_smart_turn_prepare_scope = None
@@ -3249,14 +3569,26 @@ class IndependentAsrRuntime:
         """
 
         self._ensure_asr_runtime_state()
+        if self._asr_terminal_close_requested:
+            return AsrStartResult(
+                AsrStartStatus.FAILED,
+                failure_code="ASR_START_STALE",
+                session_epoch=self._asr_session_epoch,
+            )
+        self._asr_runtime_close_task = None
+        operation_generation = self._begin_asr_start_operation()
         if not self._asr_admission_ingress_started:
             await self._asr_admission_ingress.start()
             self._asr_admission_ingress_started = True
-        # A new start owns a new runtime generation. Any predecessor close task
-        # still owns only the resources it already detached; future close calls
-        # must target this start instead of re-awaiting that retired teardown.
-        self._asr_runtime_close_task = None
-        operation_generation = self._begin_asr_start_operation()
+        if (
+            self._asr_terminal_close_requested
+            or not self._asr_start_operation_matches(operation_generation)
+        ):
+            return AsrStartResult(
+                AsrStartStatus.FAILED,
+                failure_code="ASR_START_STALE",
+                session_epoch=self._asr_session_epoch,
+            )
         cleanup = self._detach_independent_asr(
             operation_generation=operation_generation,
         )
@@ -3276,7 +3608,8 @@ class IndependentAsrRuntime:
 
         def operation_is_current() -> bool:
             return bool(
-                self._asr_start_operation_matches(operation_generation)
+                not self._asr_terminal_close_requested
+                and self._asr_start_operation_matches(operation_generation)
                 and epoch == self._asr_session_epoch
                 and audio_generation == self._asr_audio_generation
             )
@@ -3596,6 +3929,8 @@ class IndependentAsrRuntime:
                     raise RuntimeError("ASR_DETECTOR_CONTROL_BACKPRESSURE")
 
             async with self._speaker_verifier_lock:
+                if not operation_is_current():
+                    return stale_result(provider)
                 current_factory = (
                     speaker_shadow_factory
                     if self._speaker_verifier_activation_generation is None
@@ -5137,10 +5472,23 @@ class IndependentAsrRuntime:
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
         )
+        operation_generation = self._asr_start_generation
+        transcript_dispatcher = self._asr_transcript_dispatcher
+
+        def preparation_is_current() -> bool:
+            return bool(
+                not self._asr_terminal_close_requested
+                and self._asr_start_operation_matches(operation_generation)
+                and self._runtime_identity_matches(identity)
+                and self._asr_transcript_dispatcher is transcript_dispatcher
+            )
+
         try:
             if not self._asr_admission_ingress_started:
                 await self._asr_admission_ingress.start()
                 self._asr_admission_ingress_started = True
+                if not preparation_is_current():
+                    return
             await self._asr_admission_ingress.open_turn(turn_token)
         except Exception:
             await self._handle_independent_asr_error(
@@ -5150,8 +5498,11 @@ class IndependentAsrRuntime:
                 expected_identity=identity,
             )
             return
+        if not preparation_is_current():
+            # Detach already queued RouteReplaced on this lane; it owns stale
+            # record retirement. Never reserve into the replacement dispatcher.
+            return
         final_key = FinalKey.from_turn(turn_token)
-        transcript_dispatcher = self._asr_transcript_dispatcher
         if not transcript_dispatcher.try_reserve(final_key):
             await self._post_admission_event(turn_token, Reset())
             await self._handle_independent_asr_error(
@@ -5191,7 +5542,7 @@ class IndependentAsrRuntime:
                     "[%s] independent ASR turn preparation failed",
                     self.display_name,
                 )
-        if accepted and self._runtime_identity_matches(identity):
+        if accepted and preparation_is_current():
             self._asr_partial_turn_token = turn_token
             return
         await abandon_preparation()

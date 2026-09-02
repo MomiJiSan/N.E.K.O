@@ -1865,17 +1865,15 @@ async def _init_character_resources(k: str, is_new_character: bool):
             if rs.session_manager is not None:
                 from .voice_identity_runtime import unregister_voice_identity_manager
 
-                old_user_language = getattr(rs.session_manager, "user_language", None)
+                old_manager = rs.session_manager
+                old_user_language = getattr(old_manager, "user_language", None)
                 old_user_language_explicit = getattr(
-                    rs.session_manager,
+                    old_manager,
                     "_user_language_explicit",
                     False,
                 )
-                await unregister_voice_identity_manager(rs.session_manager)
-                try:
-                    rs.session_manager.shutdown()
-                except Exception as e:
-                    logger.warning(f"shutdown 旧 session_manager 失败 ({k}): {e}")
+                await unregister_voice_identity_manager(old_manager)
+                await _terminal_close_session_manager(old_manager, character_name=k)
             new_mgr = core.LLMSessionManager(
                 rs.sync_message_queue,
                 k,
@@ -2049,6 +2047,42 @@ async def _unregister_character_voice_identity_manager_locked(rs) -> None:
     await unregister_voice_identity_manager(rs.session_manager)
 
 
+async def _terminal_close_session_manager(
+    manager,
+    *,
+    character_name: str,
+) -> None:
+    """Best-effort terminal close for one manager ownership boundary.
+
+    Normal session teardown deliberately leaves the reusable ASR admission
+    ingress alive.  Replacing or deleting the manager is the point where that
+    ingress must be permanently closed before the last reference is dropped.
+    Older/fake managers without the async hook keep the previous synchronous
+    shutdown fallback; production ``LLMSessionManager`` instances use
+    ``aclose()``.
+    """
+
+    try:
+        close = getattr(manager, "aclose", None)
+        if callable(close):
+            await close()
+            return
+        shutdown = getattr(manager, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+    except Exception as exc:
+        # Do not replace/delete the slot after a failed terminal close: the
+        # old manager still owns whatever did not settle.  The caller keeps
+        # the slot reachable and can report/retry instead of orphaning it.
+        logger.warning(
+            "terminal close session_manager 失败 (%s): %s",
+            character_name,
+            exc,
+            exc_info=True,
+        )
+        raise
+
+
 async def _unregister_and_cleanup_character_slot(k: str) -> None:
     rs = role_state.get(k)
     if rs is None:
@@ -2058,6 +2092,11 @@ async def _unregister_and_cleanup_character_slot(k: str) -> None:
             return
         await _stop_character_thread(k)
         await _unregister_character_voice_identity_manager_locked(rs)
+        if rs.session_manager is not None:
+            await _terminal_close_session_manager(
+                rs.session_manager,
+                character_name=k,
+            )
         _cleanup_character_dicts(k)
 
 

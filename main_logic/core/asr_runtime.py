@@ -1997,7 +1997,7 @@ class AsrRuntimeMixin:
             # that happens, this retired operation must not re-read the shared
             # runtime and close the successor it no longer owns.
             if self._asr_route_operation_matches(operation_generation):
-                await self._asr_runtime.close()
+                await self._asr_runtime.stop_session()
             await asyncio.shield(pipeline_cleanup)
             if omni_audio_bytes:
                 logger.info(
@@ -2019,7 +2019,7 @@ class AsrRuntimeMixin:
         #
         # 这里是同步清（此函数从顶部的 operation_generation 检查到这一行没有任何
         # await，create_task 也还没让出控制权），所以不需要再自证身份；provider /
-        # route_key 的置空、_asr_runtime.close()、管线关闭与指标日志则一律交给 main
+        # route_key 的置空、_asr_runtime.stop_session()、管线关闭与指标日志则一律交给 main
         # 的 finish_close()——它带 transition lock 和 operation_generation 围栏，能
         # 区分同一条连接上的后继回合，比在这里再抄一遍精确。
         self._prerecord_visual_frames = []

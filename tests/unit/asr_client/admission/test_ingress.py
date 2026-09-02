@@ -208,6 +208,8 @@ async def test_failed_item_does_not_stop_single_consumer_and_close_drains():
     await lane.close()
     with pytest.raises(AdmissionIngressClosedError, match="INGRESS_CLOSED"):
         lane.post_nowait(token, SpeakerUnavailable(_candidate(), 1))
+    with pytest.raises(AdmissionIngressClosedError, match="INGRESS_CLOSED"):
+        await lane.start()
 
 
 async def test_identical_control_retry_has_no_effect_execution_ownership():

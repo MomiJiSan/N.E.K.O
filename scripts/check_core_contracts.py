@@ -3313,6 +3313,7 @@ def run(root: Path) -> list[Violation]:
                 "set_speaker_verifier_factory",
                 "request_speaker_candidate_rejection",
                 "start",
+                "stop_session",
                 "submit",
             }
             for node in ast.walk(component_class):

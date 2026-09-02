@@ -251,6 +251,25 @@ def _callbacks(*, abandoned: AsyncMock | None = None) -> AsrRuntimeCallbacks:
     )
 
 
+def test_terminal_runtime_rejects_late_speaker_fact_before_ingress_post() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    runtime._asr_terminal_close_requested = True
+    runtime._speaker_verifier_activation_generation = "terminal-generation"
+    runtime._asr_admission_ingress_started = True
+    runtime._asr_admission_ingress.post_nowait = MagicMock()
+    candidate = _shadow_candidate()
+
+    accepted = runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="terminal-generation",
+        enforce=True,
+    )
+
+    assert accepted is False
+    runtime._asr_admission_ingress.post_nowait.assert_not_called()
+    assert runtime._asr_admission_candidate_turns == {}
+
+
 def _install_active_candidate(
     runtime: IndependentAsrRuntime,
     detector: _RejectionDetector,

@@ -2567,9 +2567,9 @@ async def test_core_asr_teardown_force_releases_external_turn_pause(
         await runtime._abort_independent_asr("test_abort")
         runtime._asr_runtime.abort.assert_awaited_once_with("test_abort")
     else:
-        runtime._asr_runtime.close = AsyncMock()
+        runtime._asr_runtime.stop_session = AsyncMock()
         await runtime._close_independent_asr(next_route_mode="blocked")
-        runtime._asr_runtime.close.assert_awaited_once_with()
+        runtime._asr_runtime.stop_session.assert_awaited_once_with()
 
     runtime.session.abandon_external_voice_turn.assert_called_once_with(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}",
@@ -2629,7 +2629,7 @@ async def test_runtime_close_preserves_manager_lifetime_registry_builtins() -> N
     game_registration = runtime._game_voice_input_registration
     token = runtime._asr_runtime._capture_turn_token(runtime._asr_lifecycle)
     assert await runtime._prepare_voice_input_turn(token) is True
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
 
     await runtime._close_independent_asr(next_route_mode="blocked")
     runtime._ensure_asr_runtime_state()
@@ -4617,7 +4617,7 @@ async def test_cancelled_core_close_keeps_detached_cleanup_owned() -> None:
     runtime._voice_input_registry.wait_idle = AsyncMock(
         side_effect=block_registry_wait
     )
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
 
     closing = asyncio.create_task(
         runtime._close_independent_asr(next_route_mode="blocked")
@@ -4638,7 +4638,7 @@ async def test_cancelled_core_close_keeps_detached_cleanup_owned() -> None:
     await asyncio.wait_for(asyncio.gather(*cleanup_tasks), 1)
 
     pipeline.close.assert_awaited_once_with()
-    runtime._asr_runtime.close.assert_awaited_once_with()
+    runtime._asr_runtime.stop_session.assert_awaited_once_with()
 
 
 async def test_cancelled_core_close_waiting_for_pipeline_lock_stays_owned() -> None:
@@ -4650,7 +4650,7 @@ async def test_cancelled_core_close_waiting_for_pipeline_lock_stays_owned() -> N
     runtime._independent_asr_provider = "old-provider"
     runtime._independent_asr_route_key = "old-core"
     runtime._voice_input_registry.wait_idle = AsyncMock()
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
 
     closing = asyncio.create_task(
         runtime._close_independent_asr(next_route_mode="blocked")
@@ -4676,7 +4676,7 @@ async def test_cancelled_core_close_waiting_for_pipeline_lock_stays_owned() -> N
     assert runtime._independent_asr_route_key is None
     old_pipeline.close.assert_awaited_once_with()
     runtime._voice_input_registry.wait_idle.assert_awaited_once_with()
-    runtime._asr_runtime.close.assert_awaited_once_with()
+    runtime._asr_runtime.stop_session.assert_awaited_once_with()
 
 
 async def test_core_close_detaches_shared_state_before_registry_wait() -> None:
@@ -4695,7 +4695,7 @@ async def test_core_close_detaches_shared_state_before_registry_wait() -> None:
     runtime._voice_input_registry.wait_idle = AsyncMock(
         side_effect=block_registry_wait
     )
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
 
     closing = asyncio.create_task(
         runtime._close_independent_asr(next_route_mode="blocked")
@@ -4718,7 +4718,7 @@ async def test_core_close_detaches_shared_state_before_registry_wait() -> None:
     assert runtime._independent_asr_provider == "new-provider"
     assert runtime._independent_asr_route_key == "new-core"
     assert runtime._asr_route_mode == "independent"
-    runtime._asr_runtime.close.assert_not_awaited()
+    runtime._asr_runtime.stop_session.assert_not_awaited()
 
 
 async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() -> None:
@@ -4740,7 +4740,7 @@ async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() 
     runtime._voice_input_registry.wait_idle = AsyncMock(
         side_effect=block_registry_wait
     )
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
 
     retired_close = asyncio.create_task(
         runtime._close_independent_asr(next_route_mode="blocked")
@@ -4760,7 +4760,7 @@ async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() 
     await retired_close
     await asyncio.gather(*successor_cleanup)
 
-    runtime._asr_runtime.close.assert_awaited_once_with()
+    runtime._asr_runtime.stop_session.assert_awaited_once_with()
 
 
 async def test_stale_start_waiting_for_pipeline_lock_cannot_replace_successor(
@@ -4800,7 +4800,7 @@ async def test_stale_start_waiting_for_pipeline_lock_cannot_replace_successor(
 
 async def test_stale_close_waiting_for_pipeline_lock_cannot_replace_successor() -> None:
     runtime = _Runtime()
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
     runtime._set_microphone_route("independent")
     runtime._independent_asr_provider = "old-provider"
     runtime._independent_asr_route_key = "old-core"
@@ -4828,7 +4828,7 @@ async def test_stale_close_waiting_for_pipeline_lock_cannot_replace_successor() 
     assert runtime._independent_asr_route_key == "new-core"
     assert runtime._asr_route_mode == "independent"
     successor_pipeline.close.assert_not_awaited()
-    runtime._asr_runtime.close.assert_not_awaited()
+    runtime._asr_runtime.stop_session.assert_not_awaited()
 
 
 async def test_cancelled_start_settings_swap_keeps_pipeline_cleanup_owned(
@@ -4921,16 +4921,20 @@ async def test_cancelled_noise_reduction_swap_keeps_pipeline_cleanup_owned() -> 
     stale_pipeline.close.assert_awaited_once_with()
 
 
-async def test_close_failure_keeps_the_requested_blocked_route() -> None:
+async def test_close_uses_reusable_runtime_stop_and_keeps_requested_blocked_route() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
-    asr.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    asr.close = AsyncMock()
     runtime._asr_session = asr
+    runtime._asr_runtime.stop_session = AsyncMock()
+    runtime._asr_runtime.close = AsyncMock()
     runtime._asr_route_mode = "independent"
 
     await runtime._close_independent_asr(next_route_mode="blocked")
 
     assert runtime._asr_route_mode == "blocked"
+    runtime._asr_runtime.stop_session.assert_awaited_once_with()
+    runtime._asr_runtime.close.assert_not_awaited()
     assert not hasattr(runtime._asr_runtime, "_asr_route_mode")
     assert (
         await runtime._route_microphone_audio(b"\x00\x00", sample_rate_hz=16_000)
@@ -7165,10 +7169,13 @@ class _HotSwapRuntimeStub:
             self.audio_generation,
         )
 
-    async def close(self) -> None:
+    async def stop_session(self) -> None:
         self.session_epoch += 1
         self.audio_generation += 1
         self.active_provider = None
+
+    async def close(self) -> None:
+        await self.stop_session()
 
     async def start(
         self,
@@ -8715,7 +8722,7 @@ async def test_old_core_close_cannot_clear_new_pipeline_or_provider() -> None:
         runtime_close_entered.set()
         await release_runtime_close.wait()
 
-    runtime._asr_runtime.close = AsyncMock(side_effect=block_runtime_close)
+    runtime._asr_runtime.stop_session = AsyncMock(side_effect=block_runtime_close)
     old_pipeline = runtime._voice_input_audio_pipeline
     old_pipeline.close = AsyncMock()
     runtime._independent_asr_provider = "old-provider"
@@ -8769,9 +8776,12 @@ async def test_stale_runtime_ready_result_cannot_replace_new_route(
                 self.audio_generation,
             )
 
-        async def close(self) -> None:
+        async def stop_session(self) -> None:
             self.session_epoch += 1
             self.audio_generation += 1
+
+        async def close(self) -> None:
+            await self.stop_session()
 
         async def start(self, **_kwargs) -> AsrStartResult:
             source_epoch = self.session_epoch
@@ -9276,7 +9286,7 @@ async def test_stale_start_abort_does_not_clobber_newer_start_placeholder(
 
     runtime._asr_runtime.start = fake_runtime_start
     runtime._asr_runtime.abort = fake_abort
-    runtime._asr_runtime.close = AsyncMock()
+    runtime._asr_runtime.stop_session = AsyncMock()
 
     settings_calls = 0
 
@@ -10399,7 +10409,6 @@ async def test_stale_provider_endpoint_abandons_local_final_reservation() -> Non
     component = runtime._asr_runtime
     dispatcher = component._asr_transcript_dispatcher
     dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
-    component._runtime_identity_matches = MagicMock(return_value=False)
     epoch = component._asr_session_epoch
     await runtime._handle_independent_asr_activity(
         SpeechActivityEvent.SPEECH_STARTED,
@@ -10408,6 +10417,12 @@ async def test_stale_provider_endpoint_abandons_local_final_reservation() -> Non
     turn_token = component._asr_lifecycle.current_turn_token
     assert turn_token is not None
     final_key = FinalKey.from_turn(turn_token)
+    assert final_key in dispatcher._reservations
+
+    # Preparation is current and owns a reservation. Only the subsequent
+    # endpoint callback becomes stale; otherwise the post-open identity fence
+    # correctly refuses to reserve and this test never reaches its subject.
+    component._runtime_identity_matches = MagicMock(return_value=False)
 
     await runtime._handle_independent_asr_endpoint(epoch)
 
