@@ -1705,6 +1705,14 @@ class DetectorRuntime:
         throttle_policy: VoiceThrottlePolicy | None = None,
         provider_micro_event_config: ProviderMicroEventConfig | None = None,
         speaker_shadow: SpeakerShadowObserver | None = None,
+        speaker_owner_generation: str | None = None,
+        on_speaker_candidate_bound: (
+            Callable[
+                [SpeakerShadowCandidateKey, VoiceTurnToken, str | None],
+                None,
+            ]
+            | None
+        ) = None,
         on_turn_complete: Callable[[], Awaitable[None]] | None = None,
         on_endpointing_failure: Callable[[], Awaitable[None]] | None = None,
         on_event: Callable[[DetectorEvent], Awaitable[None]] | None = None,
@@ -1746,6 +1754,7 @@ class DetectorRuntime:
         self._on_endpointing_failure = on_endpointing_failure
         self._on_turn_complete = on_turn_complete
         self._on_event = on_event
+        self._on_speaker_candidate_bound = on_speaker_candidate_bound
         self._defer_turn_complete = False
         self._deferred_turn_complete = False
         self._failure_watch_task: asyncio.Task[None] | None = None
@@ -1811,11 +1820,16 @@ class DetectorRuntime:
         )
         self._provider_discarded_through_sequence_no: int | None = None
         self._speaker_shadow = speaker_shadow
+        self._speaker_owner_generation = speaker_owner_generation
         self._speaker_shadow_generation = 0
         self._speaker_shadow_candidate: SpeakerShadowCandidateKey | None = None
         self._speaker_candidate_turn_bindings: dict[
             SpeakerShadowCandidateKey,
             VoiceTurnToken,
+        ] = {}
+        self._speaker_candidate_owner_generations: dict[
+            SpeakerShadowCandidateKey,
+            str | None,
         ] = {}
         self._speaker_shadow_suppressed_candidate: (
             tuple[int, SpeakerShadowScope] | None
@@ -2123,10 +2137,32 @@ class DetectorRuntime:
         bound = self._bound_turns.get(detector_candidate)
         if bound is None:
             return
+        existing = self._speaker_candidate_turn_bindings.get(shadow_candidate)
+        if existing is not None:
+            # A candidate identity is immutable. Never let a delayed Provider
+            # split or stale detector candidate rebind it to another turn.
+            return
+        if shadow_candidate not in self._speaker_candidate_owner_generations:
+            # Replacement/reset revoked this observer generation before its
+            # delayed detector binding could publish. Never relabel it with
+            # the currently installed verifier generation.
+            return
+        owner_generation = self._speaker_candidate_owner_generations[
+            shadow_candidate
+        ]
         self._speaker_candidate_turn_bindings = {
             **self._speaker_candidate_turn_bindings,
             shadow_candidate: bound.turn_token,
         }
+        callback = self._on_speaker_candidate_bound
+        if callback is None:
+            return
+        try:
+            callback(shadow_candidate, bound.turn_token, owner_generation)
+        except Exception:
+            # Binding remains available through the synchronous lookup seam.
+            # An optional early publication failure must not break endpointing.
+            return
 
     def _mark_provider_micro_event_ambiguous(
         self,
@@ -2177,6 +2213,9 @@ class DetectorRuntime:
             shadow_generation=self._speaker_shadow_generation,
             scope="provider_candidate",
         )
+        self._speaker_candidate_owner_generations[candidate] = (
+            self._speaker_owner_generation
+        )
         # Ordered Provider segments may coexist. Reserve identity at creation,
         # rather than at finish, so a deferred tail can never reuse its head's
         # private observer key.
@@ -2190,10 +2229,6 @@ class DetectorRuntime:
         activate_deferred: bool = True,
     ) -> bool:
         candidate = segment.candidate
-        if candidate is not None:
-            bindings = dict(self._speaker_candidate_turn_bindings)
-            bindings.pop(candidate, None)
-            self._speaker_candidate_turn_bindings = bindings
         shadow = self._speaker_shadow
         if candidate is None or shadow is None:
             return False
@@ -2988,6 +3023,36 @@ class DetectorRuntime:
         ):
             return None
         return self._speaker_candidate_turn_bindings.get(shadow_candidate)
+
+    def release_speaker_candidate_binding(
+        self,
+        shadow_candidate: SpeakerShadowCandidateKey,
+        turn_token: VoiceTurnToken,
+    ) -> bool:
+        """Retire one terminal speaker binding by exact immutable identity.
+
+        Provider boundary completion only closes capture; the ordered speaker
+        worker may still publish a score and ``CaptureClosed`` afterwards.
+        The admission owner calls this after accepting that terminal notice.
+        Reset and close continue to revoke every outstanding binding at once.
+        """
+
+        if (
+            type(shadow_candidate) is not SpeakerShadowCandidateKey
+            or type(turn_token) is not VoiceTurnToken
+            or self._closed
+            or shadow_candidate.detector_epoch != self._detector_epoch
+            or self._speaker_candidate_turn_bindings.get(shadow_candidate)
+            != turn_token
+        ):
+            return False
+        bindings = dict(self._speaker_candidate_turn_bindings)
+        bindings.pop(shadow_candidate, None)
+        self._speaker_candidate_turn_bindings = bindings
+        owner_generations = dict(self._speaker_candidate_owner_generations)
+        owner_generations.pop(shadow_candidate, None)
+        self._speaker_candidate_owner_generations = owner_generations
+        return True
 
     def speaker_rejection_diagnostics_snapshot(self) -> dict[str, int]:
         """Return aggregate-only rejection preparation counters."""
@@ -5316,80 +5381,127 @@ class DetectorRuntime:
     async def replace_speaker_verifier(
         self,
         new_shadow: SpeakerShadowObserver | None,
+        *,
+        owner_generation: str | None,
     ) -> None:
         """Atomically replace speaker observation for the next candidate.
 
         An active candidate is deliberately left unobserved after the swap. Its
         old observations are invalidated by generation, and the replacement is
         admitted only after the authoritative provider/SmartTurn boundary.
+        Calling this method transfers ownership of ``new_shadow`` to Detector,
+        including when cancellation wins before the detector lock is acquired.
         Closing the detached observer happens outside the detector lock and is
         bounded so verifier cleanup cannot stall endpointing or ASR.
         """
 
+        async def bounded_close(shadow: SpeakerShadowObserver) -> None:
+            try:
+                await asyncio.wait_for(
+                    self._close_speaker_shadow(shadow),
+                    timeout=_SPEAKER_SHADOW_REPLACEMENT_CLOSE_SECONDS,
+                )
+            except TimeoutError:
+                return
+
         detached_shadow: SpeakerShadowObserver | None = None
         rejected_shadow: SpeakerShadowObserver | None = None
-        async with self._lock:
-            if self._closed:
-                if new_shadow is not self._speaker_shadow:
-                    rejected_shadow = new_shadow
-            elif new_shadow is self._speaker_shadow:
-                return
-            else:
-                self._sealed_provider_candidate_rejection = None
-                self._sealed_provider_micro_event = None
-                self._clear_provider_segment_state()
-                self._mark_provider_micro_event_ambiguous(
-                    DetectorCandidateKey(
-                        self._detector_epoch,
-                        self._candidate_generation,
-                    )
-                )
-                suppressed = self._speaker_shadow_suppressed_candidate
-                if suppressed is not None and suppressed[0] != self._detector_epoch:
-                    self._speaker_shadow_suppressed_candidate = None
-                candidate = self._speaker_shadow_candidate
-                if candidate is not None:
-                    self._speaker_shadow_suppressed_candidate = (
-                        self._detector_epoch,
-                        candidate.scope,
-                    )
-                elif (
-                    self._candidate_open
-                    and self._speaker_shadow_suppressed_candidate is None
-                ):
-                    scope: SpeakerShadowScope = (
-                        "smart_turn_turn"
-                        if self._semantic_adapter is not None
-                        else "provider_candidate"
-                    )
-                    self._speaker_shadow_suppressed_candidate = (
-                        self._detector_epoch,
-                        scope,
-                    )
-                self._speaker_shadow_generation += 1
-                self._speaker_shadow_candidate = None
-                detached_shadow, self._speaker_shadow = (
-                    self._speaker_shadow,
-                    new_shadow,
-                )
-
-        cleanup_shadow = (
-            detached_shadow if detached_shadow is not None else rejected_shadow
-        )
+        cleanup_task: asyncio.Task[None] | None = None
+        installed = False
         try:
+            async with self._lock:
+                if self._closed:
+                    if new_shadow is not self._speaker_shadow:
+                        rejected_shadow = new_shadow
+                elif new_shadow is self._speaker_shadow:
+                    # Repeated installation retains the observer's original
+                    # authority. ``None`` has no callbacks, so its empty-owner
+                    # generation may advance without relabelling evidence.
+                    if new_shadow is None:
+                        self._speaker_owner_generation = owner_generation
+                    installed = True
+                    return
+                else:
+                    self._sealed_provider_candidate_rejection = None
+                    self._sealed_provider_micro_event = None
+                    self._clear_provider_segment_state()
+                    # The detached observer cannot publish authoritative
+                    # terminal facts into the replacement verifier generation.
+                    self._speaker_candidate_turn_bindings = {}
+                    self._speaker_candidate_owner_generations = {}
+                    self._mark_provider_micro_event_ambiguous(
+                        DetectorCandidateKey(
+                            self._detector_epoch,
+                            self._candidate_generation,
+                        )
+                    )
+                    suppressed = self._speaker_shadow_suppressed_candidate
+                    if (
+                        suppressed is not None
+                        and suppressed[0] != self._detector_epoch
+                    ):
+                        self._speaker_shadow_suppressed_candidate = None
+                    candidate = self._speaker_shadow_candidate
+                    if candidate is not None:
+                        self._speaker_shadow_suppressed_candidate = (
+                            self._detector_epoch,
+                            candidate.scope,
+                        )
+                    elif (
+                        self._candidate_open
+                        and self._speaker_shadow_suppressed_candidate is None
+                    ):
+                        scope: SpeakerShadowScope = (
+                            "smart_turn_turn"
+                            if self._semantic_adapter is not None
+                            else "provider_candidate"
+                        )
+                        self._speaker_shadow_suppressed_candidate = (
+                            self._detector_epoch,
+                            scope,
+                        )
+                    self._speaker_shadow_generation += 1
+                    self._speaker_shadow_candidate = None
+                    detached_shadow, self._speaker_shadow = (
+                        self._speaker_shadow,
+                        new_shadow,
+                    )
+                    self._speaker_owner_generation = owner_generation
+                    installed = True
+
+            cleanup_shadow = (
+                detached_shadow
+                if detached_shadow is not None
+                else rejected_shadow
+            )
             if cleanup_shadow is None:
                 return
-            await asyncio.wait_for(
-                self._close_speaker_shadow(cleanup_shadow),
-                timeout=_SPEAKER_SHADOW_REPLACEMENT_CLOSE_SECONDS,
+            cleanup_task = asyncio.create_task(
+                bounded_close(cleanup_shadow),
+                name="detector-speaker-verifier-replacement-cleanup",
             )
-        except TimeoutError:
-            return
+            await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
-            current_task = asyncio.current_task()
-            if current_task is not None and current_task.cancelling():
-                raise
-            return
+            # Invocation transfers ``new_shadow`` ownership immediately. If
+            # cancellation wins before installation, Detector must close it;
+            # after installation the new observer remains authoritative while
+            # only the detached old observer is cleaned up.
+            if (
+                cleanup_task is None
+                and not installed
+                and new_shadow is not None
+                and new_shadow is not self._speaker_shadow
+            ):
+                cleanup_task = asyncio.create_task(
+                    bounded_close(new_shadow),
+                    name="detector-speaker-verifier-cancel-cleanup",
+                )
+            while cleanup_task is not None and not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            raise
         finally:
             await self._drain_provider_segment_expiry_tasks()
 
@@ -5549,6 +5661,9 @@ class DetectorRuntime:
             shadow_generation=self._speaker_shadow_generation,
             scope=scope,
         )
+        self._speaker_candidate_owner_generations[candidate] = (
+            self._speaker_owner_generation
+        )
         self._speaker_shadow_candidate = candidate
         self._publish_speaker_candidate_binding(
             candidate,
@@ -5585,10 +5700,6 @@ class DetectorRuntime:
     ) -> None:
         candidate = self._speaker_shadow_candidate
         self._speaker_shadow_candidate = None
-        if candidate is not None:
-            bindings = dict(self._speaker_candidate_turn_bindings)
-            bindings.pop(candidate, None)
-            self._speaker_candidate_turn_bindings = bindings
         self._speaker_shadow_generation += 1
         suppressed = self._speaker_shadow_suppressed_candidate
         if suppressed is not None and (
@@ -5609,6 +5720,7 @@ class DetectorRuntime:
         self._speaker_shadow_generation += 1
         self._speaker_shadow_candidate = None
         self._speaker_candidate_turn_bindings = {}
+        self._speaker_candidate_owner_generations = {}
 
     @staticmethod
     async def _reset_speaker_shadow(

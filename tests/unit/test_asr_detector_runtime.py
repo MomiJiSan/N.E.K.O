@@ -864,11 +864,18 @@ async def test_speaker_candidate_binding_snapshot_publishes_when_shadow_opens_fi
     None
 ):
     shadow = _SpeakerShadowSpy()
+    published: list[
+        tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]
+    ] = []
     detector = DetectorRuntime(
         vad=_Vad(),
         gate=_Gate(),
         provider_policy=_provider_endpoint_policy(),
         speaker_shadow=shadow,
+        speaker_owner_generation="owner-a",
+        on_speaker_candidate_bound=lambda candidate, token, owner: published.append(
+            (candidate, token, owner)
+        ),
     )
     ingress = _ingress_token()
     result = await detector.feed(
@@ -889,6 +896,7 @@ async def test_speaker_candidate_binding_snapshot_publishes_when_shadow_opens_fi
         detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
         == turn_token
     )
+    assert published == [(shadow_candidate, turn_token, "owner-a")]
     await detector.close()
 
 
@@ -910,6 +918,180 @@ async def test_speaker_candidate_binding_snapshot_reset_fences_stale_candidate()
     await detector.reset()
 
     assert detector._bound_turn_token_for_speaker_candidate(shadow_candidate) is None
+    await detector.close()
+
+
+async def test_speaker_candidate_binding_callback_publishes_once_before_score() -> (
+    None
+):
+    shadow = _SpeakerShadowSpy()
+    published: list[
+        tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]
+    ] = []
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+        speaker_owner_generation="owner-a",
+        on_speaker_candidate_bound=lambda candidate, token, owner: published.append(
+            (candidate, token, owner)
+        ),
+    )
+    ingress = _ingress_token()
+    result = await detector.feed(
+        b"\x01\x00" * 160,
+        ingress_token=ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result.candidate is not None
+    turn_token = VoiceTurnToken(ingress, turn_id=1)
+    assert await detector.bind_candidate(result.candidate, turn_token) is not None
+
+    detector.observe_provider_audio(b"\x02\x00" * 160, sample_rate_hz=16_000)
+    shadow_candidate = detector._speaker_shadow_candidate
+    assert shadow_candidate is not None
+    assert published == [(shadow_candidate, turn_token, "owner-a")]
+    assert shadow.frames
+
+    # Re-observing and re-binding the same immutable candidate cannot publish
+    # a second CandidateBound or move it to a different turn.
+    detector.observe_provider_audio(b"\x03\x00" * 160, sample_rate_hz=16_000)
+    assert await detector.bind_candidate(result.candidate, turn_token) is not None
+    assert published == [(shadow_candidate, turn_token, "owner-a")]
+    await detector.close()
+
+
+async def test_speaker_candidate_binding_callback_failure_keeps_lookup_fallback() -> (
+    None
+):
+    def fail_publication(
+        _candidate: SpeakerShadowCandidateKey,
+        _turn_token: VoiceTurnToken,
+        _owner_generation: str | None,
+    ) -> None:
+        raise RuntimeError("candidate publication failed")
+
+    shadow = _SpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+        on_speaker_candidate_bound=fail_publication,
+    )
+    candidate, _identity, turn_token = await _open_provider_candidate(
+        detector,
+        turn_id=1,
+    )
+    detector.observe_provider_audio(b"\x02\x00" * 160, sample_rate_hz=16_000)
+    shadow_candidate = detector._speaker_shadow_candidate
+    assert shadow_candidate is not None
+    assert candidate in detector._bound_turns
+    assert (
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+        == turn_token
+    )
+    await detector.close()
+
+
+async def test_provider_finish_preserves_binding_until_terminal_release() -> None:
+    (
+        detector,
+        shadow,
+        _candidate,
+        shadow_candidate,
+        turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+    score_started = asyncio.Event()
+    score_release = asyncio.Event()
+
+    async def resume_score() -> VoiceTurnToken | None:
+        score_started.set()
+        await score_release.wait()
+        return detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+
+    score_task = asyncio.create_task(resume_score())
+    await score_started.wait()
+    fence = await detector.seal_provider_candidate(turn_token)
+    assert fence is not None
+    assert shadow.finished == [shadow_candidate]
+
+    # Provider sealing ends capture, but a queued model result still owns the
+    # original turn until the admission owner accepts CaptureClosed.
+    score_release.set()
+    assert await score_task == turn_token
+    assert not detector.release_speaker_candidate_binding(
+        shadow_candidate,
+        VoiceTurnToken(turn_token.ingress, turn_id=turn_token.turn_id + 1),
+    )
+    assert (
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+        == turn_token
+    )
+    assert detector.release_speaker_candidate_binding(shadow_candidate, turn_token)
+    assert detector._bound_turn_token_for_speaker_candidate(shadow_candidate) is None
+    assert not detector.release_speaker_candidate_binding(
+        shadow_candidate,
+        turn_token,
+    )
+    await detector.close()
+
+
+async def test_provider_finish_then_reset_fences_late_score_binding() -> None:
+    (
+        detector,
+        _shadow,
+        _candidate,
+        shadow_candidate,
+        turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+    score_started = asyncio.Event()
+    score_release = asyncio.Event()
+
+    async def resume_score() -> VoiceTurnToken | None:
+        score_started.set()
+        await score_release.wait()
+        return detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+
+    score_task = asyncio.create_task(resume_score())
+    await score_started.wait()
+    assert await detector.seal_provider_candidate(turn_token) is not None
+    await detector.reset()
+    score_release.set()
+
+    assert await score_task is None
+    assert not detector.release_speaker_candidate_binding(
+        shadow_candidate,
+        turn_token,
+    )
+    await detector.close()
+
+
+async def test_speaker_verifier_replacement_fences_old_candidate_binding() -> None:
+    (
+        detector,
+        _shadow,
+        _candidate,
+        shadow_candidate,
+        turn_token,
+    ) = await _prepare_candidate_rejection_fixture()
+    assert (
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
+        == turn_token
+    )
+
+    await detector.replace_speaker_verifier(
+        _SpeakerShadowSpy(),
+        owner_generation="owner-b",
+    )
+
+    assert detector._bound_turn_token_for_speaker_candidate(shadow_candidate) is None
+    assert not detector.release_speaker_candidate_binding(
+        shadow_candidate,
+        turn_token,
+    )
     await detector.close()
 
 
@@ -2207,6 +2389,7 @@ async def test_unknown_boundary_retires_tail_without_losing_asr_fence() -> None:
     )
     head, tail = [segment.candidate for segment in detector._provider_speaker_segments]
     assert head is not None and tail is not None
+    assert detector._bound_turn_token_for_speaker_candidate(head) == token
 
     await detector.retire_provider_speaker_boundary_unknown()
     await detector.retire_provider_speaker_boundary_unknown()
@@ -2215,6 +2398,7 @@ async def test_unknown_boundary_retires_tail_without_losing_asr_fence() -> None:
     assert ("activate", tail) not in shadow.events
     assert ("finish", head) in shadow.events
     assert ("finish", tail) in shadow.events
+    assert detector._bound_turn_token_for_speaker_candidate(head) == token
     fence = await detector.seal_provider_candidate(token)
     assert fence is not None
     assert fence.boundary_exact is False
@@ -2225,6 +2409,7 @@ async def test_unknown_boundary_retires_tail_without_losing_asr_fence() -> None:
         ]
         == 1
     )
+    assert detector.release_speaker_candidate_binding(head, token)
     await detector.close()
 
 
@@ -3225,7 +3410,10 @@ async def test_ordered_provider_lifecycle_finishes_deferred_without_activation(
     if boundary == "reset":
         await detector.reset()
     elif boundary == "replace":
-        await detector.replace_speaker_verifier(_DeferredSpeakerShadowSpy())
+        await detector.replace_speaker_verifier(
+            _DeferredSpeakerShadowSpy(),
+            owner_generation="owner-b",
+        )
     else:
         await detector.close()
 
@@ -3288,7 +3476,12 @@ async def test_replace_provider_verifier_waits_for_candidate_boundary() -> None:
     old_candidate = SpeakerShadowCandidateKey(0, 0, "provider_candidate")
     assert old_shadow.frames == [(first_pcm, 16_000, old_candidate)]
 
-    replacement = asyncio.create_task(detector.replace_speaker_verifier(new_shadow))
+    replacement = asyncio.create_task(
+        detector.replace_speaker_verifier(
+            new_shadow,
+            owner_generation="owner-b",
+        )
+    )
     await asyncio.wait_for(old_shadow.close_started.wait(), 1.0)
 
     detector.observe_provider_audio(tail_pcm, sample_rate_hz=16_000)
@@ -3311,6 +3504,129 @@ async def test_replace_provider_verifier_waits_for_candidate_boundary() -> None:
     assert new_shadow.close_calls == 1
 
 
+async def test_replace_verifier_keeps_old_binding_owner_until_atomic_install() -> (
+    None
+):
+    old_shadow = _SpeakerShadowSpy()
+    new_shadow = _SpeakerShadowSpy()
+    published: list[
+        tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]
+    ] = []
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=old_shadow,
+        speaker_owner_generation="owner-old",
+        on_speaker_candidate_bound=lambda candidate, token, owner: published.append(
+            (candidate, token, owner)
+        ),
+    )
+    ingress = _ingress_token()
+    result = await detector.feed(
+        b"\x01\x00" * 160,
+        ingress_token=ingress,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert result.candidate is not None
+    detector.observe_provider_audio(b"\x02\x00" * 160, sample_rate_hz=16_000)
+    old_candidate = detector._speaker_shadow_candidate
+    assert old_candidate is not None
+
+    await detector._lock.acquire()
+    try:
+        replacement = asyncio.create_task(
+            detector.replace_speaker_verifier(
+                new_shadow,
+                owner_generation="owner-new",
+            )
+        )
+        done, _pending = await asyncio.wait({replacement}, timeout=0.01)
+        assert not done
+
+        turn_token = VoiceTurnToken(ingress, turn_id=1)
+        assert await detector.bind_candidate(result.candidate, turn_token) is not None
+        assert published == [(old_candidate, turn_token, "owner-old")]
+    finally:
+        detector._lock.release()
+
+    await replacement
+    assert detector._speaker_owner_generation == "owner-new"
+    await detector.close()
+
+
+async def test_replace_verifier_cancel_before_lock_closes_handed_off_shadow() -> (
+    None
+):
+    old_shadow = _SpeakerShadowSpy()
+    new_shadow = _SpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=old_shadow,
+        speaker_owner_generation="owner-old",
+    )
+
+    await detector._lock.acquire()
+    try:
+        replacement = asyncio.create_task(
+            detector.replace_speaker_verifier(
+                new_shadow,
+                owner_generation="owner-new",
+            )
+        )
+        done, _pending = await asyncio.wait({replacement}, timeout=0.01)
+        assert not done
+        replacement.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+    finally:
+        detector._lock.release()
+
+    assert detector._speaker_shadow is old_shadow
+    assert detector._speaker_owner_generation == "owner-old"
+    assert new_shadow.close_calls == 1
+    await detector.close()
+    assert old_shadow.close_calls == 1
+
+
+async def test_replace_verifier_cancel_after_install_keeps_new_shadow() -> None:
+    old_shadow = _BlockingCloseSpeakerShadow()
+    new_shadow = _SpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=old_shadow,
+        speaker_owner_generation="owner-old",
+    )
+
+    replacement = asyncio.create_task(
+        detector.replace_speaker_verifier(
+            new_shadow,
+            owner_generation="owner-new",
+        )
+    )
+    await asyncio.wait_for(old_shadow.close_started.wait(), 1.0)
+    assert detector._speaker_shadow is new_shadow
+    assert detector._speaker_owner_generation == "owner-new"
+
+    replacement.cancel()
+    done, _pending = await asyncio.wait({replacement}, timeout=0.01)
+    assert not done
+    old_shadow.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement
+
+    assert detector._speaker_shadow is new_shadow
+    assert new_shadow.close_calls == 0
+    assert old_shadow.close_calls == 1
+    await detector.close()
+    assert new_shadow.close_calls == 1
+
+
 async def test_discard_provider_successor_reopens_replaced_verifier() -> None:
     old_shadow = _SpeakerShadowSpy()
     new_shadow = _SpeakerShadowSpy()
@@ -3328,7 +3644,10 @@ async def test_discard_provider_successor_reopens_replaced_verifier() -> None:
     assert fence is not None
     detector.observe_provider_audio(successor_pcm, sample_rate_hz=16_000)
 
-    await detector.replace_speaker_verifier(new_shadow)
+    await detector.replace_speaker_verifier(
+        new_shadow,
+        owner_generation="owner-b",
+    )
     assert await detector.discard_provider_successor(fence) is True
     detector.observe_provider_audio(next_pcm, sample_rate_hz=16_000)
 
@@ -3357,7 +3676,10 @@ async def test_replace_smart_turn_verifier_activates_after_turn_boundary() -> No
     detector._sequence_no = 1
     detector._candidate_open = True
 
-    await detector.replace_speaker_verifier(new_shadow)
+    await detector.replace_speaker_verifier(
+        new_shadow,
+        owner_generation="owner-b",
+    )
     detector._observe_smart_turn_speaker_shadow(
         b"\x01\x00" * 160,
         16_000,
@@ -3392,7 +3714,10 @@ async def test_replace_verifier_close_failure_does_not_break_new_shadow() -> Non
         speaker_shadow=old_shadow,
     )
 
-    await detector.replace_speaker_verifier(new_shadow)
+    await detector.replace_speaker_verifier(
+        new_shadow,
+        owner_generation="owner-b",
+    )
     detector.observe_provider_audio(b"\x01\x00" * 160, sample_rate_hz=16_000)
 
     assert old_shadow.close_calls == 1
@@ -3420,7 +3745,10 @@ async def test_replace_verifier_close_timeout_is_bounded(
     )
 
     await asyncio.wait_for(
-        detector.replace_speaker_verifier(new_shadow),
+        detector.replace_speaker_verifier(
+            new_shadow,
+            owner_generation="owner-b",
+        ),
         0.5,
     )
 
@@ -3670,7 +3998,10 @@ async def test_sealed_provider_rejection_is_invalidated_by_lifecycle_boundary(
     elif advance == "detector_reset":
         await detector.reset()
     elif advance == "verifier_replacement":
-        await detector.replace_speaker_verifier(_SpeakerShadowSpy())
+        await detector.replace_speaker_verifier(
+            _SpeakerShadowSpy(),
+            owner_generation="owner-b",
+        )
     else:
         await detector.close()
 

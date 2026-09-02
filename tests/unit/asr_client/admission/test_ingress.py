@@ -4,8 +4,10 @@ import asyncio
 
 import pytest
 
+from main_logic.asr_client._provider_events import ProviderUtteranceKey
 from main_logic.asr_client.admission.contracts import (
     AdmissionDisposition,
+    BoundaryExact,
     CandidateBound,
     CaptureClosed,
     CoreSettled,
@@ -13,8 +15,12 @@ from main_logic.asr_client.admission.contracts import (
     LifecycleSettled,
     PendingProviderFinal,
     ProviderFinalReceived,
+    RejectionCapability,
+    RejectionCapabilityKind,
     ResolveReserved,
     RouteReplaced,
+    SpeakerAuthorityPending,
+    SpeakerAuthorityUnarmed,
     SpeakerCheckpointKind,
     SpeakerLow,
     SpeakerUnavailable,
@@ -45,6 +51,19 @@ def _candidate() -> SpeakerShadowCandidateKey:
     return SpeakerShadowCandidateKey(2, 1, "provider_candidate")
 
 
+def _boundary(token: VoiceTurnToken, capability_id: int) -> BoundaryExact:
+    return BoundaryExact(
+        RejectionCapability(
+            capability_id=capability_id,
+            owner_generation=1,
+            kind=RejectionCapabilityKind.SEALED,
+            turn_token=token,
+            candidate=_candidate(),
+            provider_key=ProviderUtteranceKey(1, 0, 1),
+        )
+    )
+
+
 async def test_post_nowait_preserves_fact_then_completion_fifo():
     coordinator = VoiceTurnAdmissionCoordinator()
     token = _token()
@@ -68,7 +87,7 @@ async def test_post_nowait_preserves_fact_then_completion_fifo():
     record = await coordinator.get_record(token)
     assert record is not None
     assert record.last_speaker_sequence_no == 2
-    assert record.evidence_state is EvidenceState.REJECT_REQUESTED
+    assert record.evidence_state is EvidenceState.DENY_LATCHED
     await lane.close()
 
 
@@ -103,9 +122,7 @@ async def test_terminal_settlement_retires_capacity_through_same_fifo():
     await lane.open_turn(first)
     effects = await lane.post(
         first,
-        ProviderFinalReceived(
-            PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)
-        ),
+        ProviderFinalReceived(PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)),
     )
     resolution = next(
         effect for effect in effects if isinstance(effect, ResolveReserved)
@@ -143,18 +160,17 @@ async def test_open_turn_then_bulk_fence_then_fact_is_one_fifo():
     await lane.close()
 
 
-async def test_data_overflow_is_explicit_but_unavailable_and_final_are_reserved_control():
+async def test_boundary_overflow_cannot_evict_ordered_speaker_control_facts():
     coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
     token = _token()
+    arming_token = _token(2)
     await coordinator.open_turn(token, speaker_candidate=_candidate())
+    await coordinator.open_turn(arming_token)
     lane = AdmissionIngressLane(coordinator, data_capacity=1)
     await lane.start()
 
-    first = lane.post_nowait(
-        token,
-        SpeakerLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
-    )
-    overflowed = SpeakerLow(_candidate(), 2, SpeakerCheckpointKind.SECOND)
+    boundary = lane.post_nowait(token, _boundary(token, 1))
+    overflowed = _boundary(token, 2)
     with pytest.raises(
         AdmissionIngressCapacityError,
         match="DATA_CAPACITY_EXHAUSTED",
@@ -163,21 +179,112 @@ async def test_data_overflow_is_explicit_but_unavailable_and_final_are_reserved_
     assert error.value.turn_token == token
     assert error.value.event is overflowed
 
-    unavailable = lane.post_nowait(token, SpeakerUnavailable(_candidate(), 2))
+    pending = lane.post_nowait(
+        arming_token,
+        SpeakerAuthorityPending("generation-a"),
+    )
+    unarmed = lane.post_nowait(
+        arming_token,
+        SpeakerAuthorityUnarmed("generation-a"),
+    )
+
+    first = lane.post_nowait(
+        token,
+        SpeakerLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+    second = lane.post_nowait(
+        token,
+        SpeakerLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
+    )
     final = lane.post_nowait(
         token,
-        ProviderFinalReceived(
-            PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)
-        ),
+        ProviderFinalReceived(PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)),
     )
+    await boundary
+    await pending
+    await unarmed
     await first
-    await unavailable
-    effects = await final
+    effects = await second
+    late_final = await final
 
-    resolution = next(effect for effect in effects if isinstance(effect, ResolveReserved))
-    assert resolution.disposition is AdmissionDisposition.FORWARD
+    resolution = next(
+        effect for effect in effects if isinstance(effect, ResolveReserved)
+    )
+    assert resolution.disposition is AdmissionDisposition.DROP
+    assert not any(isinstance(effect, ResolveReserved) for effect in late_final)
     record = await coordinator.get_record(token)
-    assert record is not None and record.evidence_state is EvidenceState.UNAVAILABLE
+    assert record is not None and record.evidence_state is EvidenceState.DENY_LATCHED
+    arming_record = await coordinator.get_record(arming_token)
+    assert arming_record is not None
+    assert arming_record.evidence_state is EvidenceState.UNAVAILABLE
+    await lane.close()
+
+
+async def test_bounded_partitions_reserve_two_speaker_fact_slots():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    token = _token()
+    await coordinator.open_turn(token, speaker_candidate=_candidate())
+    lane = AdmissionIngressLane(
+        coordinator,
+        data_capacity=1,
+        control_capacity=1,
+        speaker_control_capacity=2,
+    )
+    await lane.start()
+    await coordinator._lock.acquire()
+    try:
+        boundary = lane.post_nowait(token, _boundary(token, 1))
+        final = lane.post_nowait(
+            token,
+            ProviderFinalReceived(
+                PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)
+            ),
+        )
+        first = lane.post_nowait(
+            token,
+            SpeakerLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+        )
+        second = lane.post_nowait(
+            token,
+            SpeakerLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
+        )
+
+        assert lane.pending_data_count == lane.data_capacity == 1
+        assert lane.pending_control_count == 3
+        assert lane.pending_speaker_control_count == 2
+        assert lane.speaker_control_capacity == 2
+        assert len(lane._items) == 4
+
+        with pytest.raises(
+            AdmissionIngressCapacityError,
+            match="DATA_CAPACITY_EXHAUSTED",
+        ):
+            lane.post_nowait(token, _boundary(token, 2))
+        with pytest.raises(
+            AdmissionIngressCapacityError,
+            match="CONTROL_CAPACITY_EXHAUSTED",
+        ):
+            lane.post_nowait(
+                token,
+                ProviderFinalReceived(
+                    PendingProviderFinal(None, "qwen", "other", 10.0, 10.2)
+                ),
+            )
+        with pytest.raises(
+            AdmissionIngressCapacityError,
+            match="SPEAKER_CONTROL_CAPACITY_EXHAUSTED",
+        ):
+            lane.post_nowait(token, SpeakerUnavailable(_candidate(), 3))
+    finally:
+        coordinator._lock.release()
+
+    await boundary
+    await final
+    await first
+    await second
+    assert lane.pending_data_count == 0
+    assert lane.pending_control_count == 0
+    assert lane.pending_speaker_control_count == 0
     await lane.close()
 
 
@@ -288,11 +395,14 @@ async def test_identical_bulk_retry_has_no_effect_execution_ownership():
     follower_results = await follower
 
     assert len(leader_results) == 1
-    assert sum(
-        isinstance(effect, ResolveReserved)
-        for result in leader_results
-        for effect in result.effects
-    ) == 1
+    assert (
+        sum(
+            isinstance(effect, ResolveReserved)
+            for result in leader_results
+            for effect in result.effects
+        )
+        == 1
+    )
     assert follower_results == ()
     await lane.close()
 

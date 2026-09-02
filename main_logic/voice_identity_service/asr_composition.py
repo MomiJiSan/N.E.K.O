@@ -104,7 +104,8 @@ class OwnerVoiceAsrCompositionFactory:
             "first_checkpoint_count": 0,
             "second_checkpoint_count": 0,
             "low_checkpoint_count": 0,
-            "reject_decision_count": 0,
+            "speaker_first_low_count": 0,
+            "speaker_second_low_count": 0,
             "speaker_completion_count": 0,
             "speaker_completion_before_first_checkpoint_count": 0,
             "speaker_completion_after_first_checkpoint_count": 0,
@@ -114,6 +115,12 @@ class OwnerVoiceAsrCompositionFactory:
     @property
     def activation_generation(self) -> str:
         return self._activation_generation
+
+    @property
+    def enforces_admission(self) -> bool:
+        """Whether this activation may suppress independent-ASR output."""
+
+        return self._enforce
 
     def diagnostics_snapshot(self) -> dict[str, int]:
         """Return aggregate decision counters without biometric material."""
@@ -210,11 +217,13 @@ class OwnerVoiceAsrCompositionFactory:
                     )
                     with self._lock:
                         self._diagnostics["low_checkpoint_count"] += 1
-                        if checkpoint_kind in {
+                        if checkpoint_kind is SpeakerCheckpointKind.FIRST:
+                            self._diagnostics["speaker_first_low_count"] += 1
+                        elif checkpoint_kind in {
                             SpeakerCheckpointKind.SECOND,
                             SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
                         }:
-                            self._diagnostics["reject_decision_count"] += 1
+                            self._diagnostics["speaker_second_low_count"] += 1
                 elif result.classification is OwnerVoiceClassification.HIGH:
                     fact = SpeakerHigh(event.candidate, event.sequence_no)
                 else:

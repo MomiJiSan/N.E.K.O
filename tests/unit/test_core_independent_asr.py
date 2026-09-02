@@ -10751,11 +10751,26 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
         "_ensure_backend",
         AsyncMock(return_value=_ScoringHost()),
     )
+
+    def on_speaker_candidate_bound(
+        candidate,
+        turn_token,
+        speaker_owner_generation,
+    ) -> None:
+        runtime._accept_speaker_candidate_binding(
+            candidate,
+            turn_token,
+            detector=detector,
+            activation_generation=speaker_owner_generation,
+        )
+
     detector = DetectorRuntime(
         vad=_Vad(),
         gate=_Gate(),
         provider_policy=resolve_provider_policy("qwen", "provider"),
         speaker_shadow=shadow,
+        speaker_owner_generation="composition-activation",
+        on_speaker_candidate_bound=on_speaker_candidate_bound,
     )
     original_prepare = detector.prepare_candidate_rejection
 
@@ -10777,6 +10792,7 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     runtime._asr_lifecycle = lifecycle
     runtime._asr_detector = detector
     runtime._speaker_verifier_activation_generation = "composition-activation"
+    runtime._speaker_verifier_enforces_admission = composition.enforces_admission
     runtime._ensure_transport_restart_task = MagicMock()  # type: ignore[method-assign]
     ingress_token = runtime.capture_ingress_token(
         connection_id="composition-candidate",
@@ -10819,7 +10835,7 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
             admission_record = await runtime._asr_admission.get_record(turn_token)
             if (
                 admission_record is not None
-                and admission_record.evidence_state is EvidenceState.REJECT_REQUESTED
+                and admission_record.evidence_state is EvidenceState.DENY_LATCHED
                 and prepared_candidates
             ):
                 return
@@ -10856,10 +10872,14 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     assert diagnostics["rejection_prepare_unbound_count"] == 0
     admission_record = await runtime._asr_admission.get_record(turn_token)
     assert admission_record is not None
-    assert admission_record.evidence_state is EvidenceState.REJECT_REQUESTED
+    assert admission_record.evidence_state is EvidenceState.DENY_LATCHED
     assert admission_record.rejection_capability is None
-    runtime._asr_transcript_dispatcher.resolve_reserved.assert_not_called()
-    assert final_key in runtime._asr_transcript_dispatcher._reservations
+    runtime._asr_transcript_dispatcher.resolve_reserved.assert_called_once_with(
+        final_key,
+        AdmissionDisposition.DROP,
+        envelope=None,
+    )
+    assert final_key not in runtime._asr_transcript_dispatcher._reservations
 
     await runtime.close()
     composition.close()

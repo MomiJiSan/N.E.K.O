@@ -52,8 +52,12 @@ from .contracts import (
     RevokeRejectionCapability,
     RouteReplaced,
     ScheduleFinalDeadline,
+    SettlePartial,
     SettlementState,
     SpeakerCheckpointKind,
+    SpeakerAuthorityPending,
+    SpeakerAuthorityUnarmed,
+    SpeakerAuthorityUnavailable,
     SpeakerHigh,
     SpeakerLow,
     SpeakerUnavailable,
@@ -181,14 +185,15 @@ def _start_rejection_if_ready(
     capability = record.rejection_capability
     if (
         record.admission_state in _TERMINAL_ADMISSION_STATES
-        or record.evidence_state is not EvidenceState.REJECT_REQUESTED
+        or record.evidence_state is not EvidenceState.DENY_LATCHED
         or record.rejection_apply_state is not RejectionApplyState.NOT_STARTED
         or capability is None
         or record.boundary_state is not BoundaryState.EXACT
+        or record.provider_boundary_deadline_expired
     ):
         return record, ()
     final = record.pending_final
-    if final is not None and now >= final.admission_deadline:
+    if final is not None and now >= final.boundary_deadline:
         return record, ()
     nonce = record.operation_nonce_sequence + 1
     ticket = AdmissionOperationTicket(
@@ -213,7 +218,7 @@ def _start_rejection_if_ready(
         ApplyRejection(
             ticket=ticket,
             capability=capability,
-            absolute_deadline=(final.admission_deadline if final is not None else None),
+            absolute_deadline=(final.boundary_deadline if final is not None else None),
         ),
     )
 
@@ -238,33 +243,58 @@ def _resolve(
     )
     effects: list[AdmissionEffect] = [
         CountDiagnostic(f"admission_terminal_{disposition.value}"),
+    ]
+    partial_disposition = record.partial_settlement_disposition
+    if partial_disposition is None:
+        partial_disposition = disposition
+        effects.append(
+            SettlePartial(
+                turn_token=record.turn_token,
+                record_generation=record.record_generation,
+                disposition=disposition,
+            )
+        )
+    effects.append(
         ResolveReserved(
             ticket=resolution_ticket,
             final=record.pending_final,
         )
-    ]
+    )
     applied = record.rejection_apply_state in _APPLIED_STATES
     applied_drop = disposition is AdmissionDisposition.DROP and applied
-    keep_applied_authority = (
-        disposition is AdmissionDisposition.DROP
-        and record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE
-    )
-    capability = record.rejection_capability
-    if capability is not None and not keep_applied_authority:
-        effects.append(RevokeRejectionCapability(capability))
+    speaker_deny = record.evidence_state is EvidenceState.DENY_LATCHED
     if (
         disposition is AdmissionDisposition.DROP
+        and speaker_deny
+        and record.pending_final is not None
+    ):
+        effects.append(CountDiagnostic("speaker_deny_final_dropped_count"))
+    capability = record.rejection_capability
+    keep_rejection_authority = (
+        disposition is AdmissionDisposition.DROP
+        and capability is not None
         and record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE
+    )
+    if capability is not None and not keep_rejection_authority:
+        effects.append(RevokeRejectionCapability(capability))
+    if disposition is AdmissionDisposition.DROP and (
+        speaker_deny
+        or record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE
     ):
         effects.append(AbortProviderTransport(record.turn_token))
     apply_state = record.rejection_apply_state
     revoked_inflight = _revoked_inflight_changes(record)
-    if not applied_drop and apply_state in {
-        RejectionApplyState.NOT_STARTED,
-        RejectionApplyState.IN_FLIGHT,
-        RejectionApplyState.APPLIED_ACTIVE,
-        RejectionApplyState.APPLIED_SEALED,
-    }:
+    if (
+        not speaker_deny
+        and not applied_drop
+        and apply_state
+        in {
+            RejectionApplyState.NOT_STARTED,
+            RejectionApplyState.IN_FLIGHT,
+            RejectionApplyState.APPLIED_ACTIVE,
+            RejectionApplyState.APPLIED_SEALED,
+        }
+    ):
         apply_state = RejectionApplyState.STALE
     final_state = record.provider_final_state
     if (
@@ -283,9 +313,10 @@ def _resolve(
         rejection_operation_owner_generation=None,
         rejection_operation_kind=None,
         deadline_operation_nonce=None,
-        rejection_capability=(capability if keep_applied_authority else None),
+        rejection_capability=(capability if keep_rejection_authority else None),
         provider_final_state=final_state,
         resolution_ticket=resolution_ticket,
+        partial_settlement_disposition=partial_disposition,
         **revoked_inflight,
     )
     return record, tuple(effects)
@@ -340,18 +371,51 @@ def _count_terminal_micro_event_if_settled(
 
 
 def _rejection_can_still_be_confirmed(record: VoiceTurnAdmissionRecord) -> bool:
-    if record.boundary_state not in {BoundaryState.OPEN, BoundaryState.EXACT}:
-        return False
-    if record.rejection_apply_state in {
-        RejectionApplyState.STALE,
-        RejectionApplyState.FAILED,
-    }:
-        return False
-    if record.evidence_state is EvidenceState.REJECT_REQUESTED:
-        return True
+    """Return whether ordered speaker facts can still produce a formal deny."""
+
+    evidence_pending = record.evidence_state in {
+        EvidenceState.NONE,
+        EvidenceState.FIRST_LOW,
+    }
     return bool(
-        record.evidence_state is EvidenceState.FIRST_LOW
-        and record.capture_state is CaptureState.COLLECTING
+        evidence_pending
+        and (
+            record.candidate_binding_state is CandidateBindingState.ARMING
+            or (
+                record.candidate_binding_state is CandidateBindingState.BOUND
+                and record.capture_state is CaptureState.COLLECTING
+            )
+        )
+    )
+
+
+def _settle_forward_partial_if_terminal(
+    record: VoiceTurnAdmissionRecord,
+) -> tuple[VoiceTurnAdmissionRecord, tuple[AdmissionEffect, ...]]:
+    """Release a quarantined partial once speaker evidence can no longer deny."""
+
+    if record.partial_settlement_disposition is not None:
+        return record, ()
+    speaker_allows = record.evidence_state in {
+        EvidenceState.ALLOW,
+        EvidenceState.UNAVAILABLE,
+    }
+    capture_finished_without_deny = (
+        record.capture_state is CaptureState.CLOSED
+        and record.evidence_state in {EvidenceState.NONE, EvidenceState.FIRST_LOW}
+    )
+    if not speaker_allows and not capture_finished_without_deny:
+        return record, ()
+    record = _changed(
+        record,
+        partial_settlement_disposition=AdmissionDisposition.FORWARD,
+    )
+    return record, (
+        SettlePartial(
+            turn_token=record.turn_token,
+            record_generation=record.record_generation,
+            disposition=AdmissionDisposition.FORWARD,
+        ),
     )
 
 
@@ -363,14 +427,11 @@ def maybe_resolve(
 
     if record.admission_state in _TERMINAL_ADMISSION_STATES:
         return record, ()
+    if record.evidence_state is EvidenceState.DENY_LATCHED:
+        return _resolve(record, AdmissionDisposition.DROP)
     final = record.pending_final
-    if final is not None and now >= final.admission_deadline:
-        resolved, effects = _resolve(record, AdmissionDisposition.FORWARD)
-        return resolved, (CountDiagnostic("admission_deadline_forward"), *effects)
     if record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE:
         return _resolve(record, AdmissionDisposition.DROP)
-    if final is not None and not final.text.strip():
-        return _resolve(record, AdmissionDisposition.FORWARD)
     if (
         final is not None
         and record.rejection_apply_state is RejectionApplyState.APPLIED_SEALED
@@ -386,6 +447,8 @@ def maybe_resolve(
         return record, ()
     if _rejection_can_still_be_confirmed(record):
         return record, ()
+    if not final.text.strip():
+        return _resolve(record, AdmissionDisposition.FORWARD)
     if record.micro_event_state is MicroEventState.PENDING:
         return record, ()
     return _resolve(record, AdmissionDisposition.FORWARD)
@@ -399,6 +462,7 @@ def _schedule_deadline_if_needed(
         record.admission_state is not AdmissionState.PENDING
         or final is None
         or record.deadline_operation_nonce is not None
+        or record.provider_boundary_deadline_expired
     ):
         return record, ()
     nonce = record.operation_nonce_sequence + 1
@@ -416,7 +480,7 @@ def _schedule_deadline_if_needed(
     return record, (
         ScheduleFinalDeadline(
             ticket=ticket,
-            absolute_deadline=final.admission_deadline,
+            absolute_deadline=final.boundary_deadline,
         ),
     )
 
@@ -465,29 +529,43 @@ def _reduce_untracked(
     if isinstance(event, (Reset, Close, RouteReplaced)):
         return _invalidate(record)
 
-    if (
-        record.admission_state in _TERMINAL_ADMISSION_STATES
-        and not isinstance(
-            event,
-            (
-                ProviderFinalReceived,
-                RejectionApplied,
-                RejectionStale,
-                RejectionFailed,
-                CapabilityRevoked,
-                CapabilityRevokeFailed,
-                SpeakerAuthorityNamespacePoisoned,
-                SpeakerAuthorityNamespacePoisonFailed,
-                CoreSettled,
-                TransportSettled,
-                LifecycleSettled,
-            ),
-        )
+    if record.admission_state in _TERMINAL_ADMISSION_STATES and not isinstance(
+        event,
+        (
+            RejectionApplied,
+            RejectionStale,
+            RejectionFailed,
+            CapabilityRevoked,
+            CapabilityRevokeFailed,
+            SpeakerAuthorityNamespacePoisoned,
+            SpeakerAuthorityNamespacePoisonFailed,
+            CoreSettled,
+            TransportSettled,
+            LifecycleSettled,
+        ),
     ):
         if isinstance(event, BoundaryExact):
             return record, (
                 RevokeRejectionCapability(event.capability),
                 CountDiagnostic("admission_late_boundary_ignored"),
+            )
+        if isinstance(event, ProviderFinalReceived):
+            return record, (CountDiagnostic("admission_final_after_terminal_ignored"),)
+        if isinstance(
+            event,
+            (
+                SpeakerLow,
+                SpeakerHigh,
+                SpeakerUnavailable,
+                SpeakerAuthorityPending,
+                SpeakerAuthorityUnarmed,
+                SpeakerAuthorityUnavailable,
+                CaptureClosed,
+            ),
+        ):
+            return record, (
+                CountDiagnostic("admission_late_fact_ignored"),
+                CountDiagnostic("speaker_late_fact_stale_count"),
             )
         return record, (CountDiagnostic("admission_late_fact_ignored"),)
 
@@ -503,21 +581,79 @@ def _reduce_untracked(
             )
         elif record.provider_key != event.provider_key:
             return record, (CountDiagnostic("admission_provider_alias_conflict"),)
+    elif isinstance(event, SpeakerAuthorityPending):
+        if record.candidate_binding_state is CandidateBindingState.UNBOUND:
+            record = _changed(
+                record,
+                candidate_binding_state=CandidateBindingState.ARMING,
+                speaker_authority_generation=event.owner_generation,
+            )
+        elif record.candidate_binding_state is CandidateBindingState.ARMING:
+            if record.speaker_authority_generation != event.owner_generation:
+                record = _changed(
+                    record,
+                    speaker_authority_generation=event.owner_generation,
+                )
+                effects.append(CountDiagnostic("admission_speaker_authority_rearmed"))
+        else:
+            return record, (
+                CountDiagnostic("admission_stale_speaker_authority_pending"),
+            )
+    elif isinstance(event, SpeakerAuthorityUnarmed):
+        if (
+            record.candidate_binding_state is CandidateBindingState.ARMING
+            and record.speaker_authority_generation == event.owner_generation
+        ):
+            record = _changed(
+                record,
+                candidate_binding_state=CandidateBindingState.RETIRED,
+                capture_state=CaptureState.UNAVAILABLE,
+                evidence_state=(
+                    EvidenceState.DENY_LATCHED
+                    if record.evidence_state is EvidenceState.DENY_LATCHED
+                    else EvidenceState.UNAVAILABLE
+                ),
+            )
+        else:
+            return record, (
+                CountDiagnostic("admission_stale_speaker_authority_unarmed"),
+            )
     elif isinstance(event, CandidateBound):
-        if record.speaker_candidate is None:
+        legacy_direct_bind = (
+            event.owner_generation is None
+            and record.candidate_binding_state is CandidateBindingState.UNBOUND
+        )
+        generation_bound = (
+            event.owner_generation is not None
+            and record.candidate_binding_state is CandidateBindingState.ARMING
+            and record.speaker_authority_generation == event.owner_generation
+        )
+        idempotent_bound = (
+            record.candidate_binding_state is CandidateBindingState.BOUND
+            and record.speaker_candidate == event.candidate
+            and record.speaker_authority_generation == event.owner_generation
+        )
+        if idempotent_bound:
+            pass
+        elif legacy_direct_bind or generation_bound:
             record = _changed(
                 record,
                 candidate_binding_state=CandidateBindingState.BOUND,
                 capture_state=CaptureState.COLLECTING,
                 speaker_candidate=event.candidate,
+                speaker_authority_generation=event.owner_generation,
             )
-        elif record.speaker_candidate != event.candidate:
+        else:
             return record, (CountDiagnostic("admission_candidate_alias_conflict"),)
     elif isinstance(event, SpeakerLow):
         if not _speaker_fact_is_current(record, event.candidate, event.sequence_no):
-            return record, (CountDiagnostic("admission_stale_speaker_fact"),)
+            return record, (
+                CountDiagnostic("admission_stale_speaker_fact"),
+                CountDiagnostic("speaker_late_fact_stale_count"),
+            )
         evidence = record.evidence_state
-        if evidence is not EvidenceState.REJECT_REQUESTED:
+        deny_latched = False
+        if evidence is not EvidenceState.DENY_LATCHED:
             if (
                 event.checkpoint_kind is SpeakerCheckpointKind.FIRST
                 and evidence is EvidenceState.NONE
@@ -531,7 +667,8 @@ def _reduce_untracked(
                 }
                 and evidence is EvidenceState.FIRST_LOW
             ):
-                evidence = EvidenceState.REJECT_REQUESTED
+                evidence = EvidenceState.DENY_LATCHED
+                deny_latched = True
             else:
                 evidence = EvidenceState.UNAVAILABLE
         record = _changed(
@@ -539,38 +676,78 @@ def _reduce_untracked(
             last_speaker_sequence_no=event.sequence_no,
             evidence_state=evidence,
         )
+        if deny_latched:
+            effects.append(CountDiagnostic("speaker_deny_latched_count"))
     elif isinstance(event, SpeakerHigh):
         if not _speaker_fact_is_current(record, event.candidate, event.sequence_no):
-            return record, (CountDiagnostic("admission_stale_speaker_fact"),)
+            return record, (
+                CountDiagnostic("admission_stale_speaker_fact"),
+                CountDiagnostic("speaker_late_fact_stale_count"),
+            )
         record = _changed(
             record,
             last_speaker_sequence_no=event.sequence_no,
             evidence_state=(
-                EvidenceState.REJECT_REQUESTED
-                if record.evidence_state is EvidenceState.REJECT_REQUESTED
+                EvidenceState.DENY_LATCHED
+                if record.evidence_state is EvidenceState.DENY_LATCHED
                 else EvidenceState.ALLOW
             ),
         )
     elif isinstance(event, SpeakerUnavailable):
         if not _speaker_fact_is_current(record, event.candidate, event.sequence_no):
-            return record, (CountDiagnostic("admission_stale_speaker_fact"),)
-        capability = record.rejection_capability
-        if capability is not None:
-            effects.append(RevokeRejectionCapability(capability))
-        revoked_inflight = _revoked_inflight_changes(record)
-        record = _changed(
-            record,
-            last_speaker_sequence_no=event.sequence_no,
-            capture_state=CaptureState.UNAVAILABLE,
-            evidence_state=EvidenceState.UNAVAILABLE,
-            rejection_apply_state=RejectionApplyState.STALE,
-            rejection_capability=None,
-            rejection_operation_nonce=None,
-            rejection_operation_capability_id=None,
-            rejection_operation_owner_generation=None,
-            rejection_operation_kind=None,
-            **revoked_inflight,
-        )
+            return record, (
+                CountDiagnostic("admission_stale_speaker_fact"),
+                CountDiagnostic("speaker_late_fact_stale_count"),
+            )
+        if record.evidence_state is EvidenceState.DENY_LATCHED:
+            record = _changed(
+                record,
+                last_speaker_sequence_no=event.sequence_no,
+                capture_state=CaptureState.UNAVAILABLE,
+            )
+        else:
+            capability = record.rejection_capability
+            if capability is not None:
+                effects.append(RevokeRejectionCapability(capability))
+            revoked_inflight = _revoked_inflight_changes(record)
+            record = _changed(
+                record,
+                last_speaker_sequence_no=event.sequence_no,
+                capture_state=CaptureState.UNAVAILABLE,
+                evidence_state=EvidenceState.UNAVAILABLE,
+                rejection_apply_state=RejectionApplyState.STALE,
+                rejection_capability=None,
+                rejection_operation_nonce=None,
+                rejection_operation_capability_id=None,
+                rejection_operation_owner_generation=None,
+                rejection_operation_kind=None,
+                **revoked_inflight,
+            )
+    elif isinstance(event, SpeakerAuthorityUnavailable):
+        if (
+            record.candidate_binding_state is not CandidateBindingState.BOUND
+            or event.candidate != record.speaker_candidate
+        ):
+            return record, (CountDiagnostic("admission_stale_speaker_authority"),)
+        if record.evidence_state is EvidenceState.DENY_LATCHED:
+            record = _changed(record, capture_state=CaptureState.UNAVAILABLE)
+        else:
+            capability = record.rejection_capability
+            if capability is not None:
+                effects.append(RevokeRejectionCapability(capability))
+            revoked_inflight = _revoked_inflight_changes(record)
+            record = _changed(
+                record,
+                capture_state=CaptureState.UNAVAILABLE,
+                evidence_state=EvidenceState.UNAVAILABLE,
+                rejection_apply_state=RejectionApplyState.STALE,
+                rejection_capability=None,
+                rejection_operation_nonce=None,
+                rejection_operation_capability_id=None,
+                rejection_operation_owner_generation=None,
+                rejection_operation_kind=None,
+                **revoked_inflight,
+            )
     elif isinstance(event, CaptureClosed):
         if (
             event.candidate != record.speaker_candidate
@@ -578,7 +755,10 @@ def _reduce_untracked(
             or event.through_sequence_no < record.last_speaker_sequence_no
         ):
             return record, (CountDiagnostic("admission_stale_capture_close"),)
-        if event.through_sequence_no > record.last_speaker_sequence_no:
+        if (
+            event.through_sequence_no > record.last_speaker_sequence_no
+            and record.evidence_state is not EvidenceState.DENY_LATCHED
+        ):
             capability = record.rejection_capability
             if capability is not None:
                 effects.append(RevokeRejectionCapability(capability))
@@ -764,6 +944,13 @@ def _reduce_untracked(
                     else "admission_rejection_applied_sealed"
                 )
             )
+            if (
+                record.admission_state is AdmissionState.DROPPED
+                and event.kind is RejectionCapabilityKind.SEALED
+                and record.rejection_capability is not None
+            ):
+                effects.append(RevokeRejectionCapability(record.rejection_capability))
+                record = _changed(record, rejection_capability=None)
     elif isinstance(event, (RejectionStale, RejectionFailed)):
         if event.ticket == record.revoked_rejection_ticket:
             record = _changed(
@@ -844,7 +1031,9 @@ def _reduce_untracked(
             record.admission_state is AdmissionState.ABANDONED
             or record.provider_binding_state is ProviderBindingState.RETIRED
         ):
-            return record, (CountDiagnostic("admission_final_after_retirement_ignored"),)
+            return record, (
+                CountDiagnostic("admission_final_after_retirement_ignored"),
+            )
         final = event.final
         if (
             record.admission_state not in _TERMINAL_ADMISSION_STATES
@@ -881,18 +1070,21 @@ def _reduce_untracked(
             )
         record = _changed(record, **changes)
         rejection_ticket = _current_rejection_ticket(record)
-        if rejection_ticket is not None:
+        if (
+            rejection_ticket is not None
+            and not record.provider_boundary_deadline_expired
+        ):
             effects.append(
                 ConstrainRejectionDeadline(
                     ticket=rejection_ticket,
-                    absolute_deadline=final.admission_deadline,
+                    absolute_deadline=final.boundary_deadline,
                 )
             )
     elif isinstance(event, FinalDeadlineExpired):
         final = record.pending_final
         if (
             final is None
-            or event.deadline != final.admission_deadline
+            or event.deadline != final.boundary_deadline
             or not _ticket_matches(
                 record,
                 event.ticket,
@@ -901,7 +1093,37 @@ def _reduce_untracked(
             )
         ):
             return record, (CountDiagnostic("admission_late_deadline_ignored"),)
-        record = _changed(record, deadline_operation_nonce=None)
+        capability = record.rejection_capability
+        if capability is not None:
+            effects.append(RevokeRejectionCapability(capability))
+        revoked_inflight = _revoked_inflight_changes(record)
+        record = _changed(
+            record,
+            deadline_operation_nonce=None,
+            provider_boundary_deadline_expired=True,
+            boundary_state=(
+                BoundaryState.UNKNOWN
+                if record.boundary_state in {BoundaryState.OPEN, BoundaryState.EXACT}
+                else record.boundary_state
+            ),
+            micro_event_state=(
+                MicroEventState.UNAVAILABLE
+                if record.micro_event_state is MicroEventState.PENDING
+                else record.micro_event_state
+            ),
+            rejection_apply_state=(
+                RejectionApplyState.STALE
+                if record.rejection_apply_state
+                in {RejectionApplyState.NOT_STARTED, RejectionApplyState.IN_FLIGHT}
+                else record.rejection_apply_state
+            ),
+            rejection_capability=None,
+            rejection_operation_nonce=None,
+            rejection_operation_capability_id=None,
+            rejection_operation_owner_generation=None,
+            rejection_operation_kind=None,
+            **revoked_inflight,
+        )
     elif isinstance(event, MicroEventPending):
         if record.micro_event_state is MicroEventState.NOT_APPLICABLE:
             record = _changed(record, micro_event_state=MicroEventState.PENDING)
@@ -977,9 +1199,16 @@ def _reduce_untracked(
             ),
         )
         if event.degraded:
-            effects.append(
-                CountDiagnostic("admission_transport_settlement_degraded")
-            )
+            effects.append(CountDiagnostic("admission_transport_settlement_degraded"))
+            if (
+                record.evidence_state is EvidenceState.DENY_LATCHED
+                and not record.speaker_deny_cleanup_failed_counted
+            ):
+                record = _changed(
+                    record,
+                    speaker_deny_cleanup_failed_counted=True,
+                )
+                effects.append(CountDiagnostic("speaker_deny_cleanup_failed_count"))
     elif isinstance(event, LifecycleSettled):
         if event.ticket != record.resolution_ticket:
             return record, (CountDiagnostic("admission_stale_lifecycle_settlement"),)
@@ -990,18 +1219,27 @@ def _reduce_untracked(
             ),
         )
         if event.degraded:
-            effects.append(
-                CountDiagnostic("admission_lifecycle_settlement_degraded")
-            )
+            effects.append(CountDiagnostic("admission_lifecycle_settlement_degraded"))
+            if (
+                record.evidence_state is EvidenceState.DENY_LATCHED
+                and not record.speaker_deny_cleanup_failed_counted
+            ):
+                record = _changed(
+                    record,
+                    speaker_deny_cleanup_failed_counted=True,
+                )
+                effects.append(CountDiagnostic("speaker_deny_cleanup_failed_count"))
 
     record, authority_effects = _release_active_authority_if_settled(record)
     effects.extend(authority_effects)
     record, micro_event_effects = _count_terminal_micro_event_if_settled(record)
     effects.extend(micro_event_effects)
-    record, apply_effects = _start_rejection_if_ready(record, now=now)
-    effects.extend(apply_effects)
+    record, partial_effects = _settle_forward_partial_if_terminal(record)
+    effects.extend(partial_effects)
     record, resolution_effects = maybe_resolve(record, now)
     effects.extend(resolution_effects)
+    record, apply_effects = _start_rejection_if_ready(record, now=now)
+    effects.extend(apply_effects)
     record, deadline_effects = _schedule_deadline_if_needed(record)
     effects.extend(deadline_effects)
     return record, tuple(effects)

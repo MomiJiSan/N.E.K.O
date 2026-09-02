@@ -26,6 +26,7 @@ class ProviderBindingState(StrEnum):
 
 class CandidateBindingState(StrEnum):
     UNBOUND = "unbound"
+    ARMING = "arming"
     BOUND = "bound"
     RETIRED = "retired"
 
@@ -48,7 +49,7 @@ class EvidenceState(StrEnum):
     NONE = "none"
     FIRST_LOW = "first_low"
     ALLOW = "allow"
-    REJECT_REQUESTED = "reject_requested"
+    DENY_LATCHED = "deny_latched"
     UNAVAILABLE = "unavailable"
 
 
@@ -152,13 +153,23 @@ class RejectionCapability:
             raise TypeError("turn_token must be VoiceTurnToken")
         if type(self.candidate) is not SpeakerShadowCandidateKey:
             raise TypeError("candidate must be SpeakerShadowCandidateKey")
-        if self.provider_key is not None and type(self.provider_key) is not ProviderUtteranceKey:
+        if (
+            self.provider_key is not None
+            and type(self.provider_key) is not ProviderUtteranceKey
+        ):
             raise TypeError("provider_key must be ProviderUtteranceKey or None")
 
 
 @dataclass(frozen=True, slots=True)
 class PendingProviderFinal:
-    """One logical final with the receive-time budget fixed at ingress."""
+    """One logical final with its Provider-boundary budget fixed at ingress.
+
+    ``admission_deadline`` is retained as a compatibility field for existing
+    Provider adapters.  It is only the 200ms boundary/reconciliation deadline;
+    it is not authority to forward while the speaker verdict is still pending.
+    New admission code should use :attr:`boundary_deadline` to make that scope
+    explicit.
+    """
 
     provider_key: ProviderUtteranceKey | None
     provider: str
@@ -167,7 +178,10 @@ class PendingProviderFinal:
     admission_deadline: float
 
     def __post_init__(self) -> None:
-        if self.provider_key is not None and type(self.provider_key) is not ProviderUtteranceKey:
+        if (
+            self.provider_key is not None
+            and type(self.provider_key) is not ProviderUtteranceKey
+        ):
             raise TypeError("provider_key must be ProviderUtteranceKey or None")
         if type(self.provider) is not str or not self.provider.strip():
             raise ValueError("provider must be a non-empty string")
@@ -186,6 +200,10 @@ class PendingProviderFinal:
             abs_tol=1e-9,
         ):
             raise ValueError("admission deadline must be exactly 200ms after receipt")
+
+    @property
+    def boundary_deadline(self) -> float:
+        return self.admission_deadline
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +302,7 @@ class VoiceTurnAdmissionRecord:
 
     provider_key: ProviderUtteranceKey | None = None
     speaker_candidate: SpeakerShadowCandidateKey | None = None
+    speaker_authority_generation: str | None = None
     rejection_capability: RejectionCapability | None = None
     pending_final: PendingProviderFinal | None = None
     resolution_ticket: AdmissionResolutionTicket | None = None
@@ -302,6 +321,9 @@ class VoiceTurnAdmissionRecord:
     revocation_degraded: bool = False
     namespace_poison_ticket: AdmissionOperationTicket | None = None
     deadline_operation_nonce: int | None = None
+    provider_boundary_deadline_expired: bool = False
+    partial_settlement_disposition: AdmissionDisposition | None = None
+    speaker_deny_cleanup_failed_counted: bool = False
 
     def __post_init__(self) -> None:
         if type(self.turn_token) is not VoiceTurnToken:
@@ -320,6 +342,24 @@ class VoiceTurnAdmissionRecord:
             raise TypeError("micro_event_shadow_would_suppress must be bool")
         if type(self.micro_event_terminal_counted) is not bool:
             raise TypeError("micro_event_terminal_counted must be bool")
+        if type(self.provider_boundary_deadline_expired) is not bool:
+            raise TypeError("provider_boundary_deadline_expired must be bool")
+        if type(self.speaker_deny_cleanup_failed_counted) is not bool:
+            raise TypeError("speaker_deny_cleanup_failed_counted must be bool")
+        if (
+            self.partial_settlement_disposition is not None
+            and type(self.partial_settlement_disposition) is not AdmissionDisposition
+        ):
+            raise TypeError(
+                "partial_settlement_disposition must be AdmissionDisposition or None"
+            )
+        if self.speaker_authority_generation is not None and (
+            type(self.speaker_authority_generation) is not str
+            or not self.speaker_authority_generation
+        ):
+            raise ValueError(
+                "speaker_authority_generation must be a non-empty string or None"
+            )
 
     @property
     def terminal_disposition(self) -> AdmissionDisposition | None:
@@ -345,6 +385,31 @@ class ProviderBound:
 @dataclass(frozen=True, slots=True)
 class CandidateBound:
     candidate: SpeakerShadowCandidateKey
+    owner_generation: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.owner_generation is not None and (
+            type(self.owner_generation) is not str or not self.owner_generation
+        ):
+            raise ValueError("owner_generation must be a non-empty string or None")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAuthorityPending:
+    owner_generation: str
+
+    def __post_init__(self) -> None:
+        if type(self.owner_generation) is not str or not self.owner_generation:
+            raise ValueError("owner_generation must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAuthorityUnarmed:
+    owner_generation: str
+
+    def __post_init__(self) -> None:
+        if type(self.owner_generation) is not str or not self.owner_generation:
+            raise ValueError("owner_generation must be a non-empty string")
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +429,13 @@ class SpeakerHigh:
 class SpeakerUnavailable:
     candidate: SpeakerShadowCandidateKey
     sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAuthorityUnavailable:
+    """The verifier authority disappeared without fabricating audio sequence."""
+
+    candidate: SpeakerShadowCandidateKey
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,10 +566,13 @@ class RouteReplaced:
 AdmissionEvent: TypeAlias = (
     TurnOpened
     | ProviderBound
+    | SpeakerAuthorityPending
+    | SpeakerAuthorityUnarmed
     | CandidateBound
     | SpeakerLow
     | SpeakerHigh
     | SpeakerUnavailable
+    | SpeakerAuthorityUnavailable
     | CaptureClosed
     | BoundaryExact
     | BoundaryUnknown
@@ -558,6 +633,23 @@ class ResolveReserved:
 
 
 @dataclass(frozen=True, slots=True)
+class SettlePartial:
+    """Settle the latest quarantined partial without carrying UI or text data."""
+
+    turn_token: VoiceTurnToken
+    record_generation: int
+    disposition: AdmissionDisposition
+
+    def __post_init__(self) -> None:
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.record_generation) is not int or self.record_generation < 1:
+            raise ValueError("record_generation must be a positive integer")
+        if type(self.disposition) is not AdmissionDisposition:
+            raise TypeError("disposition must be AdmissionDisposition")
+
+
+@dataclass(frozen=True, slots=True)
 class RevokeRejectionCapability:
     capability: RejectionCapability
     ticket: AdmissionOperationTicket | None = None
@@ -584,6 +676,7 @@ AdmissionEffect: TypeAlias = (
     | ConstrainRejectionDeadline
     | ScheduleFinalDeadline
     | ResolveReserved
+    | SettlePartial
     | RevokeRejectionCapability
     | AbortProviderTransport
     | PoisonSpeakerAuthorityNamespace

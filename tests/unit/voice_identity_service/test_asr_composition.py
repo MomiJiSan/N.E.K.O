@@ -99,6 +99,7 @@ def test_composition_emits_stateless_ordered_low_facts_then_close() -> None:
         activation_generation="activation-1",
         enforce=True,
     )
+    assert factory.enforces_admission is True
     shadow = factory()
     candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
     callback = shadow._on_evidence
@@ -133,6 +134,10 @@ def test_composition_emits_stateless_ordered_low_facts_then_close() -> None:
     ]
     assert [event.sequence_no for event in sink.events[:2]] == [1, 2]
     assert sink.events[-1] == CaptureClosed(candidate, 2)
+    diagnostics = factory.diagnostics_snapshot()
+    assert diagnostics["speaker_first_low_count"] == 1
+    assert diagnostics["speaker_second_low_count"] == 1
+    assert "reject_decision_count" not in diagnostics
     factory.close()
 
 

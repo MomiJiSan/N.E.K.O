@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass
-from typing import TypeAlias, cast
+from typing import Literal, TypeAlias, cast
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
@@ -18,24 +18,42 @@ from .contracts import (
     AdmissionEffect,
     AdmissionEvent,
     BoundaryExact,
+    CandidateBound,
+    CaptureClosed,
     Close,
     Reset,
     RouteReplaced,
+    SpeakerAuthorityPending,
+    SpeakerAuthorityUnavailable,
+    SpeakerAuthorityUnarmed,
     SpeakerHigh,
     SpeakerLow,
+    SpeakerUnavailable,
     VoiceTurnAdmissionRecord,
 )
 from .coordinator import AdmissionBulkResult, VoiceTurnAdmissionCoordinator
 
 
-class AdmissionIngressCapacityError(RuntimeError):
-    """Optional evidence could not enter the bounded data portion of the lane."""
+_CapacityClass: TypeAlias = Literal["data", "control", "speaker_control"]
 
-    def __init__(self, turn_token: VoiceTurnToken, event: AdmissionEvent) -> None:
+
+class AdmissionIngressCapacityError(RuntimeError):
+    """One bounded ingress partition has no remaining reservation."""
+
+    def __init__(
+        self,
+        turn_token: VoiceTurnToken | None,
+        event: AdmissionEvent | None,
+        *,
+        capacity_class: _CapacityClass = "data",
+    ) -> None:
         self.turn_token = turn_token
         self.event = event
         self.event_type = type(event)
-        super().__init__("ASR_ADMISSION_INGRESS_DATA_CAPACITY_EXHAUSTED")
+        self.capacity_class = capacity_class
+        super().__init__(
+            f"ASR_ADMISSION_INGRESS_{capacity_class.upper()}_CAPACITY_EXHAUSTED"
+        )
 
 
 class AdmissionIngressClosedError(RuntimeError):
@@ -48,12 +66,15 @@ class _IngressItem:
     event: AdmissionEvent | None
     now: float | None
     result: asyncio.Future["_IngressResult"]
-    counts_toward_data_capacity: bool
-    coalescing_key: tuple[
-        VoiceTurnToken | None,
-        AdmissionEvent,
-        float | None,
-    ] | None
+    capacity_class: _CapacityClass
+    coalescing_key: (
+        tuple[
+            VoiceTurnToken | None,
+            AdmissionEvent,
+            float | None,
+        ]
+        | None
+    )
     retires_turn: bool = False
 
 
@@ -65,19 +86,27 @@ _IngressResult: TypeAlias = (
 )
 
 
-_DATA_EVENT_TYPES = (SpeakerLow, SpeakerHigh, BoundaryExact)
+_DATA_EVENT_TYPES = (BoundaryExact,)
+_SPEAKER_CONTROL_EVENT_TYPES = (
+    CandidateBound,
+    CaptureClosed,
+    SpeakerAuthorityPending,
+    SpeakerAuthorityUnavailable,
+    SpeakerAuthorityUnarmed,
+    SpeakerHigh,
+    SpeakerLow,
+    SpeakerUnavailable,
+)
 
 
 class AdmissionIngressLane:
     """Single-consumer admission event lane with control capacity isolation.
 
-    Only optional speaker/boundary evidence consumes ``data_capacity``.  Facts
-    that remove authority, Provider finals, deadlines, invalidations, and
-    settlement acknowledgements are control traffic and are always accepted
-    while the lane is open.  This prevents optional evidence pressure from
-    consuming the path that owns a transcript reservation.  Identical pending
-    control retries are coalesced; distinct production controls are bounded by
-    the coordinator's live-record capacity and its finite operation tickets.
+    Optional boundary data, general controls, and ordered speaker facts use
+    separate finite reservations in one FIFO.  General/data pressure therefore
+    cannot consume the slots required for the two authoritative speaker
+    checkpoints.  Identical controls are still coalesced, and every queued item
+    (including open/retire operations) consumes exactly one bounded slot.
     """
 
     def __init__(
@@ -85,15 +114,30 @@ class AdmissionIngressLane:
         coordinator: VoiceTurnAdmissionCoordinator,
         *,
         data_capacity: int = 64,
+        control_capacity: int = 256,
+        speaker_control_capacity: int = 128,
     ) -> None:
         if type(coordinator) is not VoiceTurnAdmissionCoordinator:
             raise TypeError("coordinator must be VoiceTurnAdmissionCoordinator")
         if type(data_capacity) is not int or data_capacity <= 0:
             raise ValueError("data_capacity must be a positive integer")
+        if type(control_capacity) is not int or control_capacity <= 0:
+            raise ValueError("control_capacity must be a positive integer")
+        if (
+            type(speaker_control_capacity) is not int
+            or speaker_control_capacity <= 0
+        ):
+            raise ValueError(
+                "speaker_control_capacity must be a positive integer"
+            )
         self._coordinator = coordinator
         self._data_capacity = data_capacity
+        self._control_capacity = control_capacity
+        self._speaker_control_capacity = speaker_control_capacity
         self._items: deque[_IngressItem] = deque()
         self._data_pending = 0
+        self._control_pending = 0
+        self._speaker_control_pending = 0
         self._pending_controls: dict[
             tuple[VoiceTurnToken | None, AdmissionEvent, float | None],
             asyncio.Future[_IngressResult],
@@ -118,7 +162,56 @@ class AdmissionIngressLane:
 
     @property
     def pending_control_count(self) -> int:
-        return len(self._pending_controls)
+        return self._control_pending + self._speaker_control_pending
+
+    @property
+    def control_capacity(self) -> int:
+        return self._control_capacity
+
+    @property
+    def speaker_control_capacity(self) -> int:
+        return self._speaker_control_capacity
+
+    @property
+    def pending_speaker_control_count(self) -> int:
+        return self._speaker_control_pending
+
+    def _reserve_capacity(
+        self,
+        capacity_class: _CapacityClass,
+        turn_token: VoiceTurnToken | None,
+        event: AdmissionEvent | None,
+    ) -> None:
+        pending = {
+            "data": self._data_pending,
+            "control": self._control_pending,
+            "speaker_control": self._speaker_control_pending,
+        }[capacity_class]
+        capacity = {
+            "data": self._data_capacity,
+            "control": self._control_capacity,
+            "speaker_control": self._speaker_control_capacity,
+        }[capacity_class]
+        if pending >= capacity:
+            raise AdmissionIngressCapacityError(
+                turn_token,
+                event,
+                capacity_class=capacity_class,
+            )
+        if capacity_class == "data":
+            self._data_pending += 1
+        elif capacity_class == "control":
+            self._control_pending += 1
+        else:
+            self._speaker_control_pending += 1
+
+    def _release_capacity(self, capacity_class: _CapacityClass) -> None:
+        if capacity_class == "data":
+            self._data_pending -= 1
+        elif capacity_class == "control":
+            self._control_pending -= 1
+        else:
+            self._speaker_control_pending -= 1
 
     async def start(self) -> None:
         """Bind the lane to the running loop and start its only consumer."""
@@ -156,19 +249,30 @@ class AdmissionIngressLane:
         if loop is not self._loop:
             raise RuntimeError("ASR_ADMISSION_INGRESS_LOOP_MISMATCH")
         is_data = isinstance(event, _DATA_EVENT_TYPES)
-        if is_data and self._data_pending >= self._data_capacity:
-            raise AdmissionIngressCapacityError(turn_token, event)
-        coalescing_key: tuple[
-            VoiceTurnToken | None,
-            AdmissionEvent,
-            float | None,
-        ] | None = None
+        capacity_class: _CapacityClass = (
+            "data"
+            if is_data
+            else (
+                "speaker_control"
+                if isinstance(event, _SPEAKER_CONTROL_EVENT_TYPES)
+                else "control"
+            )
+        )
+        coalescing_key: (
+            tuple[
+                VoiceTurnToken | None,
+                AdmissionEvent,
+                float | None,
+            ]
+            | None
+        ) = None
         if not is_data:
             coalescing_key = (turn_token, event, now)
             existing = self._pending_controls.get(coalescing_key)
             if existing is not None:
                 follower = self._effectless_follower(existing)
                 return cast(asyncio.Future[tuple[AdmissionEffect, ...]], follower)
+        self._reserve_capacity(capacity_class, turn_token, event)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
             _IngressItem(
@@ -176,13 +280,11 @@ class AdmissionIngressLane:
                 event,
                 now,
                 result,
-                is_data,
+                capacity_class,
                 coalescing_key,
             )
         )
-        if is_data:
-            self._data_pending += 1
-        else:
+        if not is_data:
             assert coalescing_key is not None
             self._pending_controls[coalescing_key] = result
         self._available.set()
@@ -214,9 +316,10 @@ class AdmissionIngressLane:
             raise RuntimeError("ASR_ADMISSION_INGRESS_NOT_STARTED")
         if loop is not self._loop:
             raise RuntimeError("ASR_ADMISSION_INGRESS_LOOP_MISMATCH")
+        self._reserve_capacity("control", turn_token, None)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
-            _IngressItem(turn_token, None, None, result, False, None)
+            _IngressItem(turn_token, None, None, result, "control", None)
         )
         self._available.set()
         return cast(asyncio.Future[VoiceTurnAdmissionRecord], result)
@@ -262,9 +365,10 @@ class AdmissionIngressLane:
 
             existing.add_done_callback(transfer_result)
             return follower
+        self._reserve_capacity("control", turn_token, None)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
-            _IngressItem(turn_token, None, None, result, False, None, True)
+            _IngressItem(turn_token, None, None, result, "control", None, True)
         )
         self._pending_retirements[turn_token] = result
         self._available.set()
@@ -301,9 +405,10 @@ class AdmissionIngressLane:
         if existing is not None:
             follower = self._effectless_follower(existing)
             return cast(asyncio.Future[tuple[AdmissionBulkResult, ...]], follower)
+        self._reserve_capacity("control", None, event)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
-            _IngressItem(None, event, now, result, False, coalescing_key)
+            _IngressItem(None, event, now, result, "control", coalescing_key)
         )
         self._pending_controls[coalescing_key] = result
         self._available.set()
@@ -366,8 +471,6 @@ class AdmissionIngressLane:
                 await self._available.wait()
                 while self._items:
                     item = self._items.popleft()
-                    if item.counts_toward_data_capacity:
-                        self._data_pending -= 1
                     try:
                         if item.retires_turn:
                             assert item.turn_token is not None
@@ -384,9 +487,7 @@ class AdmissionIngressLane:
                                 now=item.now,
                             )
                         elif item.event is None:
-                            effects = await self._coordinator.open_turn(
-                                item.turn_token
-                            )
+                            effects = await self._coordinator.open_turn(item.turn_token)
                         else:
                             effects = await self._coordinator.post(
                                 item.turn_token,
@@ -400,6 +501,7 @@ class AdmissionIngressLane:
                         if not item.result.done():
                             item.result.set_result(effects)
                     finally:
+                        self._release_capacity(item.capacity_class)
                         if item.retires_turn:
                             assert item.turn_token is not None
                             self._pending_retirements.pop(item.turn_token, None)
@@ -414,8 +516,7 @@ class AdmissionIngressLane:
             error = AdmissionIngressClosedError("ASR_ADMISSION_INGRESS_CLOSED")
             while self._items:
                 item = self._items.popleft()
-                if item.counts_toward_data_capacity:
-                    self._data_pending -= 1
+                self._release_capacity(item.capacity_class)
                 if item.coalescing_key is not None:
                     self._pending_controls.pop(item.coalescing_key, None)
                 if item.retires_turn:

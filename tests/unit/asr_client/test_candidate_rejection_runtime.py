@@ -10,10 +10,12 @@ import main_logic.asr_client.runtime as runtime_module
 from main_logic.asr_client.admission.contracts import (
     AbortProviderTransport,
     AdmissionDisposition,
+    AdmissionResolutionTicket,
     AdmissionState,
     ApplyRejection,
     BoundaryExact,
     CandidateBound,
+    CaptureState,
     CaptureClosed,
     FinalDeadlineExpired,
     LifecycleSettled,
@@ -29,6 +31,7 @@ from main_logic.asr_client.admission.contracts import (
     RejectionCapabilityKind,
     ResolveReserved,
     ScheduleFinalDeadline,
+    SettlePartial,
     SpeakerCheckpointKind,
     SpeakerHigh,
     SpeakerLow,
@@ -141,6 +144,7 @@ class _RejectionLease:
 
 class _RejectionDetector:
     def __init__(self) -> None:
+        self.detector_epoch = 7
         self.lease: _RejectionLease | None = None
         self.prepare_entered = asyncio.Event()
         self.prepare_release = asyncio.Event()
@@ -157,6 +161,8 @@ class _RejectionDetector:
         self.complete_provider_candidate = AsyncMock(return_value=False)
         self.sealed_provider_micro_event_decision = MagicMock(return_value=None)
         self.release_deferred_turn = AsyncMock()
+        self.release_speaker_candidate_binding = MagicMock(return_value=True)
+        self.endpointing_ready = MagicMock(return_value=True)
         self.observe_provider_audio_ordered = AsyncMock()
         self.observe_provider_audio = MagicMock()
         self.provisional_pending = False
@@ -299,14 +305,12 @@ def _install_active_candidate(
         lease_generation=1,
         route_generation=1,
     )
-    turn_token = VoiceTurnToken(
-        ingress=runtime._asr_current_ingress_token,
-        turn_id=lifecycle.snapshot.turn_id,
-    )
+    turn_token = runtime._capture_turn_token(lifecycle)
     detector.lease = _RejectionLease(detector, turn_token)
     runtime._asr_partial_turn_token = turn_token
     runtime._asr_turn_prepared = True
     runtime._speaker_verifier_activation_generation = "profile-generation"
+    runtime._speaker_verifier_enforces_admission = True
     assert runtime._asr_audio_dispatcher.activate(turn_token, session, b"") is True
     final_key = FinalKey.from_turn(turn_token)
     assert runtime._asr_transcript_dispatcher.try_reserve(final_key) is True
@@ -448,6 +452,300 @@ async def _drain_runtime_admission(runtime: IndependentAsrRuntime) -> None:
     raise AssertionError("admission tasks did not become idle")
 
 
+async def _open_runtime_admission_turn(
+    runtime: IndependentAsrRuntime,
+    turn_token: VoiceTurnToken,
+) -> None:
+    if not runtime._asr_admission_ingress_started:
+        await runtime._asr_admission_ingress.start()
+        runtime._asr_admission_ingress_started = True
+    if await runtime._asr_admission.get_record(turn_token) is None:
+        await runtime._asr_admission_ingress.open_turn(turn_token)
+
+
+async def test_enforced_partial_is_quarantined_until_forward_verdict() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+
+    await runtime._send_independent_asr_preview(
+        "first draft",
+        runtime._asr_session_epoch,
+    )
+    await runtime._send_independent_asr_preview(
+        "latest draft",
+        runtime._asr_session_epoch,
+    )
+
+    callbacks.on_partial.assert_not_awaited()
+    assert runtime._asr_quarantined_partials == {
+        turn_token: "latest draft"
+    }
+
+    await runtime._execute_admission_effect(
+        SettlePartial(turn_token, 1, AdmissionDisposition.FORWARD)
+    )
+
+    callbacks.on_partial.assert_awaited_once()
+    assert callbacks.on_partial.await_args.args[0].text == "latest draft"
+    assert runtime._asr_quarantined_partials == {}
+
+    await runtime._send_independent_asr_preview(
+        "admitted draft",
+        runtime._asr_session_epoch,
+    )
+    assert callbacks.on_partial.await_count == 2
+    assert callbacks.on_partial.await_args.args[0].text == "admitted draft"
+    await _close_dispatchers(runtime)
+
+
+async def test_denied_partial_is_discarded_and_never_revived() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+
+    await runtime._send_independent_asr_preview(
+        "blocked draft",
+        runtime._asr_session_epoch,
+    )
+    await runtime._execute_admission_effect(
+        SettlePartial(turn_token, 1, AdmissionDisposition.DROP)
+    )
+    await runtime._send_independent_asr_preview(
+        "late blocked draft",
+        runtime._asr_session_epoch,
+    )
+
+    callbacks.on_partial.assert_not_awaited()
+    assert runtime._asr_quarantined_partials == {}
+    await _close_dispatchers(runtime)
+
+
+async def test_forward_verdict_drops_cached_partial_when_final_already_pending() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+
+    await runtime._send_independent_asr_preview(
+        "obsolete draft",
+        runtime._asr_session_epoch,
+    )
+    runtime._asr_admission_final_contexts[turn_token] = SimpleNamespace()
+
+    await runtime._execute_admission_effect(
+        SettlePartial(turn_token, 1, AdmissionDisposition.FORWARD)
+    )
+
+    callbacks.on_partial.assert_not_awaited()
+    assert runtime._asr_quarantined_partials == {}
+    await _close_dispatchers(runtime)
+
+
+async def test_unenforced_partial_preserves_immediate_preview_contract() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+    runtime._speaker_verifier_enforces_admission = False
+
+    await runtime._send_independent_asr_preview(
+        "ordinary draft",
+        runtime._asr_session_epoch,
+    )
+
+    callbacks.on_partial.assert_awaited_once()
+    assert callbacks.on_partial.await_args.args[0].text == "ordinary draft"
+    await _close_dispatchers(runtime)
+
+
+async def test_candidate_binding_is_published_before_first_score() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+    candidate = detector.lease.shadow_candidate
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    try:
+        assert runtime._accept_speaker_candidate_binding(
+            candidate,
+            turn_token,
+            detector=detector,
+            activation_generation="profile-generation",
+        )
+        await _drain_runtime_admission(runtime)
+
+        record = await runtime._asr_admission.get_record(turn_token)
+        assert record is not None
+        assert record.speaker_candidate == candidate
+        assert runtime._asr_admission_candidate_turns[candidate] == turn_token
+    finally:
+        await _close_dispatchers(runtime)
+
+
+async def test_deny_before_final_returns_settled_without_installing_context() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, _provider_fence = (
+        await _seal_provider_candidate(runtime, detector)
+    )
+    candidate = detector.lease.shadow_candidate
+    try:
+        await runtime._asr_admission_ingress.post(
+            turn_token,
+            CandidateBound(candidate),
+        )
+        await runtime._asr_admission_ingress.post(
+            turn_token,
+            SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        )
+        await runtime._asr_admission_ingress.post(
+            turn_token,
+            SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        )
+
+        settled = await runtime._handle_independent_asr_final(
+            "blocked final",
+            runtime._asr_session_epoch,
+            "qwen",
+            received_at=10.0,
+            deadline=10.2,
+        )
+
+        assert settled is not None and settled.is_set()
+        assert turn_token not in runtime._asr_admission_final_contexts
+        callbacks.on_final.assert_not_awaited()
+    finally:
+        await _close_dispatchers(runtime)
+
+
+async def test_deny_interleaved_with_final_post_retires_late_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token, _provider_fence = (
+        await _seal_provider_candidate(runtime, detector)
+    )
+    candidate = detector.lease.shadow_candidate
+    await runtime._asr_admission_ingress.post(
+        turn_token,
+        CandidateBound(candidate),
+    )
+    original_post = runtime._post_admission_event
+
+    async def interleaved_post(token, event, *, now=None):
+        if isinstance(event, ProviderFinalReceived):
+            await runtime._asr_admission_ingress.post(
+                token,
+                SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+            )
+            await runtime._asr_admission_ingress.post(
+                token,
+                SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+            )
+            record = await runtime._asr_admission.get_record(token)
+            assert record is not None
+            assert record.resolution_ticket is not None
+            runtime._asr_admission_resolutions[FinalKey.from_turn(token)] = (
+                runtime_module._AdmissionResolutionExecution(
+                    record.resolution_ticket,
+                    core_resolution_succeeded=False,
+                    owner_done=True,
+                )
+            )
+        return await original_post(token, event, now=now)
+
+    monkeypatch.setattr(runtime, "_post_admission_event", interleaved_post)
+    try:
+        settled = await runtime._handle_independent_asr_final(
+            "blocked final",
+            runtime._asr_session_epoch,
+            "qwen",
+            received_at=10.0,
+            deadline=10.2,
+        )
+
+        assert settled is not None
+        await _drain_runtime_admission(runtime)
+        await asyncio.wait_for(settled.wait(), 0.2)
+        assert turn_token not in runtime._asr_admission_final_contexts
+        callbacks.on_final.assert_not_awaited()
+    finally:
+        await _close_dispatchers(runtime)
+
+
+async def test_same_ticket_executor_adopts_context_attached_before_owner_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+    final_key = FinalKey.from_turn(turn_token)
+    dispatcher = MagicMock()
+    dispatcher.resolve_reserved.return_value = True
+    runtime._asr_admission_reservation_dispatchers[final_key] = dispatcher
+    first_context = SimpleNamespace(settled=asyncio.Event())
+    second_context = SimpleNamespace(settled=asyncio.Event())
+    runtime._asr_admission_final_contexts[turn_token] = first_context
+    first_settle_entered = asyncio.Event()
+    release_first_settle = asyncio.Event()
+    settled_contexts = []
+
+    async def settle_context(_ticket, context) -> None:
+        settled_contexts.append(context)
+        if context is first_context:
+            first_settle_entered.set()
+            await release_first_settle.wait()
+
+    monkeypatch.setattr(runtime, "_settle_admission_final", settle_context)
+    ticket = AdmissionResolutionTicket(
+        turn_token=turn_token,
+        record_generation=1,
+        resolution_nonce=1,
+        disposition=AdmissionDisposition.DROP,
+    )
+    effect = ResolveReserved(ticket=ticket, final=None)
+    owner = asyncio.create_task(runtime._resolve_admission_reservation(effect))
+    await asyncio.wait_for(first_settle_entered.wait(), 1)
+    runtime._asr_admission_final_contexts[turn_token] = second_context
+
+    await runtime._resolve_admission_reservation(effect)
+    execution = runtime._asr_admission_resolutions[final_key]
+    assert execution.owner_done is False
+    assert execution.late_context is second_context
+    release_first_settle.set()
+    await asyncio.wait_for(owner, 1)
+
+    assert settled_contexts == [first_context, second_context]
+    assert first_context.settled.is_set()
+    assert second_context.settled.is_set()
+    await _close_dispatchers(runtime)
+
+
 
 
 
@@ -483,15 +781,24 @@ async def test_second_low_survives_capture_completion_during_arming() -> None:
             SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
         )
         completed = lane.post_nowait(turn_token, CaptureClosed(candidate, 2))
-        await first
-        await second
-        await completed
+        first_effects = await first
+        second_effects = await second
+        completed_effects = await completed
 
         record = await coordinator.get_record(turn_token)
         assert record is not None
-        assert record.evidence_state.value == "reject_requested"
+        assert record.evidence_state.value == "deny_latched"
+        assert record.admission_state is AdmissionState.DROPPED
+        assert sum(
+            isinstance(effect, ResolveReserved)
+            for effect in (*first_effects, *second_effects, *completed_effects)
+        ) == 1
+        assert any(
+            isinstance(effect, AbortProviderTransport)
+            for effect in second_effects
+        )
         effects = await lane.post(turn_token, BoundaryExact(capability))
-        assert any(isinstance(effect, ApplyRejection) for effect in effects)
+        assert not any(isinstance(effect, ApplyRejection) for effect in effects)
     finally:
         await lane.close()
 
@@ -512,20 +819,26 @@ async def test_reject_requested_survives_completion_before_ordered_seal() -> Non
             turn_token,
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         )
-        await lane.post(
+        deny_effects = await lane.post(
             turn_token,
             SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
         )
         await lane.post(turn_token, CaptureClosed(candidate, 2))
         record = await coordinator.get_record(turn_token)
         assert record is not None
-        assert record.evidence_state.value == "reject_requested"
+        assert record.evidence_state.value == "deny_latched"
+        assert record.admission_state is AdmissionState.DROPPED
+        assert [
+            effect.disposition
+            for effect in deny_effects
+            if isinstance(effect, ResolveReserved)
+        ] == [AdmissionDisposition.DROP]
 
         effects = await lane.post(turn_token, BoundaryExact(capability))
-        assert any(isinstance(effect, ApplyRejection) for effect in effects)
+        assert not any(isinstance(effect, ApplyRejection) for effect in effects)
         record = await coordinator.get_record(turn_token)
         assert record is not None
-        assert record.evidence_state.value == "reject_requested"
+        assert record.evidence_state.value == "deny_latched"
     finally:
         await lane.close()
 
@@ -546,10 +859,6 @@ async def test_pending_exact_receipt_applies_before_final_deadline() -> None:
             turn_token,
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         )
-        await lane.post(
-            turn_token,
-            SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
-        )
         final_effects = await lane.post(
             turn_token,
             ProviderFinalReceived(_admission_final(provider_key)),
@@ -567,17 +876,29 @@ async def test_pending_exact_receipt_applies_before_final_deadline() -> None:
             BoundaryExact(capability),
             now=10.1,
         )
-        apply = next(
-            effect for effect in exact_effects if isinstance(effect, ApplyRejection)
+        assert not any(
+            isinstance(effect, ApplyRejection) for effect in exact_effects
         )
-        applied_effects = await lane.post(
+        timeout_effects = await lane.post(
             turn_token,
-            RejectionApplied(apply.ticket, RejectionCapabilityKind.SEALED),
-            now=10.19,
+            FinalDeadlineExpired(deadline.ticket, deadline.absolute_deadline),
+            now=deadline.absolute_deadline,
+        )
+        assert not any(
+            isinstance(effect, ResolveReserved) for effect in timeout_effects
+        )
+        pending = await coordinator.get_record(turn_token)
+        assert pending is not None
+        assert pending.admission_state is AdmissionState.PENDING
+
+        denied_effects = await lane.post(
+            turn_token,
+            SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+            now=10.21,
         )
         assert [
             effect.disposition
-            for effect in applied_effects
+            for effect in denied_effects
             if isinstance(effect, ResolveReserved)
         ] == [AdmissionDisposition.DROP]
         record = await coordinator.get_record(turn_token)
@@ -608,6 +929,7 @@ async def test_provider_submit_observes_admitted_audio_in_dispatch_order(
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    await _open_runtime_admission_turn(runtime, turn_token)
     detector_identity = DetectorIngressIdentity(
         ingress_token=turn_token.ingress,
         detector_epoch=7,
@@ -646,6 +968,338 @@ async def test_provider_submit_observes_admitted_audio_in_dispatch_order(
     await _close_dispatchers(runtime)
 
 
+async def test_buffered_activation_arms_speaker_before_provider_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_audio_dispatcher.abort(turn_token)
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    observation_entered = asyncio.Event()
+    observation_release = asyncio.Event()
+
+    async def block_observation(*_args, **_kwargs) -> bool:
+        observation_entered.set()
+        await observation_release.wait()
+        return True
+
+    monkeypatch.setattr(
+        runtime,
+        "_observe_admitted_provider_audio",
+        block_observation,
+    )
+    activation = asyncio.create_task(
+        runtime._activate_asr_audio_dispatcher(
+            lifecycle,
+            turn_token,
+            buffered_pcm16=b"\x01\x00" * 160,
+        )
+    )
+    await asyncio.wait_for(observation_entered.wait(), 1)
+
+    record = await runtime._asr_admission.get_record(turn_token)
+    assert record is not None
+    assert record.candidate_binding_state.value == "arming"
+    final_effects = await runtime._asr_admission_ingress.post(
+        turn_token,
+        ProviderFinalReceived(_admission_final(None)),
+        now=10.0,
+    )
+    assert not any(isinstance(effect, ResolveReserved) for effect in final_effects)
+
+    observation_release.set()
+    assert await asyncio.wait_for(activation, 1) is True
+    await runtime._unarm_speaker_authority_after_observation(
+        turn_token,
+        "profile-generation",
+    )
+    await _drain_runtime_admission(runtime)
+    await _close_dispatchers(runtime)
+
+
+async def test_active_enqueue_holds_fast_final_until_two_lows_drop() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    runtime._voice_input_resource_optimization_enabled = True
+    detector_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=7,
+        sequence_no=81,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.SPEECH_STARTED,),
+            throttle_available=True,
+            identity=detector_identity,
+            candidate=DetectorCandidateKey(7, 11),
+        )
+    )
+    runtime._bind_provider_detector_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value=True
+    )
+    observation_entered = asyncio.Event()
+    observation_release = asyncio.Event()
+    provider_wire_seen = asyncio.Event()
+
+    async def block_observation(*_args, **_kwargs) -> None:
+        observation_entered.set()
+        await observation_release.wait()
+
+    async def record_provider_wire(*_args, **_kwargs) -> None:
+        provider_wire_seen.set()
+
+    detector.observe_provider_audio_ordered.side_effect = block_observation
+    session.stream_audio.side_effect = record_provider_wire
+    submission = asyncio.create_task(
+        runtime.submit(
+            ProcessedVoiceFrame(b"\x12\x00" * 160, 16_000, 0.9, True),
+            ingress_token=turn_token.ingress,
+        )
+    )
+    await asyncio.wait_for(observation_entered.wait(), 1)
+    await asyncio.wait_for(provider_wire_seen.wait(), 1)
+
+    final_effects = await runtime._asr_admission_ingress.post(
+        turn_token,
+        ProviderFinalReceived(_admission_final(None)),
+        now=10.0,
+    )
+    assert not any(isinstance(effect, ResolveReserved) for effect in final_effects)
+    candidate = detector.lease.shadow_candidate
+    assert runtime._accept_speaker_candidate_binding(
+        candidate,
+        turn_token,
+        detector=detector,
+        activation_generation="profile-generation",
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    await _drain_runtime_admission(runtime)
+    record = await runtime._asr_admission.get_record(turn_token)
+    assert record is None
+    assert runtime._speaker_rejection_metrics["speaker_deny_latched_count"] == 1
+    runtime._callbacks.on_final.assert_not_awaited()
+
+    observation_release.set()
+    await asyncio.wait_for(submission, 1)
+    await _close_dispatchers(runtime)
+
+
+async def test_observation_without_candidate_unarms_pending_authority() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    owner_generation = await runtime._arm_speaker_authority_for_provider_audio(
+        turn_token
+    )
+    assert owner_generation == "profile-generation"
+
+    assert await runtime._observe_admitted_provider_audio(
+        lifecycle,
+        detector,
+        b"\x13\x00" * 160,
+        sample_rate_hz=16_000,
+        identity=DetectorIngressIdentity(
+            ingress_token=turn_token.ingress,
+            detector_epoch=7,
+            sequence_no=82,
+        ),
+        split_before_audio=False,
+        evidence_complete=True,
+        turn_token=turn_token,
+    )
+    await _drain_runtime_admission(runtime)
+
+    record = await runtime._asr_admission.get_record(turn_token)
+    assert record is not None
+    assert record.candidate_binding_state.value == "retired"
+    assert record.evidence_state.value == "unavailable"
+    assert turn_token not in runtime._asr_speaker_authority_pending_turns
+    await _close_dispatchers(runtime)
+
+
+async def test_arm_failure_never_wires_buffered_provider_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_audio_dispatcher.abort(turn_token)
+    await _open_runtime_admission_turn(runtime, turn_token)
+    original_post = runtime._post_admission_event
+
+    async def fail_pending(token, event, *, now=None):
+        if isinstance(event, runtime_module.SpeakerAuthorityPending):
+            raise KeyError(token)
+        return await original_post(token, event, now=now)
+
+    monkeypatch.setattr(runtime, "_post_admission_event", fail_pending)
+
+    assert not await runtime._activate_asr_audio_dispatcher(
+        lifecycle,
+        turn_token,
+        buffered_pcm16=b"\x14\x00" * 160,
+    )
+    session.stream_audio.assert_not_awaited()
+    assert runtime._asr_audio_dispatcher.active_turn is None
+    await _close_dispatchers(runtime)
+
+
+async def test_arm_post_await_identity_drift_never_wires_provider_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_audio_dispatcher.abort(turn_token)
+    await _open_runtime_admission_turn(runtime, turn_token)
+    original_post = runtime._post_admission_event
+    pending_reduced = asyncio.Event()
+    release_post = asyncio.Event()
+
+    async def block_after_pending(token, event, *, now=None):
+        effects = await original_post(token, event, now=now)
+        if isinstance(event, runtime_module.SpeakerAuthorityPending):
+            pending_reduced.set()
+            await release_post.wait()
+        return effects
+
+    monkeypatch.setattr(runtime, "_post_admission_event", block_after_pending)
+    activation = asyncio.create_task(
+        runtime._activate_asr_audio_dispatcher(
+            lifecycle,
+            turn_token,
+            buffered_pcm16=b"\x16\x00" * 160,
+        )
+    )
+    await asyncio.wait_for(pending_reduced.wait(), 1)
+    runtime._asr_session = SimpleNamespace(is_ready=True, close=AsyncMock())
+    runtime._speaker_verifier_enforces_admission = False
+    release_post.set()
+
+    assert not await asyncio.wait_for(activation, 1)
+    session.stream_audio.assert_not_awaited()
+    assert runtime._asr_audio_dispatcher.active_turn is None
+    await _close_dispatchers(runtime)
+
+
+async def test_cancelled_observation_still_unarms_pending_authority() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await _open_runtime_admission_turn(runtime, turn_token)
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    observation_entered = asyncio.Event()
+
+    async def block_observation(*_args, **_kwargs) -> None:
+        observation_entered.set()
+        await asyncio.Event().wait()
+
+    detector.observe_provider_audio_ordered.side_effect = block_observation
+    observation = asyncio.create_task(
+        runtime._observe_admitted_provider_audio(
+            lifecycle,
+            detector,
+            b"\x15\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=DetectorIngressIdentity(
+                ingress_token=turn_token.ingress,
+                detector_epoch=7,
+                sequence_no=83,
+            ),
+            split_before_audio=False,
+            evidence_complete=True,
+            turn_token=turn_token,
+        )
+    )
+    await asyncio.wait_for(observation_entered.wait(), 1)
+    observation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await observation
+    await _drain_runtime_admission(runtime)
+
+    record = await runtime._asr_admission.get_record(turn_token)
+    assert record is not None
+    assert record.evidence_state.value == "unavailable"
+    assert turn_token not in runtime._asr_speaker_authority_pending_turns
+    await _close_dispatchers(runtime)
+
+
+async def test_hot_swap_cannot_bypass_authoritative_turn_partial_drop() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+    runtime._asr_speaker_authoritative_turns.add(turn_token)
+    runtime._speaker_verifier_enforces_admission = False
+
+    await runtime._send_independent_asr_preview(
+        "quarantined across swap",
+        runtime._asr_session_epoch,
+    )
+    callbacks.on_partial.assert_not_awaited()
+    await runtime._execute_admission_effect(
+        SettlePartial(turn_token, 1, AdmissionDisposition.DROP)
+    )
+    await runtime._send_independent_asr_preview(
+        "late denied partial",
+        runtime._asr_session_epoch,
+    )
+    callbacks.on_partial.assert_not_awaited()
+    await _close_dispatchers(runtime)
+
+
 async def test_provider_resumed_audio_splits_after_initial_pre_roll() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
@@ -656,6 +1310,7 @@ async def test_provider_resumed_audio_splits_after_initial_pre_roll() -> None:
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    await _open_runtime_admission_turn(runtime, turn_token)
     detector_identity = DetectorIngressIdentity(
         ingress_token=turn_token.ingress,
         detector_epoch=7,
@@ -722,6 +1377,7 @@ async def test_provider_split_with_pre_roll_marks_ordered_evidence_incomplete() 
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    await _open_runtime_admission_turn(runtime, turn_token)
     detector_identity = DetectorIngressIdentity(
         ingress_token=turn_token.ingress,
         detector_epoch=7,
@@ -775,6 +1431,7 @@ async def test_provider_ordered_observation_drift_is_stale_after_audio_admission
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    await _open_runtime_admission_turn(runtime, turn_token)
     detector_identity = DetectorIngressIdentity(
         ingress_token=turn_token.ingress,
         detector_epoch=7,
@@ -820,6 +1477,7 @@ async def test_provider_ordered_observation_missing_identity_uses_legacy_fallbac
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    await _open_runtime_admission_turn(runtime, turn_token)
     first_identity = DetectorIngressIdentity(
         ingress_token=turn_token.ingress,
         detector_epoch=7,
@@ -907,6 +1565,7 @@ async def test_provider_ordered_observation_failure_keeps_admitted_audio() -> No
         endpointing_mode="provider",
     )
     runtime._voice_input_resource_optimization_enabled = True
+    await _open_runtime_admission_turn(runtime, turn_token)
     detector_identity = DetectorIngressIdentity(
         ingress_token=turn_token.ingress,
         detector_epoch=7,
@@ -1047,6 +1706,7 @@ async def test_verifier_factory_hot_replaces_active_detector_and_closes_old() ->
     runtime._speaker_verifier_activation_generation = "old-profile"
     shadow = SimpleNamespace(close=AsyncMock())
     factory = MagicMock(return_value=shadow)
+    factory.enforces_admission = True
 
     updated = await runtime.set_speaker_verifier_factory(
         factory,
@@ -1054,15 +1714,19 @@ async def test_verifier_factory_hot_replaces_active_detector_and_closes_old() ->
     )
 
     assert updated is True
-    detector.replace_speaker_verifier.assert_awaited_once_with(shadow)
+    detector.replace_speaker_verifier.assert_awaited_once_with(
+        shadow,
+        owner_generation="new-profile",
+    )
     assert runtime._speaker_verifier_factory is factory
     assert runtime._speaker_verifier_activation_generation == "new-profile"
+    assert runtime._speaker_verifier_enforces_admission is True
     old_factory.close.assert_called_once_with()
 
 
 
 
-async def test_verifier_factory_failure_is_detached_and_preserves_activation() -> None:
+async def test_verifier_factory_failure_fences_old_activation_fail_open() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
     detector.replace_speaker_verifier.side_effect = RuntimeError("swap failed")
@@ -1072,6 +1736,7 @@ async def test_verifier_factory_failure_is_detached_and_preserves_activation() -
     runtime._speaker_verifier_activation_generation = "old-profile"
     shadow = SimpleNamespace(close=AsyncMock())
     factory = MagicMock(return_value=shadow)
+    factory.enforces_admission = True
 
     updated = await runtime.set_speaker_verifier_factory(
         factory,
@@ -1079,9 +1744,109 @@ async def test_verifier_factory_failure_is_detached_and_preserves_activation() -
     )
 
     assert updated is False
-    shadow.close.assert_awaited_once_with()
-    assert runtime._speaker_verifier_factory is old_factory
-    assert runtime._speaker_verifier_activation_generation == "old-profile"
+    shadow.close.assert_not_awaited()
+    assert runtime._speaker_verifier_factory is None
+    assert runtime._speaker_verifier_activation_generation == "new-profile"
+    assert runtime._speaker_verifier_enforces_admission is False
+    old_factory.close.assert_called_once_with()
+
+
+async def test_verifier_failure_after_new_binding_retires_collecting_authority() -> (
+    None
+):
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    old_factory = MagicMock()
+    old_factory.close = MagicMock()
+    runtime._speaker_verifier_factory = old_factory
+    runtime._speaker_verifier_activation_generation = "old-profile"
+    shadow = SimpleNamespace(close=AsyncMock())
+    factory = MagicMock(return_value=shadow)
+    factory.enforces_admission = True
+    new_candidate = SpeakerShadowCandidateKey(7, 999, "provider_candidate")
+
+    async def publish_then_fail(new_shadow, *, owner_generation) -> None:
+        assert new_shadow is shadow
+        assert owner_generation == "new-profile"
+        assert runtime._accept_speaker_candidate_binding(
+            new_candidate,
+            turn_token,
+            detector=detector,
+            activation_generation=owner_generation,
+        )
+        await _drain_runtime_admission(runtime)
+        record = await runtime._asr_admission.get_record(turn_token)
+        assert record is not None
+        assert record.capture_state is CaptureState.COLLECTING
+        raise RuntimeError("swap failed after install")
+
+    detector.replace_speaker_verifier.side_effect = publish_then_fail
+    try:
+        updated = await runtime.set_speaker_verifier_factory(
+            factory,
+            activation_generation="new-profile",
+        )
+        await _drain_runtime_admission(runtime)
+
+        assert updated is False
+        record = await runtime._asr_admission.get_record(turn_token)
+        assert (
+            record is None
+            or record.capture_state is not CaptureState.COLLECTING
+        )
+        assert runtime._asr_admission_candidate_turns == {}
+        assert runtime._asr_admission_capabilities == {}
+        shadow.close.assert_not_awaited()
+        old_factory.close.assert_called_once_with()
+    finally:
+        await _close_dispatchers(runtime)
+
+
+async def test_cancelled_verifier_swap_keeps_transferred_shadow_owned_by_detector() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    runtime._asr_detector = detector
+    old_factory = MagicMock()
+    old_factory.close = MagicMock()
+    runtime._speaker_verifier_factory = old_factory
+    runtime._speaker_verifier_activation_generation = "old-profile"
+    shadow = SimpleNamespace(close=AsyncMock())
+    factory = MagicMock(return_value=shadow)
+    factory.enforces_admission = True
+    entered = asyncio.Event()
+
+    async def block_after_handoff(new_shadow, *, owner_generation) -> None:
+        assert new_shadow is shadow
+        assert owner_generation == "new-profile"
+        assert runtime._speaker_verifier_activation_generation == "new-profile"
+        assert runtime._speaker_verifier_enforces_admission is True
+        entered.set()
+        await asyncio.Event().wait()
+
+    detector.replace_speaker_verifier.side_effect = block_after_handoff
+    task = asyncio.create_task(
+        runtime.set_speaker_verifier_factory(
+            factory,
+            activation_generation="new-profile",
+        )
+    )
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    shadow.close.assert_not_awaited()
+    assert runtime._speaker_verifier_factory is None
+    assert runtime._speaker_verifier_activation_generation == "new-profile"
+    assert runtime._speaker_verifier_enforces_admission is False
+    old_factory.close.assert_called_once_with()
 
 
 
@@ -1104,15 +1869,13 @@ async def test_sealed_provider_rejection_suppresses_only_exact_final() -> None:
             turn_token,
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         )
-        await lane.post(
+        deny_effects = await lane.post(
             turn_token,
             SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
         )
         boundary_effects = await lane.post(turn_token, BoundaryExact(capability))
-        apply = next(
-            effect
-            for effect in boundary_effects
-            if isinstance(effect, ApplyRejection)
+        assert not any(
+            isinstance(effect, ApplyRejection) for effect in boundary_effects
         )
         final_effects = await lane.post(
             turn_token,
@@ -1122,16 +1885,9 @@ async def test_sealed_provider_rejection_suppresses_only_exact_final() -> None:
         assert not any(
             isinstance(effect, ResolveReserved) for effect in final_effects
         )
-
-        applied_effects = await lane.post(
-            turn_token,
-            RejectionApplied(apply.ticket, RejectionCapabilityKind.SEALED),
-            now=10.1,
-        )
-
         resolutions = [
             effect
-            for effect in applied_effects
+            for effect in deny_effects
             if isinstance(effect, ResolveReserved)
         ]
         assert [effect.disposition for effect in resolutions] == [
@@ -1145,11 +1901,12 @@ async def test_sealed_provider_rejection_suppresses_only_exact_final() -> None:
 
 
 async def test_provider_micro_event_shadow_forwards_non_empty_final() -> None:
-    coordinator, lane, turn_token, _candidate, provider_key = (
+    coordinator, lane, turn_token, candidate, provider_key = (
         await _open_admission_turn(provider_bound=True)
     )
     assert provider_key is not None
     try:
+        await lane.post(turn_token, SpeakerHigh(candidate, 1))
         await lane.post(turn_token, MicroEventPending())
         final_effects = await lane.post(
             turn_token,
@@ -1176,11 +1933,12 @@ async def test_provider_micro_event_shadow_forwards_non_empty_final() -> None:
 async def test_provider_micro_event_empty_final_is_never_suppressed_or_counted(
     enforce: bool,
 ) -> None:
-    coordinator, lane, turn_token, _candidate, provider_key = (
+    coordinator, lane, turn_token, candidate, provider_key = (
         await _open_admission_turn(provider_bound=True)
     )
     assert provider_key is not None
     try:
+        await lane.post(turn_token, SpeakerHigh(candidate, 1))
         await lane.post(turn_token, MicroEventPending())
         await lane.post(
             turn_token,
@@ -1251,26 +2009,19 @@ async def test_exact_speaker_and_micro_event_suppress_only_once() -> None:
             turn_token,
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         )
-        await lane.post(
+        deny_effects = await lane.post(
             turn_token,
             SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
         )
         boundary_effects = await lane.post(turn_token, BoundaryExact(capability))
-        apply = next(
-            effect
-            for effect in boundary_effects
-            if isinstance(effect, ApplyRejection)
+        assert not any(
+            isinstance(effect, ApplyRejection) for effect in boundary_effects
         )
         await lane.post(turn_token, MicroEventPending())
-        await lane.post(
+        final_effects = await lane.post(
             turn_token,
             ProviderFinalReceived(_admission_final(provider_key, text="嗯")),
             now=10.0,
-        )
-        speaker_effects = await lane.post(
-            turn_token,
-            RejectionApplied(apply.ticket, RejectionCapabilityKind.SEALED),
-            now=10.1,
         )
         micro_effects = await lane.post(
             turn_token,
@@ -1279,7 +2030,7 @@ async def test_exact_speaker_and_micro_event_suppress_only_once() -> None:
         )
         assert sum(
                 isinstance(effect, ResolveReserved)
-                for effect in (*speaker_effects, *micro_effects)
+                for effect in (*deny_effects, *final_effects, *micro_effects)
         ) == 1
         record = await coordinator.get_record(turn_token)
         assert record is not None
@@ -1289,11 +2040,12 @@ async def test_exact_speaker_and_micro_event_suppress_only_once() -> None:
 
 
 async def test_provider_micro_event_query_failure_fails_open() -> None:
-    coordinator, lane, turn_token, _candidate, provider_key = (
+    coordinator, lane, turn_token, candidate, provider_key = (
         await _open_admission_turn(provider_bound=True)
     )
     assert provider_key is not None
     try:
+        await lane.post(turn_token, SpeakerHigh(candidate, 1))
         await lane.post(turn_token, MicroEventPending())
         await lane.post(
             turn_token,
@@ -1433,6 +2185,7 @@ async def test_provider_micro_event_suppression_preserves_same_text_successor() 
     )
 
     await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await _drain_runtime_admission(runtime)
     await runtime.wait_transcript_idle()
 
     callbacks.on_final.assert_awaited_once()
@@ -1516,6 +2269,7 @@ async def test_duplicate_micro_event_final_counts_once_and_preserves_next_turn(
     )
 
     await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await _drain_runtime_admission(runtime)
     await runtime.wait_transcript_idle()
 
     assert callbacks.on_final.await_count == int(not enforce) + 1
@@ -1537,6 +2291,12 @@ async def test_smart_turn_final_does_not_query_provider_micro_event() -> None:
         provider="qwen",
         endpointing_mode="manual",
     )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    await runtime._asr_admission_ingress.open_turn(turn_token)
+    runtime._asr_admission_reservation_dispatchers[FinalKey.from_turn(turn_token)] = (
+        runtime._asr_transcript_dispatcher
+    )
     _seal_installed_provider_candidate(
         runtime,
         detector,
@@ -1544,11 +2304,15 @@ async def test_smart_turn_final_does_not_query_provider_micro_event() -> None:
         lifecycle,
         turn_token,
     )
+    # This test isolates SmartTurn's micro-event contract. Speaker admission
+    # is disabled so a missing verdict cannot hold the unrelated final.
+    runtime._speaker_verifier_enforces_admission = False
     detector.sealed_provider_micro_event_decision.return_value = (
         ProviderMicroEventDecision(True, True, "micro_event_enforced")
     )
 
     await runtime._handle_independent_asr_final("嗯", 0, "qwen")
+    await _drain_runtime_admission(runtime)
     await runtime.wait_transcript_idle()
 
     detector.sealed_provider_micro_event_decision.assert_not_called()
@@ -1734,23 +2498,19 @@ async def test_exact_pause_merge_scores_before_seal_and_suppresses_final(
     await shadow.wait_idle()
     await _drain_runtime_admission(runtime)
 
-    correlator = runtime._asr_provider_correlator
-    assert correlator is not None
-    alias = correlator.record_for(key)
-    assert alias is not None
-    boundary = alias.boundary_result
-    assert boundary is not None and boundary.quality == "exact", (
-        boundary,
-        detector.speaker_rejection_diagnostics_snapshot(),
-        shadow.snapshot(),
-    )
-    assert boundary.proof is not None
-    snapshot = runtime._asr_provider_boundary_proofs[boundary.proof.proof_id]
-    assert snapshot.merged_resume_count == 1
     assert scoring_host.score_count == 2
-    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    admission_record = await runtime._asr_admission.get_record(turn_token)
+    # Terminal settlement may already retire the reducer record. The durable
+    # contract evidence is the single deny latch plus zero transcript output.
+    assert admission_record is None
+    assert (
+        runtime._speaker_verifier_diagnostics()["speaker_deny_latched_count"]
+        == 1
+    )
     assert runtime._asr_session is session
 
+    # Provider cleanup may retire the correlator alias before the ordered
+    # notification arrives. That cannot revise the already-latched deny.
     await runtime._handle_provider_endpoint_notification(
         ProviderEndpointNotification(
             phase="ordered",
@@ -1764,11 +2524,10 @@ async def test_exact_pause_merge_scores_before_seal_and_suppresses_final(
     )
     await _drain_runtime_admission(runtime)
     admission_record = await runtime._asr_admission.get_record(turn_token)
-    assert admission_record is not None
-    assert admission_record.rejection_apply_state.value == "applied_sealed", (
-        runtime._speaker_verifier_diagnostics(),
-        admission_record,
-        detector.speaker_rejection_diagnostics_snapshot(),
+    assert admission_record is None
+    assert (
+        runtime._speaker_verifier_diagnostics()["speaker_deny_latched_count"]
+        == 1
     )
 
     await runtime._handle_provider_final(
@@ -1782,13 +2541,17 @@ async def test_exact_pause_merge_scores_before_seal_and_suppresses_final(
 
     callbacks.on_final.assert_not_awaited()
     abandoned.assert_awaited_once_with(turn_token)
-    assert runtime._asr_session is session
+    # Cleanup may retire the exact Provider transport; it cannot forward the
+    # denied final or transfer that denial into a successor turn.
+    assert runtime._asr_session is None
     diagnostics = detector.speaker_rejection_diagnostics_snapshot()
     assert diagnostics["provider_speaker_segment_merged_resume_count"] == 1
-    assert diagnostics["provider_speaker_segment_exact_snapshot_count"] == 1
+    assert diagnostics["provider_speaker_segment_exact_snapshot_count"] == 0
     assert diagnostics["provider_preseal_verdict_stored_count"] == 1
-    assert diagnostics["provider_preseal_verdict_consumed_count"] == 1
-    assert diagnostics["provider_rejection_applied_count"] == 1
+    # Authoritative denial can retire the Provider transport before an exact
+    # seal consumes the cleanup-only preseal verdict.
+    assert diagnostics["provider_preseal_verdict_consumed_count"] == 0
+    assert diagnostics["provider_rejection_applied_count"] == 0
     assert diagnostics["reconciliation_batch_admitted_count"] == 1
     assert diagnostics["reconciliation_batch_applied_count"] == 1
     assert diagnostics["provider_namespace_poison_count"] == 0
@@ -1861,15 +2624,9 @@ async def test_provider_gate_timeout_forwards_final_and_rejects_late_request(
             turn_token,
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         )
-        await lane.post(
-            turn_token,
-            SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
-        )
         boundary_effects = await lane.post(turn_token, BoundaryExact(capability))
-        apply = next(
-            effect
-            for effect in boundary_effects
-            if isinstance(effect, ApplyRejection)
+        assert not any(
+            isinstance(effect, ApplyRejection) for effect in boundary_effects
         )
         final_effects = await lane.post(
             turn_token,
@@ -1888,21 +2645,26 @@ async def test_provider_gate_timeout_forwards_final_and_rejects_late_request(
             FinalDeadlineExpired(deadline.ticket, deadline.absolute_deadline),
             now=deadline.absolute_deadline,
         )
-        assert [
-            effect.disposition
-            for effect in timeout_effects
-            if isinstance(effect, ResolveReserved)
-        ] == [AdmissionDisposition.FORWARD]
+        assert not any(
+            isinstance(effect, ResolveReserved) for effect in timeout_effects
+        )
+        pending = await coordinator.get_record(turn_token)
+        assert pending is not None
+        assert pending.admission_state is AdmissionState.PENDING
 
-        late_effects = await lane.post(
+        denied_effects = await lane.post(
             turn_token,
-            RejectionApplied(apply.ticket, RejectionCapabilityKind.SEALED),
+            SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
             now=10.21,
         )
-        assert not any(isinstance(effect, ResolveReserved) for effect in late_effects)
+        assert [
+            effect.disposition
+            for effect in denied_effects
+            if isinstance(effect, ResolveReserved)
+        ] == [AdmissionDisposition.DROP]
         record = await coordinator.get_record(turn_token)
         assert record is not None
-        assert record.admission_state is AdmissionState.FORWARDED
+        assert record.admission_state is AdmissionState.DROPPED
     finally:
         await lane.close()
 async def test_smart_turn_rejection_does_not_require_provider_gate() -> None:
@@ -1923,29 +2685,22 @@ async def test_smart_turn_rejection_does_not_require_provider_gate() -> None:
             turn_token,
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         )
-        await lane.post(
+        denied_effects = await lane.post(
             turn_token,
             SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
         )
         boundary_effects = await lane.post(turn_token, BoundaryExact(capability))
-        apply = next(
-            effect
-            for effect in boundary_effects
-            if isinstance(effect, ApplyRejection)
-        )
-        applied_effects = await lane.post(
-            turn_token,
-            RejectionApplied(apply.ticket, RejectionCapabilityKind.ACTIVE),
-            now=10.1,
+        assert not any(
+            isinstance(effect, ApplyRejection) for effect in boundary_effects
         )
 
         assert any(
             isinstance(effect, AbortProviderTransport)
-            for effect in applied_effects
+            for effect in denied_effects
         )
         assert [
             effect.disposition
-            for effect in applied_effects
+            for effect in denied_effects
             if isinstance(effect, ResolveReserved)
         ] == [AdmissionDisposition.DROP]
         record = await coordinator.get_record(turn_token)
