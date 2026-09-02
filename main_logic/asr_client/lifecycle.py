@@ -328,6 +328,12 @@ class VoiceInputLifecycleController:
         return self._pending_turn_speech and self.pending_turn_bytes > 0
 
     @property
+    def has_pending_turn_identity(self) -> bool:
+        """Return whether a successor turn is known even if PCM is already on wire."""
+
+        return self._pending_turn_speech and self._pending_turn_token is not None
+
+    @property
     def current_turn_token(self) -> VoiceTurnToken | None:
         return self._current_turn_token
 
@@ -545,12 +551,14 @@ class VoiceInputLifecycleController:
         self._pending_turn_speech = True
         return self._pending_turn_token
 
-    def begin_pending_turn(self) -> bytes:
+    def begin_pending_turn(self, *, allow_empty: bool = False) -> bytes:
         """Activate and drain the pending turn after the prior final."""
 
         if self._state is not VoiceLifecycleState.WARM_IDLE:
             raise RuntimeError("VOICE_PENDING_TURN_REQUIRES_WARM_IDLE")
-        if not self.has_pending_turn:
+        if not self.has_pending_turn and not (
+            allow_empty and self.has_pending_turn_identity
+        ):
             return b""
         payload = self._pending_turn.drain()
         self._pending_turn_speech = False

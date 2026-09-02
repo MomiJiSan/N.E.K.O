@@ -1275,6 +1275,45 @@ async def test_submit_capture_reports_backend_failure_as_unavailable() -> None:
         await runtime.close()
 
 
+async def test_abandon_candidate_fences_queued_pcm_without_terminal_evidence() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_evidence=evidence.append,
+    )
+    candidate = _candidate(9_312)
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker  # type: ignore[assignment]
+    try:
+        admitted = runtime.submit_capture(
+            _pcm(1_500),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        assert admitted.accepted_sample_count == 24_000
+        assert runtime.abandon_candidate(candidate)
+
+        hold_worker.set()
+        await fake_worker
+        runtime._worker_task = None
+        await runtime.wait_idle()
+
+        assert evidence == []
+        assert runtime.snapshot()["retained_pcm_bytes"] == 0
+        stale = runtime.submit_capture(
+            _pcm(100),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        assert stale.disposition is SpeakerShadowCaptureDisposition.UNAVAILABLE
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
 async def test_terminal_coverage_preserves_scored_window_for_long_exact_range() -> None:
     runtime = SpeakerShadowRuntime(
         backend_factory=_BackendFactory(score_value=0.2),

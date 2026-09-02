@@ -672,6 +672,20 @@ class SpeakerShadowCaptureStatus(Protocol):
 
 
 @runtime_checkable
+class SpeakerShadowCandidateLifecycleControl(Protocol):
+    """Optional candidate-local retirement without resetting the observer.
+
+    The caller has already revoked the external lease before invoking this
+    control.  Implementations must synchronously fence queued or in-flight work
+    for ``candidate`` so a late score cannot publish after the lease is
+    abandoned.  No completion or unavailable fact is emitted: lifecycle
+    abandonment is owned by the caller, not inferred from speaker evidence.
+    """
+
+    def abandon_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool: ...
+
+
+@runtime_checkable
 class SpeakerShadowDeferredCandidateStatus(Protocol):
     """Optional read-only capability query for deferred candidate buffering."""
 

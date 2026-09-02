@@ -34,6 +34,7 @@ from ._provider_events import (
     ProviderEndpointNotification,
     ProviderFinalNotification,
     ProviderUtteranceKey,
+    ProviderUtteranceStartedNotification,
 )
 from .audio import AsrAudioDispatcher
 from .admission.contracts import (
@@ -56,9 +57,7 @@ from .admission.contracts import (
     CountDiagnostic,
     FinalDeadlineExpired,
     LifecycleSettled,
-    MicroEventAllowed,
     MicroEventPending,
-    MicroEventSuppressed,
     MicroEventUnavailable,
     PendingProviderFinal,
     PoisonSpeakerAuthorityNamespace,
@@ -79,7 +78,13 @@ from .admission.contracts import (
     SpeakerAuthorityUnarmed,
     SpeakerAuthorityUnavailable,
     SpeakerCheckpointKind,
+    SpeakerCaptureLeaseToken,
     SpeakerHigh,
+    SpeakerLeaseCaptureClosed,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLeaseState,
+    SpeakerLeaseUnavailable,
     SpeakerLow,
     SpeakerUnavailable,
     SpeakerAuthorityNamespacePoisonFailed,
@@ -87,7 +92,7 @@ from .admission.contracts import (
     TransportSettled,
     TurnSealed,
 )
-from .admission.coordinator import VoiceTurnAdmissionCoordinator
+from .admission.coordinator import AdmissionBulkResult, VoiceTurnAdmissionCoordinator
 from .admission.ingress import (
     AdmissionIngressCapacityError,
     AdmissionIngressClosedError,
@@ -117,11 +122,12 @@ from .endpointing.detector_runtime import (
     DetectorCandidateRejectionCommitResult,
     DetectorCandidateRejectionLease,
     DetectorRuntime,
+    ProviderSpeakerEvidenceLease,
+    ProviderSpeakerEvidenceUpdate,
     SmartTurnLease,
 )
 from .endpointing.micro_event_policy import (
     ProviderMicroEventConfig,
-    ProviderMicroEventDecision,
 )
 from .endpointing.throttle_policy import ThrottleAction
 from .lifecycle import (
@@ -136,6 +142,7 @@ from .lifecycle import (
 )
 from .provider_policy import resolve_provider_policy
 from .speaker_shadow.contracts import (
+    SpeakerShadowCaptureDisposition,
     SpeakerShadowCandidateKey,
     SpeakerShadowObserver,
 )
@@ -606,9 +613,7 @@ class IndependentAsrRuntime:
         """Join one owned task set within the absolute terminal deadline."""
 
         current = asyncio.current_task()
-        pending = {
-            task for task in tasks if task is not current and not task.done()
-        }
+        pending = {task for task in tasks if task is not current and not task.done()}
         if not pending:
             return set()
         owned = set(pending)
@@ -677,9 +682,7 @@ class IndependentAsrRuntime:
             cancel_first=True,
         )
         completed_producers = producers - pending_producers
-        self._asr_admission_candidate_owned_tasks.difference_update(
-            completed_producers
-        )
+        self._asr_admission_candidate_owned_tasks.difference_update(completed_producers)
         for candidate, task in tuple(self._asr_admission_candidate_tasks.items()):
             if task in completed_producers:
                 self._asr_admission_candidate_tasks.pop(candidate, None)
@@ -821,9 +824,7 @@ class IndependentAsrRuntime:
                 # Publish the new callback identity before Detector can install
                 # the observer. replace_speaker_verifier transfers ownership at
                 # call entry and may yield while closing the detached observer.
-                self._speaker_verifier_activation_generation = (
-                    activation_generation
-                )
+                self._speaker_verifier_activation_generation = activation_generation
                 self._speaker_verifier_enforces_admission = (
                     _speaker_factory_enforces_admission(factory)
                 )
@@ -871,10 +872,7 @@ class IndependentAsrRuntime:
                         if not revoking:
                             cleanup = asyncio.create_task(
                                 fence_failed_replacement(),
-                                name=(
-                                    "speaker-verifier-replacement-"
-                                    "cancel-fence"
-                                ),
+                                name=("speaker-verifier-replacement-cancel-fence"),
                             )
                             await asyncio.shield(cleanup)
                         raise
@@ -888,9 +886,7 @@ class IndependentAsrRuntime:
                         return False
         else:
             if not revoking:
-                self._speaker_verifier_activation_generation = (
-                    activation_generation
-                )
+                self._speaker_verifier_activation_generation = activation_generation
                 self._speaker_verifier_enforces_admission = (
                     _speaker_factory_enforces_admission(factory)
                 )
@@ -922,9 +918,7 @@ class IndependentAsrRuntime:
             self._speaker_verifier_health_generation += 1
         self._speaker_verifier_degraded = True
         candidate_turns = tuple(self._asr_admission_candidate_turns.items())
-        pending_turns = tuple(
-            self._asr_speaker_authority_pending_turns.items()
-        )
+        pending_turns = tuple(self._asr_speaker_authority_pending_turns.items())
         if self._asr_admission_ingress_started:
             for candidate, turn_token in candidate_turns:
                 try:
@@ -977,10 +971,7 @@ class IndependentAsrRuntime:
             in {VoiceLifecycleState.ACTIVE, VoiceLifecycleState.DRAINING}
             and (
                 lifecycle.current_turn_token == turn_token
-                or (
-                    sealed_token is not None
-                    and sealed_token.turn == turn_token
-                )
+                or (sealed_token is not None and sealed_token.turn == turn_token)
             )
         )
         if (
@@ -988,13 +979,71 @@ class IndependentAsrRuntime:
             or not self._speaker_verifier_enforces_admission
             or detector is not self._asr_detector
             or not self._asr_admission_ingress_started
-            or activation_generation
-            != self._speaker_verifier_activation_generation
+            or activation_generation != self._speaker_verifier_activation_generation
             or candidate.detector_epoch != detector.detector_epoch
             or not self._ingress_token_matches(turn_token.ingress)
             or not turn_is_current
         ):
             return False
+        provider_owns_turns = bool(
+            lifecycle is not None
+            and lifecycle.provider_policy.endpoint_authority == "provider"
+        )
+        if provider_owns_turns:
+            lease_token = self._asr_admission_candidate_leases.get(candidate)
+            if lease_token is None:
+                self._asr_speaker_lease_nonce += 1
+                lease_token = SpeakerCaptureLeaseToken(
+                    session_generation=self._asr_session_epoch,
+                    start_generation=self._asr_start_generation,
+                    transport_generation=lifecycle.snapshot.transport_generation,
+                    detector_epoch=detector.detector_epoch,
+                    lease_nonce=self._asr_speaker_lease_nonce,
+                )
+                try:
+                    future = self._asr_admission_ingress.open_speaker_lease_nowait(
+                        lease_token,
+                        candidate,
+                    )
+                except (
+                    AdmissionIngressClosedError,
+                    AdmissionIngressCapacityError,
+                ):
+                    return False
+                self._asr_admission_candidate_leases[candidate] = lease_token
+                self._asr_current_speaker_lease = lease_token
+                self._asr_current_speaker_candidate = candidate
+                self._consume_speaker_lease_future(lease_token, future)
+            self._asr_admission_candidate_turns.setdefault(candidate, turn_token)
+            self._asr_speaker_authoritative_turns.add(turn_token)
+            self._asr_speaker_authority_pending_turns.pop(turn_token, None)
+            provider_key = next(
+                (
+                    key
+                    for key, bound_turn in self._asr_provider_started_turns.items()
+                    if bound_turn == turn_token
+                ),
+                None,
+            )
+            if provider_key is not None:
+                self._attach_provider_turn_to_speaker_lease_nowait(
+                    turn_token,
+                    provider_key,
+                    lease_token,
+                )
+                self._schedule_speaker_admission_item(
+                    candidate,
+                    self._prepare_independent_asr_turn(self._asr_session_epoch),
+                )
+            self._schedule_speaker_admission_item(
+                candidate,
+                self._ensure_speaker_admission_capability(
+                    candidate,
+                    turn_token,
+                    activation_generation,
+                ),
+            )
+            return True
         existing = self._asr_admission_candidate_turns.get(candidate)
         if existing is not None:
             if existing != turn_token:
@@ -1005,9 +1054,7 @@ class IndependentAsrRuntime:
             return True
         self._asr_admission_candidate_turns[candidate] = turn_token
         self._asr_speaker_authoritative_turns.add(turn_token)
-        self._asr_speaker_authority_pending_turns[turn_token] = (
-            activation_generation
-        )
+        self._asr_speaker_authority_pending_turns[turn_token] = activation_generation
         try:
             pending = self._asr_admission_ingress.post_nowait(
                 turn_token,
@@ -1075,8 +1122,7 @@ class IndependentAsrRuntime:
             return False
         if (
             not isinstance(fact, (SpeakerLow, SpeakerHigh, SpeakerUnavailable))
-            or activation_generation
-            != self._speaker_verifier_activation_generation
+            or activation_generation != self._speaker_verifier_activation_generation
             or not self._speaker_verifier_enforces_admission
             or type(enforce) is not bool
         ):
@@ -1087,11 +1133,35 @@ class IndependentAsrRuntime:
         if detector is None or not self._asr_admission_ingress_started:
             return False
         candidate = fact.candidate
+        lease_token = self._asr_admission_candidate_leases.get(candidate)
+        if lease_token is not None:
+            lease_fact = (
+                SpeakerLeaseLow(
+                    candidate,
+                    fact.sequence_no,
+                    fact.checkpoint_kind,
+                )
+                if isinstance(fact, SpeakerLow)
+                else SpeakerLeaseHigh(candidate, fact.sequence_no)
+                if isinstance(fact, SpeakerHigh)
+                else SpeakerLeaseUnavailable(candidate, fact.sequence_no)
+            )
+            try:
+                future = self._asr_admission_ingress.post_speaker_lease_nowait(
+                    lease_token,
+                    lease_fact,
+                )
+            except (
+                AdmissionIngressClosedError,
+                AdmissionIngressCapacityError,
+                KeyError,
+            ):
+                return False
+            self._consume_speaker_lease_future(lease_token, future)
+            return True
         turn_token = self._asr_admission_candidate_turns.get(candidate)
         if turn_token is None:
-            turn_token = detector._bound_turn_token_for_speaker_candidate(
-                candidate
-            )
+            turn_token = detector._bound_turn_token_for_speaker_candidate(candidate)
             if turn_token is None or not self._accept_speaker_candidate_binding(
                 candidate,
                 turn_token,
@@ -1119,14 +1189,33 @@ class IndependentAsrRuntime:
         self._ensure_asr_runtime_state()
         if (
             type(closed) is not CaptureClosed
-            or activation_generation
-            != self._speaker_verifier_activation_generation
+            or activation_generation != self._speaker_verifier_activation_generation
             or not self._speaker_verifier_enforces_admission
             or type(enforce) is not bool
             or type(evidence_complete) is not bool
         ):
             return False
         if not enforce:
+            return True
+        lease_token = self._asr_admission_candidate_leases.get(closed.candidate)
+        if lease_token is not None:
+            if not self._asr_admission_ingress_started:
+                return False
+            try:
+                future = self._asr_admission_ingress.post_speaker_lease_nowait(
+                    lease_token,
+                    SpeakerLeaseCaptureClosed(
+                        closed.candidate,
+                        closed.through_sequence_no,
+                    ),
+                )
+            except (
+                AdmissionIngressClosedError,
+                AdmissionIngressCapacityError,
+                KeyError,
+            ):
+                return False
+            self._consume_speaker_lease_future(lease_token, future)
             return True
         turn_token = self._asr_admission_candidate_turns.get(closed.candidate)
         if turn_token is None or not self._asr_admission_ingress_started:
@@ -1162,6 +1251,7 @@ class IndependentAsrRuntime:
                 if suppress_terminal_errors:
                     return ()
                 raise
+
             async def execute_effects() -> None:
                 for effect in effects:
                     await self._execute_admission_effect(effect)
@@ -1187,6 +1277,75 @@ class IndependentAsrRuntime:
         self._track_admission_effect_task(task, turn_token)
         task.add_done_callback(self._admission_effect_done)
         return task
+
+    def _consume_speaker_lease_future(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        future: asyncio.Future[Any],
+    ) -> asyncio.Task[Any]:
+        """Execute one lease-control result without retiring a child turn."""
+
+        async def consume() -> Any:
+            try:
+                result = await asyncio.shield(future)
+            except (AdmissionIngressClosedError, KeyError):
+                return None
+            if isinstance(result, tuple) and all(
+                isinstance(item, AdmissionBulkResult) for item in result
+            ):
+                for item in result:
+                    for effect in item.effects:
+                        if isinstance(effect, CountDiagnostic) and effect.name in {
+                            "speaker_deny_latched_count",
+                            "speaker_lease_deny_latched_count",
+                        }:
+                            # Child records only mirror their parent's formal
+                            # verdict; fan-out must not multiply deny metrics.
+                            continue
+                        await self._execute_admission_effect(effect)
+            record = await self._asr_admission.get_speaker_lease(lease_token)
+            if (
+                record is not None
+                and record.state is SpeakerLeaseState.DENY_LATCHED
+                and lease_token not in self._asr_speaker_deny_counted_leases
+            ):
+                self._asr_speaker_deny_counted_leases.add(lease_token)
+                self._speaker_rejection_metrics["speaker_deny_latched_count"] += 1
+            return result
+
+        task = asyncio.create_task(
+            consume(),
+            name=f"speaker-capture-lease-{lease_token.lease_nonce}",
+        )
+        self._track_admission_effect_task(task, None)
+        task.add_done_callback(self._admission_effect_done)
+        return task
+
+    def _attach_provider_turn_to_speaker_lease_nowait(
+        self,
+        turn_token: VoiceTurnToken,
+        provider_key: ProviderUtteranceKey,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> bool:
+        existing = self._asr_admission_turn_leases.get(turn_token)
+        if existing is not None:
+            return existing == lease_token
+        try:
+            future = self._asr_admission_ingress.attach_turn_to_speaker_lease_nowait(
+                turn_token,
+                lease_token,
+                provider_key,
+            )
+        except (
+            AdmissionIngressClosedError,
+            AdmissionIngressCapacityError,
+            KeyError,
+        ):
+            return False
+        self._asr_admission_turn_leases[turn_token] = lease_token
+        self._asr_speaker_authoritative_turns.add(turn_token)
+        self._consume_speaker_lease_future(lease_token, future)
+        return True
 
     async def _ensure_speaker_admission_capability(
         self,
@@ -1550,13 +1709,23 @@ class IndependentAsrRuntime:
             SpeakerShadowCandidateKey,
             VoiceTurnToken,
         ] = {}
+        self._asr_admission_candidate_leases: dict[
+            SpeakerShadowCandidateKey,
+            SpeakerCaptureLeaseToken,
+        ] = {}
+        self._asr_admission_turn_leases: dict[
+            VoiceTurnToken,
+            SpeakerCaptureLeaseToken,
+        ] = {}
+        self._asr_speaker_lease_nonce = 0
+        self._asr_speaker_deny_counted_leases: set[SpeakerCaptureLeaseToken] = set()
+        self._asr_current_speaker_lease: SpeakerCaptureLeaseToken | None = None
+        self._asr_current_speaker_candidate: SpeakerShadowCandidateKey | None = None
         self._asr_admission_candidate_tasks: dict[
             SpeakerShadowCandidateKey,
             asyncio.Task[None],
         ] = {}
-        self._asr_admission_candidate_owned_tasks: set[
-            asyncio.Task[None]
-        ] = set()
+        self._asr_admission_candidate_owned_tasks: set[asyncio.Task[None]] = set()
         self._asr_admission_deadline_tasks: dict[
             AdmissionOperationTicket,
             asyncio.Task[None],
@@ -1606,6 +1775,11 @@ class IndependentAsrRuntime:
         ] = {}
         self._asr_provider_correlator: ProviderTurnCorrelator | None = None
         self._asr_provider_correlator_namespace: tuple[int, int] | None = None
+        self._asr_provider_started_turns: dict[
+            ProviderUtteranceKey,
+            VoiceTurnToken,
+        ] = {}
+        self._asr_deferred_provider_started_keys: deque[ProviderUtteranceKey] = deque()
         self._asr_provider_boundary_proof_sequence = 0
         self._asr_provider_boundary_proofs: dict[
             int,
@@ -1652,12 +1826,13 @@ class IndependentAsrRuntime:
         # seal cannot acquire its lock inside the ordered/final 200 ms budget.
         # This key never grants speaker authority; it only lets the matching
         # transcript complete the already reserved Core turn fail-open.
-        self._asr_provider_authority_reset_task: (
-            asyncio.Task[bool] | None
-        ) = None
+        self._asr_provider_authority_reset_task: asyncio.Task[bool] | None = None
         self._asr_provider_exact_session: Any | None = None
         self._asr_audio_sequence = 0
         self._asr_provider_speaker_sequence = 0
+        self._asr_provider_speaker_evidence_lease: (
+            ProviderSpeakerEvidenceLease | None
+        ) = None
         self._asr_buffered_provider_speaker_observation: (
             _BufferedProviderSpeakerObservation | None
         ) = None
@@ -1733,9 +1908,7 @@ class IndependentAsrRuntime:
         if not hasattr(self, "_asr_session_epoch"):
             self._init_asr_runtime_state()
         elif not hasattr(self, "_asr_transcript_dispatcher"):
-            self._asr_transcript_dispatcher = (
-                self._new_asr_transcript_dispatcher()
-            )
+            self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
         if not hasattr(self, "_asr_detector_dispatcher"):
             self._asr_detector_dispatcher = AsrDetectorDispatcher(
                 self._dispatch_asr_detector_event,
@@ -1760,6 +1933,12 @@ class IndependentAsrRuntime:
             self._asr_admission_capability_generation = 0
             self._asr_admission_capabilities = {}
             self._asr_admission_candidate_turns = {}
+            self._asr_admission_candidate_leases = {}
+            self._asr_admission_turn_leases = {}
+            self._asr_speaker_lease_nonce = 0
+            self._asr_speaker_deny_counted_leases = set()
+            self._asr_current_speaker_lease = None
+            self._asr_current_speaker_candidate = None
             self._asr_admission_candidate_tasks = {}
             self._asr_admission_candidate_owned_tasks = set()
             self._asr_admission_deadline_tasks = {}
@@ -1778,6 +1957,8 @@ class IndependentAsrRuntime:
             self._asr_speaker_authority_unarming_tasks = {}
             self._asr_provider_correlator = None
             self._asr_provider_correlator_namespace = None
+            self._asr_provider_started_turns = {}
+            self._asr_deferred_provider_started_keys = deque()
             self._asr_provider_boundary_proof_sequence = 0
             self._asr_provider_boundary_proofs = {}
         elif not hasattr(self, "_asr_admission_ingress"):
@@ -1792,6 +1973,17 @@ class IndependentAsrRuntime:
             self._asr_admission_reservation_dispatchers = {}
         if not hasattr(self, "_asr_admission_effect_task_turns"):
             self._asr_admission_effect_task_turns = {}
+        if not hasattr(self, "_asr_admission_candidate_leases"):
+            self._asr_admission_candidate_leases = {}
+            self._asr_admission_turn_leases = {}
+            self._asr_speaker_lease_nonce = 0
+            self._asr_current_speaker_lease = None
+            self._asr_current_speaker_candidate = None
+        if not hasattr(self, "_asr_speaker_deny_counted_leases"):
+            self._asr_speaker_deny_counted_leases = set()
+        if not hasattr(self, "_asr_provider_started_turns"):
+            self._asr_provider_started_turns = {}
+            self._asr_deferred_provider_started_keys = deque()
         if not hasattr(self, "_asr_quarantined_partials"):
             self._asr_quarantined_partials = {}
         if not hasattr(self, "_asr_partial_settlements"):
@@ -1808,6 +2000,8 @@ class IndependentAsrRuntime:
             )
         if not hasattr(self, "_asr_provider_speaker_sequence"):
             self._asr_provider_speaker_sequence = 0
+        if not hasattr(self, "_asr_provider_speaker_evidence_lease"):
+            self._asr_provider_speaker_evidence_lease = None
         if not hasattr(self, "_asr_buffered_provider_speaker_observation"):
             self._asr_buffered_provider_speaker_observation = None
         if not hasattr(self, "_asr_overlap_onset_token"):
@@ -1854,9 +2048,7 @@ class IndependentAsrRuntime:
             self._speaker_verifier_degraded = False
         if not hasattr(self, "_speaker_verifier_enforces_admission"):
             self._speaker_verifier_enforces_admission = (
-                _speaker_factory_enforces_admission(
-                    self._speaker_verifier_factory
-                )
+                _speaker_factory_enforces_admission(self._speaker_verifier_factory)
             )
         if not hasattr(self, "_speaker_verifier_health_generation"):
             self._speaker_verifier_health_generation = 0
@@ -2069,9 +2261,7 @@ class IndependentAsrRuntime:
                 self._asr_admission_rejection_deadlines[effect.ticket] = (
                     effect.absolute_deadline
                 )
-            execution = self._asr_admission_rejection_executions.get(
-                effect.ticket
-            )
+            execution = self._asr_admission_rejection_executions.get(effect.ticket)
             if execution is not None and (
                 execution.absolute_deadline is None
                 or effect.absolute_deadline < execution.absolute_deadline
@@ -2094,15 +2284,11 @@ class IndependentAsrRuntime:
                     RejectionStale(effect.ticket),
                 )
                 return
-            constrained = self._asr_admission_rejection_deadlines.get(
-                effect.ticket
-            )
+            constrained = self._asr_admission_rejection_deadlines.get(effect.ticket)
             deadline = effect.absolute_deadline
             if constrained is not None:
                 deadline = (
-                    constrained
-                    if deadline is None
-                    else min(deadline, constrained)
+                    constrained if deadline is None else min(deadline, constrained)
                 )
             execution = _AdmissionRejectionExecution(
                 ticket=effect.ticket,
@@ -2605,6 +2791,19 @@ class IndependentAsrRuntime:
                 or self._asr_sealed_provider_key == context.provider_key
             )
         )
+        has_pending_turn = context.has_pending_turn
+        if owns_current_turn:
+            pending_token = lifecycle.pending_turn_token
+            has_pending_turn = bool(
+                has_pending_turn
+                or lifecycle.has_pending_turn
+                or (
+                    lifecycle.provider_policy.endpoint_authority == "provider"
+                    and lifecycle.has_pending_turn_identity
+                    and pending_token is not None
+                    and pending_token in self._asr_provider_started_turns.values()
+                )
+            )
         if owns_current_turn:
             lifecycle.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
             self._asr_turn_prepared = False
@@ -2623,9 +2822,9 @@ class IndependentAsrRuntime:
                 None,
             )
             self._asr_speaker_authoritative_turns.discard(context.turn_token)
-            if successor_present and not context.has_pending_turn:
+            if successor_present and not has_pending_turn:
                 lifecycle.preserve_unconfirmed_pending_audio()
-            if not context.has_pending_turn:
+            if not has_pending_turn:
                 self._schedule_transport_warm_expiry(
                     context.epoch,
                     expected_state=VoiceLifecycleState.WARM_IDLE,
@@ -2658,6 +2857,7 @@ class IndependentAsrRuntime:
                         degraded = True
                 except Exception:
                     degraded = True
+            self._asr_provider_started_turns.pop(context.provider_key, None)
         delivered = bool(
             owns_current_turn
             and await self._send_asr_lifecycle_state(
@@ -2669,7 +2869,7 @@ class IndependentAsrRuntime:
         )
         if not delivered:
             degraded = True
-        elif context.has_pending_turn:
+        elif has_pending_turn:
             await self._activate_pending_independent_turn(context.epoch)
         if detector is not None and fence is not None:
             try:
@@ -2684,6 +2884,26 @@ class IndependentAsrRuntime:
             context.turn_token,
             LifecycleSettled(ticket, degraded=degraded),
         )
+        lease_token = self._asr_admission_turn_leases.pop(
+            context.turn_token,
+            None,
+        )
+        if lease_token is not None and lease_token not in (
+            self._asr_admission_turn_leases.values()
+        ):
+            try:
+                await self._asr_admission_ingress.retire_speaker_lease(lease_token)
+            except (AdmissionIngressClosedError, KeyError):
+                pass
+            for candidate, bound_lease in tuple(
+                self._asr_admission_candidate_leases.items()
+            ):
+                if bound_lease == lease_token:
+                    self._asr_admission_candidate_leases.pop(candidate, None)
+                    if self._asr_current_speaker_candidate == candidate:
+                        self._asr_current_speaker_candidate = None
+            if self._asr_current_speaker_lease == lease_token:
+                self._asr_current_speaker_lease = None
 
     def _capture_transport_token(
         self,
@@ -2983,9 +3203,7 @@ class IndependentAsrRuntime:
         state = lifecycle.snapshot.state
         if state is VoiceLifecycleState.DRAINING:
             if event.kind == "continuous":
-                lifecycle.mark_pending_turn_speech(
-                    event.ingress.ingress_token
-                )
+                lifecycle.mark_pending_turn_speech(event.ingress.ingress_token)
                 if self._asr_pending_turn_onset_at is None:
                     self._asr_pending_turn_onset_at = detected_at
                 self._asr_pending_detector_candidate = event.candidate
@@ -3211,24 +3429,18 @@ class IndependentAsrRuntime:
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
         )
-        self._speaker_rejection_metrics[
-            "provider_candidate_bind_attempt_count"
-        ] += 1
+        self._speaker_rejection_metrics["provider_candidate_bind_attempt_count"] += 1
         try:
             bound = await detector.bind_candidate(candidate, turn_token)
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._speaker_rejection_metrics[
-                "provider_candidate_bind_failed_count"
-            ] += 1
+            self._speaker_rejection_metrics["provider_candidate_bind_failed_count"] += 1
             # Binding is advisory for Provider endpoint authority. The later
             # speaker verdict fails open when no exact detector turn exists.
             return self._runtime_identity_matches(bind_identity)
         if bound is None:
-            self._speaker_rejection_metrics[
-                "provider_candidate_bind_empty_count"
-            ] += 1
+            self._speaker_rejection_metrics["provider_candidate_bind_empty_count"] += 1
         else:
             self._speaker_rejection_metrics[
                 "provider_candidate_bind_success_count"
@@ -3268,7 +3480,14 @@ class IndependentAsrRuntime:
                 ingress_token=ingress_token,
             )
         state = lifecycle.snapshot.state
+        provider_owns_turns = lifecycle.provider_policy.endpoint_authority == "provider"
         if state is VoiceLifecycleState.DRAINING:
+            if provider_owns_turns:
+                # Only Provider utterance_started can mint the successor text
+                # turn. Local VAD audio may continue feeding the transport,
+                # but it cannot create pending-turn identity or rotate speaker
+                # evidence while the previous child is draining.
+                return wake_is_current()
             lifecycle.mark_pending_turn_speech(ingress_token)
             if self._asr_pending_turn_onset_at is None:
                 self._asr_pending_turn_onset_at = detected_at
@@ -3303,14 +3522,15 @@ class IndependentAsrRuntime:
             )
             if not delivered or not wake_is_current():
                 return False
-        if not await self._bind_provider_detector_candidate(
-            lifecycle,
-            detector,
-            detector_identity=detector_identity,
-            candidate=candidate,
-            expected_identity=expected_identity,
-        ):
-            return False
+        if not provider_owns_turns:
+            if not await self._bind_provider_detector_candidate(
+                lifecycle,
+                detector,
+                detector_identity=detector_identity,
+                candidate=candidate,
+                expected_identity=expected_identity,
+            ):
+                return False
         if lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE:
             return True
         if lifecycle.snapshot.state is not VoiceLifecycleState.PREWARMING:
@@ -3360,9 +3580,16 @@ class IndependentAsrRuntime:
             return False
         self._asr_turn_audio_started_at = time.monotonic()
         self._asr_first_partial_recorded = False
-        await self._prepare_independent_asr_turn(epoch)
-        if not wake_is_current():
-            return False
+        if lifecycle.provider_policy.endpoint_authority == "provider":
+            if not self._asr_admission_ingress_started:
+                await self._asr_admission_ingress.start()
+                self._asr_admission_ingress_started = True
+                if not wake_is_current():
+                    return False
+        else:
+            await self._prepare_independent_asr_turn(epoch)
+            if not wake_is_current():
+                return False
         return await self._activate_asr_audio_dispatcher(
             lifecycle,
             turn_token,
@@ -3395,8 +3622,8 @@ class IndependentAsrRuntime:
             else buffered_pcm16
         )
         if payload:
-            armed_generation = (
-                await self._arm_speaker_authority_for_provider_audio(turn_token)
+            armed_generation = await self._arm_speaker_authority_for_provider_audio(
+                turn_token
             )
             if (
                 self._asr_session is not session_ref
@@ -3408,8 +3635,7 @@ class IndependentAsrRuntime:
                 return False
             if (
                 self._speaker_verifier_enforces_admission
-                and armed_generation
-                != self._speaker_verifier_activation_generation
+                and armed_generation != self._speaker_verifier_activation_generation
             ):
                 return False
         activated = self._asr_audio_dispatcher.activate(
@@ -3471,7 +3697,7 @@ class IndependentAsrRuntime:
         return activated
 
     def _turn_has_speaker_candidate(self, turn_token: VoiceTurnToken) -> bool:
-        return any(
+        return turn_token in self._asr_admission_turn_leases or any(
             candidate_turn == turn_token
             for candidate_turn in self._asr_admission_candidate_turns.values()
         )
@@ -3497,6 +3723,17 @@ class IndependentAsrRuntime:
             or not self._ingress_token_matches(turn_token.ingress)
         ):
             return None
+        if (
+            lifecycle.provider_policy.endpoint_authority == "provider"
+            and turn_token not in self._asr_admission_turn_leases
+        ):
+            # Audio must reach a Provider before it can emit the authoritative
+            # utterance_started key.  Arm the physical speaker lease locally;
+            # the started callback atomically creates the child admission
+            # record before any endpoint/final for that key is processed.
+            self._asr_speaker_authority_pending_turns[turn_token] = owner_generation
+            self._asr_speaker_authoritative_turns.add(turn_token)
+            return owner_generation
         identity = self._capture_runtime_identity(
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
@@ -3553,6 +3790,7 @@ class IndependentAsrRuntime:
         operation = (turn_token, owner_generation)
         task = self._asr_speaker_authority_unarming_tasks.get(operation)
         if task is None:
+
             async def settle_unarmed() -> None:
                 try:
                     await self._post_admission_event(
@@ -3582,7 +3820,10 @@ class IndependentAsrRuntime:
             self._track_admission_effect_task(task, turn_token)
 
             def done(done_task: asyncio.Task[None]) -> None:
-                if self._asr_speaker_authority_unarming_tasks.get(operation) is done_task:
+                if (
+                    self._asr_speaker_authority_unarming_tasks.get(operation)
+                    is done_task
+                ):
                     self._asr_speaker_authority_unarming_tasks.pop(operation, None)
                 self._admission_effect_done(done_task)
 
@@ -3601,20 +3842,22 @@ class IndependentAsrRuntime:
             return
         buffered = self._asr_buffered_provider_speaker_observation
         if buffered is None:
-            self._asr_buffered_provider_speaker_observation = _BufferedProviderSpeakerObservation(
-                total_bytes=byte_count,
-                spans=[
-                    _BufferedProviderSpeakerSpan(
-                        start_byte=0,
-                        end_byte=byte_count,
-                        first_identity=identity,
-                        last_identity=identity,
-                        split_before_audio=bool(split_before_audio),
-                        evidence_complete=bool(
-                            evidence_complete and identity is not None
-                        ),
-                    )
-                ],
+            self._asr_buffered_provider_speaker_observation = (
+                _BufferedProviderSpeakerObservation(
+                    total_bytes=byte_count,
+                    spans=[
+                        _BufferedProviderSpeakerSpan(
+                            start_byte=0,
+                            end_byte=byte_count,
+                            first_identity=identity,
+                            last_identity=identity,
+                            split_before_audio=bool(split_before_audio),
+                            evidence_complete=bool(
+                                evidence_complete and identity is not None
+                            ),
+                        )
+                    ],
+                )
             )
             return
         start_byte = buffered.total_bytes
@@ -3687,9 +3930,7 @@ class IndependentAsrRuntime:
     ) -> bool:
         if not pcm16:
             return True
-        owner_generation = self._asr_speaker_authority_pending_turns.get(
-            turn_token
-        )
+        owner_generation = self._asr_speaker_authority_pending_turns.get(turn_token)
         observation_identity = self._capture_runtime_identity(
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
@@ -3708,18 +3949,93 @@ class IndependentAsrRuntime:
                 None,
             )
             if identity is not None and callable(observe_ordered):
+                evidence_lease = self._asr_provider_speaker_evidence_lease
+                if evidence_lease is None:
+                    ensure_evidence_lease = getattr(
+                        detector,
+                        "ensure_provider_speaker_evidence_lease",
+                        None,
+                    )
+                    if callable(ensure_evidence_lease):
+                        evidence_lease = await ensure_evidence_lease()
+                        if not self._runtime_identity_matches(observation_identity):
+                            return False
+                        if type(evidence_lease) is ProviderSpeakerEvidenceLease:
+                            self._asr_provider_speaker_evidence_lease = evidence_lease
+                            owner_generation = (
+                                self._speaker_verifier_activation_generation
+                            )
+                            if (
+                                owner_generation is None
+                                or not self._accept_speaker_candidate_binding(
+                                    evidence_lease.candidate,
+                                    turn_token,
+                                    detector=detector,
+                                    activation_generation=owner_generation,
+                                )
+                            ):
+                                abandon = getattr(
+                                    detector,
+                                    "abandon_provider_speaker_evidence_lease",
+                                    None,
+                                )
+                                if callable(abandon):
+                                    await abandon(evidence_lease)
+                                if not self._runtime_identity_matches(
+                                    observation_identity
+                                ):
+                                    return False
+                                self._asr_provider_speaker_evidence_lease = None
+                                evidence_lease = None
+                        else:
+                            evidence_lease = None
                 # Number ordered-observer dispatch attempts only. Explicit
                 # fallback revokes incomplete evidence directly.
                 self._asr_provider_speaker_sequence += 1
                 sequence_no = self._asr_provider_speaker_sequence
-                await observe_ordered(
-                    pcm16,
-                    sample_rate_hz=sample_rate_hz,
-                    identity=identity,
-                    sequence_no=sequence_no,
-                    split_before_audio=split_before_audio,
-                    evidence_complete=evidence_complete,
-                )
+                ordered_kwargs = {
+                    "sample_rate_hz": sample_rate_hz,
+                    "identity": identity,
+                    "sequence_no": sequence_no,
+                    "split_before_audio": split_before_audio,
+                    "evidence_complete": evidence_complete,
+                }
+                if evidence_lease is not None:
+                    ordered_kwargs["speaker_evidence_lease"] = evidence_lease
+                update = await observe_ordered(pcm16, **ordered_kwargs)
+                if (
+                    type(update) is ProviderSpeakerEvidenceUpdate
+                    and update.lease == evidence_lease
+                    and update.capture.disposition
+                    is SpeakerShadowCaptureDisposition.UNAVAILABLE
+                ):
+                    if self._asr_provider_speaker_evidence_lease == evidence_lease:
+                        self._asr_provider_speaker_evidence_lease = None
+                    lease_token = self._asr_admission_candidate_leases.get(
+                        update.lease.candidate
+                    )
+                    if lease_token is not None:
+                        try:
+                            future = (
+                                self._asr_admission_ingress.post_speaker_lease_nowait(
+                                    lease_token,
+                                    SpeakerLeaseCaptureClosed(
+                                        update.lease.candidate,
+                                        update.sequence_no,
+                                    ),
+                                )
+                            )
+                        except (
+                            AdmissionIngressClosedError,
+                            AdmissionIngressCapacityError,
+                            KeyError,
+                        ):
+                            pass
+                        else:
+                            self._consume_speaker_lease_future(
+                                lease_token,
+                                future,
+                            )
             else:
                 self._observe_provider_speaker_shadow(
                     detector,
@@ -4077,9 +4393,8 @@ class IndependentAsrRuntime:
         if not self._asr_admission_ingress_started:
             await self._asr_admission_ingress.start()
             self._asr_admission_ingress_started = True
-        if (
-            self._asr_terminal_close_requested
-            or not self._asr_start_operation_matches(operation_generation)
+        if self._asr_terminal_close_requested or not self._asr_start_operation_matches(
+            operation_generation
         ):
             return AsrStartResult(
                 AsrStartStatus.FAILED,
@@ -4274,6 +4589,16 @@ class IndependentAsrRuntime:
                     epoch,
                 )
 
+            async def on_provider_utterance_started(
+                notification: ProviderUtteranceStartedNotification,
+            ) -> None:
+                if not is_adopted_candidate():
+                    return
+                await self._handle_provider_utterance_started(
+                    notification,
+                    epoch,
+                )
+
             async def on_partial(text: str) -> None:
                 if not is_adopted_candidate():
                     return
@@ -4287,6 +4612,11 @@ class IndependentAsrRuntime:
                 on_status_message=on_status,
                 on_speech_activity=on_activity,
                 on_turn_endpointed=on_endpoint,
+                on_provider_utterance_started=(
+                    on_provider_utterance_started
+                    if candidate_policy.endpoint_authority == "provider"
+                    else None
+                ),
                 on_provider_endpoint=(
                     on_provider_endpoint
                     if candidate_policy.endpoint_authority == "provider"
@@ -4464,9 +4794,7 @@ class IndependentAsrRuntime:
                     and type(factory_activation) is str
                     and factory_activation
                 ):
-                    self._speaker_verifier_activation_generation = (
-                        factory_activation
-                    )
+                    self._speaker_verifier_activation_generation = factory_activation
                 self._speaker_verifier_enforces_admission = (
                     _speaker_factory_enforces_admission(current_factory)
                 )
@@ -4509,9 +4837,7 @@ class IndependentAsrRuntime:
                 # physical audio timeline. Reconnects earn this capability
                 # only after reset_provider_audio_timeline() succeeds.
                 self._asr_provider_exact_session = (
-                    asr_session
-                    if policy.endpoint_authority == "provider"
-                    else None
+                    asr_session if policy.endpoint_authority == "provider" else None
                 )
             self._asr_session_factory = create_candidate
             self._asr_transport_selection = selection
@@ -4645,11 +4971,7 @@ class IndependentAsrRuntime:
 
         correlator = self._asr_provider_correlator
         namespace = self._asr_provider_correlator_namespace
-        if (
-            retire_owned_proofs
-            and correlator is not None
-            and namespace is not None
-        ):
+        if retire_owned_proofs and correlator is not None and namespace is not None:
             try:
                 retired = correlator.retire_namespace(namespace)
             except ProviderAliasConflictError:
@@ -4666,6 +4988,8 @@ class IndependentAsrRuntime:
                 task.add_done_callback(self._admission_effect_done)
         self._asr_provider_correlator = None
         self._asr_provider_correlator_namespace = None
+        self._asr_provider_started_turns.clear()
+        self._asr_deferred_provider_started_keys.clear()
         self._asr_sealed_provider_key = None
         self._asr_provider_exact_session = None
 
@@ -4683,9 +5007,15 @@ class IndependentAsrRuntime:
         self._asr_overlap_completed_onsets.clear()
         self._asr_overlap_completed_turns = 0
         self._asr_audio_sequence = 0
+        self._asr_provider_speaker_evidence_lease = None
         self._asr_current_ingress_token = None
         self._asr_partial_turn_token = None
         self._asr_admission_candidate_turns.clear()
+        self._asr_admission_candidate_leases.clear()
+        self._asr_admission_turn_leases.clear()
+        self._asr_speaker_deny_counted_leases.clear()
+        self._asr_current_speaker_lease = None
+        self._asr_current_speaker_candidate = None
         self._asr_speaker_authority_pending_turns.clear()
         self._asr_speaker_authoritative_turns.clear()
         self._asr_quarantined_partials.clear()
@@ -4723,9 +5053,7 @@ class IndependentAsrRuntime:
             raise TypeError("ASR_TRANSCRIPT_DISPOSITION_INVALID")
         degraded = False
         try:
-            await self._notify_asr_turn_abandoned(
-                settlement.final_key.turn_token
-            )
+            await self._notify_asr_turn_abandoned(settlement.final_key.turn_token)
         except Exception:
             degraded = True
         execution = self._asr_admission_resolutions.get(settlement.final_key)
@@ -5119,7 +5447,10 @@ class IndependentAsrRuntime:
                         return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
                     if not detector_result.throttle_available:
                         lifecycle.enable_independent_asr_fail_open()
-                    else:
+                    provider_owns_turns = bool(
+                        lifecycle.provider_policy.endpoint_authority == "provider"
+                    )
+                    if detector_result.throttle_available and not provider_owns_turns:
                         provider_detector_identity = detector_result.identity
                         for event in detector_result.events:
                             split_before_provider_audio = bool(
@@ -5131,8 +5462,17 @@ class IndependentAsrRuntime:
                             )
                             if not ingress_is_current():
                                 return AsrSubmitResult(AsrSubmitStatus.STALE)
+                    elif provider_owns_turns:
+                        # Provider authority owns logical utterance identity.
+                        # Local Silero remains an idle/throttle signal only: it
+                        # may decide that this PCM should reach the transport,
+                        # but its start/resume/pause events cannot mint turns,
+                        # rotate speaker evidence, or request a split.
+                        provider_detector_identity = detector_result.identity
+                        split_before_provider_audio = False
                     pending_speech_confirmed = bool(
-                        lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+                        not provider_owns_turns
+                        and lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
                         and any(
                             event
                             in {
@@ -5143,7 +5483,8 @@ class IndependentAsrRuntime:
                         )
                     )
                     continuous_provider_wake = bool(
-                        not detector_result.throttle_available
+                        provider_owns_turns
+                        or not detector_result.throttle_available
                         or not self._voice_input_resource_optimization_enabled
                     )
                     if continuous_provider_wake:
@@ -5254,8 +5595,8 @@ class IndependentAsrRuntime:
                         expected_identity=identity,
                     )
                     return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
-            armed_generation = (
-                await self._arm_speaker_authority_for_provider_audio(turn_token)
+            armed_generation = await self._arm_speaker_authority_for_provider_audio(
+                turn_token
             )
             if (
                 not ingress_is_current()
@@ -5267,8 +5608,7 @@ class IndependentAsrRuntime:
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
             if (
                 self._speaker_verifier_enforces_admission
-                and armed_generation
-                != self._speaker_verifier_activation_generation
+                and armed_generation != self._speaker_verifier_activation_generation
             ):
                 return AsrSubmitResult(
                     AsrSubmitStatus.STALE
@@ -5295,6 +5635,11 @@ class IndependentAsrRuntime:
                 and decision is not None
                 and decision.disposition is AudioDisposition.FORWARD_WITH_PRE_ROLL
             )
+            pre_roll_ownership_is_ambiguous = bool(
+                decision is not None
+                and decision.disposition is AudioDisposition.FORWARD_WITH_PRE_ROLL
+                and payload != pcm16
+            )
             if not await self._observe_admitted_provider_audio(
                 lifecycle,
                 detector,
@@ -5304,7 +5649,9 @@ class IndependentAsrRuntime:
                 split_before_audio=bool(
                     split_before_provider_audio and not split_payload_is_ambiguous
                 ),
-                evidence_complete=not split_payload_is_ambiguous,
+                evidence_complete=not (
+                    split_payload_is_ambiguous or pre_roll_ownership_is_ambiguous
+                ),
                 turn_token=turn_token,
             ):
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
@@ -5424,14 +5771,11 @@ class IndependentAsrRuntime:
                         None,
                     )
                     exact_timeline_ready = False
-                    if (
-                        policy.endpoint_authority == "provider"
-                        and callable(reset_provider_timeline)
+                    if policy.endpoint_authority == "provider" and callable(
+                        reset_provider_timeline
                     ):
                         try:
-                            exact_timeline_ready = bool(
-                                await reset_provider_timeline()
-                            )
+                            exact_timeline_ready = bool(await reset_provider_timeline())
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -5593,9 +5937,7 @@ class IndependentAsrRuntime:
         transcript_dispatcher = self._asr_transcript_dispatcher
         if self._asr_admission_ingress_started:
             await self._finish_admission_invalidation(
-                self._asr_admission_ingress.invalidate_all_nowait(
-                    RouteReplaced()
-                ),
+                self._asr_admission_ingress.invalidate_all_nowait(RouteReplaced()),
                 transcript_dispatcher,
                 self._asr_provider_correlator,
                 self._asr_provider_correlator_namespace,
@@ -5669,6 +6011,7 @@ class IndependentAsrRuntime:
         self._asr_provider_exact_session = None
         session_close_task = None
         if asr_session is not None:
+
             async def close_transport() -> None:
                 try:
                     await asr_session.close()
@@ -5877,9 +6220,7 @@ class IndependentAsrRuntime:
             }
         ):
             ingress_token = self._asr_current_ingress_token
-            if ingress_token is None or not self._ingress_token_matches(
-                ingress_token
-            ):
+            if ingress_token is None or not self._ingress_token_matches(ingress_token):
                 return False
             lifecycle.mark_pending_turn_speech(ingress_token)
             if self._asr_pending_turn_onset_at is None:
@@ -6059,7 +6400,8 @@ class IndependentAsrRuntime:
                 self._asr_admission_ingress_started = True
                 if not preparation_is_current():
                     return
-            await self._asr_admission_ingress.open_turn(turn_token)
+            if turn_token not in self._asr_admission_turn_leases:
+                await self._asr_admission_ingress.open_turn(turn_token)
         except Exception:
             await self._handle_independent_asr_error(
                 epoch,
@@ -6082,9 +6424,7 @@ class IndependentAsrRuntime:
                 expected_identity=identity,
             )
             return
-        self._asr_admission_reservation_dispatchers[
-            final_key
-        ] = transcript_dispatcher
+        self._asr_admission_reservation_dispatchers[final_key] = transcript_dispatcher
         self._asr_turn_prepared = True
 
         async def abandon_preparation() -> None:
@@ -6168,10 +6508,180 @@ class IndependentAsrRuntime:
         self,
         key: ProviderUtteranceKey,
     ) -> bool:
-        return (
-            self._asr_provider_correlator_namespace
-            == self._provider_key_namespace(key)
+        return self._asr_provider_correlator_namespace == self._provider_key_namespace(
+            key
         )
+
+    def _attach_current_lease_to_provider_turn(
+        self,
+        key: ProviderUtteranceKey,
+        turn_token: VoiceTurnToken,
+    ) -> bool:
+        lease_token = self._asr_current_speaker_lease
+        candidate = self._asr_current_speaker_candidate
+        if lease_token is None or candidate is None:
+            return True
+        if self._asr_admission_candidate_leases.get(candidate) != lease_token:
+            return False
+        return self._attach_provider_turn_to_speaker_lease_nowait(
+            turn_token,
+            key,
+            lease_token,
+        )
+
+    async def _handle_provider_utterance_started(
+        self,
+        notification: ProviderUtteranceStartedNotification,
+        epoch: int,
+    ) -> None:
+        """Bind Provider text identity without rotating speaker evidence."""
+
+        if (
+            type(notification) is not ProviderUtteranceStartedNotification
+            or epoch != self._asr_session_epoch
+        ):
+            return
+        key = notification.key
+        if not self._accept_provider_timeline(key):
+            return
+        correlator = self._asr_provider_correlator
+        lifecycle = self._asr_lifecycle
+        ingress_token = self._asr_current_ingress_token
+        if (
+            correlator is None
+            or lifecycle is None
+            or ingress_token is None
+            or not self._ingress_token_matches(ingress_token)
+            or lifecycle.provider_policy.endpoint_authority != "provider"
+        ):
+            return
+        existing = self._asr_provider_started_turns.get(key)
+        if existing is not None or correlator.is_completed(key):
+            return
+        try:
+            correlator.mark_ordered(key)
+        except ProviderAliasConflictError:
+            return
+
+        current_lease = self._asr_current_speaker_lease
+        if current_lease is not None:
+            lease_record = await self._asr_admission.get_speaker_lease(
+                current_lease
+            )
+            if (
+                epoch != self._asr_session_epoch
+                or lifecycle is not self._asr_lifecycle
+                or correlator is not self._asr_provider_correlator
+            ):
+                return
+            if (
+                lease_record is not None
+                and lease_record.state
+                in {
+                    SpeakerLeaseState.ALLOW,
+                    SpeakerLeaseState.DENY_LATCHED,
+                    SpeakerLeaseState.UNAVAILABLE,
+                    SpeakerLeaseState.ABANDONED,
+                }
+                and self._asr_current_speaker_lease == current_lease
+            ):
+                candidate = self._asr_current_speaker_candidate
+                self._asr_current_speaker_lease = None
+                self._asr_current_speaker_candidate = None
+                evidence_lease = self._asr_provider_speaker_evidence_lease
+                if (
+                    evidence_lease is not None
+                    and candidate is not None
+                    and evidence_lease.candidate == candidate
+                ):
+                    self._asr_provider_speaker_evidence_lease = None
+                    abandon = getattr(
+                        self._asr_detector,
+                        "abandon_provider_speaker_evidence_lease",
+                        None,
+                    )
+                    if callable(abandon):
+                        try:
+                            await abandon(evidence_lease)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            pass
+                    if (
+                        epoch != self._asr_session_epoch
+                        or lifecycle is not self._asr_lifecycle
+                        or correlator is not self._asr_provider_correlator
+                    ):
+                        return
+
+        state = lifecycle.snapshot.state
+        turn_token: VoiceTurnToken | None = None
+        if state in {
+            VoiceLifecycleState.PREWARMING,
+            VoiceLifecycleState.ACTIVE,
+        }:
+            current = self._capture_turn_token(lifecycle)
+            occupied = any(
+                bound_turn == current
+                for bound_turn in self._asr_provider_started_turns.values()
+            )
+            if not occupied:
+                turn_token = current
+            else:
+                if key not in self._asr_deferred_provider_started_keys:
+                    if len(self._asr_deferred_provider_started_keys) >= 8:
+                        return
+                    self._asr_deferred_provider_started_keys.append(key)
+                return
+        elif state is VoiceLifecycleState.DRAINING:
+            turn_token = lifecycle.mark_pending_turn_speech(ingress_token)
+            if self._asr_pending_turn_onset_at is None:
+                self._asr_pending_turn_onset_at = time.monotonic()
+        if turn_token is None:
+            return
+        try:
+            correlator.bind_ordered(key, turn_token)
+        except ProviderAliasConflictError:
+            return
+        self._asr_provider_started_turns[key] = turn_token
+        self._asr_partial_turn_token = turn_token
+        self._attach_current_lease_to_provider_turn(key, turn_token)
+        candidate = self._asr_current_speaker_candidate
+        if state is VoiceLifecycleState.ACTIVE and candidate is not None:
+            self._schedule_speaker_admission_item(
+                candidate,
+                self._prepare_independent_asr_turn(epoch),
+            )
+
+    def _materialize_deferred_provider_started_turn(
+        self,
+        lifecycle: VoiceInputLifecycleController,
+    ) -> None:
+        if (
+            lifecycle.snapshot.state is not VoiceLifecycleState.DRAINING
+            or not self._asr_deferred_provider_started_keys
+        ):
+            return
+        ingress_token = self._asr_current_ingress_token
+        correlator = self._asr_provider_correlator
+        if (
+            ingress_token is None
+            or not self._ingress_token_matches(ingress_token)
+            or correlator is None
+        ):
+            return
+        key = self._asr_deferred_provider_started_keys.popleft()
+        turn_token = lifecycle.mark_pending_turn_speech(ingress_token)
+        if turn_token is None:
+            return
+        try:
+            correlator.bind_ordered(key, turn_token)
+        except ProviderAliasConflictError:
+            return
+        self._asr_provider_started_turns[key] = turn_token
+        if self._asr_pending_turn_onset_at is None:
+            self._asr_pending_turn_onset_at = time.monotonic()
+        self._attach_current_lease_to_provider_turn(key, turn_token)
 
     async def _retire_provider_speaker_boundary_unknown(
         self,
@@ -6256,9 +6766,7 @@ class IndependentAsrRuntime:
                 remaining = deadline - time.monotonic()
                 if observed and remaining > 0:
                     snapshot = await asyncio.wait_for(
-                        detector.reconcile_provider_endpoint(
-                            notification.audio_range
-                        ),
+                        detector.reconcile_provider_endpoint(notification.audio_range),
                         timeout=remaining,
                     )
                 remaining = deadline - time.monotonic()
@@ -6321,10 +6829,7 @@ class IndependentAsrRuntime:
         deadline: float | None = None,
     ) -> None:
         if deadline is None:
-            deadline = (
-                time.monotonic()
-                + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
-            )
+            deadline = time.monotonic() + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
         key = notification.key
         if not self._accept_provider_timeline(key):
             return
@@ -6400,12 +6905,52 @@ class IndependentAsrRuntime:
                 epoch,
                 deadline=final_deadline,
             )
-        if (
-            epoch != self._asr_session_epoch
-            or self._asr_sealed_provider_key != key
-        ):
+        if epoch != self._asr_session_epoch or self._asr_sealed_provider_key != key:
             return
-        settled = await self._handle_independent_asr_final(
+        current_turn = self._asr_provider_started_turns.get(key)
+        current_lease = (
+            self._asr_admission_turn_leases.get(current_turn)
+            if current_turn is not None
+            else None
+        )
+        has_started_successor = bool(
+            current_lease is not None
+            and any(
+                other_key.utterance_id > key.utterance_id
+                and self._asr_admission_turn_leases.get(other_turn) == current_lease
+                for other_key, other_turn in self._asr_provider_started_turns.items()
+            )
+        )
+        evidence_lease = self._asr_provider_speaker_evidence_lease
+        detector = self._asr_detector
+        if (
+            not has_started_successor
+            and evidence_lease is not None
+            and detector is not None
+        ):
+            finish_evidence = getattr(
+                detector,
+                "finish_provider_speaker_evidence_lease",
+                None,
+            )
+            if callable(finish_evidence):
+                try:
+                    finished = bool(await finish_evidence(evidence_lease))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    finished = False
+                if (
+                    epoch != self._asr_session_epoch
+                    or detector is not self._asr_detector
+                    or self._asr_sealed_provider_key != key
+                ):
+                    return
+                if finished and (
+                    self._asr_provider_speaker_evidence_lease == evidence_lease
+                ):
+                    self._asr_provider_speaker_evidence_lease = None
+        await self._handle_independent_asr_final(
             text,
             epoch,
             provider,
@@ -6413,8 +6958,6 @@ class IndependentAsrRuntime:
             received_at=received_at,
             deadline=final_deadline,
         )
-        if settled is not None:
-            await settled.wait()
 
     async def _seal_independent_asr_provider_turn_transaction(
         self,
@@ -6540,9 +7083,7 @@ class IndependentAsrRuntime:
             capability: RejectionCapability | None = None
             if provider_fence is not None and provider_key is not None:
                 try:
-                    admission_record = await self._asr_admission.get_record(
-                        turn_token
-                    )
+                    admission_record = await self._asr_admission.get_record(turn_token)
                     candidate = (
                         admission_record.speaker_candidate
                         if admission_record is not None
@@ -6562,9 +7103,9 @@ class IndependentAsrRuntime:
                 except Exception:
                     lease = None
                 if lease is not None:
-                    self._asr_admission_candidate_turns[
-                        lease.shadow_candidate
-                    ] = turn_token
+                    self._asr_admission_candidate_turns[lease.shadow_candidate] = (
+                        turn_token
+                    )
                     capability = self._register_admission_capability(
                         lease,
                         kind=RejectionCapabilityKind.SEALED,
@@ -6584,9 +7125,7 @@ class IndependentAsrRuntime:
                     turn_token,
                     MicroEventPending(),
                 )
-            sealed_wait_event = self._asr_admission_turn_sealed_events.get(
-                turn_token
-            )
+            sealed_wait_event = self._asr_admission_turn_sealed_events.get(turn_token)
             if sealed_wait_event is not None:
                 sealed_wait_event.set()
 
@@ -6619,9 +7158,7 @@ class IndependentAsrRuntime:
         if lifecycle is None:
             return
         provider_identity = (
-            self._capture_runtime_identity()
-            if provider_key is not None
-            else None
+            self._capture_runtime_identity() if provider_key is not None else None
         )
 
         def provider_key_is_current() -> bool:
@@ -6642,10 +7179,7 @@ class IndependentAsrRuntime:
             # new logical text turn. Existing onset metadata is only a timing
             # hint; if it is absent or stale, wake the turn without it.
             ingress_token = self._asr_current_ingress_token
-            if (
-                ingress_token is None
-                or not self._ingress_token_matches(ingress_token)
-            ):
+            if ingress_token is None or not self._ingress_token_matches(ingress_token):
                 return
             if self._asr_overlap_completed_token != ingress_token:
                 self._asr_overlap_completed_token = ingress_token
@@ -6832,13 +7366,15 @@ class IndependentAsrRuntime:
                         status_code="ASR_CORE_TURN_REJECTED",
                     )
                     return
-            transaction, failure_status, failure_identity = (
-                await self._seal_independent_asr_provider_turn_transaction(
-                    epoch,
-                    provider_key=provider_key,
-                    provider_snapshot=provider_snapshot,
-                    deadline=deadline,
-                )
+            (
+                transaction,
+                failure_status,
+                failure_identity,
+            ) = await self._seal_independent_asr_provider_turn_transaction(
+                epoch,
+                provider_key=provider_key,
+                provider_snapshot=provider_snapshot,
+                deadline=deadline,
             )
             if failure_status is not None:
                 await self._handle_independent_asr_error(
@@ -6865,6 +7401,7 @@ class IndependentAsrRuntime:
                 lifecycle,
                 transaction.sealed_token,
             )
+            self._materialize_deferred_provider_started_turn(lifecycle)
             await self._send_asr_lifecycle_state(
                 VoiceLifecycleState.DRAINING,
                 provider=provider,
@@ -6878,7 +7415,15 @@ class IndependentAsrRuntime:
         if epoch != self._asr_session_epoch:
             return
         lifecycle = self._asr_lifecycle
-        if lifecycle is None or not lifecycle.has_pending_turn:
+        pending_token = lifecycle.pending_turn_token if lifecycle is not None else None
+        provider_pending = bool(
+            lifecycle is not None
+            and lifecycle.provider_policy.endpoint_authority == "provider"
+            and lifecycle.has_pending_turn_identity
+            and pending_token is not None
+            and pending_token in self._asr_provider_started_turns.values()
+        )
+        if lifecycle is None or not (lifecycle.has_pending_turn or provider_pending):
             # has_pending_turn 还要求 pending buffer 里真有音频：speech 先到、或者
             # 对应 PCM 被丢弃时会走到这里。不清的话这个 onset 会被**下一个**真实
             # pending turn 复用，把那一轮的起点提前到上一轮，视觉帧绑错回合。
@@ -6891,7 +7436,7 @@ class IndependentAsrRuntime:
             self._asr_pending_turn_onset_at = None
             self._asr_pending_detector_candidate = None
             return
-        payload = lifecycle.begin_pending_turn()
+        payload = lifecycle.begin_pending_turn(allow_empty=provider_pending)
         # begin_pending_turn() 内部完成 SPEECH_CONFIRMED 迁移（lifecycle.py），是第
         # 五个迁移点 —— 之前给另外四处补 onset 打点时漏了它，因为守卫只扫本模块的
         # 字面量。不补的话 _asr_turn_onset_at 还留着**上一轮**的值（它只在
@@ -6904,7 +7449,7 @@ class IndependentAsrRuntime:
             else time.monotonic()
         )
         self._asr_pending_turn_onset_at = None
-        if not payload:
+        if not payload and not provider_pending:
             return
         turn_token = self._capture_turn_token(lifecycle)
         pending_candidate = self._asr_pending_detector_candidate
@@ -7005,9 +7550,7 @@ class IndependentAsrRuntime:
             or turn_token in self._asr_speaker_authoritative_turns
         ):
             self._asr_quarantined_partials[turn_token] = clean
-            self._speaker_rejection_metrics[
-                "speaker_partial_quarantined_count"
-            ] += 1
+            self._speaker_rejection_metrics["speaker_partial_quarantined_count"] += 1
             return
         await self._deliver_independent_asr_preview(turn_token, clean)
 
@@ -7032,9 +7575,7 @@ class IndependentAsrRuntime:
                 else time.monotonic()
             )
         if deadline is None:
-            deadline = (
-                received_at + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
-            )
+            deadline = received_at + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
         if deadline < received_at:
             return
         async with self._asr_final_lock:
@@ -7092,28 +7633,12 @@ class IndependentAsrRuntime:
                 and provider_fence is not None
                 and not _uses_smart_turn_endpointing(lifecycle.provider_policy)
             ):
-                try:
-                    micro = detector.sealed_provider_micro_event_decision(
-                        provider_fence
-                    )
-                except Exception:
-                    micro = None
-                if type(micro) is ProviderMicroEventDecision:
-                    await self._post_admission_event(
-                        turn_token,
-                        (
-                            MicroEventSuppressed()
-                            if micro.suppress
-                            else MicroEventAllowed(
-                                shadow_would_suppress=micro.would_suppress
-                            )
-                        ),
-                    )
-                else:
-                    await self._post_admission_event(
-                        turn_token,
-                        MicroEventUnavailable(),
-                    )
+                # Provider-authority routes use local Silero only to throttle
+                # idle PCM.  Its micro-event policy has no admission authority.
+                await self._post_admission_event(
+                    turn_token,
+                    MicroEventUnavailable(),
+                )
             identity = self._capture_runtime_identity(
                 ingress_token=turn_token.ingress,
                 turn_token=turn_token,
@@ -7130,7 +7655,15 @@ class IndependentAsrRuntime:
                 sealed_token=sealed_token,
                 provider_fence=provider_fence,
                 runtime_identity=identity,
-                has_pending_turn=lifecycle.has_pending_turn,
+                has_pending_turn=(
+                    lifecycle.has_pending_turn
+                    or (
+                        lifecycle.provider_policy.endpoint_authority == "provider"
+                        and lifecycle.has_pending_turn_identity
+                        and lifecycle.pending_turn_token
+                        in self._asr_provider_started_turns.values()
+                    )
+                ),
             )
             self._asr_admission_final_contexts[turn_token] = context
             watchdog = self._asr_final_watchdog_task
@@ -7156,22 +7689,15 @@ class IndependentAsrRuntime:
             if not any(isinstance(effect, ResolveReserved) for effect in effects):
                 admission_record = await self._asr_admission.get_record(turn_token)
                 if admission_record is None:
-                    if (
-                        self._asr_admission_final_contexts.get(turn_token)
-                        is context
-                    ):
+                    if self._asr_admission_final_contexts.get(turn_token) is context:
                         self._asr_admission_final_contexts.pop(turn_token, None)
                     context.settled.set()
                 elif admission_record.terminal_disposition is not None:
                     ticket = admission_record.resolution_ticket
-                    if (
-                        ticket is not None
-                        and ticket.disposition
-                        in {
-                            AdmissionDisposition.DROP,
-                            AdmissionDisposition.ABANDON,
-                        }
-                    ):
+                    if ticket is not None and ticket.disposition in {
+                        AdmissionDisposition.DROP,
+                        AdmissionDisposition.ABANDON,
+                    }:
                         # The terminal transition may have raced this final
                         # through another ingress consumer. Re-submit the same
                         # immutable ticket so whichever executor wins owns the
@@ -7250,9 +7776,7 @@ class IndependentAsrRuntime:
                     expected_identity=identity,
                 )
             finally:
-                execution = self._asr_admission_resolutions.get(
-                    envelope.final_key
-                )
+                execution = self._asr_admission_resolutions.get(envelope.final_key)
                 if execution is not None and not execution.core_settled:
                     execution.core_settled = True
                     try:
@@ -7291,9 +7815,7 @@ class IndependentAsrRuntime:
         audio_dispatcher = self._asr_audio_dispatcher
         if self._asr_admission_ingress_started:
             await self._finish_admission_invalidation(
-                self._asr_admission_ingress.invalidate_all_nowait(
-                    RouteReplaced()
-                ),
+                self._asr_admission_ingress.invalidate_all_nowait(RouteReplaced()),
                 transcript_dispatcher,
                 self._asr_provider_correlator,
                 self._asr_provider_correlator_namespace,

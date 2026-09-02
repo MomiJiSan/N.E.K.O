@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -19,11 +20,32 @@ from .contracts import (
     ProviderBindingState,
     SettlementState,
     Close,
+    EvidenceState,
     Reset,
     RouteReplaced,
+    SpeakerCaptureLeaseRecord,
+    SpeakerCaptureLeaseToken,
+    SpeakerLeaseAbandoned,
+    SpeakerLeaseChildBinding,
+    SpeakerLeaseEvent,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLeaseState,
+    SpeakerLeaseUnavailable,
+    SpeakerCheckpointKind,
+    SpeakerHigh,
+    SpeakerLow,
+    SpeakerUnavailable,
     VoiceTurnAdmissionRecord,
 )
 from .reducer import reduce
+from .speaker_leases import (
+    MAX_SPEAKER_LEASE_CHILDREN,
+    MAX_SPEAKER_LEASES,
+    SpeakerLeaseIdentityError,
+    bind_speaker_lease_child,
+    reduce_speaker_lease,
+)
 
 
 class AdmissionCapacityError(RuntimeError):
@@ -32,6 +54,10 @@ class AdmissionCapacityError(RuntimeError):
 
 class AdmissionIdentityError(RuntimeError):
     """A logical turn token or one of its aliases was reused inconsistently."""
+
+
+class SpeakerLeaseCapacityError(RuntimeError):
+    """A live speaker lease could not be reserved without eviction."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,22 +75,325 @@ class VoiceTurnAdmissionCoordinator:
         self,
         *,
         capacity: int = 8,
+        speaker_lease_capacity: int = MAX_SPEAKER_LEASES,
+        speaker_lease_child_capacity: int = MAX_SPEAKER_LEASE_CHILDREN,
+        retired_speaker_lease_capacity: int = 256,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("capacity must be a positive integer")
         if not callable(clock):
             raise TypeError("clock must be callable")
+        for name, value in (
+            ("speaker_lease_capacity", speaker_lease_capacity),
+            ("speaker_lease_child_capacity", speaker_lease_child_capacity),
+            ("retired_speaker_lease_capacity", retired_speaker_lease_capacity),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if speaker_lease_capacity > MAX_SPEAKER_LEASES:
+            raise ValueError(
+                f"speaker_lease_capacity cannot exceed {MAX_SPEAKER_LEASES}"
+            )
+        if speaker_lease_child_capacity > MAX_SPEAKER_LEASE_CHILDREN:
+            raise ValueError(
+                "speaker_lease_child_capacity cannot exceed "
+                f"{MAX_SPEAKER_LEASE_CHILDREN}"
+            )
         self._capacity = capacity
+        self._speaker_lease_capacity = speaker_lease_capacity
+        self._speaker_lease_child_capacity = speaker_lease_child_capacity
+        self._retired_speaker_lease_capacity = retired_speaker_lease_capacity
         self._clock = clock
         self._records: dict[VoiceTurnToken, VoiceTurnAdmissionRecord] = {}
+        self._speaker_leases: dict[
+            SpeakerCaptureLeaseToken,
+            SpeakerCaptureLeaseRecord,
+        ] = {}
+        self._speaker_candidate_bindings: dict[
+            SpeakerShadowCandidateKey,
+            SpeakerCaptureLeaseToken,
+        ] = {}
+        self._provider_speaker_lease_bindings: dict[
+            ProviderUtteranceKey,
+            tuple[SpeakerCaptureLeaseToken, VoiceTurnToken],
+        ] = {}
+        self._retired_speaker_leases: OrderedDict[
+            SpeakerCaptureLeaseToken,
+            None,
+        ] = OrderedDict()
         self._retired_turn_high_water: dict[object, int] = {}
         self._record_generation = 0
+        self._speaker_lease_record_generation = 0
         self._lock = asyncio.Lock()
 
     @property
     def capacity(self) -> int:
         return self._capacity
+
+    @property
+    def speaker_lease_capacity(self) -> int:
+        return self._speaker_lease_capacity
+
+    @property
+    def speaker_lease_child_capacity(self) -> int:
+        return self._speaker_lease_child_capacity
+
+    async def open_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> SpeakerCaptureLeaseRecord:
+        """Reserve one stable parent verdict identity without evicting another."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(candidate) is not SpeakerShadowCandidateKey:
+            raise TypeError("candidate must be SpeakerShadowCandidateKey")
+        async with self._lock:
+            existing = self._speaker_leases.get(lease_token)
+            if existing is not None:
+                if existing.candidate != candidate:
+                    raise AdmissionIdentityError("ASR_SPEAKER_LEASE_CANDIDATE_CONFLICT")
+                return existing
+            if lease_token in self._retired_speaker_leases:
+                raise AdmissionIdentityError("ASR_SPEAKER_LEASE_ALREADY_RETIRED")
+            existing_token = self._speaker_candidate_bindings.get(candidate)
+            if existing_token is not None and existing_token != lease_token:
+                raise AdmissionIdentityError(
+                    "ASR_SPEAKER_LEASE_CANDIDATE_ALREADY_BOUND"
+                )
+            if len(self._speaker_leases) >= self._speaker_lease_capacity:
+                raise SpeakerLeaseCapacityError("ASR_SPEAKER_LEASE_CAPACITY_EXHAUSTED")
+            self._speaker_lease_record_generation += 1
+            record = SpeakerCaptureLeaseRecord(
+                lease_token=lease_token,
+                record_generation=self._speaker_lease_record_generation,
+                candidate=candidate,
+            )
+            self._speaker_leases[lease_token] = record
+            self._speaker_candidate_bindings[candidate] = lease_token
+            return record
+
+    async def attach_turn_to_speaker_lease(
+        self,
+        turn_token: VoiceTurnToken,
+        lease_token: SpeakerCaptureLeaseToken,
+        provider_key: ProviderUtteranceKey,
+    ) -> VoiceTurnAdmissionRecord:
+        """Open and bind one Provider child atomically under the same writer."""
+
+        if type(turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+        async with self._lock:
+            lease = self._speaker_leases.get(lease_token)
+            if lease is None:
+                raise KeyError(lease_token)
+            provider_binding = self._provider_speaker_lease_bindings.get(provider_key)
+            expected_binding = (lease_token, turn_token)
+            if provider_binding not in {None, expected_binding}:
+                raise AdmissionIdentityError(
+                    "ASR_SPEAKER_LEASE_PROVIDER_KEY_ALREADY_BOUND"
+                )
+            existing = self._records.get(turn_token)
+            if existing is not None:
+                if (
+                    existing.provider_key != provider_key
+                    or existing.speaker_lease_token != lease_token
+                    or existing.speaker_candidate != lease.candidate
+                ):
+                    raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
+                return existing
+            if turn_token.turn_id <= self._retired_turn_high_water.get(
+                turn_token.ingress,
+                0,
+            ):
+                raise AdmissionIdentityError("ASR_ADMISSION_TURN_ALREADY_RETIRED")
+            if len(self._records) >= self._capacity:
+                raise AdmissionCapacityError("ASR_ADMISSION_CAPACITY_EXHAUSTED")
+
+            binding = SpeakerLeaseChildBinding(provider_key, turn_token)
+            try:
+                updated_lease = bind_speaker_lease_child(
+                    lease,
+                    binding,
+                    capacity=self._speaker_lease_child_capacity,
+                )
+            except SpeakerLeaseIdentityError as exc:
+                raise AdmissionIdentityError(str(exc)) from exc
+
+            self._record_generation += 1
+            record = VoiceTurnAdmissionRecord(
+                turn_token=turn_token,
+                record_generation=self._record_generation,
+                provider_binding_state=ProviderBindingState.BOUND,
+                candidate_binding_state=CandidateBindingState.BOUND,
+                capture_state=CaptureState.COLLECTING,
+                provider_key=provider_key,
+                speaker_lease_token=lease_token,
+                speaker_candidate=lease.candidate,
+            )
+            self._speaker_leases[lease_token] = updated_lease
+            self._records[turn_token] = record
+            self._provider_speaker_lease_bindings[provider_key] = expected_binding
+            return record
+
+    async def post_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float | None = None,
+    ) -> tuple[AdmissionBulkResult, ...]:
+        """Reduce one parent fact and fan terminal verdicts to children in order."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        effective_now = self._clock() if now is None else now
+        async with self._lock:
+            record = self._speaker_leases.get(lease_token)
+            if record is None:
+                raise KeyError(lease_token)
+            reduced, diagnostics = reduce_speaker_lease(record, event)
+            if reduced.state is record.state or reduced.terminal_disposition is None:
+                self._speaker_leases[lease_token] = reduced
+                return ()
+            results, child_updates = self._prepare_speaker_lease_terminal_fanout(
+                reduced,
+                now=effective_now,
+            )
+            if diagnostics and results:
+                first, *rest = results
+                results = (
+                    AdmissionBulkResult(
+                        first.turn_token,
+                        (*diagnostics, *first.effects),
+                    ),
+                    *rest,
+                )
+            self._speaker_leases[lease_token] = reduced
+            for turn_token, child in child_updates:
+                self._records[turn_token] = child
+            return results
+
+    def _prepare_speaker_lease_terminal_fanout(
+        self,
+        lease: SpeakerCaptureLeaseRecord,
+        *,
+        now: float,
+    ) -> tuple[
+        tuple[AdmissionBulkResult, ...],
+        tuple[tuple[VoiceTurnToken, VoiceTurnAdmissionRecord], ...],
+    ]:
+        results: list[AdmissionBulkResult] = []
+        updates: list[tuple[VoiceTurnToken, VoiceTurnAdmissionRecord]] = []
+        for binding in lease.child_bindings:
+            child = self._records.get(binding.turn_token)
+            if child is None:
+                continue
+            events: tuple[AdmissionEvent, ...]
+            if lease.state is SpeakerLeaseState.DENY_LATCHED:
+                next_sequence = child.last_speaker_sequence_no + 1
+                if child.evidence_state is EvidenceState.FIRST_LOW:
+                    events = (
+                        SpeakerLow(
+                            lease.candidate,
+                            next_sequence,
+                            SpeakerCheckpointKind.SECOND,
+                        ),
+                    )
+                else:
+                    events = (
+                        SpeakerLow(
+                            lease.candidate,
+                            next_sequence,
+                            SpeakerCheckpointKind.FIRST,
+                        ),
+                        SpeakerLow(
+                            lease.candidate,
+                            next_sequence + 1,
+                            SpeakerCheckpointKind.SECOND,
+                        ),
+                    )
+            elif lease.state is SpeakerLeaseState.ALLOW:
+                events = (
+                    SpeakerHigh(
+                        lease.candidate,
+                        child.last_speaker_sequence_no + 1,
+                    ),
+                )
+            elif lease.state is SpeakerLeaseState.UNAVAILABLE:
+                events = (
+                    SpeakerUnavailable(
+                        lease.candidate,
+                        child.last_speaker_sequence_no + 1,
+                    ),
+                )
+            elif lease.state is SpeakerLeaseState.ABANDONED:
+                events = (RouteReplaced(),)
+            else:
+                continue
+
+            effects: list[AdmissionEffect] = []
+            for event in events:
+                child, emitted = reduce(child, event, now)
+                effects.extend(emitted)
+            updates.append((binding.turn_token, child))
+            results.append(AdmissionBulkResult(binding.turn_token, tuple(effects)))
+        return tuple(results), tuple(updates)
+
+    async def get_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> SpeakerCaptureLeaseRecord | None:
+        async with self._lock:
+            return self._speaker_leases.get(lease_token)
+
+    async def live_speaker_lease_tokens(
+        self,
+    ) -> tuple[SpeakerCaptureLeaseToken, ...]:
+        async with self._lock:
+            return tuple(self._speaker_leases)
+
+    async def retire_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> bool:
+        """Retire only a terminal parent whose child records are all gone."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        async with self._lock:
+            record = self._speaker_leases.get(lease_token)
+            if record is None:
+                return False
+            if record.terminal_disposition is None or any(
+                binding.turn_token in self._records for binding in record.child_bindings
+            ):
+                return False
+            self._speaker_leases.pop(lease_token, None)
+            if self._speaker_candidate_bindings.get(record.candidate) == lease_token:
+                self._speaker_candidate_bindings.pop(record.candidate, None)
+            for binding in record.child_bindings:
+                expected = (lease_token, binding.turn_token)
+                if (
+                    self._provider_speaker_lease_bindings.get(binding.provider_key)
+                    == expected
+                ):
+                    self._provider_speaker_lease_bindings.pop(
+                        binding.provider_key,
+                        None,
+                    )
+            self._retired_speaker_leases[lease_token] = None
+            while (
+                len(self._retired_speaker_leases) > self._retired_speaker_lease_capacity
+            ):
+                self._retired_speaker_leases.popitem(last=False)
+            return True
 
     async def open_turn(
         self,
@@ -79,8 +408,7 @@ class VoiceTurnAdmissionCoordinator:
             existing = self._records.get(turn_token)
             if existing is not None:
                 if (
-                    provider_key is not None
-                    and existing.provider_key != provider_key
+                    provider_key is not None and existing.provider_key != provider_key
                 ) or (
                     speaker_candidate is not None
                     and existing.speaker_candidate != speaker_candidate
@@ -170,11 +498,22 @@ class VoiceTurnAdmissionCoordinator:
             raise TypeError("event must be Reset, Close, or RouteReplaced")
         effective_now = self._clock() if now is None else now
         async with self._lock:
+            lease_updates: list[
+                tuple[SpeakerCaptureLeaseToken, SpeakerCaptureLeaseRecord]
+            ] = []
+            for lease_token, lease in self._speaker_leases.items():
+                reduced, _ = reduce_speaker_lease(lease, SpeakerLeaseAbandoned())
+                lease_updates.append((lease_token, reduced))
             results: list[AdmissionBulkResult] = []
+            record_updates: list[tuple[VoiceTurnToken, VoiceTurnAdmissionRecord]] = []
             for turn_token, record in self._records.items():
                 reduced, effects = reduce(record, event, effective_now)
-                self._records[turn_token] = reduced
+                record_updates.append((turn_token, reduced))
                 results.append(AdmissionBulkResult(turn_token, effects))
+            for lease_token, lease in lease_updates:
+                self._speaker_leases[lease_token] = lease
+            for turn_token, record in record_updates:
+                self._records[turn_token] = record
             return tuple(results)
 
     async def retire(self, turn_token: VoiceTurnToken) -> bool:
@@ -215,5 +554,6 @@ __all__ = [
     "AdmissionBulkResult",
     "AdmissionCapacityError",
     "AdmissionIdentityError",
+    "SpeakerLeaseCapacityError",
     "VoiceTurnAdmissionCoordinator",
 ]

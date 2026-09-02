@@ -598,7 +598,9 @@ class SpeakerShadowRuntime:
             or inspect.iscoroutinefunction(on_evidence)
             or inspect.iscoroutinefunction(getattr(on_evidence, "__call__", None))
         ):
-            raise TypeError("SpeakerShadowRuntime evidence callback must be synchronous")
+            raise TypeError(
+                "SpeakerShadowRuntime evidence callback must be synchronous"
+            )
         self._on_evidence = on_evidence
         self._metrics = SpeakerShadowMetrics()
         self._would_block_counts = {
@@ -1767,6 +1769,44 @@ class SpeakerShadowRuntime:
             default=0,
         )
         return math.ceil(SPEAKER_SHADOW_SAMPLE_RATE_HZ * completed_ms / 1_000)
+
+    def abandon_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        """Fence and wipe one candidate without publishing a terminal fact.
+
+        The external owner is authoritative for lifecycle abandonment.  This
+        candidate-local control only makes queued/in-flight work stale and
+        releases retained PCM; it deliberately does not turn abandonment into
+        speaker-unavailable evidence.
+        """
+
+        if self._resetting or self._closed:
+            return False
+        if not isinstance(candidate, SpeakerShadowCandidateKey):
+            return False
+
+        finalized = self._finalized.get(candidate)
+        token = self._candidate_tokens.get(candidate)
+        buffer = self._buffers.get(candidate)
+        if token is None and buffer is not None:
+            token = buffer.token
+        if token is None and finalized is not None:
+            token = finalized.token
+
+        if finalized is None:
+            self._drop_candidate(candidate, token=token)
+        else:
+            retained = self._buffers.pop(candidate, None)
+            if retained is not None:
+                self._metrics.dropped_audio_ms += retained.audio_ms
+                self._wipe_bytearray(retained.pcm16)
+            self._candidate_tokens.pop(candidate, None)
+
+        if token is not None:
+            token.finish_state = _FinishState.ABANDONED
+            token.evidence_complete = False
+            token.evidence_closed = True
+            self._abandon_completion(token)
+        return True
 
     def finish_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
         """Order the terminal boundary behind all previously accepted PCM."""

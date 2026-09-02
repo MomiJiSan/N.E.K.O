@@ -435,6 +435,50 @@ class _DeferredSpeakerShadowSpy(_SpeakerShadowSpy):
         return True
 
 
+class _StableEvidenceSpeakerShadowSpy(_DeferredSpeakerShadowSpy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sample_counts: dict[SpeakerShadowCandidateKey, int] = {}
+        self.abandoned: list[SpeakerShadowCandidateKey] = []
+
+    def submit_capture(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> SpeakerShadowCaptureResult:
+        assert self.submit(
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+            candidate=candidate,
+        )
+        accepted = len(pcm16) // 2
+        cumulative = self.sample_counts.get(candidate, 0) + accepted
+        self.sample_counts[candidate] = cumulative
+        complete = cumulative >= 48_000
+        return SpeakerShadowCaptureResult(
+            disposition=(
+                SpeakerShadowCaptureDisposition.COMPLETE
+                if complete
+                else SpeakerShadowCaptureDisposition.ACCEPTED
+            ),
+            accepted_sample_count=accepted,
+            cumulative_sample_count=cumulative,
+            completed_window_sample_count=48_000 if complete else 0,
+            decision_state=(
+                SpeakerShadowCaptureDecisionState.SCORED
+                if complete
+                else SpeakerShadowCaptureDecisionState.PENDING
+            ),
+        )
+
+    def abandon_candidate(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        self.abandoned.append(candidate)
+        self.sample_counts.pop(candidate, None)
+        return True
+
+
 class _PendingCompletionSpeakerShadowSpy(_DeferredSpeakerShadowSpy):
     """Model terminal work that a whole-shadow reset would incorrectly erase."""
 
@@ -526,8 +570,7 @@ class _ReconcilingSpeakerShadowSpy(_DeferredSpeakerShadowSpy):
         if not self.batch_admitted:
             return None
         if any(
-            self.sample_counts.get(source.candidate)
-            != source.expected_sample_count
+            self.sample_counts.get(source.candidate) != source.expected_sample_count
             for source in request.sources
         ):
             return None
@@ -637,9 +680,7 @@ class _MalformedTerminalReceiptSpeakerShadowSpy(_ReconcilingSpeakerShadowSpy):
     def __init__(self) -> None:
         super().__init__()
         self.terminal_receipts: list[SpeakerShadowTerminalCoverageReceipt] = []
-        self.revoked_terminal_receipts: list[
-            SpeakerShadowTerminalCoverageReceipt
-        ] = []
+        self.revoked_terminal_receipts: list[SpeakerShadowTerminalCoverageReceipt] = []
         self.terminal_receipt_statuses: dict[
             SpeakerShadowTerminalCoverageReceipt, str
         ] = {}
@@ -854,8 +895,7 @@ async def test_speaker_candidate_binding_snapshot_publishes_when_turn_binds_firs
     ) = await _prepare_candidate_rejection_fixture()
 
     assert (
-        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
-        == turn_token
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate) == turn_token
     )
     await detector.close()
 
@@ -864,9 +904,7 @@ async def test_speaker_candidate_binding_snapshot_publishes_when_shadow_opens_fi
     None
 ):
     shadow = _SpeakerShadowSpy()
-    published: list[
-        tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]
-    ] = []
+    published: list[tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]] = []
     detector = DetectorRuntime(
         vad=_Vad(),
         gate=_Gate(),
@@ -893,8 +931,7 @@ async def test_speaker_candidate_binding_snapshot_publishes_when_shadow_opens_fi
     turn_token = VoiceTurnToken(ingress, turn_id=1)
     assert await detector.bind_candidate(result.candidate, turn_token) is not None
     assert (
-        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
-        == turn_token
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate) == turn_token
     )
     assert published == [(shadow_candidate, turn_token, "owner-a")]
     await detector.close()
@@ -911,8 +948,7 @@ async def test_speaker_candidate_binding_snapshot_reset_fences_stale_candidate()
         turn_token,
     ) = await _prepare_candidate_rejection_fixture()
     assert (
-        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
-        == turn_token
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate) == turn_token
     )
 
     await detector.reset()
@@ -921,13 +957,9 @@ async def test_speaker_candidate_binding_snapshot_reset_fences_stale_candidate()
     await detector.close()
 
 
-async def test_speaker_candidate_binding_callback_publishes_once_before_score() -> (
-    None
-):
+async def test_speaker_candidate_binding_callback_publishes_once_before_score() -> None:
     shadow = _SpeakerShadowSpy()
-    published: list[
-        tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]
-    ] = []
+    published: list[tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]] = []
     detector = DetectorRuntime(
         vad=_Vad(),
         gate=_Gate(),
@@ -990,8 +1022,7 @@ async def test_speaker_candidate_binding_callback_failure_keeps_lookup_fallback(
     assert shadow_candidate is not None
     assert candidate in detector._bound_turns
     assert (
-        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
-        == turn_token
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate) == turn_token
     )
     await detector.close()
 
@@ -1027,8 +1058,7 @@ async def test_provider_finish_preserves_binding_until_terminal_release() -> Non
         VoiceTurnToken(turn_token.ingress, turn_id=turn_token.turn_id + 1),
     )
     assert (
-        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
-        == turn_token
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate) == turn_token
     )
     assert detector.release_speaker_candidate_binding(shadow_candidate, turn_token)
     assert detector._bound_turn_token_for_speaker_candidate(shadow_candidate) is None
@@ -1078,8 +1108,7 @@ async def test_speaker_verifier_replacement_fences_old_candidate_binding() -> No
         turn_token,
     ) = await _prepare_candidate_rejection_fixture()
     assert (
-        detector._bound_turn_token_for_speaker_candidate(shadow_candidate)
-        == turn_token
+        detector._bound_turn_token_for_speaker_candidate(shadow_candidate) == turn_token
     )
 
     await detector.replace_speaker_verifier(
@@ -1185,10 +1214,321 @@ async def _open_real_terminal_provider_candidate(
     return detector, shadow, lease, token, observations
 
 
-async def test_real_terminal_capture_survives_twelve_second_exact_boundary() -> None:
-    detector, shadow, lease, token, observations = (
-        await _open_real_terminal_provider_candidate(duration_ms=12_000)
+async def test_provider_speaker_evidence_lease_survives_segment_rotation_and_unknown_boundary() -> (
+    None
+):
+    shadow = _StableEvidenceSpeakerShadowSpy()
+    published: list[tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]] = []
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+        speaker_owner_generation="owner-a",
+        on_speaker_candidate_bound=lambda candidate, token, owner: published.append(
+            (candidate, token, owner)
+        ),
     )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+        assert await detector.ensure_provider_speaker_evidence_lease() == evidence_lease
+
+        first = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(1_500),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+        second = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(1_500),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=evidence_lease,
+        )
+
+        assert first is not None and second is not None
+        assert first.lease == second.lease == evidence_lease
+        assert second.capture.cumulative_sample_count == 48_000
+        assert second.capture.disposition is SpeakerShadowCaptureDisposition.COMPLETE
+        assert {frame[2] for frame in shadow.frames} == {evidence_lease.candidate}
+        assert published == [
+            (evidence_lease.candidate, _token, "owner-a"),
+        ]
+        assert len(detector._provider_speaker_segments) == 2
+        assert all(
+            segment.candidate is None for segment in detector._provider_speaker_segments
+        )
+
+        boundary = await detector.reconcile_provider_endpoint(
+            ProviderAudioRange(0, 48_000)
+        )
+        assert boundary is not None and boundary.boundary_exact is False
+        assert shadow.finished == []
+        assert await detector.ensure_provider_speaker_evidence_lease() == evidence_lease
+
+        assert await detector.finish_provider_speaker_evidence_lease(evidence_lease)
+        assert shadow.finished == [evidence_lease.candidate]
+        successor = await detector.ensure_provider_speaker_evidence_lease()
+        assert successor is not None and successor != evidence_lease
+    finally:
+        await detector.close()
+
+
+async def test_provider_speaker_evidence_allows_runtime_owned_binding() -> None:
+    shadow = _StableEvidenceSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        feed = await detector.feed(b"\x01\x00" * 160)
+        assert feed.identity is not None
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+
+        update = await detector.observe_provider_audio_ordered(
+            b"\x11\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=feed.identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+
+        assert update is not None
+        assert update.capture.disposition is SpeakerShadowCaptureDisposition.ACCEPTED
+        assert [frame[2] for frame in shadow.frames] == [evidence_lease.candidate]
+        assert shadow.abandoned == []
+    finally:
+        await detector.close()
+
+
+async def test_provider_speaker_evidence_lease_idle_clock_follows_latest_split_pcm() -> (
+    None
+):
+    shadow = _StableEvidenceSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+        first = await detector.observe_provider_audio_ordered(
+            b"\x11\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+        second = await detector.observe_provider_audio_ordered(
+            b"\x12\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=evidence_lease,
+        )
+        assert first is not None and second is not None
+        assert second.last_progress_at >= first.last_progress_at
+        assert all(
+            segment.last_progress_at == second.last_progress_at
+            for segment in detector._provider_speaker_segments
+        )
+
+        detector._expire_provider_segments(second.last_progress_at + 9.9)
+        assert await detector.ensure_provider_speaker_evidence_lease() == evidence_lease
+        detector._expire_provider_segments(second.last_progress_at + 10.1)
+        assert shadow.abandoned == [evidence_lease.candidate]
+        successor = await detector.ensure_provider_speaker_evidence_lease()
+        assert successor is not None and successor != evidence_lease
+    finally:
+        await detector.close()
+
+
+async def test_provider_speaker_evidence_sequence_gap_abandons_without_renewing() -> (
+    None
+):
+    shadow = _StableEvidenceSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+        first = await detector.observe_provider_audio_ordered(
+            b"\x11\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+        assert first is not None
+        unavailable = await detector.observe_provider_audio_ordered(
+            b"\x12\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=3,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+        assert unavailable is not None
+        assert (
+            unavailable.capture.disposition
+            is SpeakerShadowCaptureDisposition.UNAVAILABLE
+        )
+        assert unavailable.last_progress_at == first.last_progress_at
+        assert shadow.abandoned == [evidence_lease.candidate]
+        assert not await detector.finish_provider_speaker_evidence_lease(evidence_lease)
+    finally:
+        await detector.close()
+
+
+async def test_real_provider_speaker_evidence_lease_keeps_two_low_scores_across_split() -> (
+    None
+):
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+        on_observation=observe,
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+
+        first = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(1_500),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+        assert first is not None
+        await shadow.wait_idle()
+        second = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(1_500),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=evidence_lease,
+        )
+        assert second is not None
+        await shadow.wait_idle()
+
+        for sequence_no in range(3, 12):
+            update = await detector.observe_provider_audio_ordered(
+                _speaker_pcm(1_000),
+                sample_rate_hz=16_000,
+                identity=identity,
+                sequence_no=sequence_no,
+                split_before_audio=False,
+                speaker_evidence_lease=evidence_lease,
+            )
+            assert update is not None and update.lease == evidence_lease
+            assert (
+                update.capture.disposition is SpeakerShadowCaptureDisposition.COMPLETE
+            )
+
+        assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+        assert {item.candidate for item in observations} == {evidence_lease.candidate}
+        assert second.capture.cumulative_sample_count == 48_000
+        assert shadow.snapshot()["retained_pcm_bytes"] == 0
+
+        unknown = await detector.retire_provider_speaker_boundary_unknown()
+        assert unknown is not None and unknown.boundary_exact is False
+        assert shadow.snapshot()["finished_candidate_count"] == 0
+        assert await detector.ensure_provider_speaker_evidence_lease() == evidence_lease
+        assert await detector.finish_provider_speaker_evidence_lease(evidence_lease)
+        await shadow.wait_idle()
+        assert shadow.snapshot()["finished_candidate_count"] == 1
+    finally:
+        await detector.close()
+
+
+async def test_provider_audio_timeline_reset_abandons_stable_speaker_evidence() -> None:
+    shadow = _StableEvidenceSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+        assert await detector.observe_provider_audio_ordered(
+            b"\x11\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+
+        assert await detector.reset_provider_audio_timeline()
+        assert shadow.abandoned == [evidence_lease.candidate]
+        assert not await detector.finish_provider_speaker_evidence_lease(evidence_lease)
+        successor = await detector.ensure_provider_speaker_evidence_lease()
+        assert successor is not None and successor != evidence_lease
+    finally:
+        await detector.close()
+
+
+async def test_real_terminal_capture_survives_twelve_second_exact_boundary() -> None:
+    (
+        detector,
+        shadow,
+        lease,
+        token,
+        observations,
+    ) = await _open_real_terminal_provider_candidate(duration_ms=12_000)
     try:
         assert [
             (observation.checkpoint_ms, observation.similarity)
@@ -1214,9 +1554,7 @@ async def test_real_terminal_capture_survives_twelve_second_exact_boundary() -> 
             deadline=deadline,
         )
         assert (
-            await lease.commit_async(
-                deadline=asyncio.get_running_loop().time() + 1.0
-            )
+            await lease.commit_async(deadline=asyncio.get_running_loop().time() + 1.0)
             is DetectorCandidateRejectionCommitResult.PRESEAL_READY
         )
         fence = await detector.seal_provider_candidate(
@@ -1226,9 +1564,7 @@ async def test_real_terminal_capture_survives_twelve_second_exact_boundary() -> 
         assert fence is not None
         assert fence.boundary_exact is True
         assert (
-            await lease.commit_async(
-                deadline=asyncio.get_running_loop().time() + 1.0
-            )
+            await lease.commit_async(deadline=asyncio.get_running_loop().time() + 1.0)
             is DetectorCandidateRejectionCommitResult.SEALED_APPLIED
         )
     finally:
@@ -1238,9 +1574,13 @@ async def test_real_terminal_capture_survives_twelve_second_exact_boundary() -> 
 async def test_terminal_coverage_suffix_is_unavailable_and_micro_event_ambiguous() -> (
     None
 ):
-    detector, _shadow, _lease, _token, _observations = (
-        await _open_real_terminal_provider_candidate(duration_ms=12_000)
-    )
+    (
+        detector,
+        _shadow,
+        _lease,
+        _token,
+        _observations,
+    ) = await _open_real_terminal_provider_candidate(duration_ms=12_000)
     try:
         snapshot = await detector.reconcile_provider_endpoint(
             ProviderAudioRange(0, 10 * 16_000)
@@ -1273,9 +1613,13 @@ async def test_terminal_coverage_suffix_is_unavailable_and_micro_event_ambiguous
 async def test_real_terminal_capture_rejects_trimmed_scoring_coverage(
     boundary: ProviderAudioRange,
 ) -> None:
-    detector, _shadow, _lease, _token, _observations = (
-        await _open_real_terminal_provider_candidate(duration_ms=3_000)
-    )
+    (
+        detector,
+        _shadow,
+        _lease,
+        _token,
+        _observations,
+    ) = await _open_real_terminal_provider_candidate(duration_ms=3_000)
     try:
         snapshot = await detector.reconcile_provider_endpoint(boundary)
         assert snapshot is not None
@@ -1285,9 +1629,7 @@ async def test_real_terminal_capture_rejects_trimmed_scoring_coverage(
         await detector.close()
 
 
-async def test_malformed_terminal_receipt_is_revoked_without_batch_fallback() -> (
-    None
-):
+async def test_malformed_terminal_receipt_is_revoked_without_batch_fallback() -> None:
     shadow = _MalformedTerminalReceiptSpeakerShadowSpy()
     detector = DetectorRuntime(
         vad=_Vad(),
@@ -1503,9 +1845,7 @@ async def test_provider_sequence_gap_does_not_renew_idle_expiry(
         await detector.close()
 
 
-async def test_provider_preseal_wait_cancelled_during_post_await_lock_revokes() -> (
-    None
-):
+async def test_provider_preseal_wait_cancelled_during_post_await_lock_revokes() -> None:
     shadow = _BlockingSettlementSpeakerShadowSpy()
     detector = DetectorRuntime(
         vad=_Vad(),
@@ -2270,9 +2610,7 @@ async def test_provider_audio_timeline_reset_preserves_local_identity_and_rebase
         split_before_audio=False,
     )
     assert await observed_through is True
-    snapshot = await detector.reconcile_provider_endpoint(
-        ProviderAudioRange(0, 160)
-    )
+    snapshot = await detector.reconcile_provider_endpoint(ProviderAudioRange(0, 160))
     assert snapshot is not None
     assert snapshot.detector_epoch == detector_epoch
     assert snapshot.candidate_generation == candidate.candidate_generation
@@ -2295,9 +2633,7 @@ async def test_provider_audio_observation_wait_is_revoked_by_timeline_end(
         provider_policy=_provider_endpoint_policy(),
         speaker_shadow=_ReconcilingSpeakerShadowSpy(),
     )
-    waiter = asyncio.create_task(
-        detector.wait_provider_audio_observed_through(160)
-    )
+    waiter = asyncio.create_task(detector.wait_provider_audio_observed_through(160))
     await asyncio.sleep(0)
     assert not waiter.done()
 
@@ -2333,9 +2669,7 @@ async def test_exact_boundary_splits_one_chunk_without_sample_loss() -> None:
     head = detector._provider_speaker_segments[0].candidate
     assert head is not None
 
-    snapshot = await detector.reconcile_provider_endpoint(
-        ProviderAudioRange(200, 600)
-    )
+    snapshot = await detector.reconcile_provider_endpoint(ProviderAudioRange(200, 600))
 
     assert snapshot is not None
     assert snapshot.successor_present is True
@@ -2498,9 +2832,7 @@ async def test_late_consumed_verdict_does_not_clear_newer_preseal_entry() -> Non
         split_before_audio=True,
     )
     exact_a = await detector.reconcile_provider_endpoint(ProviderAudioRange(0, 160))
-    exact_b = await detector.reconcile_provider_endpoint(
-        ProviderAudioRange(160, 320)
-    )
+    exact_b = await detector.reconcile_provider_endpoint(ProviderAudioRange(160, 320))
     assert exact_a is not None and exact_b is not None
     receipt_b = shadow.batch_receipts[-1]
 
@@ -2569,8 +2901,7 @@ async def test_preseal_overflow_fails_only_new_generation_open() -> None:
             )
         )
     assert all(
-        verdict is not None and verdict.boundary_exact
-        for verdict in exact_verdicts
+        verdict is not None and verdict.boundary_exact for verdict in exact_verdicts
     )
     frozen_entries = dict(detector._provider_preseal_entries)
     frozen_receipts = tuple(shadow.batch_receipts)
@@ -2583,9 +2914,7 @@ async def test_preseal_overflow_fails_only_new_generation_open() -> None:
     assert overflow.candidate_generation == 8
     assert detector._provider_preseal_entries == frozen_entries
     assert len(shadow.batch_requests) == 8
-    assert not any(
-        receipt in shadow.revoked_receipts for receipt in frozen_receipts
-    )
+    assert not any(receipt in shadow.revoked_receipts for receipt in frozen_receipts)
     fence = await detector.seal_provider_candidate(
         token,
         speaker_snapshot=exact_verdicts[0],
@@ -2824,9 +3153,7 @@ async def test_batch_admission_failure_preserves_earlier_exact_entry() -> None:
     exact_receipt = shadow.batch_receipts[-1]
     shadow.batch_admitted = False
 
-    unknown = await detector.reconcile_provider_endpoint(
-        ProviderAudioRange(160, 320)
-    )
+    unknown = await detector.reconcile_provider_endpoint(ProviderAudioRange(160, 320))
 
     assert unknown is not None and unknown.boundary_exact is False
     assert unknown.candidate_generation == 1
@@ -2870,9 +3197,7 @@ async def test_non_applied_receipt_downgrades_only_its_generation(
         split_before_audio=True,
     )
     exact_a = await detector.reconcile_provider_endpoint(ProviderAudioRange(0, 160))
-    exact_b = await detector.reconcile_provider_endpoint(
-        ProviderAudioRange(160, 320)
-    )
+    exact_b = await detector.reconcile_provider_endpoint(ProviderAudioRange(160, 320))
     assert exact_a is not None and exact_b is not None
     receipt_a, receipt_b = shadow.batch_receipts
     shadow.receipt_statuses[receipt_a] = status
@@ -3504,14 +3829,10 @@ async def test_replace_provider_verifier_waits_for_candidate_boundary() -> None:
     assert new_shadow.close_calls == 1
 
 
-async def test_replace_verifier_keeps_old_binding_owner_until_atomic_install() -> (
-    None
-):
+async def test_replace_verifier_keeps_old_binding_owner_until_atomic_install() -> None:
     old_shadow = _SpeakerShadowSpy()
     new_shadow = _SpeakerShadowSpy()
-    published: list[
-        tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]
-    ] = []
+    published: list[tuple[SpeakerShadowCandidateKey, VoiceTurnToken, str | None]] = []
     detector = DetectorRuntime(
         vad=_Vad(),
         gate=_Gate(),
@@ -3556,9 +3877,7 @@ async def test_replace_verifier_keeps_old_binding_owner_until_atomic_install() -
     await detector.close()
 
 
-async def test_replace_verifier_cancel_before_lock_closes_handed_off_shadow() -> (
-    None
-):
+async def test_replace_verifier_cancel_before_lock_closes_handed_off_shadow() -> None:
     old_shadow = _SpeakerShadowSpy()
     new_shadow = _SpeakerShadowSpy()
     detector = DetectorRuntime(
@@ -4080,10 +4399,7 @@ async def test_candidate_rejection_async_commit_waits_for_short_lock_contention(
         lease.commit_async(deadline=asyncio.get_running_loop().time() + 1.0)
     )
     detector._lock.release()
-    assert (
-        await commit_task
-        is DetectorCandidateRejectionCommitResult.ACTIVE_APPLIED
-    )
+    assert await commit_task is DetectorCandidateRejectionCommitResult.ACTIVE_APPLIED
     await detector.close()
 
 

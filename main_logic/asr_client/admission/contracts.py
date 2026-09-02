@@ -116,6 +116,167 @@ class SpeakerCheckpointKind(StrEnum):
     COMPLETION_CONFIRMATION = "completion_confirmation"
 
 
+class SpeakerLeaseState(StrEnum):
+    """Authoritative verdict for one continuous physical speaker capture."""
+
+    COLLECTING = "collecting"
+    FIRST_LOW = "first_low"
+    ALLOW = "allow"
+    DENY_LATCHED = "deny_latched"
+    UNAVAILABLE = "unavailable"
+    ABANDONED = "abandoned"
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerCaptureLeaseToken:
+    """Stable identity spanning every Provider text turn in one capture."""
+
+    session_generation: int
+    start_generation: int
+    transport_generation: int
+    detector_epoch: int
+    lease_nonce: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "session_generation",
+            "start_generation",
+            "transport_generation",
+            "detector_epoch",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.lease_nonce) is not int or self.lease_nonce < 1:
+            raise ValueError("lease_nonce must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseChildBinding:
+    """One Provider text child in immutable Provider-start order."""
+
+    provider_key: ProviderUtteranceKey
+    turn_token: VoiceTurnToken
+
+    def __post_init__(self) -> None:
+        if type(self.provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerCaptureLeaseRecord:
+    """Pure bounded state for one authoritative speaker verdict."""
+
+    lease_token: SpeakerCaptureLeaseToken
+    record_generation: int
+    candidate: SpeakerShadowCandidateKey
+    state: SpeakerLeaseState = SpeakerLeaseState.COLLECTING
+    logical_revision: int = 0
+    last_speaker_sequence_no: int = 0
+    terminal_sequence_no: int | None = None
+    capture_through_sequence_no: int | None = None
+    child_bindings: tuple[SpeakerLeaseChildBinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(self.record_generation) is not int or self.record_generation < 1:
+            raise ValueError("record_generation must be a positive integer")
+        if type(self.candidate) is not SpeakerShadowCandidateKey:
+            raise TypeError("candidate must be SpeakerShadowCandidateKey")
+        if type(self.state) is not SpeakerLeaseState:
+            raise TypeError("state must be SpeakerLeaseState")
+        for name in ("logical_revision", "last_speaker_sequence_no"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.capture_through_sequence_no is not None and (
+            type(self.capture_through_sequence_no) is not int
+            or self.capture_through_sequence_no < 0
+        ):
+            raise ValueError(
+                "capture_through_sequence_no must be a non-negative integer or None"
+            )
+        if self.terminal_sequence_no is not None and (
+            type(self.terminal_sequence_no) is not int or self.terminal_sequence_no < 0
+        ):
+            raise ValueError(
+                "terminal_sequence_no must be a non-negative integer or None"
+            )
+        if (
+            self.state
+            in {
+                SpeakerLeaseState.COLLECTING,
+                SpeakerLeaseState.FIRST_LOW,
+            }
+            and self.terminal_sequence_no is not None
+        ):
+            raise ValueError("pending speaker lease cannot have a terminal fence")
+        if (
+            self.state
+            not in {
+                SpeakerLeaseState.COLLECTING,
+                SpeakerLeaseState.FIRST_LOW,
+            }
+            and self.terminal_sequence_no is None
+        ):
+            raise ValueError("terminal speaker lease requires a terminal fence")
+        keys = tuple(binding.provider_key for binding in self.child_bindings)
+        turns = tuple(binding.turn_token for binding in self.child_bindings)
+        if len(set(keys)) != len(keys) or len(set(turns)) != len(turns):
+            raise ValueError("speaker lease child bindings must be unique")
+
+    @property
+    def terminal_disposition(self) -> AdmissionDisposition | None:
+        return {
+            SpeakerLeaseState.ALLOW: AdmissionDisposition.FORWARD,
+            SpeakerLeaseState.DENY_LATCHED: AdmissionDisposition.DROP,
+            SpeakerLeaseState.UNAVAILABLE: AdmissionDisposition.FORWARD,
+            SpeakerLeaseState.ABANDONED: AdmissionDisposition.ABANDON,
+        }.get(self.state)
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseLow:
+    candidate: SpeakerShadowCandidateKey
+    sequence_no: int
+    checkpoint_kind: SpeakerCheckpointKind
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseHigh:
+    candidate: SpeakerShadowCandidateKey
+    sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseUnavailable:
+    candidate: SpeakerShadowCandidateKey
+    sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseCaptureClosed:
+    candidate: SpeakerShadowCandidateKey
+    through_sequence_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseAbandoned:
+    pass
+
+
+SpeakerLeaseEvent: TypeAlias = (
+    SpeakerLeaseLow
+    | SpeakerLeaseHigh
+    | SpeakerLeaseUnavailable
+    | SpeakerLeaseCaptureClosed
+    | SpeakerLeaseAbandoned
+)
+
+
 @dataclass(frozen=True, slots=True)
 class BoundaryProof:
     """Opaque ownership result captured before an ordered turn is bound."""
@@ -301,6 +462,7 @@ class VoiceTurnAdmissionRecord:
     lifecycle_settlement_state: SettlementState = SettlementState.NOT_STARTED
 
     provider_key: ProviderUtteranceKey | None = None
+    speaker_lease_token: SpeakerCaptureLeaseToken | None = None
     speaker_candidate: SpeakerShadowCandidateKey | None = None
     speaker_authority_generation: str | None = None
     rejection_capability: RejectionCapability | None = None
@@ -359,6 +521,12 @@ class VoiceTurnAdmissionRecord:
         ):
             raise ValueError(
                 "speaker_authority_generation must be a non-empty string or None"
+            )
+        if self.speaker_lease_token is not None and (
+            type(self.speaker_lease_token) is not SpeakerCaptureLeaseToken
+        ):
+            raise TypeError(
+                "speaker_lease_token must be SpeakerCaptureLeaseToken or None"
             )
 
     @property

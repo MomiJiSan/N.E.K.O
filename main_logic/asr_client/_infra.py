@@ -35,6 +35,7 @@ from ._provider_events import (
     ProviderEndpointNotification,
     ProviderFinalNotification,
     ProviderUtteranceKey,
+    ProviderUtteranceStartedNotification,
 )
 from .provider_policy import AsrProviderPolicy
 from .transcript import SegmentAggregator
@@ -283,6 +284,9 @@ AsrWorkerFn: TypeAlias = Callable[
 ProviderEndpointCallback: TypeAlias = Callable[
     [ProviderEndpointNotification], Awaitable[None]
 ]
+ProviderUtteranceStartedCallback: TypeAlias = Callable[
+    [ProviderUtteranceStartedNotification], Awaitable[None]
+]
 ProviderFinalCallback: TypeAlias = Callable[
     [ProviderUtteranceKey, str], Awaitable[None]
 ]
@@ -344,13 +348,18 @@ class _CallbackItem:
     generation: int
     buffer_epoch: int
     utterance_id: int | None = None
-    # "endpoint" items carry the deferred keyless seal notification through
+    # "provider_started" items carry Provider text-turn identity through the
+    # same bounded FIFO as its later endpoint and transcript. "endpoint"
+    # items carry the deferred keyless seal notification through
     # the same FIFO as transcripts so it reaches the runtime only after every
     # earlier turn's final has been delivered (and the runtime has activated
     # the turn this notification belongs to). "partial" items carry live
     # preview text through the same FIFO so a preview can never overtake an
     # earlier turn's final that is still queued for delivery.
-    kind: Literal["transcript", "endpoint", "partial"] = "transcript"
+    kind: Literal["transcript", "endpoint", "partial", "provider_started"] = (
+        "transcript"
+    )
+    provider_started: ProviderUtteranceStartedNotification | None = None
     provider_endpoint: ProviderEndpointNotification | None = None
     final_received_at: float | None = None
     final_admission_deadline: float | None = None
@@ -369,6 +378,7 @@ class _RealtimeAsrSessionImpl:
         on_connection_error: Callable[[str], Awaitable[None]],
         on_status_message: Callable[[str], Awaitable[None]] | None = None,
         on_turn_endpointed: Callable[[], Awaitable[None]] | None = None,
+        on_provider_utterance_started: ProviderUtteranceStartedCallback | None = None,
         on_provider_endpoint: ProviderEndpointCallback | None = None,
         on_provider_final: ProviderFinalCallback | None = None,
         on_provider_final_ready: ProviderFinalNotificationCallback | None = None,
@@ -385,6 +395,12 @@ class _RealtimeAsrSessionImpl:
             raise TypeError("ASR_INVALID_CONFIG: status callback must be callable")
         if on_turn_endpointed is not None and not callable(on_turn_endpointed):
             raise TypeError("ASR_INVALID_CONFIG: endpoint callback must be callable")
+        if on_provider_utterance_started is not None and not callable(
+            on_provider_utterance_started
+        ):
+            raise TypeError(
+                "ASR_INVALID_CONFIG: provider utterance-start callback must be callable"
+            )
         if on_provider_endpoint is not None and not callable(on_provider_endpoint):
             raise TypeError(
                 "ASR_INVALID_CONFIG: provider endpoint callback must be callable"
@@ -407,6 +423,7 @@ class _RealtimeAsrSessionImpl:
         self._on_connection_error = on_connection_error
         self._on_status_message = on_status_message
         self._on_turn_endpointed = on_turn_endpointed
+        self._on_provider_utterance_started = on_provider_utterance_started
         self._on_provider_endpoint = on_provider_endpoint
         self._on_provider_final = on_provider_final
         self._on_provider_final_ready = on_provider_final_ready
@@ -433,6 +450,10 @@ class _RealtimeAsrSessionImpl:
         # _drain_ready_partials_locked when the turn becomes current.
         self._pending_partials: dict[_UtteranceKey, str] = {}
         self._provider_endpoints: dict[_UtteranceKey, ProviderEndpointNotification] = {}
+        self._provider_started_settlements: dict[
+            _UtteranceKey,
+            asyncio.Future[bool],
+        ] = {}
         self._provider_boundary_tasks: dict[
             _UtteranceKey,
             asyncio.Task[bool],
@@ -986,9 +1007,7 @@ class _RealtimeAsrSessionImpl:
                 )
                 or (
                     not self._utterance_has_audio
-                    and not self._segment_aggregator.has_segments(
-                        self._logical_turn_id
-                    )
+                    and not self._segment_aggregator.has_segments(self._logical_turn_id)
                 )
             ):
                 return
@@ -1100,7 +1119,9 @@ class _RealtimeAsrSessionImpl:
                 remaining = max_bytes
             part_size = min(len(audio) - offset, remaining) & ~1
             if part_size <= 0:
-                raise ValueError("ASR_INVALID_PCM: segmented PCM must be 2-byte aligned")
+                raise ValueError(
+                    "ASR_INVALID_PCM: segmented PCM must be 2-byte aligned"
+                )
             part = audio[offset : offset + part_size]
             await self._enqueue_request(
                 _AsrWorkerRequest(
@@ -1466,6 +1487,37 @@ class _RealtimeAsrSessionImpl:
 
         if self._on_provider_endpoint is None:
             return
+
+        async def wait_for_started(
+            started_key: _UtteranceKey,
+            settlement: asyncio.Future[bool] | None,
+            *,
+            deadline: float,
+        ) -> bool:
+            if settlement is None:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                started_ready = await asyncio.wait_for(
+                    asyncio.shield(settlement),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                return False
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                return False
+            return bool(
+                started_ready
+                and self._state is _SessionState.READY
+                and started_key[0] == self._generation
+                and started_key[1] == self._buffer_epoch
+            )
+
         namespace = key[:2]
         if (
             self._provider_boundary_failed_namespace is not None
@@ -1488,10 +1540,13 @@ class _RealtimeAsrSessionImpl:
         existing = self._provider_boundary_tasks.get(key)
         if (
             existing is None
-            and len(self._provider_boundary_tasks)
-            >= _MAX_PROVIDER_BOUNDARY_TASKS
+            and len(self._provider_boundary_tasks) >= _MAX_PROVIDER_BOUNDARY_TASKS
         ):
             pending_keys = tuple(self._provider_boundary_tasks)
+            pending_started = {
+                pending_key: self._provider_started_settlements.get(pending_key)
+                for pending_key in pending_keys
+            }
             self._revoke_provider_boundary_chain()
             self._provider_boundary_failed_namespace = namespace
             notifications: list[ProviderEndpointNotification] = []
@@ -1510,9 +1565,27 @@ class _RealtimeAsrSessionImpl:
 
             async def emit_overflow_unknowns() -> bool:
                 succeeded = True
-                for unknown in notifications:
+                deadline = (
+                    time.monotonic() + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
+                )
+                for pending_key, unknown in zip(
+                    pending_keys,
+                    notifications,
+                    strict=True,
+                ):
+                    if not await wait_for_started(
+                        pending_key,
+                        pending_started[pending_key],
+                        deadline=deadline,
+                    ):
+                        succeeded = False
+                        continue
                     succeeded = (
-                        await self._emit_provider_boundary(unknown) and succeeded
+                        await self._emit_provider_boundary(
+                            unknown,
+                            deadline=deadline,
+                        )
+                        and succeeded
                     )
                 return succeeded
 
@@ -1529,10 +1602,8 @@ class _RealtimeAsrSessionImpl:
             return
 
         predecessor = self._provider_boundary_chain_tail
-        deadline = (
-            time.monotonic()
-            + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
-        )
+        started_settlement = self._provider_started_settlements.get(key)
+        deadline = time.monotonic() + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
 
         async def emit_after_predecessor() -> bool:
             if predecessor is not None:
@@ -1542,6 +1613,12 @@ class _RealtimeAsrSessionImpl:
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         raise
+            if not await wait_for_started(
+                key,
+                started_settlement,
+                deadline=deadline,
+            ):
+                return False
             return await self._emit_provider_boundary(
                 notification,
                 deadline=deadline,
@@ -1577,11 +1654,9 @@ class _RealtimeAsrSessionImpl:
 
         for pending_key in tuple(self._provider_boundary_tasks):
             if pending_key in self._provider_endpoints:
-                self._provider_endpoints[pending_key] = (
-                    self._unknown_provider_endpoint(
-                        pending_key,
-                        phase="boundary",
-                    )
+                self._provider_endpoints[pending_key] = self._unknown_provider_endpoint(
+                    pending_key,
+                    phase="boundary",
                 )
         tasks = tuple(self._provider_boundary_chain_tasks)
         self._provider_boundary_tasks.clear()
@@ -1652,16 +1727,18 @@ class _RealtimeAsrSessionImpl:
 
     async def _cancel_provider_boundary_tasks(self) -> None:
         current = asyncio.current_task()
-        tasks = tuple({
-            task
-            for task in (
-                *self._provider_boundary_tasks.values(),
-                *self._provider_boundary_chain_tasks,
-                *self._provider_boundary_retired_tasks,
-            )
-            if task is not None
-            if task is not current and not task.done()
-        })
+        tasks = tuple(
+            {
+                task
+                for task in (
+                    *self._provider_boundary_tasks.values(),
+                    *self._provider_boundary_chain_tasks,
+                    *self._provider_boundary_retired_tasks,
+                )
+                if task is not None
+                if task is not current and not task.done()
+            }
+        )
         self._provider_boundary_tasks.clear()
         self._provider_boundary_deadlines.clear()
         self._provider_boundary_chain_tasks.clear()
@@ -1685,12 +1762,39 @@ class _RealtimeAsrSessionImpl:
         assert self._callback_queue is not None
         while True:
             item = await self._callback_queue.get()
+            started_key = (
+                (
+                    item.generation,
+                    item.buffer_epoch,
+                    item.utterance_id,
+                )
+                if item.kind == "provider_started" and item.utterance_id is not None
+                else None
+            )
+            started_settlement = (
+                self._provider_started_settlements.get(started_key)
+                if started_key is not None
+                else None
+            )
+            started_succeeded = False
             try:
                 if (
                     item.generation == self._generation
                     and item.buffer_epoch == self._buffer_epoch
                 ):
-                    if item.kind == "endpoint":
+                    if item.kind == "provider_started":
+                        provider_started_callback = self._on_provider_utterance_started
+                        if (
+                            provider_started_callback is not None
+                            and item.provider_started is not None
+                        ):
+                            await provider_started_callback(item.provider_started)
+                            started_succeeded = (
+                                self._state is _SessionState.READY
+                                and item.generation == self._generation
+                                and item.buffer_epoch == self._buffer_epoch
+                            )
+                    elif item.kind == "endpoint":
                         provider_callback = self._on_provider_endpoint
                         if (
                             provider_callback is not None
@@ -1716,18 +1820,15 @@ class _RealtimeAsrSessionImpl:
                                 ordered_endpoint = item.provider_endpoint
                                 if (
                                     not boundary_ready
-                                    and ordered_endpoint.boundary_quality
-                                    == "exact"
+                                    and ordered_endpoint.boundary_quality == "exact"
                                 ):
-                                    ordered_endpoint = (
-                                        self._unknown_provider_endpoint(
-                                            (
-                                                item.generation,
-                                                item.buffer_epoch,
-                                                item.utterance_id,
-                                            ),
-                                            phase="ordered",
-                                        )
+                                    ordered_endpoint = self._unknown_provider_endpoint(
+                                        (
+                                            item.generation,
+                                            item.buffer_epoch,
+                                            item.utterance_id,
+                                        ),
+                                        phase="ordered",
                                     )
                                 ordered_deadline = item.final_admission_deadline
                                 if ordered_deadline is None:
@@ -1744,15 +1845,11 @@ class _RealtimeAsrSessionImpl:
                             if endpoint_callback is not None:
                                 await endpoint_callback()
                     elif item.kind == "partial":
-                        partial_callback = getattr(
-                            self, "_on_partial_transcript", None
-                        )
+                        partial_callback = getattr(self, "_on_partial_transcript", None)
                         if partial_callback is not None:
                             await partial_callback(item.text)
                     else:
-                        provider_final_ready_callback = (
-                            self._on_provider_final_ready
-                        )
+                        provider_final_ready_callback = self._on_provider_final_ready
                         provider_final_callback = self._on_provider_final
                         if (
                             provider_final_ready_callback is not None
@@ -1772,9 +1869,7 @@ class _RealtimeAsrSessionImpl:
                                     ),
                                     text=item.text,
                                     received_at=item.final_received_at,
-                                    admission_deadline=(
-                                        item.final_admission_deadline
-                                    ),
+                                    admission_deadline=(item.final_admission_deadline),
                                 )
                             )
                         elif (
@@ -1795,13 +1890,23 @@ class _RealtimeAsrSessionImpl:
                 raise
             except Exception:
                 logger.exception(
-                    "ASR turn endpoint callback failed"
+                    "ASR provider utterance-start callback failed"
+                    if item.kind == "provider_started"
+                    else "ASR turn endpoint callback failed"
                     if item.kind == "endpoint"
                     else "ASR partial callback failed"
                     if item.kind == "partial"
                     else "ASR transcript callback failed"
                 )
             finally:
+                if started_key is not None and started_settlement is not None:
+                    current_settlement = self._provider_started_settlements.get(
+                        started_key
+                    )
+                    if current_settlement is started_settlement:
+                        self._provider_started_settlements.pop(started_key, None)
+                    if not started_settlement.done():
+                        started_settlement.set_result(started_succeeded)
                 self._callback_queue.task_done()
             if self._state is _SessionState.CLOSED:
                 return
@@ -1832,6 +1937,8 @@ class _RealtimeAsrSessionImpl:
             ):
                 return False
             key = (event.generation, event.buffer_epoch, event.utterance_id)
+            started_item: _CallbackItem | None = None
+            started_settlement: asyncio.Future[bool] | None = None
             async with self._operation_lock:
                 if (
                     self._state is not _SessionState.READY
@@ -1848,6 +1955,34 @@ class _RealtimeAsrSessionImpl:
                 ):
                     self._active_utterance_keys.add(key)
                     self._utterance_order.append(key)
+                    if self._on_provider_utterance_started is not None:
+                        started_settlement = asyncio.get_running_loop().create_future()
+                        self._provider_started_settlements[key] = started_settlement
+                        started_item = _CallbackItem(
+                            text="",
+                            generation=event.generation,
+                            buffer_epoch=event.buffer_epoch,
+                            utterance_id=event.utterance_id,
+                            kind="provider_started",
+                            provider_started=(
+                                ProviderUtteranceStartedNotification(
+                                    generation=event.generation,
+                                    buffer_epoch=event.buffer_epoch,
+                                    utterance_id=event.utterance_id,
+                                )
+                            ),
+                        )
+            if started_item is not None:
+                assert self._callback_queue is not None
+                try:
+                    await self._callback_queue.put(started_item)
+                except asyncio.CancelledError:
+                    current_settlement = self._provider_started_settlements.get(key)
+                    if current_settlement is started_settlement:
+                        self._provider_started_settlements.pop(key, None)
+                    if started_settlement is not None and not started_settlement.done():
+                        started_settlement.set_result(False)
+                    raise
             return False
         if event.kind == "provider_endpoint":
             if (
@@ -1984,8 +2119,7 @@ class _RealtimeAsrSessionImpl:
                         text=text,
                         received_at=received_at,
                         admission_deadline=(
-                            received_at
-                            + _PROVIDER_FINAL_ADMISSION_TIMEOUT_SECONDS
+                            received_at + _PROVIDER_FINAL_ADMISSION_TIMEOUT_SECONDS
                         ),
                     )
                     ready_items = []
@@ -2023,9 +2157,7 @@ class _RealtimeAsrSessionImpl:
                                         utterance_id=ready_key[2],
                                         kind="endpoint",
                                         provider_endpoint=ordered_endpoint,
-                                        final_received_at=(
-                                            pending_final.received_at
-                                        ),
+                                        final_received_at=(pending_final.received_at),
                                         final_admission_deadline=(
                                             pending_final.admission_deadline
                                         ),

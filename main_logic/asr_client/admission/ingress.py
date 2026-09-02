@@ -14,6 +14,8 @@ from typing import Literal, TypeAlias, cast
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
+from .._provider_events import ProviderUtteranceKey
+from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
 from .contracts import (
     AdmissionEffect,
     AdmissionEvent,
@@ -23,6 +25,14 @@ from .contracts import (
     Close,
     Reset,
     RouteReplaced,
+    SpeakerCaptureLeaseRecord,
+    SpeakerCaptureLeaseToken,
+    SpeakerLeaseAbandoned,
+    SpeakerLeaseCaptureClosed,
+    SpeakerLeaseEvent,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLeaseUnavailable,
     SpeakerAuthorityPending,
     SpeakerAuthorityUnavailable,
     SpeakerAuthorityUnarmed,
@@ -43,11 +53,13 @@ class AdmissionIngressCapacityError(RuntimeError):
     def __init__(
         self,
         turn_token: VoiceTurnToken | None,
-        event: AdmissionEvent | None,
+        event: AdmissionEvent | SpeakerLeaseEvent | None,
         *,
+        speaker_lease_token: SpeakerCaptureLeaseToken | None = None,
         capacity_class: _CapacityClass = "data",
     ) -> None:
         self.turn_token = turn_token
+        self.speaker_lease_token = speaker_lease_token
         self.event = event
         self.event_type = type(event)
         self.capacity_class = capacity_class
@@ -63,24 +75,31 @@ class AdmissionIngressClosedError(RuntimeError):
 @dataclass(slots=True)
 class _IngressItem:
     turn_token: VoiceTurnToken | None
-    event: AdmissionEvent | None
+    speaker_lease_token: SpeakerCaptureLeaseToken | None
+    event: AdmissionEvent | SpeakerLeaseEvent | None
     now: float | None
     result: asyncio.Future["_IngressResult"]
     capacity_class: _CapacityClass
     coalescing_key: (
         tuple[
-            VoiceTurnToken | None,
-            AdmissionEvent,
+            VoiceTurnToken | SpeakerCaptureLeaseToken | None,
+            AdmissionEvent | SpeakerLeaseEvent,
             float | None,
         ]
         | None
     )
     retires_turn: bool = False
+    opens_speaker_lease: bool = False
+    retires_speaker_lease: bool = False
+    attaches_turn_to_speaker_lease: bool = False
+    provider_key: ProviderUtteranceKey | None = None
+    speaker_candidate: SpeakerShadowCandidateKey | None = None
 
 
 _IngressResult: TypeAlias = (
     bool
     | VoiceTurnAdmissionRecord
+    | SpeakerCaptureLeaseRecord
     | tuple[AdmissionEffect, ...]
     | tuple[AdmissionBulkResult, ...]
 )
@@ -96,6 +115,13 @@ _SPEAKER_CONTROL_EVENT_TYPES = (
     SpeakerHigh,
     SpeakerLow,
     SpeakerUnavailable,
+)
+_SPEAKER_LEASE_EVENT_TYPES = (
+    SpeakerLeaseAbandoned,
+    SpeakerLeaseCaptureClosed,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLeaseUnavailable,
 )
 
 
@@ -123,13 +149,8 @@ class AdmissionIngressLane:
             raise ValueError("data_capacity must be a positive integer")
         if type(control_capacity) is not int or control_capacity <= 0:
             raise ValueError("control_capacity must be a positive integer")
-        if (
-            type(speaker_control_capacity) is not int
-            or speaker_control_capacity <= 0
-        ):
-            raise ValueError(
-                "speaker_control_capacity must be a positive integer"
-            )
+        if type(speaker_control_capacity) is not int or speaker_control_capacity <= 0:
+            raise ValueError("speaker_control_capacity must be a positive integer")
         self._coordinator = coordinator
         self._data_capacity = data_capacity
         self._control_capacity = control_capacity
@@ -139,11 +160,19 @@ class AdmissionIngressLane:
         self._control_pending = 0
         self._speaker_control_pending = 0
         self._pending_controls: dict[
-            tuple[VoiceTurnToken | None, AdmissionEvent, float | None],
+            tuple[
+                VoiceTurnToken | SpeakerCaptureLeaseToken | None,
+                AdmissionEvent | SpeakerLeaseEvent,
+                float | None,
+            ],
             asyncio.Future[_IngressResult],
         ] = {}
         self._pending_retirements: dict[
             VoiceTurnToken,
+            asyncio.Future[_IngressResult],
+        ] = {}
+        self._pending_speaker_lease_retirements: dict[
+            SpeakerCaptureLeaseToken,
             asyncio.Future[_IngressResult],
         ] = {}
         self._available: asyncio.Event | None = None
@@ -180,7 +209,9 @@ class AdmissionIngressLane:
         self,
         capacity_class: _CapacityClass,
         turn_token: VoiceTurnToken | None,
-        event: AdmissionEvent | None,
+        event: AdmissionEvent | SpeakerLeaseEvent | None,
+        *,
+        speaker_lease_token: SpeakerCaptureLeaseToken | None = None,
     ) -> None:
         pending = {
             "data": self._data_pending,
@@ -196,6 +227,7 @@ class AdmissionIngressLane:
             raise AdmissionIngressCapacityError(
                 turn_token,
                 event,
+                speaker_lease_token=speaker_lease_token,
                 capacity_class=capacity_class,
             )
         if capacity_class == "data":
@@ -260,8 +292,8 @@ class AdmissionIngressLane:
         )
         coalescing_key: (
             tuple[
-                VoiceTurnToken | None,
-                AdmissionEvent,
+                VoiceTurnToken | SpeakerCaptureLeaseToken | None,
+                AdmissionEvent | SpeakerLeaseEvent,
                 float | None,
             ]
             | None
@@ -277,6 +309,7 @@ class AdmissionIngressLane:
         self._items.append(
             _IngressItem(
                 turn_token,
+                None,
                 event,
                 now,
                 result,
@@ -301,6 +334,210 @@ class AdmissionIngressLane:
 
         return await asyncio.shield(self.post_nowait(turn_token, event, now=now))
 
+    def open_speaker_lease_nowait(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> asyncio.Future[SpeakerCaptureLeaseRecord]:
+        """Allocate one parent lease through this lane's only worker."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(candidate) is not SpeakerShadowCandidateKey:
+            raise TypeError("candidate must be SpeakerShadowCandidateKey")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "control",
+            None,
+            None,
+            speaker_lease_token=lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=None,
+                speaker_lease_token=lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="control",
+                coalescing_key=None,
+                opens_speaker_lease=True,
+                speaker_candidate=candidate,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[SpeakerCaptureLeaseRecord], result)
+
+    async def open_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        candidate: SpeakerShadowCandidateKey,
+    ) -> SpeakerCaptureLeaseRecord:
+        return await asyncio.shield(
+            self.open_speaker_lease_nowait(lease_token, candidate)
+        )
+
+    def attach_turn_to_speaker_lease_nowait(
+        self,
+        turn_token: VoiceTurnToken,
+        lease_token: SpeakerCaptureLeaseToken,
+        provider_key: ProviderUtteranceKey,
+    ) -> asyncio.Future[VoiceTurnAdmissionRecord]:
+        """Open and bind one Provider child in FIFO order."""
+
+        if type(turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "control",
+            turn_token,
+            None,
+            speaker_lease_token=lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=turn_token,
+                speaker_lease_token=lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="control",
+                coalescing_key=None,
+                attaches_turn_to_speaker_lease=True,
+                provider_key=provider_key,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[VoiceTurnAdmissionRecord], result)
+
+    async def attach_turn_to_speaker_lease(
+        self,
+        turn_token: VoiceTurnToken,
+        lease_token: SpeakerCaptureLeaseToken,
+        provider_key: ProviderUtteranceKey,
+    ) -> VoiceTurnAdmissionRecord:
+        return await asyncio.shield(
+            self.attach_turn_to_speaker_lease_nowait(
+                turn_token,
+                lease_token,
+                provider_key,
+            )
+        )
+
+    def post_speaker_lease_nowait(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float | None = None,
+    ) -> asyncio.Future[tuple[AdmissionBulkResult, ...]]:
+        """Append an authoritative parent fact to the speaker-control partition."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if not isinstance(event, _SPEAKER_LEASE_EVENT_TYPES):
+            raise TypeError("event must be SpeakerLeaseEvent")
+        loop = self._checked_loop()
+        coalescing_key = (lease_token, event, now)
+        existing = self._pending_controls.get(coalescing_key)
+        if existing is not None:
+            follower = self._effectless_follower(existing)
+            return cast(
+                asyncio.Future[tuple[AdmissionBulkResult, ...]],
+                follower,
+            )
+        self._reserve_capacity(
+            "speaker_control",
+            None,
+            event,
+            speaker_lease_token=lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=None,
+                speaker_lease_token=lease_token,
+                event=event,
+                now=now,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=coalescing_key,
+            )
+        )
+        self._pending_controls[coalescing_key] = result
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[tuple[AdmissionBulkResult, ...]], result)
+
+    async def post_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float | None = None,
+    ) -> tuple[AdmissionBulkResult, ...]:
+        return await asyncio.shield(
+            self.post_speaker_lease_nowait(lease_token, event, now=now)
+        )
+
+    def retire_speaker_lease_nowait(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> asyncio.Future[bool]:
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        loop = self._checked_loop()
+        existing = self._pending_speaker_lease_retirements.get(lease_token)
+        if existing is not None:
+            return self._boolean_follower(existing)
+        self._reserve_capacity(
+            "control",
+            None,
+            None,
+            speaker_lease_token=lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=None,
+                speaker_lease_token=lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="control",
+                coalescing_key=None,
+                retires_speaker_lease=True,
+            )
+        )
+        self._pending_speaker_lease_retirements[lease_token] = result
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[bool], result)
+
+    async def retire_speaker_lease(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> bool:
+        return await asyncio.shield(self.retire_speaker_lease_nowait(lease_token))
+
+    def _checked_loop(self) -> asyncio.AbstractEventLoop:
+        if self._closing or self._closed:
+            raise AdmissionIngressClosedError("ASR_ADMISSION_INGRESS_CLOSED")
+        loop = asyncio.get_running_loop()
+        if self._worker is None or self._available is None or self._loop is None:
+            raise RuntimeError("ASR_ADMISSION_INGRESS_NOT_STARTED")
+        if loop is not self._loop:
+            raise RuntimeError("ASR_ADMISSION_INGRESS_LOOP_MISMATCH")
+        return loop
+
     def open_turn_nowait(
         self,
         turn_token: VoiceTurnToken,
@@ -319,7 +556,7 @@ class AdmissionIngressLane:
         self._reserve_capacity("control", turn_token, None)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
-            _IngressItem(turn_token, None, None, result, "control", None)
+            _IngressItem(turn_token, None, None, None, result, "control", None)
         )
         self._available.set()
         return cast(asyncio.Future[VoiceTurnAdmissionRecord], result)
@@ -368,7 +605,16 @@ class AdmissionIngressLane:
         self._reserve_capacity("control", turn_token, None)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
-            _IngressItem(turn_token, None, None, result, "control", None, True)
+            _IngressItem(
+                turn_token,
+                None,
+                None,
+                None,
+                result,
+                "control",
+                None,
+                retires_turn=True,
+            )
         )
         self._pending_retirements[turn_token] = result
         self._available.set()
@@ -408,7 +654,15 @@ class AdmissionIngressLane:
         self._reserve_capacity("control", None, event)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
-            _IngressItem(None, event, now, result, "control", coalescing_key)
+            _IngressItem(
+                None,
+                None,
+                event,
+                now,
+                result,
+                "control",
+                coalescing_key,
+            )
         )
         self._pending_controls[coalescing_key] = result
         self._available.set()
@@ -448,6 +702,30 @@ class AdmissionIngressLane:
         leader.add_done_callback(transfer_result)
         return follower
 
+    def _boolean_follower(
+        self,
+        leader: asyncio.Future[_IngressResult],
+    ) -> asyncio.Future[bool]:
+        """Follow an idempotent retirement without cancelling its owner."""
+
+        assert self._loop is not None
+        follower: asyncio.Future[bool] = self._loop.create_future()
+
+        def transfer_result(completed: asyncio.Future[_IngressResult]) -> None:
+            if follower.done():
+                return
+            if completed.cancelled():
+                follower.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                follower.set_exception(error)
+            else:
+                follower.set_result(bool(completed.result()))
+
+        leader.add_done_callback(transfer_result)
+        return follower
+
     async def close(self) -> None:
         """Stop accepting events, drain the FIFO, and join the worker."""
 
@@ -472,10 +750,44 @@ class AdmissionIngressLane:
                 while self._items:
                     item = self._items.popleft()
                     try:
-                        if item.retires_turn:
+                        if item.opens_speaker_lease:
+                            assert item.speaker_lease_token is not None
+                            assert item.speaker_candidate is not None
+                            assert item.event is None
+                            effects = await self._coordinator.open_speaker_lease(
+                                item.speaker_lease_token,
+                                item.speaker_candidate,
+                            )
+                        elif item.retires_speaker_lease:
+                            assert item.speaker_lease_token is not None
+                            assert item.event is None
+                            effects = await self._coordinator.retire_speaker_lease(
+                                item.speaker_lease_token,
+                            )
+                        elif item.attaches_turn_to_speaker_lease:
+                            assert item.turn_token is not None
+                            assert item.speaker_lease_token is not None
+                            assert item.provider_key is not None
+                            assert item.event is None
+                            effects = (
+                                await self._coordinator.attach_turn_to_speaker_lease(
+                                    item.turn_token,
+                                    item.speaker_lease_token,
+                                    item.provider_key,
+                                )
+                            )
+                        elif item.retires_turn:
                             assert item.turn_token is not None
                             assert item.event is None
                             effects = await self._coordinator.retire(item.turn_token)
+                        elif item.speaker_lease_token is not None:
+                            assert item.event is not None
+                            lease_event = cast(SpeakerLeaseEvent, item.event)
+                            effects = await self._coordinator.post_speaker_lease(
+                                item.speaker_lease_token,
+                                lease_event,
+                                now=item.now,
+                            )
                         elif item.turn_token is None:
                             assert type(item.event) in {Reset, Close, RouteReplaced}
                             bulk_event = cast(
@@ -505,6 +817,12 @@ class AdmissionIngressLane:
                         if item.retires_turn:
                             assert item.turn_token is not None
                             self._pending_retirements.pop(item.turn_token, None)
+                        if item.retires_speaker_lease:
+                            assert item.speaker_lease_token is not None
+                            self._pending_speaker_lease_retirements.pop(
+                                item.speaker_lease_token,
+                                None,
+                            )
                         if item.coalescing_key is not None:
                             self._pending_controls.pop(item.coalescing_key, None)
                 self._available.clear()
@@ -522,6 +840,12 @@ class AdmissionIngressLane:
                 if item.retires_turn:
                     assert item.turn_token is not None
                     self._pending_retirements.pop(item.turn_token, None)
+                if item.retires_speaker_lease:
+                    assert item.speaker_lease_token is not None
+                    self._pending_speaker_lease_retirements.pop(
+                        item.speaker_lease_token,
+                        None,
+                    )
                 if not item.result.done():
                     item.result.set_exception(error)
 

@@ -41,6 +41,7 @@ from ._provider_events import (
     ProviderEndpointNotification,
     ProviderFinalNotification,
     ProviderUtteranceKey,
+    ProviderUtteranceStartedNotification,
 )
 from .endpointing.detector_runtime import _create_voice_turn_adapter
 from .provider_policy import resolve_provider_policy
@@ -425,6 +426,10 @@ def _create_asr_session_from_selection(
     on_status_message: Callable[[str], Awaitable[None]] | None = None,
     on_speech_activity: Callable[[SpeechActivityEvent], Awaitable[None]] | None = None,
     on_turn_endpointed: Callable[[], Awaitable[None]] | None = None,
+    on_provider_utterance_started: Callable[
+        [ProviderUtteranceStartedNotification], Awaitable[None]
+    ]
+    | None = None,
     on_provider_endpoint: Callable[[ProviderEndpointNotification], Awaitable[None]]
     | None = None,
     on_provider_final: Callable[[ProviderUtteranceKey, str], Awaitable[None]]
@@ -480,6 +485,7 @@ def _create_asr_session_from_selection(
         on_connection_error=on_connection_error,
         on_status_message=on_status_message,
         on_turn_endpointed=on_turn_endpointed,
+        on_provider_utterance_started=on_provider_utterance_started,
         on_provider_endpoint=on_provider_endpoint,
         on_provider_final=on_provider_final,
         on_provider_final_ready=on_provider_final_ready,

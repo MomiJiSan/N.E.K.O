@@ -1,4 +1,4 @@
-"""Provider-neutral internal endpoint boundary contracts."""
+"""Provider-neutral internal utterance and endpoint contracts."""
 
 from __future__ import annotations
 
@@ -32,6 +32,36 @@ class ProviderUtteranceKey:
             or self.utterance_id < 1
         ):
             raise ValueError("ASR_PROVIDER_ENDPOINT_KEY_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUtteranceStartedNotification:
+    """The Provider has opened one keyed text utterance."""
+
+    generation: int
+    buffer_epoch: int
+    utterance_id: int
+
+    def __post_init__(self) -> None:
+        ProviderUtteranceKey(
+            generation=self.generation,
+            buffer_epoch=self.buffer_epoch,
+            utterance_id=self.utterance_id,
+        )
+
+    @property
+    def key(self) -> ProviderUtteranceKey:
+        return ProviderUtteranceKey(
+            generation=self.generation,
+            buffer_epoch=self.buffer_epoch,
+            utterance_id=self.utterance_id,
+        )
+
+    @property
+    def namespace(self) -> tuple[int, int]:
+        """Return the physical Provider audio-timeline namespace."""
+
+        return (self.generation, self.buffer_epoch)
 
 
 @dataclass(frozen=True, slots=True)

@@ -60,6 +60,8 @@ from ..speaker_shadow.contracts import (
     SpeakerShadowBatchReconcileReceipt,
     SpeakerShadowBatchReconcileRequest,
     SpeakerShadowBatchReconciliationControl,
+    SpeakerShadowCandidateLifecycleControl,
+    SpeakerShadowCaptureDecisionState,
     SpeakerShadowCaptureDisposition,
     SpeakerShadowCaptureResult,
     SpeakerShadowCaptureStatus,
@@ -1380,6 +1382,31 @@ class DetectorFeedResult:
     candidate: DetectorCandidateKey | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderSpeakerEvidenceLease:
+    """Opaque authority for one continuous Provider speaker-evidence stream.
+
+    Provider utterance keys and physical boundary segments may rotate while
+    this lease remains current.  The private owner fence prevents handles from
+    another DetectorRuntime from being replayed here.
+    """
+
+    detector_epoch: int
+    lease_generation: int
+    candidate: SpeakerShadowCandidateKey
+    _owner: object
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSpeakerEvidenceUpdate:
+    """One ordered capture result plus its no-progress clock position."""
+
+    lease: ProviderSpeakerEvidenceLease
+    capture: SpeakerShadowCaptureResult
+    sequence_no: int
+    last_progress_at: float
+
+
 class SmartTurnReadiness(Enum):
     UNLOADED = "unloaded"
     LOADING = "loading"
@@ -1463,9 +1490,7 @@ class _ProviderSpeakerPresealEntry:
     verdict: ProviderSpeakerPresealVerdict
     shadow_candidate: SpeakerShadowCandidateKey | None
     reconciliation: (
-        SpeakerShadowBatchReconcileReceipt
-        | SpeakerShadowTerminalCoverageReceipt
-        | None
+        SpeakerShadowBatchReconcileReceipt | SpeakerShadowTerminalCoverageReceipt | None
     )
     rejection_ready: bool = False
     revoked: bool = False
@@ -1497,8 +1522,7 @@ class _ProviderSpeakerSegment:
 
         return bool(
             self.ownership_complete
-            and self.shadow_capture_state
-            is not _ProviderShadowCaptureState.UNAVAILABLE
+            and self.shadow_capture_state is not _ProviderShadowCaptureState.UNAVAILABLE
         )
 
 
@@ -1506,6 +1530,19 @@ class _ProviderShadowCaptureState(Enum):
     COLLECTING = "collecting"
     COMPLETE = "complete"
     UNAVAILABLE = "unavailable"
+
+
+@dataclass(slots=True)
+class _ProviderSpeakerEvidenceState:
+    """Detector-owned mutable state behind one opaque evidence lease."""
+
+    lease: ProviderSpeakerEvidenceLease
+    last_sequence_no: int | None = None
+    last_progress_at: float | None = None
+    cumulative_sample_count: int = 0
+    completed_window_sample_count: int = 0
+    capture_state: _ProviderShadowCaptureState = _ProviderShadowCaptureState.COLLECTING
+    binding_published: bool = False
 
 
 @dataclass(slots=True)
@@ -1801,9 +1838,7 @@ class DetectorRuntime:
         self._provider_boundary_snapshots: dict[
             int, ProviderSpeakerBoundarySnapshot
         ] = {}
-        self._provider_preseal_entries: dict[
-            int, _ProviderSpeakerPresealEntry
-        ] = {}
+        self._provider_preseal_entries: dict[int, _ProviderSpeakerPresealEntry] = {}
         self._provider_segment_last_sequence_no: int | None = None
         self._provider_speaker_sealed_through_sequence_no: int | None = None
         self._provider_segment_ordered_mode = False
@@ -1815,6 +1850,11 @@ class DetectorRuntime:
         self._provider_segment_alignment_lost = False
         self._provider_segment_expiry_task: asyncio.Task[None] | None = None
         self._provider_segment_retired_expiry_tasks: set[asyncio.Task[None]] = set()
+        self._provider_speaker_evidence_owner = object()
+        self._provider_speaker_evidence_generation = 0
+        self._provider_speaker_evidence_state: _ProviderSpeakerEvidenceState | None = (
+            None
+        )
         self._provider_micro_event_ambiguous_candidates: set[DetectorCandidateKey] = (
             set()
         )
@@ -1886,6 +1926,10 @@ class DetectorRuntime:
             "provider_rejection_fail_open_count": 0,
             "provider_targeted_retirement_count": 0,
             "provider_namespace_poison_count": 0,
+            "provider_speaker_evidence_lease_opened_count": 0,
+            "provider_speaker_evidence_lease_finished_count": 0,
+            "provider_speaker_evidence_lease_abandoned_count": 0,
+            "provider_speaker_evidence_lease_stale_count": 0,
         }
         if (
             provider_policy is not None
@@ -2147,9 +2191,7 @@ class DetectorRuntime:
             # delayed detector binding could publish. Never relabel it with
             # the currently installed verifier generation.
             return
-        owner_generation = self._speaker_candidate_owner_generations[
-            shadow_candidate
-        ]
+        owner_generation = self._speaker_candidate_owner_generations[shadow_candidate]
         self._speaker_candidate_turn_bindings = {
             **self._speaker_candidate_turn_bindings,
             shadow_candidate: bound.turn_token,
@@ -2190,6 +2232,142 @@ class DetectorRuntime:
         self._speaker_rejection_prepare_diagnostics[
             "provider_speaker_segment_ownership_ambiguous_count"
         ] += 1
+
+    def _provider_speaker_evidence_state_for(
+        self,
+        lease: ProviderSpeakerEvidenceLease,
+    ) -> _ProviderSpeakerEvidenceState | None:
+        state = self._provider_speaker_evidence_state
+        if (
+            type(lease) is not ProviderSpeakerEvidenceLease
+            or lease._owner is not self._provider_speaker_evidence_owner
+            or lease.detector_epoch != self._detector_epoch
+            or lease.candidate.detector_epoch != self._detector_epoch
+            or state is None
+            or state.lease != lease
+        ):
+            return None
+        return state
+
+    def _unavailable_provider_speaker_evidence_update(
+        self,
+        state: _ProviderSpeakerEvidenceState,
+        *,
+        sequence_no: int,
+    ) -> ProviderSpeakerEvidenceUpdate:
+        return ProviderSpeakerEvidenceUpdate(
+            lease=state.lease,
+            capture=SpeakerShadowCaptureResult(
+                disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                accepted_sample_count=0,
+                cumulative_sample_count=state.cumulative_sample_count,
+                completed_window_sample_count=state.completed_window_sample_count,
+                decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+            ),
+            sequence_no=sequence_no,
+            last_progress_at=state.last_progress_at or 0.0,
+        )
+
+    def _abandon_provider_speaker_evidence_locked(
+        self,
+        state: _ProviderSpeakerEvidenceState,
+    ) -> bool:
+        if self._provider_speaker_evidence_state is not state:
+            return False
+        # Revoke the Detector handle first.  A callback or cleanup failure in
+        # the optional observer control cannot make the lease current again.
+        self._provider_speaker_evidence_state = None
+        state.capture_state = _ProviderShadowCaptureState.UNAVAILABLE
+        shadow = self._speaker_shadow
+        retired = False
+        if isinstance(shadow, SpeakerShadowCandidateLifecycleControl):
+            try:
+                retired = bool(shadow.abandon_candidate(state.lease.candidate))
+            except Exception:
+                retired = False
+        self._speaker_rejection_prepare_diagnostics[
+            "provider_speaker_evidence_lease_abandoned_count"
+        ] += 1
+        return retired
+
+    async def ensure_provider_speaker_evidence_lease(
+        self,
+    ) -> ProviderSpeakerEvidenceLease | None:
+        """Return one stable Provider evidence lease until explicit settlement.
+
+        This API is opt-in.  Existing Provider segment ownership keeps its
+        legacy candidate-per-segment behavior until callers pass the returned
+        handle back to :meth:`observe_provider_audio_ordered`.
+        """
+
+        async with self._lock:
+            if self._closed or self._semantic_adapter is not None:
+                return None
+            current = self._provider_speaker_evidence_state
+            if current is not None:
+                return current.lease
+            candidate = self._allocate_provider_segment_candidate()
+            if candidate is None:
+                return None
+            lease = ProviderSpeakerEvidenceLease(
+                detector_epoch=self._detector_epoch,
+                lease_generation=self._provider_speaker_evidence_generation,
+                candidate=candidate,
+                _owner=self._provider_speaker_evidence_owner,
+            )
+            self._provider_speaker_evidence_generation += 1
+            self._provider_speaker_evidence_state = _ProviderSpeakerEvidenceState(
+                lease=lease
+            )
+            self._speaker_rejection_prepare_diagnostics[
+                "provider_speaker_evidence_lease_opened_count"
+            ] += 1
+            return lease
+
+    async def finish_provider_speaker_evidence_lease(
+        self,
+        lease: ProviderSpeakerEvidenceLease,
+    ) -> bool:
+        """Queue completion confirmation for one exact current lease."""
+
+        async with self._lock:
+            state = self._provider_speaker_evidence_state_for(lease)
+            if state is None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "provider_speaker_evidence_lease_stale_count"
+                ] += 1
+                return False
+            shadow = self._speaker_shadow
+            if shadow is None:
+                self._abandon_provider_speaker_evidence_locked(state)
+                return False
+            try:
+                accepted = bool(shadow.finish_candidate(lease.candidate))
+            except Exception:
+                accepted = False
+            if not accepted:
+                self._abandon_provider_speaker_evidence_locked(state)
+                return False
+            self._provider_speaker_evidence_state = None
+            self._speaker_rejection_prepare_diagnostics[
+                "provider_speaker_evidence_lease_finished_count"
+            ] += 1
+            return True
+
+    async def abandon_provider_speaker_evidence_lease(
+        self,
+        lease: ProviderSpeakerEvidenceLease,
+    ) -> bool:
+        """Revoke a current lease without manufacturing speaker evidence."""
+
+        async with self._lock:
+            state = self._provider_speaker_evidence_state_for(lease)
+            if state is None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "provider_speaker_evidence_lease_stale_count"
+                ] += 1
+                return False
+            return self._abandon_provider_speaker_evidence_locked(state)
 
     def _allocate_provider_segment_candidate(
         self,
@@ -2254,6 +2432,14 @@ class DetectorRuntime:
         return bool(accepted and finished)
 
     def _expire_provider_segments(self, now: float) -> None:
+        evidence_state = self._provider_speaker_evidence_state
+        if (
+            evidence_state is not None
+            and evidence_state.last_progress_at is not None
+            and now - evidence_state.last_progress_at
+            >= _PROVIDER_SEGMENT_EXPIRY_SECONDS
+        ):
+            self._abandon_provider_speaker_evidence_locked(evidence_state)
         expired = False
         while self._provider_speaker_segments and (
             now - self._provider_speaker_segments[0].last_progress_at
@@ -2379,9 +2565,7 @@ class DetectorRuntime:
     ) -> SpeakerShadowTerminalCoverageControl | None:
         shadow = self._speaker_shadow
         return (
-            shadow
-            if isinstance(shadow, SpeakerShadowTerminalCoverageControl)
-            else None
+            shadow if isinstance(shadow, SpeakerShadowTerminalCoverageControl) else None
         )
 
     def _provider_preseal_reconciliation_status_locked(
@@ -2424,8 +2608,7 @@ class DetectorRuntime:
     def _revoke_provider_reconciliation_receipt(
         self,
         receipt: (
-            SpeakerShadowBatchReconcileReceipt
-            | SpeakerShadowTerminalCoverageReceipt
+            SpeakerShadowBatchReconcileReceipt | SpeakerShadowTerminalCoverageReceipt
         ),
     ) -> None:
         """Revoke one opaque receipt without mutating Detector ownership."""
@@ -2643,6 +2826,9 @@ class DetectorRuntime:
         async with self._lock:
             if self._closed or self._semantic_adapter is not None:
                 return False
+            evidence_state = self._provider_speaker_evidence_state
+            if evidence_state is not None:
+                self._abandon_provider_speaker_evidence_locked(evidence_state)
             self._provider_candidate_fence = None
             self._sealed_provider_candidate_rejection = None
             self._provider_micro_event_aggregate = None
@@ -2654,9 +2840,7 @@ class DetectorRuntime:
             # PCM-free snapshot escapes its bounded table, it cannot authorize
             # speaker suppression in the replacement Provider timeline.
             self._provider_boundary_snapshot_owner = object()
-            self._finish_speaker_shadow_candidate(
-                expected_scope="provider_candidate"
-            )
+            self._finish_speaker_shadow_candidate(expected_scope="provider_candidate")
             if self._speaker_shadow_suppressed_candidate == (
                 self._detector_epoch,
                 "provider_candidate",
@@ -2686,8 +2870,7 @@ class DetectorRuntime:
                 if (
                     self._closed
                     or self._semantic_adapter is not None
-                    or self._provider_audio_timeline_generation
-                    != timeline_generation
+                    or self._provider_audio_timeline_generation != timeline_generation
                 ):
                     return False
                 if self._provider_audio_sample_cursor_16k >= end_sample_16k:
@@ -2726,9 +2909,7 @@ class DetectorRuntime:
             except TimeoutError:
                 return False
             acquired = True
-            entry = self._provider_preseal_entries.get(
-                verdict.candidate_generation
-            )
+            entry = self._provider_preseal_entries.get(verdict.candidate_generation)
             if (
                 self._closed
                 or not verdict.boundary_exact
@@ -2892,9 +3073,7 @@ class DetectorRuntime:
                     pending_entry.verdict if pending_entry is not None else None
                 )
                 pending_status = (
-                    self._provider_preseal_reconciliation_status_locked(
-                        pending_entry
-                    )
+                    self._provider_preseal_reconciliation_status_locked(pending_entry)
                     if pending_entry is not None
                     else "stale"
                 )
@@ -3042,8 +3221,7 @@ class DetectorRuntime:
             or type(turn_token) is not VoiceTurnToken
             or self._closed
             or shadow_candidate.detector_epoch != self._detector_epoch
-            or self._speaker_candidate_turn_bindings.get(shadow_candidate)
-            != turn_token
+            or self._speaker_candidate_turn_bindings.get(shadow_candidate) != turn_token
         ):
             return False
         bindings = dict(self._speaker_candidate_turn_bindings)
@@ -3206,8 +3384,7 @@ class DetectorRuntime:
                 or entry.revoked
                 or entry.verdict is not provider_preseal
                 or not provider_preseal.boundary_exact
-                or provider_preseal._owner
-                is not self._provider_boundary_snapshot_owner
+                or provider_preseal._owner is not self._provider_boundary_snapshot_owner
                 or provider_preseal.detector_epoch != self._detector_epoch
                 or candidate
                 != DetectorCandidateKey(
@@ -4052,7 +4229,8 @@ class DetectorRuntime:
         sequence_no: int,
         split_before_audio: bool,
         evidence_complete: bool = True,
-    ) -> None:
+        speaker_evidence_lease: ProviderSpeakerEvidenceLease | None = None,
+    ) -> ProviderSpeakerEvidenceUpdate | None:
         """Assign admitted Provider PCM to a physical-segment FIFO.
 
         Detector identity fences the source. ``sequence_no`` is the separate
@@ -4070,6 +4248,10 @@ class DetectorRuntime:
             or sequence_no <= 0
             or type(split_before_audio) is not bool
             or type(evidence_complete) is not bool
+            or (
+                speaker_evidence_lease is not None
+                and type(speaker_evidence_lease) is not ProviderSpeakerEvidenceLease
+            )
         ):
             return
         async with self._lock:
@@ -4081,8 +4263,24 @@ class DetectorRuntime:
                 or identity.sequence_no > self._sequence_no
             ):
                 return
+            evidence_state = (
+                self._provider_speaker_evidence_state_for(speaker_evidence_lease)
+                if speaker_evidence_lease is not None
+                else None
+            )
+            if speaker_evidence_lease is not None and evidence_state is None:
+                self._speaker_rejection_prepare_diagnostics[
+                    "provider_speaker_evidence_lease_stale_count"
+                ] += 1
+                return None
             previous_sequence = self._provider_segment_last_sequence_no
-            if previous_sequence is not None and sequence_no <= previous_sequence:
+            evidence_previous_sequence = (
+                evidence_state.last_sequence_no if evidence_state is not None else None
+            )
+            if (previous_sequence is not None and sequence_no <= previous_sequence) or (
+                evidence_previous_sequence is not None
+                and sequence_no <= evidence_previous_sequence
+            ):
                 self._speaker_rejection_prepare_diagnostics[
                     "provider_speaker_segment_sequence_stale_count"
                 ] += 1
@@ -4090,13 +4288,21 @@ class DetectorRuntime:
             self._provider_segment_last_sequence_no = sequence_no
             sequence_gap = bool(
                 previous_sequence is not None and sequence_no != previous_sequence + 1
+            ) or bool(
+                evidence_previous_sequence is not None
+                and sequence_no != evidence_previous_sequence + 1
             )
             if sequence_gap:
                 self._speaker_rejection_prepare_diagnostics[
                     "provider_speaker_segment_sequence_gap_count"
                 ] += 1
 
-            if not self._provider_segment_ordered_mode:
+            if not self._provider_segment_ordered_mode and evidence_state is not None:
+                # Stable evidence owns one candidate across physical Provider
+                # segments, so deferred per-segment scoring is unnecessary.
+                self._provider_segment_deferred_support = True
+                self._provider_segment_ordered_mode = True
+            elif not self._provider_segment_ordered_mode:
                 support = self._provider_segment_deferred_support
                 if support is None:
                     shadow = self._speaker_shadow
@@ -4165,6 +4371,19 @@ class DetectorRuntime:
                 return
 
             observed_at = time.monotonic()
+            if (
+                evidence_state is not None
+                and evidence_state.last_progress_at is not None
+                and observed_at - evidence_state.last_progress_at
+                >= _PROVIDER_SEGMENT_EXPIRY_SECONDS
+            ):
+                unavailable = self._unavailable_provider_speaker_evidence_update(
+                    evidence_state,
+                    sequence_no=sequence_no,
+                )
+                self._abandon_provider_speaker_evidence_locked(evidence_state)
+                self._expire_provider_segments(observed_at)
+                return unavailable
             self._expire_provider_segments(observed_at)
             if sequence_gap:
                 self._mark_provider_segments_incomplete()
@@ -4174,6 +4393,21 @@ class DetectorRuntime:
                         self._candidate_generation,
                     )
                 )
+                if evidence_state is not None:
+                    unavailable = self._unavailable_provider_speaker_evidence_update(
+                        evidence_state,
+                        sequence_no=sequence_no,
+                    )
+                    self._abandon_provider_speaker_evidence_locked(evidence_state)
+                    return unavailable
+            if evidence_state is not None and not evidence_complete:
+                self._mark_provider_segments_incomplete()
+                unavailable = self._unavailable_provider_speaker_evidence_update(
+                    evidence_state,
+                    sequence_no=sequence_no,
+                )
+                self._abandon_provider_speaker_evidence_locked(evidence_state)
+                return unavailable
             segment = (
                 self._provider_speaker_segments[-1]
                 if self._provider_speaker_segments
@@ -4212,7 +4446,11 @@ class DetectorRuntime:
                         self._detector_epoch,
                         self._candidate_generation,
                     )
-                candidate = self._allocate_provider_segment_candidate()
+                candidate = (
+                    None
+                    if evidence_state is not None
+                    else self._allocate_provider_segment_candidate()
+                )
                 shadow = self._speaker_shadow
                 control = (
                     shadow
@@ -4221,7 +4459,7 @@ class DetectorRuntime:
                 )
                 segment_complete = bool(
                     evidence_complete
-                    and candidate is not None
+                    and (candidate is not None or evidence_state is not None)
                     and not sequence_gap
                     and not self._provider_segment_alignment_lost
                     and not self._provider_segment_successor_evidence_incomplete
@@ -4230,7 +4468,7 @@ class DetectorRuntime:
                     self._provider_segment_successor_evidence_incomplete
                 )
                 self._provider_segment_successor_evidence_incomplete = False
-                deferred = overlap
+                deferred = bool(overlap and evidence_state is None)
                 deferred_accepted = False
                 if candidate is not None and deferred:
                     if control is not None:
@@ -4288,11 +4526,7 @@ class DetectorRuntime:
             if segment is None:
                 return
             segment.last_identity = identity
-            if (
-                not sequence_gap
-                and evidence_complete
-                and segment.ownership_complete
-            ):
+            if not sequence_gap and evidence_complete and segment.ownership_complete:
                 segment.last_progress_at = observed_at
             if not evidence_complete:
                 segment.ownership_complete = False
@@ -4300,6 +4534,16 @@ class DetectorRuntime:
                     self._provider_segment_successor_evidence_incomplete = True
                 self._mark_provider_micro_event_ambiguous(segment.detector_candidate)
             candidate = segment.candidate
+            if evidence_state is not None:
+                candidate = evidence_state.lease.candidate
+                if not evidence_state.binding_published:
+                    self._publish_speaker_candidate_binding(
+                        candidate,
+                        segment.detector_candidate,
+                    )
+                    evidence_state.binding_published = bool(
+                        candidate in self._speaker_candidate_turn_bindings
+                    )
             shadow = self._speaker_shadow
             may_submit = bool(not segment.deferred or segment.deferred_accepted)
             if candidate is not None and shadow is not None and may_submit:
@@ -4361,6 +4605,52 @@ class DetectorRuntime:
             else:
                 segment.shadow_capture_state = _ProviderShadowCaptureState.UNAVAILABLE
                 self._mark_provider_micro_event_ambiguous(segment.detector_candidate)
+                capture_state = _ProviderShadowCaptureState.UNAVAILABLE
+            if evidence_state is not None:
+                if capture_state is _ProviderShadowCaptureState.UNAVAILABLE:
+                    unavailable = self._unavailable_provider_speaker_evidence_update(
+                        evidence_state,
+                        sequence_no=sequence_no,
+                    )
+                    self._abandon_provider_speaker_evidence_locked(evidence_state)
+                    self._schedule_provider_segment_expiry()
+                    return unavailable
+                evidence_state.last_sequence_no = sequence_no
+                evidence_state.last_progress_at = observed_at
+                evidence_state.capture_state = capture_state
+                if isinstance(shadow, SpeakerShadowCaptureStatus):
+                    assert type(capture) is SpeakerShadowCaptureResult
+                    evidence_state.cumulative_sample_count = (
+                        capture.cumulative_sample_count
+                    )
+                    evidence_state.completed_window_sample_count = max(
+                        evidence_state.completed_window_sample_count,
+                        capture.completed_window_sample_count,
+                    )
+                    capture_result = capture
+                else:
+                    accepted_samples = len(pcm16) // 2
+                    evidence_state.cumulative_sample_count += accepted_samples
+                    capture_result = SpeakerShadowCaptureResult(
+                        disposition=SpeakerShadowCaptureDisposition.ACCEPTED,
+                        accepted_sample_count=accepted_samples,
+                        cumulative_sample_count=(
+                            evidence_state.cumulative_sample_count
+                        ),
+                        completed_window_sample_count=0,
+                        decision_state=SpeakerShadowCaptureDecisionState.PENDING,
+                    )
+                # The lease clock follows the most recent legal Provider PCM,
+                # not the creation time of the oldest physical segment.
+                for retained_segment in self._provider_speaker_segments:
+                    retained_segment.last_progress_at = observed_at
+                self._schedule_provider_segment_expiry()
+                return ProviderSpeakerEvidenceUpdate(
+                    lease=evidence_state.lease,
+                    capture=capture_result,
+                    sequence_no=sequence_no,
+                    last_progress_at=observed_at,
+                )
             self._schedule_provider_segment_expiry()
 
     def _fail_provider_exact_reconcile_locked(
@@ -4483,14 +4773,20 @@ class DetectorRuntime:
                     keep_start = 0
                     keep_end = 0
                 else:
-                    keep_start = max(
-                        boundary.start_sample_16k,
-                        segment.start_sample_16k,
-                    ) - segment.start_sample_16k
-                    keep_end = min(
-                        boundary.end_sample_16k,
-                        segment.end_sample_16k,
-                    ) - segment.start_sample_16k
+                    keep_start = (
+                        max(
+                            boundary.start_sample_16k,
+                            segment.start_sample_16k,
+                        )
+                        - segment.start_sample_16k
+                    )
+                    keep_end = (
+                        min(
+                            boundary.end_sample_16k,
+                            segment.end_sample_16k,
+                        )
+                        - segment.start_sample_16k
+                    )
                 source_requests.append(
                     SpeakerShadowReconcileSource(
                         candidate=candidate,
@@ -4507,14 +4803,11 @@ class DetectorRuntime:
             if target_candidate is None:
                 return self._fail_provider_exact_reconcile_locked()
             target_was_deferred = bool(
-                target_segment.deferred
-                and target_candidate == target_segment.candidate
+                target_segment.deferred and target_candidate == target_segment.candidate
             )
 
             last_segment = covered[-1]
-            suffix_sample_count = (
-                last_segment.end_sample_16k - boundary.end_sample_16k
-            )
+            suffix_sample_count = last_segment.end_sample_16k - boundary.end_sample_16k
             suffix_candidate = (
                 self._allocate_provider_segment_candidate()
                 if suffix_sample_count > 0
@@ -4550,14 +4843,12 @@ class DetectorRuntime:
                 except Exception:
                     terminal_receipt = None
                 if (
-                    type(terminal_receipt)
-                    is SpeakerShadowTerminalCoverageReceipt
+                    type(terminal_receipt) is SpeakerShadowTerminalCoverageReceipt
                     and terminal_receipt.target == target_candidate
                     and terminal_receipt.suffix == suffix_candidate
                     and terminal_receipt.retained_sample_count
                     == scored_window_sample_count
-                    and terminal_receipt.covered_sample_count
-                    == expected_target_samples
+                    and terminal_receipt.covered_sample_count == expected_target_samples
                     and terminal_receipt.terminal_preserved
                 ):
                     receipt = terminal_receipt
@@ -4567,9 +4858,7 @@ class DetectorRuntime:
                     # match this exact request, revoke that marker before
                     # failing open; falling back to a second batch admission
                     # would leave the first operation free to settle late.
-                    self._revoke_provider_reconciliation_receipt(
-                        terminal_receipt
-                    )
+                    self._revoke_provider_reconciliation_receipt(terminal_receipt)
                     return self._fail_provider_exact_reconcile_locked()
                 elif terminal_receipt is not None:
                     return self._fail_provider_exact_reconcile_locked()
@@ -4605,9 +4894,7 @@ class DetectorRuntime:
             if receipt is None:
                 return self._fail_provider_exact_reconcile_locked()
 
-            terminal_preserved = (
-                type(receipt) is SpeakerShadowTerminalCoverageReceipt
-            )
+            terminal_preserved = type(receipt) is SpeakerShadowTerminalCoverageReceipt
             if terminal_preserved:
                 for previous in segments[:target_index]:
                     self._finish_provider_segment(
@@ -4785,24 +5072,18 @@ class DetectorRuntime:
                 entry is not None
                 and (
                     entry.verdict is speaker_snapshot
-                    or (
-                        speaker_snapshot is None
-                        and not entry.verdict.boundary_exact
-                    )
+                    or (speaker_snapshot is None and not entry.verdict.boundary_exact)
                 )
                 and entry.verdict._owner is self._provider_boundary_snapshot_owner
                 and entry.verdict.detector_epoch == self._detector_epoch
-                and entry.verdict.candidate_generation
-                == self._candidate_generation
+                and entry.verdict.candidate_generation == self._candidate_generation
             )
             standalone_unknown = bool(
                 type(speaker_snapshot) is ProviderSpeakerBoundarySnapshot
                 and not speaker_snapshot.boundary_exact
-                and speaker_snapshot._owner
-                is self._provider_boundary_snapshot_owner
+                and speaker_snapshot._owner is self._provider_boundary_snapshot_owner
                 and speaker_snapshot.detector_epoch == self._detector_epoch
-                and speaker_snapshot.candidate_generation
-                == self._candidate_generation
+                and speaker_snapshot.candidate_generation == self._candidate_generation
             )
             reconciliation_status = (
                 self._provider_preseal_reconciliation_status_locked(entry)
@@ -4910,8 +5191,7 @@ class DetectorRuntime:
                     shadow_candidate=shadow_candidate,
                     turn_token=bound.turn_token,
                     rejection_ready=bool(
-                        consumed_entry is not None
-                        and consumed_entry.rejection_ready
+                        consumed_entry is not None and consumed_entry.rejection_ready
                     ),
                 )
                 self._speaker_rejection_prepare_diagnostics[
@@ -5436,10 +5716,7 @@ class DetectorRuntime:
                         )
                     )
                     suppressed = self._speaker_shadow_suppressed_candidate
-                    if (
-                        suppressed is not None
-                        and suppressed[0] != self._detector_epoch
-                    ):
+                    if suppressed is not None and suppressed[0] != self._detector_epoch:
                         self._speaker_shadow_suppressed_candidate = None
                     candidate = self._speaker_shadow_candidate
                     if candidate is not None:
@@ -5462,6 +5739,8 @@ class DetectorRuntime:
                         )
                     self._speaker_shadow_generation += 1
                     self._speaker_shadow_candidate = None
+                    self._provider_speaker_evidence_generation += 1
+                    self._provider_speaker_evidence_state = None
                     detached_shadow, self._speaker_shadow = (
                         self._speaker_shadow,
                         new_shadow,
@@ -5470,9 +5749,7 @@ class DetectorRuntime:
                     installed = True
 
             cleanup_shadow = (
-                detached_shadow
-                if detached_shadow is not None
-                else rejected_shadow
+                detached_shadow if detached_shadow is not None else rejected_shadow
             )
             if cleanup_shadow is None:
                 return
@@ -5719,6 +5996,8 @@ class DetectorRuntime:
     def _reset_speaker_shadow_identity(self) -> None:
         self._speaker_shadow_generation += 1
         self._speaker_shadow_candidate = None
+        self._provider_speaker_evidence_generation += 1
+        self._provider_speaker_evidence_state = None
         self._speaker_candidate_turn_bindings = {}
         self._speaker_candidate_owner_generations = {}
 
