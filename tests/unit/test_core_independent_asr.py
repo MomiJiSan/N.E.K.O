@@ -4959,12 +4959,14 @@ async def test_asr_stream_failure_never_replays_the_failed_frame_to_omni() -> No
     runtime._asr_provider = "qwen"
     runtime._asr_route_mode = "independent"
     await _install_active_smart_turn(runtime, "qwen")
+    failed_dispatcher = runtime._asr_audio_dispatcher
 
     consumed = await runtime._route_microphone_audio(
         b"\x01\x00" * 160,
         sample_rate_hz=16_000,
     )
-    await runtime._asr_audio_dispatcher.wait_idle()
+    await failed_dispatcher.wait_idle()
+    await asyncio.gather(*tuple(failed_dispatcher._failure_tasks))
 
     assert consumed is True
     assert runtime._asr_route_mode == "blocked"
@@ -10940,6 +10942,8 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
 
     class _SpeakerShadow:
         enabled = True
+        enforces_admission = True
+        activation_generation = "speaker-observation-order"
 
         def __init__(self) -> None:
             self.candidate = None
@@ -10983,19 +10987,6 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
     def create_detector(**kwargs) -> DetectorRuntime:
         nonlocal detector_ref
         detector = DetectorRuntime(vad=_Vad(), gate=_Gate(), **kwargs)
-        original_bind = detector.bind_candidate
-
-        async def traced_bind(candidate, turn_token):
-            call_order.append(
-                (
-                    "bind",
-                    candidate.detector_epoch,
-                    candidate.candidate_generation,
-                )
-            )
-            return await original_bind(candidate, turn_token)
-
-        detector.bind_candidate = traced_bind  # type: ignore[method-assign]
         detector_ref = detector
         return detector
 
@@ -11042,6 +11033,20 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
         lease_generation=7,
         route_generation=11,
     )
+    original_open_speaker_lease = runtime._asr_admission_ingress.open_speaker_lease
+
+    async def traced_open_speaker_lease(lease_token, candidate):
+        record = await original_open_speaker_lease(lease_token, candidate)
+        call_order.append(
+            (
+                "lease",
+                candidate.detector_epoch,
+                candidate.shadow_generation,
+            )
+        )
+        return record
+
+    runtime._asr_admission_ingress.open_speaker_lease = traced_open_speaker_lease
 
     submit_result = await runtime.submit(
         ProcessedVoiceFrame(
@@ -11058,19 +11063,20 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
     assert speaker_shadow.candidate is not None
 
     assert submit_result.status is AsrSubmitStatus.ACCEPTED
-    assert call_order[:2] == [("bind", 0, 0), ("observe", 0, 0)]
+    assert call_order[:2] == [("lease", 0, 0), ("observe", 0, 0)]
+    lease_token = runtime._asr_current_speaker_lease
+    assert lease_token is not None
+    lease_record = await runtime._asr_admission.get_speaker_lease(lease_token)
+    assert lease_record is not None
+    assert lease_record.candidate == speaker_shadow.candidate
     assert provider_session.wire_pcm == [pcm16]
     diagnostics = runtime._speaker_verifier_diagnostics()
     assert diagnostics["rejection_prepare_unbound_count"] == 0
-    assert diagnostics["provider_candidate_bind_attempt_count"] == 1
-    assert diagnostics["provider_candidate_bind_success_count"] == 1
+    assert diagnostics["provider_candidate_bind_attempt_count"] == 0
+    assert diagnostics["provider_candidate_bind_success_count"] == 0
     assert diagnostics["provider_candidate_bind_empty_count"] == 0
     assert diagnostics["provider_candidate_bind_failed_count"] == 0
 
-    await provider_session.callbacks["on_turn_endpointed"]()
-    await provider_session.callbacks["on_input_transcript"]("owner-final")
-    await runtime.wait_transcript_idle()
-    assert [event.text for event in finals] == ["owner-final"]
     assert diagnostics["rejection_task_applied_count"] == 0
 
     await runtime.close()

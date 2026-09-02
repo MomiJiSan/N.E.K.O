@@ -6,23 +6,28 @@ import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
 from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
 from .contracts import (
+    AdmissionState,
     AdmissionEffect,
     AdmissionEvent,
+    BoundaryState,
     CandidateBindingState,
     CaptureState,
-    ProviderBindingState,
-    SettlementState,
     Close,
     EvidenceState,
+    MicroEventState,
+    ProviderBindingState,
+    ProviderFinalState,
+    RejectionApplyState,
     Reset,
     RouteReplaced,
+    SettlementState,
     SpeakerCaptureLeaseRecord,
     SpeakerCaptureLeaseToken,
     SpeakerLeaseAbandoned,
@@ -193,54 +198,351 @@ class VoiceTurnAdmissionCoordinator:
             lease = self._speaker_leases.get(lease_token)
             if lease is None:
                 raise KeyError(lease_token)
+            if self._speaker_candidate_bindings.get(lease.candidate) != lease_token:
+                raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
+            binding = SpeakerLeaseChildBinding(provider_key, turn_token)
             provider_binding = self._provider_speaker_lease_bindings.get(provider_key)
             expected_binding = (lease_token, turn_token)
+            terminal_parent = lease.state in {
+                SpeakerLeaseState.ALLOW,
+                SpeakerLeaseState.UNAVAILABLE,
+                SpeakerLeaseState.DENY_LATCHED,
+            }
             if provider_binding not in {None, expected_binding}:
                 raise AdmissionIdentityError(
                     "ASR_SPEAKER_LEASE_PROVIDER_KEY_ALREADY_BOUND"
                 )
             existing = self._records.get(turn_token)
             if existing is not None:
+                if existing.terminal_disposition is not None:
+                    raise AdmissionIdentityError(
+                        "ASR_ADMISSION_TERMINAL_BINDING_CONFLICT"
+                    )
+                provider_placeholder = (
+                    existing.provider_binding_state is ProviderBindingState.UNBOUND
+                    and existing.provider_key is None
+                )
+                provider_exact = (
+                    existing.provider_binding_state is ProviderBindingState.BOUND
+                    and existing.provider_key == provider_key
+                )
+                candidate_unbound = (
+                    existing.candidate_binding_state is CandidateBindingState.UNBOUND
+                    and existing.speaker_candidate is None
+                    and existing.speaker_lease_token is None
+                    and existing.speaker_authority_generation is None
+                    and existing.capture_state is CaptureState.NONE
+                )
+                candidate_arming = (
+                    existing.candidate_binding_state is CandidateBindingState.ARMING
+                    and existing.speaker_candidate is None
+                    and existing.speaker_lease_token is None
+                    and existing.speaker_authority_generation is not None
+                    and existing.capture_state is CaptureState.NONE
+                )
+                candidate_exact = (
+                    existing.candidate_binding_state is CandidateBindingState.BOUND
+                    and existing.speaker_candidate == lease.candidate
+                    and existing.speaker_lease_token == lease_token
+                    and (
+                        existing.capture_state is CaptureState.COLLECTING
+                        or (
+                            lease.state is SpeakerLeaseState.UNAVAILABLE
+                            and existing.capture_state is CaptureState.UNAVAILABLE
+                        )
+                    )
+                )
                 if (
-                    existing.provider_key != provider_key
-                    or existing.speaker_lease_token != lease_token
-                    or existing.speaker_candidate != lease.candidate
+                    existing.turn_token != turn_token
+                    or not (provider_placeholder or provider_exact)
+                    or not (candidate_unbound or candidate_arming or candidate_exact)
                 ):
                     raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
-                return existing
-            if turn_token.turn_id <= self._retired_turn_high_water.get(
-                turn_token.ingress,
-                0,
-            ):
-                raise AdmissionIdentityError("ASR_ADMISSION_TURN_ALREADY_RETIRED")
-            if len(self._records) >= self._capacity:
-                raise AdmissionCapacityError("ASR_ADMISSION_CAPACITY_EXHAUSTED")
+                if candidate_exact:
+                    if (
+                        not provider_exact
+                        or provider_binding != expected_binding
+                        or binding not in lease.child_bindings
+                        or (
+                            terminal_parent
+                            and not self._terminal_parent_child_is_exact(
+                                existing,
+                                lease,
+                            )
+                        )
+                    ):
+                        raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
+                    return existing
+                if provider_binding is not None or binding in lease.child_bindings:
+                    raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
+            else:
+                if provider_binding is not None or binding in lease.child_bindings:
+                    raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
+                if turn_token.turn_id <= self._retired_turn_high_water.get(
+                    turn_token.ingress,
+                    0,
+                ):
+                    raise AdmissionIdentityError("ASR_ADMISSION_TURN_ALREADY_RETIRED")
+                if len(self._records) >= self._capacity:
+                    raise AdmissionCapacityError("ASR_ADMISSION_CAPACITY_EXHAUSTED")
 
-            binding = SpeakerLeaseChildBinding(provider_key, turn_token)
+            if (
+                terminal_parent
+                and existing is not None
+                and not self._terminal_parent_attach_is_effect_free(existing)
+            ):
+                raise AdmissionIdentityError("ASR_ADMISSION_TERMINAL_BINDING_CONFLICT")
+
             try:
+                bindable_lease = (
+                    replace(
+                        lease,
+                        state=SpeakerLeaseState.COLLECTING,
+                        terminal_sequence_no=None,
+                    )
+                    if terminal_parent
+                    else lease
+                )
                 updated_lease = bind_speaker_lease_child(
-                    lease,
+                    bindable_lease,
                     binding,
                     capacity=self._speaker_lease_child_capacity,
                 )
+                if terminal_parent:
+                    updated_lease = replace(
+                        updated_lease,
+                        state=lease.state,
+                        terminal_sequence_no=lease.terminal_sequence_no,
+                    )
             except SpeakerLeaseIdentityError as exc:
                 raise AdmissionIdentityError(str(exc)) from exc
 
-            self._record_generation += 1
-            record = VoiceTurnAdmissionRecord(
-                turn_token=turn_token,
-                record_generation=self._record_generation,
-                provider_binding_state=ProviderBindingState.BOUND,
-                candidate_binding_state=CandidateBindingState.BOUND,
-                capture_state=CaptureState.COLLECTING,
-                provider_key=provider_key,
-                speaker_lease_token=lease_token,
-                speaker_candidate=lease.candidate,
-            )
+            if existing is None:
+                self._record_generation += 1
+                record = VoiceTurnAdmissionRecord(
+                    turn_token=turn_token,
+                    record_generation=self._record_generation,
+                    provider_binding_state=ProviderBindingState.BOUND,
+                    candidate_binding_state=CandidateBindingState.BOUND,
+                    capture_state=CaptureState.COLLECTING,
+                    provider_key=provider_key,
+                    speaker_lease_token=lease_token,
+                    speaker_candidate=lease.candidate,
+                )
+            else:
+                record = replace(
+                    existing,
+                    logical_revision=existing.logical_revision + 1,
+                    provider_binding_state=ProviderBindingState.BOUND,
+                    candidate_binding_state=CandidateBindingState.BOUND,
+                    capture_state=CaptureState.COLLECTING,
+                    provider_key=provider_key,
+                    speaker_lease_token=lease_token,
+                    speaker_candidate=lease.candidate,
+                )
+            if terminal_parent:
+                record = self._inherit_terminal_speaker_lease(record, lease)
             self._speaker_leases[lease_token] = updated_lease
             self._records[turn_token] = record
             self._provider_speaker_lease_bindings[provider_key] = expected_binding
             return record
+
+    @staticmethod
+    def _terminal_parent_child_is_exact(
+        record: VoiceTurnAdmissionRecord,
+        lease: SpeakerCaptureLeaseRecord,
+    ) -> bool:
+        if lease.state is SpeakerLeaseState.ALLOW:
+            return bool(
+                record.capture_state is CaptureState.COLLECTING
+                and record.evidence_state is EvidenceState.ALLOW
+                and record.last_speaker_sequence_no == 1
+            )
+        if lease.state is SpeakerLeaseState.UNAVAILABLE:
+            return bool(
+                record.capture_state is CaptureState.UNAVAILABLE
+                and record.evidence_state is EvidenceState.UNAVAILABLE
+                and record.rejection_apply_state is RejectionApplyState.STALE
+                and record.last_speaker_sequence_no == 1
+            )
+        if lease.state is SpeakerLeaseState.DENY_LATCHED:
+            return bool(
+                record.capture_state is CaptureState.COLLECTING
+                and record.evidence_state is EvidenceState.DENY_LATCHED
+                and record.last_speaker_sequence_no == 2
+            )
+        return False
+
+    @staticmethod
+    def _terminal_parent_attach_is_effect_free(
+        record: VoiceTurnAdmissionRecord,
+    ) -> bool:
+        """Return whether terminal inheritance can emit no hidden effects."""
+
+        return bool(
+            record.boundary_state is BoundaryState.OPEN
+            and record.evidence_state is EvidenceState.NONE
+            and record.rejection_apply_state is RejectionApplyState.NOT_STARTED
+            and record.micro_event_state is MicroEventState.NOT_APPLICABLE
+            and record.provider_final_state is ProviderFinalState.NOT_RECEIVED
+            and record.admission_state is AdmissionState.RESERVED
+            and record.operation_nonce_sequence == 0
+            and record.core_settlement_state is SettlementState.NOT_STARTED
+            and record.transport_settlement_state is SettlementState.NOT_STARTED
+            and record.lifecycle_settlement_state is SettlementState.NOT_STARTED
+            and record.rejection_capability is None
+            and record.pending_final is None
+            and record.resolution_ticket is None
+            and record.last_speaker_sequence_no == 0
+            and record.capture_through_sequence_no is None
+            and not record.micro_event_shadow_would_suppress
+            and not record.micro_event_terminal_counted
+            and record.rejection_operation_nonce is None
+            and record.rejection_operation_capability_id is None
+            and record.rejection_operation_owner_generation is None
+            and record.rejection_operation_kind is None
+            and record.revoked_rejection_ticket is None
+            and record.revoked_rejection_capability is None
+            and not record.pending_revocations
+            and not record.revocation_degraded
+            and record.namespace_poison_ticket is None
+            and record.deadline_operation_nonce is None
+            and not record.provider_boundary_deadline_expired
+            and record.partial_settlement_disposition is None
+            and not record.speaker_deny_cleanup_failed_counted
+        )
+
+    @staticmethod
+    def _inherit_terminal_speaker_lease(
+        record: VoiceTurnAdmissionRecord,
+        lease: SpeakerCaptureLeaseRecord,
+    ) -> VoiceTurnAdmissionRecord:
+        """Project one terminal parent verdict without duplicating its effects."""
+
+        if lease.state is SpeakerLeaseState.ALLOW:
+            return replace(
+                record,
+                logical_revision=record.logical_revision + 1,
+                evidence_state=EvidenceState.ALLOW,
+                last_speaker_sequence_no=1,
+            )
+        if lease.state is SpeakerLeaseState.UNAVAILABLE:
+            return replace(
+                record,
+                logical_revision=record.logical_revision + 1,
+                capture_state=CaptureState.UNAVAILABLE,
+                evidence_state=EvidenceState.UNAVAILABLE,
+                rejection_apply_state=RejectionApplyState.STALE,
+                last_speaker_sequence_no=1,
+            )
+        if lease.state is SpeakerLeaseState.DENY_LATCHED:
+            return replace(
+                record,
+                logical_revision=record.logical_revision + 1,
+                evidence_state=EvidenceState.DENY_LATCHED,
+                last_speaker_sequence_no=2,
+            )
+        raise AdmissionIdentityError("ASR_ADMISSION_TERMINAL_BINDING_CONFLICT")
+
+    async def detach_turn_from_speaker_lease(
+        self,
+        turn_token: VoiceTurnToken,
+        lease_token: SpeakerCaptureLeaseToken,
+        provider_key: ProviderUtteranceKey,
+    ) -> bool:
+        """Compensate one exact child attach before any final or side effect."""
+
+        if type(turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+        async with self._lock:
+            lease = self._speaker_leases.get(lease_token)
+            record = self._records.get(turn_token)
+            binding = SpeakerLeaseChildBinding(provider_key, turn_token)
+            provider_binding = self._provider_speaker_lease_bindings.get(provider_key)
+            expected_provider_binding = (lease_token, turn_token)
+            binding_count = (
+                lease.child_bindings.count(binding) if lease is not None else 0
+            )
+
+            if record is None and provider_binding is None and binding_count == 0:
+                return False
+            if lease is None:
+                raise AdmissionIdentityError("ASR_ADMISSION_DETACH_IDENTITY_CONFLICT")
+            pending_projection_exact = bool(
+                lease.state
+                in {SpeakerLeaseState.COLLECTING, SpeakerLeaseState.FIRST_LOW}
+                and record is not None
+                and record.capture_state is CaptureState.COLLECTING
+                and record.evidence_state is EvidenceState.NONE
+                and record.rejection_apply_state is RejectionApplyState.NOT_STARTED
+                and record.last_speaker_sequence_no == 0
+            )
+            terminal_projection_exact = bool(
+                record is not None
+                and self._terminal_parent_child_is_exact(record, lease)
+            )
+            if (
+                record is None
+                or record.turn_token != turn_token
+                or record.provider_binding_state is not ProviderBindingState.BOUND
+                or record.candidate_binding_state is not CandidateBindingState.BOUND
+                or record.provider_key != provider_key
+                or record.speaker_lease_token != lease_token
+                or record.speaker_candidate != lease.candidate
+                or self._speaker_candidate_bindings.get(lease.candidate) != lease_token
+                or provider_binding != expected_provider_binding
+                or binding_count != 1
+                or not (pending_projection_exact or terminal_projection_exact)
+            ):
+                raise AdmissionIdentityError("ASR_ADMISSION_DETACH_IDENTITY_CONFLICT")
+
+            side_effect_free = bool(
+                record.terminal_disposition is None
+                and record.boundary_state is BoundaryState.OPEN
+                and record.micro_event_state is MicroEventState.NOT_APPLICABLE
+                and record.provider_final_state is ProviderFinalState.NOT_RECEIVED
+                and record.admission_state is AdmissionState.RESERVED
+                and record.operation_nonce_sequence == 0
+                and record.core_settlement_state is SettlementState.NOT_STARTED
+                and record.transport_settlement_state is SettlementState.NOT_STARTED
+                and record.lifecycle_settlement_state is SettlementState.NOT_STARTED
+                and record.rejection_capability is None
+                and record.pending_final is None
+                and record.resolution_ticket is None
+                and record.capture_through_sequence_no is None
+                and not record.micro_event_shadow_would_suppress
+                and not record.micro_event_terminal_counted
+                and record.rejection_operation_nonce is None
+                and record.rejection_operation_capability_id is None
+                and record.rejection_operation_owner_generation is None
+                and record.rejection_operation_kind is None
+                and record.revoked_rejection_ticket is None
+                and record.revoked_rejection_capability is None
+                and not record.pending_revocations
+                and not record.revocation_degraded
+                and record.namespace_poison_ticket is None
+                and record.deadline_operation_nonce is None
+                and not record.provider_boundary_deadline_expired
+                and record.partial_settlement_disposition is None
+                and not record.speaker_deny_cleanup_failed_counted
+            )
+            if not side_effect_free:
+                raise AdmissionIdentityError("ASR_ADMISSION_DETACH_ALREADY_COMMITTED")
+
+            self._speaker_leases[lease_token] = replace(
+                lease,
+                logical_revision=lease.logical_revision + 1,
+                child_bindings=tuple(
+                    child for child in lease.child_bindings if child != binding
+                ),
+            )
+            self._records.pop(turn_token)
+            self._provider_speaker_lease_bindings.pop(provider_key)
+            return True
 
     async def post_speaker_lease(
         self,

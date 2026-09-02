@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +18,7 @@ from main_logic.asr_client.admission.contracts import (
     PendingProviderFinal,
     ProviderFinalReceived,
     ResolveReserved,
+    SpeakerCaptureLeaseToken,
     SpeakerCheckpointKind,
     SpeakerLow,
     TransportSettled,
@@ -51,11 +53,13 @@ async def test_provider_namespace_reset_retires_every_owned_proof() -> None:
     runtime._asr_provider_correlator = correlator
     runtime._asr_provider_correlator_namespace = (1, 2)
     runtime._asr_provider_boundary_proofs = {proof.proof_id: snapshot}
-    runtime._asr_detector = object()
+    runtime._asr_detector = MagicMock()
     runtime._asr_admission_effect_tasks = set()
     runtime._asr_admission_effect_task_turns = {}
     runtime._asr_sealed_provider_key = None
     runtime._asr_provider_exact_session = None
+    runtime._asr_provider_started_turns = {}
+    runtime._asr_deferred_provider_started_keys = deque()
 
     retirement_entered = asyncio.Event()
     retirement_release = asyncio.Event()
@@ -105,6 +109,8 @@ async def test_provider_namespace_retirement_counts_actual_proof_ownership_once(
     runtime._asr_admission_effect_task_turns = {}
     runtime._asr_sealed_provider_key = None
     runtime._asr_provider_exact_session = None
+    runtime._asr_provider_started_turns = {}
+    runtime._asr_deferred_provider_started_keys = deque()
     runtime._speaker_rejection_metrics = runtime_module._new_speaker_rejection_metrics()
     runtime._admission_effect_done = runtime._asr_admission_effect_tasks.discard
 
@@ -131,9 +137,12 @@ async def test_speaker_alias_is_retained_until_capture_closed_is_queued() -> Non
     )
     runtime._ensure_asr_runtime_state = lambda: None
     runtime._speaker_verifier_activation_generation = "verifier"
-    runtime._asr_detector = object()
+    runtime._speaker_verifier_enforces_admission = True
+    runtime._asr_terminal_close_requested = False
+    runtime._asr_detector = MagicMock()
     runtime._asr_admission_ingress_started = True
     runtime._asr_admission_candidate_turns = {candidate: turn_token}
+    runtime._asr_admission_candidate_leases = {}
     runtime._asr_admission_effect_tasks = set()
     runtime._asr_admission_effect_task_turns = {}
     runtime._admission_effect_done = runtime._asr_admission_effect_tasks.discard
@@ -298,8 +307,17 @@ async def test_provider_final_callback_waits_only_admission_settlement() -> None
     runtime._asr_sealed_provider_key = key
     runtime._asr_provider_correlator = MagicMock()
     runtime._asr_provider_correlator.is_completed.return_value = False
+    runtime._asr_provider_started_turns = {}
+    runtime._asr_provider_speaker_evidence_lease = None
+    runtime._asr_detector = None
     runtime._accept_provider_timeline = MagicMock(return_value=True)
-    runtime._handle_independent_asr_final = AsyncMock(return_value=settlement)
+
+    async def wait_for_settlement(*_args, **_kwargs) -> None:
+        await settlement.wait()
+
+    runtime._handle_independent_asr_final = AsyncMock(
+        side_effect=wait_for_settlement
+    )
 
     callback = asyncio.create_task(
         runtime._handle_provider_final(
@@ -329,6 +347,12 @@ async def test_old_route_settlement_cannot_clear_new_provider_owner() -> None:
     )
     old_key = ProviderUtteranceKey(1, 1, 1)
     new_key = ProviderUtteranceKey(2, 2, 1)
+    new_turn = VoiceTurnToken(
+        VoiceIngressToken(2, "new", 2, 2, 2),
+        1,
+    )
+    old_lease = SpeakerCaptureLeaseToken(1, 1, 1, 1, 1)
+    new_lease = SpeakerCaptureLeaseToken(2, 2, 2, 2, 2)
     old_correlator = MagicMock()
     old_correlator.complete.return_value = SimpleNamespace(
         completed=True,
@@ -338,9 +362,22 @@ async def test_old_route_settlement_cannot_clear_new_provider_owner() -> None:
     runtime._asr_smart_turn_lease = None
     runtime._asr_provider_correlator = MagicMock()
     runtime._asr_sealed_provider_key = new_key
+    runtime._asr_provider_started_turns = {old_key: new_turn}
+    runtime._asr_admission_turn_leases = {old_turn: old_lease}
+    runtime._asr_admission_candidate_leases = {}
+    runtime._asr_current_speaker_candidate = None
+    runtime._asr_current_speaker_lease = None
+    runtime._asr_admission_ingress = MagicMock()
+    runtime._asr_admission_ingress.retire_speaker_lease = AsyncMock()
     runtime._send_asr_lifecycle_state = AsyncMock(return_value=False)
     runtime._post_admission_event = AsyncMock()
-    runtime._retire_admission_boundary_proofs = AsyncMock()
+
+    async def replace_lease_owner(*_args, **_kwargs) -> None:
+        runtime._asr_admission_turn_leases[old_turn] = new_lease
+
+    runtime._retire_admission_boundary_proofs = AsyncMock(
+        side_effect=replace_lease_owner
+    )
     context = runtime_module._AdmissionFinalContext(
         turn_token=old_turn,
         final_key=FinalKey.from_turn(old_turn),
@@ -365,8 +402,11 @@ async def test_old_route_settlement_cannot_clear_new_provider_owner() -> None:
     await runtime._settle_admission_final(ticket, context)
 
     assert runtime._asr_sealed_provider_key == new_key
+    assert runtime._asr_provider_started_turns == {old_key: new_turn}
+    assert runtime._asr_admission_turn_leases[old_turn] == new_lease
     old_correlator.complete.assert_called_once_with(old_key, ticket)
     runtime._asr_provider_correlator.complete.assert_not_called()
+    runtime._asr_admission_ingress.retire_speaker_lease.assert_not_awaited()
     runtime._send_asr_lifecycle_state.assert_not_awaited()
 
 
