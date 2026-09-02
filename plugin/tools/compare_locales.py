@@ -13,7 +13,6 @@ EXPECTED_LOCALES = ("en", "ja", "ko", "zh-CN", "zh-TW", "ru", "es", "pt")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _REQUIRED_LOCALE_DIRS = (
     "static/locales",
-    "plugin/plugins/galgame_plugin/i18n",
 )
 _REQUIRED_LOCALE_DIR_SET = frozenset(_REQUIRED_LOCALE_DIRS)
 
@@ -153,7 +152,7 @@ def _is_default_required_dir(root: Path, locale_dir: Path) -> bool:
         relative = locale_dir.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         # User-supplied directories outside the repo should fail strictly instead of
-        # being downgraded to warnings by the default plugin allowlist.
+        # being downgraded to warnings by the default directory allowlist.
         return True
     return relative in _REQUIRED_LOCALE_DIR_SET
 
@@ -197,7 +196,7 @@ def main() -> int:
     parser.add_argument(
         "--strict-all",
         action="store_true",
-        help="Fail for every scanned locale directory, including non-Galgame plugins.",
+        help="Fail for every scanned plugin locale directory.",
     )
     args = parser.parse_args()
 

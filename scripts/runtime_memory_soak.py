@@ -35,7 +35,6 @@ SYNTHETIC_CHAT_PROMPT = "Reply with exactly OK. This is a synthetic soak probe."
 FEATURE_NAMES = (
     "audio",
     "embedding",
-    "ocr",
     "browser-use",
     "plugin-reload",
     "chat",
@@ -159,44 +158,6 @@ async def _embedding_cycle(args: argparse.Namespace, cycle: int) -> dict[str, An
     }
 
 
-async def _ocr_cycle(args: argparse.Namespace, cycle: int) -> dict[str, Any]:
-    from PIL import Image
-    from plugin.plugins._shared.rapidocr.rapidocr_support import (
-        DEFAULT_RAPIDOCR_ENGINE_TYPE,
-        DEFAULT_RAPIDOCR_LANG_TYPE,
-        DEFAULT_RAPIDOCR_MODEL_TYPE,
-        DEFAULT_RAPIDOCR_OCR_VERSION,
-    )
-    from plugin.plugins.galgame_plugin.ocr_rapidocr_backend import RapidOcrBackend
-
-    backend = RapidOcrBackend(
-        install_target_dir_raw="",
-        engine_type=DEFAULT_RAPIDOCR_ENGINE_TYPE,
-        lang_type=DEFAULT_RAPIDOCR_LANG_TYPE,
-        model_type=DEFAULT_RAPIDOCR_MODEL_TYPE,
-        ocr_version=DEFAULT_RAPIDOCR_OCR_VERSION,
-    )
-    text = ""
-    try:
-        if not backend.is_available():
-            raise FeatureUnavailable("rapidocr_unavailable")
-        text = backend.extract_text(Image.new("RGB", (640, 360), "white"))
-        active = _checkpoint(args, f"cycle_{cycle:04d}_ocr_active")
-    finally:
-        backend.close()
-    synthetic_text_length = len(text)
-    del text, backend
-    released = await _released_checkpoint(args, f"cycle_{cycle:04d}_ocr_released")
-    return {
-        "status": "completed",
-        "details": {
-            "synthetic_input": True,
-            "synthetic_text_length": synthetic_text_length,
-        },
-        "checkpoints": [active, released],
-    }
-
-
 async def _browser_cycle(args: argparse.Namespace, cycle: int) -> dict[str, Any]:
     from brain.browser_use_adapter import BrowserUseAdapter
 
@@ -303,7 +264,6 @@ FEATURE_RUNNERS: dict[
 ] = {
     "audio": _audio_cycle,
     "embedding": _embedding_cycle,
-    "ocr": _ocr_cycle,
     "browser-use": _browser_cycle,
     "plugin-reload": _plugin_cycle,
     "chat": _chat_cycle,

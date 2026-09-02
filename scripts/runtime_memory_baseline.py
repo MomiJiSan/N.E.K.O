@@ -472,10 +472,7 @@ def _runtime_resource_counts() -> dict[str, Any]:
     )
 
     seen_caches: set[int] = set()
-    for module_name in (
-        "plugin.plugins._shared.rapidocr.ocr_runtime_types",
-        "plugin.plugins.galgame_plugin.ocr_runtime_types",
-    ):
+    for module_name in ("plugin.plugins._shared.rapidocr.ocr_runtime_types",):
         runtime_types = sys.modules.get(module_name)
         if runtime_types is None:
             continue
@@ -693,66 +690,6 @@ async def _embedding_scenario(args: argparse.Namespace) -> dict[str, Any]:
             "model_root": str(Path(args.embedding_root).resolve()),
             "vector_dimensions": vector_dimensions,
         },
-        "checkpoints": checkpoints,
-    }
-
-
-async def _ocr_scenario(args: argparse.Namespace) -> dict[str, Any]:
-    checkpoints = [
-        _in_process_checkpoint(
-            "python_baseline",
-            seconds=args.window,
-            interval=args.interval,
-        )
-    ]
-    from PIL import Image
-    from plugin.plugins._shared.rapidocr.rapidocr_support import (
-        DEFAULT_RAPIDOCR_ENGINE_TYPE,
-        DEFAULT_RAPIDOCR_LANG_TYPE,
-        DEFAULT_RAPIDOCR_MODEL_TYPE,
-        DEFAULT_RAPIDOCR_OCR_VERSION,
-    )
-    from plugin.plugins.galgame_plugin.ocr_rapidocr_backend import RapidOcrBackend
-
-    backend = RapidOcrBackend(
-        install_target_dir_raw="",
-        engine_type=DEFAULT_RAPIDOCR_ENGINE_TYPE,
-        lang_type=DEFAULT_RAPIDOCR_LANG_TYPE,
-        model_type=DEFAULT_RAPIDOCR_MODEL_TYPE,
-        ocr_version=DEFAULT_RAPIDOCR_OCR_VERSION,
-    )
-    available = backend.is_available()
-    checkpoints.append(
-        _in_process_checkpoint(
-            "ocr_imported",
-            seconds=args.window,
-            interval=args.interval,
-        )
-    )
-    if not available:
-        raise RuntimeError("RapidOCR backend is not available")
-    text = backend.extract_text(Image.new("RGB", (640, 360), "white"))
-    checkpoints.append(
-        _in_process_checkpoint(
-            "ocr_ready_after_first_inference",
-            seconds=args.window,
-            interval=args.interval,
-        )
-    )
-    synthetic_text_length = len(text)
-    backend.close()
-    del text, backend
-    checkpoints.append(
-        _in_process_checkpoint(
-            "ocr_released",
-            seconds=args.window,
-            interval=args.interval,
-            collect=True,
-        )
-    )
-    return {
-        "scenario": "ocr",
-        "ocr": {"available": available, "synthetic_text_length": synthetic_text_length},
         "checkpoints": checkpoints,
     }
 
@@ -1405,7 +1342,7 @@ def _build_parser() -> argparse.ArgumentParser:
     scenario = subparsers.add_parser(
         "scenario", help="Run an in-process lazy feature scenario"
     )
-    scenario.add_argument("name", choices=("embedding", "ocr", "browser-use"))
+    scenario.add_argument("name", choices=("embedding", "browser-use"))
     scenario.add_argument("--embedding-root", default="data/embedding_models")
     scenario.add_argument("--headed", action="store_true")
 
@@ -1451,8 +1388,6 @@ def main(argv: list[str] | None = None) -> int:
         tracemalloc.start(10)
         if args.name == "embedding":
             result = asyncio.run(_embedding_scenario(args))
-        elif args.name == "ocr":
-            result = asyncio.run(_ocr_scenario(args))
         else:
             result = asyncio.run(_browser_scenario(args))
     else:

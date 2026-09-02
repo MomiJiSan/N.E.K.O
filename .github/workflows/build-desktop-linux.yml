@@ -108,7 +108,7 @@ jobs:
           # [project.dependencies] now — plain `uv sync` covers both the
           # build-time prepare step and the bundled runtime.
           # `--group galgame` adds rapidocr-onnxruntime + opencv-python-headless
-          # for the bundled OCR backend; pyproject's [tool.uv].override-dependencies
+          # for marketplace plugin OCR; pyproject's [tool.uv].override-dependencies
           # blocks opencv-python (full) so only the headless cv2 ships.
           uv sync --group galgame
           uv pip install --python .venv nuitka ordered-set zstandard
@@ -328,6 +328,14 @@ jobs:
           # Mirrors build-desktop.yml.
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=onnxruntime.transformers"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=tokenizers"
+          # Native OCR and screen-capture runtime for marketplace plugins.
+          # These plugins are installed after packaging, so Nuitka cannot infer
+          # their dynamic imports from the source tree.
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=rapidocr_onnxruntime"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package-data=rapidocr_onnxruntime"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=pyclipper"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=mss"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=Xlib"
 
           # Package data
           NUITKA_OPTS="$NUITKA_OPTS --include-package-data=audiolab"
@@ -341,9 +349,6 @@ jobs:
           NUITKA_OPTS="$NUITKA_OPTS --include-package-data=bilibili_api"
 
           # Exclusions
-          # galgame_plugin/training is offline-only model-training code and is
-          # not governed by a top-level plugin [tool.neko.build] rule.
-          NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=plugin.plugins.galgame_plugin.training"
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=audiolab"
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=pyrnnoise"
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=matplotlib"

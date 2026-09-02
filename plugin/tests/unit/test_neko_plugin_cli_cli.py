@@ -68,6 +68,29 @@ def _tamper_package(package_path: Path, target_name: str) -> None:
             dst.writestr(info, data)
 
 
+def _append_install_declaration(
+    plugin_dir: Path,
+    *,
+    ui_i18n_dir: str = "i18n/ui",
+    timeout: str = "600.0",
+) -> None:
+    (plugin_dir / "i18n" / "ui").mkdir(parents=True, exist_ok=True)
+    manifest_path = plugin_dir / "plugin.toml"
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8")
+        + "\n[plugin.install]\n"
+        + "enabled = true\n"
+        + f'ui_i18n_dir = "{ui_i18n_dir}"\n'
+        + "tutorial_enabled = true\n"
+        + "\n[plugin.install.kinds.rapidocr_models]\n"
+        + 'entry_id = "cli_demo_download_rapidocr_models"\n'
+        + 'label = "RapidOCR Models"\n'
+        + 'queued_message = "RapidOCR model download queued"\n'
+        + f"entry_timeout = {timeout}\n",
+        encoding="utf-8",
+    )
+
+
 def test_cli_runtime_install_is_disabled_without_writing_plugin_directories(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -339,6 +362,81 @@ def test_validate_plugin_dir_reports_invalid_toml_without_crashing(tmp_path: Pat
     issues = validate_plugin_dir(plugin_dir)
 
     assert any(level == "error" and "plugin.toml could not be read" in message for level, message in issues)
+
+
+def test_validate_plugin_dir_accepts_install_declaration_and_i18n_directory(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    _append_install_declaration(plugin_dir)
+
+    issues = validate_plugin_dir(plugin_dir)
+
+    assert not any(level == "error" and "install" in message for level, message in issues)
+    assert not any("[plugin].install is not a recognized" in message for _level, message in issues)
+
+
+@pytest.mark.parametrize("ui_i18n_dir", ["../outside", "/absolute/i18n"])
+def test_validate_plugin_dir_rejects_install_i18n_escape(
+    tmp_path: Path,
+    ui_i18n_dir: str,
+) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    _append_install_declaration(plugin_dir, ui_i18n_dir=ui_i18n_dir)
+
+    issues = validate_plugin_dir(plugin_dir)
+
+    assert any(
+        level == "error" and "ui_i18n_dir" in message
+        for level, message in issues
+    )
+
+
+def test_validate_plugin_dir_rejects_missing_install_i18n_directory(tmp_path: Path) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    _append_install_declaration(plugin_dir, ui_i18n_dir="missing-i18n")
+
+    issues = validate_plugin_dir(plugin_dir)
+
+    assert any(
+        level == "error" and "ui_i18n_dir" in message
+        for level, message in issues
+    )
+
+
+def test_validate_plugin_dir_rejects_install_i18n_symlink_escape(tmp_path: Path) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    outside = tmp_path / "outside-i18n"
+    outside.mkdir()
+    link = plugin_dir / "linked-i18n"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    _append_install_declaration(plugin_dir, ui_i18n_dir="linked-i18n")
+
+    issues = validate_plugin_dir(plugin_dir)
+
+    assert any(
+        level == "error" and "ui_i18n_dir" in message
+        for level, message in issues
+    )
+
+
+@pytest.mark.parametrize("timeout", ["true", "0", "-1", '"600"', "nan", "inf"])
+def test_validate_plugin_dir_rejects_invalid_install_timeout(
+    tmp_path: Path,
+    timeout: str,
+) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    _append_install_declaration(plugin_dir, timeout=timeout)
+
+    issues = validate_plugin_dir(plugin_dir)
+
+    assert any(
+        level == "error" and "entry_timeout" in message
+        for level, message in issues
+    )
 
 
 def test_validate_plugin_dir_reports_invalid_config_example_without_crashing(tmp_path: Path) -> None:

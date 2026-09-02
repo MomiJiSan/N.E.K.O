@@ -153,31 +153,43 @@ def test_dist_check_matches_stage_and_allows_shared_directory(tmp_path: Path) ->
     assert "unstaged file" in issues[0]
 
 
-def test_nuitka_dist_rejects_marketplace_only_plugin(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "marketplace_only_id",
+    ["neko_warthunder", "galgame_plugin", "study_companion"],
+)
+def test_nuitka_dist_rejects_marketplace_only_plugin(
+    tmp_path: Path,
+    marketplace_only_id: str,
+) -> None:
     dist_root = tmp_path / "dist"
     _write(
         dist_root / "plugin" / "plugins" / "demo" / "plugin.toml",
         '[plugin]\nid = "demo"\n',
     )
     _write(
-        dist_root / "plugin" / "plugins" / "neko_warthunder" / "plugin.toml",
-        '[plugin]\nid = "neko_warthunder"\n',
+        dist_root / "plugin" / "plugins" / marketplace_only_id / "plugin.toml",
+        f'[plugin]\nid = "{marketplace_only_id}"\n',
     )
 
     issues = _check_plugin_tomls(dist_root)
 
     assert issues == [
-        "marketplace-only plugin bundled: plugin/plugins/neko_warthunder"
+        f"marketplace-only plugin bundled: plugin/plugins/{marketplace_only_id}"
     ]
 
 
+@pytest.mark.parametrize(
+    "marketplace_only_id",
+    ["neko_warthunder", "galgame_plugin", "study_companion"],
+)
 def test_nuitka_dist_rejects_marketplace_only_manifest_id_after_directory_rename(
     tmp_path: Path,
+    marketplace_only_id: str,
 ) -> None:
     dist_root = tmp_path / "dist"
     _write(
         dist_root / "plugin" / "plugins" / "renamed_war_thunder" / "plugin.toml",
-        '[plugin]\nid = "neko_warthunder"\n',
+        f'[plugin]\nid = "{marketplace_only_id}"\n',
     )
 
     assert _check_plugin_tomls(dist_root) == [
@@ -239,7 +251,23 @@ def test_desktop_workflows_use_filtered_plugin_stage() -> None:
         assert "--include-data-dir=plugin/plugins=plugin/plugins" not in workflow
         assert 'NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=plugin.plugins"' not in workflow
         assert "set NUITKA_OPTS=%NUITKA_OPTS% --nofollow-import-to=plugin.plugins" not in workflow_lines
-        assert "--nofollow-import-to=plugin.plugins.galgame_plugin.training" in workflow
+        assert "--nofollow-import-to=plugin.plugins.galgame_plugin.training" not in workflow
+
+
+def test_linux_desktop_workflow_bundles_marketplace_plugin_runtime_dependencies() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow = (
+        repo_root / ".github" / "workflows" / "build-desktop-linux.yml"
+    ).read_text(encoding="utf-8")
+
+    for option in (
+        "--include-package=rapidocr_onnxruntime",
+        "--include-package-data=rapidocr_onnxruntime",
+        "--include-package=pyclipper",
+        "--include-package=mss",
+        "--include-package=Xlib",
+    ):
+        assert option in workflow
 
 
 def test_prepare_helper_is_directly_executable_without_pythonpath(tmp_path: Path) -> None:
