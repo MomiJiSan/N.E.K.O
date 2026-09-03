@@ -37,6 +37,7 @@ from main_logic.voice_identity_service.registry import (
 from main_logic.voice_identity_service.service import VoiceIdentityService
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
 from main_routers.debug_router import set_voice_identity_diagnostics_provider
+from utils.preferences import load_global_conversation_settings
 
 
 logger = logging.getLogger(__name__)
@@ -950,11 +951,11 @@ class _UnavailableProfileStore(VoiceIdentityProfileStore):
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    def load(self) -> SpeakerProfile | None:
+    def load(self):
         raise SecureStorageUnavailableError("secure_storage_unavailable")
 
-    def stage(self, profile: SpeakerProfile):
-        del profile
+    def stage(self, profile: SpeakerProfile, *, audio_contract):
+        del profile, audio_contract
         raise SecureStorageUnavailableError("secure_storage_unavailable")
 
     def delete(self) -> bool:
@@ -1010,6 +1011,13 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
         enrollment_ttl_seconds=45.0,
         runtime_status_callback=registry.activation_status,
         speech_validator_factory=SileroEnrollmentSpeechValidator,
+        enrollment_noise_reduction_enabled=(
+            load_global_conversation_settings().get(
+                "noiseReductionEnabled",
+                True,
+            )
+            is not False
+        ),
     )
     install_voice_identity_service_for_app(service)
     _runtime_registry = registry

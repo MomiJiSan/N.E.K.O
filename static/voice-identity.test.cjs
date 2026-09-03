@@ -13,16 +13,22 @@ const template = fs.readFileSync(
     path.join(__dirname, '../templates/voice_identity.html'),
     'utf8',
 );
+const runtimeCaptureSource = fs.readFileSync(
+    path.join(__dirname, 'app/app-audio-capture.js'),
+    'utf8',
+);
 
 const API_ROOT = '/api/voice-identity';
-const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=16000;channels=1';
+const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=48000;channels=1';
+const AUDIO_CONTRACT_ID = 'owner-campplus-desktop-v1';
 const PROFILE_HEADER = 'X-Voice-Identity-Profile';
-const TARGET_SAMPLE_RATE = 16000;
+const TARGET_SAMPLE_RATE = 48000;
 const RECORDING_MS = 3000;
-const CAPTURE_TIMEOUT_MS = RECORDING_MS + 1000;
+const STREAMING_RESAMPLE_MARGIN_MS = 100;
+const CAPTURE_TIMEOUT_MS = RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS + 1000;
 const WINDOW_CLOSE_START_WAIT_MS = 500;
-const TARGET_SAMPLES = TARGET_SAMPLE_RATE * RECORDING_MS / 1000;
-const CHUNK_SAMPLES = 512;
+const TARGET_SAMPLES = TARGET_SAMPLE_RATE * (RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS) / 1000;
+const CHUNK_SAMPLES = 480;
 const FULL_AUDIO_CHUNKS = Math.ceil(TARGET_SAMPLES / CHUNK_SAMPLES);
 
 function deferred() {
@@ -137,6 +143,9 @@ function createHarness({
     showConfirm,
     nativeConfirm = true,
     webCryptoAvailable = true,
+    selectedMicrophoneId = 'selected-microphone',
+    microphoneGainDb = '6',
+    actualContextSampleRate = TARGET_SAMPLE_RATE,
     initialEffectiveReason = null,
     initialEnrollment = false,
     initialEnrollmentProfileId = null,
@@ -173,7 +182,11 @@ function createHarness({
     const windowListeners = new Map();
     const fetchCalls = [];
     const mediaStreams = [];
+    const mediaRequestConstraints = [];
     const workletModules = [];
+    const workletNodes = [];
+    const gainNodes = [];
+    const audioContextOptions = [];
     let processor = null;
     let mediaRequests = 0;
     let serverProfile = initialProfile;
@@ -314,9 +327,10 @@ function createHarness({
     });
 
     class MockAudioContext {
-        constructor() {
+        constructor(options) {
             audioContext = this;
-            this.sampleRate = 48000;
+            audioContextOptions.push(options);
+            this.sampleRate = actualContextSampleRate;
             this.destination = {};
             this.state = 'suspended';
             this.audioWorklet = {
@@ -331,7 +345,14 @@ function createHarness({
         }
 
         createGain() {
-            return { gain: { value: 1 }, connect() {}, disconnect() {} };
+            const node = {
+                gain: { value: 1 },
+                disconnected: false,
+                connect() {},
+                disconnect() { this.disconnected = true; },
+            };
+            gainNodes.push(node);
+            return node;
         }
 
         async resume() {
@@ -347,14 +368,20 @@ function createHarness({
         constructor(context, name, options) {
             assert.equal(name, 'audio-processor');
             assert.equal(options.processorOptions.originalSampleRate, context.sampleRate);
-            assert.equal(options.processorOptions.targetSampleRate, 16000);
-            this.port = { onmessage: null };
+            assert.equal(options.processorOptions.targetSampleRate, TARGET_SAMPLE_RATE);
+            this.port = {
+                onmessage: null,
+                closed: false,
+                close() { this.closed = true; },
+            };
+            this.disconnected = false;
             processor = this;
+            workletNodes.push(this);
         }
 
         connect() {}
 
-        disconnect() {}
+        disconnect() { this.disconnected = true; }
     }
 
     const window = {
@@ -368,6 +395,7 @@ function createHarness({
                 'voiceIdentity.profileSavedDisabled': 'Owner voice profile is saved; filtering is off',
                 'voiceIdentity.reasonRuntimeDegraded': 'Voice filtering is unavailable',
                 'voiceIdentity.reasonModelUnavailable': 'Prepare the voice model assets or repair the installation',
+                'voiceIdentity.reasonAudioContractMismatch': 'Restore the enrolled noise-reduction setting or re-enroll',
                 'voiceIdentity.reasonSecureStorageUnavailable': 'Secure storage is unavailable',
                 'voiceIdentity.recording': 'Recording...',
                 'voiceIdentity.saving': 'Saving...',
@@ -437,6 +465,14 @@ function createHarness({
                 return values;
             },
         } : undefined,
+        localStorage: {
+            values: new Map([
+                ['neko_selected_microphone', selectedMicrophoneId],
+                ['neko_mic_gain_db', microphoneGainDb],
+            ].filter(([, value]) => value !== null)),
+            getItem(key) { return this.values.has(key) ? this.values.get(key) : null; },
+            removeItem(key) { this.values.delete(key); },
+        },
     };
 
     const context = {
@@ -444,10 +480,13 @@ function createHarness({
         document,
         navigator: {
             mediaDevices: {
-                async getUserMedia() {
+                async getUserMedia(constraints) {
                     mediaRequests += 1;
+                    mediaRequestConstraints.push(constraints);
                     if (mediaGate) await mediaGate.promise;
-                    if (mediaError) throw mediaError;
+                    const currentMediaError = typeof mediaError === 'function'
+                        ? mediaError(mediaRequests) : mediaError;
+                    if (currentMediaError) throw currentMediaError;
                     const track = { stopped: false, stop() { this.stopped = true; } };
                     const stream = { getTracks: () => [track], track };
                     mediaStreams.push(stream);
@@ -486,7 +525,12 @@ function createHarness({
         elements,
         fetchCalls,
         mediaStreams,
+        mediaRequestConstraints,
         workletModules,
+        workletNodes,
+        gainNodes,
+        audioContextOptions,
+        localStorage: window.localStorage,
         getAudioContext() {
             return audioContext;
         },
@@ -580,15 +624,84 @@ test('one click requests permission once and PUTs four independent three-second 
         assert.equal(upload.options.method, 'PUT');
         assert.equal(upload.options.body.byteLength, TARGET_SAMPLES * 2);
         assert.equal(upload.options.headers.get('content-type'), PCM_CONTENT_TYPE);
+        assert.equal(upload.options.headers.get('x-voice-audio-contract'), AUDIO_CONTRACT_ID);
         assert.equal(upload.options.headers.get('x-voice-identity-enrollment'), 'enrollment-1');
         assert.equal(upload.options.headers.get('x-voice-identity-profile'), 'profile-1');
         assert.equal(upload.options.headers.get('x-voice-identity-segment'), String(offset + 1));
     }
     assert.equal(harness.mediaRequests, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(harness.mediaRequestConstraints)), [{
+        audio: {
+            noiseSuppression: false,
+            echoCancellation: true,
+            autoGainControl: true,
+            channelCount: 1,
+            deviceId: { exact: 'selected-microphone' },
+        },
+        video: false,
+    }]);
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(harness.audioContextOptions)),
+        [{ sampleRate: TARGET_SAMPLE_RATE }],
+    );
     assert.deepEqual(harness.workletModules, ['/static/audio-processor.js']);
+    assert.equal(harness.workletNodes.length, 4);
+    assert.equal(harness.workletNodes.every(node => node.port.closed && node.disconnected), true);
+    assert.equal(harness.gainNodes.length, 8);
+    for (let index = 0; index < harness.gainNodes.length; index += 2) {
+        assert.ok(Math.abs(harness.gainNodes[index].gain.value - Math.pow(10, 6 / 20)) < 1e-12);
+        assert.equal(harness.gainNodes[index + 1].gain.value, 0);
+        assert.equal(harness.gainNodes[index].disconnected, true);
+        assert.equal(harness.gainNodes[index + 1].disconnected, true);
+    }
     assert.equal(harness.mediaStreams[0].track.stopped, true);
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment complete.');
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+});
+
+test('a non-48k AudioContext is rejected before creating an enrollment', async () => {
+    const harness = createHarness({ actualContextSampleRate: 44100 });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/start`),
+        false,
+    );
+    assert.equal(harness.getAudioContext().state, 'closed');
+    assert.equal(harness.mediaStreams[0].track.stopped, true);
+    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Microphone unavailable.');
+});
+
+test('an unavailable saved device falls back to runtime default constraints', async () => {
+    const unavailable = new Error('missing');
+    unavailable.name = 'NotFoundError';
+    const harness = createHarness({
+        mediaError: requestNumber => requestNumber === 1 ? unavailable : null,
+    });
+    await harness.initialize();
+    await harness.emit('voice-identity-start');
+
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(harness.mediaRequestConstraints[0].audio.deviceId)),
+        { exact: 'selected-microphone' },
+    );
+    assert.deepEqual(JSON.parse(JSON.stringify(harness.mediaRequestConstraints[1])), {
+        audio: {
+            noiseSuppression: false,
+            echoCancellation: true,
+            autoGainControl: true,
+            channelCount: 1,
+        },
+        video: false,
+    });
+    assert.equal(harness.localStorage.getItem('neko_selected_microphone'), null);
+
+    const defaults = createHarness({ selectedMicrophoneId: null, microphoneGainDb: 'invalid' });
+    await defaults.initialize();
+    await defaults.emit('voice-identity-start');
+    assert.equal(defaults.gainNodes[0].gain.value, 1);
 });
 
 test('lost start response adopts the active server session and keeps one microphone lease', async () => {
@@ -842,6 +955,28 @@ test('model unavailability disables re-enrollment for an existing profile', asyn
     assert.equal(harness.elements.get('voice-identity-delete').disabled, false);
 });
 
+test('audio contract mismatch explains how to restore filtering without producing LOW', async () => {
+    const statusGate = deferred();
+    const harness = createHarness({ initialProfile: true, initialRequested: true, statusGate });
+    const initializing = harness.startInitialization();
+    statusGate.resolve(jsonResponse({
+        requested_enabled: true,
+        effective_enabled: false,
+        effective_reason: 'audio_contract_mismatch',
+        has_profile: true,
+        enrollment: null,
+        profile_generation: 'profile-0',
+        runtime_mode: 'enforce',
+    }));
+    await initializing;
+
+    assert.equal(
+        harness.elements.get('voice-identity-profile-status').textContent,
+        'Restore the enrolled noise-reduction setting or re-enroll',
+    );
+    assert.equal(harness.elements.get('voice-identity-filter').checked, true);
+});
+
 test('late model rejection shows its dedicated enrollment error', async () => {
     const harness = createHarness({ startError: 'model_unavailable' });
     await harness.initialize();
@@ -947,6 +1082,11 @@ test('explicit cancel aborts an active capture and releases the server session',
     ));
     assert.ok(cancel);
     assert.equal(cancel.options.headers.get('x-voice-identity-enrollment'), 'enrollment-1');
+    assert.equal(harness.mediaStreams[0].track.stopped, true);
+    assert.equal(harness.getAudioContext().state, 'closed');
+    assert.equal(harness.workletNodes.length, 1);
+    assert.equal(harness.workletNodes[0].port.closed, true);
+    assert.equal(harness.workletNodes[0].disconnected, true);
     assert.equal(harness.elements.get('voice-identity-start').hidden, false);
 });
 
@@ -1015,5 +1155,40 @@ test('retired bypass endpoints and prompt contracts do not return', () => {
         'voice-identity-record',
     ]) {
         assert.equal(source.includes(retired) || template.includes(retired), false, retired);
+    }
+});
+
+test('web enrollment and Electron runtime keep one desktop microphone contract', () => {
+    for (const constraint of [
+        'noiseSuppression: false',
+        'echoCancellation: true',
+        'autoGainControl: true',
+        'channelCount: 1',
+    ]) {
+        assert.equal(source.includes(constraint), true, constraint);
+        assert.equal(runtimeCaptureSource.includes(constraint), true, constraint);
+    }
+    assert.match(source, /new AudioContextClass\(\{ sampleRate: TARGET_SAMPLE_RATE \}\)/);
+    assert.match(runtimeCaptureSource, /new AudioContext\(\{ sampleRate: 48000 \}\)/);
+    assert.match(source, /targetSampleRate: TARGET_SAMPLE_RATE/);
+    assert.match(runtimeCaptureSource, /const targetSampleRate = isMobile\(\) \? 16000 : 48000/);
+    assert.match(source, /neko_selected_microphone/);
+    assert.match(runtimeCaptureSource, /neko_selected_microphone/);
+    assert.match(source, /neko_mic_gain_db/);
+    assert.match(runtimeCaptureSource, /neko_mic_gain_db/);
+});
+
+test('all supported locales explain an audio-contract mismatch', () => {
+    for (const locale of ['en', 'es', 'ja', 'ko', 'pt', 'ru', 'zh-CN', 'zh-TW']) {
+        const messages = JSON.parse(fs.readFileSync(
+            path.join(__dirname, `locales/${locale}.json`),
+            'utf8',
+        ));
+        assert.equal(
+            typeof messages.voiceIdentity.reasonAudioContractMismatch,
+            'string',
+            locale,
+        );
+        assert.notEqual(messages.voiceIdentity.reasonAudioContractMismatch, '', locale);
     }
 });

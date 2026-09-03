@@ -18,6 +18,13 @@ from main_logic.voice_identity_service.preference_store import (
     VoiceIdentityPreferenceStoreError,
 )
 from main_logic.voice_identity_service.enrollment import EnrollmentSpeechResult
+from main_logic.voice_identity_service.audio_contract import (
+    OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID,
+    desktop_audio_contract_snapshot,
+)
+from main_logic.voice_identity_service.enrollment_audio import (
+    EnrollmentAudioNormalizationError,
+)
 from main_logic.voice_identity_service.profile_store import (
     SecureStorageUnavailableError,
     VoiceIdentityProfileCorruptError,
@@ -99,6 +106,30 @@ class _SpeechValidator:
         self.closed = True
 
 
+class _AudioNormalizer:
+    def __init__(self, nr_enabled: bool, *, failure_code: str | None = None) -> None:
+        self.nr_enabled = nr_enabled
+        self.failure_code = failure_code
+        self.calls: list[tuple[int, int, int]] = []
+
+    async def normalize(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        target_samples: int,
+    ) -> bytes:
+        self.calls.append((len(pcm16), sample_rate_hz, target_samples))
+        if self.failure_code is not None:
+            raise EnrollmentAudioNormalizationError(self.failure_code)
+        assert sample_rate_hz == 48_000
+        assert target_samples == 48_000
+        required_bytes = target_samples * 2
+        if len(pcm16) < required_bytes:
+            raise EnrollmentAudioNormalizationError("speech_too_short")
+        return pcm16[:required_bytes]
+
+
 def _pcm() -> bytes:
     samples = np.full(48_000, 4_000, dtype="<i2")
     return samples.tobytes()
@@ -123,6 +154,8 @@ def _service(
     model_timeout_seconds: float = 1.0,
     runtime_mode: str = "enforce",
     speech_validator: _SpeechValidator | None = None,
+    audio_normalizer_factory=None,
+    enrollment_noise_reduction_enabled: bool = True,
 ) -> tuple[
     VoiceIdentityService,
     _Model,
@@ -176,7 +209,33 @@ def _service(
         activation_timeout_seconds=1.0,
         runtime_status_callback=(runtime_status if runtime_status_results else None),
         speech_validator_factory=lambda: selected_validator,
+        enrollment_audio_normalizer_factory=(
+            audio_normalizer_factory or _AudioNormalizer
+        ),
+        enrollment_noise_reduction_enabled=enrollment_noise_reduction_enabled,
     )
+
+    production_submit_enrollment_segment = service.submit_enrollment_segment
+
+    async def submit_enrollment_segment(
+        enrollment_id: str,
+        profile_id: str,
+        segment_index: int,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int = 48_000,
+        audio_contract_id: str = OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID,
+    ):
+        return await production_submit_enrollment_segment(
+            enrollment_id,
+            profile_id,
+            segment_index,
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+            audio_contract_id=audio_contract_id,
+        )
+
+    service.submit_enrollment_segment = submit_enrollment_segment  # type: ignore[method-assign]
 
     async def complete_enrollment(
         enrollment_id: str,
@@ -253,6 +312,135 @@ async def test_segment_progress_is_server_owned_idempotent_and_profile_bound(
             _pcm(),
         )
     await service.cancel_enrollment(enrollment.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_segment_requires_explicit_desktop_contract_before_normalization(
+    tmp_path: Path,
+) -> None:
+    normalizers: list[_AudioNormalizer] = []
+
+    def factory(enabled: bool) -> _AudioNormalizer:
+        normalizer = _AudioNormalizer(enabled)
+        normalizers.append(normalizer)
+        return normalizer
+
+    service, _model, _activations, _events = _service(
+        tmp_path,
+        audio_normalizer_factory=factory,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+
+    with pytest.raises(VoiceIdentityServiceError, match="unsupported_audio_contract"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+            sample_rate_hz=44_100,
+            audio_contract_id=OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID,
+        )
+    with pytest.raises(VoiceIdentityServiceError, match="unsupported_audio_contract"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+            sample_rate_hz=48_000,
+            audio_contract_id="owner-campplus-desktop-v0",
+        )
+    with pytest.raises(VoiceIdentityServiceError, match="audio_too_long"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            bytes(48_000 * 4 * 2 + 2),
+        )
+
+    assert normalizers == []
+    assert service.status().enrollment is not None
+    assert service.status().enrollment.next_segment_index == 1
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_each_segment_gets_fresh_normalizer_with_frozen_nr_snapshot(
+    tmp_path: Path,
+) -> None:
+    normalizers: list[_AudioNormalizer] = []
+
+    def factory(enabled: bool) -> _AudioNormalizer:
+        normalizer = _AudioNormalizer(enabled)
+        normalizers.append(normalizer)
+        return normalizer
+
+    service, _model, _activations, _events = _service(
+        tmp_path,
+        audio_normalizer_factory=factory,
+        enrollment_noise_reduction_enabled=False,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+
+    for segment_index in (1, 2):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _pcm(),
+        )
+
+    assert len(normalizers) == 2
+    assert normalizers[0] is not normalizers[1]
+    assert [normalizer.nr_enabled for normalizer in normalizers] == [False, False]
+    assert normalizers[0].calls == [(len(_pcm()), 48_000, 48_000)]
+    assert normalizers[1].calls == [(len(_pcm()), 48_000, 48_000)]
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_normalization_unavailable_never_replaces_existing_profile(
+    tmp_path: Path,
+) -> None:
+    failure_code: list[str | None] = [None]
+
+    def factory(enabled: bool) -> _AudioNormalizer:
+        return _AudioNormalizer(enabled, failure_code=failure_code[0])
+
+    service, model, _activations, _events = _service(
+        tmp_path,
+        audio_normalizer_factory=factory,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    completed = await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+    old_generation = completed.profile_generation
+    old_inference_count = model.inference_count
+
+    failure_code[0] = "audio_processing_unavailable"
+    reenrollment = await service.start_enrollment()
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.submit_enrollment_segment(
+            reenrollment.enrollment_id,
+            "profile-b",
+            1,
+            _pcm(),
+        )
+
+    current = service.status()
+    assert current.state.has_profile
+    assert current.profile_generation == old_generation
+    assert current.enrollment is None
+    assert model.inference_count == old_inference_count
     await service.close()
 
 
@@ -733,10 +921,10 @@ async def test_commit_linearizes_before_concurrent_profile_delete(
     stage_started = threading.Event()
     stage_release = threading.Event()
 
-    def blocking_stage(profile: SpeakerProfile):
+    def blocking_stage(profile: SpeakerProfile, *, audio_contract):
         stage_started.set()
         assert stage_release.wait(1.0)
-        return original_stage(profile)
+        return original_stage(profile, audio_contract=audio_contract)
 
     monkeypatch.setattr(profile_store, "stage", blocking_stage)
     completion = asyncio.create_task(
@@ -965,10 +1153,10 @@ async def test_cancelled_profile_staging_aborts_completed_worker_write(
     stage_started = threading.Event()
     stage_release = threading.Event()
 
-    def blocking_stage(profile: SpeakerProfile):
+    def blocking_stage(profile: SpeakerProfile, *, audio_contract):
         stage_started.set()
         assert stage_release.wait(1.0)
-        return original_stage(profile)
+        return original_stage(profile, audio_contract=audio_contract)
 
     monkeypatch.setattr(profile_store, "stage", blocking_stage)
     completion = asyncio.create_task(
@@ -1128,8 +1316,8 @@ async def test_commit_failure_rolls_back_old_activation_and_profile(
 
     original_stage = service._profile_store.astage  # type: ignore[attr-defined]
 
-    async def staged_with_failed_commit(profile: SpeakerProfile):
-        staged = await original_stage(profile)
+    async def staged_with_failed_commit(profile: SpeakerProfile, *, audio_contract):
+        staged = await original_stage(profile, audio_contract=audio_contract)
         monkeypatch.setattr(staged, "acommit", fail_commit)
         return staged
 
@@ -1880,7 +2068,7 @@ async def test_cancelled_profile_commit_keeps_memory_and_disk_on_new_generation(
     stored = await service._profile_store.aload()  # type: ignore[attr-defined]
     assert stored is not None
     try:
-        assert stored.generation == "profile-b"
+        assert stored.profile.generation == "profile-b"
     finally:
         stored.close()
     await service.close()
@@ -1958,7 +2146,12 @@ async def test_initialize_maps_preference_failure_and_incompatible_profile(
     finally:
         reference.close()
     try:
-        await service._profile_store.asave(profile)  # type: ignore[attr-defined]
+        await service._profile_store.asave(  # type: ignore[attr-defined]
+            profile,
+            audio_contract=desktop_audio_contract_snapshot(
+                noise_reduction_enabled=True,
+            ),
+        )
         await service._preference_store.asave(True)  # type: ignore[attr-defined]
     finally:
         profile.close()
@@ -2004,6 +2197,34 @@ async def test_delete_failure_still_disables_requested_filter(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_runtime_noise_reduction_mismatch_detaches_and_restore_reactivates(
+    tmp_path: Path,
+) -> None:
+    service, _model, activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+
+    assert await service.prepare_runtime_audio_contract_change()
+    mismatched = await service.update_runtime_noise_reduction_enabled(False)
+    assert not mismatched.state.effective_enabled
+    assert mismatched.state.effective_reason == "audio_contract_mismatch"
+    assert activations[-1][0] is None
+
+    assert await service.prepare_runtime_audio_contract_change()
+    restored = await service.update_runtime_noise_reduction_enabled(True)
+    assert restored.state.effective_enabled
+    assert restored.state.effective_reason == "ready"
+    assert activations[-1][0] is not None
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_delete_rolls_back_profile_when_preference_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2031,7 +2252,7 @@ async def test_delete_rolls_back_profile_when_preference_write_fails(
     restored = await service._profile_store.aload()  # type: ignore[attr-defined]
     assert restored is not None
     try:
-        assert restored.generation == "profile-a"
+        assert restored.profile.generation == "profile-a"
     finally:
         restored.close()
     status = service.status()
@@ -2062,7 +2283,8 @@ async def test_delete_revokes_activation_when_profile_rollback_fails(
     async def fail_preference(_enabled: bool) -> None:
         raise VoiceIdentityPreferenceStoreError("write failed")
 
-    async def fail_restore(_profile: SpeakerProfile) -> None:
+    async def fail_restore(_profile: SpeakerProfile, *, audio_contract) -> None:
+        del audio_contract
         raise VoiceIdentityProfileStoreError("restore failed")
 
     monkeypatch.setattr(

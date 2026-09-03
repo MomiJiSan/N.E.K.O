@@ -1,15 +1,23 @@
 (function () {
     'use strict';
 
-    const TARGET_SAMPLE_RATE = 16000;
+    const TARGET_SAMPLE_RATE = 48000;
     const RECORDING_MS = 3000;
+    const STREAMING_RESAMPLE_MARGIN_MS = 100;
     const REQUIRED_SEGMENTS = 4;
     const CAPTURE_TIMEOUT_GRACE_MS = 1000;
     const WINDOW_CLOSE_START_WAIT_MS = 500;
     const SESSION_HEADER = 'X-Voice-Identity-Enrollment';
     const PROFILE_HEADER = 'X-Voice-Identity-Profile';
     const SEGMENT_HEADER = 'X-Voice-Identity-Segment';
-    const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=16000;channels=1';
+    const AUDIO_CONTRACT_HEADER = 'X-Voice-Audio-Contract';
+    const AUDIO_CONTRACT_ID = 'owner-campplus-desktop-v1';
+    const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=48000;channels=1';
+    const SELECTED_MICROPHONE_STORAGE_KEY = 'neko_selected_microphone';
+    const MICROPHONE_GAIN_STORAGE_KEY = 'neko_mic_gain_db';
+    const DEFAULT_MICROPHONE_GAIN_DB = 0;
+    const MIN_MICROPHONE_GAIN_DB = -5;
+    const MAX_MICROPHONE_GAIN_DB = 25;
     const API_ROOT = '/api/voice-identity';
     const READING_PROMPT_KEYS = Object.freeze([
         'voiceIdentity.readingPrompt1', 'voiceIdentity.readingPrompt2',
@@ -37,6 +45,7 @@
         disabled: 'voiceIdentity.reasonDisabled', ready: 'voiceIdentity.profileReady',
         no_profile: 'voiceIdentity.profileMissing', model_unavailable: 'voiceIdentity.reasonModelUnavailable',
         profile_incompatible: 'voiceIdentity.reasonProfileIncompatible',
+        audio_contract_mismatch: 'voiceIdentity.reasonAudioContractMismatch',
         secure_storage_unavailable: 'voiceIdentity.reasonSecureStorageUnavailable',
         enrollment_active: 'voiceIdentity.reasonEnrollmentActive',
         runtime_degraded: 'voiceIdentity.reasonRuntimeDegraded',
@@ -348,16 +357,76 @@
     }
     function render() { renderProfile(); renderEnrollment(); }
 
+    function localStorageValue(key) {
+        try { return window.localStorage ? window.localStorage.getItem(key) : null; }
+        catch (_) { return null; }
+    }
+    function selectedMicrophoneId() {
+        const value = localStorageValue(SELECTED_MICROPHONE_STORAGE_KEY);
+        return typeof value === 'string' && value ? value : null;
+    }
+    function microphoneGain() {
+        const saved = Number.parseFloat(localStorageValue(MICROPHONE_GAIN_STORAGE_KEY));
+        const gainDb = Number.isFinite(saved)
+            && saved >= MIN_MICROPHONE_GAIN_DB && saved <= MAX_MICROPHONE_GAIN_DB
+            ? saved : DEFAULT_MICROPHONE_GAIN_DB;
+        return Math.pow(10, gainDb / 20);
+    }
+    function microphoneConstraints(deviceId) {
+        const audio = {
+            noiseSuppression: false,
+            echoCancellation: true,
+            autoGainControl: true,
+            channelCount: 1
+        };
+        if (deviceId) audio.deviceId = { exact: deviceId };
+        return { audio, video: false };
+    }
+    function selectedMicrophoneFallbackEligible(error) {
+        return Boolean(error && ['NotFoundError', 'OverconstrainedError', 'NotReadableError'].includes(error.name));
+    }
+    async function openMicrophone() {
+        const deviceId = selectedMicrophoneId();
+        if (!deviceId) {
+            return {
+                stream: await navigator.mediaDevices.getUserMedia(microphoneConstraints(null)),
+                fallbackFromSelected: false
+            };
+        }
+        try {
+            return {
+                stream: await navigator.mediaDevices.getUserMedia(microphoneConstraints(deviceId)),
+                fallbackFromSelected: false
+            };
+        } catch (error) {
+            if (!selectedMicrophoneFallbackEligible(error)) throw error;
+            return {
+                stream: await navigator.mediaDevices.getUserMedia(microphoneConstraints(null)),
+                fallbackFromSelected: true
+            };
+        }
+    }
     async function ensureMicrophone() {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('media_devices_unavailable');
-        if (!state.mediaStream) state.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 }, video: false });
+        let fallbackFromSelected = false;
+        if (!state.mediaStream) {
+            const opened = await openMicrophone();
+            state.mediaStream = opened.stream;
+            fallbackFromSelected = opened.fallbackFromSelected;
+        }
         if (!state.audioContext) {
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
             if (!AudioContextClass || typeof AudioWorkletNode !== 'function') throw new Error('audio_worklet_unavailable');
-            const context = new AudioContextClass();
-            try { await context.audioWorklet.addModule('/static/audio-processor.js'); }
+            const context = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
+            try {
+                if (context.sampleRate !== TARGET_SAMPLE_RATE) throw new Error('unsupported_audio_sample_rate');
+                await context.audioWorklet.addModule('/static/audio-processor.js');
+            }
             catch (error) { await context.close(); throw error; }
             state.audioContext = context;
+        }
+        if (fallbackFromSelected) {
+            try { window.localStorage.removeItem(SELECTED_MICROPHONE_STORAGE_KEY); } catch (_) {}
         }
     }
     async function capturePcm16() {
@@ -368,13 +437,16 @@
             numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
             processorOptions: { originalSampleRate: context.sampleRate, targetSampleRate: TARGET_SAMPLE_RATE }
         });
+        const gain = context.createGain();
         const mute = context.createGain();
         const chunks = [];
-        const targetSamples = TARGET_SAMPLE_RATE * RECORDING_MS / 1000;
+        const captureDurationMs = RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS;
+        const targetSamples = TARGET_SAMPLE_RATE * captureDurationMs / 1000;
         let capturedSamples = 0;
         let finishCapture = null;
+        gain.gain.value = microphoneGain();
         mute.gain.value = 0;
-        source.connect(processor); processor.connect(mute); mute.connect(context.destination);
+        source.connect(gain); gain.connect(processor); processor.connect(mute); mute.connect(context.destination);
         await context.resume();
         const startedAt = performance.now();
         const timer = window.setInterval(function () {
@@ -385,7 +457,7 @@
         try {
             await new Promise(function (resolve, reject) {
                 let settled = false;
-                const timeoutId = window.setTimeout(function () { finishCapture(new Error('incomplete_capture')); }, RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS);
+                const timeoutId = window.setTimeout(function () { finishCapture(new Error('incomplete_capture')); }, captureDurationMs + CAPTURE_TIMEOUT_GRACE_MS);
                 finishCapture = function (error) {
                     if (settled) return;
                     settled = true;
@@ -416,7 +488,8 @@
             state.captureAbort = null;
             window.clearInterval(timer);
             processor.port.onmessage = null;
-            processor.disconnect(); source.disconnect(); mute.disconnect();
+            if (typeof processor.port.close === 'function') processor.port.close();
+            processor.disconnect(); source.disconnect(); gain.disconnect(); mute.disconnect();
             elements.timer.textContent = '';
             for (const chunk of chunks) chunk.fill(0);
         }
@@ -463,7 +536,7 @@
     }
     function isMicrophoneError(error) {
         return Boolean(error && (['NotAllowedError', 'NotFoundError', 'NotReadableError'].includes(error.name)
-            || ['audio_worklet_unavailable', 'media_devices_unavailable'].includes(error.message)));
+            || ['audio_worklet_unavailable', 'media_devices_unavailable', 'unsupported_audio_sample_rate'].includes(error.message)));
     }
     function finishEnrollment(payload, enrollmentId, profileId) {
         if (!completionMatches(payload, enrollmentId, profileId)) throw new Error('profile_not_confirmed');
@@ -491,7 +564,13 @@
             try {
                 payload = await apiRequest('/enrollment/segment', {
                     method: 'PUT', body: pcm, signal: controller ? controller.signal : undefined,
-                    headers: { 'Content-Type': PCM_CONTENT_TYPE, [SESSION_HEADER]: enrollmentId, [PROFILE_HEADER]: profileId, [SEGMENT_HEADER]: String(index) }
+                    headers: {
+                        'Content-Type': PCM_CONTENT_TYPE,
+                        [AUDIO_CONTRACT_HEADER]: AUDIO_CONTRACT_ID,
+                        [SESSION_HEADER]: enrollmentId,
+                        [PROFILE_HEADER]: profileId,
+                        [SEGMENT_HEADER]: String(index)
+                    }
                 });
             } catch (error) {
                 if (nonce !== state.operationNonce) return 'stale';

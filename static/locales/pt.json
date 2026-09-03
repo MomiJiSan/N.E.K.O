@@ -2963,6 +2963,7 @@
         "reasonDisabled": "O perfil de voz do Owner está salvo; o filtro está desligado",
         "reasonModelUnavailable": "Os recursos do modelo de voz estão indisponíveis. Ao executar pelo código-fonte, use uv run python scripts/prepare_speaker_model.py; em uma instalação, repare ou reinstale. O ASR independente não é afetado.",
         "reasonProfileIncompatible": "Este perfil não é compatível com o modelo atual; cadastre novamente",
+        "reasonAudioContractMismatch": "A redução de ruído atual não corresponde a este perfil de voz; restaure a configuração usada no cadastro ou cadastre novamente",
         "reasonSecureStorageUnavailable": "O armazenamento seguro está indisponível, então o filtro de voz está desligado",
         "reasonEnrollmentActive": "Um novo perfil está sendo cadastrado; o ASR independente seguirá sem filtro temporariamente",
         "reasonRuntimeDegraded": "O filtro de voz está temporariamente indisponível; o ASR independente seguirá sem filtro",

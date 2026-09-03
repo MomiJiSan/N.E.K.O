@@ -192,8 +192,9 @@ def test_browser_capture_is_one_permission_four_segment_pcm16_and_cancels_on_clo
         "AudioWorkletNode",
         "audioWorklet.addModule('/static/audio-processor.js')",
         "Int16Array",
-        "TARGET_SAMPLE_RATE = 16000",
+        "TARGET_SAMPLE_RATE = 48000",
         "RECORDING_MS = 3000",
+        "STREAMING_RESAMPLE_MARGIN_MS = 100",
         "API_ROOT = '/api/voice-identity'",
         "'/enrollment/start'",
         "'/enrollment/segment'",
@@ -203,7 +204,14 @@ def test_browser_capture_is_one_permission_four_segment_pcm16_and_cancels_on_clo
         "X-Voice-Identity-Enrollment",
         "X-Voice-Identity-Profile",
         "X-Voice-Identity-Segment",
-        "audio/pcm;format=pcm_s16le;rate=16000;channels=1",
+        "X-Voice-Audio-Contract",
+        "owner-campplus-desktop-v1",
+        "audio/pcm;format=pcm_s16le;rate=48000;channels=1",
+        "neko_selected_microphone",
+        "neko_mic_gain_db",
+        "noiseSuppression: false",
+        "echoCancellation: true",
+        "autoGainControl: true",
         "X-CSRF-Token",
         "window.nekoBeforeWindowClose",
         "pagehide",
@@ -211,8 +219,12 @@ def test_browser_capture_is_one_permission_four_segment_pcm16_and_cancels_on_clo
     ):
         assert contract in script
 
-    assert "RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS" in script
-    assert "targetSamples = TARGET_SAMPLE_RATE * RECORDING_MS / 1000" in script
+    assert "captureDurationMs + CAPTURE_TIMEOUT_GRACE_MS" in script
+    assert "targetSamples = TARGET_SAMPLE_RATE * captureDurationMs / 1000" in script
+    assert "new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE })" in script
+    assert "context.sampleRate !== TARGET_SAMPLE_RATE" in script
+    assert "source.connect(gain); gain.connect(processor)" in script
+    assert "processor.port.close()" in script
     assert "capturedSamples < targetSamples" in script
     assert "state.profileId = valueFrom([enrollment, status], ['profile_id']" in script
     assert "['has_profile', 'profile_available', 'available']" in script
@@ -401,6 +413,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "reasonDisabled",
         "reasonModelUnavailable",
         "reasonProfileIncompatible",
+        "reasonAudioContractMismatch",
         "reasonSecureStorageUnavailable",
         "reasonEnrollmentActive",
         "reasonRuntimeDegraded",

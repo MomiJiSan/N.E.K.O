@@ -9,6 +9,7 @@ import shutil
 import sys
 import wave
 
+import numpy as np
 import pytest
 
 
@@ -25,15 +26,21 @@ _AGGREGATE_REPORT_KEYS = {
     "device_class_count",
     "scenario_count",
     "decision_count",
-    "cross_threshold_disagreement_count",
-    "disagreements",
+    "path_decision_disagreement_count",
+    "path_decision_disagreements",
+    "evaluations",
+    "near_threshold_margin",
     "runtime_noise_reduction",
     "error_code",
 }
 _DISAGREEMENT_KEYS = {
-    "reference_leave_one_out",
-    "holdout_1_5",
-    "holdout_3_0",
+    "baseline_vs_production",
+    "production_vs_control",
+}
+_EVALUATION_KEYS = {
+    "browser_old_profile_to_runtime_holdout",
+    "server_normalized_profile_to_runtime_holdout",
+    "server_normalized_profile_to_same_path_holdout",
 }
 _PRIVATE_REPORT_KEYS = {
     "speaker_id",
@@ -141,10 +148,14 @@ def _assert_aggregate_only(
     assert set(report) <= _AGGREGATE_REPORT_KEYS
     run_id = report.get("run_id")
     assert type(run_id) is str and run_id
-    disagreements = report.get("disagreements")
+    disagreements = report.get("path_decision_disagreements")
     if disagreements is not None:
         assert type(disagreements) is dict
         assert set(disagreements) == _DISAGREEMENT_KEYS
+    evaluations = report.get("evaluations")
+    if evaluations is not None:
+        assert type(evaluations) is dict
+        assert set(evaluations) <= _EVALUATION_KEYS
 
     def inspect(value: object) -> None:
         if isinstance(value, dict):
@@ -409,59 +420,87 @@ def _install_pure_evaluation_fakes(
     monkeypatch: pytest.MonkeyPatch,
     module,
     *,
-    decisions: list[tuple[bool, bool, bool, bool, bool]],
+    browser_centroids: list[np.ndarray] | None = None,
+    server_centroids: list[np.ndarray] | None = None,
+    server_candidates: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    runtime_candidates: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    browser_reference_scores: list[tuple[float, float, float]] | None = None,
+    server_reference_scores: list[tuple[float, float, float]] | None = None,
 ) -> _FakeModel:
     model = _FakeModel()
     monkeypatch.setattr(module, "_create_model", lambda _asset_dir: model)
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
+    browser_centroids = browser_centroids or axes
+    server_centroids = server_centroids or axes
+    server_candidates = server_candidates or [
+        (axis.copy(), axis.copy()) for axis in axes
+    ]
+    runtime_candidates = runtime_candidates or [
+        (axis.copy(), axis.copy()) for axis in axes
+    ]
+    browser_reference_scores = browser_reference_scores or [
+        (0.9, 0.9, 0.9) for _ in axes
+    ]
+    server_reference_scores = server_reference_scores or [
+        (0.9, 0.9, 0.9) for _ in axes
+    ]
 
-    async def prepare_case_audio(_case, *, node: str):
+    async def prepare_case_audio(case, *, node: str):
         assert node == "fake-node"
+        case_index = int(case.speaker_id.rsplit("-", 1)[1])
         return (
-            [bytearray(b"ref") for _ in range(3)],
-            bytearray(b"holdout"),
-            [bytearray(b"ref") for _ in range(3)],
-            bytearray(b"holdout"),
+            [bytearray(f"browser:{case_index}".encode()) for _ in range(3)],
+            [bytearray(f"server:{case_index}".encode()) for _ in range(3)],
+            bytearray(f"server:{case_index}".encode()),
+            bytearray(f"runtime:{case_index}".encode()),
         )
 
-    decision_iterator = iter(decisions)
+    def profile_vectors(_model, references):
+        path, raw_index = bytes(references[0]).decode().split(":")
+        case_index = int(raw_index)
+        centroids = (
+            browser_centroids if path == "browser" else server_centroids
+        )
+        reference_scores = (
+            browser_reference_scores
+            if path == "browser"
+            else server_reference_scores
+        )
+        return module._ProfileVectors(
+            centroid=np.asarray(centroids[case_index], dtype=np.float32).copy(),
+            reference_scores=reference_scores[case_index],
+        )
+
+    def candidate_vectors(_model, holdout):
+        path, raw_index = bytes(holdout).decode().split(":")
+        case_index = int(raw_index)
+        candidates = (
+            server_candidates if path == "server" else runtime_candidates
+        )
+        first, full = candidates[case_index]
+        return module._CandidateVectors(
+            first=np.asarray(first, dtype=np.float32).copy(),
+            full=np.asarray(full, dtype=np.float32).copy(),
+        )
+
     monkeypatch.setattr(module, "_prepare_case_audio", prepare_case_audio)
-    monkeypatch.setattr(
-        module,
-        "_path_decisions",
-        lambda _model, _references, _holdout: next(decision_iterator),
-    )
+    monkeypatch.setattr(module, "_profile_vectors", profile_vectors)
+    monkeypatch.setattr(module, "_candidate_vectors", candidate_vectors)
     return model
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("decision_index", "disagreement_key"),
-    [
-        (0, "reference_leave_one_out"),
-        (1, "reference_leave_one_out"),
-        (2, "reference_leave_one_out"),
-        (3, "holdout_1_5"),
-        (4, "holdout_3_0"),
-    ],
-    ids=("loo-1", "loo-2", "loo-3", "holdout-1.5", "holdout-3.0"),
-)
-async def test_each_cross_path_decision_disagreement_blocks_gate(
+async def test_real_production_combinations_replace_same_domain_comparison(
     monkeypatch: pytest.MonkeyPatch,
-    decision_index: int,
-    disagreement_key: str,
 ) -> None:
     module = _load_harness()
     cases = _corpus_cases_for_pure_evaluation(module)
-    enrollment = (True, True, True, True, True)
-    runtime = list(enrollment)
-    runtime[decision_index] = False
-    decisions = [enrollment, tuple(runtime)]
-    decisions.extend([enrollment, enrollment] * 2)
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
     model = _install_pure_evaluation_fakes(
         monkeypatch,
         module,
-        decisions=decisions,
+        browser_centroids=[axes[1], axes[1], axes[2]],
     )
 
     exit_code, report = await module._evaluate(
@@ -471,16 +510,25 @@ async def test_each_cross_path_decision_disagreement_blocks_gate(
         scenario_count=3,
         asset_dir=None,
         node="fake-node",
-        run_id="block-run-id",
+        run_id="production-matrix-run-id",
     )
 
-    assert int(exit_code) == 2
-    assert report["verdict"] == "BLOCK_AUDIO_NORMALIZATION_REQUIRED"
-    assert report["decision_count"] == 15
-    assert report["cross_threshold_disagreement_count"] == 1
-    disagreements = report["disagreements"]
-    assert disagreements[disagreement_key] == 1
-    assert sum(disagreements.values()) == 1
+    assert int(exit_code) == 0
+    assert report["verdict"] == "PASS_AUDIO_NORMALIZATION_GATE"
+    assert report["decision_count"] == 81
+    disagreements = report["path_decision_disagreements"]
+    assert disagreements["baseline_vs_production"] > 0
+    assert disagreements["production_vs_control"] == 0
+    evaluations = report["evaluations"]
+    assert (
+        evaluations[module.BASELINE_PATH]["owner_false_low"]["total"] > 0
+    )
+    assert (
+        evaluations[module.PRODUCTION_PATH]["owner_false_low"]["total"] == 0
+    )
+    assert (
+        evaluations[module.CONTROL_PATH]["owner_false_low"]["total"] == 0
+    )
     assert model.closed
     _assert_aggregate_only(
         report,
@@ -494,16 +542,16 @@ async def test_each_cross_path_decision_disagreement_blocks_gate(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_equal_path_decisions_pass_with_aggregate_only_report(
+async def test_production_owner_false_low_blocks_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_harness()
     cases = _corpus_cases_for_pure_evaluation(module)
-    equal_decisions = (True, False, True, True, False)
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
     model = _install_pure_evaluation_fakes(
         monkeypatch,
         module,
-        decisions=[equal_decisions, equal_decisions] * 3,
+        server_centroids=[axes[1], axes[1], axes[2]],
     )
 
     exit_code, report = await module._evaluate(
@@ -513,36 +561,151 @@ async def test_equal_path_decisions_pass_with_aggregate_only_report(
         scenario_count=3,
         asset_dir=None,
         node="fake-node",
-        run_id="pass-run-id",
+        run_id="owner-false-low-run-id",
     )
 
-    assert int(exit_code) == 0
-    assert report == {
-        "schema_version": 1,
-        "run_id": "pass-run-id",
-        "verdict": "PASS_KEEP_16K_CONTRACT",
-        "speaker_count": 3,
-        "case_count": 3,
-        "device_class_count": 2,
-        "scenario_count": 3,
-        "decision_count": 15,
-        "cross_threshold_disagreement_count": 0,
-        "disagreements": {
-            "reference_leave_one_out": 0,
-            "holdout_1_5": 0,
-            "holdout_3_0": 0,
-        },
-        "runtime_noise_reduction": "enabled",
-    }
+    assert int(exit_code) == 2
+    assert report["verdict"] == "BLOCK_AUDIO_NORMALIZATION_GATE"
+    production = report["evaluations"][module.PRODUCTION_PATH]
+    assert production["owner_false_low"]["holdout_1_5"] > 0
+    assert production["owner_false_low"]["holdout_3_0"] > 0
     assert model.closed
-    _assert_aggregate_only(
-        report,
-        secrets=(
-            "private-speaker-canary",
-            "private-reference",
-            "private-holdout",
-        ),
+    _assert_aggregate_only(report)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_impostor_false_high_regression_blocks_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_harness()
+    cases = _corpus_cases_for_pure_evaluation(module)
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
+    risky = np.asarray((0.8, 0.6, 0.0), dtype=np.float32)
+    model = _install_pure_evaluation_fakes(
+        monkeypatch,
+        module,
+        server_centroids=[risky, axes[1], axes[2]],
     )
+
+    exit_code, report = await module._evaluate(
+        cases,
+        speaker_count=3,
+        device_class_count=2,
+        scenario_count=3,
+        asset_dir=None,
+        node="fake-node",
+        run_id="impostor-regression-run-id",
+    )
+
+    baseline = report["evaluations"][module.BASELINE_PATH]
+    production = report["evaluations"][module.PRODUCTION_PATH]
+    assert int(exit_code) == 2
+    assert production["owner_false_low"]["total"] == 0
+    assert (
+        production["impostor_false_high"]["total"]
+        > baseline["impostor_false_high"]["total"]
+    )
+    assert model.closed
+    _assert_aggregate_only(report)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_same_path_control_disagreement_blocks_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_harness()
+    cases = _corpus_cases_for_pure_evaluation(module)
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
+    model = _install_pure_evaluation_fakes(
+        monkeypatch,
+        module,
+        server_candidates=[
+            (-axes[0], -axes[0]),
+            (axes[1], axes[1]),
+            (axes[2], axes[2]),
+        ],
+    )
+
+    exit_code, report = await module._evaluate(
+        cases,
+        speaker_count=3,
+        device_class_count=2,
+        scenario_count=3,
+        asset_dir=None,
+        node="fake-node",
+        run_id="control-disagreement-run-id",
+    )
+
+    assert int(exit_code) == 2
+    assert report["path_decision_disagreements"]["production_vs_control"] > 0
+    assert model.closed
+    _assert_aggregate_only(report)
+
+
+@pytest.mark.unit
+def test_path_metrics_cover_loo_holdouts_impostors_and_near_threshold() -> None:
+    module = _load_harness()
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
+    profiles = [
+        module._ProfileVectors(axis.copy(), (0.9, 0.9, 0.9))
+        for axis in axes
+    ]
+    candidates = [
+        module._CandidateVectors(axis.copy(), axis.copy())
+        for axis in axes
+    ]
+    candidates[0].first = np.asarray((0.4, 0.0, 0.0), dtype=np.float32)
+    try:
+        metrics, decisions = module._path_metrics(
+            profiles,
+            candidates,
+            ("speaker-a", "speaker-b", "speaker-c"),
+        )
+    finally:
+        for profile in profiles:
+            profile.wipe()
+        for candidate in candidates:
+            candidate.wipe()
+
+    assert len(decisions) == 27
+    assert metrics["owner_false_low"] == {
+        "reference_leave_one_out": 0,
+        "holdout_1_5": 0,
+        "holdout_3_0": 0,
+        "total": 0,
+    }
+    assert metrics["impostor_false_high"]["total"] == 0
+    assert metrics["near_threshold_count"] == 1
+
+
+@pytest.mark.unit
+def test_impostor_metrics_exclude_other_cases_from_the_same_speaker() -> None:
+    module = _load_harness()
+    axes = [row.copy() for row in np.eye(3, dtype=np.float32)]
+    profiles = [
+        module._ProfileVectors(axis.copy(), (0.9, 0.9, 0.9))
+        for axis in axes
+    ]
+    candidates = [
+        module._CandidateVectors(axis.copy(), axis.copy())
+        for axis in axes
+    ]
+    try:
+        metrics, decisions = module._path_metrics(
+            profiles,
+            candidates,
+            ("speaker-a", "speaker-a", "speaker-b"),
+        )
+    finally:
+        for profile in profiles:
+            profile.wipe()
+        for candidate in candidates:
+            candidate.wipe()
+
+    assert len(decisions) == 23
+    assert metrics["impostor_false_high"]["total"] == 0
 
 
 @pytest.mark.unit
@@ -836,6 +999,53 @@ async def test_lazy_runtime_preprocessor_import_failure_maps_to_exit_five(
 
     assert int(raised.value.exit_code) == 5
     assert raised.value.verdict == "RUNTIME_PREPROCESSOR_UNAVAILABLE"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_server_path_uses_enrollment_normalizer_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_harness()
+    from main_logic.voice_identity_service import enrollment_audio
+
+    calls: dict[str, object] = {}
+
+    class FakeNormalizer:
+        def __init__(self, *, nr_enabled: bool) -> None:
+            calls["nr_enabled"] = nr_enabled
+
+        async def normalize(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+            target_samples: int,
+        ) -> bytes:
+            calls.update(
+                pcm16=pcm16,
+                sample_rate_hz=sample_rate_hz,
+                target_samples=target_samples,
+            )
+            return b"\x00\x00" * target_samples
+
+    monkeypatch.setattr(
+        enrollment_audio,
+        "EnrollmentAudioNormalizer",
+        FakeNormalizer,
+    )
+    source = bytearray(b"private-source-pcm-canary")
+    result = await module._run_server_normalized_path(source)
+
+    assert calls == {
+        "nr_enabled": True,
+        "pcm16": bytes(source),
+        "sample_rate_hz": 48_000,
+        "target_samples": 48_000,
+    }
+    assert len(result) == 96_000
+    result[:] = b"\x00" * len(result)
+    source[:] = b"\x00" * len(source)
 
 
 @pytest.mark.unit

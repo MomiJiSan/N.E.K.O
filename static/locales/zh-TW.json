@@ -2963,6 +2963,7 @@
         "reasonDisabled": "Owner 聲紋已保存，目前已關閉過濾",
         "reasonModelUnavailable": "聲紋模型資源不可用。原始碼執行請使用 uv run python scripts/prepare_speaker_model.py；正式版本請修復或重新安裝。獨立 ASR 不受影響。",
         "reasonProfileIncompatible": "目前聲紋與模型不相容，請重新錄入",
+        "reasonAudioContractMismatch": "目前降噪設定與該聲紋的錄入音訊合約不一致，請恢復錄入時的設定或重新錄入",
         "reasonSecureStorageUnavailable": "安全儲存不可用，聲紋過濾未啟用",
         "reasonEnrollmentActive": "正在錄入新聲紋，獨立 ASR 將暫時放行",
         "reasonRuntimeDegraded": "聲紋執行環境暫時不可用，獨立 ASR 將正常放行",

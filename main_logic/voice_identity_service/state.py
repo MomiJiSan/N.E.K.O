@@ -14,6 +14,7 @@ class VoiceIdentityEffectiveReason(StrEnum):
     NO_PROFILE = "no_profile"
     MODEL_UNAVAILABLE = "model_unavailable"
     PROFILE_INCOMPATIBLE = "profile_incompatible"
+    AUDIO_CONTRACT_MISMATCH = "audio_contract_mismatch"
     SECURE_STORAGE_UNAVAILABLE = "secure_storage_unavailable"
     ENROLLMENT_ACTIVE = "enrollment_active"
     RUNTIME_DEGRADED = "runtime_degraded"

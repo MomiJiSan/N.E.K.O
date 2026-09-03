@@ -18,8 +18,9 @@ import main_routers.voice_identity_router as voice_identity_router
 
 
 API_ROOT = "/api/voice-identity"
-PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=16000;channels=1"
-MAX_PCM_BYTES = 16_000 * 4 * 2
+PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=48000;channels=1"
+AUDIO_CONTRACT_ID = "owner-campplus-desktop-v1"
+MAX_PCM_BYTES = 48_000 * 4 * 2
 MAX_FILTER_JSON_BYTES = 1024
 AUTH_HEADERS = {
     "Origin": "http://testserver",
@@ -84,6 +85,7 @@ def _client(
     client = TestClient(app, base_url="http://testserver")
     if authenticated:
         client.headers.update(AUTH_HEADERS)
+        client.headers.update({"X-Voice-Audio-Contract": AUDIO_CONTRACT_ID})
     return client
 
 
@@ -265,6 +267,14 @@ def test_binary_segment_upload_forwards_exact_headers_index_and_body_idempotentl
         3,
         pcm16,
     )
+    assert service.submit_enrollment_segment.await_args_list[0].kwargs == {
+        "sample_rate_hz": 48_000,
+        "audio_contract_id": AUDIO_CONTRACT_ID,
+    }
+    assert service.submit_enrollment_segment.await_args_list[1].kwargs == {
+        "sample_rate_hz": 48_000,
+        "audio_contract_id": AUDIO_CONTRACT_ID,
+    }
     _assert_private_values_absent(first.json())
 
 
@@ -317,6 +327,24 @@ def test_retired_one_shot_profile_endpoint_is_not_registered(
     ("body_size", "content_type", "expected_status", "expected_code"),
     [
         (MAX_PCM_BYTES, "application/octet-stream", 415, "invalid_pcm"),
+        (
+            MAX_PCM_BYTES,
+            "audio/pcm;format=pcm_s16le;rate=16000;channels=1",
+            415,
+            "invalid_pcm",
+        ),
+        (
+            MAX_PCM_BYTES,
+            "audio/pcm;format=pcm_s16le;rate=44100;channels=1",
+            415,
+            "invalid_pcm",
+        ),
+        (
+            MAX_PCM_BYTES,
+            "audio/pcm;format=pcm_s16le;rate=48000;channels=2",
+            415,
+            "invalid_pcm",
+        ),
         (MAX_PCM_BYTES + 1, PCM_CONTENT_TYPE, 413, "audio_too_long"),
     ],
 )
@@ -344,6 +372,101 @@ def test_segment_upload_rejects_wrong_type_and_more_than_four_seconds(
     assert response.status_code == expected_status
     assert response.json() == {"error_code": expected_code}
     service.submit_enrollment_segment.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("contract_id", [None, "", "owner-campplus-desktop-v0"])
+def test_segment_upload_requires_known_audio_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    contract_id: str | None,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+    client.headers.pop("X-Voice-Audio-Contract", None)
+    headers = {
+        "Content-Type": PCM_CONTENT_TYPE,
+        "X-Voice-Identity-Enrollment": "enrollment-1",
+        "X-Voice-Identity-Profile": "profile-1",
+        "X-Voice-Identity-Segment": "1",
+    }
+    if contract_id is not None:
+        headers["X-Voice-Audio-Contract"] = contract_id
+
+    response = client.put(
+        f"{API_ROOT}/enrollment/segment",
+        content=bytes(48_000 * 31 // 10 * 2),
+        headers=headers,
+    )
+
+    assert response.status_code == 415
+    assert response.json() == {"error_code": "unsupported_audio_contract"}
+    service.submit_enrollment_segment.assert_not_awaited()
+
+
+@pytest.mark.unit
+def test_segment_upload_rejects_odd_pcm_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+
+    response = client.put(
+        f"{API_ROOT}/enrollment/segment",
+        content=b"\x00",
+        headers={
+            "Content-Type": PCM_CONTENT_TYPE,
+            "X-Voice-Identity-Enrollment": "enrollment-1",
+            "X-Voice-Identity-Profile": "profile-1",
+            "X-Voice-Identity-Segment": "1",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error_code": "invalid_pcm"}
+    service.submit_enrollment_segment.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("segment_index", "body_size", "expected_status"),
+    [
+        (1, MAX_PCM_BYTES, 200),
+        (1, MAX_PCM_BYTES + 1, 413),
+        (2, MAX_PCM_BYTES, 200),
+        (2, MAX_PCM_BYTES + 1, 413),
+        (3, MAX_PCM_BYTES, 200),
+        (3, MAX_PCM_BYTES + 1, 413),
+        (4, MAX_PCM_BYTES, 200),
+        (4, MAX_PCM_BYTES + 1, 413),
+    ],
+)
+def test_segment_upload_applies_uniform_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    segment_index: int,
+    body_size: int,
+    expected_status: int,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+
+    response = client.put(
+        f"{API_ROOT}/enrollment/segment",
+        content=bytes(body_size),
+        headers={
+            "Content-Type": PCM_CONTENT_TYPE,
+            "X-Voice-Identity-Enrollment": "enrollment-1",
+            "X-Voice-Identity-Profile": "profile-1",
+            "X-Voice-Identity-Segment": str(segment_index),
+        },
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json() == SAFE_STATUS
+        service.submit_enrollment_segment.assert_awaited_once()
+    else:
+        assert response.json() == {"error_code": "audio_too_long"}
+        service.submit_enrollment_segment.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -384,6 +507,7 @@ async def test_chunked_profile_body_is_bounded_without_content_length() -> None:
         ("no_speech_detected", 422),
         ("voice_samples_inconsistent", 422),
         ("owner_verification_failed", 422),
+        ("unsupported_audio_contract", 503),
         ("model_unavailable", 503),
     ],
 )

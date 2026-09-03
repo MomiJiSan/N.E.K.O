@@ -2963,6 +2963,7 @@
         "reasonDisabled": "Owner 声紋は保存されています。フィルターはオフです",
         "reasonModelUnavailable": "声紋モデル資産を利用できません。ソース実行では uv run python scripts/prepare_speaker_model.py を実行し、インストール版では修復または再インストールしてください。独立 ASR には影響しません。",
         "reasonProfileIncompatible": "現在のモデルと声紋に互換性がありません。再登録してください",
+        "reasonAudioContractMismatch": "現在のノイズ低減設定はこの声紋の登録時と一致しません。登録時の設定に戻すか、再登録してください",
         "reasonSecureStorageUnavailable": "安全な保存領域を利用できないため、声紋フィルターは無効です",
         "reasonEnrollmentActive": "新しい声紋を登録中です。独立 ASR は一時的に通過します",
         "reasonRuntimeDegraded": "声紋機能を一時的に利用できないため、独立 ASR は通常どおり通過します",

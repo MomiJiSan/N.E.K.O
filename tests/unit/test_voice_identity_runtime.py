@@ -13,6 +13,9 @@ from main_logic.asr_client import VoiceIdentityActivationResult
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
 from main_logic.voice_identity.reference import SpeakerReference
+from main_logic.voice_identity_service.audio_contract import (
+    desktop_audio_contract_snapshot,
+)
 
 
 @dataclass
@@ -1821,7 +1824,12 @@ def test_unavailable_profile_store_never_falls_back_to_plaintext(
         with pytest.raises(RuntimeError, match="secure_storage_unavailable"):
             store.load()
         with pytest.raises(RuntimeError, match="secure_storage_unavailable"):
-            store.stage(profile)
+            store.stage(
+                profile,
+                audio_contract=desktop_audio_contract_snapshot(
+                    noise_reduction_enabled=True,
+                ),
+            )
         with pytest.raises(RuntimeError, match="secure_storage_unavailable"):
             store.delete()
     finally:
@@ -1861,12 +1869,16 @@ async def test_runtime_install_and_wrapper_lifecycle(
             runtime_status_callback,
             enrollment_ttl_seconds: float,
             speech_validator_factory,
-        ) -> None:
+            enrollment_noise_reduction_enabled: bool,
+            ) -> None:
             self.args = args
             self.runtime_mode = runtime_mode
             self.runtime_status_callback = runtime_status_callback
             self.enrollment_ttl_seconds = enrollment_ttl_seconds
             self.speech_validator_factory = speech_validator_factory
+            self.enrollment_noise_reduction_enabled = (
+                enrollment_noise_reduction_enabled
+            )
             self.initialized = 0
             self.closed = 0
 
@@ -1898,6 +1910,7 @@ async def test_runtime_install_and_wrapper_lifecycle(
 
     service = runtime_module.install_voice_identity_runtime(config)
     assert service.runtime_mode == "off"
+    assert service.enrollment_noise_reduction_enabled
     assert "Unsupported NEKO_VOICE_IDENTITY_MODE" in caplog.text
     assert isinstance(service.args[0], runtime_module._UnavailableProfileStore)
     assert service.enrollment_ttl_seconds == 45.0

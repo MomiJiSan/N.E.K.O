@@ -7,6 +7,10 @@ import json
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from main_logic.voice_identity_service.audio_contract import (
+    OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID,
+    OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ,
+)
 from main_logic.voice_identity_service.registry import (
     VoiceIdentityServiceRegistryError,
     get_voice_identity_service_for_router,
@@ -19,8 +23,11 @@ router = APIRouter(prefix="/api/voice-identity", tags=["voice-identity"])
 _ENROLLMENT_HEADER = "X-Voice-Identity-Enrollment"
 _PROFILE_HEADER = "X-Voice-Identity-Profile"
 _SEGMENT_HEADER = "X-Voice-Identity-Segment"
-_PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=16000;channels=1"
-_MAX_PCM_BYTES = 16_000 * 4 * 2
+_AUDIO_CONTRACT_HEADER = "X-Voice-Audio-Contract"
+_PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=48000;channels=1"
+_MAX_PCM_BYTES = (
+    OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ * 4 * 2
+)
 _MAX_FILTER_JSON_BYTES = 1024
 
 
@@ -121,6 +128,12 @@ async def submit_voice_identity_enrollment_segment(request: Request):
         return rejected
     if request.headers.get("content-type", "").lower() != _PCM_CONTENT_TYPE:
         return JSONResponse({"error_code": "invalid_pcm"}, status_code=415)
+    audio_contract_id = request.headers.get(_AUDIO_CONTRACT_HEADER, "")
+    if audio_contract_id != OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID:
+        return JSONResponse(
+            {"error_code": "unsupported_audio_contract"},
+            status_code=415,
+        )
     raw_segment_index = request.headers.get(_SEGMENT_HEADER, "")
     if raw_segment_index not in {"1", "2", "3", "4"}:
         return JSONResponse(
@@ -144,6 +157,8 @@ async def submit_voice_identity_enrollment_segment(request: Request):
     pcm16 = await _read_bounded_body(request, _MAX_PCM_BYTES)
     if pcm16 is None:
         return JSONResponse({"error_code": "audio_too_long"}, status_code=413)
+    if len(pcm16) % 2:
+        return JSONResponse({"error_code": "invalid_pcm"}, status_code=400)
     service = _service()
     if service is None:
         return _service_unavailable()
@@ -153,6 +168,8 @@ async def submit_voice_identity_enrollment_segment(request: Request):
             request.headers.get(_PROFILE_HEADER, ""),
             segment_index,
             pcm16,
+            sample_rate_hz=OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ,
+            audio_contract_id=audio_contract_id,
         )
     except VoiceIdentityServiceError as exc:
         return _service_error(exc)

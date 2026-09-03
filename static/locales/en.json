@@ -2963,6 +2963,7 @@
         "reasonDisabled": "Owner voice profile is saved; filtering is off",
         "reasonModelUnavailable": "The voice model assets are unavailable. For a source checkout, run uv run python scripts/prepare_speaker_model.py; for an installed build, repair or reinstall it. Independent ASR is unaffected.",
         "reasonProfileIncompatible": "This voice profile is incompatible with the current model; enroll again",
+        "reasonAudioContractMismatch": "The current noise-reduction setting does not match this voice profile; restore the enrolled setting or enroll again",
         "reasonSecureStorageUnavailable": "Secure storage is unavailable, so voice filtering is off",
         "reasonEnrollmentActive": "A new voice profile is being enrolled; independent ASR will temporarily pass through",
         "reasonRuntimeDegraded": "Voice filtering is temporarily unavailable; independent ASR will pass through normally",
