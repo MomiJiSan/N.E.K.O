@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 
 import pytest
@@ -23,12 +24,14 @@ from main_logic.asr_client.admission.contracts import (
     RouteReplaced,
     SpeakerCaptureLeaseRecord,
     SpeakerCaptureLeaseToken,
+    SpeakerLeaseChildBinding,
     SpeakerCheckpointKind,
     SpeakerLeaseAbandoned,
     SpeakerLeaseCaptureClosed,
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseState,
+    SpeakerLeaseTransitionOutcome,
     SpeakerLeaseUnavailable,
     SpeakerAuthorityPending,
 )
@@ -127,13 +130,11 @@ async def test_two_provider_children_share_one_sticky_deny_and_fan_out_in_order(
     await coordinator.post(first, ProviderFinalReceived(_final(_key(1), "a")))
     await coordinator.post(second, ProviderFinalReceived(_final(_key(2), "b")))
 
-    assert (
-        await coordinator.post_speaker_lease(
-            lease,
-            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
-        )
-        == ()
+    first_receipt = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
     )
+    assert first_receipt.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
     assert (
         await coordinator.get_record(first)
     ).admission_state is AdmissionState.PENDING
@@ -141,10 +142,16 @@ async def test_two_provider_children_share_one_sticky_deny_and_fan_out_in_order(
         await coordinator.get_record(second)
     ).admission_state is AdmissionState.PENDING
 
-    results = await coordinator.post_speaker_lease(
+    receipt = await coordinator.post_speaker_lease(
         lease,
         SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
     )
+    assert receipt.outcome is SpeakerLeaseTransitionOutcome.APPLIED
+    assert receipt.frozen_children == tuple(
+        SpeakerLeaseChildBinding(_key(index), turn)
+        for index, turn in ((1, first), (2, second))
+    )
+    results = receipt.child_results
     assert tuple(result.turn_token for result in results) == (first, second)
     assert all(
         any(
@@ -205,7 +212,8 @@ async def test_terminal_parent_verdict_resolves_pending_child(
     assert child.provider_key == _key(1)
     await coordinator.post(turn, ProviderFinalReceived(_final(_key(1), "hello")))
 
-    results = await coordinator.post_speaker_lease(lease, fact)
+    receipt = await coordinator.post_speaker_lease(lease, fact)
+    results = receipt.child_results
     assert len(results) == 1
     resolution = next(
         effect for effect in results[0].effects if isinstance(effect, ResolveReserved)
@@ -277,45 +285,19 @@ async def test_late_child_inherits_terminal_parent_and_resolves_final(
     for event in parent_events:
         await coordinator.post_speaker_lease(lease, event)
 
-    late = await coordinator.attach_turn_to_speaker_lease(
-        late_turn,
-        lease,
-        late_key,
-    )
+    del evidence, capture, disposition
+    with pytest.raises(SpeakerLeaseTerminalError, match="LEASE_TERMINAL"):
+        await coordinator.attach_turn_to_speaker_lease(
+            late_turn,
+            lease,
+            late_key,
+        )
 
-    assert late.evidence_state is evidence
-    assert late.capture_state is capture
-    assert late.provider_binding_state is ProviderBindingState.BOUND
-    assert late.candidate_binding_state is CandidateBindingState.BOUND
-    assert late.provider_key == late_key
-    assert late.speaker_lease_token == lease
-    assert late.speaker_candidate == _candidate()
+    assert await coordinator.get_record(late_turn) is None
     parent = await coordinator.get_speaker_lease(lease)
     assert parent is not None
     assert tuple(binding.provider_key for binding in parent.child_bindings) == (
         first_key,
-        late_key,
-    )
-    assert (
-        await coordinator.attach_turn_to_speaker_lease(late_turn, lease, late_key)
-        is late
-    )
-
-    effects = await coordinator.post(
-        late_turn,
-        ProviderFinalReceived(_final(late_key, "late")),
-    )
-    resolution = next(
-        effect for effect in effects if isinstance(effect, ResolveReserved)
-    )
-    assert resolution.disposition is disposition
-    assert (
-        sum(
-            isinstance(effect, CountDiagnostic)
-            and effect.name == "speaker_deny_latched_count"
-            for effect in effects
-        )
-        == 0
     )
 
 
@@ -329,7 +311,7 @@ async def test_terminal_parent_late_child_preserves_provider_order():
         SpeakerLeaseHigh(_candidate(), 1),
     )
 
-    with pytest.raises(AdmissionIdentityError, match="PROVIDER_ORDER_CONFLICT"):
+    with pytest.raises(SpeakerLeaseTerminalError, match="LEASE_TERMINAL"):
         await coordinator.attach_turn_to_speaker_lease(_turn(2), lease, _key(1))
 
     assert await coordinator.get_record(_turn(2)) is None
@@ -350,7 +332,7 @@ async def test_terminal_parent_late_child_preserves_capacity():
         SpeakerLeaseUnavailable(_candidate(), 1),
     )
 
-    with pytest.raises(SpeakerLeaseChildCapacityError, match="CHILD_CAPACITY"):
+    with pytest.raises(SpeakerLeaseTerminalError, match="LEASE_TERMINAL"):
         await coordinator.attach_turn_to_speaker_lease(_turn(2), lease, _key(2))
 
     assert await coordinator.get_record(_turn(2)) is None
@@ -383,7 +365,7 @@ async def test_terminal_parent_late_child_preserves_provider_key_uniqueness():
     assert await coordinator.get_record(_turn(2)) is None
 
 
-async def test_terminal_parent_upgrades_exact_empty_placeholder():
+async def test_terminal_parent_rejects_exact_empty_placeholder():
     coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
     lease = _lease()
     turn = _turn(1)
@@ -396,25 +378,14 @@ async def test_terminal_parent_upgrades_exact_empty_placeholder():
     opened = await coordinator.open_turn(turn)
     await coordinator.post(turn, SpeakerAuthorityPending("provider-arming"))
 
-    upgraded = await coordinator.attach_turn_to_speaker_lease(
-        turn,
-        lease,
-        provider_key,
-    )
-
-    assert upgraded.record_generation == opened.record_generation
-    assert upgraded.provider_binding_state is ProviderBindingState.BOUND
-    assert upgraded.candidate_binding_state is CandidateBindingState.BOUND
-    assert upgraded.evidence_state is EvidenceState.ALLOW
-    assert upgraded.speaker_authority_generation == "provider-arming"
-    effects = await coordinator.post(
-        turn,
-        ProviderFinalReceived(_final(provider_key, "late")),
-    )
-    resolution = next(
-        effect for effect in effects if isinstance(effect, ResolveReserved)
-    )
-    assert resolution.disposition is AdmissionDisposition.FORWARD
+    with pytest.raises(SpeakerLeaseTerminalError, match="LEASE_TERMINAL"):
+        await coordinator.attach_turn_to_speaker_lease(
+            turn,
+            lease,
+            provider_key,
+        )
+    assert await coordinator.get_record(turn) is not None
+    assert (await coordinator.get_record(turn)).record_generation == opened.record_generation
 
 
 async def test_terminal_parent_rejects_placeholder_with_early_final():
@@ -775,7 +746,7 @@ async def test_detach_missing_and_duplicate_are_idempotent_false():
         ),
     ),
 )
-async def test_detach_exact_terminal_late_child_preserves_parent_and_siblings(
+async def test_terminal_parent_rejects_late_child_and_preserves_frozen_siblings(
     parent_events,
     parent_state: SpeakerLeaseState,
 ):
@@ -790,21 +761,15 @@ async def test_detach_exact_terminal_late_child_preserves_parent_and_siblings(
     for event in parent_events:
         await coordinator.post_speaker_lease(lease, event)
     sibling = await coordinator.get_record(first_turn)
-    late = await coordinator.attach_turn_to_speaker_lease(
-        late_turn,
-        lease,
-        late_key,
-    )
     parent_before = await coordinator.get_speaker_lease(lease)
     assert sibling is not None
     assert parent_before is not None
-    assert late.terminal_disposition is None
-
-    assert await coordinator.detach_turn_from_speaker_lease(
-        late_turn,
-        lease,
-        late_key,
-    )
+    with pytest.raises(SpeakerLeaseTerminalError, match="LEASE_TERMINAL"):
+        await coordinator.attach_turn_to_speaker_lease(
+            late_turn,
+            lease,
+            late_key,
+        )
 
     assert await coordinator.get_record(late_turn) is None
     assert await coordinator.get_record(first_turn) is sibling
@@ -812,7 +777,7 @@ async def test_detach_exact_terminal_late_child_preserves_parent_and_siblings(
     assert parent_after is not None
     assert parent_after.state is parent_state
     assert parent_after.terminal_sequence_no == parent_before.terminal_sequence_no
-    assert tuple(parent_after.child_bindings) == (parent_before.child_bindings[0],)
+    assert parent_after.child_bindings == parent_before.child_bindings
     assert parent_after.child_bindings[0].turn_token == first_turn
     assert coordinator._speaker_candidate_bindings[_candidate()] == lease
     assert late_key not in coordinator._provider_speaker_lease_bindings
@@ -827,11 +792,11 @@ async def test_detach_terminal_late_child_rejects_committed_child_state(
     turn = _turn(1)
     provider_key = _key(1)
     await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.attach_turn_to_speaker_lease(turn, lease, provider_key)
     await coordinator.post_speaker_lease(
         lease,
         SpeakerLeaseHigh(_candidate(), 1),
     )
-    await coordinator.attach_turn_to_speaker_lease(turn, lease, provider_key)
     if advance_child == "final":
         await coordinator.post(
             turn,
@@ -868,15 +833,16 @@ async def test_detach_terminal_late_child_does_not_touch_replacement_mapping():
     provider_key = _key(1)
     await coordinator.open_speaker_lease(lease, _candidate(1))
     await coordinator.open_speaker_lease(replacement_lease, _candidate(2))
-    await coordinator.post_speaker_lease(
-        lease,
-        SpeakerLeaseUnavailable(_candidate(1), 1),
-    )
     child = await coordinator.attach_turn_to_speaker_lease(
         turn,
         lease,
         provider_key,
     )
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseUnavailable(_candidate(1), 1),
+    )
+    child = await coordinator.get_record(turn)
     replacement = (replacement_lease, replacement_turn)
     coordinator._provider_speaker_lease_bindings[provider_key] = replacement
 
@@ -1001,8 +967,9 @@ async def test_lease_facts_share_single_ingress_worker_and_reserved_capacity():
         coordinator._lock.release()
 
     await boundary
-    assert await first == ()
-    results = await second
+    assert (await first).outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    receipt = await second
+    results = receipt.child_results
     assert tuple(result.turn_token for result in results) == (turn,)
     assert (
         await coordinator.get_record(turn)
@@ -1024,3 +991,85 @@ async def test_terminal_empty_lease_retires_through_same_ingress():
     assert await lane.retire_speaker_lease(lease) is True
     assert await coordinator.get_speaker_lease(lease) is None
     await lane.close()
+
+
+async def test_zero_child_deny_returns_terminal_receipt_and_exact_retry_is_idempotent():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease = _lease()
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+    fact = SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND)
+
+    receipt = await coordinator.post_speaker_lease(lease, fact)
+    assert receipt.outcome is SpeakerLeaseTransitionOutcome.APPLIED
+    assert receipt.after_state is SpeakerLeaseState.DENY_LATCHED
+    assert receipt.terminal_sequence_no == 2
+    assert receipt.frozen_children == ()
+    assert receipt.child_results == ()
+
+    duplicate = await coordinator.post_speaker_lease(lease, fact)
+    assert duplicate.outcome is SpeakerLeaseTransitionOutcome.IDEMPOTENT
+    assert duplicate.frozen_children == ()
+    assert duplicate.child_results == ()
+
+    conflict = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseHigh(_candidate(), 2),
+    )
+    assert conflict.outcome is SpeakerLeaseTransitionOutcome.CONFLICT
+
+
+async def test_attach_and_deny_are_linearized_by_one_coordinator_lock():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease = _lease()
+    turn = _turn(1)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+
+    await coordinator._lock.acquire()
+    attach = asyncio.create_task(
+        coordinator.attach_turn_to_speaker_lease(turn, lease, _key(1))
+    )
+    await asyncio.sleep(0)
+    deny = asyncio.create_task(
+        coordinator.post_speaker_lease(
+            lease,
+            SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
+        )
+    )
+    await asyncio.sleep(0)
+    coordinator._lock.release()
+    await attach
+    receipt = await deny
+    assert tuple(binding.turn_token for binding in receipt.frozen_children) == (turn,)
+
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease = _lease()
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+    await coordinator._lock.acquire()
+    deny = asyncio.create_task(
+        coordinator.post_speaker_lease(
+            lease,
+            SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
+        )
+    )
+    await asyncio.sleep(0)
+    attach = asyncio.create_task(
+        coordinator.attach_turn_to_speaker_lease(turn, lease, _key(1))
+    )
+    await asyncio.sleep(0)
+    coordinator._lock.release()
+    receipt = await deny
+    assert receipt.frozen_children == ()
+    with pytest.raises(SpeakerLeaseTerminalError, match="LEASE_TERMINAL"):
+        await attach

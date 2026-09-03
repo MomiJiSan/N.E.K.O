@@ -17,6 +17,7 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerLeaseCaptureClosed,
     SpeakerLeaseLow,
     SpeakerLeaseState,
+    SpeakerLeaseTransitionOutcome,
     TransportSettled,
 )
 from main_logic.asr_client.admission.coordinator import (
@@ -143,17 +144,17 @@ async def test_terminal_deny_fanout_carries_parent_state_and_exact_child_tickets
     await coordinator.attach_turn_to_speaker_lease(first, lease, _provider_key(1))
     await coordinator.attach_turn_to_speaker_lease(second, lease, _provider_key(2))
 
-    assert (
-        await coordinator.post_speaker_lease(
-            lease,
-            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
-        )
-        == ()
+    first_receipt = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
     )
-    results = await coordinator.post_speaker_lease(
+    assert first_receipt.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    receipt = await coordinator.post_speaker_lease(
         lease,
         SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
     )
+    assert receipt.outcome is SpeakerLeaseTransitionOutcome.APPLIED
+    results = receipt.child_results
 
     assert tuple(result.turn_token for result in results) == (first, second)
     assert all(result.speaker_lease_token == lease for result in results)
@@ -194,17 +195,16 @@ async def test_first_low_then_capture_close_remains_fail_open_with_parent_metada
         ),
     )
 
-    assert (
-        await coordinator.post_speaker_lease(
-            lease,
-            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
-        )
-        == ()
+    first_receipt = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
     )
-    results = await coordinator.post_speaker_lease(
+    assert first_receipt.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    receipt = await coordinator.post_speaker_lease(
         lease,
         SpeakerLeaseCaptureClosed(_candidate(), 1),
     )
+    results = receipt.child_results
 
     assert len(results) == 1
     assert results[0].speaker_lease_token == lease

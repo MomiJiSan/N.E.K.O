@@ -564,6 +564,7 @@ async def test_chunked_profile_body_is_bounded_without_content_length() -> None:
         ("no_speech_detected", 422),
         ("voice_samples_inconsistent", 422),
         ("owner_verification_failed", 422),
+        ("audio_processing_unavailable", 503),
         ("unsupported_audio_contract", 503),
         ("model_unavailable", 503),
     ],

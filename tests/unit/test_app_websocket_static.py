@@ -371,7 +371,7 @@ def test_independent_asr_terminal_status_clears_partial_preview():
     # never emit a BLOCKED lifecycle event). The terminal tail must call it
     # before showing its per-code toast.
     assert terminal_branch.index("tearDownBlockedVoiceRoute();") < terminal_branch.index(
-        "showStatusToast"
+        "showAsrIncidentToast"
     )
     teardown_fn = source.split("function tearDownBlockedVoiceRoute() {", 1)[1].split(
         "\n    }", 1
@@ -405,7 +405,7 @@ def test_voice_lifecycle_status_is_validated_and_exposed_to_ui():
     assert "data-voice-input-state" in source
 
 
-def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
+def test_lifecycle_blocked_classifies_reason_without_defaulting_to_config():
     # runtime.py _handle_independent_asr_error always broadcasts lifecycle
     # BLOCKED before the fatal status code, and most fatal codes
     # (ASR_ENDPOINTING_FAILED, ASR_BLOCKED_ENDPOINTING,
@@ -437,10 +437,20 @@ def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
     assert teardown_fn.index("removeExternalAsrPreview();") < teardown_fn.index(
         "S.independentAsrActive = false;"
     )
-    # The teardown runs before the toast, so the failure message is what stays
-    # on screen.
+    # BLOCKED is classified by its explicit reason. A missing or future reason
+    # is a generic runtime failure, never a misleading configuration error.
+    for expected in (
+        "ASR_DENY_CLEANUP_FAILED",
+        "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
+        "ASR_INDEPENDENT_FAILED",
+        "microphone.independentAsrCleanupFailed",
+        "microphone.independentAsrProviderUnavailable",
+        "microphone.independentAsrFallback",
+        "microphone.independentAsrRuntimeFailed",
+    ):
+        assert expected in blocked_branch
     assert blocked_branch.index("tearDownBlockedVoiceRoute();") < blocked_branch.index(
-        "microphone.independentAsrFallback"
+        "showAsrIncidentToast("
     )
 
     # Cross-reference comment so backend changes to the failure path get
@@ -455,6 +465,85 @@ def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
     )[1].split("if (statusCode === 'TTS_CONNECTION_FAILED')", 1)[0]
     assert "microphone.independentAsrProviderUnavailable" in prefix_block
     assert "microphone.independentAsrFallback" in prefix_block
+
+
+def test_asr_control_identity_and_incident_dedupe_helpers_behave() -> None:
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    parse_identity = (
+        "function parseAsrControlIdentity(details) {"
+        + _block_after(source, "function parseAsrControlIdentity(details) {")
+        + "}\n"
+    )
+    accept_identity = (
+        "function acceptAsrControlIdentity(details) {"
+        + _block_after(source, "function acceptAsrControlIdentity(details) {")
+        + "}\n"
+    )
+    toast_helper = (
+        "function showAsrIncidentToast(incidentId, message, durationMs) {"
+        + _block_after(
+            source,
+            "function showAsrIncidentToast(incidentId, message, durationMs) {",
+        )
+        + "}\n"
+    )
+    script = textwrap.dedent(
+        f"""
+        let _latestAsrControlIdentity = null;
+        let _seenAsrIncidentIds = Object.create(null);
+        let _seenAsrIncidentOrder = [];
+        const MAX_SEEN_ASR_INCIDENTS = 64;
+        const shown = [];
+        const window = {{ showStatusToast(message, duration) {{ shown.push([message, duration]); }} }};
+        {parse_identity}
+        {accept_identity}
+        {toast_helper}
+        function check(value, message) {{ if (!value) throw new Error(message); }}
+        const id = (epoch, generation, revision) => ({{
+            session_epoch: epoch,
+            transport_generation: generation,
+            lifecycle_revision: revision,
+        }});
+        check(acceptAsrControlIdentity(id(1, 2, 3)) === true, 'first identity');
+        check(acceptAsrControlIdentity(id(1, 2, 3)) === false, 'equal identity');
+        check(acceptAsrControlIdentity(id(1, 2, 2)) === false, 'older revision');
+        check(acceptAsrControlIdentity(id(1, 3, 0)) === true, 'new transport');
+        check(acceptAsrControlIdentity(id(1, 2, 99)) === false, 'old transport');
+        check(acceptAsrControlIdentity(id(2, 0, 0)) === true, 'new epoch');
+        check(acceptAsrControlIdentity({{ session_epoch: 3 }}) === false, 'missing identity');
+        check(showAsrIncidentToast('incident', 'first', 5) === true, 'first incident');
+        check(showAsrIncidentToast('incident', 'duplicate', 5) === false, 'duplicate incident');
+        check(shown.length === 1 && shown[0][0] === 'first', 'toast dedupe');
+        """
+    )
+    result = run_node_script(
+        shutil.which("node") or pytest.skip("node is required"),
+        script,
+        cwd=str(Path(__file__).resolve().parents[2]),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_asr_cleanup_failure_copy_exists_in_all_locales() -> None:
+    expected = {
+        "en.json": "Voice session cleanup failed. Please restart the microphone.",
+        "es.json": "No se pudo limpiar la sesión de voz. Reinicia el micrófono.",
+        "ja.json": "音声セッションのクリーンアップに失敗しました。マイクを再起動してください。",
+        "ko.json": "음성 세션 정리에 실패했습니다. 마이크를 다시 시작하세요.",
+        "pt.json": "Falha ao limpar a sessão de voz. Reinicie o microfone.",
+        "ru.json": "Не удалось очистить голосовой сеанс. Перезапустите микрофон.",
+        "zh-CN.json": "语音会话清理失败，请重启麦克风。",
+        "zh-TW.json": "語音會話清理失敗，請重新啟動麥克風。",
+    }
+    for locale_name, cleanup_copy in expected.items():
+        locale = json.loads((LOCALES_PATH / locale_name).read_text(encoding="utf-8"))
+        microphone = locale["microphone"]
+        assert microphone["independentAsrCleanupFailed"] == cleanup_copy
+        assert microphone["independentAsrRuntimeFailed"].strip()
 
 
 def test_lease_resync_status_resends_snapshot_only_from_capturing_window():

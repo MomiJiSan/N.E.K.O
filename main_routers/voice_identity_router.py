@@ -74,6 +74,13 @@ def _service_error(exc: VoiceIdentityServiceError) -> JSONResponse:
         "owner_verification_failed",
     }:
         status_code = 422
+    elif exc.code in {
+        "audio_processing_unavailable",
+        "unsupported_audio_contract",
+        "model_unavailable",
+        "secure_storage_unavailable",
+    }:
+        status_code = 503
     else:
         status_code = 503
     return JSONResponse({"error_code": exc.code}, status_code=status_code)

@@ -695,6 +695,20 @@ class VoiceIdentityService:
                 ):
                     self._clear_segment_operation(session)
             raise VoiceIdentityServiceError(exc.code) from exc
+        except EnrollmentAudioNormalizationError as exc:
+            retired = await self._terminate_failed_segment_operation(
+                session,
+                session_generation,
+                operation_nonce,
+                segment_index,
+                operation_task,
+                VoiceIdentityEffectiveReason.RUNTIME_DEGRADED,
+            )
+            if not retired:
+                raise VoiceIdentityServiceError("stale_enrollment") from exc
+            raise VoiceIdentityServiceError(
+                "audio_processing_unavailable"
+            ) from exc
         except EnrollmentSpeechValidatorUnavailableError as exc:
             retired = await self._terminate_failed_segment_operation(
                 session,
@@ -877,6 +891,14 @@ class VoiceIdentityService:
             if exc.code in {"invalid_pcm", "speech_too_short"}:
                 raise EnrollmentAudioError(exc.code) from exc
             raise
+
+        self._require_compute_fence(
+            session,
+            session_generation,
+            operation_nonce,
+            segment_index,
+            operation_task,
+        )
 
         reference_bytes = ENROLLMENT_SAMPLE_RATE_HZ * 3 * 2
         verification_bytes = ENROLLMENT_SAMPLE_RATE_HZ * 5 * 2

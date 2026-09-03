@@ -297,6 +297,7 @@ class AsrRuntimeMixin:
         self._microphone_route_generation = 0
         self._asr_route_operation_generation = 0
         self._asr_notification_lock = asyncio.Lock()
+        self._core_asr_notification_revision = 0
         # Shared with the hot-swap lifecycle: a prepared final either finishes
         # against the still-open old session, or waits until close+promotion
         # has atomically exposed the replacement.
@@ -423,6 +424,8 @@ class AsrRuntimeMixin:
             )
         if not hasattr(self, "_asr_notification_lock"):
             self._asr_notification_lock = asyncio.Lock()
+        if not hasattr(self, "_core_asr_notification_revision"):
+            self._core_asr_notification_revision = 0
         if not hasattr(self, "_core_voice_session_swap_lock"):
             self._core_voice_session_swap_lock = asyncio.Lock()
         if not hasattr(self, "_core_voice_session_swap_barrier_timeout_s"):
@@ -2772,10 +2775,25 @@ class AsrRuntimeMixin:
                     declared_rate_hz,
                 )
                 return
+            audio_captured_at = (
+                float(captured_at)
+                if isinstance(captured_at, (int, float)) and captured_at > 0
+                else time.time()
+            )
             try:
                 processed_frame = await pipeline_ref.process(
                     audio_bytes,
                     sample_rate_hz=source_rate_hz,
+                    ingress_sequence=ingress_sequence,
+                    captured_at=audio_captured_at,
+                )
+                # Capture identity belongs to Core ingress. Even a legacy or
+                # injected pipeline implementation must not be able to replace
+                # it with a Runtime-local surrogate.
+                processed_frame = replace(
+                    processed_frame,
+                    ingress_sequence=ingress_sequence,
+                    captured_at=audio_captured_at,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2789,11 +2807,6 @@ class AsrRuntimeMixin:
                 return
             if not processed_frame.pcm16:
                 return
-            audio_captured_at = (
-                float(captured_at)
-                if isinstance(captured_at, (int, float)) and captured_at > 0
-                else time.time()
-            )
             if (
                 not self.is_active
                 or self._audio_stream_epoch != audio_epoch
@@ -2830,8 +2843,8 @@ class AsrRuntimeMixin:
                             rnnoise_available=processed_frame.rnnoise_available,
                             rnnoise_evidence=processed_frame.rnnoise_evidence,
                             audio_stream_epoch=audio_epoch,
-                            ingress_sequence=ingress_sequence,
-                            captured_at=audio_captured_at,
+                            ingress_sequence=processed_frame.ingress_sequence,
+                            captured_at=processed_frame.captured_at,
                         )
                     )
             if cache_for_hot_swap:
@@ -2855,7 +2868,8 @@ class AsrRuntimeMixin:
                 rnnoise_available=processed_frame.rnnoise_available,
                 rnnoise_evidence=processed_frame.rnnoise_evidence,
                 ingress_token=ingress_token,
-                captured_at=audio_captured_at,
+                ingress_sequence=processed_frame.ingress_sequence,
+                captured_at=processed_frame.captured_at,
             )
         except struct.error:
             logger.error("Microphone input rejected: invalid PCM samples")
@@ -2876,6 +2890,7 @@ class AsrRuntimeMixin:
         rnnoise_available: bool | None = None,
         rnnoise_evidence: RnnoiseEvidence | None = None,
         ingress_token: VoiceIngressToken | None = None,
+        ingress_sequence: int = 0,
         captured_at: float | None = None,
     ) -> bool:
         route_mode = self._asr_route_mode
@@ -2980,6 +2995,12 @@ class AsrRuntimeMixin:
                 speech_probability=speech_probability,
                 rnnoise_available=bool(rnnoise_available),
                 rnnoise_evidence=rnnoise_evidence,
+                ingress_sequence=ingress_sequence,
+                captured_at=(
+                    float(captured_at)
+                    if isinstance(captured_at, (int, float)) and captured_at > 0
+                    else 0.0
+                ),
             ),
             ingress_token=token,
         )
@@ -3104,6 +3125,9 @@ class AsrRuntimeMixin:
                             rnnoise_available=frame.rnnoise_available,
                             rnnoise_evidence=frame.rnnoise_evidence,
                             ingress_token=token,
+                            ingress_sequence=audio_frames[
+                                batch_end - 1
+                            ].ingress_sequence,
                             captured_at=audio_frames[batch_end - 1].captured_at,
                         )
                     except asyncio.CancelledError:
@@ -4319,6 +4343,11 @@ class AsrRuntimeMixin:
                 != self._core_asr_identity_ingress_token(source_identity).session_epoch
             ):
                 return
+            self._core_asr_notification_revision = max(
+                self._core_asr_notification_revision + 1,
+                event.lifecycle_revision,
+            )
+            transport_generation = max(0, event.transport_generation)
             await self._send_voice_control_status(
                 json.dumps(
                     {
@@ -4326,6 +4355,10 @@ class AsrRuntimeMixin:
                         "details": {
                             "provider": event.provider,
                             "session_epoch": event.session_epoch,
+                            "transport_generation": transport_generation,
+                            "lifecycle_revision": self._core_asr_notification_revision,
+                            "reason_code": event.reason_code,
+                            "incident_id": event.incident_id,
                         },
                     }
                 ),
@@ -4343,6 +4376,11 @@ class AsrRuntimeMixin:
                 != self._core_asr_identity_ingress_token(source_identity).session_epoch
             ):
                 return
+            self._core_asr_notification_revision = max(
+                self._core_asr_notification_revision + 1,
+                event.lifecycle_revision,
+            )
+            transport_generation = max(0, event.transport_generation)
             await self._send_voice_control_status(
                 json.dumps(
                     {
@@ -4352,6 +4390,10 @@ class AsrRuntimeMixin:
                             "state": event.state,
                             "route_mode": self._asr_route_mode,
                             "session_epoch": event.session_epoch,
+                            "transport_generation": transport_generation,
+                            "lifecycle_revision": self._core_asr_notification_revision,
+                            "reason_code": event.reason_code,
+                            "incident_id": event.incident_id,
                         },
                     }
                 ),

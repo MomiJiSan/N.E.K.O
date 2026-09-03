@@ -94,7 +94,7 @@ def test_final_handler_only_posts_provider_final_to_admission() -> None:
     assert not ({"try_reserve", "release", "submit", "resolve_reserved"} & calls)
 
 
-def test_runtime_resolves_dispatcher_only_from_admission_effect_executor() -> None:
+def test_runtime_resolves_dispatcher_only_from_typed_settlement_owners() -> None:
     tree = _tree(_RUNTIME)
     owners: list[str] = []
     for function in (
@@ -105,7 +105,11 @@ def test_runtime_resolves_dispatcher_only_from_admission_effect_executor() -> No
         if "resolve_reserved" in _call_attribute_names(function):
             owners.append(function.name)
 
-    assert owners == ["_resolve_admission_reservation"]
+    assert owners == [
+        "_resolve_admission_reservation",
+        "_finish_speaker_deny_cleanup",
+        "_settle_published_provider_turn_ownership",
+    ]
 
 
 def test_speaker_completion_has_no_forward_authority_or_runtime_import_cycle() -> None:

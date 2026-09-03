@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Hashable, Literal
 
-from main_logic.voice_turn.contracts import VoiceTurnToken
+from main_logic.voice_turn.contracts import VoiceIngressToken, VoiceTurnToken
 
 from .admission.contracts import AdmissionDisposition
 from .lifecycle import FinalKey
@@ -194,6 +195,37 @@ class TranscriptTerminalSettlement:
     cleanup_kind: TranscriptCleanupKind
 
 
+class TranscriptResolutionOutcome(StrEnum):
+    APPLIED = "applied"
+    ALREADY_SAME = "already_same"
+    CONFLICT = "conflict"
+    NOT_RESERVED = "not_reserved"
+    OWNER_MISMATCH = "owner_mismatch"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptResolutionReceipt:
+    final_key: FinalKey
+    requested: AdmissionDisposition
+    outcome: TranscriptResolutionOutcome
+    existing: AdmissionDisposition | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.final_key) is not FinalKey:
+            raise TypeError("final_key must be FinalKey")
+        if type(self.requested) is not AdmissionDisposition:
+            raise TypeError("requested must be AdmissionDisposition")
+        if type(self.outcome) is not TranscriptResolutionOutcome:
+            raise TypeError("outcome must be TranscriptResolutionOutcome")
+        if self.existing is not None and type(self.existing) is not AdmissionDisposition:
+            raise TypeError("existing must be AdmissionDisposition or None")
+
+
+class TranscriptTombstoneCapacityError(RuntimeError):
+    """A live resolution tombstone cannot be evicted without reopening history."""
+
+
 _DispatchQueueItem = TranscriptEnvelope | TranscriptTerminalSettlement
 
 
@@ -208,20 +240,35 @@ class TranscriptDispatcher:
         settle_terminal: Callable[[TranscriptTerminalSettlement], Awaitable[None]]
         | None = None,
         require_terminal_settlement: bool = False,
+        resolution_tombstone_capacity: int = 256,
     ) -> None:
         if capacity <= 0:
             raise ValueError("dispatcher capacity must be positive")
         if require_terminal_settlement and settle_terminal is None:
             raise ValueError("dispatcher terminal settlement callback is required")
+        if (
+            type(resolution_tombstone_capacity) is not int
+            or resolution_tombstone_capacity < capacity
+        ):
+            raise ValueError(
+                "resolution_tombstone_capacity must be an integer at least capacity"
+            )
         self._dispatch = dispatch
         self._settle_terminal = settle_terminal
         self._capacity = capacity
+        self._resolution_tombstone_capacity = resolution_tombstone_capacity
         self._queue: asyncio.Queue[_DispatchQueueItem] = asyncio.Queue(
             maxsize=capacity
         )
         self._reservations: set[FinalKey] = set()
-        self._resolved: set[FinalKey] = set()
+        self._resolved: dict[FinalKey, AdmissionDisposition] = {}
         self._terminal_settlement_pending: set[FinalKey] = set()
+        self._terminal_settlement_failures: dict[FinalKey, Exception] = {}
+        self._delivery_pending: set[FinalKey] = set()
+        self._retired_transport_watermarks: dict[
+            str,
+            tuple[int, int, int, int],
+        ] = {}
         self._worker: asyncio.Task[None] | None = None
         self._handoff_worker: asyncio.Task[None] | None = None
         self._active: _DispatchQueueItem | None = None
@@ -243,6 +290,12 @@ class TranscriptDispatcher:
             return False
         if key in self._reservations:
             return True
+        if self._is_retired_transport(key.turn_token.ingress):
+            return False
+        if len(self._resolved) >= self._resolution_tombstone_capacity:
+            raise TranscriptTombstoneCapacityError(
+                "ASR_TRANSCRIPT_TOMBSTONE_CAPACITY_EXHAUSTED"
+            )
         occupied = (
             len(self._reservations)
             + self._queue.qsize()
@@ -264,11 +317,12 @@ class TranscriptDispatcher:
         key = envelope.final_key
         if key not in self._reservations:
             raise RuntimeError("ASR_TRANSCRIPT_SLOT_NOT_RESERVED")
-        if not self.resolve_reserved(
+        receipt = self.resolve_reserved(
             key,
             AdmissionDisposition.FORWARD,
             envelope=envelope,
-        ):
+        )
+        if receipt.outcome is not TranscriptResolutionOutcome.APPLIED:
             raise RuntimeError("ASR_TRANSCRIPT_SLOT_NOT_RESERVED")
 
     def resolve_reserved(
@@ -277,18 +331,41 @@ class TranscriptDispatcher:
         disposition: AdmissionDisposition,
         *,
         envelope: TranscriptEnvelope | None = None,
-    ) -> bool:
-        """Resolve one reservation exactly once as forward/drop/abandon."""
+    ) -> TranscriptResolutionReceipt:
+        """Resolve a reservation with an explicit idempotency/conflict receipt."""
 
         if type(disposition) is not AdmissionDisposition:
             raise TypeError("ASR_TRANSCRIPT_DISPOSITION_INVALID")
         if disposition is AdmissionDisposition.FORWARD:
-            if envelope is None or envelope.final_key != final_key:
+            if envelope is None:
                 raise ValueError("ASR_TRANSCRIPT_ENVELOPE_INVALID")
+            if envelope.final_key != final_key:
+                return TranscriptResolutionReceipt(
+                    final_key,
+                    disposition,
+                    TranscriptResolutionOutcome.OWNER_MISMATCH,
+                )
         elif envelope is not None:
             raise ValueError("ASR_TRANSCRIPT_TERMINAL_ENVELOPE_FORBIDDEN")
-        if final_key in self._resolved or final_key not in self._reservations:
-            return False
+        existing = self._resolved.get(final_key)
+        if existing is not None:
+            outcome = (
+                TranscriptResolutionOutcome.ALREADY_SAME
+                if existing is disposition
+                else TranscriptResolutionOutcome.CONFLICT
+            )
+            return TranscriptResolutionReceipt(
+                final_key,
+                disposition,
+                outcome,
+                existing,
+            )
+        if final_key not in self._reservations:
+            return TranscriptResolutionReceipt(
+                final_key,
+                disposition,
+                TranscriptResolutionOutcome.NOT_RESERVED,
+            )
 
         # Write the tombstone before relinquishing the reservation. No retry,
         # timeout, or late callback can reserve this FinalKey again.
@@ -297,12 +374,47 @@ class TranscriptDispatcher:
         if disposition is AdmissionDisposition.FORWARD:
             assert envelope is not None
             self._queue.put_nowait(envelope)
+            self._delivery_pending.add(final_key)
             self._idle.clear()
             self._ensure_worker()
         elif self._settle_terminal is not None:
             self._enqueue_terminal(final_key, disposition)
         else:
             self._set_idle_if_empty()
+        return TranscriptResolutionReceipt(
+            final_key,
+            disposition,
+            TranscriptResolutionOutcome.APPLIED,
+        )
+
+    def retire_resolution(
+        self,
+        final_key: FinalKey,
+        *,
+        retired_transport: VoiceIngressToken,
+    ) -> bool:
+        """Release a settled tombstone after the caller proves transport retirement."""
+
+        if final_key.turn_token.ingress != retired_transport:
+            return False
+        if final_key not in self._resolved:
+            return False
+        if (
+            final_key in self._reservations
+            or final_key in self._delivery_pending
+            or final_key in self._terminal_settlement_pending
+            or final_key in self._terminal_settlement_failures
+        ):
+            return False
+        identity = self._transport_identity(retired_transport)
+        previous = self._retired_transport_watermarks.get(
+            retired_transport.connection_id
+        )
+        if previous is None or identity > previous:
+            self._retired_transport_watermarks[retired_transport.connection_id] = (
+                identity
+            )
+        self._resolved.pop(final_key)
         return True
 
     def invalidate_all(self) -> None:
@@ -397,6 +509,8 @@ class TranscriptDispatcher:
         """
 
         await self._idle.wait()
+        if self._terminal_settlement_failures:
+            raise next(iter(self._terminal_settlement_failures.values()))
 
     def _ensure_worker(self) -> None:
         if (
@@ -424,10 +538,11 @@ class TranscriptDispatcher:
                         await self._settle_terminal(item)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     # Dispatch callbacks own status reporting. Keep the serial
                     # worker alive if a defensive caller still leaks an error.
-                    pass
+                    if isinstance(item, TranscriptTerminalSettlement):
+                        self._terminal_settlement_failures[item.final_key] = exc
                 finally:
                     self._queue.task_done()
                     if (
@@ -442,6 +557,7 @@ class TranscriptDispatcher:
                             self._terminal_settlement_pending.discard(
                                 item.final_key
                             )
+                        self._delivery_pending.discard(item.final_key)
                         self._set_idle_if_empty()
                 if self._worker is not worker_task:
                     # invalidate_all() 已经把我们从 _worker 上摘掉了（而且刻意没有
@@ -472,8 +588,14 @@ class TranscriptDispatcher:
         final_key: FinalKey,
         disposition: AdmissionDisposition,
     ) -> None:
-        del disposition
-        self._resolved.add(final_key)
+        if (
+            final_key not in self._resolved
+            and len(self._resolved) >= self._resolution_tombstone_capacity
+        ):
+            raise TranscriptTombstoneCapacityError(
+                "ASR_TRANSCRIPT_TOMBSTONE_CAPACITY_EXHAUSTED"
+            )
+        self._resolved[final_key] = disposition
 
     def _enqueue_terminal(
         self,
@@ -491,6 +613,7 @@ class TranscriptDispatcher:
                 else "abandon"
             )
         self._terminal_settlement_pending.add(final_key)
+        self._delivery_pending.add(final_key)
         self._queue.put_nowait(
             TranscriptTerminalSettlement(
                 final_key=final_key,
@@ -500,3 +623,19 @@ class TranscriptDispatcher:
         )
         self._idle.clear()
         self._ensure_worker()
+
+    @staticmethod
+    def _transport_identity(ingress: VoiceIngressToken) -> tuple[int, int, int, int]:
+        return (
+            ingress.session_epoch,
+            ingress.lease_generation,
+            ingress.route_generation,
+            ingress.audio_generation,
+        )
+
+    def _is_retired_transport(self, ingress: VoiceIngressToken) -> bool:
+        watermark = self._retired_transport_watermarks.get(ingress.connection_id)
+        return bool(
+            watermark is not None
+            and self._transport_identity(ingress) <= watermark
+        )

@@ -25,7 +25,9 @@
   → 任一项未通过：返回最低匹配率并按服务端进度重试或重置
 ```
 
-前三段显示为 3 秒录音。浏览器为服务端流式重采样保留 100 ms 采集余量，服务端规范化后只使用精确 3 秒。第四段必须精确上传并使用 5 秒，不增加余量，避免越过 5 秒硬上限。
+前三段显示为 3 秒录音。浏览器为服务端流式重采样保留 100 ms 采集余量，服务端规范化后只使用精确 3 秒。第四段的 source 必须严格为 5 秒：浏览器精确上传 `240,000 samples / 480,000 bytes`，不增加采集余量，避免越过 5 秒硬上限。
+
+第四段 source 结束后，Enrollment normalizer 允许对该段自己的 `VoiceInputAudioPipeline` 执行一次且仅一次 EOF drain，以结算有状态 FIR/soxr 在流尾保留的输出。EOF drain 不输入新 PCM、不增加 source 样本或录音时长，也不改变 Router 的 `480,000 bytes` 上限；所得输出只用于补齐这 5 秒 source 对应的规范化尾部。
 
 四段共用一次麦克风租约和同一组采集参数。服务端 `next_segment_index` 是唯一权威进度；客户端不得根据本地计时自行跳段或提交 Profile。
 
@@ -39,11 +41,14 @@
 | 浏览器配置 | 与桌面运行时相同的麦克风设备、客户端增益和 `getUserMedia` 约束 |
 | 服务端分块 | 每块 480 samples |
 | 服务端处理 | 复用运行时 `VoiceInputAudioPipeline` 的 NR、AGC、Limiter 与 soxr 路径 |
+| 录入 EOF | 每段结束时仅由 Enrollment adapter 一次性 drain，结算该段 FIR/soxr 尾部 |
 | 模型输入 | PCM16LE、mono、16 kHz |
 | 参考长度 | 规范化后的前 3.0 秒 |
 | 验证长度 | 规范化后的前 1.5、3.0 和 5.0 秒 |
 
 每个 Segment 创建独立 normalizer，不能复用上一段的 DSP 内部状态。录入开始时冻结当前降噪开关，四段使用同一快照；运行时配置与 Profile 快照不一致时，声纹证据必须为 `UNAVAILABLE` 并 fail-open，不能比较后产生 `LOW`。
+
+EOF drain 是 Enrollment-only 的段结算接口，不进入普通 ASR 麦克风流、Speaker Shadow、Provider worker 或历史 Profile 读取路径。前三段仍按原有 `3 秒 + 100 ms source 余量 → 精确取前 3 秒` 合同执行；第四段仍只采集严格 5 秒。
 
 浏览器若实际无法建立 48 kHz `AudioContext`，或请求缺少/伪造音频合同，录入直接失败，不允许把 44.1 kHz 或旧 16 kHz 数据标记成 48 kHz。
 
@@ -116,6 +121,7 @@ match_percent = round(
 | 第二次独立验证低分 | 清除本轮参考数据，服务端进度重置到 Segment 1 |
 | 静音、削波或真人语音门失败 | 使用既有音频错误合同，不解释成匹配失败 |
 | normalizer、Silero 或 CAM++ 不可用/超时 | 不保存新 Profile，不产生伪造 `LOW` |
+| 麦克风音频处理链或 EOF drain 不可用 | 返回 `audio_processing_unavailable`（HTTP 503），前端提示“录音处理暂时不可用，请重新启动麦克风后重试” |
 | 响应丢失 | 读取服务端状态恢复进度，不恢复匹配率 |
 | 取消、页面关闭或 TTL 到期 | 停止 track、AudioContext、worklet、定时器和上传；服务端退休 Session |
 | 降噪配置与 Profile 不一致 | 撤销声纹激活并返回音频合同不匹配，运行时 fail-open |

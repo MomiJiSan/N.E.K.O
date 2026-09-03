@@ -1,6 +1,7 @@
 """Provider-neutral transcript admission state machine."""
 
 from .contracts import (
+    AdmissionBulkResult,
     AdmissionDisposition,
     AdmissionEffect,
     AdmissionEvent,
@@ -13,11 +14,12 @@ from .contracts import (
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseState,
+    SpeakerLeaseTransitionOutcome,
+    SpeakerLeaseTransitionReceipt,
     SpeakerLeaseUnavailable,
     VoiceTurnAdmissionRecord,
 )
 from .coordinator import (
-    AdmissionBulkResult,
     AdmissionCapacityError,
     AdmissionIdentityError,
     SpeakerLeaseCapacityError,
@@ -63,6 +65,8 @@ __all__ = [
     "SpeakerLeaseIdentityError",
     "SpeakerLeaseLow",
     "SpeakerLeaseState",
+    "SpeakerLeaseTransitionOutcome",
+    "SpeakerLeaseTransitionReceipt",
     "SpeakerLeaseTerminalError",
     "SpeakerLeaseUnavailable",
     "VoiceTurnAdmissionCoordinator",

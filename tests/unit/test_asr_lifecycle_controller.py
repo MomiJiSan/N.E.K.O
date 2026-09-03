@@ -227,6 +227,82 @@ def test_stop_clears_audio_and_invalidates_all_async_identity() -> None:
     assert controller.pending_turn_bytes == 0
 
 
+@pytest.mark.parametrize(
+    "events",
+    [
+        (),
+        (VoiceLifecycleEvent.SOFT_WAKE,),
+        (VoiceLifecycleEvent.SOFT_WAKE, VoiceLifecycleEvent.SPEECH_CONFIRMED),
+        (
+            VoiceLifecycleEvent.SOFT_WAKE,
+            VoiceLifecycleEvent.SPEECH_CONFIRMED,
+            VoiceLifecycleEvent.TURN_SEALED,
+        ),
+        (
+            VoiceLifecycleEvent.SOFT_WAKE,
+            VoiceLifecycleEvent.SPEECH_CONFIRMED,
+            VoiceLifecycleEvent.TURN_SEALED,
+            VoiceLifecycleEvent.PROVIDER_FINAL,
+        ),
+    ],
+)
+def test_hard_block_records_incident_and_clears_all_audio(events) -> None:
+    controller = VoiceInputLifecycleController(
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        shadow_mode=False,
+    )
+    controller.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    controller.accept_audio(_pcm(100), sample_rate_hz=16_000)
+    for event in events:
+        controller.transition(event)
+        if event is VoiceLifecycleEvent.TURN_SEALED:
+            controller.accept_audio(_pcm(100), sample_rate_hz=16_000)
+            controller.mark_pending_turn_speech()
+    before = controller.snapshot
+
+    state = controller.block(
+        reason_code="ASR_DENY_CLEANUP_FAILED",
+        incident_id="incident-1",
+    )
+    after = controller.snapshot
+
+    assert state is VoiceLifecycleState.BLOCKED
+    assert after.route_mode is VoiceRouteMode.BLOCKED
+    assert after.transport_generation == before.transport_generation + 1
+    assert after.lifecycle_revision == before.lifecycle_revision + 1
+    assert after.reason_code == "ASR_DENY_CLEANUP_FAILED"
+    assert after.incident_id == "incident-1"
+    assert controller.pre_roll_bytes == 0
+    assert controller.pending_connect_bytes == 0
+    assert controller.pending_turn_bytes == 0
+    assert controller.current_turn_token is None
+    assert controller.has_pending_turn is False
+
+
+def test_hard_block_is_idempotent_only_for_the_same_incident() -> None:
+    controller = VoiceInputLifecycleController(
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        shadow_mode=False,
+    )
+    controller.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    controller.block(
+        reason_code="ASR_DENY_CLEANUP_FAILED",
+        incident_id="incident-1",
+    )
+    blocked = controller.snapshot
+
+    assert controller.block(
+        reason_code="ASR_DENY_CLEANUP_FAILED",
+        incident_id="incident-1",
+    ) is VoiceLifecycleState.BLOCKED
+    assert controller.snapshot == blocked
+    with pytest.raises(RuntimeError, match="VOICE_LIFECYCLE_BLOCKED_INCIDENT_CONFLICT"):
+        controller.block(
+            reason_code="ASR_DENY_CLEANUP_FAILED",
+            incident_id="incident-2",
+        )
+
+
 def test_detector_failure_fails_open_only_to_continuous_independent_asr() -> None:
     controller = VoiceInputLifecycleController(
         provider_policy=resolve_provider_policy("qwen", "manual"),

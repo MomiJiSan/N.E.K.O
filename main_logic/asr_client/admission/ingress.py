@@ -18,6 +18,7 @@ from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
 from .contracts import (
     AdmissionEffect,
+    AdmissionBulkResult,
     AdmissionEvent,
     BoundaryExact,
     CandidateBound,
@@ -33,6 +34,8 @@ from .contracts import (
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseUnavailable,
+    SpeakerLeaseTransitionOutcome,
+    SpeakerLeaseTransitionReceipt,
     SpeakerAuthorityPending,
     SpeakerAuthorityUnavailable,
     SpeakerAuthorityUnarmed,
@@ -41,7 +44,7 @@ from .contracts import (
     SpeakerUnavailable,
     VoiceTurnAdmissionRecord,
 )
-from .coordinator import AdmissionBulkResult, VoiceTurnAdmissionCoordinator
+from .coordinator import VoiceTurnAdmissionCoordinator
 
 
 _CapacityClass: TypeAlias = Literal["data", "control", "speaker_control"]
@@ -102,6 +105,7 @@ _IngressResult: TypeAlias = (
     | SpeakerCaptureLeaseRecord
     | tuple[AdmissionEffect, ...]
     | tuple[AdmissionBulkResult, ...]
+    | SpeakerLeaseTransitionReceipt
 )
 
 
@@ -438,7 +442,7 @@ class AdmissionIngressLane:
         event: SpeakerLeaseEvent,
         *,
         now: float | None = None,
-    ) -> asyncio.Future[tuple[AdmissionBulkResult, ...]]:
+    ) -> asyncio.Future[SpeakerLeaseTransitionReceipt]:
         """Append an authoritative parent fact to the speaker-control partition."""
 
         if type(lease_token) is not SpeakerCaptureLeaseToken:
@@ -449,9 +453,9 @@ class AdmissionIngressLane:
         coalescing_key = (lease_token, event, now)
         existing = self._pending_controls.get(coalescing_key)
         if existing is not None:
-            follower = self._effectless_follower(existing)
+            follower = self._speaker_transition_follower(existing)
             return cast(
-                asyncio.Future[tuple[AdmissionBulkResult, ...]],
+                asyncio.Future[SpeakerLeaseTransitionReceipt],
                 follower,
             )
         self._reserve_capacity(
@@ -475,7 +479,7 @@ class AdmissionIngressLane:
         self._pending_controls[coalescing_key] = result
         assert self._available is not None
         self._available.set()
-        return cast(asyncio.Future[tuple[AdmissionBulkResult, ...]], result)
+        return cast(asyncio.Future[SpeakerLeaseTransitionReceipt], result)
 
     async def post_speaker_lease(
         self,
@@ -483,10 +487,58 @@ class AdmissionIngressLane:
         event: SpeakerLeaseEvent,
         *,
         now: float | None = None,
-    ) -> tuple[AdmissionBulkResult, ...]:
+    ) -> SpeakerLeaseTransitionReceipt:
         return await asyncio.shield(
             self.post_speaker_lease_nowait(lease_token, event, now=now)
         )
+
+    def _speaker_transition_follower(
+        self,
+        leader: asyncio.Future[_IngressResult],
+    ) -> asyncio.Future[SpeakerLeaseTransitionReceipt]:
+        """Join an exact parent fact without duplicating child effect ownership."""
+
+        assert self._loop is not None
+        follower: asyncio.Future[SpeakerLeaseTransitionReceipt] = (
+            self._loop.create_future()
+        )
+
+        def transfer_result(completed: asyncio.Future[_IngressResult]) -> None:
+            if follower.done():
+                return
+            if completed.cancelled():
+                follower.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                follower.set_exception(error)
+                return
+            receipt = completed.result()
+            if not isinstance(receipt, SpeakerLeaseTransitionReceipt):
+                follower.set_exception(
+                    RuntimeError("ASR_ADMISSION_SPEAKER_RECEIPT_INVALID")
+                )
+                return
+            follower.set_result(
+                SpeakerLeaseTransitionReceipt(
+                    lease_token=receipt.lease_token,
+                    before_state=receipt.before_state,
+                    after_state=receipt.after_state,
+                    outcome=(
+                        SpeakerLeaseTransitionOutcome.IDEMPOTENT
+                        if receipt.terminal_sequence_no is not None
+                        else receipt.outcome
+                    ),
+                    terminal_sequence_no=receipt.terminal_sequence_no,
+                    capture_through_sequence_no=receipt.capture_through_sequence_no,
+                    frozen_children=receipt.frozen_children,
+                    child_results=(),
+                    diagnostics=(),
+                )
+            )
+
+        leader.add_done_callback(transfer_result)
+        return follower
 
     def retire_speaker_lease_nowait(
         self,

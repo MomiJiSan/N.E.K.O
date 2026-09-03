@@ -14,16 +14,18 @@ from main_logic.asr_client.admission.contracts import AdmissionDisposition
 from main_logic.asr_client.transcript import (
     TranscriptDispatcher,
     TranscriptEnvelope,
+    TranscriptResolutionOutcome,
     TranscriptTerminalSettlement,
+    TranscriptTombstoneCapacityError,
 )
 
 
 pytestmark = pytest.mark.asyncio
 
 
-def _envelope(turn_id: int) -> TranscriptEnvelope:
+def _envelope(turn_id: int, *, audio_generation: int = 4) -> TranscriptEnvelope:
     token = VoiceTurnToken(
-        ingress=VoiceIngressToken(1, "socket", 2, 3, 4),
+        ingress=VoiceIngressToken(1, "socket", 2, 3, audio_generation),
         turn_id=turn_id,
     )
     return TranscriptEnvelope(token, "qwen", f"text-{turn_id}")
@@ -266,19 +268,25 @@ async def test_resolve_reserved_is_exactly_once_for_forward_drop_and_abandon() -
         forward.final_key,
         AdmissionDisposition.FORWARD,
         envelope=forward,
-    ) is True
-    assert dispatcher.resolve_reserved(
+    ).outcome is TranscriptResolutionOutcome.APPLIED
+    conflict = dispatcher.resolve_reserved(
         forward.final_key,
         AdmissionDisposition.DROP,
-    ) is False
+    )
+    assert conflict.outcome is TranscriptResolutionOutcome.CONFLICT
+    assert conflict.existing is AdmissionDisposition.FORWARD
     assert dispatcher.resolve_reserved(
         dropped.final_key,
         AdmissionDisposition.DROP,
-    ) is True
+    ).outcome is TranscriptResolutionOutcome.APPLIED
+    assert dispatcher.resolve_reserved(
+        dropped.final_key,
+        AdmissionDisposition.DROP,
+    ).outcome is TranscriptResolutionOutcome.ALREADY_SAME
     assert dispatcher.resolve_reserved(
         abandoned.final_key,
         AdmissionDisposition.ABANDON,
-    ) is True
+    ).outcome is TranscriptResolutionOutcome.APPLIED
 
     await asyncio.wait_for(dispatcher.wait_idle(), 1)
     assert delivered == [forward]
@@ -331,7 +339,7 @@ async def test_invalidate_preserves_active_queued_terminal_and_reservation_settl
     assert dispatcher.resolve_reserved(
         dropped.final_key,
         AdmissionDisposition.DROP,
-    ) is True
+    ).outcome is TranscriptResolutionOutcome.APPLIED
 
     dispatcher.invalidate_all()
     await asyncio.wait_for(active_cancelled.wait(), 1)
@@ -371,3 +379,81 @@ async def test_invalidate_all_still_cancels_a_worker_from_outside() -> None:
     dispatcher.invalidate_all()
 
     await asyncio.wait_for(finished.wait(), 1.0)
+
+
+async def test_resolution_receipt_distinguishes_missing_and_wrong_owner() -> None:
+    dispatcher = TranscriptDispatcher(AsyncMock())
+    reserved = _envelope(1)
+    wrong_owner = _envelope(2)
+
+    assert dispatcher.try_reserve(reserved.final_key)
+    missing = dispatcher.resolve_reserved(
+        wrong_owner.final_key,
+        AdmissionDisposition.DROP,
+    )
+    assert missing.outcome is TranscriptResolutionOutcome.NOT_RESERVED
+    assert missing.existing is None
+
+    mismatch = dispatcher.resolve_reserved(
+        reserved.final_key,
+        AdmissionDisposition.FORWARD,
+        envelope=wrong_owner,
+    )
+    assert mismatch.outcome is TranscriptResolutionOutcome.OWNER_MISMATCH
+    assert reserved.final_key in dispatcher._reservations
+
+
+async def test_tombstone_capacity_fails_closed_until_retired_transport_watermark() -> None:
+    dispatcher = TranscriptDispatcher(
+        AsyncMock(),
+        capacity=1,
+        resolution_tombstone_capacity=1,
+    )
+    first = _envelope(1)
+    second = _envelope(2, audio_generation=5)
+    assert dispatcher.try_reserve(first.final_key)
+    assert (
+        dispatcher.resolve_reserved(first.final_key, AdmissionDisposition.DROP).outcome
+        is TranscriptResolutionOutcome.APPLIED
+    )
+    await dispatcher.wait_idle()
+
+    with pytest.raises(
+        TranscriptTombstoneCapacityError,
+        match="ASR_TRANSCRIPT_TOMBSTONE_CAPACITY_EXHAUSTED",
+    ):
+        dispatcher.try_reserve(second.final_key)
+
+    assert dispatcher.retire_resolution(
+        first.final_key,
+        retired_transport=first.turn_token.ingress,
+    )
+    assert first.final_key not in dispatcher._resolved
+    assert dispatcher.try_reserve(first.final_key) is False
+    assert dispatcher.try_reserve(second.final_key)
+
+
+async def test_terminal_settlement_failure_is_observable_and_not_retirable() -> None:
+    failure = RuntimeError("terminal settlement failed")
+
+    async def settle(_settlement: TranscriptTerminalSettlement) -> None:
+        raise failure
+
+    dispatcher = TranscriptDispatcher(
+        AsyncMock(),
+        settle_terminal=settle,
+        require_terminal_settlement=True,
+    )
+    envelope = _envelope(1)
+    assert dispatcher.try_reserve(envelope.final_key)
+    assert (
+        dispatcher.resolve_reserved(envelope.final_key, AdmissionDisposition.DROP).outcome
+        is TranscriptResolutionOutcome.APPLIED
+    )
+
+    with pytest.raises(RuntimeError, match="terminal settlement failed"):
+        await asyncio.wait_for(dispatcher.wait_idle(), 1)
+    assert not dispatcher.retire_resolution(
+        envelope.final_key,
+        retired_transport=envelope.turn_token.ingress,
+    )

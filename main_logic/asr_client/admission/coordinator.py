@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
@@ -14,6 +14,7 @@ from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
 from .contracts import (
     AdmissionState,
+    AdmissionBulkResult,
     AdmissionEffect,
     AdmissionEvent,
     BoundaryState,
@@ -31,11 +32,14 @@ from .contracts import (
     SpeakerCaptureLeaseRecord,
     SpeakerCaptureLeaseToken,
     SpeakerLeaseAbandoned,
+    SpeakerLeaseCaptureClosed,
     SpeakerLeaseChildBinding,
     SpeakerLeaseEvent,
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseState,
+    SpeakerLeaseTransitionOutcome,
+    SpeakerLeaseTransitionReceipt,
     SpeakerLeaseUnavailable,
     SpeakerCheckpointKind,
     SpeakerHigh,
@@ -48,6 +52,7 @@ from .speaker_leases import (
     MAX_SPEAKER_LEASE_CHILDREN,
     MAX_SPEAKER_LEASES,
     SpeakerLeaseIdentityError,
+    SpeakerLeaseTerminalError,
     bind_speaker_lease_child,
     reduce_speaker_lease,
 )
@@ -63,39 +68,6 @@ class AdmissionIdentityError(RuntimeError):
 
 class SpeakerLeaseCapacityError(RuntimeError):
     """A live speaker lease could not be reserved without eviction."""
-
-
-@dataclass(frozen=True, slots=True)
-class AdmissionBulkResult:
-    """Effects produced for one turn by an atomic bulk invalidation snapshot."""
-
-    turn_token: VoiceTurnToken
-    effects: tuple[AdmissionEffect, ...]
-    speaker_lease_token: SpeakerCaptureLeaseToken | None = None
-    speaker_lease_terminal_state: SpeakerLeaseState | None = None
-
-    def __post_init__(self) -> None:
-        if type(self.turn_token) is not VoiceTurnToken:
-            raise TypeError("turn_token must be VoiceTurnToken")
-        lease_identity = (
-            self.speaker_lease_token,
-            self.speaker_lease_terminal_state,
-        )
-        if lease_identity == (None, None):
-            return
-        if type(self.speaker_lease_token) is not SpeakerCaptureLeaseToken:
-            raise TypeError(
-                "speaker_lease_token must be SpeakerCaptureLeaseToken when present"
-            )
-        if type(self.speaker_lease_terminal_state) is not SpeakerLeaseState:
-            raise TypeError(
-                "speaker_lease_terminal_state must be SpeakerLeaseState when present"
-            )
-        if self.speaker_lease_terminal_state in {
-            SpeakerLeaseState.COLLECTING,
-            SpeakerLeaseState.FIRST_LOW,
-        }:
-            raise ValueError("speaker lease bulk result requires a terminal state")
 
 
 class VoiceTurnAdmissionCoordinator:
@@ -232,6 +204,7 @@ class VoiceTurnAdmissionCoordinator:
                 SpeakerLeaseState.ALLOW,
                 SpeakerLeaseState.UNAVAILABLE,
                 SpeakerLeaseState.DENY_LATCHED,
+                SpeakerLeaseState.ABANDONED,
             }
             if provider_binding not in {None, expected_binding}:
                 raise AdmissionIdentityError(
@@ -239,10 +212,6 @@ class VoiceTurnAdmissionCoordinator:
                 )
             existing = self._records.get(turn_token)
             if existing is not None:
-                if existing.terminal_disposition is not None:
-                    raise AdmissionIdentityError(
-                        "ASR_ADMISSION_TERMINAL_BINDING_CONFLICT"
-                    )
                 provider_placeholder = (
                     existing.provider_binding_state is ProviderBindingState.UNBOUND
                     and existing.provider_key is None
@@ -298,6 +267,10 @@ class VoiceTurnAdmissionCoordinator:
                     ):
                         raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
                     return existing
+                if existing.terminal_disposition is not None:
+                    raise AdmissionIdentityError(
+                        "ASR_ADMISSION_TERMINAL_BINDING_CONFLICT"
+                    )
                 if provider_binding is not None or binding in lease.child_bindings:
                     raise AdmissionIdentityError("ASR_ADMISSION_ALIAS_CONFLICT")
             else:
@@ -311,34 +284,15 @@ class VoiceTurnAdmissionCoordinator:
                 if len(self._records) >= self._capacity:
                     raise AdmissionCapacityError("ASR_ADMISSION_CAPACITY_EXHAUSTED")
 
-            if (
-                terminal_parent
-                and existing is not None
-                and not self._terminal_parent_attach_is_effect_free(existing)
-            ):
-                raise AdmissionIdentityError("ASR_ADMISSION_TERMINAL_BINDING_CONFLICT")
+            if terminal_parent:
+                raise SpeakerLeaseTerminalError("ASR_SPEAKER_LEASE_TERMINAL")
 
             try:
-                bindable_lease = (
-                    replace(
-                        lease,
-                        state=SpeakerLeaseState.COLLECTING,
-                        terminal_sequence_no=None,
-                    )
-                    if terminal_parent
-                    else lease
-                )
                 updated_lease = bind_speaker_lease_child(
-                    bindable_lease,
+                    lease,
                     binding,
                     capacity=self._speaker_lease_child_capacity,
                 )
-                if terminal_parent:
-                    updated_lease = replace(
-                        updated_lease,
-                        state=lease.state,
-                        terminal_sequence_no=lease.terminal_sequence_no,
-                    )
             except SpeakerLeaseIdentityError as exc:
                 raise AdmissionIdentityError(str(exc)) from exc
 
@@ -365,8 +319,6 @@ class VoiceTurnAdmissionCoordinator:
                     speaker_lease_token=lease_token,
                     speaker_candidate=lease.candidate,
                 )
-            if terminal_parent:
-                record = self._inherit_terminal_speaker_lease(record, lease)
             self._speaker_leases[lease_token] = updated_lease
             self._records[turn_token] = record
             self._provider_speaker_lease_bindings[provider_key] = expected_binding
@@ -396,78 +348,9 @@ class VoiceTurnAdmissionCoordinator:
                 and record.evidence_state is EvidenceState.DENY_LATCHED
                 and record.last_speaker_sequence_no == 2
             )
+        if lease.state is SpeakerLeaseState.ABANDONED:
+            return record.admission_state is AdmissionState.ABANDONED
         return False
-
-    @staticmethod
-    def _terminal_parent_attach_is_effect_free(
-        record: VoiceTurnAdmissionRecord,
-    ) -> bool:
-        """Return whether terminal inheritance can emit no hidden effects."""
-
-        return bool(
-            record.boundary_state is BoundaryState.OPEN
-            and record.evidence_state is EvidenceState.NONE
-            and record.rejection_apply_state is RejectionApplyState.NOT_STARTED
-            and record.micro_event_state is MicroEventState.NOT_APPLICABLE
-            and record.provider_final_state is ProviderFinalState.NOT_RECEIVED
-            and record.admission_state is AdmissionState.RESERVED
-            and record.operation_nonce_sequence == 0
-            and record.core_settlement_state is SettlementState.NOT_STARTED
-            and record.transport_settlement_state is SettlementState.NOT_STARTED
-            and record.lifecycle_settlement_state is SettlementState.NOT_STARTED
-            and record.rejection_capability is None
-            and record.pending_final is None
-            and record.resolution_ticket is None
-            and record.last_speaker_sequence_no == 0
-            and record.capture_through_sequence_no is None
-            and not record.micro_event_shadow_would_suppress
-            and not record.micro_event_terminal_counted
-            and record.rejection_operation_nonce is None
-            and record.rejection_operation_capability_id is None
-            and record.rejection_operation_owner_generation is None
-            and record.rejection_operation_kind is None
-            and record.revoked_rejection_ticket is None
-            and record.revoked_rejection_capability is None
-            and not record.pending_revocations
-            and not record.revocation_degraded
-            and record.namespace_poison_ticket is None
-            and record.deadline_operation_nonce is None
-            and not record.provider_boundary_deadline_expired
-            and record.partial_settlement_disposition is None
-            and not record.speaker_deny_cleanup_failed_counted
-        )
-
-    @staticmethod
-    def _inherit_terminal_speaker_lease(
-        record: VoiceTurnAdmissionRecord,
-        lease: SpeakerCaptureLeaseRecord,
-    ) -> VoiceTurnAdmissionRecord:
-        """Project one terminal parent verdict without duplicating its effects."""
-
-        if lease.state is SpeakerLeaseState.ALLOW:
-            return replace(
-                record,
-                logical_revision=record.logical_revision + 1,
-                evidence_state=EvidenceState.ALLOW,
-                last_speaker_sequence_no=1,
-            )
-        if lease.state is SpeakerLeaseState.UNAVAILABLE:
-            return replace(
-                record,
-                logical_revision=record.logical_revision + 1,
-                capture_state=CaptureState.UNAVAILABLE,
-                evidence_state=EvidenceState.UNAVAILABLE,
-                rejection_apply_state=RejectionApplyState.STALE,
-                last_speaker_sequence_no=1,
-            )
-        if lease.state is SpeakerLeaseState.DENY_LATCHED:
-            return replace(
-                record,
-                logical_revision=record.logical_revision + 1,
-                evidence_state=EvidenceState.DENY_LATCHED,
-                last_speaker_sequence_no=2,
-            )
-        raise AdmissionIdentityError("ASR_ADMISSION_TERMINAL_BINDING_CONFLICT")
 
     async def detach_turn_from_speaker_lease(
         self,
@@ -575,8 +458,8 @@ class VoiceTurnAdmissionCoordinator:
         event: SpeakerLeaseEvent,
         *,
         now: float | None = None,
-    ) -> tuple[AdmissionBulkResult, ...]:
-        """Reduce one parent fact and fan terminal verdicts to children in order."""
+    ) -> SpeakerLeaseTransitionReceipt:
+        """Reduce one parent fact and return its typed linearization receipt."""
 
         if type(lease_token) is not SpeakerCaptureLeaseToken:
             raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
@@ -586,28 +469,105 @@ class VoiceTurnAdmissionCoordinator:
             if record is None:
                 raise KeyError(lease_token)
             reduced, diagnostics = reduce_speaker_lease(record, event)
-            if reduced.state is record.state or reduced.terminal_disposition is None:
+            if reduced.terminal_disposition is None:
                 self._speaker_leases[lease_token] = reduced
-                return ()
+                return SpeakerLeaseTransitionReceipt(
+                    lease_token=lease_token,
+                    before_state=record.state,
+                    after_state=reduced.state,
+                    outcome=(
+                        SpeakerLeaseTransitionOutcome.NON_TERMINAL
+                        if reduced is not record
+                        else SpeakerLeaseTransitionOutcome.STALE
+                    ),
+                    terminal_sequence_no=None,
+                    capture_through_sequence_no=reduced.capture_through_sequence_no,
+                    frozen_children=(),
+                    child_results=(),
+                    diagnostics=diagnostics,
+                )
+            if record.terminal_disposition is not None:
+                return SpeakerLeaseTransitionReceipt(
+                    lease_token=lease_token,
+                    before_state=record.state,
+                    after_state=record.state,
+                    outcome=self._terminal_speaker_event_outcome(record, event),
+                    terminal_sequence_no=record.terminal_sequence_no,
+                    capture_through_sequence_no=record.capture_through_sequence_no,
+                    frozen_children=record.child_bindings,
+                    child_results=(),
+                    diagnostics=diagnostics,
+                )
             results, child_updates = self._prepare_speaker_lease_terminal_fanout(
                 reduced,
                 now=effective_now,
             )
-            if diagnostics and results:
-                first, *rest = results
-                results = (
-                    AdmissionBulkResult(
-                        first.turn_token,
-                        (*diagnostics, *first.effects),
-                        first.speaker_lease_token,
-                        first.speaker_lease_terminal_state,
-                    ),
-                    *rest,
-                )
             self._speaker_leases[lease_token] = reduced
             for turn_token, child in child_updates:
                 self._records[turn_token] = child
-            return results
+            return SpeakerLeaseTransitionReceipt(
+                lease_token=lease_token,
+                before_state=record.state,
+                after_state=reduced.state,
+                outcome=SpeakerLeaseTransitionOutcome.APPLIED,
+                terminal_sequence_no=reduced.terminal_sequence_no,
+                capture_through_sequence_no=reduced.capture_through_sequence_no,
+                frozen_children=reduced.child_bindings,
+                child_results=results,
+                diagnostics=diagnostics,
+            )
+
+    @staticmethod
+    def _terminal_speaker_event_outcome(
+        record: SpeakerCaptureLeaseRecord,
+        event: SpeakerLeaseEvent,
+    ) -> SpeakerLeaseTransitionOutcome:
+        if record.state is SpeakerLeaseState.ABANDONED:
+            return (
+                SpeakerLeaseTransitionOutcome.IDEMPOTENT
+                if isinstance(event, SpeakerLeaseAbandoned)
+                else SpeakerLeaseTransitionOutcome.STALE
+            )
+        candidate = getattr(event, "candidate", None)
+        if candidate != record.candidate:
+            return SpeakerLeaseTransitionOutcome.STALE
+        terminal_sequence_no = record.terminal_sequence_no
+        event_sequence_no = getattr(
+            event,
+            "through_sequence_no",
+            getattr(event, "sequence_no", None),
+        )
+        if event_sequence_no != terminal_sequence_no:
+            return SpeakerLeaseTransitionOutcome.STALE
+        exact = bool(
+            (
+                record.state is SpeakerLeaseState.DENY_LATCHED
+                and isinstance(event, SpeakerLeaseLow)
+                and event.checkpoint_kind
+                in {
+                    SpeakerCheckpointKind.SECOND,
+                    SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+                }
+            )
+            or (
+                record.state is SpeakerLeaseState.ALLOW
+                and isinstance(event, SpeakerLeaseHigh)
+            )
+            or (
+                record.state is SpeakerLeaseState.UNAVAILABLE
+                and isinstance(event, SpeakerLeaseUnavailable)
+            )
+            or (
+                record.state is SpeakerLeaseState.UNAVAILABLE
+                and isinstance(event, SpeakerLeaseCaptureClosed)
+                and record.capture_through_sequence_no == event.through_sequence_no
+            )
+        )
+        return (
+            SpeakerLeaseTransitionOutcome.IDEMPOTENT
+            if exact
+            else SpeakerLeaseTransitionOutcome.CONFLICT
+        )
 
     def _prepare_speaker_lease_terminal_fanout(
         self,
@@ -891,5 +851,7 @@ __all__ = [
     "AdmissionCapacityError",
     "AdmissionIdentityError",
     "SpeakerLeaseCapacityError",
+    "SpeakerLeaseTransitionOutcome",
+    "SpeakerLeaseTransitionReceipt",
     "VoiceTurnAdmissionCoordinator",
 ]

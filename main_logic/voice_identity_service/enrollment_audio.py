@@ -39,6 +39,8 @@ class _EnrollmentPipeline(Protocol):
         sample_rate_hz: int,
     ) -> ProcessedVoiceFrame: ...
 
+    async def finalize_stream(self) -> bytes: ...
+
     async def close(self) -> None: ...
 
 
@@ -99,6 +101,14 @@ class EnrollmentAudioNormalizer:
             raise EnrollmentAudioNormalizationError("invalid_pcm")
         if type(target_samples) is not int or target_samples <= 0:
             raise ValueError("target_samples must be a positive integer")
+        required_source_samples, remainder = divmod(
+            target_samples * OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ,
+            OWNER_CAMPPLUS_TARGET_SAMPLE_RATE_HZ,
+        )
+        if remainder:
+            raise ValueError("target_samples cannot map exactly to source PCM")
+        if len(pcm16) < required_source_samples * 2:
+            raise EnrollmentAudioNormalizationError("speech_too_short")
 
         try:
             pipeline = self._pipeline_factory()
@@ -120,6 +130,7 @@ class EnrollmentAudioNormalizer:
                 )
                 if (
                     frame.sample_rate_hz != OWNER_CAMPPLUS_TARGET_SAMPLE_RATE_HZ
+                    or type(frame.pcm16) is not bytes
                     or len(frame.pcm16) % 2
                     or (self._nr_enabled and not frame.rnnoise_available)
                 ):
@@ -128,9 +139,18 @@ class EnrollmentAudioNormalizer:
                     )
                 normalized.extend(frame.pcm16)
 
+            tail = await pipeline.finalize_stream()
+            if type(tail) is not bytes or len(tail) % 2:
+                raise EnrollmentAudioNormalizationError(
+                    "audio_processing_unavailable"
+                )
+            normalized.extend(tail)
+
             required_bytes = target_samples * 2
             if len(normalized) < required_bytes:
-                raise EnrollmentAudioNormalizationError("speech_too_short")
+                raise EnrollmentAudioNormalizationError(
+                    "audio_processing_unavailable"
+                )
             return bytes(normalized[:required_bytes])
         except BaseException as exc:
             primary_failure = exc

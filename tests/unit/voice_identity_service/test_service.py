@@ -508,7 +508,10 @@ async def test_normalization_unavailable_never_replaces_existing_profile(
 
     failure_code[0] = "audio_processing_unavailable"
     reenrollment = await service.start_enrollment()
-    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+    with pytest.raises(
+        VoiceIdentityServiceError,
+        match="audio_processing_unavailable",
+    ):
         await service.submit_enrollment_segment(
             reenrollment.enrollment_id,
             "profile-b",
@@ -518,9 +521,111 @@ async def test_normalization_unavailable_never_replaces_existing_profile(
 
     current = service.status()
     assert current.state.has_profile
+    assert current.state.effective_reason == "ready"
     assert current.profile_generation == old_generation
     assert current.enrollment is None
     assert model.inference_count == old_inference_count
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_normalization_unavailable_without_profile_degrades_runtime(
+    tmp_path: Path,
+) -> None:
+    def factory(enabled: bool) -> _AudioNormalizer:
+        return _AudioNormalizer(
+            enabled,
+            failure_code="audio_processing_unavailable",
+        )
+
+    service, model, _activations, _events = _service(
+        tmp_path,
+        audio_normalizer_factory=factory,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+
+    with pytest.raises(
+        VoiceIdentityServiceError,
+        match="audio_processing_unavailable",
+    ):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+
+    current = service.status()
+    assert not current.state.has_profile
+    assert not current.state.effective_enabled
+    assert current.state.effective_reason == "runtime_degraded"
+    assert current.enrollment is None
+    assert model.inference_count == 0
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_normalization_result_rechecks_operation_fence_before_silero(
+    tmp_path: Path,
+) -> None:
+    normalization_started = asyncio.Event()
+    release_normalization = asyncio.Event()
+
+    class BlockingNormalizer(_AudioNormalizer):
+        async def normalize(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+            target_samples: int,
+        ) -> bytes:
+            normalization_started.set()
+            await release_normalization.wait()
+            return await super().normalize(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+                target_samples=target_samples,
+            )
+
+    validator = _SpeechValidator()
+    validation_calls = 0
+    original_validate = validator.validate_pcm16
+
+    async def count_validation(*args, **kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        return await original_validate(*args, **kwargs)
+
+    validator.validate_pcm16 = count_validation  # type: ignore[method-assign]
+    service, model, _activations, _events = _service(
+        tmp_path,
+        speech_validator=validator,
+        audio_normalizer_factory=BlockingNormalizer,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submission = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _verification_pcm(3_000),
+        )
+    )
+    await normalization_started.wait()
+    session = service._enrollment  # type: ignore[attr-defined]
+    assert session is not None
+    session.operation_nonce += 1
+    release_normalization.set()
+
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await submission
+    assert validation_calls == 0
+    assert model.inference_count == 0
+    await service.cancel_enrollment(enrollment.enrollment_id)
     await service.close()
 
 

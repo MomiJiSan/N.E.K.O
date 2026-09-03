@@ -107,6 +107,9 @@ class VoiceLifecycleSnapshot:
     route_generation: int
     transport_generation: int
     turn_id: int
+    lifecycle_revision: int
+    reason_code: str | None
+    incident_id: str | None
 
 
 _TRANSITIONS: dict[
@@ -273,6 +276,9 @@ class VoiceInputLifecycleController:
         self._route_mode = VoiceRouteMode.BLOCKED
         self._route_generation = 0
         self._transport_generation = 0
+        self._lifecycle_revision = 0
+        self._reason_code: str | None = None
+        self._incident_id: str | None = None
         # Candidate identity is allocated at SOFT_WAKE so pre-roll and the
         # confirmation frame keep one turn id.
         self._turn_sequence = 0
@@ -306,6 +312,9 @@ class VoiceInputLifecycleController:
             route_generation=self._route_generation,
             transport_generation=self._transport_generation,
             turn_id=self._turn_id,
+            lifecycle_revision=self._lifecycle_revision,
+            reason_code=self._reason_code,
+            incident_id=self._incident_id,
         )
 
     @property
@@ -373,12 +382,15 @@ class VoiceInputLifecycleController:
             raise RuntimeError("VOICE_LIFECYCLE_ALREADY_OPEN")
         self._route_generation += 1
         self._route_mode = route_mode
+        self._reason_code = None
+        self._incident_id = None
         self._state = next_lifecycle_state(
             self._state,
             VoiceLifecycleEvent.MIC_OPENED,
         )
         if route_mode is VoiceRouteMode.BLOCKED:
             self._state = VoiceLifecycleState.BLOCKED
+        self._lifecycle_revision += 1
 
     def transition(self, event: VoiceLifecycleEvent) -> VoiceLifecycleState:
         self._state = next_lifecycle_state(self._state, event)
@@ -434,6 +446,62 @@ class VoiceInputLifecycleController:
             self._pending_turn_token = None
             self._pending_connect.clear()
             self._active_start_audio = b""
+        elif event is VoiceLifecycleEvent.RECOVERED:
+            self._reason_code = None
+            self._incident_id = None
+        self._lifecycle_revision += 1
+        return self._state
+
+    def block(self, *, reason_code: str, incident_id: str) -> VoiceLifecycleState:
+        """Quarantine one live route after a hard cleanup failure.
+
+        The incident identity is immutable once BLOCKED. An exact retry is an
+        idempotent read; a different failure cannot overwrite the first
+        incident that owns the quarantined route.
+        """
+
+        normalized_reason = str(reason_code or "").strip()
+        normalized_incident = str(incident_id or "").strip()
+        if not normalized_reason:
+            raise ValueError("VOICE_LIFECYCLE_BLOCK_REASON_REQUIRED")
+        if not normalized_incident:
+            raise ValueError("VOICE_LIFECYCLE_BLOCK_INCIDENT_REQUIRED")
+        if self._state is VoiceLifecycleState.BLOCKED:
+            if (
+                self._reason_code == normalized_reason
+                and self._incident_id == normalized_incident
+            ):
+                return self._state
+            raise RuntimeError("VOICE_LIFECYCLE_BLOCKED_INCIDENT_CONFLICT")
+        if self._state not in {
+            VoiceLifecycleState.LOCAL_LISTEN,
+            VoiceLifecycleState.PREWARMING,
+            VoiceLifecycleState.ACTIVE,
+            VoiceLifecycleState.DRAINING,
+            VoiceLifecycleState.WARM_IDLE,
+        }:
+            raise RuntimeError(
+                "VOICE_LIFECYCLE_BLOCK_REQUIRES_LIVE_ROUTE: "
+                f"{self._state.value}"
+            )
+        self._state = VoiceLifecycleState.BLOCKED
+        self._route_mode = VoiceRouteMode.BLOCKED
+        self._route_generation += 1
+        self._transport_generation += 1
+        self._lifecycle_revision += 1
+        self._reason_code = normalized_reason
+        self._incident_id = normalized_incident
+        self._turn_id = self._allocate_turn_id()
+        self._current_turn_token = None
+        self._completed_turn_id = self._turn_id
+        self._pre_roll_sent_for_turn = False
+        self._pre_roll.clear()
+        self._pending_turn.clear()
+        self._pending_turn_speech = False
+        self._pending_turn_id = None
+        self._pending_turn_token = None
+        self._pending_connect.clear()
+        self._active_start_audio = b""
         return self._state
 
     def accept_audio(self, pcm16: bytes, *, sample_rate_hz: int) -> AudioDecision:
@@ -630,6 +698,9 @@ class VoiceInputLifecycleController:
         self._route_mode = VoiceRouteMode.BLOCKED
         self._route_generation += 1
         self._transport_generation += 1
+        self._lifecycle_revision += 1
+        self._reason_code = None
+        self._incident_id = None
         self._turn_id = self._allocate_turn_id()
         self._current_turn_token = None
         self._pre_roll_sent_for_turn = False
@@ -651,6 +722,7 @@ class VoiceInputLifecycleController:
         """Advance transport generation without stopping local listening."""
 
         self._transport_generation += 1
+        self._lifecycle_revision += 1
 
     def invalidate_audio(self) -> None:
         """Invalidate buffered PCM and turn identity after input suppression."""
@@ -672,6 +744,7 @@ class VoiceInputLifecycleController:
             VoiceLifecycleState.SUSPENDED,
         }:
             self._state = VoiceLifecycleState.LOCAL_LISTEN
+        self._lifecycle_revision += 1
 
     def _allocate_turn_id(self) -> int:
         self._turn_sequence += 1

@@ -76,12 +76,20 @@ from main_logic.asr_client.lifecycle import (
     VoiceTransportToken,
 )
 from main_logic.asr_client.provider_policy import resolve_provider_policy
-from main_logic.asr_client.runtime import AsrRuntimeCallbacks, IndependentAsrRuntime
+from main_logic.asr_client.runtime import (
+    AsrRuntimeCallbacks,
+    DenyTransportState,
+    IndependentAsrRuntime,
+)
 from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCaptureDecisionState,
     SpeakerShadowCaptureDisposition,
     SpeakerShadowCaptureResult,
     SpeakerShadowCandidateKey,
+)
+from main_logic.asr_client.transcript import (
+    TranscriptResolutionOutcome,
+    TranscriptResolutionReceipt,
 )
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from main_logic.voice_turn.contracts import (
@@ -360,6 +368,9 @@ def _install_active_candidate(
     assert runtime._asr_audio_dispatcher.activate(turn_token, session, b"") is True
     final_key = FinalKey.from_turn(turn_token)
     assert runtime._asr_transcript_dispatcher.try_reserve(final_key) is True
+    runtime._asr_admission_reservation_dispatchers[final_key] = (
+        runtime._asr_transcript_dispatcher
+    )
     runtime._ensure_transport_restart_task = MagicMock()
     return session, lifecycle, turn_token
 
@@ -752,7 +763,12 @@ async def test_same_ticket_executor_adopts_context_attached_before_owner_done(
     )
     final_key = FinalKey.from_turn(turn_token)
     dispatcher = MagicMock()
-    dispatcher.resolve_reserved.return_value = True
+    dispatcher.resolve_reserved.return_value = TranscriptResolutionReceipt(
+        final_key,
+        AdmissionDisposition.DROP,
+        TranscriptResolutionOutcome.APPLIED,
+        AdmissionDisposition.DROP,
+    )
     runtime._asr_admission_reservation_dispatchers[final_key] = dispatcher
     first_context = SimpleNamespace(settled=asyncio.Event())
     second_context = SimpleNamespace(settled=asyncio.Event())
@@ -1492,7 +1508,7 @@ async def test_provider_started_gate_active_never_reserves_child() -> None:
         endpointing_mode="provider",
     )
     runtime._asr_deny_cleanup_generation += 1
-    runtime._asr_deny_cleanup_active = True
+    runtime._asr_deny_transport_state = DenyTransportState.DENY_FENCED
     dispatcher = runtime._asr_transcript_dispatcher
     reservations_before = set(dispatcher._reservations)
 
@@ -1504,7 +1520,7 @@ async def test_provider_started_gate_active_never_reserves_child() -> None:
     assert set(dispatcher._reservations) == reservations_before
     assert runtime._asr_provider_turn_ownerships == {}
     assert runtime._asr_provider_started_turns == {}
-    runtime._asr_deny_cleanup_active = False
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
     await _close_dispatchers(runtime)
 
 
@@ -1585,6 +1601,7 @@ async def test_provider_started_deferred_deny_settles_without_binding_failure() 
         ProviderUtteranceStartedNotification(0, 0, 1),
         runtime._asr_session_epoch,
     )
+    await _drain_runtime_admission(runtime)
 
     session.close.assert_awaited_once_with()
     assert runtime._asr_session is None
@@ -1595,6 +1612,7 @@ async def test_provider_started_deferred_deny_settles_without_binding_failure() 
     assert runtime._ingress_token_matches(turn_token.ingress)
     assert callbacks.on_prepare_turn.await_count == 0
     assert callbacks.on_failure.await_count == 0
+    assert callbacks.on_status.await_count == 0
     assert await runtime._asr_admission.get_speaker_lease(lease_token) is None
     await _close_dispatchers(runtime)
 
@@ -1641,11 +1659,17 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
         lease_token,
         SpeakerLeaseLow(candidate, 1, SpeakerCheckpointKind.FIRST),
     )
-    await runtime._asr_admission.post_speaker_lease(
+    deny_receipt = await runtime._asr_admission.post_speaker_lease(
         lease_token,
         SpeakerLeaseLow(candidate, 2, SpeakerCheckpointKind.SECOND),
     )
-    runtime._begin_speaker_deny_cleanup(lease_token, ())
+    runtime._begin_speaker_deny_cleanup(
+        lease_token,
+        (),
+        candidate_key=candidate,
+        terminal_sequence=2,
+    )
+    await runtime._apply_speaker_lease_result(lease_token, deny_receipt)
     attach_release.set()
 
     assert await asyncio.wait_for(started, 1)
@@ -1661,7 +1685,7 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
     await _close_dispatchers(runtime)
 
 
-async def test_deny_cleanup_transition_failure_still_settles_and_ungates(
+async def test_deny_cleanup_transition_failure_quarantines_and_keeps_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -1704,13 +1728,26 @@ async def test_deny_cleanup_transition_failure_still_settles_and_ungates(
 
     session.close.assert_awaited_once_with()
     assert runtime._asr_provider_turn_ownerships == {}
-    assert runtime._asr_admission_reservation_dispatchers == {}
-    assert runtime._asr_speaker_deny_cleanups == {}
-    assert runtime._asr_deny_cleanup_active is False
+    final_key = FinalKey.from_turn(turn_token)
+    assert runtime._asr_admission_reservation_dispatchers == {
+        final_key: runtime._asr_transcript_dispatcher
+    }
+    assert runtime._asr_transcript_dispatcher._resolved[final_key] is (
+        AdmissionDisposition.DROP
+    )
+    assert runtime._asr_speaker_deny_cleanups
+    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
+    assert runtime._asr_deny_cleanup_active is True
+    assert lifecycle.snapshot.state is VoiceLifecycleState.BLOCKED
+    assert lifecycle.snapshot.reason_code == "ASR_DENY_CLEANUP_FAILED"
+    runtime._callbacks.on_status.assert_awaited_once()
+    assert runtime._callbacks.on_status.await_args.args[0].code == (
+        "ASR_DENY_CLEANUP_FAILED"
+    )
     await _close_dispatchers(runtime)
 
 
-async def test_deny_resolve_effect_failure_still_tombstones_and_ungates(
+async def test_deny_typed_drop_failure_quarantines_and_keeps_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -1736,14 +1773,14 @@ async def test_deny_resolve_effect_failure_still_tombstones_and_ungates(
         enforce=True,
     )
     dispatcher = runtime._asr_transcript_dispatcher
-    execute = runtime._execute_admission_effect
+    original_resolve = dispatcher.resolve_reserved
 
-    async def fail_resolve(effect) -> None:
-        if isinstance(effect, ResolveReserved):
+    def fail_drop(final_key, disposition, **kwargs):
+        if disposition is AdmissionDisposition.DROP:
             raise RuntimeError("forced transcript settlement failure")
-        await execute(effect)
+        return original_resolve(final_key, disposition, **kwargs)
 
-    monkeypatch.setattr(runtime, "_execute_admission_effect", fail_resolve)
+    monkeypatch.setattr(dispatcher, "resolve_reserved", fail_drop)
 
     assert await runtime._handle_provider_utterance_started(
         ProviderUtteranceStartedNotification(0, 0, 1),
@@ -1753,12 +1790,15 @@ async def test_deny_resolve_effect_failure_still_tombstones_and_ungates(
 
     final_key = FinalKey.from_turn(turn_token)
     session.close.assert_awaited_once_with()
-    assert final_key not in dispatcher._reservations
-    assert final_key in dispatcher._resolved
-    assert runtime._asr_provider_turn_ownerships == {}
-    assert runtime._asr_admission_reservation_dispatchers == {}
-    assert runtime._asr_speaker_deny_cleanups == {}
-    assert runtime._asr_deny_cleanup_active is False
+    assert final_key in dispatcher._reservations
+    assert final_key not in dispatcher._resolved
+    assert runtime._asr_speaker_deny_cleanups
+    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
+    assert runtime._asr_deny_cleanup_active is True
+    runtime._callbacks.on_status.assert_awaited_once()
+    assert runtime._callbacks.on_status.await_args.args[0].code == (
+        "ASR_DENY_CLEANUP_FAILED"
+    )
     await _close_dispatchers(runtime)
 
 
@@ -3753,3 +3793,144 @@ async def test_smart_turn_rejection_does_not_require_provider_gate() -> None:
         assert record.admission_state is AdmissionState.DROPPED
     finally:
         await lane.close()
+
+
+@pytest.mark.parametrize(
+    ("events", "endpointing_available"),
+    (
+        ((SpeechActivityEvent.SPEECH_STARTED,), True),
+        ((SpeechActivityEvent.SPEECH_RESUMED,), True),
+        ((SpeechActivityEvent.CANDIDATE_PAUSE,), False),
+    ),
+)
+async def test_deny_wait_silence_requires_available_silero_pause(
+    events: tuple[SpeechActivityEvent, ...],
+    endpointing_available: bool,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=events,
+            throttle_available=True,
+            endpointing_available=endpointing_available,
+        )
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+    runtime._asr_rearm_cutoff_sequence = 0
+    runtime._asr_rearm_last_sequence = 0
+    runtime._asr_rearm_last_captured_at = 0.0
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x01\x00" * 160,
+            16_000,
+            0.9,
+            False,
+            ingress_sequence=1,
+            captured_at=1.0,
+        ),
+        ingress_token=turn_token.ingress,
+    )
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_rearm_rejects_gap_then_arms_on_contiguous_silero_pause() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
+            throttle_available=True,
+        )
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+    runtime._asr_rearm_cutoff_sequence = 10
+    runtime._asr_rearm_last_sequence = 10
+    runtime._asr_rearm_last_captured_at = 10.0
+    runtime._asr_last_ingress_sequence = 10
+    runtime._asr_last_captured_at = 10.0
+
+    await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x01\x00" * 160,
+            16_000,
+            0.0,
+            False,
+            ingress_sequence=12,
+            captured_at=12.0,
+        ),
+        ingress_token=turn_token.ingress,
+    )
+    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
+    detector.feed.assert_not_awaited()
+
+    await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x00\x00" * 160,
+            16_000,
+            0.0,
+            False,
+            ingress_sequence=13,
+            captured_at=13.0,
+        ),
+        ingress_token=turn_token.ingress,
+    )
+    assert runtime._asr_deny_transport_state is DenyTransportState.ARMED
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_provider_close_failure_quarantines_transport() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    session.close.side_effect = RuntimeError("forced close failure")
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    candidate = runtime._asr_current_speaker_candidate
+    assert candidate is not None
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+    await _drain_runtime_admission(runtime)
+
+    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
+    assert lifecycle.snapshot.state is VoiceLifecycleState.BLOCKED
+    assert callbacks.on_status.await_count == 1
+    assert callbacks.on_status.await_args.args[0].code == "ASR_DENY_CLEANUP_FAILED"
+    await _close_dispatchers(runtime)

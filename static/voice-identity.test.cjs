@@ -424,6 +424,7 @@ function createHarness({
                 'voiceIdentity.microphoneDenied': 'Microphone unavailable.',
                 'voiceIdentity.requestFailed': 'Request failed.',
                 'voiceIdentity.errorModelUnavailable': 'Voice model unavailable; prepare assets or repair the installation.',
+                'voiceIdentity.errorAudioProcessingUnavailable': 'Microphone audio processing is temporarily unavailable. Restart the microphone and try again.',
                 'voiceIdentity.errorInvalidPcm': 'Invalid recording format.',
                 'voiceIdentity.errorAudioTooLong': 'Recording is too long.',
                 'voiceIdentity.errorSpeechTooShort': 'Not enough speech.',
@@ -948,6 +949,24 @@ test('canonical enrollment audio errors show localized messages', async () => {
     assert.equal(
         tooLong.elements.get('voice-identity-message').textContent,
         'Recording is too long.',
+    );
+
+    const unavailable = createHarness({ profileError: 'audio_processing_unavailable' });
+    await unavailable.initialize();
+    await unavailable.emit('voice-identity-start');
+    assert.equal(
+        unavailable.elements.get('voice-identity-message').textContent,
+        'Microphone audio processing is temporarily unavailable. Restart the microphone and try again.',
+    );
+});
+
+test('verification capture remains an exact five-second 480000-byte contract', () => {
+    assert.match(source, /const VERIFICATION_RECORDING_MS = 5000;/);
+    assert.equal(VERIFICATION_TARGET_SAMPLES, 240000);
+    assert.equal(VERIFICATION_TARGET_SAMPLES * 2, 480000);
+    assert.match(
+        source,
+        /recordingDurationMs === VERIFICATION_RECORDING_MS\s*\? recordingDurationMs\s*: recordingDurationMs \+ STREAMING_RESAMPLE_MARGIN_MS/,
     );
 });
 

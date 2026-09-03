@@ -428,6 +428,7 @@ async def test_admission_settlement_does_not_wait_blocked_core_delivery() -> Non
     assert dispatcher.try_reserve(final_key)
     runtime = object.__new__(IndependentAsrRuntime)
     runtime._asr_admission_resolutions = {}
+    runtime._asr_provider_turn_ownerships = {}
     runtime._asr_admission_reservation_dispatchers = {
         final_key: dispatcher,
     }

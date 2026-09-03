@@ -88,6 +88,8 @@ from .admission.contracts import (
     SpeakerLeaseLow,
     SpeakerLeaseEvent,
     SpeakerLeaseState,
+    SpeakerLeaseTransitionOutcome,
+    SpeakerLeaseTransitionReceipt,
     SpeakerLeaseUnavailable,
     SpeakerLow,
     SpeakerUnavailable,
@@ -153,6 +155,8 @@ from .speaker_shadow.contracts import (
 from .transcript import (
     TranscriptDispatcher,
     TranscriptEnvelope,
+    TranscriptResolutionOutcome,
+    TranscriptResolutionReceipt,
     TranscriptTerminalSettlement,
 )
 
@@ -442,6 +446,40 @@ class _ProviderTurnOwnershipState(Enum):
     RETIRED = "retired"
 
 
+class DenyTransportState(Enum):
+    """Transport-scoped lifecycle after an authoritative speaker denial."""
+
+    OPEN = "open"
+    DENY_FENCED = "deny_fenced"
+    RETIRING = "retiring"
+    WAIT_SILENCE = "wait_silence"
+    ARMED = "armed"
+    QUARANTINED = "quarantined"
+
+
+@dataclass(frozen=True, slots=True)
+class DenyCleanupContext:
+    """Immutable identity captured at the DENY fence linearization point."""
+
+    lease_token: SpeakerCaptureLeaseToken
+    candidate_key: SpeakerShadowCandidateKey
+    session_epoch: int
+    transport_generation: int
+    start_generation: int
+    detector_epoch: int
+    session_ref: Any
+    capture_cutoff_sequence: int
+    terminal_speaker_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCallbackTicket:
+    session_epoch: int
+    transport_generation: int
+    ticket_no: int
+    session_ref: Any
+
+
 @dataclass(slots=True)
 class _ProviderTurnOwnership:
     turn_token: VoiceTurnToken
@@ -461,6 +499,7 @@ class _ProviderTurnOwnership:
 class _SpeakerDenyCleanupOperation:
     lease_token: SpeakerCaptureLeaseToken
     generation: int
+    context: DenyCleanupContext
     runtime_identity: _AsrRuntimeIdentity
     lifecycle: VoiceInputLifecycleController | None
     session: Any
@@ -468,11 +507,22 @@ class _SpeakerDenyCleanupOperation:
     namespace: tuple[int, int] | None
     detector: DetectorRuntime | None
     evidence_lease: ProviderSpeakerEvidenceLease | None
+    audio_dispatcher: AsrAudioDispatcher
+    audio_transport_generation: int
+    frozen_children: tuple[Any, ...] = ()
     tickets: dict[VoiceTurnToken, AdmissionResolutionTicket] = field(
+        default_factory=dict
+    )
+    provisional_reservations: dict[FinalKey, TranscriptDispatcher] = field(
         default_factory=dict
     )
     settled_tickets: set[AdmissionResolutionTicket] = field(default_factory=set)
     owner_task: asyncio.Task[Any] | None = None
+    text_safe: bool = False
+    transport_safe: bool = False
+    fully_settled: bool = False
+    failure_reason: str | None = None
+    incident_id: str | None = None
     degraded: bool = False
     settled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
@@ -1241,7 +1291,30 @@ class IndependentAsrRuntime:
         lease_token: SpeakerCaptureLeaseToken,
         event: SpeakerLeaseEvent,
     ) -> bool:
-        """Keep terminal parent facts behind the first exact child attachment."""
+        """Fence decisive DENY before publishing it to the coordinator."""
+
+        decisive_deny = bool(
+            isinstance(event, SpeakerLeaseLow)
+            and event.checkpoint_kind
+            in {
+                SpeakerCheckpointKind.SECOND,
+                SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+            }
+        )
+        if decisive_deny:
+            try:
+                self._begin_speaker_deny_cleanup(
+                    lease_token,
+                    (),
+                    candidate_key=event.candidate,
+                    terminal_sequence=event.sequence_no,
+                )
+            except Exception:
+                self._schedule_speaker_deny_cleanup_failure(
+                    lease_token,
+                    "ASR_DENY_CLEANUP_IDENTITY_MISMATCH",
+                )
+                return False
 
         lifecycle = self._asr_lifecycle
         provider_parent_without_child = bool(
@@ -1249,7 +1322,7 @@ class IndependentAsrRuntime:
             and lifecycle.provider_policy.endpoint_authority == "provider"
             and lease_token not in self._asr_admission_turn_leases.values()
         )
-        if provider_parent_without_child:
+        if provider_parent_without_child and not decisive_deny:
             if lease_token in self._asr_deferred_provider_speaker_lease_overflow:
                 return False
             pending = self._asr_deferred_provider_speaker_lease_events.setdefault(
@@ -1264,6 +1337,31 @@ class IndependentAsrRuntime:
                 return False
             pending.append(event)
             return True
+        if decisive_deny:
+            pending = self._asr_deferred_provider_speaker_lease_events.pop(
+                lease_token,
+                deque(),
+            )
+            while pending:
+                prior = pending.popleft()
+                try:
+                    prior_future = (
+                        self._asr_admission_ingress.post_speaker_lease_nowait(
+                            lease_token,
+                            prior,
+                        )
+                    )
+                except (
+                    AdmissionIngressClosedError,
+                    AdmissionIngressCapacityError,
+                    KeyError,
+                ):
+                    self._schedule_speaker_deny_cleanup_failure(
+                        lease_token,
+                        "ASR_DENY_CLEANUP_ADMISSION_PUBLISH_FAILED",
+                    )
+                    return False
+                self._consume_speaker_lease_future(lease_token, prior_future)
         try:
             future = self._asr_admission_ingress.post_speaker_lease_nowait(
                 lease_token,
@@ -1376,28 +1474,45 @@ class IndependentAsrRuntime:
         lease_token: SpeakerCaptureLeaseToken,
         result: Any,
     ) -> None:
-        bulk_results: tuple[AdmissionBulkResult, ...] = ()
-        if isinstance(result, tuple) and all(
-            isinstance(item, AdmissionBulkResult) for item in result
-        ):
-            bulk_results = result
+        if not isinstance(result, SpeakerLeaseTransitionReceipt):
+            return
+        bulk_results = result.child_results
         formal_deny = bool(
-            bulk_results
-            and any(
-                item.speaker_lease_token == lease_token
-                and item.speaker_lease_terminal_state
-                is SpeakerLeaseState.DENY_LATCHED
-                for item in bulk_results
-            )
+            result.lease_token == lease_token
+            and result.after_state is SpeakerLeaseState.DENY_LATCHED
+            and result.outcome
+            in {
+                SpeakerLeaseTransitionOutcome.APPLIED,
+                SpeakerLeaseTransitionOutcome.IDEMPOTENT,
+            }
         )
-        effects = tuple(
-            effect for item in bulk_results for effect in item.effects
+        effects = (
+            *result.diagnostics,
+            *(effect for item in bulk_results for effect in item.effects),
         )
         if formal_deny:
             aborts = tuple(
                 effect for effect in effects if isinstance(effect, AbortProviderTransport)
             )
-            cleanup = self._begin_speaker_deny_cleanup(lease_token, aborts)
+            cleanup = self._asr_speaker_deny_cleanups.get(lease_token)
+            if cleanup is None:
+                cleanup = self._begin_speaker_deny_cleanup(
+                    lease_token,
+                    aborts,
+                    terminal_sequence=result.terminal_sequence_no,
+                )
+            if (
+                result.terminal_sequence_no
+                != cleanup.context.terminal_speaker_sequence
+            ):
+                await self._fail_speaker_deny_cleanup(
+                    cleanup,
+                    "ASR_DENY_CLEANUP_TERMINAL_CONFLICT",
+                )
+                return
+            cleanup.frozen_children = result.frozen_children
+            for effect in aborts:
+                cleanup.tickets.setdefault(effect.turn_token, effect.ticket)
             self._asr_provider_speaker_terminal_leases.add(lease_token)
             for stale_lease in tuple(self._asr_provider_speaker_terminal_leases):
                 if (
@@ -1410,18 +1525,6 @@ class IndependentAsrRuntime:
             if lease_token not in self._asr_speaker_deny_counted_leases:
                 self._asr_speaker_deny_counted_leases.add(lease_token)
                 self._speaker_rejection_metrics["speaker_deny_latched_count"] += 1
-            # Every child transcript is tombstoned before the first transport
-            # abort can close the shared Provider session.
-            for effect in effects:
-                if isinstance(effect, ResolveReserved):
-                    try:
-                        await self._execute_admission_effect(effect)
-                    except Exception:
-                        # A broken Core settlement must not prevent the exact
-                        # Provider retirement from completing. The cleanup
-                        # owner below applies a direct DROP tombstone for any
-                        # reservation that the effect did not consume.
-                        cleanup.degraded = True
             for effect in effects:
                 if isinstance(effect, (ResolveReserved, AbortProviderTransport)):
                     continue
@@ -1434,14 +1537,20 @@ class IndependentAsrRuntime:
                     await self._execute_admission_effect(effect)
                 except Exception:
                     cleanup.degraded = True
-            for effect in aborts:
-                try:
-                    await self._abort_admission_transport(effect, cleanup=cleanup)
-                except Exception:
-                    cleanup.degraded = True
             if cleanup.owner_task is None and not cleanup.settled.is_set():
-                cleanup.owner_task = asyncio.current_task()
-                await self._finish_speaker_deny_cleanup(cleanup)
+                cleanup.owner_task = asyncio.create_task(
+                    self._finish_speaker_deny_cleanup(cleanup),
+                    name=f"speaker-deny-cleanup-{lease_token.lease_nonce}",
+                )
+                self._track_admission_effect_task(cleanup.owner_task, None)
+                cleanup.owner_task.add_done_callback(self._admission_effect_done)
+        elif result.outcome is SpeakerLeaseTransitionOutcome.CONFLICT:
+            cleanup = self._asr_speaker_deny_cleanups.get(lease_token)
+            if cleanup is not None:
+                await self._fail_speaker_deny_cleanup(
+                    cleanup,
+                    "ASR_DENY_CLEANUP_TERMINAL_CONFLICT",
+                )
         else:
             for effect in effects:
                 if isinstance(effect, CountDiagnostic) and effect.name in {
@@ -1822,6 +1931,101 @@ class IndependentAsrRuntime:
         self._asr_start_generation += 1
         return self._asr_start_generation
 
+    def _deny_transport_blocks_provider_egress(self) -> bool:
+        return self._asr_deny_transport_state in {
+            DenyTransportState.DENY_FENCED,
+            DenyTransportState.RETIRING,
+            DenyTransportState.WAIT_SILENCE,
+            DenyTransportState.ARMED,
+            DenyTransportState.QUARANTINED,
+        }
+
+    def _provider_callback_scope(self) -> tuple[int, int] | None:
+        lifecycle = self._asr_lifecycle
+        if lifecycle is None:
+            return None
+        return (
+            self._asr_session_epoch,
+            lifecycle.snapshot.transport_generation,
+        )
+
+    def _acquire_provider_callback_ticket(
+        self,
+        *,
+        session_ref: Any,
+        session_epoch: int,
+    ) -> _ProviderCallbackTicket | None:
+        """Fence callback entry against DENY and retain pre-fence callbacks."""
+
+        if (
+            self._asr_deny_transport_state is not DenyTransportState.OPEN
+            or session_epoch != self._asr_session_epoch
+            or self._asr_session is not session_ref
+        ):
+            return None
+        scope = self._provider_callback_scope()
+        if scope is None or scope[0] != session_epoch:
+            return None
+        self._asr_provider_callback_ticket_sequence += 1
+        idle = self._asr_provider_callback_idle.setdefault(scope, asyncio.Event())
+        idle.clear()
+        self._asr_provider_callback_inflight[scope] = (
+            self._asr_provider_callback_inflight.get(scope, 0) + 1
+        )
+        return _ProviderCallbackTicket(
+            session_epoch=scope[0],
+            transport_generation=scope[1],
+            ticket_no=self._asr_provider_callback_ticket_sequence,
+            session_ref=session_ref,
+        )
+
+    def _release_provider_callback_ticket(
+        self,
+        ticket: _ProviderCallbackTicket,
+    ) -> None:
+        scope = (ticket.session_epoch, ticket.transport_generation)
+        count = self._asr_provider_callback_inflight.get(scope, 0)
+        if count <= 1:
+            self._asr_provider_callback_inflight.pop(scope, None)
+            self._asr_provider_callback_idle.setdefault(scope, asyncio.Event()).set()
+            return
+        self._asr_provider_callback_inflight[scope] = count - 1
+
+    async def _wait_provider_callback_tickets(
+        self,
+        context: DenyCleanupContext,
+    ) -> bool:
+        scope = (context.session_epoch, context.transport_generation)
+        if self._asr_provider_callback_inflight.get(scope, 0) == 0:
+            return True
+        idle = self._asr_provider_callback_idle.setdefault(scope, asyncio.Event())
+        try:
+            await asyncio.wait_for(
+                idle.wait(),
+                timeout=_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
+        return self._asr_provider_callback_inflight.get(scope, 0) == 0
+
+    async def _run_provider_callback(
+        self,
+        *,
+        session_ref: Any,
+        session_epoch: int,
+        callback: Callable[[], Awaitable[Any]],
+    ) -> tuple[bool, Any]:
+        ticket = self._acquire_provider_callback_ticket(
+            session_ref=session_ref,
+            session_epoch=session_epoch,
+        )
+        if ticket is None:
+            return False, None
+        try:
+            return True, await callback()
+        finally:
+            self._release_provider_callback_ticket(ticket)
+
     def _asr_start_operation_matches(self, operation_generation: int) -> bool:
         return operation_generation == self._asr_start_generation
 
@@ -2086,6 +2290,16 @@ class IndependentAsrRuntime:
         ] = {}
         self._asr_deny_cleanup_generation = 0
         self._asr_deny_cleanup_active = False
+        self._asr_deny_transport_state = DenyTransportState.OPEN
+        self._asr_last_ingress_sequence = 0
+        self._asr_last_captured_at = 0.0
+        self._asr_rearm_cutoff_sequence = 0
+        self._asr_rearm_last_sequence = 0
+        self._asr_rearm_last_captured_at = 0.0
+        self._asr_provider_callback_ticket_sequence = 0
+        self._asr_provider_callback_inflight: dict[tuple[int, int], int] = {}
+        self._asr_provider_callback_idle: dict[tuple[int, int], asyncio.Event] = {}
+        self._asr_lifecycle_notification_revision = 0
         self._asr_speaker_deny_cleanups: dict[
             SpeakerCaptureLeaseToken,
             _SpeakerDenyCleanupOperation,
@@ -2291,6 +2505,16 @@ class IndependentAsrRuntime:
             self._asr_provider_turn_ownerships = {}
             self._asr_deny_cleanup_generation = 0
             self._asr_deny_cleanup_active = False
+            self._asr_deny_transport_state = DenyTransportState.OPEN
+            self._asr_last_ingress_sequence = 0
+            self._asr_last_captured_at = 0.0
+            self._asr_rearm_cutoff_sequence = 0
+            self._asr_rearm_last_sequence = 0
+            self._asr_rearm_last_captured_at = 0.0
+            self._asr_provider_callback_ticket_sequence = 0
+            self._asr_provider_callback_inflight = {}
+            self._asr_provider_callback_idle = {}
+            self._asr_lifecycle_notification_revision = 0
             self._asr_speaker_deny_cleanups = {}
             self._asr_quarantined_partials = {}
             self._asr_partial_settlements = {}
@@ -2320,6 +2544,17 @@ class IndependentAsrRuntime:
             self._asr_deny_cleanup_generation = 0
             self._asr_deny_cleanup_active = False
             self._asr_speaker_deny_cleanups = {}
+        if not hasattr(self, "_asr_deny_transport_state"):
+            self._asr_deny_transport_state = DenyTransportState.OPEN
+            self._asr_last_ingress_sequence = 0
+            self._asr_last_captured_at = 0.0
+            self._asr_rearm_cutoff_sequence = 0
+            self._asr_rearm_last_sequence = 0
+            self._asr_rearm_last_captured_at = 0.0
+            self._asr_provider_callback_ticket_sequence = 0
+            self._asr_provider_callback_inflight = {}
+            self._asr_provider_callback_idle = {}
+            self._asr_lifecycle_notification_revision = 0
         if not hasattr(self, "_asr_admission_effect_task_turns"):
             self._asr_admission_effect_task_turns = {}
         if not hasattr(self, "_asr_admission_candidate_leases"):
@@ -2852,17 +3087,25 @@ class IndependentAsrRuntime:
         ownership = self._asr_provider_turn_ownerships.get(effect.turn_token)
         if ownership is not None and ownership.final_key == final_key:
             ownership.state = _ProviderTurnOwnershipState.RESOLVED
+        receipt: TranscriptResolutionReceipt | None = None
         try:
-            resolved = bool(
-                dispatcher is not None
-                and dispatcher.resolve_reserved(
+            if dispatcher is not None:
+                receipt = dispatcher.resolve_reserved(
                     final_key,
                     effect.disposition,
                     envelope=envelope,
                 )
-            )
         except Exception:
-            resolved = False
+            receipt = None
+        resolved = bool(
+            receipt is not None
+            and receipt.outcome
+            in {
+                TranscriptResolutionOutcome.APPLIED,
+                TranscriptResolutionOutcome.ALREADY_SAME,
+            }
+            and receipt.requested is effect.disposition
+        )
         existing.core_resolution_succeeded = resolved
         if not resolved:
             if effect.disposition is AdmissionDisposition.DROP:
@@ -3077,26 +3320,161 @@ class IndependentAsrRuntime:
         self,
         lease_token: SpeakerCaptureLeaseToken,
         aborts: tuple[AbortProviderTransport, ...],
+        *,
+        candidate_key: SpeakerShadowCandidateKey | None = None,
+        terminal_sequence: int | None = None,
     ) -> _SpeakerDenyCleanupOperation:
         cleanup = self._asr_speaker_deny_cleanups.get(lease_token)
-        if cleanup is None:
-            self._asr_deny_cleanup_generation += 1
-            self._asr_deny_cleanup_active = True
-            cleanup = _SpeakerDenyCleanupOperation(
-                lease_token=lease_token,
-                generation=self._asr_deny_cleanup_generation,
-                runtime_identity=self._capture_runtime_identity(),
-                lifecycle=self._asr_lifecycle,
-                session=self._asr_session,
-                correlator=self._asr_provider_correlator,
-                namespace=self._asr_provider_correlator_namespace,
-                detector=self._asr_detector,
-                evidence_lease=self._asr_provider_speaker_evidence_lease,
-            )
-            self._asr_speaker_deny_cleanups[lease_token] = cleanup
+        if cleanup is not None:
+            if (
+                candidate_key is not None
+                and candidate_key != cleanup.context.candidate_key
+            ) or (
+                terminal_sequence is not None
+                and terminal_sequence
+                != cleanup.context.terminal_speaker_sequence
+            ):
+                raise RuntimeError("ASR_DENY_CLEANUP_IDENTITY_MISMATCH")
+            for effect in aborts:
+                cleanup.tickets.setdefault(effect.turn_token, effect.ticket)
+            return cleanup
+
+        candidate = candidate_key or self._asr_current_speaker_candidate
+        lifecycle = self._asr_lifecycle
+        detector = self._asr_detector
+        session = self._asr_session
+        if (
+            candidate is None
+            or lifecycle is None
+            or detector is None
+            or self._asr_current_speaker_lease != lease_token
+            or self._asr_admission_candidate_leases.get(candidate) != lease_token
+            or self._asr_deny_transport_state is not DenyTransportState.OPEN
+        ):
+            raise RuntimeError("ASR_DENY_CLEANUP_IDENTITY_MISMATCH")
+        speaker_sequence = (
+            terminal_sequence
+            if terminal_sequence is not None
+            else self._asr_provider_speaker_sequence
+        )
+        if speaker_sequence <= 0:
+            raise RuntimeError("ASR_DENY_CLEANUP_SEQUENCE_INVALID")
+
+        runtime_identity = self._capture_runtime_identity()
+        old_transport_generation = lifecycle.snapshot.transport_generation
+        context = DenyCleanupContext(
+            lease_token=lease_token,
+            candidate_key=candidate,
+            session_epoch=self._asr_session_epoch,
+            transport_generation=old_transport_generation,
+            start_generation=self._asr_start_generation,
+            detector_epoch=detector.detector_epoch,
+            session_ref=session,
+            capture_cutoff_sequence=self._asr_last_ingress_sequence,
+            terminal_speaker_sequence=speaker_sequence,
+        )
+
+        # This await-free block is the DENY linearization point. From here on,
+        # no new callback ticket or audio command can target the old transport.
+        self._asr_deny_cleanup_generation += 1
+        self._asr_deny_transport_state = DenyTransportState.DENY_FENCED
+        self._asr_deny_cleanup_active = True  # compatibility mirror only
+        self._begin_asr_start_operation()
+        self._asr_session = None
+        self._asr_provider_exact_session = None
+        lifecycle.invalidate_transport()
+        audio_dispatcher = self._asr_audio_dispatcher
+        audio_dispatcher.abort()
+        for task_name in (
+            "_asr_transport_task",
+            "_asr_warm_expiry_task",
+            "_asr_final_watchdog_task",
+        ):
+            task = getattr(self, task_name, None)
+            setattr(self, task_name, None)
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+
+        cleanup = _SpeakerDenyCleanupOperation(
+            lease_token=lease_token,
+            generation=self._asr_deny_cleanup_generation,
+            context=context,
+            runtime_identity=runtime_identity,
+            lifecycle=lifecycle,
+            session=session,
+            correlator=self._asr_provider_correlator,
+            namespace=self._asr_provider_correlator_namespace,
+            detector=detector,
+            evidence_lease=self._asr_provider_speaker_evidence_lease,
+            audio_dispatcher=audio_dispatcher,
+            audio_transport_generation=audio_dispatcher.transport_generation,
+        )
+        self._asr_speaker_deny_cleanups[lease_token] = cleanup
         for effect in aborts:
             cleanup.tickets.setdefault(effect.turn_token, effect.ticket)
         return cleanup
+
+    def _schedule_speaker_deny_cleanup_failure(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        reason_code: str,
+    ) -> None:
+        cleanup = self._asr_speaker_deny_cleanups.get(lease_token)
+        if cleanup is None:
+            self._asr_deny_transport_state = DenyTransportState.QUARANTINED
+            self._asr_deny_cleanup_active = True
+            return
+        task = asyncio.create_task(
+            self._fail_speaker_deny_cleanup(cleanup, reason_code),
+            name=f"speaker-deny-quarantine-{lease_token.lease_nonce}",
+        )
+        self._track_admission_effect_task(task, None)
+        task.add_done_callback(self._admission_effect_done)
+
+    async def _fail_speaker_deny_cleanup(
+        self,
+        cleanup: _SpeakerDenyCleanupOperation,
+        reason_code: str,
+    ) -> None:
+        if cleanup.failure_reason is not None:
+            return
+        cleanup.failure_reason = reason_code
+        cleanup.degraded = True
+        cleanup.incident_id = (
+            f"asr-deny-{cleanup.context.session_epoch}-"
+            f"{cleanup.context.transport_generation}-"
+            f"{cleanup.generation}"
+        )
+        self._asr_deny_transport_state = DenyTransportState.QUARANTINED
+        self._asr_deny_cleanup_active = True
+        self._speaker_rejection_metrics["speaker_deny_cleanup_failed_count"] += 1
+        lifecycle = cleanup.lifecycle
+        if lifecycle is not None:
+            try:
+                lifecycle.block(
+                    reason_code="ASR_DENY_CLEANUP_FAILED",
+                    incident_id=cleanup.incident_id,
+                )
+            except Exception:
+                pass
+            identity = self._capture_runtime_identity()
+            await self._send_asr_lifecycle_state(
+                VoiceLifecycleState.BLOCKED,
+                provider=self._asr_provider or "unknown",
+                session_epoch=self._asr_session_epoch,
+                expected_identity=identity,
+                reason_code="ASR_DENY_CLEANUP_FAILED",
+                incident_id=cleanup.incident_id,
+            )
+            await self._send_asr_status(
+                "ASR_DENY_CLEANUP_FAILED",
+                self._asr_provider or "unknown",
+                session_epoch=self._asr_session_epoch,
+                expected_identity=identity,
+                reason_code="ASR_DENY_CLEANUP_FAILED",
+                incident_id=cleanup.incident_id,
+            )
+        cleanup.settled.set()
 
     async def _settle_speaker_deny_ticket(
         self,
@@ -3127,164 +3505,283 @@ class IndependentAsrRuntime:
         self,
         cleanup: _SpeakerDenyCleanupOperation,
     ) -> None:
+        self._asr_deny_transport_state = DenyTransportState.RETIRING
+        failure: str | None = None
+        retired_proofs: tuple[BoundaryProof, ...] = ()
+
+        async def close_captured_session() -> None:
+            if cleanup.session is not None:
+                await cleanup.session.close()
+
         try:
-            child_turns = tuple(cleanup.tickets)
-            owned_dispatchers = {
-                ownership.transcript_dispatcher
-                for ownership in tuple(self._asr_provider_turn_ownerships.values())
-                if ownership.speaker_lease_token == cleanup.lease_token
-            }
-            retired_proofs: tuple[BoundaryProof, ...] = ()
-            owns_runtime = bool(
-                self._runtime_identity_matches(cleanup.runtime_identity)
-                and self._asr_lifecycle is cleanup.lifecycle
-                and self._asr_session is cleanup.session
-                and self._asr_provider_correlator is cleanup.correlator
-                and self._asr_provider_correlator_namespace == cleanup.namespace
+            receipt = await asyncio.wait_for(
+                cleanup.audio_dispatcher.abort_and_join(
+                    close_session=close_captured_session,
+                    transport_generation=cleanup.audio_transport_generation,
+                ),
+                timeout=_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS,
             )
-            if owns_runtime:
-                # TURN_DENIED rotates Provider ownership while preserving the
-                # reusable microphone ingress generation.
-                self._begin_asr_start_operation()
-                for task_name in (
-                    "_asr_transport_task",
-                    "_asr_warm_expiry_task",
-                    "_asr_final_watchdog_task",
+            cleanup.transport_safe = bool(
+                receipt.active_writer_joined and receipt.session_closed
+            )
+            if not cleanup.transport_safe:
+                failure = "ASR_DENY_CLEANUP_TRANSPORT_NOT_RETIRED"
+        except Exception:
+            failure = "ASR_DENY_CLEANUP_TRANSPORT_NOT_RETIRED"
+
+        if failure is None and not await self._wait_provider_callback_tickets(
+            cleanup.context
+        ):
+            failure = "ASR_DENY_CLEANUP_CALLBACKS_INFLIGHT"
+
+        # Seal membership only after pre-fence callbacks have left. A callback
+        # that reserved before the fence remains visible in this registry even
+        # when terminal parent attachment was rejected.
+        ownerships = tuple(
+            ownership
+            for ownership in self._asr_provider_turn_ownerships.values()
+            if ownership.speaker_lease_token == cleanup.lease_token
+            or (
+                ownership.runtime_identity.session is cleanup.session
+                and ownership.runtime_identity.session_epoch
+                == cleanup.context.session_epoch
+            )
+        )
+        for ownership in ownerships:
+            cleanup.provisional_reservations.setdefault(
+                ownership.final_key,
+                ownership.transcript_dispatcher,
+            )
+        for binding in cleanup.frozen_children:
+            final_key = FinalKey.from_turn(binding.turn_token)
+            dispatcher = self._asr_admission_reservation_dispatchers.get(final_key)
+            if dispatcher is not None:
+                cleanup.provisional_reservations.setdefault(final_key, dispatcher)
+        for final_key, dispatcher in tuple(
+            self._asr_admission_reservation_dispatchers.items()
+        ):
+            if (
+                final_key.turn_token.ingress.session_epoch
+                == cleanup.context.session_epoch
+            ):
+                cleanup.provisional_reservations.setdefault(final_key, dispatcher)
+
+        drop_receipts: dict[FinalKey, TranscriptResolutionReceipt] = {}
+        for final_key, dispatcher in tuple(cleanup.provisional_reservations.items()):
+            ticket = cleanup.tickets.get(final_key.turn_token)
+            if ticket is not None:
+                await self._resolve_admission_reservation(
+                    ResolveReserved(ticket=ticket, final=None)
+                )
+                execution = self._asr_admission_resolutions.get(final_key)
+                if (
+                    execution is None
+                    or execution.core_resolution_succeeded is not True
                 ):
-                    task = getattr(self, task_name, None)
-                    setattr(self, task_name, None)
-                    if task is not None and task is not asyncio.current_task():
-                        task.cancel()
-                self._asr_session = None
-                self._asr_provider_exact_session = None
-                self._asr_audio_dispatcher.abort()
-                lifecycle = cleanup.lifecycle
-                if lifecycle is not None and lifecycle.snapshot.state in {
+                    failure = failure or "ASR_DENY_CLEANUP_TRANSCRIPT_UNSAFE"
+                else:
+                    drop_receipts[final_key] = TranscriptResolutionReceipt(
+                        final_key,
+                        AdmissionDisposition.DROP,
+                        TranscriptResolutionOutcome.APPLIED,
+                        AdmissionDisposition.DROP,
+                    )
+                continue
+            resolution: TranscriptResolutionReceipt | None = None
+            try:
+                resolution = dispatcher.resolve_reserved(
+                    final_key,
+                    AdmissionDisposition.DROP,
+                )
+            except Exception:
+                resolution = None
+            if resolution is None or resolution.outcome not in {
+                TranscriptResolutionOutcome.APPLIED,
+                TranscriptResolutionOutcome.ALREADY_SAME,
+            }:
+                failure = failure or "ASR_DENY_CLEANUP_TRANSCRIPT_UNSAFE"
+                continue
+            drop_receipts[final_key] = resolution
+            if (
+                resolution.existing is not None
+                and resolution.existing is not AdmissionDisposition.DROP
+            ):
+                failure = failure or "ASR_DENY_CLEANUP_TRANSCRIPT_CONFLICT"
+        cleanup.text_safe = bool(
+            failure is None
+            and len(drop_receipts) == len(cleanup.provisional_reservations)
+        )
+
+        correlator = cleanup.correlator
+        if correlator is not None and cleanup.namespace is not None:
+            try:
+                retired = correlator.retire_namespace(cleanup.namespace)
+                retired_proofs = retired.retired_proofs
+            except Exception:
+                failure = failure or "ASR_DENY_CLEANUP_NAMESPACE_RETIRE_FAILED"
+        if retired_proofs:
+            try:
+                await self._retire_admission_boundary_proofs(
+                    retired_proofs,
+                    cleanup.detector,
+                )
+            except Exception:
+                failure = failure or "ASR_DENY_CLEANUP_BOUNDARY_RETIRE_FAILED"
+        abandon = getattr(
+            cleanup.detector,
+            "abandon_provider_speaker_evidence_lease",
+            None,
+        )
+        if callable(abandon) and cleanup.evidence_lease is not None:
+            try:
+                await abandon(cleanup.evidence_lease)
+            except Exception:
+                failure = failure or "ASR_DENY_CLEANUP_EVIDENCE_RETIRE_FAILED"
+
+        child_turns = tuple(
+            dict.fromkeys(
+                (*cleanup.tickets, *(item.turn_token for item in ownerships))
+            )
+        )
+        lifecycle = cleanup.lifecycle
+        if failure is None and lifecycle is not None:
+            try:
+                if lifecycle.snapshot.state in {
                     VoiceLifecycleState.PREWARMING,
                     VoiceLifecycleState.ACTIVE,
                     VoiceLifecycleState.DRAINING,
                     VoiceLifecycleState.WARM_IDLE,
                 }:
-                    try:
-                        lifecycle.transition(VoiceLifecycleEvent.TURN_DENIED)
-                    except Exception:
-                        cleanup.degraded = True
-                correlator = cleanup.correlator
-                if correlator is not None and cleanup.namespace is not None:
-                    try:
-                        retired = correlator.retire_namespace(cleanup.namespace)
-                        retired_proofs = retired.retired_proofs
-                    except Exception:
-                        cleanup.degraded = True
-                self._asr_provider_correlator = None
-                self._asr_provider_correlator_namespace = None
-                self._asr_provider_started_turns = {
-                    key: turn
-                    for key, turn in self._asr_provider_started_turns.items()
-                    if turn not in child_turns
-                }
-                self._asr_deferred_provider_started_keys.clear()
-                self._asr_turn_prepared = False
-                if self._asr_partial_turn_token in child_turns:
-                    self._asr_partial_turn_token = None
-                for turn_token in child_turns:
-                    self._asr_quarantined_partials.pop(turn_token, None)
-                    self._asr_partial_settlements.pop(turn_token, None)
-                    self._asr_speaker_authority_pending_turns.pop(turn_token, None)
-                    self._asr_speaker_authoritative_turns.discard(turn_token)
-                    self._asr_admission_turn_leases.pop(turn_token, None)
-                    ownership = self._asr_provider_turn_ownerships.pop(
-                        turn_token,
-                        None,
-                    )
-                    if ownership is not None:
-                        ownership.state = _ProviderTurnOwnershipState.RETIRED
-                self._asr_sealed_turn_token = None
-                self._asr_provider_candidate_fence = None
-                self._asr_sealed_provider_key = None
-                self._asr_provider_speaker_evidence_lease = None
-                if self._asr_current_speaker_lease == cleanup.lease_token:
-                    candidate = self._asr_current_speaker_candidate
-                    self._asr_current_speaker_lease = None
-                    self._asr_current_speaker_candidate = None
-                    if candidate is not None:
-                        self._asr_admission_candidate_leases.pop(candidate, None)
-                        self._asr_admission_candidate_turns.pop(candidate, None)
-            else:
-                cleanup.degraded = True
-
-            # Resolve every still-owned transcript before publishing transport
-            # settlement. This is the invariant fallback for a missing or
-            # failed ResolveReserved effect; DROP remains authoritative even
-            # when Admission/Core bookkeeping is degraded.
-            for turn_token in child_turns:
-                final_key = FinalKey.from_turn(turn_token)
-                dispatcher = self._asr_admission_reservation_dispatchers.pop(
-                    final_key,
-                    None,
-                )
-                if dispatcher is None:
-                    continue
-                try:
-                    if not dispatcher.resolve_reserved(
-                        final_key,
-                        AdmissionDisposition.DROP,
-                    ):
-                        cleanup.degraded = True
-                except Exception:
-                    cleanup.degraded = True
-
-            if retired_proofs:
-                try:
-                    await self._retire_admission_boundary_proofs(
-                        retired_proofs,
-                        cleanup.detector,
-                    )
-                except Exception:
-                    cleanup.degraded = True
-            abandon = getattr(
-                cleanup.detector,
-                "abandon_provider_speaker_evidence_lease",
-                None,
-            )
-            if callable(abandon) and cleanup.evidence_lease is not None:
-                try:
-                    await abandon(cleanup.evidence_lease)
-                except Exception:
-                    cleanup.degraded = True
-            if cleanup.session is not None:
-                try:
-                    # Keep this await in the provider-started callback owner.
-                    # _RealtimeAsrSessionImpl.close() explicitly supports
-                    # retiring its own started settlement without self-deadlock.
-                    await cleanup.session.close()
-                except Exception:
-                    cleanup.degraded = True
-            for ticket in tuple(cleanup.tickets.values()):
-                try:
-                    await self._settle_speaker_deny_ticket(cleanup, ticket)
-                except Exception:
-                    cleanup.degraded = True
-            for dispatcher in owned_dispatchers:
-                try:
-                    await asyncio.wait_for(
-                        dispatcher.wait_idle(),
-                        timeout=_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS,
-                    )
-                except Exception:
-                    cleanup.degraded = True
-            try:
-                await self._asr_admission_ingress.retire_speaker_lease(
-                    cleanup.lease_token
+                    lifecycle.transition(VoiceLifecycleEvent.TURN_DENIED)
+                identity = self._capture_runtime_identity()
+                await self._send_asr_lifecycle_state(
+                    VoiceLifecycleState.LOCAL_LISTEN,
+                    provider=self._asr_provider or "unknown",
+                    session_epoch=self._asr_session_epoch,
+                    expected_identity=identity,
                 )
             except Exception:
-                cleanup.degraded = True
-        finally:
-            cleanup.settled.set()
-            if cleanup.generation == self._asr_deny_cleanup_generation:
-                self._asr_deny_cleanup_active = False
-            if self._asr_speaker_deny_cleanups.get(cleanup.lease_token) is cleanup:
-                self._asr_speaker_deny_cleanups.pop(cleanup.lease_token, None)
+                failure = "ASR_DENY_CLEANUP_LIFECYCLE_FAILED"
+
+        for ticket in tuple(cleanup.tickets.values()):
+            if failure is not None:
+                break
+            try:
+                await self._settle_speaker_deny_ticket(cleanup, ticket)
+            except Exception:
+                failure = "ASR_DENY_CLEANUP_SETTLEMENT_FAILED"
+
+        # Core DROP acknowledgements are generated by the transcript worker;
+        # quiescence is only a join here, never the proof. Flags below are the
+        # authoritative per-child acknowledgements.
+        for dispatcher in set(cleanup.provisional_reservations.values()):
+            if failure is not None:
+                break
+            try:
+                await asyncio.wait_for(
+                    dispatcher.wait_idle(),
+                    timeout=_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                failure = "ASR_DENY_CLEANUP_CORE_SETTLEMENT_FAILED"
+        for turn_token, ticket in cleanup.tickets.items():
+            execution = self._asr_admission_resolutions.get(
+                FinalKey.from_turn(turn_token)
+            )
+            if execution is not None and not (
+                execution.core_settled
+                and execution.transport_settled
+                and execution.lifecycle_settled
+            ):
+                failure = failure or "ASR_DENY_CLEANUP_SETTLEMENT_FAILED"
+
+        if failure is not None or not cleanup.text_safe or not cleanup.transport_safe:
+            await self._fail_speaker_deny_cleanup(
+                cleanup,
+                failure or "ASR_DENY_CLEANUP_UNPROVEN",
+            )
+            return
+
+        self._asr_provider_correlator = None
+        self._asr_provider_correlator_namespace = None
+        self._asr_deferred_provider_started_keys.clear()
+        self._asr_turn_prepared = False
+        for turn_token in child_turns:
+            self._asr_quarantined_partials.pop(turn_token, None)
+            self._asr_partial_settlements.pop(turn_token, None)
+            self._asr_speaker_authority_pending_turns.pop(turn_token, None)
+            self._asr_speaker_authoritative_turns.discard(turn_token)
+            self._asr_admission_turn_leases.pop(turn_token, None)
+            ownership = self._asr_provider_turn_ownerships.pop(turn_token, None)
+            if ownership is not None:
+                ownership.state = _ProviderTurnOwnershipState.RETIRED
+            try:
+                retired_child = await self._asr_admission_ingress.retire_turn(
+                    turn_token
+                )
+                if (
+                    not retired_child
+                    and await self._asr_admission.get_record(turn_token)
+                    is not None
+                ):
+                    raise RuntimeError("ASR_DENY_CLEANUP_CHILD_RETIRE_FAILED")
+            except Exception:
+                await self._fail_speaker_deny_cleanup(
+                    cleanup,
+                    "ASR_DENY_CLEANUP_CHILD_RETIRE_FAILED",
+                )
+                return
+        self._asr_provider_started_turns = {
+            key: turn
+            for key, turn in self._asr_provider_started_turns.items()
+            if turn not in child_turns
+        }
+        self._asr_partial_turn_token = None
+        self._asr_sealed_turn_token = None
+        self._asr_provider_candidate_fence = None
+        self._asr_sealed_provider_key = None
+        self._asr_provider_speaker_evidence_lease = None
+        candidate = cleanup.context.candidate_key
+        self._asr_admission_candidate_leases.pop(candidate, None)
+        self._asr_admission_candidate_turns.pop(candidate, None)
+        self._asr_current_speaker_lease = None
+        self._asr_current_speaker_candidate = None
+        try:
+            retired = await self._asr_admission_ingress.retire_speaker_lease(
+                cleanup.lease_token
+            )
+            if not retired:
+                raise RuntimeError("ASR_DENY_CLEANUP_LEASE_RETIRE_FAILED")
+        except Exception:
+            await self._fail_speaker_deny_cleanup(
+                cleanup,
+                "ASR_DENY_CLEANUP_LEASE_RETIRE_FAILED",
+            )
+            return
+        for final_key, dispatcher in cleanup.provisional_reservations.items():
+            if not dispatcher.retire_resolution(
+                final_key,
+                retired_transport=final_key.turn_token.ingress,
+            ):
+                await self._fail_speaker_deny_cleanup(
+                    cleanup,
+                    "ASR_DENY_CLEANUP_TOMBSTONE_RETIRE_FAILED",
+                )
+                return
+            if (
+                self._asr_admission_reservation_dispatchers.get(final_key)
+                is dispatcher
+            ):
+                self._asr_admission_reservation_dispatchers.pop(final_key, None)
+
+        cleanup.fully_settled = True
+        cleanup.settled.set()
+        self._asr_rearm_cutoff_sequence = self._asr_last_ingress_sequence
+        self._asr_rearm_last_sequence = self._asr_rearm_cutoff_sequence
+        self._asr_rearm_last_captured_at = self._asr_last_captured_at
+        self._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+        self._asr_deny_cleanup_active = False
+        self._asr_speaker_deny_cleanups.pop(cleanup.lease_token, None)
 
     async def _abort_admission_transport(
         self,
@@ -5268,6 +5765,16 @@ class IndependentAsrRuntime:
                 AsrStartStatus.FAILED,
                 failure_code="ASR_START_STALE",
             )
+        if self._asr_deny_transport_state is DenyTransportState.QUARANTINED:
+            # start() is reached only after the explicit microphone restart
+            # has completed predecessor teardown. That is the sole recovery
+            # path from a cleanup quarantine.
+            self._asr_speaker_deny_cleanups.clear()
+            self._asr_deny_transport_state = DenyTransportState.OPEN
+            self._asr_deny_cleanup_active = False
+            self._asr_rearm_cutoff_sequence = 0
+            self._asr_rearm_last_sequence = 0
+            self._asr_rearm_last_captured_at = 0.0
         epoch = self._asr_session_epoch
         audio_generation = self._asr_audio_generation
 
@@ -5312,7 +5819,7 @@ class IndependentAsrRuntime:
             if availability is not AsrProviderAvailability.IMPLEMENTED:
                 if not operation_is_current():
                     return stale_result(provider)
-                failure_code = "ASR_INDEPENDENT_UNAVAILABLE"
+                failure_code = "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE"
                 status_identity = self._capture_runtime_identity()
                 delivered = await self._send_asr_status(
                     failure_code,
@@ -5383,8 +5890,12 @@ class IndependentAsrRuntime:
             async def on_final(text: str) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_independent_asr_final(
-                    text, epoch, candidate_provider
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._handle_independent_asr_final(
+                        text, epoch, candidate_provider
+                    ),
                 )
 
             async def on_provider_final_ready(
@@ -5392,54 +5903,92 @@ class IndependentAsrRuntime:
             ) -> None:
                 if not is_adopted_candidate():
                     return
-                if (
-                    candidate_policy.endpoint_authority == "provider"
-                    and notification.key is not None
-                ):
-                    await self._handle_provider_final(
-                        notification.key,
-                        notification.text,
-                        epoch,
-                        candidate_provider,
-                        received_at=notification.received_at,
-                        admission_deadline=notification.admission_deadline,
-                    )
-                else:
-                    await self._handle_independent_asr_final(
-                        notification.text,
-                        epoch,
-                        candidate_provider,
-                        received_at=notification.received_at,
-                        deadline=notification.admission_deadline,
-                    )
+
+                async def handle() -> None:
+                    if (
+                        candidate_policy.endpoint_authority == "provider"
+                        and notification.key is not None
+                    ):
+                        await self._handle_provider_final(
+                            notification.key,
+                            notification.text,
+                            epoch,
+                            candidate_provider,
+                            received_at=notification.received_at,
+                            admission_deadline=notification.admission_deadline,
+                        )
+                    else:
+                        await self._handle_independent_asr_final(
+                            notification.text,
+                            epoch,
+                            candidate_provider,
+                            received_at=notification.received_at,
+                            deadline=notification.admission_deadline,
+                        )
+
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=handle,
+                )
 
             async def on_error(_message: str) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_independent_asr_error(epoch, candidate_provider)
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._handle_independent_asr_error(
+                        epoch, candidate_provider
+                    ),
+                )
 
             async def on_status(_message: str) -> None:
                 # Provider status strings are intentionally not forwarded verbatim.
-                return None
+                if not is_adopted_candidate():
+                    return
+
+                async def ignore_status() -> None:
+                    return None
+
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=ignore_status,
+                )
 
             async def on_activity(event: SpeechActivityEvent) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_independent_asr_activity(event, epoch)
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._handle_independent_asr_activity(
+                        event, epoch
+                    ),
+                )
 
             async def on_endpoint() -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_independent_asr_endpoint(epoch)
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._handle_independent_asr_endpoint(epoch),
+                )
 
             async def on_provider_endpoint(
                 notification: ProviderEndpointNotification,
             ) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_provider_endpoint_notification(
-                    notification,
-                    epoch,
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._handle_provider_endpoint_notification(
+                        notification,
+                        epoch,
+                    ),
                 )
 
             async def on_provider_utterance_started(
@@ -5447,17 +5996,27 @@ class IndependentAsrRuntime:
             ) -> None:
                 if not is_adopted_candidate():
                     raise RuntimeError("ASR_PROVIDER_STARTED_STALE")
-                outcome = await self._bind_provider_utterance_started(
-                    notification,
-                    epoch,
+                granted, outcome = await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._bind_provider_utterance_started(
+                        notification,
+                        epoch,
+                    ),
                 )
+                if not granted:
+                    return
                 if not outcome.accepted:
                     raise RuntimeError("ASR_PROVIDER_STARTED_BINDING_FAILED")
 
             async def on_partial(text: str) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._send_independent_asr_preview(text, epoch)
+                await self._run_provider_callback(
+                    session_ref=candidate_session,
+                    session_epoch=epoch,
+                    callback=lambda: self._send_independent_asr_preview(text, epoch),
+                )
 
             candidate_session = _create_asr_session_from_selection(
                 core_type,
@@ -6126,6 +6685,99 @@ class IndependentAsrRuntime:
 
         return finish_detached_cleanup()
 
+    def _capture_frame_identity_is_new(self, frame: ProcessedVoiceFrame) -> bool:
+        sequence = frame.ingress_sequence
+        captured_at = frame.captured_at
+        valid = bool(
+            type(sequence) is int
+            and sequence > 0
+            and isinstance(captured_at, (int, float))
+            and not isinstance(captured_at, bool)
+            and captured_at > 0
+            and sequence > self._asr_last_ingress_sequence
+            and captured_at > self._asr_last_captured_at
+        )
+        if valid:
+            self._asr_last_ingress_sequence = sequence
+            self._asr_last_captured_at = float(captured_at)
+        return valid
+
+    async def _submit_deny_rearm_frame(
+        self,
+        frame: ProcessedVoiceFrame,
+        *,
+        ingress_token: VoiceIngressToken,
+        identity_valid: bool,
+    ) -> bool:
+        """Use only contiguous post-cleanup Silero facts to re-arm egress."""
+
+        sequence = frame.ingress_sequence
+        captured_at = float(frame.captured_at)
+        contiguous = bool(
+            identity_valid
+            and sequence > self._asr_rearm_cutoff_sequence
+            and sequence == self._asr_rearm_last_sequence + 1
+            and captured_at > self._asr_rearm_last_captured_at
+        )
+        if not contiguous:
+            if identity_valid:
+                self._asr_rearm_cutoff_sequence = sequence
+                self._asr_rearm_last_sequence = sequence
+                self._asr_rearm_last_captured_at = captured_at
+            return False
+        self._asr_rearm_last_sequence = sequence
+        self._asr_rearm_last_captured_at = captured_at
+        detector = self._asr_detector
+        lifecycle = self._asr_lifecycle
+        if detector is None or lifecycle is None:
+            return False
+        try:
+            result = await detector.feed(
+                frame.pcm16,
+                speech_probability=frame.speech_probability,
+                rnnoise_available=frame.rnnoise_available,
+                rnnoise_evidence=frame.rnnoise_evidence,
+                ingress_token=ingress_token,
+                allow_baseline_update=True,
+            )
+        except Exception:
+            return False
+        if not result.endpointing_available:
+            return False
+        events = tuple(result.events)
+        if self._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE:
+            if SpeechActivityEvent.CANDIDATE_PAUSE not in events:
+                return False
+            self._asr_deny_transport_state = DenyTransportState.ARMED
+            # TURN_DENIED already cleared every pre-DENY/pre-cleanup buffer.
+            return False
+        onset = next(
+            (
+                event
+                for event in events
+                if event
+                in {
+                    SpeechActivityEvent.SPEECH_STARTED,
+                    SpeechActivityEvent.SPEECH_RESUMED,
+                }
+            ),
+            None,
+        )
+        if onset is None:
+            # Only post-silence PCM may populate the next turn's pre-roll.
+            lifecycle.accept_audio(
+                frame.pcm16,
+                sample_rate_hz=frame.sample_rate_hz,
+            )
+            return False
+        self._asr_deny_transport_state = DenyTransportState.OPEN
+        self._asr_deny_cleanup_active = False
+        await self._handle_independent_asr_activity(
+            onset,
+            self._asr_session_epoch,
+        )
+        return True
+
     async def submit(
         self,
         frame: ProcessedVoiceFrame,
@@ -6135,14 +6787,30 @@ class IndependentAsrRuntime:
         """Submit one normalized frame to the independent-ASR hard route."""
 
         self._ensure_asr_runtime_state()
+        identity_valid = self._capture_frame_identity_is_new(frame)
         deny_cleanup_generation = self._asr_deny_cleanup_generation
-        if self._asr_deny_cleanup_active:
+        if self._asr_deny_transport_state in {
+            DenyTransportState.DENY_FENCED,
+            DenyTransportState.RETIRING,
+            DenyTransportState.QUARANTINED,
+        }:
             return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
         if self._asr_lifecycle is None:
             return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
         if not self._ingress_token_matches(ingress_token):
             return AsrSubmitResult(AsrSubmitStatus.STALE)
         self._asr_current_ingress_token = ingress_token
+        if self._asr_deny_transport_state in {
+            DenyTransportState.WAIT_SILENCE,
+            DenyTransportState.ARMED,
+        }:
+            rearmed = await self._submit_deny_rearm_frame(
+                frame,
+                ingress_token=ingress_token,
+                identity_valid=identity_valid,
+            )
+            if not rearmed:
+                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
         authority_reset_task = self._asr_provider_authority_reset_task
         if authority_reset_task is not None:
             reset_succeeded = False
@@ -6174,7 +6842,7 @@ class IndependentAsrRuntime:
                 )
                 return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
             if (
-                self._asr_deny_cleanup_active
+                self._asr_deny_transport_state is not DenyTransportState.OPEN
                 or self._asr_deny_cleanup_generation != deny_cleanup_generation
             ):
                 return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
@@ -6198,7 +6866,7 @@ class IndependentAsrRuntime:
 
             def deny_cleanup_is_current() -> bool:
                 return bool(
-                    not self._asr_deny_cleanup_active
+                    self._asr_deny_transport_state is DenyTransportState.OPEN
                     and self._asr_deny_cleanup_generation == deny_cleanup_generation
                 )
 
@@ -7543,6 +8211,69 @@ class IndependentAsrRuntime:
         """Tombstone a child that Admission has already observed."""
 
         if not ownership.child_published:
+            if denied:
+                cleanup = (
+                    self._asr_speaker_deny_cleanups.get(
+                        ownership.speaker_lease_token
+                    )
+                    if ownership.speaker_lease_token is not None
+                    else None
+                )
+                if cleanup is None:
+                    if self._asr_deny_transport_state not in {
+                        DenyTransportState.WAIT_SILENCE,
+                        DenyTransportState.ARMED,
+                    }:
+                        return
+                    receipt = ownership.transcript_dispatcher.resolve_reserved(
+                        ownership.final_key,
+                        AdmissionDisposition.DROP,
+                    )
+                    if receipt.outcome not in {
+                        TranscriptResolutionOutcome.APPLIED,
+                        TranscriptResolutionOutcome.ALREADY_SAME,
+                        TranscriptResolutionOutcome.NOT_RESERVED,
+                    }:
+                        self._asr_deny_transport_state = (
+                            DenyTransportState.QUARANTINED
+                        )
+                        self._asr_deny_cleanup_active = True
+                        return
+                    self._asr_admission_reservation_dispatchers.pop(
+                        ownership.final_key,
+                        None,
+                    )
+                    self._retire_provider_turn_ownership(ownership)
+                    return
+                cleanup.provisional_reservations.setdefault(
+                    ownership.final_key,
+                    ownership.transcript_dispatcher,
+                )
+                receipt = ownership.transcript_dispatcher.resolve_reserved(
+                    ownership.final_key,
+                    AdmissionDisposition.DROP,
+                )
+                safe_outcomes = {
+                    TranscriptResolutionOutcome.APPLIED,
+                    TranscriptResolutionOutcome.ALREADY_SAME,
+                }
+                if cleanup.settled.is_set():
+                    safe_outcomes.add(TranscriptResolutionOutcome.NOT_RESERVED)
+                if receipt.outcome not in safe_outcomes or (
+                    receipt.existing is not None
+                    and receipt.existing is not AdmissionDisposition.DROP
+                ):
+                    await self._fail_speaker_deny_cleanup(
+                        cleanup,
+                        "ASR_DENY_CLEANUP_TRANSCRIPT_UNSAFE",
+                    )
+                else:
+                    self._asr_admission_reservation_dispatchers.pop(
+                        ownership.final_key,
+                        None,
+                    )
+                    self._retire_provider_turn_ownership(ownership)
+                return
             self._release_unpublished_provider_turn_ownership(ownership)
             return
         lease_token = ownership.speaker_lease_token
@@ -7614,12 +8345,21 @@ class IndependentAsrRuntime:
                     else AdmissionDisposition.ABANDON
                 )
                 try:
-                    dispatcher.resolve_reserved(
+                    receipt = dispatcher.resolve_reserved(
                         ownership.final_key,
                         disposition,
                     )
                 except Exception:
-                    pass
+                    receipt = None
+                if receipt is None or receipt.outcome not in {
+                    TranscriptResolutionOutcome.APPLIED,
+                    TranscriptResolutionOutcome.ALREADY_SAME,
+                }:
+                    if denied and cleanup is not None:
+                        await self._fail_speaker_deny_cleanup(
+                            cleanup,
+                            "ASR_DENY_CLEANUP_TRANSCRIPT_UNSAFE",
+                        )
             self._retire_provider_turn_ownership(ownership)
         self._asr_admission_turn_leases.pop(ownership.turn_token, None)
         self._asr_speaker_authoritative_turns.discard(ownership.turn_token)
@@ -7672,12 +8412,12 @@ class IndependentAsrRuntime:
             or epoch != self._asr_session_epoch
         ):
             return _ProviderStartedOutcome.STALE
-        if self._asr_deny_cleanup_active:
+        if self._deny_transport_blocks_provider_egress():
             return _ProviderStartedOutcome.DENIED_SETTLED
 
         def deny_gate_is_current() -> bool:
             return bool(
-                not self._asr_deny_cleanup_active
+                self._asr_deny_transport_state is DenyTransportState.OPEN
                 and self._asr_deny_cleanup_generation == deny_generation
             )
 
@@ -7840,6 +8580,10 @@ class IndependentAsrRuntime:
                     else _ProviderStartedOutcome.FAILED
                 )
             if denied:
+                await self._settle_published_provider_turn_ownership(
+                    ownership,
+                    denied=True,
+                )
                 return _ProviderStartedOutcome.DENIED_SETTLED
             self._retire_provider_started_alias_reservation(
                 correlator,
@@ -9263,18 +10007,29 @@ class IndependentAsrRuntime:
         *,
         session_epoch: int,
         expected_identity: _AsrRuntimeIdentity,
+        reason_code: str | None = None,
+        incident_id: str | None = None,
     ) -> bool:
         if (
             session_epoch != expected_identity.session_epoch
             or not self._runtime_identity_matches(expected_identity)
         ):
             return False
+        self._asr_lifecycle_notification_revision += 1
+        revision = self._asr_lifecycle_notification_revision
+        transport_generation = expected_identity.transport_generation
+        if transport_generation is None:
+            transport_generation = 0
         try:
             await self._callbacks.on_status(
                 AsrStatusEvent(
                     code=code,
                     provider=provider,
                     session_epoch=session_epoch,
+                    transport_generation=transport_generation,
+                    lifecycle_revision=revision,
+                    reason_code=reason_code,
+                    incident_id=incident_id,
                 )
             )
         except Exception:
@@ -9291,18 +10046,34 @@ class IndependentAsrRuntime:
         provider: str,
         session_epoch: int,
         expected_identity: _AsrRuntimeIdentity,
+        reason_code: str | None = None,
+        incident_id: str | None = None,
     ) -> bool:
         if (
             session_epoch != expected_identity.session_epoch
             or not self._runtime_identity_matches(expected_identity)
         ):
             return False
+        lifecycle = expected_identity.lifecycle
+        snapshot = lifecycle.snapshot if lifecycle is not None else None
+        self._asr_lifecycle_notification_revision += 1
+        revision = self._asr_lifecycle_notification_revision
+        transport_generation = expected_identity.transport_generation
+        if transport_generation is None:
+            transport_generation = 0
+        if snapshot is not None:
+            reason_code = reason_code or snapshot.reason_code
+            incident_id = incident_id or snapshot.incident_id
         try:
             await self._callbacks.on_lifecycle(
                 AsrLifecycleNotification(
                     state=state.value,
                     provider=provider,
                     session_epoch=session_epoch,
+                    transport_generation=transport_generation,
+                    lifecycle_revision=revision,
+                    reason_code=reason_code,
+                    incident_id=incident_id,
                 )
             )
         except Exception:

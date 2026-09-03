@@ -55,6 +55,7 @@
     });
     const ENROLLMENT_ERROR_MESSAGES = Object.freeze({
         model_unavailable: ['voiceIdentity.errorModelUnavailable', '声纹模型不可用，请修复模型资源后重试。'],
+        audio_processing_unavailable: ['voiceIdentity.errorAudioProcessingUnavailable', '录音处理暂时不可用，请重新启动麦克风后重试。'],
         invalid_pcm: ['voiceIdentity.errorInvalidPcm', '录音格式无效，请重录当前段。'],
         speech_too_short: ['voiceIdentity.errorSpeechTooShort', '没有检测到足够的人声，请重录当前段。'],
         silence: ['voiceIdentity.errorVolumeTooLow', '录音音量过低，请重录当前段。'],

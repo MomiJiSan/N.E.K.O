@@ -66,6 +66,10 @@
     // 放在这里而不是 Jukebox 里：转发出去的指令在拥有者窗口用的是另一套计数器，
     // 作废判定必须留在发件的这一侧。
     let _jukeboxSupersedeGeneration = 0;
+    let _latestAsrControlIdentity = null;
+    let _seenAsrIncidentIds = Object.create(null);
+    let _seenAsrIncidentOrder = [];
+    const MAX_SEEN_ASR_INCIDENTS = 64;
     const MUSIC_PLAY_URL_SENDER_ID = (Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
 
     function gameRouteStateRevision() {
@@ -1245,6 +1249,58 @@
             ready: false,
             reason: 'route_blocked'
         });
+    }
+
+    function parseAsrControlIdentity(details) {
+        if (!details || typeof details !== 'object') return null;
+        var sessionEpoch = details.session_epoch;
+        var transportGeneration = details.transport_generation;
+        var lifecycleRevision = details.lifecycle_revision;
+        if (!Number.isInteger(sessionEpoch) || sessionEpoch < 0
+            || !Number.isInteger(transportGeneration) || transportGeneration < 0
+            || !Number.isInteger(lifecycleRevision) || lifecycleRevision < 0) {
+            return null;
+        }
+        return {
+            sessionEpoch: sessionEpoch,
+            transportGeneration: transportGeneration,
+            lifecycleRevision: lifecycleRevision
+        };
+    }
+
+    function acceptAsrControlIdentity(details) {
+        var incoming = parseAsrControlIdentity(details);
+        if (!incoming) return false;
+        var current = _latestAsrControlIdentity;
+        var newer = !current
+            || incoming.sessionEpoch > current.sessionEpoch
+            || (incoming.sessionEpoch === current.sessionEpoch
+                && incoming.transportGeneration > current.transportGeneration)
+            || (incoming.sessionEpoch === current.sessionEpoch
+                && incoming.transportGeneration === current.transportGeneration
+                && incoming.lifecycleRevision > current.lifecycleRevision);
+        if (!newer) return false;
+        _latestAsrControlIdentity = incoming;
+        return true;
+    }
+
+    function showAsrIncidentToast(incidentId, message, durationMs) {
+        var normalizedIncident = typeof incidentId === 'string'
+            ? incidentId.trim()
+            : '';
+        if (normalizedIncident && _seenAsrIncidentIds[normalizedIncident]) {
+            return false;
+        }
+        if (normalizedIncident) {
+            _seenAsrIncidentIds[normalizedIncident] = true;
+            _seenAsrIncidentOrder.push(normalizedIncident);
+            if (_seenAsrIncidentOrder.length > MAX_SEEN_ASR_INCIDENTS) {
+                delete _seenAsrIncidentIds[_seenAsrIncidentOrder.shift()];
+            }
+        }
+        if (typeof window.showStatusToast !== 'function') return false;
+        window.showStatusToast(message, durationMs);
+        return true;
     }
 
     // Fail-closed voice-route teardown, shared by the two ways a route dies:
@@ -3340,8 +3396,19 @@
                         }
                     } catch (_) { }
 
+                    var isAsrControlStatus = statusCode === 'ASR_LIFECYCLE_STATE'
+                        || statusCode === 'ASR_AUDIO_PREPROCESSING_FAILED'
+                        || statusCode === 'ASR_DENY_CLEANUP_FAILED'
+                        || (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0);
+                    if (isAsrControlStatus && !acceptAsrControlIdentity(statusDetails)) {
+                        return;
+                    }
+
                     if (statusCode === 'ASR_LIFECYCLE_STATE') {
                         var lifecycleState = (statusDetails && statusDetails.state) || '';
+                        var lifecycleReasonCode = (statusDetails && statusDetails.reason_code) || '';
+                        var lifecycleIncidentId = (statusDetails && statusDetails.incident_id) || '';
+                        var lifecycleProvider = (statusDetails && statusDetails.provider) || '';
                         var allowedLifecycleStates = [
                             'off', 'local_listen', 'prewarming', 'active',
                             'draining', 'warm_idle', 'deep_sleep', 'backoff',
@@ -3374,12 +3441,29 @@
                             // fallback text, which the toast renders as one message.
                             if (lifecycleState === 'blocked') {
                                 tearDownBlockedVoiceRoute();
-                                if (typeof window.showStatusToast === 'function') {
-                                    window.showStatusToast(
-                                        window.t ? window.t('microphone.independentAsrFallback') : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.',
-                                        5000
-                                    );
+                                var blockedMessage;
+                                if (lifecycleReasonCode === 'ASR_DENY_CLEANUP_FAILED') {
+                                    blockedMessage = window.t
+                                        ? window.t('microphone.independentAsrCleanupFailed')
+                                        : 'Voice session cleanup failed. Please restart the microphone.';
+                                } else if (lifecycleReasonCode === 'ASR_INDEPENDENT_PROVIDER_UNAVAILABLE') {
+                                    blockedMessage = window.t
+                                        ? window.t('microphone.independentAsrProviderUnavailable', { providerKey: lifecycleProvider || 'unknown' })
+                                        : ((lifecycleProvider || 'ASR') + ' is temporarily unavailable. Voice input has stopped for this session. It did not switch to another speech recognition service. Please start a new voice session later.');
+                                } else if (lifecycleReasonCode === 'ASR_INDEPENDENT_FAILED') {
+                                    blockedMessage = window.t
+                                        ? window.t('microphone.independentAsrFallback')
+                                        : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.';
+                                } else {
+                                    blockedMessage = window.t
+                                        ? window.t('microphone.independentAsrRuntimeFailed')
+                                        : 'Independent ASR stopped because of a runtime error. Please restart the microphone.';
                                 }
+                                showAsrIncidentToast(
+                                    lifecycleIncidentId,
+                                    blockedMessage,
+                                    5000
+                                );
                             }
                         }
                         return;
@@ -3406,12 +3490,21 @@
                         // is the one status that says "route dead" while the
                         // microphone keeps running.
                         tearDownBlockedVoiceRoute();
-                        if (typeof window.showStatusToast === 'function') {
-                            window.showStatusToast(
-                                window.t ? window.t('microphone.audioPreprocessingFailed') : 'Microphone audio processing failed. Voice input has stopped for this session. Please start a new voice session.',
-                                5000
-                            );
-                        }
+                        showAsrIncidentToast(
+                            statusDetails && statusDetails.incident_id,
+                            window.t ? window.t('microphone.audioPreprocessingFailed') : 'Microphone audio processing failed. Voice input has stopped for this session. Please start a new voice session.',
+                            5000
+                        );
+                        return;
+                    }
+
+                    if (statusCode === 'ASR_DENY_CLEANUP_FAILED') {
+                        tearDownBlockedVoiceRoute();
+                        showAsrIncidentToast(
+                            statusDetails && statusDetails.incident_id,
+                            window.t ? window.t('microphone.independentAsrCleanupFailed') : 'Voice session cleanup failed. Please restart the microphone.',
+                            5000
+                        );
                         return;
                     }
 
@@ -3455,26 +3548,35 @@
                         if (statusCode === 'ASR_INDEPENDENT_INJECTION_FAILED') {
                             return;
                         }
+                        if (statusCode !== 'ASR_INDEPENDENT_PROVIDER_UNAVAILABLE'
+                            && statusCode !== 'ASR_INDEPENDENT_FAILED'
+                            && statusCode !== 'ASR_INDEPENDENT_STREAM_FAILED') {
+                            console.warn('[App] ignored unknown independent ASR status:', statusCode);
+                            return;
+                        }
                         // Terminal startup failure. Same fail-closed state as a
                         // runtime BLOCKED, but no lifecycle event is ever emitted
                         // for it, so run the same teardown here. The per-code
                         // toasts below already say the right thing.
                         tearDownBlockedVoiceRoute();
-                        if (typeof window.showStatusToast === 'function') {
-                            if (statusCode === 'ASR_INDEPENDENT_PROVIDER_UNAVAILABLE') {
-                                window.showStatusToast(
-                                    window.t
-                                        ? window.t('microphone.independentAsrProviderUnavailable', { providerKey: asrProvider || 'unknown' })
-                                        : ((asrProvider || 'ASR') + ' is temporarily unavailable. Voice input has stopped for this session. It did not switch to another speech recognition service. Please start a new voice session later.'),
-                                    5000
-                                );
-                                return;
-                            }
-                            window.showStatusToast(
-                                window.t ? window.t('microphone.independentAsrFallback') : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.',
+                        var statusIncidentId = statusDetails && statusDetails.incident_id;
+                        if (statusCode === 'ASR_INDEPENDENT_PROVIDER_UNAVAILABLE') {
+                            showAsrIncidentToast(
+                                statusIncidentId,
+                                window.t
+                                    ? window.t('microphone.independentAsrProviderUnavailable', { providerKey: asrProvider || 'unknown' })
+                                    : ((asrProvider || 'ASR') + ' is temporarily unavailable. Voice input has stopped for this session. It did not switch to another speech recognition service. Please start a new voice session later.'),
                                 5000
                             );
+                            return;
                         }
+                        showAsrIncidentToast(
+                            statusIncidentId,
+                            statusCode === 'ASR_INDEPENDENT_FAILED'
+                                ? (window.t ? window.t('microphone.independentAsrFallback') : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.')
+                                : (window.t ? window.t('microphone.independentAsrRuntimeFailed') : 'Independent ASR stopped because of a runtime error. Please restart the microphone.'),
+                            5000
+                        );
                         return;
                     }
 

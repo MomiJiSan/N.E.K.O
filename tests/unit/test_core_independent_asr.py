@@ -1255,6 +1255,7 @@ async def test_game_consumer_accepts_real_pcm_through_pipeline(
         rnnoise_available=processed.rnnoise_available,
         rnnoise_evidence=evidence,
         ingress_token=token,
+        ingress_sequence=1,
         captured_at=1234.5,
     )
 
@@ -8986,13 +8987,17 @@ async def test_old_notifications_cannot_override_new_generation() -> None:
         for payload in payloads
         if payload["code"] == "ASR_LIFECYCLE_STATE"
     ] == ["local_listen", "blocked"]
-    assert payloads[-1] == {
-        "code": "ASR_NEW_READY",
-        "details": {
-            "provider": "new-provider",
-            "session_epoch": new_epoch,
-        },
+    assert payloads[-1]["code"] == "ASR_NEW_READY"
+    latest_revision = payloads[-1]["details"]["lifecycle_revision"]
+    assert payloads[-1]["details"] == {
+        "provider": "new-provider",
+        "session_epoch": new_epoch,
+        "transport_generation": 0,
+        "lifecycle_revision": latest_revision,
+        "reason_code": None,
+        "incident_id": None,
     }
+    assert latest_revision > payloads[1]["details"]["lifecycle_revision"]
     assert payloads[1]["details"]["session_epoch"] == new_epoch
 
 

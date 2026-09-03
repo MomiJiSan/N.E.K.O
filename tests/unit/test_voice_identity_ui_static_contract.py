@@ -434,6 +434,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "microphoneDenied",
         "requestFailed",
         "errorModelUnavailable",
+        "errorAudioProcessingUnavailable",
         "errorInvalidPcm",
         "errorAudioTooLong",
         "errorSpeechTooShort",

@@ -886,3 +886,69 @@ AdmissionEffect: TypeAlias = (
     | PoisonSpeakerAuthorityNamespace
     | CountDiagnostic
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionBulkResult:
+    """Effects produced for one child by an atomic parent transition."""
+
+    turn_token: VoiceTurnToken
+    effects: tuple[AdmissionEffect, ...]
+    speaker_lease_token: SpeakerCaptureLeaseToken | None = None
+    speaker_lease_terminal_state: SpeakerLeaseState | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        lease_identity = (
+            self.speaker_lease_token,
+            self.speaker_lease_terminal_state,
+        )
+        if lease_identity == (None, None):
+            return
+        if type(self.speaker_lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError(
+                "speaker_lease_token must be SpeakerCaptureLeaseToken when present"
+            )
+        if type(self.speaker_lease_terminal_state) is not SpeakerLeaseState:
+            raise TypeError(
+                "speaker_lease_terminal_state must be SpeakerLeaseState when present"
+            )
+        if self.speaker_lease_terminal_state in {
+            SpeakerLeaseState.COLLECTING,
+            SpeakerLeaseState.FIRST_LOW,
+        }:
+            raise ValueError("speaker lease bulk result requires a terminal state")
+
+
+class SpeakerLeaseTransitionOutcome(StrEnum):
+    APPLIED = "applied"
+    IDEMPOTENT = "idempotent"
+    NON_TERMINAL = "non_terminal"
+    STALE = "stale"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseTransitionReceipt:
+    """Typed result of one parent fact under the coordinator's writer lock."""
+
+    lease_token: SpeakerCaptureLeaseToken
+    before_state: SpeakerLeaseState
+    after_state: SpeakerLeaseState
+    outcome: SpeakerLeaseTransitionOutcome
+    terminal_sequence_no: int | None
+    capture_through_sequence_no: int | None
+    frozen_children: tuple[SpeakerLeaseChildBinding, ...]
+    child_results: tuple[AdmissionBulkResult, ...]
+    diagnostics: tuple[AdmissionEffect, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(self.before_state) is not SpeakerLeaseState:
+            raise TypeError("before_state must be SpeakerLeaseState")
+        if type(self.after_state) is not SpeakerLeaseState:
+            raise TypeError("after_state must be SpeakerLeaseState")
+        if type(self.outcome) is not SpeakerLeaseTransitionOutcome:
+            raise TypeError("outcome must be SpeakerLeaseTransitionOutcome")
