@@ -825,7 +825,43 @@ class RevokeRejectionCapability:
 
 @dataclass(frozen=True, slots=True)
 class AbortProviderTransport:
-    turn_token: VoiceTurnToken
+    """Request cleanup for the exact admission resolution that dropped a turn.
+
+    The immutable resolution ticket remains usable after the coordinator record
+    retires.  A parent lease token lets the Runtime coalesce every child abort
+    from one sticky speaker denial into one transport cleanup operation.
+    """
+
+    ticket: AdmissionResolutionTicket
+    speaker_lease_token: SpeakerCaptureLeaseToken | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.ticket) is not AdmissionResolutionTicket:
+            raise TypeError("ticket must be AdmissionResolutionTicket")
+        if self.ticket.disposition is not AdmissionDisposition.DROP:
+            raise ValueError("transport abort requires a DROP resolution")
+        if self.speaker_lease_token is not None and (
+            type(self.speaker_lease_token) is not SpeakerCaptureLeaseToken
+        ):
+            raise TypeError(
+                "speaker_lease_token must be SpeakerCaptureLeaseToken or None"
+            )
+
+    @property
+    def turn_token(self) -> VoiceTurnToken:
+        return self.ticket.turn_token
+
+    @property
+    def record_generation(self) -> int:
+        return self.ticket.record_generation
+
+    @property
+    def resolution_nonce(self) -> int:
+        return self.ticket.resolution_nonce
+
+    @property
+    def disposition(self) -> AdmissionDisposition:
+        return self.ticket.disposition
 
 
 @dataclass(frozen=True, slots=True)

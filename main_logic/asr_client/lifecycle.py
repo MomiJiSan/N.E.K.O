@@ -64,6 +64,7 @@ class VoiceLifecycleEvent(Enum):
     # 兼容旧调用方；新代码应使用 TURN_SEALED，明确区分语义端点和 provider final。
     TURN_ENDPOINTED = "turn_endpointed"
     PROVIDER_FINAL = "provider_final"
+    TURN_DENIED = "turn_denied"
     PREWARM_EXPIRED = "prewarm_expired"
     WARM_EXPIRED = "warm_expired"
     RECOVERED = "recovered"
@@ -118,6 +119,10 @@ _TRANSITIONS: dict[
     (VoiceLifecycleState.ACTIVE, VoiceLifecycleEvent.TURN_SEALED): VoiceLifecycleState.DRAINING,
     (VoiceLifecycleState.ACTIVE, VoiceLifecycleEvent.TURN_ENDPOINTED): VoiceLifecycleState.DRAINING,
     (VoiceLifecycleState.DRAINING, VoiceLifecycleEvent.PROVIDER_FINAL): VoiceLifecycleState.WARM_IDLE,
+    (VoiceLifecycleState.PREWARMING, VoiceLifecycleEvent.TURN_DENIED): VoiceLifecycleState.LOCAL_LISTEN,
+    (VoiceLifecycleState.ACTIVE, VoiceLifecycleEvent.TURN_DENIED): VoiceLifecycleState.LOCAL_LISTEN,
+    (VoiceLifecycleState.DRAINING, VoiceLifecycleEvent.TURN_DENIED): VoiceLifecycleState.LOCAL_LISTEN,
+    (VoiceLifecycleState.WARM_IDLE, VoiceLifecycleEvent.TURN_DENIED): VoiceLifecycleState.LOCAL_LISTEN,
     (VoiceLifecycleState.WARM_IDLE, VoiceLifecycleEvent.SOFT_WAKE): VoiceLifecycleState.PREWARMING,
     (VoiceLifecycleState.WARM_IDLE, VoiceLifecycleEvent.SPEECH_CONFIRMED): VoiceLifecycleState.ACTIVE,
     (VoiceLifecycleState.PREWARMING, VoiceLifecycleEvent.PREWARM_EXPIRED): VoiceLifecycleState.LOCAL_LISTEN,
@@ -398,6 +403,19 @@ class VoiceInputLifecycleController:
             self._completed_turn_id = self._turn_id
             self._pre_roll_sent_for_turn = False
             self._pre_roll.clear()
+        elif event is VoiceLifecycleEvent.TURN_DENIED:
+            self._transport_generation += 1
+            self._turn_id = self._allocate_turn_id()
+            self._current_turn_token = None
+            self._completed_turn_id = self._turn_id
+            self._pre_roll_sent_for_turn = False
+            self._pre_roll.clear()
+            self._pending_turn.clear()
+            self._pending_turn_speech = False
+            self._pending_turn_id = None
+            self._pending_turn_token = None
+            self._pending_connect.clear()
+            self._active_start_audio = b""
         elif event is VoiceLifecycleEvent.PREWARM_EXPIRED:
             self._current_turn_token = None
             self._pre_roll_sent_for_turn = False

@@ -71,6 +71,31 @@ class AdmissionBulkResult:
 
     turn_token: VoiceTurnToken
     effects: tuple[AdmissionEffect, ...]
+    speaker_lease_token: SpeakerCaptureLeaseToken | None = None
+    speaker_lease_terminal_state: SpeakerLeaseState | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        lease_identity = (
+            self.speaker_lease_token,
+            self.speaker_lease_terminal_state,
+        )
+        if lease_identity == (None, None):
+            return
+        if type(self.speaker_lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError(
+                "speaker_lease_token must be SpeakerCaptureLeaseToken when present"
+            )
+        if type(self.speaker_lease_terminal_state) is not SpeakerLeaseState:
+            raise TypeError(
+                "speaker_lease_terminal_state must be SpeakerLeaseState when present"
+            )
+        if self.speaker_lease_terminal_state in {
+            SpeakerLeaseState.COLLECTING,
+            SpeakerLeaseState.FIRST_LOW,
+        }:
+            raise ValueError("speaker lease bulk result requires a terminal state")
 
 
 class VoiceTurnAdmissionCoordinator:
@@ -574,6 +599,8 @@ class VoiceTurnAdmissionCoordinator:
                     AdmissionBulkResult(
                         first.turn_token,
                         (*diagnostics, *first.effects),
+                        first.speaker_lease_token,
+                        first.speaker_lease_terminal_state,
                     ),
                     *rest,
                 )
@@ -645,7 +672,14 @@ class VoiceTurnAdmissionCoordinator:
                 child, emitted = reduce(child, event, now)
                 effects.extend(emitted)
             updates.append((binding.turn_token, child))
-            results.append(AdmissionBulkResult(binding.turn_token, tuple(effects)))
+            results.append(
+                AdmissionBulkResult(
+                    binding.turn_token,
+                    tuple(effects),
+                    lease.lease_token,
+                    lease.state,
+                )
+            )
         return tuple(results), tuple(updates)
 
     async def get_speaker_lease(

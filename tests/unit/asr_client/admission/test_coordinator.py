@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from main_logic.asr_client.admission.contracts import (
+    AbortProviderTransport,
     AdmissionDisposition,
     AdmissionState,
     CoreSettled,
@@ -11,6 +12,11 @@ from main_logic.asr_client.admission.contracts import (
     ProviderFinalReceived,
     ResolveReserved,
     RouteReplaced,
+    SpeakerCaptureLeaseToken,
+    SpeakerCheckpointKind,
+    SpeakerLeaseCaptureClosed,
+    SpeakerLeaseLow,
+    SpeakerLeaseState,
     TransportSettled,
 )
 from main_logic.asr_client.admission.coordinator import (
@@ -19,6 +25,7 @@ from main_logic.asr_client.admission.coordinator import (
     VoiceTurnAdmissionCoordinator,
 )
 from main_logic.asr_client._provider_events import ProviderUtteranceKey
+from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
 from main_logic.voice_turn.contracts import VoiceIngressToken, VoiceTurnToken
 
 
@@ -27,6 +34,18 @@ pytestmark = pytest.mark.asyncio
 
 def _token(turn_id: int) -> VoiceTurnToken:
     return VoiceTurnToken(VoiceIngressToken(1, "socket", 2, 3, 4), turn_id)
+
+
+def _lease() -> SpeakerCaptureLeaseToken:
+    return SpeakerCaptureLeaseToken(1, 2, 3, 4, 1)
+
+
+def _candidate() -> SpeakerShadowCandidateKey:
+    return SpeakerShadowCandidateKey(5, 6, "provider_candidate")
+
+
+def _provider_key(utterance_id: int) -> ProviderUtteranceKey:
+    return ProviderUtteranceKey(1, 0, utterance_id)
 
 
 async def test_post_reduces_under_single_writer_and_returns_effects_without_awaiting_them():
@@ -114,3 +133,86 @@ async def test_bulk_invalidation_rejects_non_route_control_event():
                 PendingProviderFinal(None, "qwen", "hello", 10.0, 10.2)
             )
         )
+
+
+async def test_terminal_deny_fanout_carries_parent_state_and_exact_child_tickets():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease = _lease()
+    first, second = _token(1), _token(2)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.attach_turn_to_speaker_lease(first, lease, _provider_key(1))
+    await coordinator.attach_turn_to_speaker_lease(second, lease, _provider_key(2))
+
+    assert (
+        await coordinator.post_speaker_lease(
+            lease,
+            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+        )
+        == ()
+    )
+    results = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
+    )
+
+    assert tuple(result.turn_token for result in results) == (first, second)
+    assert all(result.speaker_lease_token == lease for result in results)
+    assert all(
+        result.speaker_lease_terminal_state is SpeakerLeaseState.DENY_LATCHED
+        for result in results
+    )
+    aborts = [
+        next(
+            effect
+            for effect in result.effects
+            if isinstance(effect, AbortProviderTransport)
+        )
+        for result in results
+    ]
+    resolutions = [
+        next(effect for effect in result.effects if isinstance(effect, ResolveReserved))
+        for result in results
+    ]
+    assert tuple(abort.ticket for abort in aborts) == tuple(
+        resolution.ticket for resolution in resolutions
+    )
+    assert all(abort.speaker_lease_token == lease for abort in aborts)
+    assert {abort.turn_token for abort in aborts} == {first, second}
+    assert len({abort.record_generation for abort in aborts}) == 2
+
+
+async def test_first_low_then_capture_close_remains_fail_open_with_parent_metadata():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease = _lease()
+    turn = _token(1)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.attach_turn_to_speaker_lease(turn, lease, _provider_key(1))
+    await coordinator.post(
+        turn,
+        ProviderFinalReceived(
+            PendingProviderFinal(_provider_key(1), "qwen", "hello", 10.0, 10.2)
+        ),
+    )
+
+    assert (
+        await coordinator.post_speaker_lease(
+            lease,
+            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+        )
+        == ()
+    )
+    results = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseCaptureClosed(_candidate(), 1),
+    )
+
+    assert len(results) == 1
+    assert results[0].speaker_lease_token == lease
+    assert results[0].speaker_lease_terminal_state is SpeakerLeaseState.UNAVAILABLE
+    resolution = next(
+        effect for effect in results[0].effects if isinstance(effect, ResolveReserved)
+    )
+    assert resolution.disposition is AdmissionDisposition.FORWARD
+    assert not any(
+        isinstance(effect, AbortProviderTransport) for effect in results[0].effects
+    )

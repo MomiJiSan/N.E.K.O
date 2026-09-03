@@ -34,6 +34,7 @@ from main_logic.asr_client.admission.contracts import (
     SettlePartial,
     SpeakerCheckpointKind,
     SpeakerHigh,
+    SpeakerLeaseLow,
     SpeakerLeaseState,
     SpeakerLow,
     SpeakerUnavailable,
@@ -1164,7 +1165,8 @@ async def test_active_enqueue_holds_fast_final_until_two_lows_drop() -> None:
 
     observation_release.set()
     await asyncio.wait_for(submission, 1)
-    await asyncio.wait_for(provider_wire_seen.wait(), 1)
+    assert provider_wire_seen.is_set() is False
+    session.stream_audio.assert_not_awaited()
     await _close_dispatchers(runtime)
 
 
@@ -1480,6 +1482,286 @@ async def test_provider_started_commits_aliases_only_after_attach_settles(
     await _close_dispatchers(runtime)
 
 
+async def test_provider_started_gate_active_never_reserves_child() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, _turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._asr_deny_cleanup_generation += 1
+    runtime._asr_deny_cleanup_active = True
+    dispatcher = runtime._asr_transcript_dispatcher
+    reservations_before = set(dispatcher._reservations)
+
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+
+    assert set(dispatcher._reservations) == reservations_before
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_provider_started_turns == {}
+    runtime._asr_deny_cleanup_active = False
+    await _close_dispatchers(runtime)
+
+
+async def test_published_started_failure_abandons_without_releasing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await _open_runtime_admission_turn(runtime, turn_token)
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    dispatcher = runtime._asr_transcript_dispatcher
+    dispatcher.release = MagicMock(wraps=dispatcher.release)
+    dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
+
+    async def fail_after_publication(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        runtime,
+        "_flush_deferred_provider_speaker_lease_events",
+        fail_after_publication,
+    )
+
+    assert not await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+    await _drain_runtime_admission(runtime)
+
+    final_key = FinalKey.from_turn(turn_token)
+    dispatcher.release.assert_not_called()
+    assert dispatcher.resolve_reserved.call_args.args == (
+        final_key,
+        AdmissionDisposition.ABANDON,
+    )
+    assert final_key not in dispatcher._reservations
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
+    assert runtime._asr_provider_started_turns == {}
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_started_deferred_deny_settles_without_binding_failure() -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    candidate = runtime._asr_current_speaker_candidate
+    lease_token = runtime._asr_current_speaker_lease
+    assert candidate is not None
+    assert lease_token is not None
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+
+    session.close.assert_awaited_once_with()
+    assert runtime._asr_session is None
+    assert lifecycle.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
+    assert runtime._asr_provider_started_turns == {}
+    assert runtime._asr_admission_turn_leases == {}
+    assert runtime._asr_deny_cleanup_active is False
+    assert runtime._ingress_token_matches(turn_token.ingress)
+    assert callbacks.on_prepare_turn.await_count == 0
+    assert callbacks.on_failure.await_count == 0
+    assert await runtime._asr_admission.get_speaker_lease(lease_token) is None
+    await _close_dispatchers(runtime)
+
+
+async def test_provider_started_gate_change_drops_late_terminal_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await _open_runtime_admission_turn(runtime, turn_token)
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    lease_token = runtime._asr_current_speaker_lease
+    candidate = runtime._asr_current_speaker_candidate
+    assert lease_token is not None
+    assert candidate is not None
+    attach_entered = asyncio.Event()
+    attach_release = asyncio.Event()
+    original_attach = runtime._asr_admission.attach_turn_to_speaker_lease
+
+    async def block_attach(child_turn, parent_lease, provider_key):
+        attach_entered.set()
+        await attach_release.wait()
+        return await original_attach(child_turn, parent_lease, provider_key)
+
+    monkeypatch.setattr(
+        runtime._asr_admission,
+        "attach_turn_to_speaker_lease",
+        block_attach,
+    )
+    started = asyncio.create_task(
+        runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1),
+            runtime._asr_session_epoch,
+        )
+    )
+    await asyncio.wait_for(attach_entered.wait(), 1)
+    await runtime._asr_admission.post_speaker_lease(
+        lease_token,
+        SpeakerLeaseLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+    )
+    await runtime._asr_admission.post_speaker_lease(
+        lease_token,
+        SpeakerLeaseLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+    )
+    runtime._begin_speaker_deny_cleanup(lease_token, ())
+    attach_release.set()
+
+    assert await asyncio.wait_for(started, 1)
+    await _drain_runtime_admission(runtime)
+
+    final_key = FinalKey.from_turn(turn_token)
+    assert final_key not in runtime._asr_transcript_dispatcher._reservations
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
+    assert runtime._asr_speaker_deny_cleanups == {}
+    assert runtime._asr_deny_cleanup_active is False
+    session.close.assert_awaited_once_with()
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_cleanup_transition_failure_still_settles_and_ungates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    candidate = runtime._asr_current_speaker_candidate
+    assert candidate is not None
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    original_transition = lifecycle.transition
+
+    def fail_deny_transition(event):
+        if event is VoiceLifecycleEvent.TURN_DENIED:
+            raise RuntimeError("forced lifecycle cleanup failure")
+        return original_transition(event)
+
+    monkeypatch.setattr(lifecycle, "transition", fail_deny_transition)
+
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+    await _drain_runtime_admission(runtime)
+
+    session.close.assert_awaited_once_with()
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
+    assert runtime._asr_speaker_deny_cleanups == {}
+    assert runtime._asr_deny_cleanup_active is False
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_resolve_effect_failure_still_tombstones_and_ungates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await _open_runtime_admission_turn(runtime, turn_token)
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    candidate = runtime._asr_current_speaker_candidate
+    assert candidate is not None
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    dispatcher = runtime._asr_transcript_dispatcher
+    execute = runtime._execute_admission_effect
+
+    async def fail_resolve(effect) -> None:
+        if isinstance(effect, ResolveReserved):
+            raise RuntimeError("forced transcript settlement failure")
+        await execute(effect)
+
+    monkeypatch.setattr(runtime, "_execute_admission_effect", fail_resolve)
+
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+    await _drain_runtime_admission(runtime)
+
+    final_key = FinalKey.from_turn(turn_token)
+    session.close.assert_awaited_once_with()
+    assert final_key not in dispatcher._reservations
+    assert final_key in dispatcher._resolved
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
+    assert runtime._asr_speaker_deny_cleanups == {}
+    assert runtime._asr_deny_cleanup_active is False
+    await _close_dispatchers(runtime)
+
+
 async def test_provider_started_identity_drift_detaches_exact_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1727,9 +2009,11 @@ async def test_deferred_parent_event_overflow_fails_closed_without_child() -> No
     )
     assert await runtime._asr_admission.get_record(turn_token) is None
     parent = await runtime._asr_admission.get_speaker_lease(lease_token)
-    assert parent is not None and not parent.child_bindings
-    assert not runtime._asr_deferred_provider_speaker_lease_events[lease_token]
-    assert lease_token in runtime._asr_deferred_provider_speaker_lease_overflow
+    assert parent is None
+    assert lease_token not in runtime._asr_deferred_provider_speaker_lease_events
+    assert lease_token not in runtime._asr_deferred_provider_speaker_lease_overflow
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
     await _close_dispatchers(runtime)
 
 
@@ -1875,6 +2159,47 @@ async def test_parent_terminal_before_started_attaches_then_forwards_final(
 
     callbacks.on_final.assert_awaited_once()
     assert callbacks.on_final.await_args.args[0].text == "forwarded"
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
+    await _close_dispatchers(runtime)
+
+
+async def test_unleased_drop_retires_provider_turn_ownership() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    runtime._speaker_verifier_enforces_admission = False
+    runtime._asr_current_speaker_lease = None
+    runtime._asr_current_speaker_candidate = None
+    await _open_runtime_admission_turn(runtime, turn_token)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+    record = await runtime._asr_admission.get_record(turn_token)
+    assert record is not None
+    ticket = AdmissionResolutionTicket(
+        turn_token=turn_token,
+        record_generation=record.record_generation,
+        resolution_nonce=1,
+        disposition=AdmissionDisposition.DROP,
+    )
+
+    await runtime._resolve_admission_reservation(
+        ResolveReserved(ticket=ticket, final=None)
+    )
+    assert turn_token in runtime._asr_provider_turn_ownerships
+    await runtime._abort_admission_transport(
+        AbortProviderTransport(ticket=ticket)
+    )
+
+    assert runtime._asr_provider_turn_ownerships == {}
+    assert runtime._asr_admission_reservation_dispatchers == {}
     await _close_dispatchers(runtime)
 
 
@@ -3088,7 +3413,7 @@ async def test_provider_keys_share_one_authoritative_speaker_lease(
 
     runtime = IndependentAsrRuntime(_callbacks())
     placeholder = _RejectionDetector()
-    _session, lifecycle, first_turn = _install_active_candidate(
+    session, lifecycle, first_turn = _install_active_candidate(
         runtime,
         placeholder,
         provider="qwen",
@@ -3208,15 +3533,15 @@ async def test_provider_keys_share_one_authoritative_speaker_lease(
     await _drain_runtime_admission(runtime)
 
     denied_lease = await runtime._asr_admission.get_speaker_lease(lease_token)
-    assert denied_lease is not None
-    assert denied_lease.state is SpeakerLeaseState.DENY_LATCHED
-    assert denied_lease.candidate == candidate
-    assert [binding.provider_key for binding in denied_lease.child_bindings] == [
-        key_a,
-        key_b,
-    ]
+    # Formal denial retires the complete physical lease only after every child
+    # transcript is tombstoned and the old Provider transport has closed.
+    assert denied_lease is None
     assert scoring_host.score_count == 2
     assert runtime._speaker_verifier_diagnostics()["speaker_deny_latched_count"] == 1
+    session.close.assert_awaited_once_with()
+    assert lifecycle.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
+    assert runtime._asr_provider_started_turns == {}
+    assert runtime._asr_deny_cleanup_active is False
 
     first_record = await runtime._asr_admission.get_record(first_turn)
     second_record = await runtime._asr_admission.get_record(second_turn)

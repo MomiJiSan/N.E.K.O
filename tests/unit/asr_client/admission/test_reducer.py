@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from main_logic.asr_client._provider_events import ProviderUtteranceKey
 from main_logic.asr_client.admission.contracts import (
     AbortProviderTransport,
@@ -40,6 +42,7 @@ from main_logic.asr_client.admission.contracts import (
     ScheduleFinalDeadline,
     SettlePartial,
     SettlementState,
+    SpeakerCaptureLeaseToken,
     SpeakerCheckpointKind,
     SpeakerAuthorityPending,
     SpeakerAuthorityUnarmed,
@@ -69,6 +72,10 @@ def _provider_key(utterance_id: int = 1) -> ProviderUtteranceKey:
 
 def _candidate(generation: int = 1) -> SpeakerShadowCandidateKey:
     return SpeakerShadowCandidateKey(5, generation, "provider_candidate")
+
+
+def _lease() -> SpeakerCaptureLeaseToken:
+    return SpeakerCaptureLeaseToken(1, 2, 3, 4, 5)
 
 
 def _record(
@@ -455,6 +462,7 @@ def test_late_exact_after_deny_is_revoked_without_rebinding():
 
 def test_deny_before_final_drops_without_capability():
     record, _ = _record()
+    record = replace(record, speaker_lease_token=_lease())
     record, _ = _step(
         record,
         SpeakerLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
@@ -464,8 +472,17 @@ def test_deny_before_final_drops_without_capability():
         SpeakerLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
     )
     assert record.admission_state is AdmissionState.DROPPED
-    assert _resolve_effects(effects)[0].final is None
-    assert any(isinstance(effect, AbortProviderTransport) for effect in effects)
+    resolution = _resolve_effects(effects)[0]
+    abort = next(
+        effect for effect in effects if isinstance(effect, AbortProviderTransport)
+    )
+    assert resolution.final is None
+    assert abort.ticket is resolution.ticket
+    assert abort.speaker_lease_token == _lease()
+    assert abort.turn_token == record.turn_token
+    assert abort.record_generation == record.record_generation
+    assert abort.resolution_nonce == resolution.ticket.resolution_nonce
+    assert abort.disposition is AdmissionDisposition.DROP
 
 
 def test_empty_final_is_not_dropped_by_micro_event_suppress():

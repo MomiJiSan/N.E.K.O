@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from main_logic.asr_client.lifecycle import (
     FinalKey,
     VoiceIngressToken,
@@ -7,6 +9,7 @@ from main_logic.asr_client.lifecycle import (
     VoiceLifecycleState,
     VoiceRouteMode,
     VoiceTurnToken,
+    next_lifecycle_state,
 )
 from main_logic.asr_client.lifecycle import (
     AudioDisposition,
@@ -272,3 +275,87 @@ def test_game_takeover_suspends_active_turn_and_clears_audio() -> None:
 
     controller.transition(VoiceLifecycleEvent.GAME_RELEASED)
     assert controller.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
+
+
+def _controller_in_turn_denied_source_state(
+    state: VoiceLifecycleState,
+) -> VoiceInputLifecycleController:
+    controller = VoiceInputLifecycleController(
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        shadow_mode=False,
+    )
+    controller.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    controller.accept_audio(_pcm(100), sample_rate_hz=16_000)
+    controller.open_turn(_ingress(6))
+    controller.accept_audio(_pcm(100), sample_rate_hz=16_000)
+    if state is VoiceLifecycleState.PREWARMING:
+        return controller
+
+    controller.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    if state is VoiceLifecycleState.ACTIVE:
+        return controller
+
+    controller.transition(VoiceLifecycleEvent.TURN_SEALED)
+    controller.accept_audio(_pcm(100), sample_rate_hz=16_000)
+    controller.mark_pending_turn_speech(_ingress(7))
+    if state is VoiceLifecycleState.DRAINING:
+        return controller
+
+    controller.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
+    return controller
+
+
+@pytest.mark.parametrize(
+    "source_state",
+    (
+        VoiceLifecycleState.PREWARMING,
+        VoiceLifecycleState.ACTIVE,
+        VoiceLifecycleState.DRAINING,
+        VoiceLifecycleState.WARM_IDLE,
+    ),
+)
+def test_turn_denied_returns_to_clean_local_listen(
+    source_state: VoiceLifecycleState,
+) -> None:
+    controller = _controller_in_turn_denied_source_state(source_state)
+    old_identity = controller.identity
+    old_transport_generation = controller.snapshot.transport_generation
+
+    result = controller.transition(VoiceLifecycleEvent.TURN_DENIED)
+
+    assert result is VoiceLifecycleState.LOCAL_LISTEN
+    assert controller.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
+    assert controller.snapshot.route_mode is VoiceRouteMode.INDEPENDENT
+    assert controller.snapshot.transport_generation == old_transport_generation + 1
+    assert controller.identity.turn_id > old_identity.turn_id
+    assert controller.matches(old_identity) is False
+    assert controller.current_turn_token is None
+    assert controller.pending_turn_token is None
+    assert controller.pre_roll_bytes == 0
+    assert controller.pending_connect_bytes == 0
+    assert controller.pending_turn_bytes == 0
+    assert controller.has_pending_turn is False
+
+    controller.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    controller.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    next_audio = controller.accept_audio(_pcm(20), sample_rate_hz=16_000)
+    assert next_audio.disposition is AudioDisposition.FORWARD_WITH_PRE_ROLL
+    assert next_audio.pre_roll == _pcm(20)
+
+
+@pytest.mark.parametrize(
+    "source_state",
+    (
+        VoiceLifecycleState.OFF,
+        VoiceLifecycleState.LOCAL_LISTEN,
+        VoiceLifecycleState.DEEP_SLEEP,
+        VoiceLifecycleState.BACKOFF,
+        VoiceLifecycleState.BLOCKED,
+        VoiceLifecycleState.SUSPENDED,
+    ),
+)
+def test_turn_denied_rejects_states_without_provider_turn(
+    source_state: VoiceLifecycleState,
+) -> None:
+    with pytest.raises(RuntimeError, match="VOICE_LIFECYCLE_INVALID_TRANSITION"):
+        next_lifecycle_state(source_state, VoiceLifecycleEvent.TURN_DENIED)

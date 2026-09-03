@@ -281,7 +281,12 @@ def _resolve(
         speaker_deny
         or record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE
     ):
-        effects.append(AbortProviderTransport(record.turn_token))
+        effects.append(
+            AbortProviderTransport(
+                ticket=resolution_ticket,
+                speaker_lease_token=record.speaker_lease_token,
+            )
+        )
     apply_state = record.rejection_apply_state
     revoked_inflight = _revoked_inflight_changes(record)
     if (
