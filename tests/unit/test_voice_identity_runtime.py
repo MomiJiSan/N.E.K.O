@@ -1859,10 +1859,14 @@ async def test_runtime_install_and_wrapper_lifecycle(
             *args,
             runtime_mode: str,
             runtime_status_callback,
+            enrollment_ttl_seconds: float,
+            speech_validator_factory,
         ) -> None:
             self.args = args
             self.runtime_mode = runtime_mode
             self.runtime_status_callback = runtime_status_callback
+            self.enrollment_ttl_seconds = enrollment_ttl_seconds
+            self.speech_validator_factory = speech_validator_factory
             self.initialized = 0
             self.closed = 0
 
@@ -1896,6 +1900,15 @@ async def test_runtime_install_and_wrapper_lifecycle(
     assert service.runtime_mode == "off"
     assert "Unsupported NEKO_VOICE_IDENTITY_MODE" in caplog.text
     assert isinstance(service.args[0], runtime_module._UnavailableProfileStore)
+    assert service.enrollment_ttl_seconds == 45.0
+    assert (
+        service.speech_validator_factory
+        is runtime_module.SileroEnrollmentSpeechValidator
+    )
+    assert service.args[2].kwargs == {
+        "default_ttl_seconds": 45.0,
+        "hard_ttl_seconds": 60.0,
+    }
     assert installed == [service]
     assert runtime_module.install_voice_identity_runtime(config) is service
 

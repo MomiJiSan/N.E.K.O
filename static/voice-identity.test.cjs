@@ -18,7 +18,7 @@ const API_ROOT = '/api/voice-identity';
 const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=16000;channels=1';
 const PROFILE_HEADER = 'X-Voice-Identity-Profile';
 const TARGET_SAMPLE_RATE = 16000;
-const RECORDING_MS = 4000;
+const RECORDING_MS = 3000;
 const CAPTURE_TIMEOUT_MS = RECORDING_MS + 1000;
 const WINDOW_CLOSE_START_WAIT_MS = 500;
 const TARGET_SAMPLES = TARGET_SAMPLE_RATE * RECORDING_MS / 1000;
@@ -71,11 +71,21 @@ class MockHeaders {
 function createElement() {
     const listeners = new Map();
     const classes = new Set();
+    const attributes = new Map();
     const element = {
         textContent: '',
         hidden: false,
         disabled: false,
         checked: false,
+        setAttribute(name, value) {
+            attributes.set(name, String(value));
+        },
+        getAttribute(name) {
+            return attributes.get(name);
+        },
+        removeAttribute(name) {
+            attributes.delete(name);
+        },
         addEventListener(type, listener) {
             listeners.set(type, listener);
         },
@@ -115,16 +125,22 @@ function createHarness({
     statusGate,
     startGate,
     startError,
+    startTransportErrorAfterCreate = false,
     mediaGate,
     mediaError,
     audioChunks = FULL_AUDIO_CHUNKS,
     manualAudio = false,
     profileError,
+    profileErrorSegment = 1,
     profileTransportErrorAfterCommit = false,
+    segmentTransportErrorAfterAccept = null,
     showConfirm,
     nativeConfirm = true,
     webCryptoAvailable = true,
     initialEffectiveReason = null,
+    initialEnrollment = false,
+    initialEnrollmentProfileId = null,
+    initialRemainingSeconds = 45,
 } = {}) {
     const elementIds = [
         'voice-identity-status-dot',
@@ -140,8 +156,16 @@ function createHarness({
         'voice-identity-reenroll',
         'voice-identity-delete',
         'voice-identity-filter',
+        'voice-identity-progress-label',
+        'voice-identity-phase',
+        'voice-identity-remaining',
     ];
     const elements = new Map(elementIds.map(id => [id, createElement()]));
+    const stepElements = [1, 2, 3, 4].map(index => {
+        const element = createElement();
+        element.setAttribute('data-voice-segment', String(index));
+        return element;
+    });
     const documentListeners = new Map();
     const windowListeners = new Map();
     const fetchCalls = [];
@@ -152,12 +176,26 @@ function createHarness({
     let serverProfile = initialProfile;
     let serverProfileGeneration = initialProfile ? 'profile-0' : null;
     let serverRequested = initialRequested;
-    let enrollmentId = null;
+    let enrollmentId = initialEnrollment ? 'enrollment-1' : null;
+    let enrollmentProfileId = initialEnrollmentProfileId;
+    let nextSegmentIndex = 1;
+    let lastCompletedEnrollmentId = null;
     let statusRequestCount = 0;
     let timerId = 0;
+    let nowMs = 1000;
+    let enrollmentExpiresAtMs = enrollmentId
+        ? nowMs + initialRemainingSeconds * 1000
+        : null;
+    const intervals = new Map();
     let audioContext = null;
 
-    const statusPayload = () => ({
+    const statusPayload = () => {
+        if (enrollmentId && enrollmentExpiresAtMs !== null && nowMs >= enrollmentExpiresAtMs) {
+            enrollmentId = null;
+            enrollmentProfileId = null;
+            nextSegmentIndex = 1;
+        }
+        return ({
         requested_enabled: serverRequested,
         effective_enabled: serverProfile && serverRequested,
         effective_reason: serverProfile
@@ -165,11 +203,22 @@ function createHarness({
             : (enrollmentId ? 'enrollment_active' : (initialEffectiveReason || 'no_profile')),
         has_profile: serverProfile,
         enrollment: enrollmentId
-            ? { enrollment_id: enrollmentId, expires_at: 123.5 }
+            ? {
+                enrollment_id: enrollmentId,
+                profile_id: enrollmentProfileId,
+                expires_at: 123.5,
+                remaining_seconds: Math.max(0, (enrollmentExpiresAtMs - nowMs) / 1000),
+                accepted_segments: nextSegmentIndex - 1,
+                required_segments: 4,
+                next_segment_index: nextSegmentIndex,
+                phase: nextSegmentIndex < 4 ? 'collecting_reference' : 'verifying',
+            }
             : null,
         profile_generation: serverProfileGeneration,
+        last_completed_enrollment_id: lastCompletedEnrollmentId,
         runtime_mode: 'enforce',
-    });
+        });
+    };
 
     async function defaultRoute(call) {
         if (call.url === '/api/config/page_config') {
@@ -189,18 +238,34 @@ function createHarness({
                 );
             }
             enrollmentId = 'enrollment-1';
+            enrollmentProfileId = null;
+            nextSegmentIndex = 1;
+            enrollmentExpiresAtMs = nowMs + initialRemainingSeconds * 1000;
+            if (startTransportErrorAfterCreate) throw new Error('start_response_lost');
             return jsonResponse(statusPayload());
         }
-        if (call.url === `${API_ROOT}/enrollment/profile`) {
-            enrollmentId = null;
-            if (profileError) {
+        if (call.url === `${API_ROOT}/enrollment/segment`) {
+            const submittedIndex = Number(call.options.headers.get('x-voice-identity-segment'));
+            if (profileError && submittedIndex === profileErrorSegment) {
+                if (profileError === 'voice_samples_inconsistent') nextSegmentIndex = 1;
                 return jsonResponse(
                     { error_code: profileError },
                     { ok: false, status: 422 },
                 );
             }
+            assert.equal(submittedIndex, nextSegmentIndex);
+            enrollmentProfileId = call.options.headers.get(PROFILE_HEADER);
+            if (submittedIndex < 4) {
+                nextSegmentIndex += 1;
+                if (submittedIndex === segmentTransportErrorAfterAccept) {
+                    throw new Error('segment_response_lost');
+                }
+                return jsonResponse(statusPayload());
+            }
+            lastCompletedEnrollmentId = enrollmentId;
+            enrollmentId = null;
             serverProfile = true;
-            serverProfileGeneration = call.options.headers.get(PROFILE_HEADER);
+            serverProfileGeneration = enrollmentProfileId;
             serverRequested = initialProfile ? serverRequested : true;
             if (profileTransportErrorAfterCommit) {
                 throw new Error('profile_response_lost');
@@ -209,6 +274,8 @@ function createHarness({
         }
         if (call.url === `${API_ROOT}/enrollment/cancel`) {
             enrollmentId = null;
+            enrollmentProfileId = null;
+            nextSegmentIndex = 1;
             return jsonResponse(statusPayload());
         }
         if (call.url === `${API_ROOT}/filter`) {
@@ -229,6 +296,9 @@ function createHarness({
         activeElement: null,
         getElementById(id) {
             return elements.get(id);
+        },
+        querySelectorAll(selector) {
+            return selector === '[data-voice-segment]' ? stepElements : [];
         },
         addEventListener(type, listener) {
             documentListeners.set(type, listener);
@@ -304,6 +374,11 @@ function createHarness({
                 'voiceIdentity.errorModelUnavailable': 'Voice model unavailable; prepare assets or repair the installation.',
                 'voiceIdentity.errorInvalidPcm': 'Invalid recording format.',
                 'voiceIdentity.errorAudioTooLong': 'Recording is too long.',
+                'voiceIdentity.errorSpeechTooShort': 'Not enough speech.',
+                'voiceIdentity.errorVoiceSamplesInconsistent': 'Recordings differ too much.',
+                'voiceIdentity.errorOwnerVerificationFailed': 'Verification failed.',
+                'voiceIdentity.errorSegmentInProgress': 'Still checking.',
+                'voiceIdentity.errorStaleEnrollment': 'Enrollment expired.',
                 'voiceIdentity.deleteConfirm': 'Delete the profile?',
                 'voiceIdentity.delete': 'Delete voice profile',
             };
@@ -315,11 +390,14 @@ function createHarness({
         dispatchEvent(event) {
             return windowListeners.get(event.type)?.(event);
         },
-        setInterval() {
+        setInterval(callback) {
             timerId += 1;
+            intervals.set(timerId, callback);
             return timerId;
         },
-        clearInterval() {},
+        clearInterval(id) {
+            intervals.delete(id);
+        },
         setTimeout(callback, delay) {
             timerId += 1;
             if (delay === CAPTURE_TIMEOUT_MS) {
@@ -377,7 +455,7 @@ function createHarness({
         },
         Headers: MockHeaders,
         AudioWorkletNode: MockAudioWorkletNode,
-        performance: { now: () => 1000 },
+        performance: { now: () => nowMs },
         console: { log() {}, warn() {}, error() {} },
         Uint8Array,
         Int16Array,
@@ -407,6 +485,13 @@ function createHarness({
         },
         get mediaRequests() {
             return mediaRequests;
+        },
+        get intervalCount() {
+            return intervals.size;
+        },
+        advanceTime(milliseconds) {
+            nowMs += milliseconds;
+            for (const callback of Array.from(intervals.values())) callback();
         },
         async initialize() {
             await documentListeners.get('DOMContentLoaded')();
@@ -453,7 +538,7 @@ test('mutation controls stay disabled until CSRF and canonical status resolve', 
     assert.equal(harness.elements.get('voice-identity-start').disabled, false);
 });
 
-test('one click requests permission, records four seconds, and PUTs exact PCM16', async () => {
+test('one click requests permission once and PUTs four independent three-second segments', async () => {
     const harness = createHarness();
     await harness.initialize();
 
@@ -464,14 +549,21 @@ test('one click requests permission, records four seconds, and PUTs exact PCM16'
         '/api/config/page_config',
         `${API_ROOT}/status`,
         `${API_ROOT}/enrollment/start`,
-        `${API_ROOT}/enrollment/profile`,
+        `${API_ROOT}/enrollment/segment`,
+        `${API_ROOT}/enrollment/segment`,
+        `${API_ROOT}/enrollment/segment`,
+        `${API_ROOT}/enrollment/segment`,
     ]);
-    const upload = harness.fetchCalls.at(-1);
-    assert.equal(upload.options.method, 'PUT');
-    assert.equal(upload.options.body.byteLength, TARGET_SAMPLES * 2);
-    assert.equal(upload.options.headers.get('content-type'), PCM_CONTENT_TYPE);
-    assert.equal(upload.options.headers.get('x-voice-identity-enrollment'), 'enrollment-1');
-    assert.equal(upload.options.headers.get('x-voice-identity-profile'), 'profile-1');
+    const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.equal(uploads.length, 4);
+    for (const [offset, upload] of uploads.entries()) {
+        assert.equal(upload.options.method, 'PUT');
+        assert.equal(upload.options.body.byteLength, TARGET_SAMPLES * 2);
+        assert.equal(upload.options.headers.get('content-type'), PCM_CONTENT_TYPE);
+        assert.equal(upload.options.headers.get('x-voice-identity-enrollment'), 'enrollment-1');
+        assert.equal(upload.options.headers.get('x-voice-identity-profile'), 'profile-1');
+        assert.equal(upload.options.headers.get('x-voice-identity-segment'), String(offset + 1));
+    }
     assert.equal(harness.mediaRequests, 1);
     assert.deepEqual(harness.workletModules, ['/static/audio-processor.js']);
     assert.equal(harness.mediaStreams[0].track.stopped, true);
@@ -479,14 +571,32 @@ test('one click requests permission, records four seconds, and PUTs exact PCM16'
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
 });
 
-test('underfilled capture cancels the lease and never uploads partial PCM', async () => {
-    const harness = createHarness({ audioChunks: 100 });
+test('lost start response adopts the active server session and keeps one microphone lease', async () => {
+    const harness = createHarness({ startTransportErrorAfterCreate: true });
     await harness.initialize();
 
     await harness.emit('voice-identity-start');
 
     assert.equal(
-        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/profile`),
+        harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/start`).length,
+        1,
+    );
+    assert.equal(
+        harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
+        4,
+    );
+    assert.equal(harness.mediaRequests, 1);
+    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment complete.');
+});
+
+test('underfilled capture cancels the lease and never uploads partial PCM', async () => {
+    const harness = createHarness({ audioChunks: 50 });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
         false,
     );
     assert.equal(
@@ -496,18 +606,108 @@ test('underfilled capture cancels the lease and never uploads partial PCM', asyn
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Request failed.');
 });
 
-test('server rejection for insufficient usable speech stays fail-safe and visible', async () => {
+test('recoverable speech rejection keeps the session and microphone for current-segment retry', async () => {
     const harness = createHarness({ profileError: 'speech_too_short' });
     await harness.initialize();
 
     await harness.emit('voice-identity-start');
 
     assert.equal(
-        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/profile`),
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
         true,
     );
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, true);
-    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Request failed.');
+    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Not enough speech.');
+    assert.equal(harness.mediaStreams[0].track.stopped, false);
+    assert.equal(harness.elements.get('voice-identity-start').hidden, false);
+});
+
+test('server consistency reset returns the client to segment one without reopening the microphone', async () => {
+    const harness = createHarness({
+        profileError: 'voice_samples_inconsistent',
+        profileErrorSegment: 3,
+    });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.deepEqual(
+        uploads.map(call => call.options.headers.get('x-voice-identity-segment')),
+        ['1', '2', '3'],
+    );
+    assert.equal(harness.elements.get('voice-identity-progress-label').textContent, '第 1/4 段');
+    assert.equal(harness.mediaRequests, 1);
+    assert.equal(harness.mediaStreams[0].track.stopped, false);
+});
+
+test('lost non-final response adopts server progress without resubmitting accepted audio', async () => {
+    const harness = createHarness({ segmentTransportErrorAfterAccept: 2 });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.deepEqual(
+        uploads.map(call => call.options.headers.get('x-voice-identity-segment')),
+        ['1', '2'],
+    );
+    assert.equal(harness.elements.get('voice-identity-progress-label').textContent, '第 3/4 段');
+    assert.equal(harness.mediaStreams[0].track.stopped, false);
+});
+
+test('active status reuses the server-bound opaque profile id after reload', async () => {
+    const harness = createHarness({
+        initialEnrollment: true,
+        initialEnrollmentProfileId: 'bound-profile',
+    });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/start`),
+        false,
+    );
+    assert.equal(uploads.length, 4);
+    assert.equal(
+        uploads.every(call => call.options.headers.get('x-voice-identity-profile') === 'bound-profile'),
+        true,
+    );
+});
+
+test('active unbound status generates one opaque profile id before the first segment', async () => {
+    const harness = createHarness({ initialEnrollment: true });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.equal(uploads.length, 4);
+    assert.equal(
+        uploads.every(call => call.options.headers.get('x-voice-identity-profile') === 'profile-1'),
+        true,
+    );
+});
+
+test('TTL expiry while awaiting a retry stops media resources and clears its interval', async () => {
+    const harness = createHarness({
+        profileError: 'speech_too_short',
+        initialRemainingSeconds: 1,
+    });
+    await harness.initialize();
+    await harness.emit('voice-identity-start');
+
+    assert.equal(harness.mediaStreams[0].track.stopped, false);
+    assert.equal(harness.intervalCount, 1);
+    harness.advanceTime(1500);
+    await flush();
+
+    assert.equal(harness.mediaStreams[0].track.stopped, true);
+    assert.equal(harness.getAudioContext().state, 'closed');
+    assert.equal(harness.intervalCount, 0);
+    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment expired.');
 });
 
 test('canonical enrollment audio errors show localized messages', async () => {
@@ -528,19 +728,19 @@ test('canonical enrollment audio errors show localized messages', async () => {
     );
 });
 
-test('missing Web Crypto cancels enrollment without attempting an upload', async () => {
+test('missing Web Crypto fails before creating a server enrollment or uploading', async () => {
     const harness = createHarness({ webCryptoAvailable: false });
     await harness.initialize();
 
     await harness.emit('voice-identity-start');
 
     assert.equal(
-        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/profile`),
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
         false,
     );
     assert.equal(
-        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/cancel`),
-        true,
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/start`),
+        false,
     );
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Request failed.');
 });
@@ -570,7 +770,7 @@ test('canonical has_profile reveals only switch, re-enroll, and delete controls'
     assert.equal(harness.elements.get('voice-identity-profile-status').textContent,
         'Owner voice profile is saved and enabled');
     assert.equal(template.includes('voice-identity-record'), false);
-    assert.equal(template.includes('step-progress'), false);
+    assert.equal(template.includes('step-progress'), true);
 });
 
 test('backend degradation reason is preserved when no profile exists', async () => {
@@ -633,7 +833,7 @@ test('late model rejection shows its dedicated enrollment error', async () => {
         'Voice model unavailable; prepare assets or repair the installation.',
     );
     assert.equal(
-        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/profile`),
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
         false,
     );
 });
@@ -785,15 +985,14 @@ test('the one-click page keeps complete dark-theme overrides', () => {
     assert.match(template, /static\/css\/dark-mode\.css/);
 });
 
-test('old five-step endpoints and DOM contracts do not return', () => {
+test('retired bypass endpoints and prompt contracts do not return', () => {
     for (const retired of [
-        '/enrollment/segment',
+        '/enrollment/profile',
         '/enrollment/verify',
         '/enrollment/commit',
         'ready_to_commit',
         'fixedPrompts',
         'voice-identity-record',
-        'step-progress',
     ]) {
         assert.equal(source.includes(retired) || template.includes(retired), false, retired);
     }

@@ -17,9 +17,11 @@ from main_logic.voice_identity_service.preference_store import (
     VoiceIdentityPreferenceStore,
     VoiceIdentityPreferenceStoreError,
 )
+from main_logic.voice_identity_service.enrollment import EnrollmentSpeechResult
 from main_logic.voice_identity_service.profile_store import (
     SecureStorageUnavailableError,
     VoiceIdentityProfileCorruptError,
+    VoiceIdentityProfileIncompatibleError,
     VoiceIdentityProfileStore,
     VoiceIdentityProfileStoreError,
 )
@@ -36,9 +38,16 @@ class _Model:
     model_id = "3d-speaker-campplus-zh-en"
     model_revision = "2025-06-16-sherpa-onnx-campplus"
 
-    def __init__(self, *, loads: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        loads: bool = True,
+        embeddings: list[np.ndarray] | None = None,
+    ) -> None:
         self.loads = loads
         self.closed = False
+        self.embeddings = list(embeddings or [])
+        self.inference_count = 0
 
     def load(self) -> bool:
         return self.loads
@@ -54,6 +63,9 @@ class _Model:
     ) -> np.ndarray:
         assert pcm16
         assert sample_rate_hz == 16_000
+        self.inference_count += 1
+        if self.embeddings:
+            return self.embeddings.pop(0)
         result = np.zeros(CAMPPLUS_EMBEDDING_DIM, dtype=np.float32)
         result[0] = 1.0
         return result
@@ -65,8 +77,30 @@ class _Model:
         self.closed = True
 
 
+class _SpeechValidator:
+    def __init__(self, *, loads: bool = True) -> None:
+        self.loads = loads
+        self.closed = False
+
+    async def load(self) -> bool:
+        return self.loads
+
+    async def validate_pcm16(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int = 16_000,
+    ) -> EnrollmentSpeechResult:
+        assert pcm16
+        assert sample_rate_hz == 16_000
+        return EnrollmentSpeechResult(window_count=96, active_window_count=96)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _pcm() -> bytes:
-    samples = np.full(24_000, 4_000, dtype="<i2")
+    samples = np.full(48_000, 4_000, dtype="<i2")
     return samples.tobytes()
 
 
@@ -88,6 +122,7 @@ def _service(
     enrollment_ttl_seconds: float = 30.0,
     model_timeout_seconds: float = 1.0,
     runtime_mode: str = "enforce",
+    speech_validator: _SpeechValidator | None = None,
 ) -> tuple[
     VoiceIdentityService,
     _Model,
@@ -95,6 +130,7 @@ def _service(
     list[str],
 ]:
     selected_model = model or _Model()
+    selected_validator = speech_validator or _SpeechValidator()
     activations: list[tuple[SpeakerProfile | None, str]] = []
     results = activation_results or []
     runtime_results = runtime_status_results or []
@@ -139,8 +175,700 @@ def _service(
         model_timeout_seconds=model_timeout_seconds,
         activation_timeout_seconds=1.0,
         runtime_status_callback=(runtime_status if runtime_status_results else None),
+        speech_validator_factory=lambda: selected_validator,
     )
+
+    async def complete_enrollment(
+        enrollment_id: str,
+        profile_id: str,
+        pcm16: bytes,
+    ):
+        status = service.status()
+        for segment_index in range(1, 5):
+            status = await service.submit_enrollment_segment(
+                enrollment_id,
+                profile_id,
+                segment_index,
+                pcm16,
+            )
+        return status
+
+    # Keep the legacy tests focused on transaction semantics while the production
+    # service exposes only the four-segment API.
+    service.complete_enrollment = complete_enrollment  # type: ignore[attr-defined]
     return service, selected_model, activations, suppression_events
+
+
+def _embedding(axis: int = 0) -> np.ndarray:
+    result = np.zeros(CAMPPLUS_EMBEDDING_DIM, dtype=np.float32)
+    result[axis] = 1.0
+    return result
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_segment_progress_is_server_owned_idempotent_and_profile_bound(
+    tmp_path: Path,
+) -> None:
+    service, model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    assert enrollment.profile_id is None
+    assert enrollment.next_segment_index == 1
+    assert enrollment.required_segments == 4
+
+    with pytest.raises(VoiceIdentityServiceError, match="segment_out_of_order"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            2,
+            _pcm(),
+        )
+
+    first = await service.submit_enrollment_segment(
+        enrollment.enrollment_id,
+        "profile-a",
+        1,
+        _pcm(),
+    )
+    assert first.enrollment is not None
+    assert first.enrollment.profile_id == "profile-a"
+    assert first.enrollment.accepted_segments == 1
+    assert first.enrollment.next_segment_index == 2
+    assert model.inference_count == 1
+
+    retry = await service.submit_enrollment_segment(
+        enrollment.enrollment_id,
+        "profile-a",
+        1,
+        _pcm(),
+    )
+    assert retry.enrollment == first.enrollment
+    assert model.inference_count == 1
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-b",
+            1,
+            _pcm(),
+        )
+    await service.cancel_enrollment(enrollment.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reference_inconsistency_wipes_all_inputs_and_resets_round(
+    tmp_path: Path,
+) -> None:
+    embeddings = [_embedding(), _embedding(), _embedding(1)]
+    model = _Model(embeddings=embeddings)
+    service, _selected, _activations, _events = _service(tmp_path, model=model)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    for segment_index in (1, 2):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _pcm(),
+        )
+    with pytest.raises(VoiceIdentityServiceError, match="voice_samples_inconsistent"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            3,
+            _pcm(),
+        )
+
+    current = service.status().enrollment
+    assert current is not None
+    assert current.profile_id == "profile-a"
+    assert current.next_segment_index == 1
+    assert current.accepted_segments == 0
+    assert all(np.count_nonzero(item) == 0 for item in embeddings)
+    await service.cancel_enrollment(enrollment.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_holdout_first_failure_retries_fourth_second_resets_all(
+    tmp_path: Path,
+) -> None:
+    embeddings = [
+        _embedding(),
+        _embedding(),
+        _embedding(),
+        _embedding(1),
+        _embedding(),
+        _embedding(1),
+        _embedding(),
+    ]
+    model = _Model(embeddings=embeddings)
+    service, _selected, _activations, _events = _service(tmp_path, model=model)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    for segment_index in (1, 2, 3):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _pcm(),
+        )
+    session = service._enrollment  # type: ignore[attr-defined]
+    assert session is not None
+    centroid = session.reference_centroid
+    assert centroid is not None
+
+    for expected_next in (4, 1):
+        with pytest.raises(
+            VoiceIdentityServiceError,
+            match="owner_verification_failed",
+        ):
+            await service.submit_enrollment_segment(
+                enrollment.enrollment_id,
+                "profile-a",
+                4,
+                _pcm(),
+            )
+        current = service.status().enrollment
+        assert current is not None
+        assert current.next_segment_index == expected_next
+    assert np.count_nonzero(centroid) == 0
+    assert all(np.count_nonzero(item) == 0 for item in embeddings)
+    await service.cancel_enrollment(enrollment.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_same_segment_in_flight_is_bounded_and_not_duplicated(
+    tmp_path: Path,
+) -> None:
+    class BlockingValidator(_SpeechValidator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def validate_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int = 16_000,
+        ) -> EnrollmentSpeechResult:
+            self.started.set()
+            await self.release.wait()
+            return await super().validate_pcm16(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+
+    validator = BlockingValidator()
+    service, model, _activations, _events = _service(
+        tmp_path,
+        speech_validator=validator,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    first = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    await asyncio.wait_for(validator.started.wait(), 1.0)
+    with pytest.raises(VoiceIdentityServiceError, match="segment_in_progress"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    validator.release.set()
+    result = await first
+    assert result.enrollment is not None
+    assert result.enrollment.next_segment_index == 2
+    assert model.inference_count == 1
+    await service.cancel_enrollment(enrollment.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancel_during_speech_validation_invalidates_old_operation(
+    tmp_path: Path,
+) -> None:
+    class BlockingValidator(_SpeechValidator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def validate_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int = 16_000,
+        ) -> EnrollmentSpeechResult:
+            self.started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    validator = BlockingValidator()
+    service, model, _activations, events = _service(
+        tmp_path,
+        speech_validator=validator,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submission = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    await asyncio.wait_for(validator.started.wait(), 1.0)
+    assert await service.cancel_enrollment(enrollment.enrollment_id)
+    await asyncio.wait_for(validator.cancelled.wait(), 1.0)
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await submission
+    assert service.status().enrollment is None
+    assert model.inference_count == 0
+    assert model.closed and validator.closed
+    assert events[-1] == "restore:voice_identity_enrollment"
+    replacement = await service.start_enrollment()
+    assert replacement.enrollment_id != enrollment.enrollment_id
+    await service.cancel_enrollment(replacement.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_late_inference_is_wiped_and_cannot_commit_after_cancel(
+    tmp_path: Path,
+) -> None:
+    class LateModel(_Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.result = _embedding()
+
+        def embedding_from_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+        ) -> np.ndarray:
+            self.started.set()
+            assert self.release.wait(2.0)
+            return self.result
+
+        def cancel_inference(self) -> None:
+            return
+
+    model = LateModel()
+    service, _selected, _activations, _events = _service(
+        tmp_path,
+        model=model,
+        model_timeout_seconds=1.0,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submission = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    assert await asyncio.to_thread(model.started.wait, 1.0)
+    service._model_timeout_seconds = 0.05  # type: ignore[attr-defined]
+    assert await service.cancel_enrollment(enrollment.enrollment_id)
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.start_enrollment()
+    model.release.set()
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await submission
+    await _wait_until(
+        lambda: service._model_inference_cleanup_task is None,  # type: ignore[attr-defined]
+    )
+    assert np.count_nonzero(model.result) == 0
+    assert service.status().profile_generation is None
+    replacement = await service.start_enrollment()
+    await service.cancel_enrollment(replacement.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_invalid_embedding_is_terminal_and_wiped(tmp_path: Path) -> None:
+    invalid = _embedding()
+    invalid[3] = np.nan
+    model = _Model(embeddings=[invalid])
+    service, _selected, _activations, events = _service(tmp_path, model=model)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    assert service.status().enrollment is None
+    assert np.count_nonzero(invalid) == 0
+    assert model.closed
+    assert events[-1] == "restore:voice_identity_enrollment"
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validator_load_timeout_retains_owned_cleanup(tmp_path: Path) -> None:
+    class SlowLoadValidator(_SpeechValidator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def load(self) -> bool:
+            self.started.set()
+            await self.release.wait()
+            return True
+
+    validator = SlowLoadValidator()
+    service, model, _activations, events = _service(
+        tmp_path,
+        speech_validator=validator,
+        model_timeout_seconds=0.05,
+    )
+    await service.initialize()
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.start_enrollment()
+    await asyncio.wait_for(validator.started.wait(), 1.0)
+    assert events == []
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.start_enrollment()
+    validator.release.set()
+    await _wait_until(
+        lambda: service._speech_validator_load_cleanup_task is None,  # type: ignore[attr-defined]
+    )
+    assert validator.closed and model.closed
+    retry = await service.start_enrollment()
+    await service.cancel_enrollment(retry.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_for_cas_wipes_computed_embedding(
+    tmp_path: Path,
+) -> None:
+    class BlockingValidator(_SpeechValidator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def validate_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int = 16_000,
+        ) -> EnrollmentSpeechResult:
+            self.started.set()
+            await self.release.wait()
+            return await super().validate_pcm16(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+
+    computed_embedding = _embedding()
+    model = _Model(embeddings=[computed_embedding])
+    validator = BlockingValidator()
+    service, _selected, _activations, _events = _service(
+        tmp_path,
+        model=model,
+        speech_validator=validator,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submission = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    await asyncio.wait_for(validator.started.wait(), 1.0)
+    await service._operation_lock.acquire()  # type: ignore[attr-defined]
+    validator.release.set()
+    await _wait_until(lambda: model.inference_count == 1)
+    submission.cancel()
+    await asyncio.sleep(0)
+    service._operation_lock.release()  # type: ignore[attr-defined]
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert np.count_nonzero(computed_embedding) == 0
+    assert service.status().enrollment is None
+    assert model.closed and validator.closed
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reference_and_holdout_inference_use_exact_checkpoint_lengths(
+    tmp_path: Path,
+) -> None:
+    class LengthRecordingModel(_Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pcm_lengths: list[int] = []
+
+        def embedding_from_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+        ) -> np.ndarray:
+            self.pcm_lengths.append(len(pcm16))
+            return super().embedding_from_pcm16(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+
+    model = LengthRecordingModel()
+    service, _selected, _activations, _events = _service(tmp_path, model=model)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    for segment_index in range(1, 5):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _pcm(),
+        )
+    assert model.pcm_lengths == [96_000, 96_000, 96_000, 48_000, 96_000]
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_expiry_during_validation_retires_operation_before_late_result(
+    tmp_path: Path,
+) -> None:
+    class BlockingValidator(_SpeechValidator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def validate_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int = 16_000,
+        ) -> EnrollmentSpeechResult:
+            self.started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+    validator = BlockingValidator()
+    service, model, _activations, events = _service(
+        tmp_path,
+        speech_validator=validator,
+        enrollment_ttl_seconds=0.03,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submission = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    await asyncio.wait_for(validator.started.wait(), 1.0)
+    await _wait_until(lambda: service.status().enrollment is None)
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await submission
+    assert model.inference_count == 0
+    assert model.closed and validator.closed
+    assert events[-1] == "restore:voice_identity_enrollment"
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_commit_linearizes_before_concurrent_profile_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    for segment_index in (1, 2, 3):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _pcm(),
+        )
+
+    profile_store = service._profile_store  # type: ignore[attr-defined]
+    original_stage = profile_store.stage
+    stage_started = threading.Event()
+    stage_release = threading.Event()
+
+    def blocking_stage(profile: SpeakerProfile):
+        stage_started.set()
+        assert stage_release.wait(1.0)
+        return original_stage(profile)
+
+    monkeypatch.setattr(profile_store, "stage", blocking_stage)
+    completion = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            4,
+            _pcm(),
+        )
+    )
+    assert await asyncio.to_thread(stage_started.wait, 1.0)
+    deletion = asyncio.create_task(service.delete_profile())
+    await asyncio.sleep(0)
+    assert not deletion.done()
+    stage_release.set()
+
+    committed = await completion
+    deleted = await deletion
+    assert committed.profile_generation == "profile-a"
+    assert deleted.profile_generation is None
+    assert not deleted.state.has_profile
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_late_validation_cannot_start_inference_after_session_cancel(
+    tmp_path: Path,
+) -> None:
+    class LateValidator(_SpeechValidator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancel_seen = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def validate_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int = 16_000,
+        ) -> EnrollmentSpeechResult:
+            self.started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                await self.release.wait()
+                return EnrollmentSpeechResult(window_count=96, active_window_count=96)
+
+    validator = LateValidator()
+    service, model, _activations, _events = _service(
+        tmp_path,
+        speech_validator=validator,
+        model_timeout_seconds=1.0,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submission = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    await asyncio.wait_for(validator.started.wait(), 1.0)
+    service._model_timeout_seconds = 0.05  # type: ignore[attr-defined]
+    assert await service.cancel_enrollment(enrollment.enrollment_id)
+    await asyncio.wait_for(validator.cancel_seen.wait(), 1.0)
+    assert model.closed
+    validator.release.set()
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await submission
+    assert model.inference_count == 0
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancel_after_first_holdout_never_starts_second_holdout(
+    tmp_path: Path,
+) -> None:
+    class FourthCallBlockingModel(_Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.holdout_started = threading.Event()
+            self.holdout_release = threading.Event()
+
+        def embedding_from_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+        ) -> np.ndarray:
+            if self.inference_count == 3:
+                self.holdout_started.set()
+                assert self.holdout_release.wait(1.0)
+            return super().embedding_from_pcm16(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+
+        def cancel_inference(self) -> None:
+            self.holdout_release.set()
+
+    model = FourthCallBlockingModel()
+    service, _selected, _activations, _events = _service(tmp_path, model=model)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    for segment_index in (1, 2, 3):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _pcm(),
+        )
+    fourth = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            4,
+            _pcm(),
+        )
+    )
+    assert await asyncio.to_thread(model.holdout_started.wait, 1.0)
+    assert await service.cancel_enrollment(enrollment.enrollment_id)
+    with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+        await fourth
+    assert model.inference_count == 4
+    assert service.status().profile_generation is None
+    await service.close()
 
 
 @pytest.mark.unit
@@ -597,7 +1325,9 @@ async def test_status_stays_valid_while_profile_delete_detaches(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_invalid_pcm_ends_session_and_restores_input(tmp_path: Path) -> None:
+async def test_invalid_pcm_preserves_session_for_current_segment_retry(
+    tmp_path: Path,
+) -> None:
     service, model, _activations, events = _service(tmp_path)
     await service.initialize()
     enrollment = await service.start_enrollment()
@@ -609,8 +1339,14 @@ async def test_invalid_pcm_ends_session_and_restores_input(tmp_path: Path) -> No
             b"\x00\x00",
         )
 
-    assert service.status().enrollment is None
-    assert service.status().state.effective_reason == "disabled"
+    status = service.status().enrollment
+    assert status is not None
+    assert status.profile_id is None
+    assert status.next_segment_index == 1
+    assert service.status().state.effective_reason == "enrollment_active"
+    assert not model.closed
+    assert events == ["suppress:voice_identity_enrollment"]
+    assert await service.cancel_enrollment(enrollment.enrollment_id)
     assert model.closed
     assert events[-1] == "restore:voice_identity_enrollment"
     await service.close()
@@ -1086,6 +1822,7 @@ async def test_public_guards_and_status_shape(tmp_path: Path) -> None:
         "enrollment": None,
         "profile_generation": None,
         "runtime_mode": "enforce",
+        "last_completed_enrollment_id": None,
     }
     enrollment = await service.start_enrollment()
     duplicate = await service.start_enrollment()
@@ -1159,8 +1896,12 @@ async def test_cancelled_profile_commit_keeps_memory_and_disk_on_new_generation(
             "secure_storage_unavailable",
         ),
         (
-            VoiceIdentityProfileCorruptError("corrupt"),
+            VoiceIdentityProfileIncompatibleError("incompatible"),
             "profile_incompatible",
+        ),
+        (
+            VoiceIdentityProfileCorruptError("corrupt"),
+            "runtime_degraded",
         ),
     ],
 )

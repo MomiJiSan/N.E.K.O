@@ -14,6 +14,7 @@ from main_logic.voice_identity.reference import SpeakerReference
 from main_logic.voice_identity_service.profile_store import (
     SecureStorageUnavailableError,
     VoiceIdentityProfileCorruptError,
+    VoiceIdentityProfileIncompatibleError,
     VoiceIdentityProfileStore,
     VoiceIdentityProfileStoreError,
     WindowsDpapiKeyProtector,
@@ -94,7 +95,7 @@ def test_store_round_trip_contains_no_plain_profile(tmp_path: Path) -> None:
         assert plain_bytes not in stored
         assert plain_base64 not in stored
         envelope = json.loads(stored)
-        assert envelope["schema_version"] == 1
+        assert envelope["schema_version"] == 2
         assert envelope["algorithm"] == "AES-256-GCM"
         assert envelope["key_wrapping"] == "DPAPI-CURRENT-USER"
 
@@ -234,6 +235,33 @@ def test_wrapped_key_unprotect_failure_is_reported_as_corrupt_profile(
 
     with pytest.raises(VoiceIdentityProfileCorruptError):
         store.load()
+
+
+@pytest.mark.unit
+def test_v1_profile_is_explicitly_incompatible_and_not_migrated(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice_identity.profile"
+    store = VoiceIdentityProfileStore(path, key_protector=_TestKeyProtector())
+    profile = _profile()
+    try:
+        store.save(profile)
+    finally:
+        profile.close()
+    envelope = json.loads(path.read_text(encoding="ascii"))
+    envelope["schema_version"] = 1
+    path.write_text(json.dumps(envelope), encoding="ascii")
+
+    with pytest.raises(VoiceIdentityProfileIncompatibleError):
+        store.load()
+
+    assert json.loads(path.read_text(encoding="ascii"))["schema_version"] == 1
+
+
+@pytest.mark.unit
+def test_v2_uses_versioned_authenticated_data() -> None:
+    assert store_module._SCHEMA_VERSION == 2
+    assert store_module._AAD == b"N.E.K.O.voice-identity.profile\x00v2"
 
 
 @pytest.mark.unit

@@ -27,10 +27,10 @@ except ImportError:  # pragma: no cover - exercised through the platform guard
 
 
 _IS_WINDOWS: Final = os.name == "nt"
-_SCHEMA_VERSION: Final = 1
+_SCHEMA_VERSION: Final = 2
 _ALGORITHM: Final = "AES-256-GCM"
 _KEY_WRAPPING: Final = "DPAPI-CURRENT-USER"
-_AAD: Final = b"N.E.K.O.voice-identity.profile\x00v1"
+_AAD: Final = b"N.E.K.O.voice-identity.profile\x00v2"
 _NONCE_BYTES: Final = 12
 _KEY_BYTES: Final = 32
 _DPAPI_UI_FORBIDDEN: Final = 0x1
@@ -47,6 +47,10 @@ class SecureStorageUnavailableError(VoiceIdentityProfileStoreError):
 
 class VoiceIdentityProfileCorruptError(VoiceIdentityProfileStoreError):
     """Raised when an existing encrypted profile cannot be trusted."""
+
+
+class VoiceIdentityProfileIncompatibleError(VoiceIdentityProfileCorruptError):
+    """Raised when a trusted envelope uses an unsupported profile schema."""
 
 
 class _KeyProtector(Protocol):
@@ -334,7 +338,9 @@ class VoiceIdentityProfileStore:
             }:
                 raise ValueError("invalid envelope")
             if envelope["schema_version"] != _SCHEMA_VERSION:
-                raise ValueError("unsupported schema")
+                raise VoiceIdentityProfileIncompatibleError(
+                    "voice identity profile schema is incompatible"
+                )
             if envelope["algorithm"] != _ALGORITHM:
                 raise ValueError("unsupported algorithm")
             if envelope["key_wrapping"] != _KEY_WRAPPING:

@@ -32,6 +32,7 @@ SAFE_STATUS = {
     "has_profile": True,
     "enrollment": None,
     "profile_generation": "profile-a",
+    "last_completed_enrollment_id": None,
     "runtime_mode": "enforce",
 }
 
@@ -49,7 +50,7 @@ def _fake_service(payload: dict[str, object] | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         status=MagicMock(return_value=status),
         start_enrollment=AsyncMock(),
-        complete_enrollment=AsyncMock(return_value=status),
+        submit_enrollment_segment=AsyncMock(return_value=status),
         cancel_enrollment=AsyncMock(return_value=True),
         set_filter=AsyncMock(return_value=status),
         delete_profile=AsyncMock(return_value=status),
@@ -168,8 +169,14 @@ def test_mutations_require_matching_csrf_and_local_origin(
         ("post", "/enrollment/start", {}),
         (
             "put",
-            "/enrollment/profile",
-            {"content": b"", "headers": {"Content-Type": PCM_CONTENT_TYPE}},
+            "/enrollment/segment",
+            {
+                "content": b"",
+                "headers": {
+                    "Content-Type": PCM_CONTENT_TYPE,
+                    "X-Voice-Identity-Segment": "1",
+                },
+            },
         ),
         ("post", "/enrollment/cancel", {}),
         ("put", "/filter", {"json": {"enabled": True}}),
@@ -190,7 +197,7 @@ def test_every_mutation_route_is_csrf_guarded(
     assert response.status_code == 403
     assert response.json()["error_code"] == "csrf_validation_failed"
     service.start_enrollment.assert_not_awaited()
-    service.complete_enrollment.assert_not_awaited()
+    service.submit_enrollment_segment.assert_not_awaited()
     service.cancel_enrollment.assert_not_awaited()
     service.set_filter.assert_not_awaited()
     service.delete_profile.assert_not_awaited()
@@ -224,7 +231,7 @@ def test_start_returns_canonical_status_without_private_model_data(
 
 
 @pytest.mark.unit
-def test_binary_profile_upload_forwards_exact_headers_and_body_idempotently(
+def test_binary_segment_upload_forwards_exact_headers_index_and_body_idempotently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _fake_service()
@@ -234,28 +241,75 @@ def test_binary_profile_upload_forwards_exact_headers_and_body_idempotently(
         "Content-Type": PCM_CONTENT_TYPE,
         "X-Voice-Identity-Enrollment": "enrollment-1",
         "X-Voice-Identity-Profile": "profile-1",
+        "X-Voice-Identity-Segment": "3",
     }
 
-    first = client.put(f"{API_ROOT}/enrollment/profile", content=pcm16, headers=headers)
+    first = client.put(f"{API_ROOT}/enrollment/segment", content=pcm16, headers=headers)
     second = client.put(
-        f"{API_ROOT}/enrollment/profile", content=pcm16, headers=headers
+        f"{API_ROOT}/enrollment/segment", content=pcm16, headers=headers
     )
 
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json() == second.json() == SAFE_STATUS
-    assert service.complete_enrollment.await_count == 2
-    assert service.complete_enrollment.await_args_list[0].args == (
+    assert service.submit_enrollment_segment.await_count == 2
+    assert service.submit_enrollment_segment.await_args_list[0].args == (
         "enrollment-1",
         "profile-1",
+        3,
         pcm16,
     )
-    assert service.complete_enrollment.await_args_list[1].args == (
+    assert service.submit_enrollment_segment.await_args_list[1].args == (
         "enrollment-1",
         "profile-1",
+        3,
         pcm16,
     )
     _assert_private_values_absent(first.json())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("segment_header", [None, "", "0", "5", "01", "+1", " 1"])
+def test_segment_upload_requires_canonical_one_to_four_header(
+    monkeypatch: pytest.MonkeyPatch,
+    segment_header: str | None,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+    headers = {
+        "Content-Type": PCM_CONTENT_TYPE,
+        "X-Voice-Identity-Enrollment": "enrollment-1",
+        "X-Voice-Identity-Profile": "profile-1",
+    }
+    if segment_header is not None:
+        headers["X-Voice-Identity-Segment"] = segment_header
+
+    response = client.put(
+        f"{API_ROOT}/enrollment/segment",
+        content=bytes(48_000),
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error_code": "invalid_segment_index"}
+    service.submit_enrollment_segment.assert_not_awaited()
+
+
+@pytest.mark.unit
+def test_retired_one_shot_profile_endpoint_is_not_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+
+    response = client.put(
+        f"{API_ROOT}/enrollment/profile",
+        content=bytes(48_000),
+        headers={"Content-Type": PCM_CONTENT_TYPE},
+    )
+
+    assert response.status_code == 404
+    service.submit_enrollment_segment.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -266,7 +320,7 @@ def test_binary_profile_upload_forwards_exact_headers_and_body_idempotently(
         (MAX_PCM_BYTES + 1, PCM_CONTENT_TYPE, 413, "audio_too_long"),
     ],
 )
-def test_profile_upload_rejects_wrong_type_and_more_than_four_seconds(
+def test_segment_upload_rejects_wrong_type_and_more_than_four_seconds(
     monkeypatch: pytest.MonkeyPatch,
     body_size: int,
     content_type: str,
@@ -277,18 +331,19 @@ def test_profile_upload_rejects_wrong_type_and_more_than_four_seconds(
     client = _client(monkeypatch, service)
 
     response = client.put(
-        f"{API_ROOT}/enrollment/profile",
+        f"{API_ROOT}/enrollment/segment",
         content=bytes(body_size),
         headers={
             "Content-Type": content_type,
             "X-Voice-Identity-Enrollment": "enrollment-1",
             "X-Voice-Identity-Profile": "profile-1",
+            "X-Voice-Identity-Segment": "1",
         },
     )
 
     assert response.status_code == expected_status
     assert response.json() == {"error_code": expected_code}
-    service.complete_enrollment.assert_not_awaited()
+    service.submit_enrollment_segment.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -316,31 +371,39 @@ async def test_chunked_profile_body_is_bounded_without_content_length() -> None:
     [
         ("invalid_enrollment_id", 400),
         ("invalid_profile_id", 400),
+        ("invalid_segment_index", 400),
         ("stale_enrollment", 409),
+        ("segment_out_of_order", 409),
+        ("segment_in_progress", 409),
         ("invalid_pcm", 422),
         ("speech_too_short", 422),
-        ("audio_too_long", 422),
+        ("audio_too_long", 413),
         ("silence", 422),
+        ("volume_too_low", 422),
         ("severe_clipping", 422),
+        ("no_speech_detected", 422),
+        ("voice_samples_inconsistent", 422),
+        ("owner_verification_failed", 422),
         ("model_unavailable", 503),
     ],
 )
-def test_profile_upload_maps_stable_service_errors(
+def test_segment_upload_maps_stable_service_errors(
     monkeypatch: pytest.MonkeyPatch,
     error_code: str,
     expected_status: int,
 ) -> None:
     service = _fake_service()
-    service.complete_enrollment.side_effect = VoiceIdentityServiceError(error_code)
+    service.submit_enrollment_segment.side_effect = VoiceIdentityServiceError(error_code)
     client = _client(monkeypatch, service)
 
     response = client.put(
-        f"{API_ROOT}/enrollment/profile",
+        f"{API_ROOT}/enrollment/segment",
         content=bytes(48_000),
         headers={
             "Content-Type": PCM_CONTENT_TYPE,
             "X-Voice-Identity-Enrollment": "enrollment-1",
             "X-Voice-Identity-Profile": "profile-1",
+            "X-Voice-Identity-Segment": "1",
         },
     )
 

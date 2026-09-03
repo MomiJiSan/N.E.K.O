@@ -21,6 +21,9 @@ from main_logic.voice_identity_service.asr_composition import (
 from main_logic.voice_identity_service.diagnostics import (
     VOICE_IDENTITY_DIAGNOSTIC_COUNTERS as _VOICE_IDENTITY_DIAGNOSTIC_COUNTERS,
 )
+from main_logic.voice_identity_service.enrollment import (
+    SileroEnrollmentSpeechValidator,
+)
 from main_logic.voice_identity_service.preference_store import (
     VoiceIdentityPreferenceStore,
 )
@@ -994,7 +997,7 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
     suppression = VoiceInputSuppressionController(
         registry.suppress,
         registry.restore,
-        default_ttl_seconds=30.0,
+        default_ttl_seconds=45.0,
         hard_ttl_seconds=60.0,
     )
     service = VoiceIdentityService(
@@ -1004,7 +1007,9 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
         CampPlusEmbeddingModel,
         registry.activate,
         runtime_mode=runtime_mode,
+        enrollment_ttl_seconds=45.0,
         runtime_status_callback=registry.activation_status,
+        speech_validator_factory=SileroEnrollmentSpeechValidator,
     )
     install_voice_identity_service_for_app(service)
     _runtime_registry = registry

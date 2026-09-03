@@ -116,7 +116,7 @@ def test_voice_identity_header_keeps_title_bounded() -> None:
     assert "text-overflow: ellipsis" in title_layers.group(1)
 
 
-def test_voice_identity_template_is_a_single_action_enrollment_flow() -> None:
+def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow() -> None:
     template = (ROOT / "templates/voice_identity.html").read_text(encoding="utf-8")
     stylesheet = (ROOT / "static/css/voice_identity.css").read_text(encoding="utf-8")
 
@@ -132,7 +132,13 @@ def test_voice_identity_template_is_a_single_action_enrollment_flow() -> None:
     assert 'aria-labelledby="voice-filter-title"' in template
     assert 'aria-describedby="voice-filter-help"' in template
     assert 'role="status" aria-live="polite" aria-atomic="true"' in template
-    assert "step-progress" not in template
+    assert 'class="step-progress"' in template
+    assert template.count('data-voice-segment="') == 4
+    assert 'id="voice-identity-progress-label"' in template
+    assert 'id="voice-identity-phase" aria-live="polite"' in template
+    assert 'id="voice-identity-remaining" aria-live="polite"' in template
+    assert 'data-i18n="voiceIdentity.hintSameMicrophone"' in template
+    assert 'data-i18n="voiceIdentity.hintDifferentSentence"' in template
     assert "voice-identity-record" not in template
     assert "voice-identity-prompt" not in template
     assert "embedding" not in template.lower()
@@ -163,7 +169,7 @@ def test_voice_identity_enrollment_focus_target_is_programmatically_focusable() 
     assert "#voice-identity-enrollment-title:focus-visible" in stylesheet
 
 
-def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close() -> None:
+def test_browser_capture_is_one_permission_four_segment_pcm16_and_cancels_on_close() -> None:
     script = (ROOT / "static/js/voice_identity.js").read_text(encoding="utf-8")
     processor = (ROOT / "static/audio-processor.js").read_text(encoding="utf-8")
 
@@ -174,15 +180,16 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
         "audioWorklet.addModule('/static/audio-processor.js')",
         "Int16Array",
         "TARGET_SAMPLE_RATE = 16000",
-        "RECORDING_MS = 4000",
+        "RECORDING_MS = 3000",
         "API_ROOT = '/api/voice-identity'",
         "'/enrollment/start'",
-        "'/enrollment/profile'",
+        "'/enrollment/segment'",
         "'/enrollment/cancel'",
         "'/profile'",
         "'/filter'",
         "X-Voice-Identity-Enrollment",
         "X-Voice-Identity-Profile",
+        "X-Voice-Identity-Segment",
         "audio/pcm;format=pcm_s16le;rate=16000;channels=1",
         "X-CSRF-Token",
         "window.nekoBeforeWindowClose",
@@ -194,13 +201,16 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
     assert "RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS" in script
     assert "targetSamples = TARGET_SAMPLE_RATE * RECORDING_MS / 1000" in script
     assert "capturedSamples < targetSamples" in script
-    assert "state.profileId || createProfileId()" in script
+    assert "state.profileId = valueFrom([enrollment, status], ['profile_id']" in script
     assert "['has_profile', 'profile_available', 'available']" in script
-    assert "const replacementConfirmed = uploadStarted" in script
-    assert "state.profileRevision !== profileRevisionBefore" in script
+    assert "payload.last_completed_enrollment_id === enrollmentId" in script
+    assert "payload.profile_generation === profileId" in script
+    assert "startTtlClock()" in script
+    assert "stopTtlClock()" in script
+    assert "new Uint8Array(pcm).fill(0)" in script
     assert "MediaRecorder" not in script
     assert "createScriptProcessor" not in script
-    assert "'/enrollment/segment'" not in script
+    assert "'/enrollment/profile'" not in script
     assert "'/enrollment/verify'" not in script
     assert "'/enrollment/commit'" not in script
     assert "fixedPrompts" not in script
@@ -351,7 +361,19 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "localOnly",
         "privacyTitle",
         "privacyBody",
+        "recordingHints",
+        "progressLabel",
+        "hintSameMicrophone",
+        "hintNormalVolume",
+        "hintDifferentSentence",
         "enrollAndEnable",
+        "continueEnrollment",
+        "segmentProgress",
+        "phaseCollectingReference",
+        "phaseCheckingConsistency",
+        "phaseVerifying",
+        "phaseCommitting",
+        "expiresInSeconds",
         "recording",
         "cancel",
         "delete",
@@ -375,6 +397,18 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "microphoneDenied",
         "requestFailed",
         "errorModelUnavailable",
+        "errorInvalidPcm",
+        "errorAudioTooLong",
+        "errorSpeechTooShort",
+        "errorVolumeTooLow",
+        "errorSevereClipping",
+        "errorNoSpeechDetected",
+        "errorVoiceSamplesInconsistent",
+        "errorOwnerVerificationFailed",
+        "errorSegmentOutOfOrder",
+        "errorSegmentInProgress",
+        "errorStaleEnrollment",
+        "errorSecureStorageUnavailable",
         "deleteConfirm",
     }
     removed_wizard_keys = {
