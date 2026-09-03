@@ -325,6 +325,40 @@ input:focus-visible,
     font-weight: 600;
 }
 
+.reading-prompt {
+    display: grid;
+    width: min(560px, 100%);
+    margin-top: 14px;
+    padding: 16px 20px;
+    border: 1px solid var(--voice-border);
+    border-radius: 16px;
+    color: var(--voice-ink);
+    background: rgba(36, 184, 242, 0.09);
+    line-height: 1.6;
+    gap: 4px;
+}
+
+.reading-prompt[hidden] {
+    display: none;
+}
+
+.reading-prompt-label {
+    color: var(--voice-blue-dark);
+    font-size: 0.82rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+}
+
+#voice-identity-reading-text {
+    font-size: clamp(1.05rem, 2.4vw, 1.3rem);
+    font-weight: 700;
+}
+
+#voice-identity-reading-text::before,
+#voice-identity-reading-text::after {
+    color: var(--voice-muted);
+}
+
 .remaining-label {
     min-height: 1.4em;
     font-size: 0.88rem;

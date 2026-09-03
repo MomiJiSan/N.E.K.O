@@ -11,6 +11,28 @@
     const SEGMENT_HEADER = 'X-Voice-Identity-Segment';
     const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=16000;channels=1';
     const API_ROOT = '/api/voice-identity';
+    const READING_PROMPT_KEYS = Object.freeze([
+        'voiceIdentity.readingPrompt1', 'voiceIdentity.readingPrompt2',
+        'voiceIdentity.readingPrompt3', 'voiceIdentity.readingPrompt4',
+        'voiceIdentity.readingPrompt5', 'voiceIdentity.readingPrompt6',
+        'voiceIdentity.readingPrompt7', 'voiceIdentity.readingPrompt8',
+        'voiceIdentity.readingPrompt9', 'voiceIdentity.readingPrompt10',
+        'voiceIdentity.readingPrompt11', 'voiceIdentity.readingPrompt12'
+    ]);
+    const READING_PROMPT_FALLBACKS = Object.freeze([
+        '今天天气不错，我想出去走走。',
+        '桌上的热茶，正慢慢冒着香气。',
+        '晚上有空，我会听一会儿音乐。',
+        '现在请确认，这确实是我的声音。',
+        '清晨的阳光，让房间变得很温暖。',
+        '窗外的微风，轻轻吹过树叶。',
+        '忙完今天的事情，我想休息一会儿。',
+        '这段时间很安静，说话也很自然。',
+        '柔和的灯光，正照在桌面上。',
+        '我喜欢用平常的声音和朋友聊天。',
+        '前面的道路，看起来清晰又平静。',
+        '我正在用自己平时的声音说话。'
+    ]);
     const EFFECTIVE_REASON_KEYS = Object.freeze({
         disabled: 'voiceIdentity.reasonDisabled', ready: 'voiceIdentity.profileReady',
         no_profile: 'voiceIdentity.profileMissing', model_unavailable: 'voiceIdentity.reasonModelUnavailable',
@@ -67,9 +89,35 @@
             cancel: 'voice-identity-cancel', profileControls: 'voice-identity-profile-controls',
             reenroll: 'voice-identity-reenroll', delete: 'voice-identity-delete',
             filter: 'voice-identity-filter', progressLabel: 'voice-identity-progress-label',
-            phase: 'voice-identity-phase', remaining: 'voice-identity-remaining'
+            phase: 'voice-identity-phase', remaining: 'voice-identity-remaining',
+            readingPrompt: 'voice-identity-reading-prompt',
+            readingText: 'voice-identity-reading-text'
         })) elements[name] = document.getElementById(id);
         elements.steps = Array.from(document.querySelectorAll('[data-voice-segment]'));
+    }
+
+    function readingPromptOrder(enrollmentId) {
+        let seed = 2166136261;
+        for (let index = 0; index < enrollmentId.length; index += 1) {
+            seed ^= enrollmentId.charCodeAt(index);
+            seed = Math.imul(seed, 16777619) >>> 0;
+        }
+        const order = READING_PROMPT_KEYS.map((key, index) => ({
+            key,
+            fallback: READING_PROMPT_FALLBACKS[index]
+        }));
+        for (let index = order.length - 1; index > 0; index -= 1) {
+            seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+            const swapIndex = seed % (index + 1);
+            [order[index], order[swapIndex]] = [order[swapIndex], order[index]];
+        }
+        return order.slice(0, REQUIRED_SEGMENTS);
+    }
+
+    function currentReadingPrompt() {
+        if (!state.enrollmentId) return '';
+        const prompt = readingPromptOrder(state.enrollmentId)[state.nextSegmentIndex - 1];
+        return prompt ? translate(prompt.key, prompt.fallback) : '';
     }
 
     async function loadCsrfToken() {
@@ -278,6 +326,9 @@
         elements.filter.disabled = pending;
     }
     function renderEnrollment() {
+        const readingPrompt = currentReadingPrompt();
+        elements.readingPrompt.hidden = !readingPrompt;
+        elements.readingText.textContent = readingPrompt;
         elements.captureStatus.hidden = !state.recording && !state.saving;
         elements.captureStatus.classList.toggle('saving', state.saving);
         elements.captureLabel.textContent = state.recording

@@ -137,13 +137,14 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert 'id="voice-identity-progress-label"' in template
     assert 'id="voice-identity-phase" aria-live="polite"' in template
     assert 'id="voice-identity-remaining" aria-live="polite"' in template
+    assert 'id="voice-identity-reading-prompt"' in template
+    assert 'id="voice-identity-reading-text"' in template
+    assert 'data-i18n="voiceIdentity.readingPromptLabel"' in template
     assert 'data-i18n="voiceIdentity.hintSameMicrophone"' in template
     assert 'data-i18n="voiceIdentity.hintDifferentSentence"' in template
     assert "voice-identity-record" not in template
-    assert "voice-identity-prompt" not in template
     assert "embedding" not in template.lower()
     assert "similarity" not in template.lower()
-
     assert ".switch input:focus-visible + .switch-track" in stylesheet
     assert "--voice-blue-dark: #075b80" in stylesheet
     assert "--voice-danger: #b4233b" in stylesheet
@@ -159,6 +160,18 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert "linear-gradient(to right, #4bd4fd, #17a7ff)" in stylesheet
     assert "/static/js/voice_identity.js" in template
     assert "/static/css/voice_identity.css" in template
+
+
+def test_voice_identity_reading_prompts_exist_in_every_supported_locale() -> None:
+    for locale in LOCALES:
+        messages = json.loads(
+            (ROOT / "static" / "locales" / f"{locale}.json").read_text(encoding="utf-8")
+        )
+        voice_identity = messages["voiceIdentity"]
+        assert voice_identity["readingPromptLabel"].strip()
+        prompts = [voice_identity[f"readingPrompt{index}"] for index in range(1, 13)]
+        assert all(prompt.strip() for prompt in prompts)
+        assert len(set(prompts)) == 12
 
 
 def test_voice_identity_enrollment_focus_target_is_programmatically_focusable() -> None:

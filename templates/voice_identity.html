@@ -99,6 +99,12 @@
                     </div>
                     <p class="progress-label" id="voice-identity-progress-label">第 1/4 段</p>
                     <p class="phase-label" id="voice-identity-phase" aria-live="polite"></p>
+                    <div class="reading-prompt" id="voice-identity-reading-prompt"
+                        role="status" aria-live="polite" aria-atomic="true" hidden>
+                        <span class="reading-prompt-label"
+                            data-i18n="voiceIdentity.readingPromptLabel">请朗读</span>
+                        <q id="voice-identity-reading-text"></q>
+                    </div>
                     <p class="remaining-label" id="voice-identity-remaining" aria-live="polite"></p>
                     <div class="capture-status" id="voice-identity-capture-status" hidden>
                         <span class="record-icon" aria-hidden="true"></span>

@@ -140,6 +140,7 @@ function createHarness({
     initialEffectiveReason = null,
     initialEnrollment = false,
     initialEnrollmentProfileId = null,
+    initialNextSegmentIndex = 1,
     initialRemainingSeconds = 45,
 } = {}) {
     const elementIds = [
@@ -159,6 +160,8 @@ function createHarness({
         'voice-identity-progress-label',
         'voice-identity-phase',
         'voice-identity-remaining',
+        'voice-identity-reading-prompt',
+        'voice-identity-reading-text',
     ];
     const elements = new Map(elementIds.map(id => [id, createElement()]));
     const stepElements = [1, 2, 3, 4].map(index => {
@@ -178,7 +181,7 @@ function createHarness({
     let serverRequested = initialRequested;
     let enrollmentId = initialEnrollment ? 'enrollment-1' : null;
     let enrollmentProfileId = initialEnrollmentProfileId;
-    let nextSegmentIndex = 1;
+    let nextSegmentIndex = initialEnrollment ? initialNextSegmentIndex : 1;
     let lastCompletedEnrollmentId = null;
     let statusRequestCount = 0;
     let timerId = 0;
@@ -381,7 +384,11 @@ function createHarness({
                 'voiceIdentity.errorStaleEnrollment': 'Enrollment expired.',
                 'voiceIdentity.deleteConfirm': 'Delete the profile?',
                 'voiceIdentity.delete': 'Delete voice profile',
+                'voiceIdentity.readingPromptLabel': 'Please read',
             };
+            if (/^voiceIdentity\.readingPrompt\d+$/.test(key)) {
+                return `Prompt ${key.match(/\d+$/)[0]}`;
+            }
             return translations[key] || key;
         },
         addEventListener(type, listener) {
@@ -536,6 +543,19 @@ test('mutation controls stay disabled until CSRF and canonical status resolve', 
     await initializing;
 
     assert.equal(harness.elements.get('voice-identity-start').disabled, false);
+});
+
+test('active enrollment shows one deterministic reading prompt for the current segment', async () => {
+    const prompts = [];
+    for (let segment = 1; segment <= 4; segment += 1) {
+        const harness = createHarness({ initialEnrollment: true, initialNextSegmentIndex: segment });
+        await harness.initialize();
+        assert.equal(harness.elements.get('voice-identity-reading-prompt').hidden, false);
+        const prompt = harness.elements.get('voice-identity-reading-text').textContent;
+        assert.match(prompt, /^Prompt \d+$/);
+        prompts.push(prompt);
+    }
+    assert.equal(new Set(prompts).size, 4);
 });
 
 test('one click requests permission once and PUTs four independent three-second segments', async () => {
