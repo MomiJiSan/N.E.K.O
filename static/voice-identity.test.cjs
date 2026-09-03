@@ -23,13 +23,16 @@ const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=48000;channels=1';
 const AUDIO_CONTRACT_ID = 'owner-campplus-desktop-v1';
 const PROFILE_HEADER = 'X-Voice-Identity-Profile';
 const TARGET_SAMPLE_RATE = 48000;
-const RECORDING_MS = 3000;
+const REFERENCE_RECORDING_MS = 3000;
+const VERIFICATION_RECORDING_MS = 5000;
 const STREAMING_RESAMPLE_MARGIN_MS = 100;
-const CAPTURE_TIMEOUT_MS = RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS + 1000;
+const REFERENCE_CAPTURE_MS = REFERENCE_RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS;
+const REFERENCE_CAPTURE_TIMEOUT_MS = REFERENCE_CAPTURE_MS + 1000;
+const VERIFICATION_CAPTURE_TIMEOUT_MS = VERIFICATION_RECORDING_MS + 1000;
 const WINDOW_CLOSE_START_WAIT_MS = 500;
-const TARGET_SAMPLES = TARGET_SAMPLE_RATE * (RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS) / 1000;
+const REFERENCE_TARGET_SAMPLES = TARGET_SAMPLE_RATE * REFERENCE_CAPTURE_MS / 1000;
+const VERIFICATION_TARGET_SAMPLES = TARGET_SAMPLE_RATE * VERIFICATION_RECORDING_MS / 1000;
 const CHUNK_SAMPLES = 480;
-const FULL_AUDIO_CHUNKS = Math.ceil(TARGET_SAMPLES / CHUNK_SAMPLES);
 
 function deferred() {
     let resolve;
@@ -134,12 +137,16 @@ function createHarness({
     startTransportErrorAfterCreate = false,
     mediaGate,
     mediaError,
-    audioChunks = FULL_AUDIO_CHUNKS,
+    audioChunks = null,
     manualAudio = false,
     profileError,
     profileErrorSegment = 1,
     profileTransportErrorAfterCommit = false,
     segmentTransportErrorAfterAccept = null,
+    verificationPassed = true,
+    verificationMatchPercent = 72,
+    verificationNextSegmentIndex = 4,
+    verificationTransportErrorAfterResult = false,
     showConfirm,
     nativeConfirm = true,
     webCryptoAvailable = true,
@@ -171,6 +178,7 @@ function createHarness({
         'voice-identity-remaining',
         'voice-identity-reading-prompt',
         'voice-identity-reading-text',
+        'voice-identity-verification-help',
     ];
     const elements = new Map(elementIds.map(id => [id, createElement()]));
     const stepElements = [1, 2, 3, 4].map(index => {
@@ -278,6 +286,16 @@ function createHarness({
                 }
                 return jsonResponse(statusPayload());
             }
+            if (!verificationPassed) {
+                nextSegmentIndex = verificationNextSegmentIndex;
+                if (verificationTransportErrorAfterResult) {
+                    throw new Error('verification_response_lost');
+                }
+                return jsonResponse({
+                    ...statusPayload(),
+                    verification: { passed: false, match_percent: verificationMatchPercent },
+                });
+            }
             lastCompletedEnrollmentId = enrollmentId;
             enrollmentId = null;
             serverProfile = true;
@@ -286,7 +304,10 @@ function createHarness({
             if (profileTransportErrorAfterCommit) {
                 throw new Error('profile_response_lost');
             }
-            return jsonResponse(statusPayload());
+            return jsonResponse({
+                ...statusPayload(),
+                verification: { passed: true, match_percent: verificationMatchPercent },
+            });
         }
         if (call.url === `${API_ROOT}/enrollment/cancel`) {
             enrollmentId = null;
@@ -413,6 +434,9 @@ function createHarness({
                 'voiceIdentity.deleteConfirm': 'Delete the profile?',
                 'voiceIdentity.delete': 'Delete voice profile',
                 'voiceIdentity.readingPromptLabel': 'Please read',
+                'voiceIdentity.verificationPrompt': 'Read the five-second verification prompt.',
+                'voiceIdentity.verificationPassed': `Lowest voice similarity: ${options?.percent}%. Verification passed. ${options?.status}`,
+                'voiceIdentity.verificationRetry': `Lowest voice similarity: ${options?.percent}%. Please keep your natural tone and verify again.`,
             };
             if (/^voiceIdentity\.readingPrompt\d+$/.test(key)) {
                 return `Prompt ${key.match(/\d+$/)[0]}`;
@@ -435,15 +459,19 @@ function createHarness({
         },
         setTimeout(callback, delay) {
             timerId += 1;
-            if (delay === CAPTURE_TIMEOUT_MS) {
+            if ([REFERENCE_CAPTURE_TIMEOUT_MS, VERIFICATION_CAPTURE_TIMEOUT_MS].includes(delay)) {
                 if (!manualAudio) {
                     Promise.resolve().then(() => {
-                        for (let index = 0; index < audioChunks; index += 1) {
+                        const targetSamples = delay === VERIFICATION_CAPTURE_TIMEOUT_MS
+                            ? VERIFICATION_TARGET_SAMPLES : REFERENCE_TARGET_SAMPLES;
+                        const fullAudioChunks = Math.ceil(targetSamples / CHUNK_SAMPLES);
+                        const chunksToEmit = audioChunks === null ? fullAudioChunks : audioChunks;
+                        for (let index = 0; index < chunksToEmit; index += 1) {
                             processor?.port.onmessage?.({
                                 data: new Int16Array(CHUNK_SAMPLES).fill(1024),
                             });
                         }
-                        if (audioChunks < FULL_AUDIO_CHUNKS) callback();
+                        if (chunksToEmit < fullAudioChunks) callback();
                     });
                 }
             } else if (delay === WINDOW_CLOSE_START_WAIT_MS) {
@@ -589,20 +617,25 @@ test('mutation controls stay disabled until CSRF and canonical status resolve', 
     assert.equal(harness.elements.get('voice-identity-start').disabled, false);
 });
 
-test('active enrollment shows one deterministic reading prompt for the current segment', async () => {
+test('active enrollment shows deterministic reference prompts and a dedicated verification prompt', async () => {
     const prompts = [];
     for (let segment = 1; segment <= 4; segment += 1) {
         const harness = createHarness({ initialEnrollment: true, initialNextSegmentIndex: segment });
         await harness.initialize();
         assert.equal(harness.elements.get('voice-identity-reading-prompt').hidden, false);
         const prompt = harness.elements.get('voice-identity-reading-text').textContent;
-        assert.match(prompt, /^Prompt \d+$/);
+        if (segment < 4) assert.match(prompt, /^Prompt \d+$/);
+        else assert.equal(prompt, 'Read the five-second verification prompt.');
+        assert.equal(
+            harness.elements.get('voice-identity-verification-help').hidden,
+            segment !== 4,
+        );
         prompts.push(prompt);
     }
     assert.equal(new Set(prompts).size, 4);
 });
 
-test('one click requests permission once and PUTs four independent three-second segments', async () => {
+test('one click PUTs three reference captures plus one exact five-second verification at 48 kHz', async () => {
     const harness = createHarness();
     await harness.initialize();
 
@@ -622,7 +655,8 @@ test('one click requests permission once and PUTs four independent three-second 
     assert.equal(uploads.length, 4);
     for (const [offset, upload] of uploads.entries()) {
         assert.equal(upload.options.method, 'PUT');
-        assert.equal(upload.options.body.byteLength, TARGET_SAMPLES * 2);
+        const targetSamples = offset === 3 ? VERIFICATION_TARGET_SAMPLES : REFERENCE_TARGET_SAMPLES;
+        assert.equal(upload.options.body.byteLength, targetSamples * 2);
         assert.equal(upload.options.headers.get('content-type'), PCM_CONTENT_TYPE);
         assert.equal(upload.options.headers.get('x-voice-audio-contract'), AUDIO_CONTRACT_ID);
         assert.equal(upload.options.headers.get('x-voice-identity-enrollment'), 'enrollment-1');
@@ -655,7 +689,10 @@ test('one click requests permission once and PUTs four independent three-second 
         assert.equal(harness.gainNodes[index + 1].disconnected, true);
     }
     assert.equal(harness.mediaStreams[0].track.stopped, true);
-    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment complete.');
+    assert.equal(
+        harness.elements.get('voice-identity-message').textContent,
+        'Lowest voice similarity: 72%. Verification passed. Enrollment complete.',
+    );
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
 });
 
@@ -719,7 +756,60 @@ test('lost start response adopts the active server session and keeps one microph
         4,
     );
     assert.equal(harness.mediaRequests, 1);
-    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment complete.');
+    assert.equal(
+        harness.elements.get('voice-identity-message').textContent,
+        'Lowest voice similarity: 72%. Verification passed. Enrollment complete.',
+    );
+});
+
+test('failed verification shows its transient percentage and follows the server retry step', async () => {
+    const harness = createHarness({
+        verificationPassed: false,
+        verificationMatchPercent: 31,
+        verificationNextSegmentIndex: 4,
+    });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.equal(
+        harness.elements.get('voice-identity-message').textContent,
+        'Lowest voice similarity: 31%. Please keep your natural tone and verify again.',
+    );
+    assert.equal(harness.elements.get('voice-identity-progress-label').textContent, '第 4/4 段');
+    assert.equal(harness.elements.get('voice-identity-verification-help').hidden, false);
+    assert.equal(harness.mediaStreams[0].track.stopped, false);
+});
+
+test('failed verification follows a server reset to segment one', async () => {
+    const harness = createHarness({
+        verificationPassed: false,
+        verificationMatchPercent: 28,
+        verificationNextSegmentIndex: 1,
+    });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.equal(harness.elements.get('voice-identity-progress-label').textContent, '第 1/4 段');
+    assert.equal(harness.elements.get('voice-identity-verification-help').hidden, true);
+    assert.match(harness.elements.get('voice-identity-message').textContent, /28%/);
+});
+
+test('lost failed-verification response recovers status without inventing a percentage', async () => {
+    const harness = createHarness({
+        verificationPassed: false,
+        verificationMatchPercent: 31,
+        verificationNextSegmentIndex: 4,
+        verificationTransportErrorAfterResult: true,
+    });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.equal(harness.elements.get('voice-identity-progress-label').textContent, '第 4/4 段');
+    assert.equal(harness.elements.get('voice-identity-message').textContent, 'Request failed.');
+    assert.doesNotMatch(harness.elements.get('voice-identity-message').textContent, /\d+%/);
 });
 
 test('underfilled capture cancels the lease and never uploads partial PCM', async () => {

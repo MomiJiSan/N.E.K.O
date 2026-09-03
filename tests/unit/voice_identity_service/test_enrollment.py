@@ -9,6 +9,7 @@ import pytest
 import main_logic.voice_identity_service.enrollment as enrollment_module
 from main_logic.voice_identity_service.enrollment import (
     ENROLLMENT_MAXIMUM_PCM_BYTES,
+    ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES,
     EnrollmentAudioError,
     EnrollmentSpeechValidatorUnavailableError,
     SileroEnrollmentSpeechValidator,
@@ -27,6 +28,10 @@ def _pcm(milliseconds: int, *, amplitude: int = 2_000) -> bytes:
 
 def test_accepts_four_seconds_of_usable_pcm() -> None:
     validate_enrollment_pcm16(_pcm(4_000))
+    validate_enrollment_pcm16(
+        _pcm(5_000),
+        maximum_pcm_bytes=ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES,
+    )
 
 
 @pytest.mark.parametrize(
@@ -56,6 +61,7 @@ def test_rejects_unusable_pcm(pcm16: bytes, code: str) -> None:
 
 def test_payload_ceiling_matches_four_second_pcm16() -> None:
     assert ENROLLMENT_MAXIMUM_PCM_BYTES == 128_000
+    assert ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES == 160_000
 
 
 class _FakeSileroVad:
@@ -286,34 +292,84 @@ def test_holdout_requires_both_runtime_checkpoints() -> None:
     centroid = _unit((1.0, 0.0))
     holdout_1_5 = _unit((0.9, 0.1))
     holdout_3_0 = _unit((0.8, -0.1))
-    originals = [value.copy() for value in (centroid, holdout_1_5, holdout_3_0)]
+    holdout_5_0 = _unit((0.6, 0.8))
+    originals = [
+        value.copy()
+        for value in (centroid, holdout_1_5, holdout_3_0, holdout_5_0)
+    ]
     try:
-        verify_enrollment_holdout(centroid, holdout_1_5, holdout_3_0)
+        result = verify_enrollment_holdout(
+            centroid,
+            holdout_1_5,
+            holdout_3_0,
+            holdout_5_0,
+        )
+        assert result.passed
+        assert result.match_percent == 60
         for embedding, original in zip(
-            (centroid, holdout_1_5, holdout_3_0),
+            (centroid, holdout_1_5, holdout_3_0, holdout_5_0),
             originals,
             strict=True,
         ):
             np.testing.assert_array_equal(embedding, original)
     finally:
-        for embedding in (centroid, holdout_1_5, holdout_3_0, *originals):
+        for embedding in (
+            centroid,
+            holdout_1_5,
+            holdout_3_0,
+            holdout_5_0,
+            *originals,
+        ):
             wipe_enrollment_embedding(embedding)
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failed_checkpoint", ("1.5", "3.0"))
+@pytest.mark.parametrize("failed_checkpoint", ("1.5", "3.0", "5.0"))
 def test_holdout_rejects_either_low_checkpoint(failed_checkpoint: str) -> None:
     centroid = _unit((1.0, 0.0))
     high = _unit((0.9, 0.1))
     low = _unit((0.0, 1.0))
     holdout_1_5 = low if failed_checkpoint == "1.5" else high
     holdout_3_0 = low if failed_checkpoint == "3.0" else high
+    holdout_5_0 = low if failed_checkpoint == "5.0" else high
     try:
-        with pytest.raises(EnrollmentAudioError) as caught:
-            verify_enrollment_holdout(centroid, holdout_1_5, holdout_3_0)
-        assert caught.value.code == "owner_verification_failed"
+        result = verify_enrollment_holdout(
+            centroid,
+            holdout_1_5,
+            holdout_3_0,
+            holdout_5_0,
+        )
+        assert not result.passed
+        assert result.match_percent == 0
     finally:
         for embedding in (centroid, high, low):
+            wipe_enrollment_embedding(embedding)
+
+
+@pytest.mark.unit
+def test_holdout_match_percent_clamps_negative_and_accepts_threshold() -> None:
+    centroid = _unit((1.0, 0.0))
+    threshold = _unit((0.4, 0.9165151))
+    negative = _unit((-1.0, 0.0))
+    try:
+        accepted = verify_enrollment_holdout(
+            centroid,
+            threshold,
+            threshold,
+            threshold,
+        )
+        rejected = verify_enrollment_holdout(
+            centroid,
+            threshold,
+            threshold,
+            negative,
+        )
+        assert accepted.passed
+        assert accepted.match_percent == 40
+        assert not rejected.passed
+        assert rejected.match_percent == 0
+    finally:
+        for embedding in (centroid, threshold, negative):
             wipe_enrollment_embedding(embedding)
 
 

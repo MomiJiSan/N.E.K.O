@@ -18,11 +18,15 @@ from main_logic.asr_client.endpointing.silero_vad import SileroVad
 ENROLLMENT_SAMPLE_RATE_HZ = 16_000
 ENROLLMENT_MINIMUM_AUDIO_MS = 1_500
 ENROLLMENT_TARGET_AUDIO_MS = 4_000
+ENROLLMENT_VERIFICATION_AUDIO_MS = 5_000
 ENROLLMENT_MINIMUM_PCM_BYTES = (
     ENROLLMENT_SAMPLE_RATE_HZ * ENROLLMENT_MINIMUM_AUDIO_MS // 1_000 * 2
 )
 ENROLLMENT_MAXIMUM_PCM_BYTES = (
     ENROLLMENT_SAMPLE_RATE_HZ * ENROLLMENT_TARGET_AUDIO_MS // 1_000 * 2
+)
+ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES = (
+    ENROLLMENT_SAMPLE_RATE_HZ * ENROLLMENT_VERIFICATION_AUDIO_MS // 1_000 * 2
 )
 _FRAME_SAMPLES = 320
 _ACTIVE_FRAME_RMS = 0.008
@@ -50,6 +54,20 @@ class EnrollmentSpeechResult:
 
     window_count: int
     active_window_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class EnrollmentVerificationResult:
+    """Privacy-safe result for one independent verification segment."""
+
+    passed: bool
+    match_percent: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "passed": self.passed,
+            "match_percent": self.match_percent,
+        }
 
 
 class EnrollmentSpeechValidator(Protocol):
@@ -127,7 +145,10 @@ class SileroEnrollmentSpeechValidator:
     ) -> EnrollmentSpeechResult:
         if sample_rate_hz != ENROLLMENT_SAMPLE_RATE_HZ:
             raise EnrollmentAudioError("invalid_pcm")
-        validate_enrollment_pcm16(pcm16)
+        validate_enrollment_pcm16(
+            pcm16,
+            maximum_pcm_bytes=ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES,
+        )
         with self._operation_lock:
             if self._closed or not self._vad.is_ready:
                 raise EnrollmentSpeechValidatorUnavailableError(
@@ -162,14 +183,18 @@ class SileroEnrollmentSpeechValidator:
             self._vad.close()
 
 
-def validate_enrollment_pcm16(pcm16: bytes) -> None:
+def validate_enrollment_pcm16(
+    pcm16: bytes,
+    *,
+    maximum_pcm_bytes: int = ENROLLMENT_MAXIMUM_PCM_BYTES,
+) -> None:
     """Accept usable 16 kHz mono PCM16 without retaining derived samples."""
 
     if type(pcm16) is not bytes or len(pcm16) % 2:
         raise EnrollmentAudioError("invalid_pcm")
     if len(pcm16) < ENROLLMENT_MINIMUM_PCM_BYTES:
         raise EnrollmentAudioError("speech_too_short")
-    if len(pcm16) > ENROLLMENT_MAXIMUM_PCM_BYTES:
+    if len(pcm16) > maximum_pcm_bytes:
         raise EnrollmentAudioError("audio_too_long")
 
     samples: np.ndarray | None = None
@@ -326,28 +351,39 @@ def verify_enrollment_holdout(
     reference_centroid: np.ndarray,
     holdout_1_5: np.ndarray,
     holdout_3_0: np.ndarray,
-) -> None:
-    """Require one independent segment to pass both runtime checkpoints.
+    holdout_5_0: np.ndarray,
+) -> EnrollmentVerificationResult:
+    """Compare one independent segment at all three enrollment checkpoints.
 
-    All three arrays remain caller-owned and are never modified. In particular,
-    the caller must overwrite both holdout embeddings in a ``finally`` block.
+    All four arrays remain caller-owned and are never modified. The returned
+    percentage is the clamped minimum score; raw checkpoint scores never leave
+    this function.
     """
 
     normalized: list[np.ndarray] = []
     try:
-        for embedding in (reference_centroid, holdout_1_5, holdout_3_0):
+        for embedding in (
+            reference_centroid,
+            holdout_1_5,
+            holdout_3_0,
+            holdout_5_0,
+        ):
             normalized.append(_normalized_embedding_copy(embedding))
         if len({embedding.shape for embedding in normalized}) != 1:
             raise ValueError("enrollment embedding dimensions differ")
-        score_1_5 = float(np.dot(normalized[0], normalized[1]))
-        score_3_0 = float(np.dot(normalized[0], normalized[2]))
-        if (
-            not math.isfinite(score_1_5)
-            or not math.isfinite(score_3_0)
-            or score_1_5 < ENROLLMENT_SIMILARITY_THRESHOLD
-            or score_3_0 < ENROLLMENT_SIMILARITY_THRESHOLD
-        ):
-            raise EnrollmentAudioError("owner_verification_failed")
+        scores = tuple(
+            float(np.dot(normalized[0], holdout)) for holdout in normalized[1:]
+        )
+        passed = all(
+            math.isfinite(score)
+            and score >= ENROLLMENT_SIMILARITY_THRESHOLD
+            for score in scores
+        )
+        minimum_score = min(scores) if all(map(math.isfinite, scores)) else 0.0
+        return EnrollmentVerificationResult(
+            passed=passed,
+            match_percent=round(max(0.0, min(1.0, minimum_score)) * 100),
+        )
     finally:
         for embedding in normalized:
             wipe_enrollment_embedding(embedding)

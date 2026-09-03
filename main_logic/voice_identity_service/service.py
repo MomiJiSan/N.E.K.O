@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Literal, Protocol, TypeVar
 import uuid
@@ -33,11 +33,14 @@ from .audio_contract import (
     desktop_audio_contract_snapshot,
 )
 from .enrollment import (
+    ENROLLMENT_MAXIMUM_PCM_BYTES,
     ENROLLMENT_SAMPLE_RATE_HZ,
+    ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES,
     EnrollmentAudioError,
     EnrollmentSpeechValidator,
     EnrollmentSpeechValidatorFactory,
     EnrollmentSpeechValidatorUnavailableError,
+    EnrollmentVerificationResult,
     SileroEnrollmentSpeechValidator,
     create_enrollment_reference_centroid,
     verify_enrollment_holdout,
@@ -158,6 +161,7 @@ class VoiceIdentityServiceStatus:
     profile_generation: str | None
     runtime_mode: VoiceIdentityRuntimeMode
     last_completed_enrollment_id: str | None
+    verification: EnrollmentVerificationResult | None = None
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = self.state.as_dict()
@@ -167,6 +171,8 @@ class VoiceIdentityServiceStatus:
         result["profile_generation"] = self.profile_generation
         result["runtime_mode"] = self.runtime_mode
         result["last_completed_enrollment_id"] = self.last_completed_enrollment_id
+        if self.verification is not None:
+            result["verification"] = self.verification.as_dict()
         return result
 
 
@@ -199,14 +205,17 @@ class _SegmentComputation:
     reference_embedding: np.ndarray | None = None
     holdout_1_5: np.ndarray | None = None
     holdout_3_0: np.ndarray | None = None
+    holdout_5_0: np.ndarray | None = None
 
     def wipe(self) -> None:
         wipe_enrollment_embedding(self.reference_embedding)
         wipe_enrollment_embedding(self.holdout_1_5)
         wipe_enrollment_embedding(self.holdout_3_0)
+        wipe_enrollment_embedding(self.holdout_5_0)
         self.reference_embedding = None
         self.holdout_1_5 = None
         self.holdout_3_0 = None
+        self.holdout_5_0 = None
 
 
 class VoiceIdentityService:
@@ -631,7 +640,7 @@ class VoiceIdentityService:
                 raise VoiceIdentityServiceError("unsupported_audio_contract")
             maximum_raw_pcm_bytes = (
                 OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ
-                * 4
+                * (5 if segment_index == 4 else 4)
                 * 2
             )
             if len(pcm16) > maximum_raw_pcm_bytes:
@@ -802,29 +811,36 @@ class VoiceIdentityService:
                 centroid = session.reference_centroid
                 if centroid is None:
                     raise VoiceIdentityServiceError("stale_enrollment")
-                if computed.holdout_1_5 is None or computed.holdout_3_0 is None:
+                if (
+                    computed.holdout_1_5 is None
+                    or computed.holdout_3_0 is None
+                    or computed.holdout_5_0 is None
+                ):
                     raise VoiceIdentityServiceError("model_unavailable")
-                verify_enrollment_holdout(
+                verification = verify_enrollment_holdout(
                     centroid,
                     computed.holdout_1_5,
                     computed.holdout_3_0,
+                    computed.holdout_5_0,
                 )
-            except EnrollmentAudioError as exc:
+            finally:
+                computed.wipe()
+
+            if not verification.passed:
                 session.holdout_failure_count += 1
                 if session.holdout_failure_count >= 2:
                     self._reset_session_references(session)
                 self._clear_segment_operation(session, preserve_phase=True)
-                raise VoiceIdentityServiceError(exc.code) from exc
-            finally:
-                computed.wipe()
+                return replace(self.status(), verification=verification)
 
             session.phase = "committing"
-            return await self._commit_enrollment_reference(
+            committed = await self._commit_enrollment_reference(
                 session,
                 session_generation=session_generation,
                 operation_nonce=operation_nonce,
                 profile_id=profile_id,
             )
+            return replace(committed, verification=verification)
         finally:
             computed.wipe()
             self._operation_lock.release()
@@ -840,7 +856,9 @@ class VoiceIdentityService:
         operation_nonce: int,
         operation_task: asyncio.Task[object],
     ) -> _SegmentComputation:
-        target_samples = ENROLLMENT_SAMPLE_RATE_HZ * 3
+        target_samples = ENROLLMENT_SAMPLE_RATE_HZ * (
+            5 if segment_index == 4 else 3
+        )
         normalizer = self._enrollment_audio_normalizer_factory(
             session.noise_reduction_enabled_snapshot
         )
@@ -861,6 +879,14 @@ class VoiceIdentityService:
             raise
 
         reference_bytes = ENROLLMENT_SAMPLE_RATE_HZ * 3 * 2
+        verification_bytes = ENROLLMENT_SAMPLE_RATE_HZ * 5 * 2
+        maximum_normalized_bytes = (
+            ENROLLMENT_VERIFICATION_MAXIMUM_PCM_BYTES
+            if segment_index == 4
+            else ENROLLMENT_MAXIMUM_PCM_BYTES
+        )
+        if len(normalized_pcm16) > maximum_normalized_bytes:
+            raise EnrollmentAudioError("audio_too_long")
 
         validation_task = asyncio.create_task(
             session.speech_validator.validate_pcm16(
@@ -919,6 +945,17 @@ class VoiceIdentityService:
             computation.holdout_3_0 = await self._infer_embedding(
                 session,
                 normalized_pcm16[:reference_bytes],
+            )
+            self._require_compute_fence(
+                session,
+                session_generation,
+                operation_nonce,
+                segment_index,
+                operation_task,
+            )
+            computation.holdout_5_0 = await self._infer_embedding(
+                session,
+                normalized_pcm16[:verification_bytes],
             )
             self._require_compute_fence(
                 session,

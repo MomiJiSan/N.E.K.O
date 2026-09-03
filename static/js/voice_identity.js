@@ -2,7 +2,8 @@
     'use strict';
 
     const TARGET_SAMPLE_RATE = 48000;
-    const RECORDING_MS = 3000;
+    const REFERENCE_RECORDING_MS = 3000;
+    const VERIFICATION_RECORDING_MS = 5000;
     const STREAMING_RESAMPLE_MARGIN_MS = 100;
     const REQUIRED_SEGMENTS = 4;
     const CAPTURE_TIMEOUT_GRACE_MS = 1000;
@@ -100,7 +101,8 @@
             filter: 'voice-identity-filter', progressLabel: 'voice-identity-progress-label',
             phase: 'voice-identity-phase', remaining: 'voice-identity-remaining',
             readingPrompt: 'voice-identity-reading-prompt',
-            readingText: 'voice-identity-reading-text'
+            readingText: 'voice-identity-reading-text',
+            verificationHelp: 'voice-identity-verification-help'
         })) elements[name] = document.getElementById(id);
         elements.steps = Array.from(document.querySelectorAll('[data-voice-segment]'));
     }
@@ -125,6 +127,12 @@
 
     function currentReadingPrompt() {
         if (!state.enrollmentId) return '';
+        if (state.nextSegmentIndex === REQUIRED_SEGMENTS) {
+            return translate(
+                'voiceIdentity.verificationPrompt',
+                '现在请用平常的语气完整读完这句话，让我确认这段声音确实来自同一个人。'
+            );
+        }
         const prompt = readingPromptOrder(state.enrollmentId)[state.nextSegmentIndex - 1];
         return prompt ? translate(prompt.key, prompt.fallback) : '';
     }
@@ -338,6 +346,7 @@
         const readingPrompt = currentReadingPrompt();
         elements.readingPrompt.hidden = !readingPrompt;
         elements.readingText.textContent = readingPrompt;
+        elements.verificationHelp.hidden = !state.enrollmentId || state.nextSegmentIndex !== REQUIRED_SEGMENTS;
         elements.captureStatus.hidden = !state.recording && !state.saving;
         elements.captureStatus.classList.toggle('saving', state.saving);
         elements.captureLabel.textContent = state.recording
@@ -429,7 +438,7 @@
             try { window.localStorage.removeItem(SELECTED_MICROPHONE_STORAGE_KEY); } catch (_) {}
         }
     }
-    async function capturePcm16() {
+    async function capturePcm16(recordingDurationMs) {
         await ensureMicrophone();
         const context = state.audioContext;
         const source = context.createMediaStreamSource(state.mediaStream);
@@ -440,7 +449,8 @@
         const gain = context.createGain();
         const mute = context.createGain();
         const chunks = [];
-        const captureDurationMs = RECORDING_MS + STREAMING_RESAMPLE_MARGIN_MS;
+        const captureDurationMs = recordingDurationMs === VERIFICATION_RECORDING_MS
+            ? recordingDurationMs : recordingDurationMs + STREAMING_RESAMPLE_MARGIN_MS;
         const targetSamples = TARGET_SAMPLE_RATE * captureDurationMs / 1000;
         let capturedSamples = 0;
         let finishCapture = null;
@@ -450,7 +460,7 @@
         await context.resume();
         const startedAt = performance.now();
         const timer = window.setInterval(function () {
-            const elapsed = Math.min(RECORDING_MS, performance.now() - startedAt);
+            const elapsed = Math.min(recordingDurationMs, performance.now() - startedAt);
             elements.timer.textContent = translate('voiceIdentity.recordingSeconds', `${(elapsed / 1000).toFixed(1)} 秒`, { seconds: (elapsed / 1000).toFixed(1) });
             renderEnrollment();
         }, 100);
@@ -538,13 +548,36 @@
         return Boolean(error && (['NotAllowedError', 'NotFoundError', 'NotReadableError'].includes(error.name)
             || ['audio_worklet_unavailable', 'media_devices_unavailable', 'unsupported_audio_sample_rate'].includes(error.message)));
     }
-    function finishEnrollment(payload, enrollmentId, profileId) {
+    function enrollmentVerification(payload) {
+        const verification = payload && typeof payload.verification === 'object'
+            ? payload.verification : null;
+        if (!verification || typeof verification.passed !== 'boolean'
+            || !Number.isInteger(verification.match_percent)
+            || verification.match_percent < 0 || verification.match_percent > 100) return null;
+        return { passed: verification.passed, matchPercent: verification.match_percent };
+    }
+    function verificationMessage(verification) {
+        if (verification.passed) {
+            const status = enrollmentCompleteMessage();
+            return translate(
+                'voiceIdentity.verificationPassed',
+                `最低声纹相似度 ${verification.matchPercent}%，验证通过。${status}`,
+                { percent: verification.matchPercent, status }
+            );
+        }
+        return translate(
+            'voiceIdentity.verificationRetry',
+            `最低声纹相似度 ${verification.matchPercent}%，请保持自然语气重新验证。`,
+            { percent: verification.matchPercent }
+        );
+    }
+    function finishEnrollment(payload, enrollmentId, profileId, verification) {
         if (!completionMatches(payload, enrollmentId, profileId)) throw new Error('profile_not_confirmed');
         applyStatus(payload);
         stopTtlClock();
         state.enrollmentId = null; state.profileId = null;
         stopMicrophone();
-        setMessage(enrollmentCompleteMessage(), false);
+        setMessage(verification ? verificationMessage(verification) : enrollmentCompleteMessage(), false);
     }
     async function submitCurrentSegment(nonce) {
         const index = state.nextSegmentIndex;
@@ -553,7 +586,9 @@
         state.recording = true; state.saving = false; render();
         let pcm = null;
         try {
-            pcm = await capturePcm16();
+            const recordingDurationMs = index === REQUIRED_SEGMENTS
+                ? VERIFICATION_RECORDING_MS : REFERENCE_RECORDING_MS;
+            pcm = await capturePcm16(recordingDurationMs);
             if (nonce !== state.operationNonce) return 'stale';
             state.recording = false; state.saving = true;
             state.enrollmentPhase = index === 3 ? 'checking_consistency' : (index === 4 ? 'verifying' : 'collecting_reference');
@@ -576,7 +611,7 @@
                 if (nonce !== state.operationNonce) return 'stale';
                 const canonical = await reconcileStatus();
                 if (canonical && completionMatches(canonical, enrollmentId, profileId)) {
-                    finishEnrollment(canonical, enrollmentId, profileId); return 'complete';
+                    finishEnrollment(canonical, enrollmentId, profileId, null); return 'complete';
                 }
                 if (canonical && state.enrollmentId === enrollmentId) {
                     setMessage(enrollmentErrorMessage(error), true); return 'retry';
@@ -586,11 +621,18 @@
                 if (state.uploadAbort === controller) state.uploadAbort = null;
             }
             if (nonce !== state.operationNonce) return 'stale';
+            const verification = index === REQUIRED_SEGMENTS ? enrollmentVerification(payload) : null;
             if (completionMatches(payload, enrollmentId, profileId)) {
-                finishEnrollment(payload, enrollmentId, profileId); return 'complete';
+                if (verification && !verification.passed) throw new Error('profile_not_confirmed');
+                finishEnrollment(payload, enrollmentId, profileId, verification); return 'complete';
             }
             applyStatus(payload);
             if (state.enrollmentId !== enrollmentId) throw new Error('profile_not_confirmed');
+            if (verification) {
+                if (verification.passed) throw new Error('profile_not_confirmed');
+                setMessage(verificationMessage(verification), true);
+                return 'retry';
+            }
             if (state.nextSegmentIndex <= index) {
                 setMessage(translate('voiceIdentity.errorSegmentInProgress', '当前录音仍在检查，请稍后继续。'), true);
                 return 'retry';

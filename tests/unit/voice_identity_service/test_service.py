@@ -123,7 +123,7 @@ class _AudioNormalizer:
         if self.failure_code is not None:
             raise EnrollmentAudioNormalizationError(self.failure_code)
         assert sample_rate_hz == 48_000
-        assert target_samples == 48_000
+        assert target_samples in (48_000, 80_000)
         required_bytes = target_samples * 2
         if len(pcm16) < required_bytes:
             raise EnrollmentAudioNormalizationError("speech_too_short")
@@ -132,6 +132,11 @@ class _AudioNormalizer:
 
 def _pcm() -> bytes:
     samples = np.full(48_000, 4_000, dtype="<i2")
+    return samples.tobytes()
+
+
+def _verification_pcm(milliseconds: int = 5_000) -> bytes:
+    samples = np.full(48_000 * milliseconds // 1_000, 4_000, dtype="<i2")
     return samples.tobytes()
 
 
@@ -248,7 +253,7 @@ def _service(
                 enrollment_id,
                 profile_id,
                 segment_index,
-                pcm16,
+                _verification_pcm() if segment_index == 4 else pcm16,
             )
         return status
 
@@ -363,6 +368,81 @@ async def test_segment_requires_explicit_desktop_contract_before_normalization(
     assert normalizers == []
     assert service.status().enrollment is not None
     assert service.status().enrollment.next_segment_index == 1
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_segment_duration_limits_follow_the_48khz_desktop_contract(
+    tmp_path: Path,
+) -> None:
+    target_samples_seen: list[int] = []
+
+    class StrictDurationNormalizer:
+        def __init__(self, _enabled: bool) -> None:
+            pass
+
+        async def normalize(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+            target_samples: int,
+        ) -> bytes:
+            assert sample_rate_hz == 48_000
+            target_samples_seen.append(target_samples)
+            required_source_bytes = target_samples * 3 * 2
+            if len(pcm16) < required_source_bytes:
+                raise EnrollmentAudioNormalizationError("speech_too_short")
+            return bytes(target_samples * 2)
+
+    service, model, _activations, _events = _service(
+        tmp_path,
+        audio_normalizer_factory=StrictDurationNormalizer,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+
+    with pytest.raises(VoiceIdentityServiceError, match="audio_too_long"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _verification_pcm(4_001),
+        )
+    for segment_index in (1, 2, 3):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            segment_index,
+            _verification_pcm(3_000),
+        )
+
+    with pytest.raises(VoiceIdentityServiceError, match="speech_too_short"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            4,
+            _verification_pcm(4_999),
+        )
+    with pytest.raises(VoiceIdentityServiceError, match="audio_too_long"):
+        await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            4,
+            _verification_pcm(5_001),
+        )
+
+    completed = await service.submit_enrollment_segment(
+        enrollment.enrollment_id,
+        "profile-a",
+        4,
+        _verification_pcm(),
+    )
+    assert completed.verification is not None
+    assert completed.verification.passed
+    assert target_samples_seen == [48_000, 48_000, 48_000, 80_000, 80_000]
+    assert model.inference_count == 6
     await service.close()
 
 
@@ -490,7 +570,9 @@ async def test_holdout_first_failure_retries_fourth_second_resets_all(
         _embedding(),
         _embedding(1),
         _embedding(),
+        _embedding(),
         _embedding(1),
+        _embedding(),
         _embedding(),
     ]
     model = _Model(embeddings=embeddings)
@@ -510,19 +592,19 @@ async def test_holdout_first_failure_retries_fourth_second_resets_all(
     assert centroid is not None
 
     for expected_next in (4, 1):
-        with pytest.raises(
-            VoiceIdentityServiceError,
-            match="owner_verification_failed",
-        ):
-            await service.submit_enrollment_segment(
-                enrollment.enrollment_id,
-                "profile-a",
-                4,
-                _pcm(),
-            )
+        result = await service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            4,
+            _verification_pcm(),
+        )
+        assert result.verification is not None
+        assert not result.verification.passed
+        assert result.verification.match_percent == 0
         current = service.status().enrollment
         assert current is not None
         assert current.next_segment_index == expected_next
+        assert service.status().verification is None
     assert np.count_nonzero(centroid) == 0
     assert all(np.count_nonzero(item) == 0 for item in embeddings)
     await service.cancel_enrollment(enrollment.enrollment_id)
@@ -838,18 +920,58 @@ async def test_reference_and_holdout_inference_use_exact_checkpoint_lengths(
                 sample_rate_hz=sample_rate_hz,
             )
 
+    normalizers: list[_AudioNormalizer] = []
+
+    def factory(enabled: bool) -> _AudioNormalizer:
+        normalizer = _AudioNormalizer(enabled)
+        normalizers.append(normalizer)
+        return normalizer
+
     model = LengthRecordingModel()
-    service, _selected, _activations, _events = _service(tmp_path, model=model)
+    service, _selected, _activations, _events = _service(
+        tmp_path,
+        model=model,
+        audio_normalizer_factory=factory,
+    )
     await service.initialize()
     enrollment = await service.start_enrollment()
+    result = service.status()
     for segment_index in range(1, 5):
-        await service.submit_enrollment_segment(
+        result = await service.submit_enrollment_segment(
             enrollment.enrollment_id,
             "profile-a",
             segment_index,
-            _pcm(),
+            _verification_pcm() if segment_index == 4 else _pcm(),
         )
-    assert model.pcm_lengths == [96_000, 96_000, 96_000, 48_000, 96_000]
+    assert [normalizer.calls[0][2] for normalizer in normalizers] == [
+        48_000,
+        48_000,
+        48_000,
+        80_000,
+    ]
+    assert model.pcm_lengths == [
+        96_000,
+        96_000,
+        96_000,
+        48_000,
+        96_000,
+        160_000,
+    ]
+    assert result.verification is not None
+    assert result.verification.passed
+    assert result.verification.match_percent == 100
+    assert result.as_dict()["verification"] == {
+        "passed": True,
+        "match_percent": 100,
+    }
+    assert "verification" not in service.status().as_dict()
+    reconciled = await service.submit_enrollment_segment(
+        enrollment.enrollment_id,
+        "profile-a",
+        4,
+        _verification_pcm(),
+    )
+    assert reconciled.verification is None
     await service.close()
 
 
@@ -932,7 +1054,7 @@ async def test_commit_linearizes_before_concurrent_profile_delete(
             enrollment.enrollment_id,
             "profile-a",
             4,
-            _pcm(),
+            _verification_pcm(),
         )
     )
     assert await asyncio.to_thread(stage_started.wait, 1.0)
@@ -1047,7 +1169,7 @@ async def test_cancel_after_first_holdout_never_starts_second_holdout(
             enrollment.enrollment_id,
             "profile-a",
             4,
-            _pcm(),
+            _verification_pcm(),
         )
     )
     assert await asyncio.to_thread(model.holdout_started.wait, 1.0)
@@ -1424,7 +1546,10 @@ async def test_filter_toggle_delete_and_completion_retry(tmp_path: Path) -> None
         "profile-a",
         b"not reprocessed",
     )
-    assert retry == first
+    assert first.verification is not None
+    assert first.verification.passed
+    assert retry == service.status()
+    assert retry.verification is None
 
     disabled = await service.set_filter(False)
     assert not disabled.state.requested_enabled

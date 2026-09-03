@@ -21,6 +21,7 @@ API_ROOT = "/api/voice-identity"
 PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=48000;channels=1"
 AUDIO_CONTRACT_ID = "owner-campplus-desktop-v1"
 MAX_PCM_BYTES = 48_000 * 4 * 2
+MAX_VERIFICATION_PCM_BYTES = 48_000 * 5 * 2
 MAX_FILTER_JSON_BYTES = 1024
 AUTH_HEADERS = {
     "Origin": "http://testserver",
@@ -279,6 +280,62 @@ def test_binary_segment_upload_forwards_exact_headers_index_and_body_idempotentl
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("passed", "match_percent"),
+    [(False, 31), (True, 72)],
+)
+def test_fourth_segment_verification_is_transient_and_recovery_is_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+    passed: bool,
+    match_percent: int,
+) -> None:
+    service = _fake_service()
+    verification_status = _Status(
+        {
+            **SAFE_STATUS,
+            "verification": {
+                "passed": passed,
+                "match_percent": match_percent,
+            },
+        }
+    )
+    service.submit_enrollment_segment.side_effect = [
+        verification_status,
+        _Status(),
+    ]
+    client = _client(monkeypatch, service)
+    headers = {
+        "Content-Type": PCM_CONTENT_TYPE,
+        "X-Voice-Identity-Enrollment": "enrollment-1",
+        "X-Voice-Identity-Profile": "profile-1",
+        "X-Voice-Identity-Segment": "4",
+    }
+    pcm16 = bytes(MAX_VERIFICATION_PCM_BYTES)
+
+    first = client.put(f"{API_ROOT}/enrollment/segment", content=pcm16, headers=headers)
+    recovered = client.put(
+        f"{API_ROOT}/enrollment/segment", content=pcm16, headers=headers
+    )
+    status = client.get(f"{API_ROOT}/status")
+
+    assert first.status_code == 200
+    assert first.json() == {
+        **SAFE_STATUS,
+        "verification": {
+            "passed": passed,
+            "match_percent": match_percent,
+        },
+    }
+    assert recovered.status_code == 200
+    assert recovered.json() == SAFE_STATUS
+    assert status.status_code == 200
+    assert status.json() == SAFE_STATUS
+    assert "verification" not in recovered.json()
+    assert "verification" not in status.json()
+    _assert_private_values_absent(first.json())
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("segment_header", [None, "", "0", "5", "01", "+1", " 1"])
 def test_segment_upload_requires_canonical_one_to_four_header(
     monkeypatch: pytest.MonkeyPatch,
@@ -436,11 +493,11 @@ def test_segment_upload_rejects_odd_pcm_before_service(
         (2, MAX_PCM_BYTES + 1, 413),
         (3, MAX_PCM_BYTES, 200),
         (3, MAX_PCM_BYTES + 1, 413),
-        (4, MAX_PCM_BYTES, 200),
-        (4, MAX_PCM_BYTES + 1, 413),
+        (4, MAX_VERIFICATION_PCM_BYTES, 200),
+        (4, MAX_VERIFICATION_PCM_BYTES + 1, 413),
     ],
 )
-def test_segment_upload_applies_uniform_size_limit(
+def test_segment_upload_applies_reference_and_verification_size_limits(
     monkeypatch: pytest.MonkeyPatch,
     segment_index: int,
     body_size: int,

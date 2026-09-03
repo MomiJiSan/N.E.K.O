@@ -25,8 +25,11 @@ _PROFILE_HEADER = "X-Voice-Identity-Profile"
 _SEGMENT_HEADER = "X-Voice-Identity-Segment"
 _AUDIO_CONTRACT_HEADER = "X-Voice-Audio-Contract"
 _PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=48000;channels=1"
-_MAX_PCM_BYTES = (
+_MAX_REFERENCE_PCM_BYTES = (
     OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ * 4 * 2
+)
+_MAX_VERIFICATION_PCM_BYTES = (
+    OWNER_CAMPPLUS_DESKTOP_SOURCE_SAMPLE_RATE_HZ * 5 * 2
 )
 _MAX_FILTER_JSON_BYTES = 1024
 
@@ -141,20 +144,25 @@ async def submit_voice_identity_enrollment_segment(request: Request):
             status_code=400,
         )
     segment_index = int(raw_segment_index)
+    maximum_pcm_bytes = (
+        _MAX_VERIFICATION_PCM_BYTES
+        if segment_index == 4
+        else _MAX_REFERENCE_PCM_BYTES
+    )
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
             parsed_content_length = int(content_length)
             if parsed_content_length < 0:
                 raise ValueError
-            if parsed_content_length > _MAX_PCM_BYTES:
+            if parsed_content_length > maximum_pcm_bytes:
                 return JSONResponse(
                     {"error_code": "audio_too_long"},
                     status_code=413,
                 )
         except ValueError:
             return JSONResponse({"error_code": "invalid_pcm"}, status_code=400)
-    pcm16 = await _read_bounded_body(request, _MAX_PCM_BYTES)
+    pcm16 = await _read_bounded_body(request, maximum_pcm_bytes)
     if pcm16 is None:
         return JSONResponse({"error_code": "audio_too_long"}, status_code=413)
     if len(pcm16) % 2:

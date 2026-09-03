@@ -140,6 +140,8 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert 'id="voice-identity-reading-prompt"' in template
     assert 'id="voice-identity-reading-text"' in template
     assert 'data-i18n="voiceIdentity.readingPromptLabel"' in template
+    assert 'id="voice-identity-verification-help"' in template
+    assert 'data-i18n="voiceIdentity.verificationScoreHelp"' in template
     assert 'data-i18n="voiceIdentity.hintSameMicrophone"' in template
     assert 'data-i18n="voiceIdentity.hintDifferentSentence"' in template
     assert "voice-identity-record" not in template
@@ -169,6 +171,10 @@ def test_voice_identity_reading_prompts_exist_in_every_supported_locale() -> Non
         )
         voice_identity = messages["voiceIdentity"]
         assert voice_identity["readingPromptLabel"].strip()
+        assert voice_identity["verificationPrompt"].strip()
+        assert voice_identity["verificationScoreHelp"].strip()
+        assert "{{percent}}" in voice_identity["verificationPassed"]
+        assert "{{percent}}" in voice_identity["verificationRetry"]
         prompts = [voice_identity[f"readingPrompt{index}"] for index in range(1, 13)]
         assert all(prompt.strip() for prompt in prompts)
         assert len(set(prompts)) == 12
@@ -193,7 +199,8 @@ def test_browser_capture_is_one_permission_four_segment_pcm16_and_cancels_on_clo
         "audioWorklet.addModule('/static/audio-processor.js')",
         "Int16Array",
         "TARGET_SAMPLE_RATE = 48000",
-        "RECORDING_MS = 3000",
+        "REFERENCE_RECORDING_MS = 3000",
+        "VERIFICATION_RECORDING_MS = 5000",
         "STREAMING_RESAMPLE_MARGIN_MS = 100",
         "API_ROOT = '/api/voice-identity'",
         "'/enrollment/start'",
@@ -391,6 +398,10 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "hintSameMicrophone",
         "hintNormalVolume",
         "hintDifferentSentence",
+        "verificationPrompt",
+        "verificationScoreHelp",
+        "verificationPassed",
+        "verificationRetry",
         "enrollAndEnable",
         "continueEnrollment",
         "segmentProgress",
@@ -446,8 +457,6 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "freePrompt1",
         "freePrompt2",
         "stepCount",
-        "verificationPassed",
-        "verificationRetry",
     }
     for locale in LOCALES:
         payload = json.loads(
@@ -469,4 +478,5 @@ def test_locale_bootstrap_declares_a_non_empty_locale_cache_key() -> None:
     bootstrap = (ROOT / "static/i18n-i18next.js").read_text(encoding="utf-8")
     locale_version = re.search(r"const\s+LOCALE_VERSION\s*=\s*'([^']+)'", bootstrap)
     assert locale_version and locale_version.group(1).strip()
+    assert locale_version.group(1) == "2026-09-03-voice-identity-five-second-verification"
     assert locale_version.group(1) != "2026-08-07-credentials-console-guide"
