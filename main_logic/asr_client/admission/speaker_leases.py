@@ -25,6 +25,7 @@ MAX_SPEAKER_LEASE_CHILDREN = 8
 _TERMINAL_STATES = {
     SpeakerLeaseState.ALLOW,
     SpeakerLeaseState.DENY_LATCHED,
+    SpeakerLeaseState.MIXED_DENY_LATCHED,
     SpeakerLeaseState.UNAVAILABLE,
     SpeakerLeaseState.ABANDONED,
 }
@@ -135,7 +136,10 @@ def reduce_speaker_lease(
     if not isinstance(event, _EVENT_TYPES):
         raise TypeError("event must be SpeakerLeaseEvent")
 
-    if record.state is SpeakerLeaseState.DENY_LATCHED:
+    if record.state in {
+        SpeakerLeaseState.DENY_LATCHED,
+        SpeakerLeaseState.MIXED_DENY_LATCHED,
+    }:
         return record, (CountDiagnostic("speaker_lease_late_fact_stale_count"),)
 
     if isinstance(event, SpeakerLeaseAbandoned):
@@ -145,6 +149,7 @@ def reduce_speaker_lease(
             record,
             state=SpeakerLeaseState.ABANDONED,
             terminal_sequence_no=record.last_speaker_sequence_no,
+            terminal_event=event,
         ), ()
 
     if record.state in _TERMINAL_STATES:
@@ -158,11 +163,20 @@ def reduce_speaker_lease(
         through = event.through_sequence_no
         if type(through) is not int or through < record.last_speaker_sequence_no:
             return record, (CountDiagnostic("speaker_lease_late_fact_stale_count"),)
+        if record.state is SpeakerLeaseState.HIGH_SEEN:
+            return _changed(
+                record,
+                state=SpeakerLeaseState.ALLOW,
+                terminal_sequence_no=through,
+                capture_through_sequence_no=through,
+                terminal_event=event,
+            ), (CountDiagnostic("speaker_lease_allow_count"),)
         return _changed(
             record,
             state=SpeakerLeaseState.UNAVAILABLE,
             terminal_sequence_no=through,
             capture_through_sequence_no=through,
+            terminal_event=event,
         ), (CountDiagnostic("speaker_lease_capture_closed_unavailable_count"),)
 
     sequence_no = getattr(event, "sequence_no", None)
@@ -176,6 +190,14 @@ def reduce_speaker_lease(
     if isinstance(event, SpeakerLeaseLow):
         if type(event.checkpoint_kind) is not SpeakerCheckpointKind:
             raise TypeError("checkpoint_kind must be SpeakerCheckpointKind")
+        if record.state is SpeakerLeaseState.HIGH_SEEN:
+            return _changed(
+                record,
+                state=SpeakerLeaseState.MIXED_DENY_LATCHED,
+                last_speaker_sequence_no=sequence_no,
+                terminal_sequence_no=sequence_no,
+                terminal_event=event,
+            ), (CountDiagnostic("speaker_lease_mixed_deny_latched_count"),)
         if record.state is SpeakerLeaseState.FIRST_LOW and event.checkpoint_kind in {
             SpeakerCheckpointKind.SECOND,
             SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
@@ -185,6 +207,7 @@ def reduce_speaker_lease(
                 state=SpeakerLeaseState.DENY_LATCHED,
                 last_speaker_sequence_no=sequence_no,
                 terminal_sequence_no=sequence_no,
+                terminal_event=event,
             ), (CountDiagnostic("speaker_lease_deny_latched_count"),)
         if (
             record.state is SpeakerLeaseState.COLLECTING
@@ -205,15 +228,23 @@ def reduce_speaker_lease(
             state=SpeakerLeaseState.UNAVAILABLE,
             last_speaker_sequence_no=sequence_no,
             terminal_sequence_no=sequence_no,
+            terminal_event=event,
         ), (CountDiagnostic("speaker_lease_low_without_first_count"),)
 
     if isinstance(event, SpeakerLeaseHigh):
+        if record.state is SpeakerLeaseState.FIRST_LOW:
+            return _changed(
+                record,
+                state=SpeakerLeaseState.MIXED_DENY_LATCHED,
+                last_speaker_sequence_no=sequence_no,
+                terminal_sequence_no=sequence_no,
+                terminal_event=event,
+            ), (CountDiagnostic("speaker_lease_mixed_deny_latched_count"),)
         return _changed(
             record,
-            state=SpeakerLeaseState.ALLOW,
+            state=SpeakerLeaseState.HIGH_SEEN,
             last_speaker_sequence_no=sequence_no,
-            terminal_sequence_no=sequence_no,
-        ), (CountDiagnostic("speaker_lease_allow_count"),)
+        ), (CountDiagnostic("speaker_lease_high_seen_count"),)
 
     if isinstance(event, SpeakerLeaseUnavailable):
         return _changed(
@@ -221,6 +252,7 @@ def reduce_speaker_lease(
             state=SpeakerLeaseState.UNAVAILABLE,
             last_speaker_sequence_no=sequence_no,
             terminal_sequence_no=sequence_no,
+            terminal_event=event,
         ), (CountDiagnostic("speaker_lease_unavailable_count"),)
 
     raise TypeError("unsupported speaker lease event")

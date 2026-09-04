@@ -13,6 +13,7 @@ import pytest
 from main_logic.asr_client.speaker_shadow.contracts import (
     MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES,
     SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+    SpeakerShadowBatchReconcileReceipt,
     SpeakerShadowBatchReconcileRequest,
     SpeakerShadowCandidateKey,
     SpeakerShadowCaptureDecisionState,
@@ -28,6 +29,8 @@ from main_logic.asr_client.speaker_shadow.runtime import (
     _AudioFrame,
     _BackendProcessHost,
     _CandidateActivated,
+    _CandidateBatchReconciliation,
+    _CandidateBuffer,
     _CandidateDeferred,
     _CandidateFinished,
     _CandidateToken,
@@ -845,6 +848,321 @@ async def test_batch_reconcile_merges_pause_and_owns_finish_checkpoint_order() -
     assert runtime.snapshot()["reconciliation_batch_applied_count"] == 1
     assert runtime.snapshot()["reconciliation_batch_failed_count"] == 0
     assert runtime.snapshot()["reconciliation_batch_revoked_count"] == 0
+    await runtime.close()
+
+
+async def test_prepared_exact_interval_is_invisible_until_commit_and_abort_restores_source() -> (
+    None
+):
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    source = _candidate(9_250)
+    target = _candidate(9_251)
+    suffix = _candidate(9_252)
+    try:
+        assert runtime.submit(
+            _tagged_pcm(1_000, 0x31),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        source_token = runtime._candidate_tokens[source]
+        original_samples = source_token.accepted_sample_count
+        receipt = runtime.prepare_exact_interval(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(
+                        source,
+                        1_000,
+                        keep_start_ms=200,
+                        keep_end_ms=700,
+                    ),
+                ),
+                target=target,
+                suffix=suffix,
+            )
+        )
+
+        assert receipt is not None
+        assert source_token.pcm_frozen is True
+        assert target in runtime._candidate_tokens
+        assert suffix in runtime._candidate_tokens
+        assert not runtime._reconciliations
+        assert all(
+            not isinstance(item, _CandidateBatchReconciliation)
+            for item in tuple(runtime._queue._queue)
+        )
+        assert runtime.snapshot()["reconciliation_batch_admitted_count"] == 0
+
+        assert runtime.abort_exact_interval(receipt)
+        assert not runtime.abort_exact_interval(receipt)
+        assert source_token.pcm_frozen is False
+        assert source_token.accepted_sample_count == original_samples
+        assert source_token.finish_state == "open"
+        assert target not in runtime._candidate_tokens
+        assert suffix not in runtime._candidate_tokens
+        assert runtime._queued_terminal_count == 0
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_prepared_exact_interval_commit_publishes_one_marker_and_successor() -> (
+    None
+):
+    completions: list[SpeakerShadowCompletion] = []
+
+    async def complete(completion: SpeakerShadowCompletion) -> None:
+        completions.append(completion)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+        on_completion=complete,
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    source = _candidate(9_253)
+    target = _candidate(9_254)
+    suffix = _candidate(9_255)
+    try:
+        assert runtime.submit(
+            _tagged_pcm(1_000, 0x41),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        receipt = runtime.prepare_exact_interval(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(
+                        source,
+                        1_000,
+                        keep_start_ms=200,
+                        keep_end_ms=700,
+                    ),
+                ),
+                target=target,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        assert completions == []
+        staged = runtime.submit_capture(
+            _tagged_pcm(100, 0x52),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        assert staged.accepted_sample_count == 100 * 16
+        assert staged.cumulative_sample_count == 1_100 * 16
+        assert runtime.commit_exact_interval(receipt)
+        assert not runtime.commit_exact_interval(receipt)
+        assert len(runtime._reconciliations) == 1
+        assert sum(
+            isinstance(item, _CandidateBatchReconciliation)
+            for item in tuple(runtime._queue._queue)
+        ) == 1
+
+        hold_worker.set()
+        await fake_worker
+        runtime._worker_task = None
+        await runtime.wait_idle()
+
+        assert runtime.reconciliation_status(receipt) == "applied"
+        assert runtime._finalized[source].terminal_reason == "dropped"
+        assert bytes(runtime._buffers[suffix].pcm16) == (
+            _tagged_pcm(300, 0x41) + _tagged_pcm(100, 0x52)
+        )
+        assert completions == [SpeakerShadowCompletion(target, "insufficient", None)]
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_prepared_exact_interval_abort_reports_staged_pcm_restore_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker
+    source = _candidate(9_262)
+    target = _candidate(9_263)
+    suffix = _candidate(9_264)
+    try:
+        assert runtime.submit(
+            _tagged_pcm(1_000, 0x61),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        source_token = runtime._candidate_tokens[source]
+        original_samples = source_token.accepted_sample_count
+        receipt = runtime.prepare_exact_interval(
+            SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    _reconcile_source(
+                        source,
+                        1_000,
+                        keep_start_ms=200,
+                        keep_end_ms=700,
+                    ),
+                ),
+                target=target,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        staged = runtime.submit_capture(
+            _tagged_pcm(100, 0x62),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=source,
+        )
+        assert staged.accepted_sample_count == 100 * 16
+        scratch = runtime._prepared_exact_intervals[
+            receipt.batch_id
+        ].suffix_scratch_pcm16
+        assert any(scratch)
+        monkeypatch.setattr(runtime, "_ensure_worker", lambda: False)
+
+        assert not runtime.abort_exact_interval(receipt)
+        assert not runtime._prepared_exact_intervals
+        assert source_token.accepted_sample_count == original_samples
+        assert target not in runtime._candidate_tokens
+        assert suffix not in runtime._candidate_tokens
+        assert not any(scratch)
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_prepared_exact_interval_rejects_forged_stale_and_repeated_receipts() -> (
+    None
+):
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    source = _candidate(9_256)
+    assert runtime.submit(
+        _pcm(400),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=source,
+    )
+    receipt = runtime.prepare_exact_interval(
+        SpeakerShadowBatchReconcileRequest(
+            sources=(_reconcile_source(source, 400),),
+            target=source,
+        )
+    )
+    assert receipt is not None
+    forged = SpeakerShadowBatchReconcileReceipt(
+        runtime_generation=receipt.runtime_generation,
+        batch_id=receipt.batch_id,
+        target=receipt.target,
+        suffix=receipt.suffix,
+        target_sample_count=receipt.target_sample_count,
+        suffix_sample_count=receipt.suffix_sample_count,
+        _owner=object(),
+    )
+    assert not runtime.commit_exact_interval(forged)
+    assert not runtime.abort_exact_interval(forged)
+    assert runtime.abort_exact_interval(receipt)
+    assert not runtime.abort_exact_interval(receipt)
+    assert not runtime.commit_exact_interval(receipt)
+    await runtime.close()
+
+
+async def test_prepared_exact_interval_abort_wipes_unexpected_provisional_buffer() -> (
+    None
+):
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    source = _candidate(9_257)
+    target = _candidate(9_258)
+    assert runtime.submit(
+        _pcm(400),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=source,
+    )
+    receipt = runtime.prepare_exact_interval(
+        SpeakerShadowBatchReconcileRequest(
+            sources=(_reconcile_source(source, 400),),
+            target=target,
+        )
+    )
+    assert receipt is not None
+    token = runtime._candidate_tokens[target]
+    scratch = bytearray(b"\x55\x00" * 10)
+    runtime._buffers[target] = _CandidateBuffer(
+        token=token,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        pcm16=scratch,
+        sample_count=10,
+    )
+
+    assert runtime.abort_exact_interval(receipt)
+    assert target not in runtime._buffers
+    assert not any(scratch)
+    await runtime.close()
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+async def test_prepared_exact_interval_is_automatically_aborted_on_lifecycle_reset(
+    operation: str,
+) -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(),
+        config=_provider_gate_config(),
+    )
+    source = _candidate(9_259)
+    target = _candidate(9_260)
+    suffix = _candidate(9_261)
+    assert runtime.submit(
+        _pcm(400),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=source,
+    )
+    receipt = runtime.prepare_exact_interval(
+        SpeakerShadowBatchReconcileRequest(
+            sources=(_reconcile_source(source, 400, keep_end_ms=300),),
+            target=target,
+            suffix=suffix,
+        )
+    )
+    assert receipt is not None
+    staged = runtime.submit_capture(
+        _pcm(50),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=source,
+    )
+    assert staged.accepted_sample_count == 50 * 16
+    scratch = runtime._prepared_exact_intervals[
+        receipt.batch_id
+    ].suffix_scratch_pcm16
+    assert any(scratch)
+
+    if operation == "reset":
+        await runtime.reset()
+    else:
+        await runtime.close()
+
+    assert not runtime._prepared_exact_intervals
+    assert runtime._queued_data_item_count == 0
+    assert runtime._queued_terminal_count == 0
+    assert not any(scratch)
+    assert not runtime.abort_exact_interval(receipt)
     await runtime.close()
 
 

@@ -164,7 +164,12 @@ class SpeakerShadowBatchReconcileRequest:
 
 @dataclass(frozen=True, slots=True)
 class SpeakerShadowBatchReconcileReceipt:
-    """Opaque reservation receipt returned only after atomic queue admission."""
+    """Opaque receipt for atomically reserved reconciliation ownership.
+
+    Immediate batch reconciliation publishes its marker before returning;
+    staged exact reconciliation returns the same receipt after reserving queue
+    capacity but before publication.
+    """
 
     runtime_generation: int
     batch_id: int
@@ -744,6 +749,32 @@ class SpeakerShadowBatchReconciliationControl(Protocol):
         self,
         receipt: SpeakerShadowBatchReconcileReceipt,
     ) -> None: ...
+
+
+@runtime_checkable
+class SpeakerShadowExactIntervalControl(Protocol):
+    """Optional staged ownership transfer for one exact Provider interval.
+
+    Preparation freezes the source and reserves all candidate and queue
+    capacity, but does not publish work to the shadow worker.  The opaque
+    receipt is intentionally consumed only by DetectorRuntime; callers must
+    either commit or abort it exactly once.
+    """
+
+    def prepare_exact_interval(
+        self,
+        request: SpeakerShadowBatchReconcileRequest,
+    ) -> SpeakerShadowBatchReconcileReceipt | None: ...
+
+    def commit_exact_interval(
+        self,
+        receipt: SpeakerShadowBatchReconcileReceipt,
+    ) -> bool: ...
+
+    def abort_exact_interval(
+        self,
+        receipt: SpeakerShadowBatchReconcileReceipt,
+    ) -> bool: ...
 
 
 @runtime_checkable

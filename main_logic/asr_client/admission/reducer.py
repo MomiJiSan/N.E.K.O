@@ -322,6 +322,7 @@ def _resolve(
         provider_final_state=final_state,
         resolution_ticket=resolution_ticket,
         partial_settlement_disposition=partial_disposition,
+        exact_interval_hold_id=None,
         **revoked_inflight,
     )
     return record, tuple(effects)
@@ -424,6 +425,89 @@ def _settle_forward_partial_if_terminal(
     )
 
 
+def hold_exact_interval_final(
+    record: VoiceTurnAdmissionRecord,
+    final: PendingProviderFinal,
+) -> VoiceTurnAdmissionRecord:
+    """Store one exact-held final without scheduling generic resolution work."""
+
+    if type(record) is not VoiceTurnAdmissionRecord:
+        raise TypeError("record must be VoiceTurnAdmissionRecord")
+    if type(final) is not PendingProviderFinal:
+        raise TypeError("final must be PendingProviderFinal")
+    if record.exact_interval_hold_id is None:
+        raise ValueError("record is not exact-interval held")
+    if record.terminal_disposition is not None:
+        return record
+    if final.provider_key != record.provider_key:
+        raise ValueError("exact interval final provider key mismatch")
+    if record.pending_final is not None:
+        if record.pending_final != final:
+            raise ValueError("conflicting exact interval final")
+        return record
+    return _changed(
+        record,
+        provider_final_state=ProviderFinalState.RECEIVED,
+        pending_final=final,
+        admission_state=AdmissionState.PENDING,
+    )
+
+
+def resolve_exact_interval(
+    record: VoiceTurnAdmissionRecord,
+    disposition: AdmissionDisposition,
+) -> tuple[VoiceTurnAdmissionRecord, tuple[AdmissionEffect, ...]]:
+    """Resolve one exact child locally without transport-wide side effects."""
+
+    if type(record) is not VoiceTurnAdmissionRecord:
+        raise TypeError("record must be VoiceTurnAdmissionRecord")
+    if disposition not in {
+        AdmissionDisposition.FORWARD,
+        AdmissionDisposition.DROP,
+    }:
+        raise ValueError("exact interval disposition must be FORWARD or DROP")
+    if record.exact_interval_hold_id is None:
+        raise ValueError("record is not exact-interval held")
+    if record.terminal_disposition is not None:
+        return record, ()
+    if record.pending_final is None:
+        raise ValueError("exact interval resolution requires a held final")
+    if (
+        record.rejection_capability is not None
+        or record.rejection_apply_state is not RejectionApplyState.NOT_STARTED
+        or record.partial_settlement_disposition is not None
+        or record.resolution_ticket is not None
+    ):
+        raise ValueError("exact interval record has incompatible authority")
+    nonce = record.operation_nonce_sequence + 1
+    ticket = AdmissionResolutionTicket(
+        turn_token=record.turn_token,
+        record_generation=record.record_generation,
+        resolution_nonce=nonce,
+        disposition=disposition,
+    )
+    resolved = _changed(
+        record,
+        operation_nonce_sequence=nonce,
+        admission_state=(
+            AdmissionState.FORWARDED
+            if disposition is AdmissionDisposition.FORWARD
+            else AdmissionState.DROPPED
+        ),
+        resolution_ticket=ticket,
+        partial_settlement_disposition=disposition,
+        exact_interval_hold_id=None,
+    )
+    return resolved, (
+        SettlePartial(
+            turn_token=record.turn_token,
+            record_generation=record.record_generation,
+            disposition=disposition,
+        ),
+        ResolveReserved(ticket=ticket, final=record.pending_final),
+    )
+
+
 def maybe_resolve(
     record: VoiceTurnAdmissionRecord,
     now: float,
@@ -431,6 +515,8 @@ def maybe_resolve(
     """Resolve one reservation if the accumulated facts make it terminal."""
 
     if record.admission_state in _TERMINAL_ADMISSION_STATES:
+        return record, ()
+    if record.exact_interval_hold_id is not None:
         return record, ()
     if record.evidence_state is EvidenceState.DENY_LATCHED:
         return _resolve(record, AdmissionDisposition.DROP)
@@ -1342,4 +1428,9 @@ def reduce(
     return _track_revocation_effects(reduced, effects)
 
 
-__all__ = ["maybe_resolve", "reduce"]
+__all__ = [
+    "hold_exact_interval_final",
+    "maybe_resolve",
+    "reduce",
+    "resolve_exact_interval",
+]

@@ -8,7 +8,7 @@ refer to them here only through bounded immutable identifiers.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeAlias
 
@@ -121,10 +121,22 @@ class SpeakerLeaseState(StrEnum):
 
     COLLECTING = "collecting"
     FIRST_LOW = "first_low"
+    HIGH_SEEN = "high_seen"
     ALLOW = "allow"
     DENY_LATCHED = "deny_latched"
+    MIXED_DENY_LATCHED = "mixed_deny_latched"
     UNAVAILABLE = "unavailable"
     ABANDONED = "abandoned"
+
+
+class ExactIntervalOutcome(StrEnum):
+    PROMOTED = "promoted"
+    ABORTED = "aborted"
+    ACTIVATED = "activated"
+    HELD = "held"
+    RESOLVED = "resolved"
+    STALE = "stale"
+    CONFLICT = "conflict"
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +190,7 @@ class SpeakerCaptureLeaseRecord:
     terminal_sequence_no: int | None = None
     capture_through_sequence_no: int | None = None
     child_bindings: tuple[SpeakerLeaseChildBinding, ...] = ()
+    terminal_event: SpeakerLeaseEvent | None = None
 
     def __post_init__(self) -> None:
         if type(self.lease_token) is not SpeakerCaptureLeaseToken:
@@ -210,6 +223,7 @@ class SpeakerCaptureLeaseRecord:
             in {
                 SpeakerLeaseState.COLLECTING,
                 SpeakerLeaseState.FIRST_LOW,
+                SpeakerLeaseState.HIGH_SEEN,
             }
             and self.terminal_sequence_no is not None
         ):
@@ -219,10 +233,29 @@ class SpeakerCaptureLeaseRecord:
             not in {
                 SpeakerLeaseState.COLLECTING,
                 SpeakerLeaseState.FIRST_LOW,
+                SpeakerLeaseState.HIGH_SEEN,
             }
             and self.terminal_sequence_no is None
         ):
             raise ValueError("terminal speaker lease requires a terminal fence")
+        pending = self.state in {
+            SpeakerLeaseState.COLLECTING,
+            SpeakerLeaseState.FIRST_LOW,
+            SpeakerLeaseState.HIGH_SEEN,
+        }
+        if pending and self.terminal_event is not None:
+            raise ValueError("pending speaker lease cannot have a terminal event")
+        if self.terminal_event is not None and not isinstance(
+            self.terminal_event,
+            (
+                SpeakerLeaseAbandoned,
+                SpeakerLeaseCaptureClosed,
+                SpeakerLeaseHigh,
+                SpeakerLeaseLow,
+                SpeakerLeaseUnavailable,
+            ),
+        ):
+            raise TypeError("terminal_event must be SpeakerLeaseEvent or None")
         keys = tuple(binding.provider_key for binding in self.child_bindings)
         turns = tuple(binding.turn_token for binding in self.child_bindings)
         if len(set(keys)) != len(keys) or len(set(turns)) != len(turns):
@@ -233,6 +266,7 @@ class SpeakerCaptureLeaseRecord:
         return {
             SpeakerLeaseState.ALLOW: AdmissionDisposition.FORWARD,
             SpeakerLeaseState.DENY_LATCHED: AdmissionDisposition.DROP,
+            SpeakerLeaseState.MIXED_DENY_LATCHED: AdmissionDisposition.DROP,
             SpeakerLeaseState.UNAVAILABLE: AdmissionDisposition.FORWARD,
             SpeakerLeaseState.ABANDONED: AdmissionDisposition.ABANDON,
         }.get(self.state)
@@ -278,6 +312,50 @@ SpeakerLeaseEvent: TypeAlias = (
 
 
 @dataclass(frozen=True, slots=True)
+class SpeakerLeaseTerminalClaim:
+    """Opaque one-shot CAS authority for a prepared DROP terminal transition."""
+
+    lease_token: SpeakerCaptureLeaseToken
+    record_generation: int
+    expected_logical_revision: int
+    event: SpeakerLeaseEvent
+    expected_terminal_state: SpeakerLeaseState
+    claim_nonce: int
+    _owner: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        for name in ("record_generation", "claim_nonce"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            type(self.expected_logical_revision) is not int
+            or self.expected_logical_revision < 0
+        ):
+            raise ValueError("expected_logical_revision must be non-negative")
+        if not isinstance(
+            self.event,
+            (
+                SpeakerLeaseAbandoned,
+                SpeakerLeaseCaptureClosed,
+                SpeakerLeaseHigh,
+                SpeakerLeaseLow,
+                SpeakerLeaseUnavailable,
+            ),
+        ):
+            raise TypeError("event must be SpeakerLeaseEvent")
+        if self.expected_terminal_state not in {
+            SpeakerLeaseState.DENY_LATCHED,
+            SpeakerLeaseState.MIXED_DENY_LATCHED,
+        }:
+            raise ValueError("terminal claim must target a DROP speaker lease state")
+        if self._owner is None:
+            raise ValueError("terminal claim owner is required")
+
+
+@dataclass(frozen=True, slots=True)
 class BoundaryProof:
     """Opaque ownership result captured before an ordered turn is bound."""
 
@@ -292,6 +370,174 @@ class BoundaryProof:
             raise ValueError("owner_generation must be a non-negative integer")
         if type(self.provider_key) is not ProviderUtteranceKey:
             raise TypeError("provider_key must be ProviderUtteranceKey")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalPromotionScope:
+    """Exact identities required to move one sole tail child out of a lease."""
+
+    parent_lease_token: SpeakerCaptureLeaseToken
+    parent_record_generation: int
+    expected_parent_logical_revision: int
+    expected_parent_state: SpeakerLeaseState
+    turn_token: VoiceTurnToken
+    child_record_generation: int
+    expected_child_logical_revision: int
+    provider_key: ProviderUtteranceKey
+    boundary_proof: BoundaryProof
+    target_candidate: SpeakerShadowCandidateKey
+    successor_candidate: SpeakerShadowCandidateKey | None
+
+    def __post_init__(self) -> None:
+        if type(self.parent_lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("parent_lease_token must be SpeakerCaptureLeaseToken")
+        for name in ("parent_record_generation", "child_record_generation"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in (
+            "expected_parent_logical_revision",
+            "expected_child_logical_revision",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.expected_parent_state not in {
+            SpeakerLeaseState.COLLECTING,
+            SpeakerLeaseState.FIRST_LOW,
+            SpeakerLeaseState.HIGH_SEEN,
+        }:
+            raise ValueError("exact interval requires a pending parent state")
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+        if type(self.boundary_proof) is not BoundaryProof:
+            raise TypeError("boundary_proof must be BoundaryProof")
+        if self.boundary_proof.provider_key != self.provider_key:
+            raise ValueError("boundary proof must match provider_key")
+        if type(self.target_candidate) is not SpeakerShadowCandidateKey:
+            raise TypeError("target_candidate must be SpeakerShadowCandidateKey")
+        if self.successor_candidate is not None and (
+            type(self.successor_candidate) is not SpeakerShadowCandidateKey
+        ):
+            raise TypeError(
+                "successor_candidate must be SpeakerShadowCandidateKey or None"
+            )
+        if self.successor_candidate == self.target_candidate:
+            raise ValueError("successor_candidate must differ from target_candidate")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalPromotionReceipt:
+    interval_id: int
+    scope: ExactIntervalPromotionScope
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.interval_id) is not int or self.interval_id < 1:
+            raise ValueError("interval_id must be a positive integer")
+        if type(self.scope) is not ExactIntervalPromotionScope:
+            raise TypeError("scope must be ExactIntervalPromotionScope")
+        if self._owner is None or self._token is None:
+            raise ValueError("promotion receipt authority is required")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalPromotionResult:
+    outcome: ExactIntervalOutcome
+    receipt: ExactIntervalPromotionReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome is ExactIntervalOutcome.PROMOTED:
+            if type(self.receipt) is not ExactIntervalPromotionReceipt:
+                raise ValueError("promoted result requires a receipt")
+        elif self.outcome not in {
+            ExactIntervalOutcome.STALE,
+            ExactIntervalOutcome.CONFLICT,
+        }:
+            raise ValueError("invalid promotion outcome")
+        elif self.receipt is not None:
+            raise ValueError("failed promotion cannot carry a receipt")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalAbortResult:
+    outcome: ExactIntervalOutcome
+
+    def __post_init__(self) -> None:
+        if self.outcome not in {
+            ExactIntervalOutcome.ABORTED,
+            ExactIntervalOutcome.STALE,
+            ExactIntervalOutcome.CONFLICT,
+        }:
+            raise ValueError("invalid exact interval abort outcome")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalActivationReceipt:
+    interval_id: int
+    turn_token: VoiceTurnToken
+    child_record_generation: int
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.interval_id) is not int or self.interval_id < 1:
+            raise ValueError("interval_id must be a positive integer")
+        if type(self.turn_token) is not VoiceTurnToken:
+            raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.child_record_generation) is not int or (
+            self.child_record_generation < 1
+        ):
+            raise ValueError("child_record_generation must be positive")
+        if self._owner is None or self._token is None:
+            raise ValueError("activation receipt authority is required")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalActivationResult:
+    outcome: ExactIntervalOutcome
+    receipt: ExactIntervalActivationReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome is ExactIntervalOutcome.ACTIVATED:
+            if type(self.receipt) is not ExactIntervalActivationReceipt:
+                raise ValueError("activated result requires a receipt")
+        elif self.outcome not in {
+            ExactIntervalOutcome.STALE,
+            ExactIntervalOutcome.CONFLICT,
+        }:
+            raise ValueError("invalid activation outcome")
+        elif self.receipt is not None:
+            raise ValueError("failed activation cannot carry a receipt")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactIntervalTransitionReceipt:
+    interval_id: int
+    outcome: ExactIntervalOutcome
+    disposition: AdmissionDisposition | None
+    effects: tuple[AdmissionEffect, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.interval_id) is not int or self.interval_id < 1:
+            raise ValueError("interval_id must be a positive integer")
+        if self.outcome is ExactIntervalOutcome.RESOLVED:
+            if self.disposition not in {
+                AdmissionDisposition.FORWARD,
+                AdmissionDisposition.DROP,
+            }:
+                raise ValueError("resolved interval requires local disposition")
+        elif self.outcome not in {
+            ExactIntervalOutcome.HELD,
+            ExactIntervalOutcome.STALE,
+            ExactIntervalOutcome.CONFLICT,
+        }:
+            raise ValueError("invalid exact interval transition outcome")
+        elif self.disposition is not None:
+            raise ValueError("unresolved interval cannot carry disposition")
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +732,7 @@ class VoiceTurnAdmissionRecord:
     provider_boundary_deadline_expired: bool = False
     partial_settlement_disposition: AdmissionDisposition | None = None
     speaker_deny_cleanup_failed_counted: bool = False
+    exact_interval_hold_id: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.turn_token) is not VoiceTurnToken:
@@ -508,6 +755,11 @@ class VoiceTurnAdmissionRecord:
             raise TypeError("provider_boundary_deadline_expired must be bool")
         if type(self.speaker_deny_cleanup_failed_counted) is not bool:
             raise TypeError("speaker_deny_cleanup_failed_counted must be bool")
+        if self.exact_interval_hold_id is not None and (
+            type(self.exact_interval_hold_id) is not int
+            or self.exact_interval_hold_id < 1
+        ):
+            raise ValueError("exact_interval_hold_id must be positive or None")
         if (
             self.partial_settlement_disposition is not None
             and type(self.partial_settlement_disposition) is not AdmissionDisposition
@@ -917,6 +1169,7 @@ class AdmissionBulkResult:
         if self.speaker_lease_terminal_state in {
             SpeakerLeaseState.COLLECTING,
             SpeakerLeaseState.FIRST_LOW,
+            SpeakerLeaseState.HIGH_SEEN,
         }:
             raise ValueError("speaker lease bulk result requires a terminal state")
 
@@ -952,3 +1205,8 @@ class SpeakerLeaseTransitionReceipt:
             raise TypeError("after_state must be SpeakerLeaseState")
         if type(self.outcome) is not SpeakerLeaseTransitionOutcome:
             raise TypeError("outcome must be SpeakerLeaseTransitionOutcome")
+
+
+SpeakerLeasePreparedTransition: TypeAlias = (
+    SpeakerLeaseTransitionReceipt | SpeakerLeaseTerminalClaim
+)

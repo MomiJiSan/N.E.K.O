@@ -7,11 +7,14 @@ import pytest
 from main_logic.asr_client._provider_events import ProviderUtteranceKey
 from main_logic.asr_client.admission.contracts import (
     AdmissionDisposition,
+    BoundaryProof,
     BoundaryExact,
     CandidateBound,
     CaptureClosed,
     CoreSettled,
     EvidenceState,
+    ExactIntervalOutcome,
+    ExactIntervalPromotionScope,
     LifecycleSettled,
     PendingProviderFinal,
     ProviderFinalReceived,
@@ -19,9 +22,16 @@ from main_logic.asr_client.admission.contracts import (
     RejectionCapabilityKind,
     ResolveReserved,
     RouteReplaced,
+    SpeakerCaptureLeaseToken,
     SpeakerAuthorityPending,
     SpeakerAuthorityUnarmed,
     SpeakerCheckpointKind,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLeaseState,
+    SpeakerLeaseTerminalClaim,
+    SpeakerLeaseTransitionOutcome,
+    SpeakerLeaseTransitionReceipt,
     SpeakerLow,
     SpeakerUnavailable,
     TransportSettled,
@@ -49,6 +59,14 @@ def _token(turn_id: int = 1) -> VoiceTurnToken:
 
 def _candidate() -> SpeakerShadowCandidateKey:
     return SpeakerShadowCandidateKey(2, 1, "provider_candidate")
+
+
+def _successor() -> SpeakerShadowCandidateKey:
+    return SpeakerShadowCandidateKey(2, 2, "provider_candidate")
+
+
+def _lease() -> SpeakerCaptureLeaseToken:
+    return SpeakerCaptureLeaseToken(1, 2, 3, 4, 5)
 
 
 def _boundary(token: VoiceTurnToken, capability_id: int) -> BoundaryExact:
@@ -466,3 +484,287 @@ async def test_waiter_cancellation_does_not_cancel_accepted_final_ownership():
     record = await coordinator.get_record(token)
     assert record is not None
     assert record.admission_state.value == "forwarded"
+
+
+async def test_terminal_claim_commit_is_fifo_ordered_after_intervening_fact():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease = _lease()
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+    claim = await lane.prepare_speaker_lease_transition(
+        lease,
+        SpeakerLeaseHigh(_candidate(), 2),
+    )
+    assert claim is not None
+
+    await coordinator._lock.acquire()
+    try:
+        intervening = lane.post_speaker_lease_nowait(
+            lease,
+            SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.FIRST),
+        )
+        committed = lane.commit_speaker_lease_terminal_claim_nowait(claim)
+        await asyncio.sleep(0)
+        assert lane.pending_speaker_control_count == 2
+    finally:
+        coordinator._lock.release()
+
+    advanced = await intervening
+    stale = await committed
+    parent = await coordinator.get_speaker_lease(lease)
+    assert advanced.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    assert stale.outcome is SpeakerLeaseTransitionOutcome.STALE
+    assert parent is not None
+    assert parent.state is SpeakerLeaseState.FIRST_LOW
+    assert parent.last_speaker_sequence_no == 2
+    await lane.close()
+
+
+async def test_terminal_claim_waiter_cancellation_preserves_accepted_commit():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease = _lease()
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseHigh(_candidate(), 1),
+    )
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+    claim = await lane.prepare_speaker_lease_transition(
+        lease,
+        SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.FIRST),
+    )
+    assert claim is not None
+
+    await coordinator._lock.acquire()
+    waiter = asyncio.create_task(
+        lane.commit_speaker_lease_terminal_claim(claim)
+    )
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert lane.pending_speaker_control_count == 1
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    finally:
+        coordinator._lock.release()
+
+    await lane.close()
+    parent = await coordinator.get_speaker_lease(lease)
+    assert parent is not None
+    assert parent.state is SpeakerLeaseState.MIXED_DENY_LATCHED
+    assert parent.terminal_disposition is AdmissionDisposition.DROP
+
+
+@pytest.mark.parametrize(
+    "events",
+    (
+        (
+            SpeakerLeaseHigh(_candidate(), 1),
+            SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.FIRST),
+        ),
+        (
+            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+            SpeakerLeaseHigh(_candidate(), 2),
+        ),
+    ),
+)
+async def test_fifo_prepare_commits_first_fact_before_preparing_mixed_deny(events):
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease = _lease()
+    await coordinator.open_speaker_lease(lease, _candidate())
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+
+    await coordinator._lock.acquire()
+    try:
+        first = lane.prepare_speaker_lease_transition_nowait(lease, events[0])
+        second = lane.prepare_speaker_lease_transition_nowait(lease, events[1])
+        await asyncio.sleep(0)
+        assert lane.pending_speaker_control_count == 2
+    finally:
+        coordinator._lock.release()
+
+    first_result = await first
+    second_result = await second
+    assert isinstance(first_result, SpeakerLeaseTransitionReceipt)
+    assert first_result.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    assert isinstance(second_result, SpeakerLeaseTerminalClaim)
+    assert (
+        second_result.expected_terminal_state
+        is SpeakerLeaseState.MIXED_DENY_LATCHED
+    )
+    parent = await coordinator.get_speaker_lease(lease)
+    assert parent is not None
+    assert parent.logical_revision == 1
+    await lane.close()
+
+
+async def test_exact_promotion_is_fifo_after_previously_accepted_parent_fact():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    lease, turn = _lease(), _token()
+    key = ProviderUtteranceKey(1, 0, 1)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    child = await coordinator.attach_turn_to_speaker_lease(turn, lease, key)
+    parent = await coordinator.get_speaker_lease(lease)
+    assert parent is not None
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+    scope = ExactIntervalPromotionScope(
+        parent_lease_token=lease,
+        parent_record_generation=parent.record_generation,
+        expected_parent_logical_revision=parent.logical_revision + 1,
+        expected_parent_state=SpeakerLeaseState.HIGH_SEEN,
+        turn_token=turn,
+        child_record_generation=child.record_generation,
+        expected_child_logical_revision=child.logical_revision,
+        provider_key=key,
+        boundary_proof=BoundaryProof(1, 1, key),
+        target_candidate=_candidate(),
+        successor_candidate=_successor(),
+    )
+
+    await coordinator._lock.acquire()
+    try:
+        high = lane.prepare_speaker_lease_transition_nowait(
+            lease,
+            SpeakerLeaseHigh(_candidate(), 1),
+        )
+        promoted = lane.promote_exact_interval_nowait(scope)
+        await asyncio.sleep(0)
+        assert lane.pending_speaker_control_count == 2
+    finally:
+        coordinator._lock.release()
+
+    high_result = await high
+    promoted_result = await promoted
+    assert isinstance(high_result, SpeakerLeaseTransitionReceipt)
+    assert promoted_result.outcome is ExactIntervalOutcome.PROMOTED
+    assert promoted_result.receipt is not None
+    activated = await lane.activate_exact_interval(promoted_result.receipt)
+    assert activated.outcome is ExactIntervalOutcome.ACTIVATED
+    record = await coordinator.get_record(turn)
+    assert record is not None
+    assert record.evidence_state is EvidenceState.ALLOW
+    await lane.close()
+
+
+async def test_exact_final_and_completion_fact_keep_fifo_order():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease, turn = _lease(), _token()
+    key = ProviderUtteranceKey(1, 0, 1)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    child = await coordinator.attach_turn_to_speaker_lease(turn, lease, key)
+    await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+    parent = await coordinator.get_speaker_lease(lease)
+    assert parent is not None
+    scope = ExactIntervalPromotionScope(
+        parent_lease_token=lease,
+        parent_record_generation=parent.record_generation,
+        expected_parent_logical_revision=parent.logical_revision,
+        expected_parent_state=parent.state,
+        turn_token=turn,
+        child_record_generation=child.record_generation,
+        expected_child_logical_revision=child.logical_revision,
+        provider_key=key,
+        boundary_proof=BoundaryProof(1, 1, key),
+        target_candidate=_candidate(),
+        successor_candidate=_successor(),
+    )
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+    promoted = await lane.promote_exact_interval(scope)
+    assert promoted.receipt is not None
+    activated = await lane.activate_exact_interval(promoted.receipt)
+    assert activated.receipt is not None
+
+    await coordinator._lock.acquire()
+    try:
+        final = lane.post_exact_interval_nowait(
+            activated.receipt,
+            ProviderFinalReceived(
+                PendingProviderFinal(key, "qwen", "deny", 10.0, 10.2)
+            ),
+        )
+        completion = lane.post_exact_interval_nowait(
+            activated.receipt,
+            SpeakerLeaseLow(
+                _candidate(),
+                2,
+                SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+            ),
+        )
+        await asyncio.sleep(0)
+        assert lane.pending_speaker_control_count == 2
+    finally:
+        coordinator._lock.release()
+
+    final_result = await final
+    completion_result = await completion
+    assert final_result.outcome is ExactIntervalOutcome.HELD
+    assert completion_result.outcome is ExactIntervalOutcome.RESOLVED
+    assert completion_result.disposition is AdmissionDisposition.DROP
+    await lane.close()
+
+
+async def test_exact_post_waiter_cancellation_does_not_revoke_accepted_fact():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease, turn = _lease(), _token()
+    key = ProviderUtteranceKey(1, 0, 1)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    child = await coordinator.attach_turn_to_speaker_lease(turn, lease, key)
+    parent = await coordinator.get_speaker_lease(lease)
+    assert parent is not None
+    scope = ExactIntervalPromotionScope(
+        parent_lease_token=lease,
+        parent_record_generation=parent.record_generation,
+        expected_parent_logical_revision=parent.logical_revision,
+        expected_parent_state=parent.state,
+        turn_token=turn,
+        child_record_generation=child.record_generation,
+        expected_child_logical_revision=child.logical_revision,
+        provider_key=key,
+        boundary_proof=BoundaryProof(1, 1, key),
+        target_candidate=_candidate(),
+        successor_candidate=_successor(),
+    )
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+    promoted = await lane.promote_exact_interval(scope)
+    assert promoted.receipt is not None
+    activated = await lane.activate_exact_interval(promoted.receipt)
+    assert activated.receipt is not None
+
+    await coordinator._lock.acquire()
+    waiter = asyncio.create_task(
+        lane.post_exact_interval(
+            activated.receipt,
+            ProviderFinalReceived(
+                PendingProviderFinal(key, "qwen", "accepted", 10.0, 10.2)
+            ),
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert lane.pending_speaker_control_count == 1
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    finally:
+        coordinator._lock.release()
+
+    await lane.close()
+    record = await coordinator.get_record(turn)
+    assert record is not None
+    assert record.pending_final is not None
+    assert record.pending_final.text == "accepted"

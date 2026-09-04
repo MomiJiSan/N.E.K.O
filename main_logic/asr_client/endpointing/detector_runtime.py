@@ -69,6 +69,7 @@ from ..speaker_shadow.contracts import (
     SpeakerShadowDecisionStatus,
     SpeakerShadowDeferredCandidateControl,
     SpeakerShadowDeferredCandidateStatus,
+    SpeakerShadowExactIntervalControl,
     SpeakerShadowObserver,
     SpeakerShadowReconcileSource,
     SpeakerShadowReconciliationSettlement,
@@ -1490,6 +1491,31 @@ class ProviderSpeakerEvidenceLease:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderExactSpeakerIntervalReservation:
+    """Opaque, one-shot Detector reservation for one exact Provider range."""
+
+    boundary: ProviderAudioRange
+    target_candidate: SpeakerShadowCandidateKey
+    suffix_candidate: SpeakerShadowCandidateKey | None
+    detector_epoch: int
+    timeline_generation: int
+    lease_generation: int
+    candidate_generation: int
+    shadow_runtime_generation: int
+    _owner: object
+    _token: object
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderExactSpeakerIntervalCommitResult:
+    """Committed exact snapshot and its optional continuing evidence owner."""
+
+    snapshot: ProviderSpeakerBoundarySnapshot
+    target_candidate: SpeakerShadowCandidateKey
+    successor_evidence_lease: ProviderSpeakerEvidenceLease | None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderSpeakerEvidenceUpdate:
     """One ordered capture result plus its no-progress clock position."""
 
@@ -1629,12 +1655,25 @@ class _ProviderSpeakerEvidenceState:
     """Detector-owned mutable state behind one opaque evidence lease."""
 
     lease: ProviderSpeakerEvidenceLease
+    timeline_generation: int
+    start_sample_16k: int
     last_sequence_no: int | None = None
     last_progress_at: float | None = None
     cumulative_sample_count: int = 0
     completed_window_sample_count: int = 0
     capture_state: _ProviderShadowCaptureState = _ProviderShadowCaptureState.COLLECTING
     binding_published: bool = False
+
+
+@dataclass(slots=True)
+class _ProviderExactSpeakerIntervalRecord:
+    reservation: ProviderExactSpeakerIntervalReservation
+    state: _ProviderSpeakerEvidenceState
+    shadow_control: SpeakerShadowExactIntervalControl
+    shadow_receipt: SpeakerShadowBatchReconcileReceipt
+    segment_fingerprint: tuple[tuple[int, ...], ...]
+    prepared_cursor_16k: int
+    next_shadow_generation: int
 
 
 @dataclass(slots=True)
@@ -1949,6 +1988,10 @@ class DetectorRuntime:
         self._provider_speaker_evidence_state: _ProviderSpeakerEvidenceState | None = (
             None
         )
+        self._provider_exact_interval_owner = object()
+        self._provider_exact_interval_records: dict[
+            object, _ProviderExactSpeakerIntervalRecord
+        ] = {}
         self._provider_micro_event_ambiguous_candidates: set[DetectorCandidateKey] = (
             set()
         )
@@ -2411,7 +2454,9 @@ class DetectorRuntime:
             )
             self._provider_speaker_evidence_generation += 1
             self._provider_speaker_evidence_state = _ProviderSpeakerEvidenceState(
-                lease=lease
+                lease=lease,
+                timeline_generation=self._provider_audio_timeline_generation,
+                start_sample_16k=self._provider_audio_sample_cursor_16k,
             )
             self._speaker_rejection_prepare_diagnostics[
                 "provider_speaker_evidence_lease_opened_count"
@@ -2462,6 +2507,422 @@ class DetectorRuntime:
                 ] += 1
                 return False
             return self._abandon_provider_speaker_evidence_locked(state)
+
+    @staticmethod
+    def _provider_exact_interval_segment_fingerprint(
+        segments: tuple[_ProviderSpeakerSegment, ...],
+    ) -> tuple[tuple[int, ...], ...]:
+        return tuple(
+            (
+                id(segment),
+                segment.start_sample_16k,
+                segment.end_sample_16k,
+                segment.first_identity.sequence_no,
+                segment.last_identity.sequence_no,
+                int(segment.ownership_complete),
+                int(segment.ownership_ambiguous),
+                int(segment.shadow_capture_state.value == "unavailable"),
+                int(segment.candidate is None),
+            )
+            for segment in segments
+        )
+
+    def _abort_provider_exact_interval_record(
+        self,
+        record: _ProviderExactSpeakerIntervalRecord,
+    ) -> bool:
+        token = record.reservation._token
+        if self._provider_exact_interval_records.get(token) is not record:
+            return False
+        self._provider_exact_interval_records.pop(token, None)
+        try:
+            aborted = bool(
+                record.shadow_control.abort_exact_interval(record.shadow_receipt)
+            )
+        except Exception:
+            aborted = False
+        state_candidate = record.state.lease.candidate
+        for candidate in (
+            record.reservation.target_candidate,
+            record.reservation.suffix_candidate,
+        ):
+            if candidate is not None and candidate != state_candidate:
+                self._speaker_candidate_owner_generations.pop(candidate, None)
+                self._speaker_candidate_turn_bindings.pop(candidate, None)
+        return aborted
+
+    def _provider_exact_interval_segments_still_current(
+        self,
+        record: _ProviderExactSpeakerIntervalRecord,
+        segments: tuple[_ProviderSpeakerSegment, ...],
+    ) -> bool:
+        original = record.segment_fingerprint
+        if not original or len(segments) < len(original):
+            return False
+        for index, expected in enumerate(original):
+            segment = segments[index]
+            current = self._provider_exact_interval_segment_fingerprint((segment,))[0]
+            if current[0:2] != expected[0:2] or current[3] != expected[3]:
+                return False
+            if index < len(original) - 1:
+                if current != expected:
+                    return False
+            elif (
+                current[2] < expected[2]
+                or current[4] < expected[4]
+                or current[5:] != expected[5:]
+            ):
+                return False
+        for index, segment in enumerate(segments):
+            if (
+                segment.candidate is not None
+                or not segment.evidence_complete
+                or segment.ownership_ambiguous
+                or segment.end_sample_16k <= segment.start_sample_16k
+                or (
+                    index > 0
+                    and segments[index - 1].end_sample_16k
+                    != segment.start_sample_16k
+                )
+            ):
+                return False
+        return bool(
+            segments[0].start_sample_16k == record.state.start_sample_16k
+            and segments[-1].end_sample_16k
+            == self._provider_audio_sample_cursor_16k
+            and self._provider_audio_sample_cursor_16k >= record.prepared_cursor_16k
+            and record.state.cumulative_sample_count
+            == self._provider_audio_sample_cursor_16k
+            - record.state.start_sample_16k
+        )
+
+    async def prepare_provider_exact_speaker_interval(
+        self,
+        boundary: ProviderAudioRange,
+        *,
+        speaker_evidence_lease: ProviderSpeakerEvidenceLease,
+    ) -> ProviderExactSpeakerIntervalReservation | None:
+        """Reserve an exact live-evidence interval without publishing work."""
+
+        async with self._lock:
+            for record in tuple(self._provider_exact_interval_records.values()):
+                if (
+                    record.reservation.detector_epoch == self._detector_epoch
+                    and record.state is self._provider_speaker_evidence_state
+                ):
+                    return None
+                self._abort_provider_exact_interval_record(record)
+            if (
+                self._closed
+                or self._semantic_adapter is not None
+                or type(boundary) is not ProviderAudioRange
+            ):
+                return None
+            state = self._provider_speaker_evidence_state_for(
+                speaker_evidence_lease
+            )
+            shadow = self._speaker_shadow
+            control = (
+                shadow
+                if isinstance(shadow, SpeakerShadowExactIntervalControl)
+                else None
+            )
+            segments = tuple(self._provider_speaker_segments)
+            cursor = self._provider_audio_sample_cursor_16k
+            if (
+                state is None
+                or control is None
+                or state.capture_state is _ProviderShadowCaptureState.UNAVAILABLE
+                or state.timeline_generation
+                != self._provider_audio_timeline_generation
+                or not self._provider_segment_ordered_mode
+                or self._provider_segment_alignment_lost
+                or not segments
+                or state.start_sample_16k < 0
+                or boundary.start_sample_16k < state.start_sample_16k
+                or boundary.end_sample_16k > cursor
+                or state.cumulative_sample_count
+                != cursor - state.start_sample_16k
+                or len(self._provider_preseal_entries)
+                >= _PROVIDER_SEGMENT_FIFO_LIMIT
+            ):
+                return None
+            if (
+                segments[0].start_sample_16k != state.start_sample_16k
+                or segments[-1].end_sample_16k != cursor
+            ):
+                return None
+            for index, segment in enumerate(segments):
+                if (
+                    segment.candidate is not None
+                    or not segment.evidence_complete
+                    or segment.ownership_ambiguous
+                    or segment.end_sample_16k <= segment.start_sample_16k
+                    or (
+                        index > 0
+                        and segments[index - 1].end_sample_16k
+                        != segment.start_sample_16k
+                    )
+                ):
+                    return None
+
+            expected_generation = self._candidate_generation
+            while expected_generation in self._provider_preseal_entries:
+                expected_generation += 1
+            if expected_generation != self._candidate_generation:
+                return None
+            source_candidate = state.lease.candidate
+            target_candidate = source_candidate
+            allocated: list[SpeakerShadowCandidateKey] = []
+            if boundary.start_sample_16k != state.start_sample_16k:
+                target_candidate = self._allocate_provider_segment_candidate()
+                if target_candidate is None:
+                    return None
+                allocated.append(target_candidate)
+            # Always reserve a successor. Provider PCM may arrive while the
+            # upper Admission transaction is between prepare and commit; the
+            # shadow reservation stages that post-boundary PCM without
+            # relabelling the still-current evidence lease.
+            suffix_candidate = self._allocate_provider_segment_candidate()
+            if suffix_candidate is None:
+                for candidate in allocated:
+                    self._speaker_candidate_owner_generations.pop(candidate, None)
+                return None
+            allocated.append(suffix_candidate)
+            request = SpeakerShadowBatchReconcileRequest(
+                sources=(
+                    SpeakerShadowReconcileSource(
+                        candidate=source_candidate,
+                        expected_sample_count=state.cumulative_sample_count,
+                        keep_start_sample=(
+                            boundary.start_sample_16k - state.start_sample_16k
+                        ),
+                        keep_end_sample=(
+                            boundary.end_sample_16k - state.start_sample_16k
+                        ),
+                    ),
+                ),
+                target=target_candidate,
+                suffix=suffix_candidate,
+                finish_target=True,
+            )
+            try:
+                receipt = control.prepare_exact_interval(request)
+            except Exception:
+                receipt = None
+            expected_target_samples = (
+                boundary.end_sample_16k - boundary.start_sample_16k
+            )
+            expected_suffix_samples = cursor - boundary.end_sample_16k
+            if not (
+                type(receipt) is SpeakerShadowBatchReconcileReceipt
+                and receipt.target == target_candidate
+                and receipt.suffix == suffix_candidate
+                and receipt.target_sample_count == expected_target_samples
+                and receipt.suffix_sample_count == expected_suffix_samples
+            ):
+                if type(receipt) is SpeakerShadowBatchReconcileReceipt:
+                    try:
+                        control.abort_exact_interval(receipt)
+                    except Exception:
+                        pass
+                for candidate in allocated:
+                    self._speaker_candidate_owner_generations.pop(candidate, None)
+                return None
+
+            reservation_token = object()
+            reservation = ProviderExactSpeakerIntervalReservation(
+                boundary=boundary,
+                target_candidate=target_candidate,
+                suffix_candidate=suffix_candidate,
+                detector_epoch=self._detector_epoch,
+                timeline_generation=self._provider_audio_timeline_generation,
+                lease_generation=state.lease.lease_generation,
+                candidate_generation=expected_generation,
+                shadow_runtime_generation=receipt.runtime_generation,
+                _owner=self._provider_exact_interval_owner,
+                _token=reservation_token,
+            )
+            self._provider_exact_interval_records[reservation_token] = (
+                _ProviderExactSpeakerIntervalRecord(
+                    reservation=reservation,
+                    state=state,
+                    shadow_control=control,
+                    shadow_receipt=receipt,
+                    segment_fingerprint=(
+                        self._provider_exact_interval_segment_fingerprint(segments)
+                    ),
+                    prepared_cursor_16k=cursor,
+                    next_shadow_generation=self._speaker_shadow_generation,
+                )
+            )
+            return reservation
+
+    def abort_provider_exact_speaker_interval(
+        self,
+        reservation: ProviderExactSpeakerIntervalReservation,
+    ) -> bool:
+        """Abort one unpublished exact reservation without yielding."""
+
+        if (
+            type(reservation) is not ProviderExactSpeakerIntervalReservation
+            or reservation._owner is not self._provider_exact_interval_owner
+        ):
+            return False
+        record = self._provider_exact_interval_records.get(reservation._token)
+        if record is None or record.reservation is not reservation:
+            return False
+        return self._abort_provider_exact_interval_record(record)
+
+    def commit_provider_exact_speaker_interval(
+        self,
+        reservation: ProviderExactSpeakerIntervalReservation,
+    ) -> ProviderExactSpeakerIntervalCommitResult | None:
+        """Commit one prepared exact interval at an await-free linearization."""
+
+        if (
+            type(reservation) is not ProviderExactSpeakerIntervalReservation
+            or reservation._owner is not self._provider_exact_interval_owner
+        ):
+            return None
+        record = self._provider_exact_interval_records.get(reservation._token)
+        if record is None or record.reservation is not reservation:
+            return None
+        state = record.state
+        segments = tuple(self._provider_speaker_segments)
+        current = bool(
+            not self._closed
+            and self._semantic_adapter is None
+            and self._provider_speaker_evidence_state is state
+            and self._provider_speaker_evidence_state_for(state.lease) is state
+            and reservation.detector_epoch == self._detector_epoch
+            and reservation.timeline_generation
+            == self._provider_audio_timeline_generation
+            == state.timeline_generation
+            and reservation.lease_generation == state.lease.lease_generation
+            and reservation.candidate_generation == self._candidate_generation
+            and reservation.shadow_runtime_generation
+            == record.shadow_receipt.runtime_generation
+            and record.next_shadow_generation == self._speaker_shadow_generation
+            and record.shadow_control is self._speaker_shadow
+            and state.capture_state is not _ProviderShadowCaptureState.UNAVAILABLE
+            and self._provider_exact_interval_segments_still_current(record, segments)
+            and reservation.candidate_generation
+            not in self._provider_preseal_entries
+        )
+        if not current:
+            self._abort_provider_exact_interval_record(record)
+            return None
+
+        boundary = reservation.boundary
+        last_segment = segments[-1]
+        successor_lease: ProviderSpeakerEvidenceLease | None = None
+        successor_state: _ProviderSpeakerEvidenceState | None = None
+        survivor: _ProviderSpeakerSegment | None = None
+        successor_sample_count = 0
+        if reservation.suffix_candidate is not None:
+            successor_sample_count = (
+                self._provider_audio_sample_cursor_16k - boundary.end_sample_16k
+            )
+            successor_lease = ProviderSpeakerEvidenceLease(
+                detector_epoch=self._detector_epoch,
+                lease_generation=self._provider_speaker_evidence_generation,
+                candidate=reservation.suffix_candidate,
+                _owner=self._provider_speaker_evidence_owner,
+            )
+            successor_state = _ProviderSpeakerEvidenceState(
+                lease=successor_lease,
+                timeline_generation=state.timeline_generation,
+                start_sample_16k=boundary.end_sample_16k,
+                last_sequence_no=state.last_sequence_no,
+                last_progress_at=state.last_progress_at,
+                cumulative_sample_count=(
+                    successor_sample_count
+                ),
+                completed_window_sample_count=0,
+                capture_state=_ProviderShadowCaptureState.COLLECTING,
+            )
+            if successor_sample_count > 0:
+                survivor = _ProviderSpeakerSegment(
+                    candidate=None,
+                    detector_candidate=DetectorCandidateKey(
+                        self._detector_epoch,
+                        reservation.candidate_generation + 1,
+                    ),
+                    first_identity=last_segment.first_identity,
+                    last_identity=last_segment.last_identity,
+                    created_at=last_segment.created_at,
+                    ownership_complete=True,
+                    shadow_capture_state=_ProviderShadowCaptureState.COLLECTING,
+                    shadow_completed_window_sample_count=0,
+                    last_progress_at=last_segment.last_progress_at,
+                    deferred=False,
+                    deferred_accepted=False,
+                    start_sample_16k=boundary.end_sample_16k,
+                    end_sample_16k=self._provider_audio_sample_cursor_16k,
+                    tentative=False,
+                )
+
+        snapshot = ProviderSpeakerBoundarySnapshot(
+            detector_epoch=self._detector_epoch,
+            candidate_generation=reservation.candidate_generation,
+            through_sequence_no=record.segment_fingerprint[-1][4],
+            shadow_generation=reservation.target_candidate.shadow_generation,
+            merged_resume_count=max(0, len(segments) - 1),
+            successor_present=successor_sample_count > 0,
+            evidence_complete=True,
+            _owner=self._provider_boundary_snapshot_owner,
+            boundary_exact=True,
+        )
+        try:
+            committed = bool(
+                record.shadow_control.commit_exact_interval(record.shadow_receipt)
+            )
+        except Exception:
+            committed = False
+        if not committed:
+            self._abort_provider_exact_interval_record(record)
+            return None
+
+        self._provider_exact_interval_records.pop(reservation._token, None)
+        self._provider_speaker_evidence_state = successor_state
+        if successor_lease is not None:
+            self._provider_speaker_evidence_generation += 1
+        self._retire_provider_segment_expiry_task()
+        self._provider_speaker_segments = deque(
+            (survivor,) if survivor is not None else ()
+        )
+        self._schedule_provider_segment_expiry()
+        self._provider_preseal_entries[reservation.candidate_generation] = (
+            _ProviderSpeakerPresealEntry(
+                verdict=snapshot,
+                shadow_candidate=reservation.target_candidate,
+                reconciliation=record.shadow_receipt,
+            )
+        )
+        self._provider_boundary_snapshots[reservation.candidate_generation] = snapshot
+        self._publish_speaker_candidate_binding(
+            reservation.target_candidate,
+            DetectorCandidateKey(
+                self._detector_epoch,
+                reservation.candidate_generation,
+            ),
+        )
+        self._speaker_rejection_prepare_diagnostics[
+            "provider_preseal_verdict_stored_count"
+        ] += 1
+        self._speaker_rejection_prepare_diagnostics[
+            "provider_speaker_segment_merged_resume_count"
+        ] += snapshot.merged_resume_count
+        if successor_lease is not None:
+            self._speaker_rejection_prepare_diagnostics[
+                "provider_speaker_segment_sample_split_count"
+            ] += 1
+        return ProviderExactSpeakerIntervalCommitResult(
+            snapshot=snapshot,
+            target_candidate=reservation.target_candidate,
+            successor_evidence_lease=successor_lease,
+        )
 
     def _allocate_provider_segment_candidate(
         self,
@@ -6270,6 +6731,11 @@ class DetectorRuntime:
         self._speaker_shadow_candidate = None
         self._provider_speaker_evidence_generation += 1
         self._provider_speaker_evidence_state = None
+        # The paired shadow reset/close revokes its staged PCM reservation.
+        # Drop Detector's receipts at the same synchronous identity fence so
+        # an old caller cannot retain or later consume authority from the
+        # retired epoch while that asynchronous cleanup is still running.
+        self._provider_exact_interval_records.clear()
         self._speaker_candidate_turn_bindings = {}
         self._speaker_candidate_owner_generations = {}
 

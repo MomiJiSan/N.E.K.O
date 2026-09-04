@@ -24,6 +24,14 @@ from .contracts import (
     CandidateBound,
     CaptureClosed,
     Close,
+    ExactIntervalAbortResult,
+    ExactIntervalActivationReceipt,
+    ExactIntervalActivationResult,
+    ExactIntervalPromotionReceipt,
+    ExactIntervalPromotionResult,
+    ExactIntervalPromotionScope,
+    ExactIntervalTransitionReceipt,
+    ProviderFinalReceived,
     Reset,
     RouteReplaced,
     SpeakerCaptureLeaseRecord,
@@ -33,6 +41,8 @@ from .contracts import (
     SpeakerLeaseEvent,
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
+    SpeakerLeasePreparedTransition,
+    SpeakerLeaseTerminalClaim,
     SpeakerLeaseUnavailable,
     SpeakerLeaseTransitionOutcome,
     SpeakerLeaseTransitionReceipt,
@@ -97,6 +107,13 @@ class _IngressItem:
     attaches_turn_to_speaker_lease: bool = False
     provider_key: ProviderUtteranceKey | None = None
     speaker_candidate: SpeakerShadowCandidateKey | None = None
+    terminal_claim: SpeakerLeaseTerminalClaim | None = None
+    prepares_speaker_lease_transition: bool = False
+    commits_speaker_lease_terminal_claim: bool = False
+    exact_operation: Literal["promote", "activate", "abort", "post"] | None = None
+    exact_promotion_scope: ExactIntervalPromotionScope | None = None
+    exact_promotion_receipt: ExactIntervalPromotionReceipt | None = None
+    exact_activation_receipt: ExactIntervalActivationReceipt | None = None
 
 
 _IngressResult: TypeAlias = (
@@ -105,7 +122,13 @@ _IngressResult: TypeAlias = (
     | SpeakerCaptureLeaseRecord
     | tuple[AdmissionEffect, ...]
     | tuple[AdmissionBulkResult, ...]
+    | SpeakerLeaseTerminalClaim
+    | None
     | SpeakerLeaseTransitionReceipt
+    | ExactIntervalPromotionResult
+    | ExactIntervalActivationResult
+    | ExactIntervalAbortResult
+    | ExactIntervalTransitionReceipt
 )
 
 
@@ -122,6 +145,13 @@ _SPEAKER_CONTROL_EVENT_TYPES = (
 )
 _SPEAKER_LEASE_EVENT_TYPES = (
     SpeakerLeaseAbandoned,
+    SpeakerLeaseCaptureClosed,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLeaseUnavailable,
+)
+_EXACT_INTERVAL_EVENT_TYPES = (
+    ProviderFinalReceived,
     SpeakerLeaseCaptureClosed,
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
@@ -492,6 +522,262 @@ class AdmissionIngressLane:
             self.post_speaker_lease_nowait(lease_token, event, now=now)
         )
 
+    def prepare_speaker_lease_transition_nowait(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float | None = None,
+    ) -> asyncio.Future[SpeakerLeasePreparedTransition]:
+        """FIFO-commit ordinary facts or prepare one exact DROP claim."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if not isinstance(event, _SPEAKER_LEASE_EVENT_TYPES):
+            raise TypeError("event must be SpeakerLeaseEvent")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            None,
+            event,
+            speaker_lease_token=lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=None,
+                speaker_lease_token=lease_token,
+                event=event,
+                now=now,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                prepares_speaker_lease_transition=True,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[SpeakerLeasePreparedTransition], result)
+
+    async def prepare_speaker_lease_transition(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float | None = None,
+    ) -> SpeakerLeasePreparedTransition:
+        return await asyncio.shield(
+            self.prepare_speaker_lease_transition_nowait(
+                lease_token,
+                event,
+                now=now,
+            )
+        )
+
+    def commit_speaker_lease_terminal_claim_nowait(
+        self,
+        claim: SpeakerLeaseTerminalClaim,
+        *,
+        now: float | None = None,
+    ) -> asyncio.Future[SpeakerLeaseTransitionReceipt]:
+        """FIFO-commit one exact prepared DROP claim under coordinator CAS."""
+
+        if type(claim) is not SpeakerLeaseTerminalClaim:
+            raise TypeError("claim must be SpeakerLeaseTerminalClaim")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            None,
+            claim.event,
+            speaker_lease_token=claim.lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=None,
+                speaker_lease_token=claim.lease_token,
+                event=claim.event,
+                now=now,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                terminal_claim=claim,
+                commits_speaker_lease_terminal_claim=True,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[SpeakerLeaseTransitionReceipt], result)
+
+    async def commit_speaker_lease_terminal_claim(
+        self,
+        claim: SpeakerLeaseTerminalClaim,
+        *,
+        now: float | None = None,
+    ) -> SpeakerLeaseTransitionReceipt:
+        return await asyncio.shield(
+            self.commit_speaker_lease_terminal_claim_nowait(claim, now=now)
+        )
+
+    def promote_exact_interval_nowait(
+        self,
+        scope: ExactIntervalPromotionScope,
+    ) -> asyncio.Future[ExactIntervalPromotionResult]:
+        """Queue one atomic tail promotion behind all accepted speaker facts."""
+
+        if type(scope) is not ExactIntervalPromotionScope:
+            raise TypeError("scope must be ExactIntervalPromotionScope")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            scope.turn_token,
+            None,
+            speaker_lease_token=scope.parent_lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=scope.turn_token,
+                speaker_lease_token=scope.parent_lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                exact_operation="promote",
+                exact_promotion_scope=scope,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[ExactIntervalPromotionResult], result)
+
+    async def promote_exact_interval(
+        self,
+        scope: ExactIntervalPromotionScope,
+    ) -> ExactIntervalPromotionResult:
+        return await asyncio.shield(self.promote_exact_interval_nowait(scope))
+
+    def activate_exact_interval_nowait(
+        self,
+        receipt: ExactIntervalPromotionReceipt,
+    ) -> asyncio.Future[ExactIntervalActivationResult]:
+        if type(receipt) is not ExactIntervalPromotionReceipt:
+            raise TypeError("receipt must be ExactIntervalPromotionReceipt")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            receipt.scope.turn_token,
+            None,
+            speaker_lease_token=receipt.scope.parent_lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=receipt.scope.turn_token,
+                speaker_lease_token=receipt.scope.parent_lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                exact_operation="activate",
+                exact_promotion_receipt=receipt,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[ExactIntervalActivationResult], result)
+
+    async def activate_exact_interval(
+        self,
+        receipt: ExactIntervalPromotionReceipt,
+    ) -> ExactIntervalActivationResult:
+        return await asyncio.shield(self.activate_exact_interval_nowait(receipt))
+
+    def abort_exact_interval_promotion_nowait(
+        self,
+        receipt: ExactIntervalPromotionReceipt,
+    ) -> asyncio.Future[ExactIntervalAbortResult]:
+        if type(receipt) is not ExactIntervalPromotionReceipt:
+            raise TypeError("receipt must be ExactIntervalPromotionReceipt")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            receipt.scope.turn_token,
+            None,
+            speaker_lease_token=receipt.scope.parent_lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=receipt.scope.turn_token,
+                speaker_lease_token=receipt.scope.parent_lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                exact_operation="abort",
+                exact_promotion_receipt=receipt,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[ExactIntervalAbortResult], result)
+
+    async def abort_exact_interval_promotion(
+        self,
+        receipt: ExactIntervalPromotionReceipt,
+    ) -> ExactIntervalAbortResult:
+        return await asyncio.shield(
+            self.abort_exact_interval_promotion_nowait(receipt)
+        )
+
+    def post_exact_interval_nowait(
+        self,
+        receipt: ExactIntervalActivationReceipt,
+        event: SpeakerLeaseEvent | ProviderFinalReceived,
+    ) -> asyncio.Future[ExactIntervalTransitionReceipt]:
+        """Queue one exact child fact in the shared bounded speaker FIFO."""
+
+        if type(receipt) is not ExactIntervalActivationReceipt:
+            raise TypeError("receipt must be ExactIntervalActivationReceipt")
+        if not isinstance(event, _EXACT_INTERVAL_EVENT_TYPES):
+            raise TypeError("event must be an exact interval fact")
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            receipt.turn_token,
+            event,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=receipt.turn_token,
+                speaker_lease_token=None,
+                event=event,
+                now=None,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                exact_operation="post",
+                exact_activation_receipt=receipt,
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[ExactIntervalTransitionReceipt], result)
+
+    async def post_exact_interval(
+        self,
+        receipt: ExactIntervalActivationReceipt,
+        event: SpeakerLeaseEvent | ProviderFinalReceived,
+    ) -> ExactIntervalTransitionReceipt:
+        return await asyncio.shield(
+            self.post_exact_interval_nowait(receipt, event)
+        )
+
     def _speaker_transition_follower(
         self,
         leader: asyncio.Future[_IngressResult],
@@ -802,7 +1088,36 @@ class AdmissionIngressLane:
                 while self._items:
                     item = self._items.popleft()
                     try:
-                        if item.opens_speaker_lease:
+                        if item.exact_operation == "promote":
+                            assert item.exact_promotion_scope is not None
+                            effects = (
+                                await self._coordinator.promote_exact_interval_tail_child(
+                                    item.exact_promotion_scope
+                                )
+                            )
+                        elif item.exact_operation == "activate":
+                            assert item.exact_promotion_receipt is not None
+                            effects = await self._coordinator.activate_exact_interval(
+                                item.exact_promotion_receipt
+                            )
+                        elif item.exact_operation == "abort":
+                            assert item.exact_promotion_receipt is not None
+                            effects = (
+                                await self._coordinator.abort_exact_interval_promotion(
+                                    item.exact_promotion_receipt
+                                )
+                            )
+                        elif item.exact_operation == "post":
+                            assert item.exact_activation_receipt is not None
+                            assert item.event is not None
+                            effects = await self._coordinator.post_exact_interval(
+                                item.exact_activation_receipt,
+                                cast(
+                                    SpeakerLeaseEvent | ProviderFinalReceived,
+                                    item.event,
+                                ),
+                            )
+                        elif item.opens_speaker_lease:
                             assert item.speaker_lease_token is not None
                             assert item.speaker_candidate is not None
                             assert item.event is None
@@ -832,6 +1147,24 @@ class AdmissionIngressLane:
                             assert item.turn_token is not None
                             assert item.event is None
                             effects = await self._coordinator.retire(item.turn_token)
+                        elif item.prepares_speaker_lease_transition:
+                            assert item.speaker_lease_token is not None
+                            assert item.event is not None
+                            effects = (
+                                await self._coordinator.prepare_speaker_lease_transition(
+                                    item.speaker_lease_token,
+                                    cast(SpeakerLeaseEvent, item.event),
+                                    now=item.now,
+                                )
+                            )
+                        elif item.commits_speaker_lease_terminal_claim:
+                            assert item.terminal_claim is not None
+                            effects = (
+                                await self._coordinator.commit_speaker_lease_terminal_claim(
+                                    item.terminal_claim,
+                                    now=item.now,
+                                )
+                            )
                         elif item.speaker_lease_token is not None:
                             assert item.event is not None
                             lease_event = cast(SpeakerLeaseEvent, item.event)

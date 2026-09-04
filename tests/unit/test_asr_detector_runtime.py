@@ -14,6 +14,7 @@ from main_logic.asr_client.endpointing.detector_runtime import (
     DetectorCandidateRejectionLease,
     DetectorFeedResult,
     DetectorRuntime,
+    ProviderExactSpeakerIntervalReservation,
     SmartTurnLease,
     SmartTurnReadiness,
     _AudioItem,
@@ -1355,6 +1356,427 @@ async def test_provider_speaker_evidence_allows_runtime_owned_binding() -> None:
         assert update.capture.disposition is SpeakerShadowCaptureDisposition.ACCEPTED
         assert [frame[2] for frame in shadow.frames] == [evidence_lease.candidate]
         assert shadow.abandoned == []
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_interval_preserves_pcm_arriving_before_commit() -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        first = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(800),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        assert first is not None
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 12_800),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+
+        second = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+        assert second is not None
+        assert second.capture.accepted_sample_count == 1_600
+        assert second.capture.cumulative_sample_count == 14_400
+
+        committed = detector.commit_provider_exact_speaker_interval(reservation)
+        assert committed is not None
+        assert committed.snapshot.boundary_exact is True
+        assert committed.snapshot.successor_present is True
+        assert committed.snapshot.through_sequence_no == 1
+        assert committed.target_candidate == lease.candidate
+        successor = committed.successor_evidence_lease
+        assert successor is not None
+        assert successor != lease
+        assert await detector.ensure_provider_speaker_evidence_lease() == successor
+        assert len(detector._provider_speaker_segments) == 1
+        segment = detector._provider_speaker_segments[0]
+        assert (segment.start_sample_16k, segment.end_sample_16k) == (12_800, 14_400)
+
+        await shadow.wait_idle()
+        assert shadow._buffers[successor.candidate].sample_count == 1_600
+        assert detector.commit_provider_exact_speaker_interval(reservation) is None
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_interval_empty_successor_accepts_future_pcm() -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        first = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(800),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        assert first is not None
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 12_800),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+
+        committed = detector.commit_provider_exact_speaker_interval(reservation)
+
+        assert committed is not None
+        assert committed.snapshot.successor_present is False
+        successor = committed.successor_evidence_lease
+        assert successor is not None
+        assert await detector.ensure_provider_speaker_evidence_lease() == successor
+        assert not detector._provider_speaker_segments
+
+        future = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=successor,
+        )
+        assert future is not None
+        assert future.lease == successor
+        assert future.capture.disposition is SpeakerShadowCaptureDisposition.ACCEPTED
+        assert future.capture.cumulative_sample_count == 1_600
+
+        await shadow.wait_idle()
+        assert shadow._buffers[successor.candidate].sample_count == 1_600
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_interval_abort_returns_staged_pcm_to_parent() -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(800),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 12_800),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+
+        assert detector.abort_provider_exact_speaker_interval(reservation)
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
+        assert await detector.ensure_provider_speaker_evidence_lease() == lease
+        await shadow.wait_idle()
+        assert shadow._buffers[lease.candidate].sample_count == 14_400
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_interval_abort_restore_failure_is_not_reported_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(800),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 12_800),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+        monkeypatch.setattr(shadow, "_ensure_worker", lambda: False)
+
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
+        assert not detector._provider_exact_interval_records
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_interval_rejects_forged_and_stale_timeline_authority() -> (
+    None
+):
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(400),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 6_400),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+        forged = ProviderExactSpeakerIntervalReservation(
+            boundary=reservation.boundary,
+            target_candidate=reservation.target_candidate,
+            suffix_candidate=reservation.suffix_candidate,
+            detector_epoch=reservation.detector_epoch,
+            timeline_generation=reservation.timeline_generation,
+            lease_generation=reservation.lease_generation,
+            candidate_generation=reservation.candidate_generation,
+            shadow_runtime_generation=reservation.shadow_runtime_generation,
+            _owner=object(),
+            _token=reservation._token,
+        )
+        assert detector.commit_provider_exact_speaker_interval(forged) is None
+        assert not detector.abort_provider_exact_speaker_interval(forged)
+
+        detector._provider_audio_timeline_generation += 1
+        assert detector.commit_provider_exact_speaker_interval(reservation) is None
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
+        assert not detector._provider_exact_interval_records
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_interval_rejects_sequence_gap_and_overlapping_segments() -> (
+    None
+):
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=3,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+        assert await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 1_600),
+            speaker_evidence_lease=lease,
+        ) is None
+
+        successor = await detector.ensure_provider_speaker_evidence_lease()
+        if successor is lease:
+            await detector.abandon_provider_speaker_evidence_lease(lease)
+            successor = await detector.ensure_provider_speaker_evidence_lease()
+        assert successor is not None
+    finally:
+        await detector.close()
+
+    overlap_shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    overlap_detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=overlap_shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            overlap_detector,
+            turn_id=2,
+        )
+        lease = await overlap_detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        assert await overlap_detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        assert await overlap_detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+        overlap_detector._provider_speaker_segments[1].start_sample_16k -= 1
+        assert await overlap_detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 1_600),
+            speaker_evidence_lease=lease,
+        ) is None
+    finally:
+        await overlap_detector.close()
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+async def test_provider_exact_interval_lifecycle_invalidates_reservation_immediately(
+    operation: str,
+) -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 1_600),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+
+        if operation == "reset":
+            await detector.reset()
+        else:
+            await detector.close()
+
+        assert not detector._provider_exact_interval_records
+        assert detector.commit_provider_exact_speaker_interval(reservation) is None
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
     finally:
         await detector.close()
 

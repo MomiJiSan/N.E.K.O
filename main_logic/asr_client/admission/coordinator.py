@@ -6,13 +6,14 @@ import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
 
 from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
 from .contracts import (
+    AdmissionDisposition,
     AdmissionState,
     AdmissionBulkResult,
     AdmissionEffect,
@@ -22,9 +23,18 @@ from .contracts import (
     CaptureState,
     Close,
     EvidenceState,
+    ExactIntervalActivationReceipt,
+    ExactIntervalActivationResult,
+    ExactIntervalAbortResult,
+    ExactIntervalOutcome,
+    ExactIntervalPromotionReceipt,
+    ExactIntervalPromotionResult,
+    ExactIntervalPromotionScope,
+    ExactIntervalTransitionReceipt,
     MicroEventState,
     ProviderBindingState,
     ProviderFinalState,
+    ProviderFinalReceived,
     RejectionApplyState,
     Reset,
     RouteReplaced,
@@ -38,6 +48,8 @@ from .contracts import (
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseState,
+    SpeakerLeasePreparedTransition,
+    SpeakerLeaseTerminalClaim,
     SpeakerLeaseTransitionOutcome,
     SpeakerLeaseTransitionReceipt,
     SpeakerLeaseUnavailable,
@@ -47,7 +59,7 @@ from .contracts import (
     SpeakerUnavailable,
     VoiceTurnAdmissionRecord,
 )
-from .reducer import reduce
+from .reducer import hold_exact_interval_final, reduce, resolve_exact_interval
 from .speaker_leases import (
     MAX_SPEAKER_LEASE_CHILDREN,
     MAX_SPEAKER_LEASES,
@@ -68,6 +80,18 @@ class AdmissionIdentityError(RuntimeError):
 
 class SpeakerLeaseCapacityError(RuntimeError):
     """A live speaker lease could not be reserved without eviction."""
+
+
+@dataclass(slots=True)
+class _ExactIntervalRecord:
+    promotion_receipt: ExactIntervalPromotionReceipt
+    evidence: SpeakerCaptureLeaseRecord
+    parent_before: SpeakerCaptureLeaseRecord
+    parent_after: SpeakerCaptureLeaseRecord
+    child_before: VoiceTurnAdmissionRecord
+    child_logical_revision: int
+    activation_receipt: ExactIntervalActivationReceipt | None = None
+    post_started: bool = False
 
 
 class VoiceTurnAdmissionCoordinator:
@@ -127,6 +151,15 @@ class VoiceTurnAdmissionCoordinator:
         self._retired_turn_high_water: dict[object, int] = {}
         self._record_generation = 0
         self._speaker_lease_record_generation = 0
+        self._speaker_lease_terminal_claim_sequence = 0
+        self._speaker_lease_terminal_claim_owner = object()
+        self._exact_interval_sequence = 0
+        self._exact_interval_owner = object()
+        self._exact_interval_records: dict[object, _ExactIntervalRecord] = {}
+        self._exact_interval_candidate_bindings: dict[
+            SpeakerShadowCandidateKey,
+            object,
+        ] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -160,6 +193,10 @@ class VoiceTurnAdmissionCoordinator:
                 return existing
             if lease_token in self._retired_speaker_leases:
                 raise AdmissionIdentityError("ASR_SPEAKER_LEASE_ALREADY_RETIRED")
+            if candidate in self._exact_interval_candidate_bindings:
+                raise AdmissionIdentityError(
+                    "ASR_SPEAKER_LEASE_CANDIDATE_EXACT_INTERVAL_HELD"
+                )
             existing_token = self._speaker_candidate_bindings.get(candidate)
             if existing_token is not None and existing_token != lease_token:
                 raise AdmissionIdentityError(
@@ -204,6 +241,7 @@ class VoiceTurnAdmissionCoordinator:
                 SpeakerLeaseState.ALLOW,
                 SpeakerLeaseState.UNAVAILABLE,
                 SpeakerLeaseState.DENY_LATCHED,
+                SpeakerLeaseState.MIXED_DENY_LATCHED,
                 SpeakerLeaseState.ABANDONED,
             }
             if provider_binding not in {None, expected_binding}:
@@ -342,7 +380,10 @@ class VoiceTurnAdmissionCoordinator:
                 and record.rejection_apply_state is RejectionApplyState.STALE
                 and record.last_speaker_sequence_no == 1
             )
-        if lease.state is SpeakerLeaseState.DENY_LATCHED:
+        if lease.state in {
+            SpeakerLeaseState.DENY_LATCHED,
+            SpeakerLeaseState.MIXED_DENY_LATCHED,
+        }:
             return bool(
                 record.capture_state is CaptureState.COLLECTING
                 and record.evidence_state is EvidenceState.DENY_LATCHED
@@ -382,7 +423,11 @@ class VoiceTurnAdmissionCoordinator:
                 raise AdmissionIdentityError("ASR_ADMISSION_DETACH_IDENTITY_CONFLICT")
             pending_projection_exact = bool(
                 lease.state
-                in {SpeakerLeaseState.COLLECTING, SpeakerLeaseState.FIRST_LOW}
+                in {
+                    SpeakerLeaseState.COLLECTING,
+                    SpeakerLeaseState.FIRST_LOW,
+                    SpeakerLeaseState.HIGH_SEEN,
+                }
                 and record is not None
                 and record.capture_state is CaptureState.COLLECTING
                 and record.evidence_state is EvidenceState.NONE
@@ -452,6 +497,719 @@ class VoiceTurnAdmissionCoordinator:
             self._provider_speaker_lease_bindings.pop(provider_key)
             return True
 
+    @staticmethod
+    def _exact_interval_promotion_failure(
+        outcome: ExactIntervalOutcome,
+    ) -> ExactIntervalPromotionResult:
+        return ExactIntervalPromotionResult(outcome=outcome)
+
+    @staticmethod
+    def _exact_interval_activation_failure(
+        outcome: ExactIntervalOutcome,
+    ) -> ExactIntervalActivationResult:
+        return ExactIntervalActivationResult(outcome=outcome)
+
+    @staticmethod
+    def _exact_interval_child_is_held(
+        record: VoiceTurnAdmissionRecord,
+        scope: ExactIntervalPromotionScope,
+        parent: SpeakerCaptureLeaseRecord,
+    ) -> bool:
+        pending_final_exact = bool(
+            (
+                record.provider_final_state is ProviderFinalState.NOT_RECEIVED
+                and record.pending_final is None
+                and record.admission_state is AdmissionState.RESERVED
+            )
+            or (
+                record.provider_final_state is ProviderFinalState.RECEIVED
+                and record.pending_final is not None
+                and record.pending_final.provider_key == scope.provider_key
+                and record.admission_state is AdmissionState.PENDING
+            )
+        )
+        return bool(
+            record.turn_token == scope.turn_token
+            and record.provider_binding_state is ProviderBindingState.BOUND
+            and record.provider_key == scope.provider_key
+            and record.candidate_binding_state is CandidateBindingState.BOUND
+            and record.speaker_lease_token == scope.parent_lease_token
+            and record.speaker_candidate == parent.candidate
+            and record.capture_state is CaptureState.COLLECTING
+            and record.evidence_state is EvidenceState.NONE
+            and record.boundary_state is BoundaryState.OPEN
+            and record.rejection_apply_state is RejectionApplyState.NOT_STARTED
+            and record.rejection_capability is None
+            and record.resolution_ticket is None
+            and record.partial_settlement_disposition is None
+            and record.exact_interval_hold_id is None
+            and record.deadline_operation_nonce is None
+            and record.operation_nonce_sequence == 0
+            and record.core_settlement_state is SettlementState.NOT_STARTED
+            and record.transport_settlement_state is SettlementState.NOT_STARTED
+            and record.lifecycle_settlement_state is SettlementState.NOT_STARTED
+            and pending_final_exact
+        )
+
+    async def promote_exact_interval_tail_child(
+        self,
+        scope: ExactIntervalPromotionScope,
+    ) -> ExactIntervalPromotionResult:
+        """Atomically move one sole tail child into an unpublished exact hold."""
+
+        if type(scope) is not ExactIntervalPromotionScope:
+            raise TypeError("scope must be ExactIntervalPromotionScope")
+        async with self._lock:
+            parent = self._speaker_leases.get(scope.parent_lease_token)
+            child = self._records.get(scope.turn_token)
+            if parent is None or child is None:
+                return self._exact_interval_promotion_failure(
+                    ExactIntervalOutcome.STALE
+                )
+            if (
+                parent.record_generation != scope.parent_record_generation
+                or parent.logical_revision != scope.expected_parent_logical_revision
+                or child.record_generation != scope.child_record_generation
+                or child.logical_revision != scope.expected_child_logical_revision
+                or parent.terminal_disposition is not None
+            ):
+                return self._exact_interval_promotion_failure(
+                    ExactIntervalOutcome.STALE
+                )
+            if parent.state is not scope.expected_parent_state:
+                return self._exact_interval_promotion_failure(
+                    ExactIntervalOutcome.CONFLICT
+                )
+            if (
+                scope.target_candidate != parent.candidate
+                and (
+                    parent.state is not SpeakerLeaseState.COLLECTING
+                    or parent.last_speaker_sequence_no != 0
+                )
+            ):
+                return self._exact_interval_promotion_failure(
+                    ExactIntervalOutcome.CONFLICT
+                )
+            binding = SpeakerLeaseChildBinding(
+                scope.provider_key,
+                scope.turn_token,
+            )
+            expected_provider_binding = (
+                scope.parent_lease_token,
+                scope.turn_token,
+            )
+            if (
+                parent.child_bindings != (binding,)
+                or self._speaker_candidate_bindings.get(parent.candidate)
+                != scope.parent_lease_token
+                or self._provider_speaker_lease_bindings.get(scope.provider_key)
+                != expected_provider_binding
+                or not self._exact_interval_child_is_held(child, scope, parent)
+            ):
+                return self._exact_interval_promotion_failure(
+                    ExactIntervalOutcome.CONFLICT
+                )
+            target_owner = self._speaker_candidate_bindings.get(
+                scope.target_candidate
+            )
+            successor_owner = (
+                self._speaker_candidate_bindings.get(scope.successor_candidate)
+                if scope.successor_candidate is not None
+                else None
+            )
+            if (
+                len(self._exact_interval_records) >= self._capacity
+                or scope.target_candidate in self._exact_interval_candidate_bindings
+                or target_owner not in {None, scope.parent_lease_token}
+                or successor_owner not in {None, scope.parent_lease_token}
+                or (
+                    scope.successor_candidate is not None
+                    and scope.successor_candidate
+                    in self._exact_interval_candidate_bindings
+                )
+            ):
+                return self._exact_interval_promotion_failure(
+                    ExactIntervalOutcome.CONFLICT
+                )
+
+            self._exact_interval_sequence += 1
+            interval_id = self._exact_interval_sequence
+            token = object()
+            receipt = ExactIntervalPromotionReceipt(
+                interval_id=interval_id,
+                scope=scope,
+                _owner=self._exact_interval_owner,
+                _token=token,
+            )
+            exact_evidence = SpeakerCaptureLeaseRecord(
+                lease_token=scope.parent_lease_token,
+                record_generation=parent.record_generation,
+                candidate=scope.target_candidate,
+                state=parent.state,
+                last_speaker_sequence_no=parent.last_speaker_sequence_no,
+            )
+            if scope.successor_candidate is None:
+                updated_parent = replace(
+                    parent,
+                    logical_revision=parent.logical_revision + 1,
+                    state=SpeakerLeaseState.ABANDONED,
+                    last_speaker_sequence_no=0,
+                    terminal_sequence_no=0,
+                    capture_through_sequence_no=None,
+                    child_bindings=(),
+                    terminal_event=SpeakerLeaseAbandoned(),
+                )
+            else:
+                updated_parent = replace(
+                    parent,
+                    logical_revision=parent.logical_revision + 1,
+                    candidate=scope.successor_candidate,
+                    state=SpeakerLeaseState.COLLECTING,
+                    last_speaker_sequence_no=0,
+                    terminal_sequence_no=None,
+                    capture_through_sequence_no=None,
+                    child_bindings=(),
+                    terminal_event=None,
+                )
+            updated_child = replace(
+                child,
+                logical_revision=child.logical_revision + 1,
+                speaker_lease_token=None,
+                exact_interval_hold_id=interval_id,
+            )
+
+            self._speaker_leases[scope.parent_lease_token] = updated_parent
+            self._records[scope.turn_token] = updated_child
+            self._provider_speaker_lease_bindings.pop(scope.provider_key)
+            if (
+                self._speaker_candidate_bindings.get(parent.candidate)
+                == scope.parent_lease_token
+            ):
+                self._speaker_candidate_bindings.pop(parent.candidate)
+            if scope.successor_candidate is not None:
+                self._speaker_candidate_bindings[scope.successor_candidate] = (
+                    scope.parent_lease_token
+                )
+            self._exact_interval_candidate_bindings[scope.target_candidate] = token
+            self._exact_interval_records[token] = _ExactIntervalRecord(
+                promotion_receipt=receipt,
+                evidence=exact_evidence,
+                parent_before=parent,
+                parent_after=updated_parent,
+                child_before=child,
+                child_logical_revision=updated_child.logical_revision,
+            )
+            return ExactIntervalPromotionResult(
+                outcome=ExactIntervalOutcome.PROMOTED,
+                receipt=receipt,
+            )
+
+    async def abort_exact_interval_promotion(
+        self,
+        receipt: ExactIntervalPromotionReceipt,
+    ) -> ExactIntervalAbortResult:
+        """Roll back one unpublished promotion after Detector commit failed."""
+
+        if type(receipt) is not ExactIntervalPromotionReceipt:
+            raise TypeError("receipt must be ExactIntervalPromotionReceipt")
+        async with self._lock:
+            if receipt._owner is not self._exact_interval_owner:
+                return ExactIntervalAbortResult(ExactIntervalOutcome.CONFLICT)
+            exact = self._exact_interval_records.get(receipt._token)
+            if exact is None or exact.promotion_receipt is not receipt:
+                return ExactIntervalAbortResult(ExactIntervalOutcome.STALE)
+            if exact.post_started:
+                return ExactIntervalAbortResult(ExactIntervalOutcome.CONFLICT)
+
+            scope = receipt.scope
+            parent = self._speaker_leases.get(scope.parent_lease_token)
+            child = self._records.get(scope.turn_token)
+            expected_child = replace(
+                exact.child_before,
+                logical_revision=exact.child_before.logical_revision + 1,
+                speaker_lease_token=None,
+                exact_interval_hold_id=receipt.interval_id,
+            )
+            if exact.activation_receipt is not None:
+                expected_child = replace(
+                    expected_child,
+                    logical_revision=expected_child.logical_revision + 1,
+                    speaker_candidate=scope.target_candidate,
+                    evidence_state=self._exact_interval_evidence_projection(
+                        exact.evidence.state
+                    ),
+                    last_speaker_sequence_no=(
+                        exact.evidence.last_speaker_sequence_no
+                    ),
+                )
+            provider_binding = self._provider_speaker_lease_bindings.get(
+                scope.provider_key
+            )
+            target_binding = self._speaker_candidate_bindings.get(
+                scope.target_candidate
+            )
+            successor_binding = (
+                self._speaker_candidate_bindings.get(scope.successor_candidate)
+                if scope.successor_candidate is not None
+                else None
+            )
+            if (
+                parent != exact.parent_after
+                or child != expected_child
+                or provider_binding is not None
+                or target_binding is not None
+                or (
+                    scope.successor_candidate is not None
+                    and successor_binding != scope.parent_lease_token
+                )
+                or self._exact_interval_candidate_bindings.get(
+                    scope.target_candidate
+                )
+                is not receipt._token
+            ):
+                return ExactIntervalAbortResult(ExactIntervalOutcome.CONFLICT)
+
+            if scope.successor_candidate is not None:
+                self._speaker_candidate_bindings.pop(
+                    scope.successor_candidate,
+                    None,
+                )
+            self._speaker_leases[scope.parent_lease_token] = exact.parent_before
+            self._records[scope.turn_token] = exact.child_before
+            self._provider_speaker_lease_bindings[scope.provider_key] = (
+                scope.parent_lease_token,
+                scope.turn_token,
+            )
+            self._speaker_candidate_bindings[exact.parent_before.candidate] = (
+                scope.parent_lease_token
+            )
+            self._exact_interval_candidate_bindings.pop(
+                scope.target_candidate,
+                None,
+            )
+            self._exact_interval_records.pop(receipt._token, None)
+            return ExactIntervalAbortResult(ExactIntervalOutcome.ABORTED)
+
+    @staticmethod
+    def _exact_interval_evidence_projection(
+        state: SpeakerLeaseState,
+    ) -> EvidenceState:
+        return {
+            SpeakerLeaseState.COLLECTING: EvidenceState.NONE,
+            SpeakerLeaseState.FIRST_LOW: EvidenceState.FIRST_LOW,
+            SpeakerLeaseState.HIGH_SEEN: EvidenceState.ALLOW,
+            SpeakerLeaseState.ALLOW: EvidenceState.ALLOW,
+            SpeakerLeaseState.UNAVAILABLE: EvidenceState.UNAVAILABLE,
+            SpeakerLeaseState.DENY_LATCHED: EvidenceState.DENY_LATCHED,
+            SpeakerLeaseState.MIXED_DENY_LATCHED: EvidenceState.DENY_LATCHED,
+        }[state]
+
+    async def activate_exact_interval(
+        self,
+        receipt: ExactIntervalPromotionReceipt,
+    ) -> ExactIntervalActivationResult:
+        """Publish transferred evidence only after Detector commit succeeded."""
+
+        if type(receipt) is not ExactIntervalPromotionReceipt:
+            raise TypeError("receipt must be ExactIntervalPromotionReceipt")
+        async with self._lock:
+            if receipt._owner is not self._exact_interval_owner:
+                return self._exact_interval_activation_failure(
+                    ExactIntervalOutcome.CONFLICT
+                )
+            exact = self._exact_interval_records.get(receipt._token)
+            if exact is None or exact.promotion_receipt is not receipt:
+                return self._exact_interval_activation_failure(
+                    ExactIntervalOutcome.STALE
+                )
+            if exact.activation_receipt is not None:
+                return self._exact_interval_activation_failure(
+                    ExactIntervalOutcome.STALE
+                )
+            scope = receipt.scope
+            child = self._records.get(scope.turn_token)
+            if (
+                child is None
+                or child.record_generation != scope.child_record_generation
+                or child.logical_revision != exact.child_logical_revision
+                or child.exact_interval_hold_id != receipt.interval_id
+            ):
+                return self._exact_interval_activation_failure(
+                    ExactIntervalOutcome.STALE
+                )
+            if child.terminal_disposition is not None:
+                return self._exact_interval_activation_failure(
+                    ExactIntervalOutcome.CONFLICT
+                )
+            evidence = exact.evidence
+            updated_child = replace(
+                child,
+                logical_revision=child.logical_revision + 1,
+                speaker_candidate=scope.target_candidate,
+                evidence_state=self._exact_interval_evidence_projection(
+                    evidence.state
+                ),
+                last_speaker_sequence_no=evidence.last_speaker_sequence_no,
+            )
+            activation = ExactIntervalActivationReceipt(
+                interval_id=receipt.interval_id,
+                turn_token=scope.turn_token,
+                child_record_generation=scope.child_record_generation,
+                _owner=self._exact_interval_owner,
+                _token=receipt._token,
+            )
+            exact.child_logical_revision = updated_child.logical_revision
+            exact.activation_receipt = activation
+            self._records[scope.turn_token] = updated_child
+            return ExactIntervalActivationResult(
+                outcome=ExactIntervalOutcome.ACTIVATED,
+                receipt=activation,
+            )
+
+    @staticmethod
+    def _exact_interval_transition_failure(
+        receipt: ExactIntervalActivationReceipt,
+        outcome: ExactIntervalOutcome,
+    ) -> ExactIntervalTransitionReceipt:
+        return ExactIntervalTransitionReceipt(
+            interval_id=receipt.interval_id,
+            outcome=outcome,
+            disposition=None,
+            effects=(),
+        )
+
+    async def post_exact_interval(
+        self,
+        receipt: ExactIntervalActivationReceipt,
+        event: SpeakerLeaseEvent | ProviderFinalReceived,
+    ) -> ExactIntervalTransitionReceipt:
+        """Apply one local exact fact; never fan out or abort provider transport."""
+
+        if type(receipt) is not ExactIntervalActivationReceipt:
+            raise TypeError("receipt must be ExactIntervalActivationReceipt")
+        if not isinstance(
+            event,
+            (
+                ProviderFinalReceived,
+                SpeakerLeaseCaptureClosed,
+                SpeakerLeaseHigh,
+                SpeakerLeaseLow,
+                SpeakerLeaseUnavailable,
+            ),
+        ):
+            raise TypeError("event must be an exact interval fact")
+        async with self._lock:
+            if receipt._owner is not self._exact_interval_owner:
+                return self._exact_interval_transition_failure(
+                    receipt,
+                    ExactIntervalOutcome.CONFLICT,
+                )
+            exact = self._exact_interval_records.get(receipt._token)
+            if (
+                exact is None
+                or exact.activation_receipt is not receipt
+                or exact.promotion_receipt.scope.turn_token != receipt.turn_token
+            ):
+                return self._exact_interval_transition_failure(
+                    receipt,
+                    ExactIntervalOutcome.STALE,
+                )
+            scope = exact.promotion_receipt.scope
+            child = self._records.get(scope.turn_token)
+            if (
+                child is None
+                or child.record_generation != scope.child_record_generation
+                or child.logical_revision != exact.child_logical_revision
+                or child.exact_interval_hold_id != receipt.interval_id
+            ):
+                return self._exact_interval_transition_failure(
+                    receipt,
+                    ExactIntervalOutcome.STALE,
+                )
+            exact.post_started = True
+
+            evidence = exact.evidence
+            if isinstance(event, ProviderFinalReceived):
+                if event.final.provider_key != scope.provider_key:
+                    return self._exact_interval_transition_failure(
+                        receipt,
+                        ExactIntervalOutcome.CONFLICT,
+                    )
+                try:
+                    updated_child = hold_exact_interval_final(child, event.final)
+                except ValueError:
+                    return self._exact_interval_transition_failure(
+                        receipt,
+                        ExactIntervalOutcome.CONFLICT,
+                    )
+                if updated_child is not child:
+                    exact.child_logical_revision = updated_child.logical_revision
+                    self._records[scope.turn_token] = updated_child
+                    child = updated_child
+            else:
+                if getattr(event, "candidate", None) != scope.target_candidate:
+                    return self._exact_interval_transition_failure(
+                        receipt,
+                        ExactIntervalOutcome.CONFLICT,
+                    )
+                reduced, _diagnostics = reduce_speaker_lease(evidence, event)
+                if reduced is evidence:
+                    return self._exact_interval_transition_failure(
+                        receipt,
+                        ExactIntervalOutcome.STALE,
+                    )
+                capture_state = child.capture_state
+                if reduced.state is SpeakerLeaseState.UNAVAILABLE:
+                    capture_state = CaptureState.UNAVAILABLE
+                elif isinstance(event, SpeakerLeaseCaptureClosed):
+                    capture_state = CaptureState.CLOSED
+                updated_child = replace(
+                    child,
+                    logical_revision=child.logical_revision + 1,
+                    evidence_state=self._exact_interval_evidence_projection(
+                        reduced.state
+                    ),
+                    capture_state=capture_state,
+                    last_speaker_sequence_no=reduced.last_speaker_sequence_no,
+                    capture_through_sequence_no=(
+                        reduced.capture_through_sequence_no
+                    ),
+                )
+                exact.evidence = reduced
+                exact.child_logical_revision = updated_child.logical_revision
+                self._records[scope.turn_token] = updated_child
+                evidence = reduced
+                child = updated_child
+
+            disposition = evidence.terminal_disposition
+            if (
+                disposition
+                not in {AdmissionDisposition.FORWARD, AdmissionDisposition.DROP}
+                or child.pending_final is None
+            ):
+                return ExactIntervalTransitionReceipt(
+                    interval_id=receipt.interval_id,
+                    outcome=ExactIntervalOutcome.HELD,
+                    disposition=None,
+                    effects=(),
+                )
+            try:
+                resolved, effects = resolve_exact_interval(child, disposition)
+            except ValueError:
+                return self._exact_interval_transition_failure(
+                    receipt,
+                    ExactIntervalOutcome.CONFLICT,
+                )
+            self._records[scope.turn_token] = resolved
+            self._exact_interval_records.pop(receipt._token, None)
+            if (
+                self._exact_interval_candidate_bindings.get(
+                    scope.target_candidate
+                )
+                is receipt._token
+            ):
+                self._exact_interval_candidate_bindings.pop(
+                    scope.target_candidate,
+                    None,
+                )
+            return ExactIntervalTransitionReceipt(
+                interval_id=receipt.interval_id,
+                outcome=ExactIntervalOutcome.RESOLVED,
+                disposition=disposition,
+                effects=effects,
+            )
+
+    def _new_speaker_lease_terminal_claim(
+        self,
+        record: SpeakerCaptureLeaseRecord,
+        event: SpeakerLeaseEvent,
+        reduced: SpeakerCaptureLeaseRecord,
+    ) -> SpeakerLeaseTerminalClaim | None:
+        if reduced.terminal_disposition is not AdmissionDisposition.DROP:
+            return None
+        if reduced.state not in {
+            SpeakerLeaseState.DENY_LATCHED,
+            SpeakerLeaseState.MIXED_DENY_LATCHED,
+        }:
+            return None
+        if record.terminal_disposition is not None or reduced is record:
+            return None
+        self._speaker_lease_terminal_claim_sequence += 1
+        return SpeakerLeaseTerminalClaim(
+            lease_token=record.lease_token,
+            record_generation=record.record_generation,
+            expected_logical_revision=record.logical_revision,
+            event=event,
+            expected_terminal_state=reduced.state,
+            claim_nonce=self._speaker_lease_terminal_claim_sequence,
+            _owner=self._speaker_lease_terminal_claim_owner,
+        )
+
+    def _prepare_speaker_lease_transition_locked(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float,
+        defer_drop_terminal: bool,
+    ) -> SpeakerLeasePreparedTransition:
+        record = self._speaker_leases.get(lease_token)
+        if record is None:
+            raise KeyError(lease_token)
+        reduced, diagnostics = reduce_speaker_lease(record, event)
+        if reduced.terminal_disposition is None:
+            self._speaker_leases[lease_token] = reduced
+            return SpeakerLeaseTransitionReceipt(
+                lease_token=lease_token,
+                before_state=record.state,
+                after_state=reduced.state,
+                outcome=(
+                    SpeakerLeaseTransitionOutcome.NON_TERMINAL
+                    if reduced is not record
+                    else SpeakerLeaseTransitionOutcome.STALE
+                ),
+                terminal_sequence_no=None,
+                capture_through_sequence_no=reduced.capture_through_sequence_no,
+                frozen_children=(),
+                child_results=(),
+                diagnostics=diagnostics,
+            )
+        if record.terminal_disposition is not None:
+            return SpeakerLeaseTransitionReceipt(
+                lease_token=lease_token,
+                before_state=record.state,
+                after_state=record.state,
+                outcome=self._terminal_speaker_event_outcome(record, event),
+                terminal_sequence_no=record.terminal_sequence_no,
+                capture_through_sequence_no=record.capture_through_sequence_no,
+                frozen_children=record.child_bindings,
+                child_results=(),
+                diagnostics=diagnostics,
+            )
+        claim = self._new_speaker_lease_terminal_claim(record, event, reduced)
+        if claim is not None:
+            if defer_drop_terminal:
+                return claim
+            return self._commit_speaker_lease_terminal_claim_locked(claim, now=now)
+        results, child_updates = self._prepare_speaker_lease_terminal_fanout(
+            reduced,
+            now=now,
+        )
+        self._speaker_leases[lease_token] = reduced
+        for turn_token, child in child_updates:
+            self._records[turn_token] = child
+        return SpeakerLeaseTransitionReceipt(
+            lease_token=lease_token,
+            before_state=record.state,
+            after_state=reduced.state,
+            outcome=SpeakerLeaseTransitionOutcome.APPLIED,
+            terminal_sequence_no=reduced.terminal_sequence_no,
+            capture_through_sequence_no=reduced.capture_through_sequence_no,
+            frozen_children=reduced.child_bindings,
+            child_results=results,
+            diagnostics=diagnostics,
+        )
+
+    async def prepare_speaker_lease_transition(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+        event: SpeakerLeaseEvent,
+        *,
+        now: float | None = None,
+    ) -> SpeakerLeasePreparedTransition:
+        """Commit ordinary facts, but stop before publishing a DROP terminal."""
+
+        if type(lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        effective_now = self._clock() if now is None else now
+        async with self._lock:
+            return self._prepare_speaker_lease_transition_locked(
+                lease_token,
+                event,
+                now=effective_now,
+                defer_drop_terminal=True,
+            )
+
+    def _stale_speaker_lease_terminal_claim_receipt(
+        self,
+        record: SpeakerCaptureLeaseRecord,
+    ) -> SpeakerLeaseTransitionReceipt:
+        return SpeakerLeaseTransitionReceipt(
+            lease_token=record.lease_token,
+            before_state=record.state,
+            after_state=record.state,
+            outcome=SpeakerLeaseTransitionOutcome.STALE,
+            terminal_sequence_no=record.terminal_sequence_no,
+            capture_through_sequence_no=record.capture_through_sequence_no,
+            frozen_children=record.child_bindings,
+            child_results=(),
+            diagnostics=(),
+        )
+
+    def _commit_speaker_lease_terminal_claim_locked(
+        self,
+        claim: SpeakerLeaseTerminalClaim,
+        *,
+        now: float,
+    ) -> SpeakerLeaseTransitionReceipt:
+        if (
+            claim._owner is not self._speaker_lease_terminal_claim_owner
+            or claim.claim_nonce > self._speaker_lease_terminal_claim_sequence
+        ):
+            raise AdmissionIdentityError("ASR_SPEAKER_LEASE_TERMINAL_CLAIM_INVALID")
+        record = self._speaker_leases.get(claim.lease_token)
+        if record is None:
+            raise KeyError(claim.lease_token)
+        if (
+            record.record_generation != claim.record_generation
+            or record.logical_revision != claim.expected_logical_revision
+        ):
+            return self._stale_speaker_lease_terminal_claim_receipt(record)
+        reduced, diagnostics = reduce_speaker_lease(record, claim.event)
+        if (
+            reduced is record
+            or reduced.logical_revision != record.logical_revision + 1
+            or reduced.state is not claim.expected_terminal_state
+            or reduced.terminal_disposition is not AdmissionDisposition.DROP
+            or reduced.terminal_event != claim.event
+        ):
+            return self._stale_speaker_lease_terminal_claim_receipt(record)
+        results, child_updates = self._prepare_speaker_lease_terminal_fanout(
+            reduced,
+            now=now,
+        )
+        self._speaker_leases[claim.lease_token] = reduced
+        for turn_token, child in child_updates:
+            self._records[turn_token] = child
+        return SpeakerLeaseTransitionReceipt(
+            lease_token=claim.lease_token,
+            before_state=record.state,
+            after_state=reduced.state,
+            outcome=SpeakerLeaseTransitionOutcome.APPLIED,
+            terminal_sequence_no=reduced.terminal_sequence_no,
+            capture_through_sequence_no=reduced.capture_through_sequence_no,
+            frozen_children=reduced.child_bindings,
+            child_results=results,
+            diagnostics=diagnostics,
+        )
+
+    async def commit_speaker_lease_terminal_claim(
+        self,
+        claim: SpeakerLeaseTerminalClaim,
+        *,
+        now: float | None = None,
+    ) -> SpeakerLeaseTransitionReceipt:
+        """Commit one prepared DROP transition iff its exact lease revision owns."""
+
+        if type(claim) is not SpeakerLeaseTerminalClaim:
+            raise TypeError("claim must be SpeakerLeaseTerminalClaim")
+        effective_now = self._clock() if now is None else now
+        async with self._lock:
+            return self._commit_speaker_lease_terminal_claim_locked(
+                claim,
+                now=effective_now,
+            )
+
     async def post_speaker_lease(
         self,
         lease_token: SpeakerCaptureLeaseToken,
@@ -465,57 +1223,14 @@ class VoiceTurnAdmissionCoordinator:
             raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
         effective_now = self._clock() if now is None else now
         async with self._lock:
-            record = self._speaker_leases.get(lease_token)
-            if record is None:
-                raise KeyError(lease_token)
-            reduced, diagnostics = reduce_speaker_lease(record, event)
-            if reduced.terminal_disposition is None:
-                self._speaker_leases[lease_token] = reduced
-                return SpeakerLeaseTransitionReceipt(
-                    lease_token=lease_token,
-                    before_state=record.state,
-                    after_state=reduced.state,
-                    outcome=(
-                        SpeakerLeaseTransitionOutcome.NON_TERMINAL
-                        if reduced is not record
-                        else SpeakerLeaseTransitionOutcome.STALE
-                    ),
-                    terminal_sequence_no=None,
-                    capture_through_sequence_no=reduced.capture_through_sequence_no,
-                    frozen_children=(),
-                    child_results=(),
-                    diagnostics=diagnostics,
-                )
-            if record.terminal_disposition is not None:
-                return SpeakerLeaseTransitionReceipt(
-                    lease_token=lease_token,
-                    before_state=record.state,
-                    after_state=record.state,
-                    outcome=self._terminal_speaker_event_outcome(record, event),
-                    terminal_sequence_no=record.terminal_sequence_no,
-                    capture_through_sequence_no=record.capture_through_sequence_no,
-                    frozen_children=record.child_bindings,
-                    child_results=(),
-                    diagnostics=diagnostics,
-                )
-            results, child_updates = self._prepare_speaker_lease_terminal_fanout(
-                reduced,
+            result = self._prepare_speaker_lease_transition_locked(
+                lease_token,
+                event,
                 now=effective_now,
+                defer_drop_terminal=False,
             )
-            self._speaker_leases[lease_token] = reduced
-            for turn_token, child in child_updates:
-                self._records[turn_token] = child
-            return SpeakerLeaseTransitionReceipt(
-                lease_token=lease_token,
-                before_state=record.state,
-                after_state=reduced.state,
-                outcome=SpeakerLeaseTransitionOutcome.APPLIED,
-                terminal_sequence_no=reduced.terminal_sequence_no,
-                capture_through_sequence_no=reduced.capture_through_sequence_no,
-                frozen_children=reduced.child_bindings,
-                child_results=results,
-                diagnostics=diagnostics,
-            )
+            assert isinstance(result, SpeakerLeaseTransitionReceipt)
+            return result
 
     @staticmethod
     def _terminal_speaker_event_outcome(
@@ -539,30 +1254,37 @@ class VoiceTurnAdmissionCoordinator:
         )
         if event_sequence_no != terminal_sequence_no:
             return SpeakerLeaseTransitionOutcome.STALE
-        exact = bool(
-            (
-                record.state is SpeakerLeaseState.DENY_LATCHED
-                and isinstance(event, SpeakerLeaseLow)
-                and event.checkpoint_kind
-                in {
-                    SpeakerCheckpointKind.SECOND,
-                    SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
-                }
+        if record.terminal_event is not None:
+            exact = event == record.terminal_event
+        else:
+            # Compatibility for records constructed before exact terminal-event
+            # identity was persisted. Newly reduced records always take the
+            # exact-event branch above.
+            exact = bool(
+                (
+                    record.state is SpeakerLeaseState.DENY_LATCHED
+                    and isinstance(event, SpeakerLeaseLow)
+                    and event.checkpoint_kind
+                    in {
+                        SpeakerCheckpointKind.SECOND,
+                        SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+                    }
+                )
+                or (
+                    record.state is SpeakerLeaseState.ALLOW
+                    and isinstance(event, SpeakerLeaseHigh)
+                )
+                or (
+                    record.state is SpeakerLeaseState.UNAVAILABLE
+                    and isinstance(event, SpeakerLeaseUnavailable)
+                )
+                or (
+                    record.state is SpeakerLeaseState.UNAVAILABLE
+                    and isinstance(event, SpeakerLeaseCaptureClosed)
+                    and record.capture_through_sequence_no
+                    == event.through_sequence_no
+                )
             )
-            or (
-                record.state is SpeakerLeaseState.ALLOW
-                and isinstance(event, SpeakerLeaseHigh)
-            )
-            or (
-                record.state is SpeakerLeaseState.UNAVAILABLE
-                and isinstance(event, SpeakerLeaseUnavailable)
-            )
-            or (
-                record.state is SpeakerLeaseState.UNAVAILABLE
-                and isinstance(event, SpeakerLeaseCaptureClosed)
-                and record.capture_through_sequence_no == event.through_sequence_no
-            )
-        )
         return (
             SpeakerLeaseTransitionOutcome.IDEMPOTENT
             if exact
@@ -585,7 +1307,10 @@ class VoiceTurnAdmissionCoordinator:
             if child is None:
                 continue
             events: tuple[AdmissionEvent, ...]
-            if lease.state is SpeakerLeaseState.DENY_LATCHED:
+            if lease.state in {
+                SpeakerLeaseState.DENY_LATCHED,
+                SpeakerLeaseState.MIXED_DENY_LATCHED,
+            }:
                 next_sequence = child.last_speaker_sequence_no + 1
                 if child.evidence_state is EvidenceState.FIRST_LOW:
                     events = (
@@ -810,6 +1535,8 @@ class VoiceTurnAdmissionCoordinator:
                 self._speaker_leases[lease_token] = lease
             for turn_token, record in record_updates:
                 self._records[turn_token] = record
+            self._exact_interval_records.clear()
+            self._exact_interval_candidate_bindings.clear()
             return tuple(results)
 
     async def retire(self, turn_token: VoiceTurnToken) -> bool:
