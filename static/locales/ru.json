@@ -2955,6 +2955,8 @@
         "phaseVerifying": "Проверка голоса Owner",
         "phaseCommitting": "Безопасное сохранение профиля",
         "expiresInSeconds": "Осталось {{seconds}} с",
+        "preparingRecording": "Подготовка к записи…",
+        "recordingStartsInSeconds": "Запись начнётся через {{seconds}} с",
         "recording": "Идёт запись…",
         "cancel": "Отменить",
         "delete": "Удалить голосовой профиль",

@@ -2955,6 +2955,8 @@
         "phaseVerifying": "Verificando a voz do Owner",
         "phaseCommitting": "Salvando o perfil com segurança",
         "expiresInSeconds": "{{seconds}} s restantes",
+        "preparingRecording": "Preparando a gravação…",
+        "recordingStartsInSeconds": "A gravação começa em {{seconds}} s",
         "recording": "Gravando…",
         "cancel": "Cancelar cadastro",
         "delete": "Excluir perfil de voz",

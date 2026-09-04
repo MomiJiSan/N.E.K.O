@@ -2955,6 +2955,8 @@
         "phaseVerifying": "正在驗證 Owner 聲紋",
         "phaseCommitting": "正在安全儲存聲紋",
         "expiresInSeconds": "本次錄入剩餘 {{seconds}} 秒",
+        "preparingRecording": "準備錄音…",
+        "recordingStartsInSeconds": "{{seconds}} 秒後開始",
         "recording": "正在錄音…",
         "cancel": "取消錄入",
         "delete": "刪除聲紋",

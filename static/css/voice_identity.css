@@ -411,6 +411,16 @@ input:focus-visible,
     animation: pulse 0.9s ease-in-out infinite alternate;
 }
 
+.capture-status.preparing {
+    color: var(--voice-muted);
+    background: rgba(97, 121, 138, 0.12);
+}
+
+.capture-status.preparing .record-icon {
+    background: var(--voice-muted);
+    animation: none;
+}
+
 .capture-status.saving .record-icon {
     background: var(--voice-blue-dark);
     animation: none;

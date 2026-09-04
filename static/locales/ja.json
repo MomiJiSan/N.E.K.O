@@ -2955,6 +2955,8 @@
         "phaseVerifying": "Owner 声紋を検証中",
         "phaseCommitting": "声紋を安全に保存中",
         "expiresInSeconds": "残り {{seconds}} 秒",
+        "preparingRecording": "録音の準備中…",
+        "recordingStartsInSeconds": "録音開始まであと {{seconds}} 秒",
         "recording": "録音中…",
         "cancel": "登録をキャンセル",
         "delete": "声紋を削除",

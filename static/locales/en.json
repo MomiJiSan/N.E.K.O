@@ -2955,6 +2955,8 @@
         "phaseVerifying": "Verifying the Owner voice profile",
         "phaseCommitting": "Securely saving the voice profile",
         "expiresInSeconds": "{{seconds}} seconds remaining",
+        "preparingRecording": "Preparing to record…",
+        "recordingStartsInSeconds": "Recording starts in {{seconds}} s",
         "recording": "Recording…",
         "cancel": "Cancel enrollment",
         "delete": "Delete voice profile",

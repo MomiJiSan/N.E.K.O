@@ -2955,6 +2955,8 @@
         "phaseVerifying": "Owner 음성 지문 확인 중",
         "phaseCommitting": "음성 지문을 안전하게 저장하는 중",
         "expiresInSeconds": "{{seconds}}초 남음",
+        "preparingRecording": "녹음 준비 중…",
+        "recordingStartsInSeconds": "{{seconds}}초 후 녹음 시작",
         "recording": "녹음 중…",
         "cancel": "등록 취소",
         "delete": "음성 지문 삭제",

@@ -30,6 +30,8 @@ const REFERENCE_CAPTURE_MS = REFERENCE_RECORDING_MS + STREAMING_RESAMPLE_MARGIN_
 const REFERENCE_CAPTURE_TIMEOUT_MS = REFERENCE_CAPTURE_MS + 1000;
 const VERIFICATION_CAPTURE_TIMEOUT_MS = VERIFICATION_RECORDING_MS + 1000;
 const WINDOW_CLOSE_START_WAIT_MS = 500;
+const SEGMENT_PREPARATION_MS = 2000;
+const PREPARATION_TICK_MS = 1000;
 const REFERENCE_TARGET_SAMPLES = TARGET_SAMPLE_RATE * REFERENCE_CAPTURE_MS / 1000;
 const VERIFICATION_TARGET_SAMPLES = TARGET_SAMPLE_RATE * VERIFICATION_RECORDING_MS / 1000;
 const CHUNK_SAMPLES = 480;
@@ -139,6 +141,7 @@ function createHarness({
     mediaError,
     audioChunks = null,
     manualAudio = false,
+    manualPreparation = false,
     profileError,
     profileErrorSegment = 1,
     profileTransportErrorAfterCommit = false,
@@ -193,6 +196,8 @@ function createHarness({
     const mediaRequestConstraints = [];
     const workletModules = [];
     const workletNodes = [];
+    const workletCreations = [];
+    const audioMessages = [];
     const gainNodes = [];
     const audioContextOptions = [];
     let processor = null;
@@ -211,7 +216,44 @@ function createHarness({
         ? nowMs + initialRemainingSeconds * 1000
         : null;
     const intervals = new Map();
+    const timeouts = new Map();
+    const timeoutHistory = new Map();
     let audioContext = null;
+
+    function nextDueTimer(targetMs) {
+        let next = null;
+        for (const [id, timer] of timeouts) {
+            if (timer.dueAt > targetMs) continue;
+            if (!next || timer.dueAt < next.dueAt || (timer.dueAt === next.dueAt && id < next.id)) {
+                next = { id, type: 'timeout', ...timer };
+            }
+        }
+        for (const [id, timer] of intervals) {
+            if (timer.dueAt > targetMs) continue;
+            if (!next || timer.dueAt < next.dueAt || (timer.dueAt === next.dueAt && id < next.id)) {
+                next = { id, type: 'interval', ...timer };
+            }
+        }
+        return next;
+    }
+
+    function advanceVirtualTime(milliseconds) {
+        const targetMs = nowMs + milliseconds;
+        for (;;) {
+            const next = nextDueTimer(targetMs);
+            if (!next) break;
+            nowMs = next.dueAt;
+            if (next.type === 'timeout') {
+                if (!timeouts.delete(next.id)) continue;
+            } else {
+                const interval = intervals.get(next.id);
+                if (!interval) continue;
+                interval.dueAt += interval.delay;
+            }
+            next.callback();
+        }
+        nowMs = targetMs;
+    }
 
     const statusPayload = () => {
         if (enrollmentId && enrollmentExpiresAtMs !== null && nowMs >= enrollmentExpiresAtMs) {
@@ -398,6 +440,11 @@ function createHarness({
             this.disconnected = false;
             processor = this;
             workletNodes.push(this);
+            workletCreations.push({
+                atMs: nowMs,
+                prompt: elements.get('voice-identity-reading-text').textContent,
+                captureLabel: elements.get('voice-identity-capture-label').textContent,
+            });
         }
 
         connect() {}
@@ -418,6 +465,8 @@ function createHarness({
                 'voiceIdentity.reasonModelUnavailable': 'Prepare the voice model assets or repair the installation',
                 'voiceIdentity.reasonAudioContractMismatch': 'Restore the enrolled noise-reduction setting or re-enroll',
                 'voiceIdentity.reasonSecureStorageUnavailable': 'Secure storage is unavailable',
+                'voiceIdentity.preparingRecording': 'Preparing to record...',
+                'voiceIdentity.recordingStartsInSeconds': `Recording starts in ${options?.seconds} s`,
                 'voiceIdentity.recording': 'Recording...',
                 'voiceIdentity.saving': 'Saving...',
                 'voiceIdentity.enrollmentComplete': 'Enrollment complete.',
@@ -450,9 +499,9 @@ function createHarness({
         dispatchEvent(event) {
             return windowListeners.get(event.type)?.(event);
         },
-        setInterval(callback) {
+        setInterval(callback, delay) {
             timerId += 1;
-            intervals.set(timerId, callback);
+            intervals.set(timerId, { callback, delay, dueAt: nowMs + delay });
             return timerId;
         },
         clearInterval(id) {
@@ -460,6 +509,10 @@ function createHarness({
         },
         setTimeout(callback, delay) {
             timerId += 1;
+            const id = timerId;
+            const timer = { callback, delay, dueAt: nowMs + delay };
+            timeouts.set(id, timer);
+            timeoutHistory.set(id, timer);
             if ([REFERENCE_CAPTURE_TIMEOUT_MS, VERIFICATION_CAPTURE_TIMEOUT_MS].includes(delay)) {
                 if (!manualAudio) {
                     Promise.resolve().then(() => {
@@ -468,21 +521,34 @@ function createHarness({
                         const fullAudioChunks = Math.ceil(targetSamples / CHUNK_SAMPLES);
                         const chunksToEmit = audioChunks === null ? fullAudioChunks : audioChunks;
                         for (let index = 0; index < chunksToEmit; index += 1) {
+                            audioMessages.push({ atMs: nowMs, prompt: elements.get('voice-identity-reading-text').textContent });
                             processor?.port.onmessage?.({
                                 data: new Int16Array(CHUNK_SAMPLES).fill(1024),
                             });
                         }
-                        if (chunksToEmit < fullAudioChunks) callback();
+                        if (chunksToEmit < fullAudioChunks && timeouts.delete(id)) callback();
                     });
                 }
             } else if (delay === WINDOW_CLOSE_START_WAIT_MS) {
-                Promise.resolve().then(callback);
+                Promise.resolve().then(() => {
+                    if (timeouts.delete(id)) callback();
+                });
+            } else if ([PREPARATION_TICK_MS, SEGMENT_PREPARATION_MS].includes(delay)) {
+                if (!manualPreparation) {
+                    Promise.resolve().then(() => {
+                        if (timeouts.has(id)) advanceVirtualTime(delay);
+                    });
+                }
+            } else if (delay <= 0) {
+                Promise.resolve().then(() => {
+                    if (timeouts.delete(id)) callback();
+                });
             } else {
                 throw new Error(`unmodeled setTimeout delay: ${delay}`);
             }
-            return timerId;
+            return id;
         },
-        clearTimeout() {},
+        clearTimeout(id) { timeouts.delete(id); },
         AudioContext: MockAudioContext,
         webkitAudioContext: undefined,
         showConfirm,
@@ -524,7 +590,12 @@ function createHarness({
             },
         },
         fetch: async (url, options = {}) => {
-            const call = { url, options: { ...options, headers: new MockHeaders(options.headers) } };
+            const call = {
+                url,
+                atMs: nowMs,
+                prompt: elements.get('voice-identity-reading-text').textContent,
+                options: { ...options, headers: new MockHeaders(options.headers) },
+            };
             fetchCalls.push(call);
             return defaultRoute(call);
         },
@@ -557,6 +628,8 @@ function createHarness({
         mediaRequestConstraints,
         workletModules,
         workletNodes,
+        workletCreations,
+        audioMessages,
         gainNodes,
         audioContextOptions,
         localStorage: window.localStorage,
@@ -569,9 +642,28 @@ function createHarness({
         get intervalCount() {
             return intervals.size;
         },
+        get timeoutCount() {
+            return timeouts.size;
+        },
+        get nowMs() {
+            return nowMs;
+        },
+        pendingTimeoutIds() {
+            return Array.from(timeouts.keys());
+        },
+        fireHistoricalTimeout(id) {
+            const timer = timeoutHistory.get(id);
+            if (!timer) throw new Error(`unknown timeout: ${id}`);
+            timer.callback();
+        },
+        setCanonicalEnrollment({ id = enrollmentId, profileId = enrollmentProfileId, segmentIndex = nextSegmentIndex } = {}) {
+            enrollmentId = id;
+            enrollmentProfileId = profileId;
+            nextSegmentIndex = segmentIndex;
+            enrollmentExpiresAtMs = id ? nowMs + initialRemainingSeconds * 1000 : null;
+        },
         advanceTime(milliseconds) {
-            nowMs += milliseconds;
-            for (const callback of Array.from(intervals.values())) callback();
+            advanceVirtualTime(milliseconds);
         },
         async initialize() {
             await documentListeners.get('DOMContentLoaded')();
@@ -634,6 +726,244 @@ test('active enrollment shows deterministic reference prompts and a dedicated ve
         prompts.push(prompt);
     }
     assert.equal(new Set(prompts).size, 4);
+});
+
+test('all four prompts remain visible for a full two seconds before PCM capture starts', async () => {
+    const harness = createHarness({ manualPreparation: true });
+    await harness.initialize();
+
+    const enrolling = harness.emit('voice-identity-start');
+    await flush(12);
+
+    for (let segment = 1; segment <= 4; segment += 1) {
+        const preparationStartedAt = harness.nowMs;
+        const previousWorklets = harness.workletNodes.length;
+        const previousMessages = harness.audioMessages.length;
+        const previousUploads = harness.fetchCalls.filter(
+            call => call.url === `${API_ROOT}/enrollment/segment`,
+        ).length;
+        const prompt = harness.elements.get('voice-identity-reading-text').textContent;
+
+        assert.notEqual(prompt, '', `segment ${segment} prompt`);
+        assert.equal(
+            harness.elements.get('voice-identity-capture-status').classList.contains('preparing'),
+            true,
+            `segment ${segment} preparing class`,
+        );
+        assert.equal(
+            harness.elements.get('voice-identity-capture-status').classList.contains('saving'),
+            false,
+            `segment ${segment} is not saving`,
+        );
+        assert.equal(
+            harness.elements.get('voice-identity-capture-label').textContent,
+            'Preparing to record...',
+            `segment ${segment} preparation label`,
+        );
+
+        harness.advanceTime(SEGMENT_PREPARATION_MS - 1);
+        await flush(8);
+        assert.equal(harness.workletNodes.length, previousWorklets, `segment ${segment} at 1999ms`);
+        assert.equal(harness.audioMessages.length, previousMessages, `segment ${segment} has no PCM at 1999ms`);
+        assert.equal(
+            harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
+            previousUploads,
+            `segment ${segment} has no PUT at 1999ms`,
+        );
+
+        harness.advanceTime(1);
+        await flush(16);
+        assert.equal(harness.workletNodes.length, previousWorklets + 1, `segment ${segment} at 2000ms`);
+        assert.deepEqual(harness.workletCreations.at(-1), {
+            atMs: preparationStartedAt + SEGMENT_PREPARATION_MS,
+            prompt,
+            captureLabel: 'Recording...',
+        });
+        assert.equal(
+            harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
+            previousUploads + 1,
+            `segment ${segment} uploads only after capture`,
+        );
+    }
+
+    await enrolling;
+    const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.deepEqual(
+        uploads.map(call => call.options.body.byteLength),
+        [REFERENCE_TARGET_SAMPLES * 2, REFERENCE_TARGET_SAMPLES * 2,
+            REFERENCE_TARGET_SAMPLES * 2, VERIFICATION_TARGET_SAMPLES * 2],
+    );
+    assert.equal(harness.mediaRequests, 1);
+    assert.equal(harness.workletNodes.every(node => node.port.closed && node.disconnected), true);
+    assert.equal(harness.timeoutCount, 0);
+    assert.equal(harness.intervalCount, 0);
+});
+
+test('cancelling the first preparation leaves no late PCM, PUT, or timer', async () => {
+    const harness = createHarness({ manualPreparation: true });
+    await harness.initialize();
+
+    const enrolling = harness.emit('voice-identity-start');
+    await flush(12);
+    harness.advanceTime(PREPARATION_TICK_MS);
+    await flush(4);
+    await harness.emit('voice-identity-cancel');
+    await enrolling;
+
+    harness.advanceTime(SEGMENT_PREPARATION_MS * 2);
+    await flush(8);
+    assert.equal(harness.workletNodes.length, 0);
+    assert.equal(harness.audioMessages.length, 0);
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
+        false,
+    );
+    assert.equal(harness.timeoutCount, 0);
+    assert.equal(harness.intervalCount, 0);
+});
+
+test('cancelling a later preparation cannot start the next segment', async () => {
+    const harness = createHarness({ manualPreparation: true });
+    await harness.initialize();
+
+    const enrolling = harness.emit('voice-identity-start');
+    await flush(12);
+    harness.advanceTime(SEGMENT_PREPARATION_MS);
+    await flush(16);
+    assert.equal(harness.workletNodes.length, 1);
+    assert.equal(
+        harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
+        1,
+    );
+
+    await harness.emit('voice-identity-cancel');
+    await enrolling;
+    harness.advanceTime(SEGMENT_PREPARATION_MS * 2);
+    await flush(8);
+    assert.equal(harness.workletNodes.length, 1);
+    assert.equal(
+        harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
+        1,
+    );
+    assert.equal(harness.timeoutCount, 0);
+    assert.equal(harness.intervalCount, 0);
+});
+
+for (const [eventName, stop] of [
+    ['pagehide', async harness => { harness.dispatch('pagehide'); await flush(12); }],
+    ['window close', async harness => { await harness.beforeClose(); await flush(12); }],
+]) {
+    test(`${eventName} during preparation prevents late capture and uses keepalive cancellation`, async () => {
+        const harness = createHarness({ manualPreparation: true });
+        await harness.initialize();
+
+        const enrolling = harness.emit('voice-identity-start');
+        await flush(12);
+        await stop(harness);
+        await enrolling;
+        harness.advanceTime(SEGMENT_PREPARATION_MS * 2);
+        await flush(8);
+
+        assert.equal(harness.workletNodes.length, 0);
+        assert.equal(harness.audioMessages.length, 0);
+        assert.equal(
+            harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
+            false,
+        );
+        assert.equal(
+            harness.fetchCalls.some(call => (
+                call.url === `${API_ROOT}/enrollment/cancel` && call.options.keepalive === true
+            )),
+            true,
+        );
+        assert.equal(harness.timeoutCount, 0);
+        assert.equal(harness.intervalCount, 0);
+    });
+}
+
+test('TTL expiry during preparation stops before AudioWorklet and PCM creation', async () => {
+    const harness = createHarness({ manualPreparation: true, initialRemainingSeconds: 1 });
+    await harness.initialize();
+
+    const enrolling = harness.emit('voice-identity-start');
+    await flush(12);
+    harness.advanceTime(PREPARATION_TICK_MS);
+    await flush(20);
+    await enrolling;
+    harness.advanceTime(SEGMENT_PREPARATION_MS * 2);
+    await flush(8);
+
+    assert.equal(harness.workletNodes.length, 0);
+    assert.equal(harness.audioMessages.length, 0);
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
+        false,
+    );
+    assert.equal(harness.mediaStreams[0].track.stopped, true);
+    assert.equal(harness.timeoutCount, 0);
+    assert.equal(harness.intervalCount, 0);
+});
+
+for (const [identityName, canonical] of [
+    ['enrollment id', { id: 'enrollment-2' }],
+    ['profile id', { profileId: 'profile-2' }],
+    ['segment index', { segmentIndex: 2 }],
+    ['retired enrollment', { id: null }],
+]) {
+    test(`canonical ${identityName} drift makes the active preparation stale`, async () => {
+        const harness = createHarness({ manualPreparation: true });
+        await harness.initialize();
+
+        const enrolling = harness.emit('voice-identity-start');
+        await flush(12);
+        harness.setCanonicalEnrollment(canonical);
+        await harness.dispatch('pageshow', { persisted: true });
+        await flush(16);
+        await enrolling;
+        harness.advanceTime(SEGMENT_PREPARATION_MS * 2);
+        await flush(8);
+
+        assert.equal(harness.workletNodes.length, 0);
+        assert.equal(harness.audioMessages.length, 0);
+        assert.equal(
+            harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/segment`),
+            false,
+        );
+        assert.equal(harness.timeoutCount, 0);
+    });
+}
+
+test('a cancelled preparation timer cannot clear or start its successor operation', async () => {
+    const harness = createHarness({ manualPreparation: true });
+    await harness.initialize();
+
+    const firstEnrollment = harness.emit('voice-identity-start');
+    await flush(12);
+    const staleTimerId = harness.pendingTimeoutIds()[0];
+    assert.ok(staleTimerId);
+    await harness.emit('voice-identity-cancel');
+    await firstEnrollment;
+
+    const secondEnrollment = harness.emit('voice-identity-start');
+    await flush(12);
+    assert.equal(harness.workletNodes.length, 0);
+    assert.equal(harness.timeoutCount, 1);
+    harness.fireHistoricalTimeout(staleTimerId);
+    await flush(8);
+    assert.equal(harness.workletNodes.length, 0);
+    assert.equal(harness.timeoutCount, 1);
+
+    harness.advanceTime(SEGMENT_PREPARATION_MS - 1);
+    await flush(8);
+    assert.equal(harness.workletNodes.length, 0);
+    harness.advanceTime(1);
+    await flush(16);
+    assert.equal(harness.workletNodes.length, 1);
+
+    await harness.emit('voice-identity-cancel');
+    await secondEnrollment;
+    assert.equal(harness.timeoutCount, 0);
+    assert.equal(harness.intervalCount, 0);
 });
 
 test('one click PUTs three reference captures plus one exact five-second verification at 48 kHz', async () => {
@@ -918,14 +1248,14 @@ test('active unbound status generates one opaque profile id before the first seg
 test('TTL expiry while awaiting a retry stops media resources and clears its interval', async () => {
     const harness = createHarness({
         profileError: 'speech_too_short',
-        initialRemainingSeconds: 1,
+        initialRemainingSeconds: 10,
     });
     await harness.initialize();
     await harness.emit('voice-identity-start');
 
     assert.equal(harness.mediaStreams[0].track.stopped, false);
     assert.equal(harness.intervalCount, 1);
-    harness.advanceTime(1500);
+    harness.advanceTime(8500);
     await flush();
 
     assert.equal(harness.mediaStreams[0].track.stopped, true);

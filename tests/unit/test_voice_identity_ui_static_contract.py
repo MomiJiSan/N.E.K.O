@@ -142,6 +142,12 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert 'data-i18n="voiceIdentity.readingPromptLabel"' in template
     assert 'id="voice-identity-verification-help"' in template
     assert 'data-i18n="voiceIdentity.verificationScoreHelp"' in template
+    assert (
+        'id="voice-identity-capture-label" role="status"\n'
+        '                            aria-live="polite" aria-atomic="true"'
+        in template
+    )
+    assert 'id="voice-identity-timer" aria-hidden="true"' in template
     assert 'data-i18n="voiceIdentity.hintSameMicrophone"' in template
     assert 'data-i18n="voiceIdentity.hintDifferentSentence"' in template
     assert "voice-identity-record" not in template
@@ -160,6 +166,20 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert "--voice-panel: rgba(27, 39, 48, 0.96)" in stylesheet
     assert "padding: 18px 24px" in stylesheet
     assert "linear-gradient(to right, #4bd4fd, #17a7ff)" in stylesheet
+    preparing_status = re.search(
+        r"\.capture-status\.preparing\s*\{(?P<body>[^}]*)\}", stylesheet
+    )
+    preparing_icon = re.search(
+        r"\.capture-status\.preparing \.record-icon\s*\{(?P<body>[^}]*)\}",
+        stylesheet,
+    )
+    assert preparing_status is not None
+    assert "var(--voice-muted)" in preparing_status.group("body")
+    assert preparing_icon is not None
+    assert "background: var(--voice-muted)" in preparing_icon.group("body")
+    assert "animation: none" in preparing_icon.group("body")
+    assert "var(--voice-danger)" not in preparing_icon.group("body")
+    assert "pulse" not in preparing_icon.group("body")
     assert "/static/js/voice_identity.js" in template
     assert "/static/css/voice_identity.css" in template
 
@@ -410,6 +430,8 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "phaseVerifying",
         "phaseCommitting",
         "expiresInSeconds",
+        "preparingRecording",
+        "recordingStartsInSeconds",
         "recording",
         "cancel",
         "delete",
@@ -467,6 +489,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         assert required <= set(copy)
         assert removed_wizard_keys.isdisjoint(copy)
         assert all(isinstance(copy[key], str) and copy[key].strip() for key in required)
+        assert "{{seconds}}" in copy["recordingStartsInSeconds"]
         assert payload["settings"]["menu"]["voiceIdentity"]
 
 

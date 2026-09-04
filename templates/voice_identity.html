@@ -112,7 +112,9 @@
                     <p class="remaining-label" id="voice-identity-remaining" aria-live="polite"></p>
                     <div class="capture-status" id="voice-identity-capture-status" hidden>
                         <span class="record-icon" aria-hidden="true"></span>
-                        <span id="voice-identity-capture-label" data-i18n="voiceIdentity.recording">正在录音…</span>
+                        <span id="voice-identity-capture-label" role="status"
+                            aria-live="polite" aria-atomic="true"
+                            data-i18n="voiceIdentity.recording">正在录音…</span>
                         <span class="recording-timer" id="voice-identity-timer" aria-hidden="true"></span>
                     </div>
                     <div class="enrollment-actions">

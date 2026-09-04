@@ -6,6 +6,8 @@
     const VERIFICATION_RECORDING_MS = 5000;
     const STREAMING_RESAMPLE_MARGIN_MS = 100;
     const REQUIRED_SEGMENTS = 4;
+    const SEGMENT_PREPARATION_MS = 2000;
+    const PREPARATION_TICK_MS = 1000;
     const CAPTURE_TIMEOUT_GRACE_MS = 1000;
     const WINDOW_CLOSE_START_WAIT_MS = 500;
     const SESSION_HEADER = 'X-Voice-Identity-Enrollment';
@@ -77,6 +79,7 @@
         acceptedSegments: 0, enrollmentPhase: 'collecting_reference',
         remainingSeconds: null, remainingObservedAt: 0, mediaStream: null,
         audioContext: null, captureAbort: null, uploadAbort: null,
+        preparing: false, preparationSeconds: null, preparationContext: null, preparationAbort: null,
         recording: false, saving: false, cancelPending: false, filterPending: false,
         busy: false, initialized: false, closeStarted: false, startSettled: null,
         operationNonce: 0, ttlTimer: null, ttlSettling: false
@@ -221,6 +224,9 @@
         state.effectiveEnabled = valueFrom([status, filter], ['effective_enabled'], 'boolean', state.requestedEnabled && state.profileAvailable);
         state.effectiveReason = valueFrom([status, filter], ['effective_reason', 'reason'], 'string', state.effectiveEnabled ? 'ready' : (state.profileAvailable ? 'disabled' : 'no_profile'));
         if (!state.profileAvailable) state.effectiveEnabled = false;
+        if (state.preparationContext && !preparationMatches(state.preparationContext)) {
+            stopPreparation('stale_enrollment');
+        }
         render();
     }
 
@@ -277,6 +283,103 @@
     function remainingSeconds() {
         if (state.remainingSeconds === null) return null;
         return Math.max(0, Math.ceil(state.remainingSeconds - Math.max(0, performance.now() - state.remainingObservedAt) / 1000));
+    }
+    function createPreparationContext(nonce, enrollmentId, profileId, segmentIndex) {
+        return Object.freeze({
+            operationNonce: nonce,
+            enrollmentId,
+            profileId,
+            segmentIndex,
+            deadline: performance.now() + SEGMENT_PREPARATION_MS
+        });
+    }
+    function preparationMatches(context) {
+        return Boolean(context
+            && state.preparationContext === context
+            && state.operationNonce === context.operationNonce
+            && state.enrollmentId === context.enrollmentId
+            && state.profileId === context.profileId
+            && state.nextSegmentIndex === context.segmentIndex
+            && !state.cancelPending
+            && !state.closeStarted);
+    }
+    function preparationMatchesForCapture(context) {
+        return preparationMatches(context)
+            && state.preparing
+            && !state.ttlSettling
+            && remainingSeconds() !== 0;
+    }
+    function stopPreparation(reason) {
+        const abort = state.preparationAbort;
+        state.preparationAbort = null;
+        state.preparationContext = null;
+        state.preparationSeconds = null;
+        state.preparing = false;
+        if (abort) abort(reason || 'preparation_cancelled');
+    }
+    async function prepareCurrentSegment(context) {
+        stopPreparation('preparation_replaced');
+        state.preparationContext = context;
+        state.preparationSeconds = Math.max(1, Math.ceil(
+            (context.deadline - performance.now()) / PREPARATION_TICK_MS
+        ));
+        state.preparing = true;
+        state.recording = false;
+        state.saving = false;
+        render();
+
+        let result = 'stale';
+        let timeoutId = null;
+        let abortPreparation = null;
+        try {
+            result = await new Promise(function (resolve) {
+                let settled = false;
+                function finish(value) {
+                    if (settled) return;
+                    settled = true;
+                    if (timeoutId !== null) window.clearTimeout(timeoutId);
+                    timeoutId = null;
+                    resolve(value);
+                }
+                abortPreparation = function () { finish('stale'); };
+                state.preparationAbort = abortPreparation;
+                function tick() {
+                    timeoutId = null;
+                    if (!preparationMatches(context)) {
+                        finish('stale');
+                        return;
+                    }
+                    if (remainingSeconds() === 0) {
+                        finish('stale');
+                        expireEnrollment().catch(function () {});
+                        return;
+                    }
+                    const remainingMs = context.deadline - performance.now();
+                    if (remainingMs <= 0) {
+                        finish('ready');
+                        return;
+                    }
+                    const seconds = Math.ceil(remainingMs / PREPARATION_TICK_MS);
+                    if (state.preparationSeconds !== seconds) {
+                        state.preparationSeconds = seconds;
+                        render();
+                    }
+                    timeoutId = window.setTimeout(tick, Math.min(PREPARATION_TICK_MS, remainingMs));
+                }
+                tick();
+            });
+            return result;
+        } finally {
+            if (state.preparationContext === context) {
+                if (state.preparationAbort === abortPreparation) state.preparationAbort = null;
+                if (result !== 'ready') {
+                    state.preparationContext = null;
+                    state.preparationSeconds = null;
+                    state.preparing = false;
+                    render();
+                }
+            }
+        }
     }
     function stopTtlClock() {
         if (state.ttlTimer !== null) {
@@ -348,10 +451,23 @@
         elements.readingPrompt.hidden = !readingPrompt;
         elements.readingText.textContent = readingPrompt;
         elements.verificationHelp.hidden = !state.enrollmentId || state.nextSegmentIndex !== REQUIRED_SEGMENTS;
-        elements.captureStatus.hidden = !state.recording && !state.saving;
+        elements.captureStatus.hidden = !state.preparing && !state.recording && !state.saving;
+        elements.captureStatus.classList.toggle('preparing', state.preparing);
         elements.captureStatus.classList.toggle('saving', state.saving);
-        elements.captureLabel.textContent = state.recording
-            ? translate('voiceIdentity.recording', '正在录音…') : phaseMessage();
+        const captureLabel = state.preparing
+            ? translate('voiceIdentity.preparingRecording', '准备录音…')
+            : (state.recording ? translate('voiceIdentity.recording', '正在录音…') : phaseMessage());
+        if (elements.captureLabel.textContent !== captureLabel) elements.captureLabel.textContent = captureLabel;
+        if (state.preparing) {
+            const seconds = state.preparationSeconds === null ? 2 : state.preparationSeconds;
+            elements.timer.textContent = translate(
+                'voiceIdentity.recordingStartsInSeconds',
+                `${seconds} 秒后开始`,
+                { seconds }
+            );
+        } else if (!state.recording) {
+            elements.timer.textContent = '';
+        }
         elements.progressLabel.textContent = translate('voiceIdentity.segmentProgress', `第 ${state.nextSegmentIndex}/4 段`, { current: state.nextSegmentIndex, total: 4 });
         elements.phase.textContent = state.enrollmentId ? phaseMessage() : '';
         const remaining = remainingSeconds();
@@ -506,6 +622,7 @@
         }
     }
     function stopMicrophone(reason) {
+        stopPreparation(reason);
         const captureAbort = state.captureAbort;
         state.captureAbort = null;
         if (captureAbort) captureAbort(new Error(reason || 'capture_cancelled'));
@@ -584,7 +701,20 @@
         const index = state.nextSegmentIndex;
         const enrollmentId = state.enrollmentId;
         const profileId = state.profileId;
-        state.recording = true; state.saving = false; render();
+        const context = createPreparationContext(nonce, enrollmentId, profileId, index);
+        if (await prepareCurrentSegment(context) !== 'ready') return 'stale';
+        if (!preparationMatchesForCapture(context)) {
+            const expired = remainingSeconds() === 0;
+            stopPreparation(expired ? 'stale_enrollment' : 'preparation_cancelled');
+            if (expired) expireEnrollment().catch(function () {});
+            return 'stale';
+        }
+        state.preparationContext = null;
+        state.preparationSeconds = null;
+        state.preparing = false;
+        state.recording = true;
+        state.saving = false;
+        render();
         let pcm = null;
         try {
             const recordingDurationMs = index === REQUIRED_SEGMENTS
@@ -648,6 +778,7 @@
     async function startEnrollment() {
         if (state.busy || state.filterPending || state.cancelPending) return;
         const nonce = ++state.operationNonce;
+        stopPreparation('preparation_replaced');
         let startSettled = null;
         let settleStart = null;
         state.busy = true; setMessage(''); render();
@@ -704,6 +835,7 @@
                 state.startSettled = null; settleStart();
             }
             if (nonce === state.operationNonce) {
+                stopPreparation('preparation_cancelled');
                 state.recording = false; state.saving = false; state.busy = false; state.cancelPending = false;
             }
             render();
@@ -779,6 +911,7 @@
         window.addEventListener('pagehide', () => { window.nekoBeforeWindowClose().catch(function () {}); });
         window.addEventListener('pageshow', async function (event) {
             if (!event.persisted) return;
+            stopPreparation('stale_enrollment');
             state.closeStarted = false; state.cancelPending = false; state.busy = true; render();
             if (!await reconcileStatus()) setMessage(translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。'), true);
             state.busy = false; render();

@@ -15,15 +15,22 @@
 
 ```text
 开始录入
+  → 服务端确认 Segment 1 与对应朗读文本
+  → PREPARING 2 秒（不采集 PCM）
   → Segment 1：3 秒参考语音
-  → Segment 2：3 秒参考语音
-  → Segment 3：3 秒参考语音
+  → 服务端确认 Segment 2 / 3 与各自朗读文本
+  → 每段分别 PREPARING 2 秒（不采集 PCM）
+  → Segment 2 / 3：各 3 秒参考语音
   → 建立三段参考 centroid
+  → 服务端确认 Segment 4 与对应朗读文本
+  → PREPARING 2 秒（不采集 PCM）
   → Segment 4：5 秒独立验证语音
   → 计算 1.5 / 3.0 / 5.0 秒三个检查点
   → 三项全部通过：提交并激活 Profile
   → 任一项未通过：返回最低匹配率并按服务端进度重试或重置
 ```
+
+每段都必须先应用服务端权威 `next_segment_index`、更新并绘制对应朗读文本，再进入完整、可见的 2 秒 `PREPARING`，到期后才允许建立该段 `AudioWorkletNode` 并采集 PCM。准备态与 `RECORDING`、`SAVING` 互斥；上传、模型推理和前一段响应耗时不计作准备时间。四段仍为一次用户操作、一次麦克风授权和同一麦克风租约，段间不关闭或重新申请麦克风。
 
 前三段显示为 3 秒录音。浏览器为服务端流式重采样保留 100 ms 采集余量，服务端规范化后只使用精确 3 秒。第四段的 source 必须严格为 5 秒：浏览器精确上传 `240,000 samples / 480,000 bytes`，不增加采集余量，避免越过 5 秒硬上限。
 
@@ -128,6 +135,8 @@ match_percent = round(
 
 录入 Session TTL 保持 45 秒，硬租约保持 60 秒。增加 5 秒验证不能扩大生产 Speaker Shadow、Provider candidate、ASR endpointing 或候选拒绝缓冲；运行时声纹 PCM 上限仍为 4 秒。
 
+四次固定准备共占 8 秒，准备期间 TTL 正常递减；按 `3.1 × 3 + 5.0` 秒 source 估算，网络与模型处理预算约剩 22.7 秒。准备结束时若 TTL 已归零，客户端不得开始录音，而应进入既有过期清理；不得动态续租或提高 45 秒 TTL。
+
 ## 7. 提交事务与异步边界
 
 每段遵循：
@@ -139,6 +148,8 @@ match_percent = round(
 ```
 
 每个关键 `await` 后必须重新校验 session generation、operation nonce、segment index 和 task identity。取消、过期、重录、重复请求或新 Session 接管后，迟到的归一化、验证和推理结果不得写回。
+
+客户端准备操作同样使用不可变身份上下文，至少绑定 operation nonce、enrollment ID、profile ID、segment index 和基于 `performance.now()` 的 deadline。所有 timer 回调及 deadline 到达点都必须重新校验该上下文；取消、页面隐藏、窗口关闭、TTL 到期、服务端退休、BFCache 恢复同步或新 operation 接管时必须中止准备。旧 timer 只能返回 stale，不能迟到创建 AudioWorklet、采集 PCM、上传 Segment，且旧 operation 的 `finally` 不得清除后继准备态。
 
 旧 Profile 和启用偏好在第四段验证及完整提交成功前保持不变。通过后才依次 stage Profile、激活 Runtime、保存 preference 并提交加密文件；任一步失败都必须回滚本轮未提交状态。
 
@@ -161,8 +172,10 @@ Profile 使用 schema/AAD v3，保存合同 ID、合同 revision、录入时降�
 解除 Draft/实验门禁前，除自动化测试外还必须完成：
 
 1. Electron 使用实际麦克风走完 3 / 3 / 3 / 5 秒计时和资源释放；
-2. 私有真实语料验证 Owner 三检查点不产生 false-LOW；
-3. impostor false-HIGH 不高于统一音频处理域之前；
-4. 响应丢失、取消、TTL、配置切换和 Profile 回滚在真实桌面链路成立。
+2. 四段均在正确朗读文本已经显示后保持完整 2 秒准备态，准备期间没有 AudioWorklet message、PCM 或 Segment PUT；
+3. 准备期间取消、身份变化、页面隐藏、窗口关闭或 TTL 到期后没有迟到录音和悬挂 timer；
+4. 私有真实语料验证 Owner 三检查点不产生 false-LOW；
+5. impostor false-HIGH 不高于统一音频处理域之前；
+6. 响应丢失、取消、TTL、配置切换和 Profile 回滚在真实桌面链路成立。
 
 自动化测试通过不能替代真实语料与 Electron 验收，也不能把匹配率解释为认证准确率。
