@@ -82,7 +82,10 @@
         preparing: false, preparationSeconds: null, preparationContext: null, preparationAbort: null,
         recording: false, saving: false, cancelPending: false, filterPending: false,
         busy: false, initialized: false, closeStarted: false, startSettled: null,
-        operationNonce: 0, ttlTimer: null, ttlSettling: false
+        operationNonce: 0, ttlTimer: null, ttlSettling: false,
+        message: { kind: 'text', text: '', isError: false, verification: null },
+        passiveRefreshPromise: null, passiveRefreshContext: null,
+        passiveRefreshQueued: false, refreshAfterCompletion: false
     };
     const elements = {};
 
@@ -244,8 +247,30 @@
             && payload.profile_generation === profileId);
     }
     function setMessage(message, isError) {
-        elements.message.textContent = message || '';
-        elements.message.classList.toggle('error', Boolean(isError));
+        state.message = {
+            kind: 'text', text: message || '', isError: Boolean(isError), verification: null
+        };
+        renderMessage();
+    }
+    function setCompletionMessage(verification) {
+        state.message = {
+            kind: 'completion', text: '', isError: false,
+            verification: verification ? {
+                passed: verification.passed,
+                matchPercent: verification.matchPercent
+            } : null
+        };
+        renderMessage();
+    }
+    function renderMessage() {
+        const message = state.message;
+        const text = message.kind === 'completion'
+            ? (message.verification
+                ? verificationMessage(message.verification)
+                : enrollmentCompleteMessage())
+            : message.text;
+        elements.message.textContent = text || '';
+        elements.message.classList.toggle('error', Boolean(message.isError));
     }
     function enrollmentErrorMessage(error) {
         const configured = error && ENROLLMENT_ERROR_MESSAGES[error.message];
@@ -481,7 +506,64 @@
             else step.removeAttribute('aria-current');
         }
     }
-    function render() { renderProfile(); renderEnrollment(); }
+    function render() { renderProfile(); renderEnrollment(); renderMessage(); }
+
+    function passiveRefreshIdentity() {
+        return Object.freeze({
+            operationNonce: state.operationNonce,
+            enrollmentId: state.enrollmentId,
+            profileId: state.profileId,
+            profileRevision: state.profileRevision
+        });
+    }
+    function isIdleForPassiveRefresh() {
+        return Boolean(state.initialized
+            && document.visibilityState !== 'hidden'
+            && !state.busy
+            && !state.cancelPending
+            && !state.filterPending
+            && !state.enrollmentId
+            && !state.preparing
+            && !state.recording
+            && !state.saving
+            && !state.ttlSettling
+            && !state.closeStarted);
+    }
+    function passiveRefreshMatches(identity) {
+        return Boolean(identity
+            && state.operationNonce === identity.operationNonce
+            && state.enrollmentId === identity.enrollmentId
+            && state.profileId === identity.profileId
+            && state.profileRevision === identity.profileRevision);
+    }
+    function refreshStatusWhenIdle() {
+        if (state.passiveRefreshPromise) {
+            if (isIdleForPassiveRefresh()
+                && !passiveRefreshMatches(state.passiveRefreshContext)) {
+                state.passiveRefreshQueued = true;
+            }
+            return state.passiveRefreshPromise;
+        }
+        if (!isIdleForPassiveRefresh()) return Promise.resolve(null);
+        const identity = passiveRefreshIdentity();
+        const request = getCanonicalStatus().then(function (payload) {
+            if (!isIdleForPassiveRefresh() || !passiveRefreshMatches(identity)) return null;
+            applyStatus(payload);
+            return payload;
+        }).catch(function () {
+            return null;
+        }).finally(function () {
+            if (state.passiveRefreshPromise !== request) return;
+            state.passiveRefreshPromise = null;
+            state.passiveRefreshContext = null;
+            const queued = state.passiveRefreshQueued;
+            state.passiveRefreshQueued = false;
+            if (queued) refreshStatusWhenIdle();
+        });
+        state.passiveRefreshPromise = request;
+        state.passiveRefreshContext = identity;
+        return request;
+    }
 
     function localStorageValue(key) {
         try { return window.localStorage ? window.localStorage.getItem(key) : null; }
@@ -695,7 +777,8 @@
         stopTtlClock();
         state.enrollmentId = null; state.profileId = null;
         stopMicrophone();
-        setMessage(verification ? verificationMessage(verification) : enrollmentCompleteMessage(), false);
+        setCompletionMessage(verification);
+        state.refreshAfterCompletion = true;
     }
     async function submitCurrentSegment(nonce) {
         const index = state.nextSegmentIndex;
@@ -831,14 +914,18 @@
                     : enrollmentErrorMessage(error), true);
             }
         } finally {
+            let refreshAfterCompletion = false;
             if (settleStart && state.startSettled === startSettled) {
                 state.startSettled = null; settleStart();
             }
             if (nonce === state.operationNonce) {
                 stopPreparation('preparation_cancelled');
                 state.recording = false; state.saving = false; state.busy = false; state.cancelPending = false;
+                refreshAfterCompletion = state.refreshAfterCompletion;
+                state.refreshAfterCompletion = false;
             }
             render();
+            if (refreshAfterCompletion) refreshStatusWhenIdle();
         }
     }
     async function cancelEnrollment(options) {
@@ -894,6 +981,10 @@
         elements.delete.addEventListener('click', deleteProfile);
         elements.filter.addEventListener('change', updateFilter);
         window.addEventListener('localechange', render);
+        window.addEventListener('focus', function () { refreshStatusWhenIdle(); });
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') refreshStatusWhenIdle();
+        });
         window.nekoBeforeWindowClose = async function () {
             state.closeStarted = true; ++state.operationNonce; state.cancelPending = true;
             stopTtlClock();
@@ -909,12 +1000,11 @@
             return true;
         };
         window.addEventListener('pagehide', () => { window.nekoBeforeWindowClose().catch(function () {}); });
-        window.addEventListener('pageshow', async function (event) {
+        window.addEventListener('pageshow', function (event) {
             if (!event.persisted) return;
             stopPreparation('stale_enrollment');
-            state.closeStarted = false; state.cancelPending = false; state.busy = true; render();
-            if (!await reconcileStatus()) setMessage(translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。'), true);
-            state.busy = false; render();
+            state.closeStarted = false; state.cancelPending = false; state.busy = false; render();
+            refreshStatusWhenIdle();
         });
     }
     async function initialize() {

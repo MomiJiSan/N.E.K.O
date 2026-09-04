@@ -161,6 +161,8 @@ function createHarness({
     initialEnrollmentProfileId = null,
     initialNextSegmentIndex = 1,
     initialRemainingSeconds = 45,
+    statusHandler,
+    finalResponseTransform,
 } = {}) {
     const elementIds = [
         'voice-identity-status-dot',
@@ -210,6 +212,7 @@ function createHarness({
     let nextSegmentIndex = initialEnrollment ? initialNextSegmentIndex : 1;
     let lastCompletedEnrollmentId = null;
     let statusRequestCount = 0;
+    let canonicalStatusOverride = null;
     let timerId = 0;
     let nowMs = 1000;
     let enrollmentExpiresAtMs = enrollmentId
@@ -219,6 +222,7 @@ function createHarness({
     const timeouts = new Map();
     const timeoutHistory = new Map();
     let audioContext = null;
+    let currentStartGate = startGate;
 
     function nextDueTimer(targetMs) {
         let next = null;
@@ -283,6 +287,7 @@ function createHarness({
         profile_generation: serverProfileGeneration,
         last_completed_enrollment_id: lastCompletedEnrollmentId,
         runtime_mode: 'enforce',
+        ...(canonicalStatusOverride || {}),
         });
     };
 
@@ -293,10 +298,17 @@ function createHarness({
         if (call.url === `${API_ROOT}/status`) {
             statusRequestCount += 1;
             if (statusGate && statusRequestCount === 1) return statusGate.promise;
+            if (statusHandler) {
+                return statusHandler({
+                    requestNumber: statusRequestCount,
+                    payload: statusPayload(),
+                    call,
+                });
+            }
             return jsonResponse(statusPayload());
         }
         if (call.url === `${API_ROOT}/enrollment/start`) {
-            if (startGate) await startGate.promise;
+            if (currentStartGate) await currentStartGate.promise;
             if (startError) {
                 return jsonResponse(
                     { error_code: startError },
@@ -346,10 +358,15 @@ function createHarness({
             if (profileTransportErrorAfterCommit) {
                 throw new Error('profile_response_lost');
             }
-            return jsonResponse({
+            const completedPayload = {
                 ...statusPayload(),
                 verification: { passed: true, match_percent: verificationMatchPercent },
-            });
+            };
+            return jsonResponse(
+                finalResponseTransform
+                    ? finalResponseTransform(completedPayload)
+                    : completedPayload,
+            );
         }
         if (call.url === `${API_ROOT}/enrollment/cancel`) {
             enrollmentId = null;
@@ -373,6 +390,10 @@ function createHarness({
 
     const document = {
         activeElement: null,
+        visibilityState: 'visible',
+        get hidden() {
+            return this.visibilityState !== 'visible';
+        },
         getElementById(id) {
             return elements.get(id);
         },
@@ -381,6 +402,9 @@ function createHarness({
         },
         addEventListener(type, listener) {
             documentListeners.set(type, listener);
+        },
+        dispatchEvent(event) {
+            return documentListeners.get(event.type)?.(event);
         },
     };
     elements.forEach(element => {
@@ -648,6 +672,9 @@ function createHarness({
         get nowMs() {
             return nowMs;
         },
+        get statusRequestCount() {
+            return statusRequestCount;
+        },
         pendingTimeoutIds() {
             return Array.from(timeouts.keys());
         },
@@ -661,6 +688,15 @@ function createHarness({
             enrollmentProfileId = profileId;
             nextSegmentIndex = segmentIndex;
             enrollmentExpiresAtMs = id ? nowMs + initialRemainingSeconds * 1000 : null;
+        },
+        setCanonicalStatusOverride(override) {
+            canonicalStatusOverride = override;
+        },
+        setStartGate(gate) {
+            currentStartGate = gate;
+        },
+        setDocumentVisibility(visibilityState) {
+            document.visibilityState = visibilityState;
         },
         advanceTime(milliseconds) {
             advanceVirtualTime(milliseconds);
@@ -676,6 +712,9 @@ function createHarness({
         },
         dispatch(type, event = {}) {
             return window.dispatchEvent({ type, ...event });
+        },
+        dispatchDocument(type, event = {}) {
+            return document.dispatchEvent({ type, ...event });
         },
         beforeClose() {
             return window.nekoBeforeWindowClose();
@@ -981,6 +1020,7 @@ test('one click PUTs three reference captures plus one exact five-second verific
         `${API_ROOT}/enrollment/segment`,
         `${API_ROOT}/enrollment/segment`,
         `${API_ROOT}/enrollment/segment`,
+        `${API_ROOT}/status`,
     ]);
     const uploads = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
     assert.equal(uploads.length, 4);
@@ -1025,6 +1065,204 @@ test('one click PUTs three reference captures plus one exact five-second verific
         'Lowest voice similarity: 72%. Verification passed. Enrollment complete.',
     );
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+});
+
+test('successful final keeps its verification score visible once the profile is canonical', async () => {
+    const harness = createHarness({ verificationMatchPercent: 83 });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    const message = harness.elements.get('voice-identity-message').textContent;
+    assert.match(message, /83%/);
+    assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-message').classList.contains('error'), false);
+});
+
+test('completion refresh preserves the score while adopting a recovered status suffix', async () => {
+    const refreshGate = deferred();
+    const refreshStarted = deferred();
+    let canonicalAfterCompletion = null;
+    const harness = createHarness({
+        verificationMatchPercent: 79,
+        finalResponseTransform(payload) {
+            return {
+                ...payload,
+                effective_enabled: false,
+                effective_reason: 'model_unavailable',
+            };
+        },
+        statusHandler({ requestNumber, payload }) {
+            if (requestNumber === 1) return jsonResponse(payload);
+            if (requestNumber === 2) {
+                canonicalAfterCompletion = payload;
+                refreshStarted.resolve();
+                return refreshGate.promise;
+            }
+            return jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+
+    const enrolling = harness.emit('voice-identity-start');
+    await refreshStarted.promise;
+    await flush(2);
+    const unavailableMessage = harness.elements.get('voice-identity-message').textContent;
+    assert.match(unavailableMessage, /79%/);
+
+    refreshGate.resolve(jsonResponse(canonicalAfterCompletion));
+    await enrolling;
+    await flush(2);
+
+    const recoveredMessage = harness.elements.get('voice-identity-message').textContent;
+    assert.match(recoveredMessage, /79%/);
+    assert.notEqual(recoveredMessage, unavailableMessage);
+    assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+});
+
+test('focus and visible visibilitychange silently refresh canonical profile state', async () => {
+    const harness = createHarness({ initialProfile: true, initialRequested: false });
+    await harness.initialize();
+
+    harness.setCanonicalStatusOverride({
+        requested_enabled: true,
+        effective_enabled: true,
+        effective_reason: 'ready',
+    });
+    await harness.dispatch('focus');
+    await flush(2);
+    assert.equal(harness.statusRequestCount, 2);
+    assert.equal(harness.elements.get('voice-identity-filter').checked, true);
+
+    harness.setDocumentVisibility('hidden');
+    await harness.dispatchDocument('visibilitychange');
+    await flush(2);
+    assert.equal(harness.statusRequestCount, 2);
+
+    harness.setCanonicalStatusOverride({
+        requested_enabled: false,
+        effective_enabled: false,
+        effective_reason: 'disabled',
+    });
+    harness.setDocumentVisibility('visible');
+    await harness.dispatchDocument('visibilitychange');
+    await flush(2);
+    assert.equal(harness.statusRequestCount, 3);
+    assert.equal(harness.elements.get('voice-identity-filter').checked, false);
+});
+
+test('simultaneous focus and visibility signals share one canonical refresh', async () => {
+    const refreshGate = deferred();
+    const harness = createHarness({
+        initialProfile: true,
+        statusHandler({ requestNumber, payload }) {
+            return requestNumber === 2 ? refreshGate.promise : jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+
+    const focusRefresh = harness.dispatch('focus');
+    const visibleRefresh = harness.dispatchDocument('visibilitychange');
+    await flush(2);
+    assert.equal(harness.statusRequestCount, 2);
+
+    refreshGate.resolve(jsonResponse({
+        requested_enabled: true,
+        effective_enabled: true,
+        effective_reason: 'ready',
+        has_profile: true,
+        enrollment: null,
+        profile_generation: 'profile-0',
+        last_completed_enrollment_id: null,
+        runtime_mode: 'enforce',
+    }));
+    await Promise.all([focusRefresh, visibleRefresh]);
+    assert.equal(harness.statusRequestCount, 2);
+});
+
+test('a refresh response captured before re-enrollment cannot overwrite its identity', async () => {
+    const refreshGate = deferred();
+    const startGate = deferred();
+    const harness = createHarness({
+        initialProfile: true,
+        initialRequested: true,
+        startGate,
+        statusHandler({ requestNumber, payload }) {
+            return requestNumber === 2 ? refreshGate.promise : jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+
+    const staleRefresh = harness.dispatch('focus');
+    await flush(2);
+    const reenrolling = harness.emit('voice-identity-reenroll');
+    await flush(2);
+    refreshGate.resolve(jsonResponse({
+        requested_enabled: false,
+        effective_enabled: false,
+        effective_reason: 'disabled',
+        has_profile: true,
+        enrollment: null,
+        profile_generation: 'profile-0',
+        last_completed_enrollment_id: null,
+        runtime_mode: 'enforce',
+    }));
+    await staleRefresh;
+    await flush(2);
+
+    assert.equal(harness.elements.get('voice-identity-filter').checked, true);
+    assert.equal(harness.elements.get('voice-identity-enrollment').hidden, false);
+    startGate.resolve();
+    await reenrolling;
+});
+
+test('passive refresh failure is silent and preserves a completed verification result', async () => {
+    const harness = createHarness({
+        verificationMatchPercent: 77,
+        statusHandler({ requestNumber, payload }) {
+            if (requestNumber === 3) throw new Error('offline');
+            return jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+    await harness.emit('voice-identity-start');
+    const completedMessage = harness.elements.get('voice-identity-message').textContent;
+    assert.match(completedMessage, /77%/);
+
+    await harness.dispatch('focus');
+    await flush(2);
+
+    assert.equal(harness.elements.get('voice-identity-message').textContent, completedMessage);
+    assert.equal(harness.elements.get('voice-identity-message').classList.contains('error'), false);
+});
+
+test('lost final response never invents a verification score', async () => {
+    const harness = createHarness({
+        profileTransportErrorAfterCommit: true,
+        verificationMatchPercent: 91,
+    });
+    await harness.initialize();
+
+    await harness.emit('voice-identity-start');
+
+    assert.doesNotMatch(harness.elements.get('voice-identity-message').textContent, /91%/);
+    assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+});
+
+test('starting a new recording clears the previous verification result', async () => {
+    const harness = createHarness({ verificationMatchPercent: 88 });
+    await harness.initialize();
+    await harness.emit('voice-identity-start');
+    assert.match(harness.elements.get('voice-identity-message').textContent, /88%/);
+
+    const startGate = deferred();
+    harness.setStartGate(startGate);
+    const reenrolling = harness.emit('voice-identity-reenroll');
+    await flush(2);
+
+    assert.equal(harness.elements.get('voice-identity-message').textContent, '');
+    startGate.resolve();
+    await reenrolling;
 });
 
 test('a non-48k AudioContext is rejected before creating an enrollment', async () => {

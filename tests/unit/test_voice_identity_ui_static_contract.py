@@ -184,6 +184,39 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert "/static/css/voice_identity.css" in template
 
 
+def test_voice_identity_message_is_a_shared_accessible_plain_text_status() -> None:
+    template = (ROOT / "templates/voice_identity.html").read_text(encoding="utf-8")
+    script = (ROOT / "static/js/voice_identity.js").read_text(encoding="utf-8")
+
+    message_id = 'id="voice-identity-message"'
+    assert template.count(message_id) == 1
+
+    enrollment = re.search(
+        r'<section class="enrollment-card" id="voice-identity-enrollment".*?</section>',
+        template,
+        re.DOTALL,
+    )
+    shared_message = re.search(
+        r'<p id="voice-identity-message"(?P<attributes>[^>]*)></p>',
+        template,
+    )
+    assert enrollment is not None
+    assert shared_message is not None
+    assert message_id not in enrollment.group(0)
+    assert shared_message.start() > enrollment.end()
+    assert re.search(
+        r'</section>\s*<p id="voice-identity-message"',
+        template[template.index('id="voice-identity-profile-controls"') :],
+    )
+
+    attributes = shared_message.group("attributes")
+    assert 'role="status"' in attributes
+    assert 'aria-live="polite"' in attributes
+    assert 'aria-atomic="true"' in attributes
+    assert "data-i18n" not in attributes
+    assert "innerHTML" not in script
+
+
 def test_voice_identity_reading_prompts_exist_in_every_supported_locale() -> None:
     for locale in LOCALES:
         messages = json.loads(
