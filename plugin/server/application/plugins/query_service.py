@@ -519,6 +519,23 @@ def _build_plugin_list_sync(locale: str | None = None) -> list[dict[str, object]
             )
             plugin_i18n = load_plugin_i18n_from_meta(plugin_meta)
             _resolve_plugin_display_fields(plugin_info, plugin_i18n, locale=effective_locale)
+            # Import lazily to keep application.plugins package initialization
+            # acyclic. The runtime exposes only app_id/title/availability here;
+            # executable paths and launch credentials stay host-private.
+            from plugin.server.local_app_bridge.runtime import (
+                get_local_app_bridge_runtime,
+            )
+
+            local_app = get_local_app_bridge_runtime().describe_plugin_app(
+                plugin_id,
+                fallback_title=str(plugin_info.get("name") or plugin_id),
+            )
+            if local_app is not None:
+                plugin_info["local_app"] = {
+                    "app_id": local_app.app_id,
+                    "title": local_app.title,
+                    "available": local_app.available,
+                }
             plugin_i18n_payload = _plugin_card_i18n_payload(plugin_meta, plugin_i18n)
             if plugin_i18n_payload:
                 plugin_info["i18n"] = plugin_i18n_payload

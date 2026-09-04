@@ -22,6 +22,16 @@ from plugin.server.messaging.proactive_bridge import start_proactive_bridge, sto
 from plugin.server.messaging.plane_runner import MessagePlaneRunner, build_message_plane_runner
 from plugin.server.monitoring.metrics import metrics_collector
 from plugin.server.messaging.request_router import plugin_router
+from plugin.server.local_app_bridge.runtime import (
+    start_local_app_bridge,
+    stop_local_app_bridge,
+)
+from plugin.server.local_app_bridge.manifest import (
+    configure_local_app_bridge_from_registry,
+)
+from plugin.server.local_app_bridge.host_installations import (
+    configure_local_app_installations_from_host,
+)
 from plugin.settings import PLUGIN_SHUTDOWN_TIMEOUT, PLUGIN_SHUTDOWN_TOTAL_TIMEOUT
 from utils.logger_config import get_module_logger
 
@@ -248,6 +258,29 @@ class ServerLifecycleService:
 
         await self._refresh_registry_and_start_autostart_plugins()
 
+        try:
+            local_app_issues = await configure_local_app_bridge_from_registry()
+            for issue in local_app_issues:
+                logger.warning(
+                    "local app manifest ignored: plugin_id={}, code={}",
+                    issue.plugin_id,
+                    issue.code,
+                )
+            installation_issues = await configure_local_app_installations_from_host()
+            for issue in installation_issues:
+                logger.warning(
+                    "local app installation registry ignored: code={}",
+                    issue.code,
+                )
+            local_app_origin = await start_local_app_bridge()
+            logger.info("local app bridge started: origin={}", local_app_origin)
+        except (RuntimeError, ValueError, TypeError, OSError) as exc:
+            logger.warning(
+                "local app bridge start failed: err_type={}, err={}",
+                type(exc).__name__,
+                str(exc),
+            )
+
         await bus_subscription_manager.start()
         logger.debug("bus subscription manager started")
 
@@ -344,6 +377,14 @@ class ServerLifecycleService:
             logger.warning("failed to emit server_shutdown_begin event: {}", exc)
 
         had_errors = False
+
+        # Stop accepting local-app operations before plugin hosts begin their
+        # parallel shutdown. close() also cancels bridge-owned in-flight tasks.
+        try:
+            await stop_local_app_bridge()
+        except (RuntimeError, ValueError, TypeError, OSError) as exc:
+            had_errors = True
+            logger.warning("failed to stop local app bridge: {}", exc)
 
         # Phase 1: sync signals (instant)
         for stop_fn, label in [

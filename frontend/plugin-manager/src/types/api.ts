@@ -141,6 +141,11 @@ export interface PluginMeta {
   i18n?: Record<string, any>
   status?: string
   list_actions?: PluginListAction[]
+  local_app?: {
+    app_id: string
+    title: string
+    available: boolean
+  }
   install_source?: PluginInstallSource
 }
 

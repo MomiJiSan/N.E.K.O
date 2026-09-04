@@ -346,6 +346,79 @@ class PluginCommunicationResourceManager:
             req_id, msg, timeout, f"custom event {event_type}.{event_id}",
         )
 
+    async def trigger_trusted_local_app(
+        self,
+        *,
+        context: dict[str, str],
+        operation: str,
+        payload: dict[str, object],
+        timeout: float = PLUGIN_TRIGGER_TIMEOUT,
+    ) -> Any:
+        """Invoke a host-authorized local-app handler in the plugin process.
+
+        This command is deliberately unavailable from PluginContext and the
+        plugin-to-plugin router. Its identity comes from the authenticated
+        Local App Bridge session in the host process.
+        """
+        return await self._run_on_owner_loop(
+            self._trigger_trusted_local_app_local(
+                context=context,
+                operation=operation,
+                payload=payload,
+                timeout=timeout,
+            )
+        )
+
+    async def _trigger_trusted_local_app_local(
+        self,
+        *,
+        context: dict[str, str],
+        operation: str,
+        payload: dict[str, object],
+        timeout: float,
+    ) -> Any:
+        req_id = str(uuid.uuid4())
+        msg = {
+            "type": "TRUSTED_LOCAL_APP_INVOKE",
+            "req_id": req_id,
+            "context": dict(context),
+            "operation": operation,
+            "payload": dict(payload),
+            "timeout": timeout,
+        }
+        try:
+            return await self._send_command_and_wait_local(
+                req_id,
+                msg,
+                timeout,
+                f"trusted local app operation {operation}",
+            )
+        except PluginExecutionError as exc:
+            if "Execution timed out" in str(exc):
+                raise TimeoutError(
+                    "trusted local app operation outcome is unconfirmed"
+                ) from exc
+            raise
+        except (asyncio.CancelledError, TimeoutError):
+            # The result may already have committed in the child. Cancel work
+            # best-effort, but preserve the ambiguous outcome for the caller.
+            self._pending_futures.pop(req_id, None)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        self.transport.send_command(
+                            {
+                                "type": "CANCEL_TRUSTED_LOCAL_APP",
+                                "req_id": req_id,
+                            }
+                        )
+                    ),
+                    timeout=0.25,
+                )
+            except (Exception, asyncio.CancelledError):
+                pass
+            raise
+
     async def send_freeze_command(self, timeout: float = PLUGIN_TRIGGER_TIMEOUT) -> Dict[str, Any]:
         return await self._run_on_owner_loop(self._send_freeze_command_local(timeout))
 

@@ -1,7 +1,7 @@
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { deletePlugin } from '@/api/plugins'
+import { deletePlugin, launchLocalApp } from '@/api/plugins'
 import { buildPluginCli } from '@/api/pluginCli'
 import { usePluginStore } from '@/stores/plugin'
 import type { PluginListAction, PluginMeta } from '@/types/api'
@@ -61,6 +61,15 @@ export function usePluginListContextActions() {
       id: 'reload',
       kind: 'builtin',
     })
+    if (plugin.local_app) {
+      actions.push({
+        id: 'launch_local_app',
+        kind: 'builtin',
+        label: `${t('plugins.start')} ${plugin.local_app.title}`,
+        disabled: !plugin.local_app.available,
+        requires_running: true,
+      })
+    }
     actions.push(
       {
         id: 'build',
@@ -257,6 +266,13 @@ export function usePluginListContextActions() {
         }
         await pluginStore.reload(plugin.id)
         ElMessage.success(t('messages.pluginReloaded'))
+        return
+      case 'launch_local_app':
+        if (!plugin.local_app) {
+          return
+        }
+        await launchLocalApp(plugin.local_app.app_id)
+        ElMessage.success(`${plugin.local_app.title}: ${t('messages.operationSuccess')}`)
         return
       case 'build': {
         const result = await buildPluginCli({

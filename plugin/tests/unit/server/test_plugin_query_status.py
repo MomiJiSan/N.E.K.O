@@ -9,6 +9,7 @@ import pytest
 
 from plugin.server.application.plugins import query_service as query_module
 from plugin.server.application.plugins import router_query_service as router_module
+from plugin.server.local_app_bridge import runtime as local_app_runtime
 from plugin.server.domain.errors import ServerDomainError
 from plugin.sdk.shared.i18n import PluginI18n
 
@@ -132,6 +133,58 @@ def test_build_plugin_list_omits_internal_entries_preview(monkeypatch: pytest.Mo
     assert "entries_preview" in registry_meta
     assert "entries_preview" not in results[0]
     assert [entry["id"] for entry in results[0]["entries"]] == ["ping"]
+
+
+def test_build_plugin_list_exposes_only_safe_local_app_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        query_module.state,
+        "get_plugins_snapshot_cached",
+        lambda timeout=2.0: {
+            "study_companion": {
+                "id": "study_companion",
+                "name": "Study Companion",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        query_module.state,
+        "get_plugin_hosts_snapshot_cached",
+        lambda timeout=2.0: {},
+    )
+    monkeypatch.setattr(
+        query_module.state,
+        "get_event_handlers_snapshot_cached",
+        lambda timeout=2.0: {},
+    )
+
+    class _Runtime:
+        @staticmethod
+        def describe_plugin_app(plugin_id: str, *, fallback_title: str):
+            assert plugin_id == "study_companion"
+            assert fallback_title == "Study Companion"
+            return SimpleNamespace(
+                app_id="knowledge_dungeon",
+                title="Knowledge Dungeon",
+                available=False,
+                executable="must-not-leak",
+            )
+
+    monkeypatch.setattr(
+        local_app_runtime,
+        "get_local_app_bridge_runtime",
+        lambda: _Runtime(),
+    )
+
+    result = query_module._build_plugin_list_sync()[0]
+
+    assert result["local_app"] == {
+        "app_id": "knowledge_dungeon",
+        "title": "Knowledge Dungeon",
+        "available": False,
+    }
+    assert "must-not-leak" not in json.dumps(result)
 
 
 def test_resolve_plugin_display_fields_preserves_empty_description_without_translation() -> None:

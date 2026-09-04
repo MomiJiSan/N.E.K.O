@@ -28,6 +28,21 @@ describe('plugin hosted UI API', () => {
     })
   })
 
+  it('launches a local app with only app_id and a same-origin UI token', async () => {
+    getMock.mockResolvedValue({ token: 'ui-csrf-token' })
+    postMock.mockResolvedValue({ success: true, app_id: 'knowledge_dungeon' })
+    const { launchLocalApp } = await import('./plugins')
+
+    await launchLocalApp('knowledge_dungeon')
+
+    expect(getMock).toHaveBeenCalledWith('/local-app/ui-token')
+    expect(postMock).toHaveBeenCalledWith(
+      '/local-app/launch',
+      { app_id: 'knowledge_dungeon' },
+      { headers: { 'X-CSRF-Token': 'ui-csrf-token' } },
+    )
+  })
+
   it('preserves URLSearchParams when merging locale', async () => {
     const { getPlugins } = await import('./plugins')
     const input = new URLSearchParams([

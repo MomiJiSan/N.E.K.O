@@ -2,7 +2,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ElMessage } from 'element-plus'
-import { deletePlugin } from '@/api/plugins'
+import { deletePlugin, launchLocalApp } from '@/api/plugins'
 import { usePluginListContextActions } from './usePluginListContextActions'
 import type { PluginListAction, PluginMeta } from '@/types/api'
 
@@ -41,7 +41,7 @@ vi.mock('@/stores/plugin', () => ({
   }),
 }))
 
-vi.mock('@/api/plugins', () => ({ deletePlugin: vi.fn() }))
+vi.mock('@/api/plugins', () => ({ deletePlugin: vi.fn(), launchLocalApp: vi.fn() }))
 vi.mock('@/api/pluginCli', () => ({ buildPluginCli: vi.fn() }))
 vi.mock('@/utils/openExternal', () => ({
   openExternalUrl: mocks.openExternalUrl,
@@ -63,6 +63,40 @@ beforeEach(() => {
 })
 
 describe('plugin list UI action navigation contract', () => {
+  it('launches only the host-declared app id and disables missing installations', async () => {
+    const plugin: PluginMeta = {
+      id: 'study_companion',
+      name: 'Study Companion',
+      description: 'Study Companion',
+      version: '1.0.0',
+      status: 'running',
+      local_app: {
+        app_id: 'knowledge_dungeon',
+        title: 'Knowledge Dungeon',
+        available: true,
+      },
+    }
+    const { buildActions, executeAction } = usePluginListContextActions()
+    const action = buildActions(plugin).find(
+      (candidate) => candidate.id === 'launch_local_app',
+    )
+
+    expect(action).toMatchObject({
+      kind: 'builtin',
+      disabled: false,
+      requires_running: true,
+    })
+    await executeAction(action!, plugin)
+    expect(launchLocalApp).toHaveBeenCalledWith('knowledge_dungeon')
+    expect(ElMessage.success).toHaveBeenCalled()
+
+    plugin.local_app!.available = false
+    const disabled = buildActions(plugin).find(
+      (candidate) => candidate.id === 'launch_local_app',
+    )
+    expect(disabled?.disabled).toBe(true)
+  })
+
   it('uses openExternalUrl for the default new-tab path', async () => {
     const plugin = makePlugin({
       id: 'open_ui',

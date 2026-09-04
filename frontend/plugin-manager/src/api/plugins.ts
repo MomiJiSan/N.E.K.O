@@ -109,6 +109,17 @@ export function reloadAllPlugins(): Promise<{
   return post('/plugins/reload')
 }
 
+/** Launch a host-installed local app. Executable details never cross this API. */
+export async function launchLocalApp(appId: string): Promise<{
+  success: boolean
+  app_id: string
+}> {
+  const token = await get<{ token: string }>('/local-app/ui-token')
+  return post('/local-app/launch', { app_id: appId }, {
+    headers: { 'X-CSRF-Token': token.token },
+  })
+}
+
 /**
  * 删除插件目录并刷新注册表
  */

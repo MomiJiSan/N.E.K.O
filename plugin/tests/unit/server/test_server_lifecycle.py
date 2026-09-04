@@ -103,6 +103,31 @@ async def test_startup_reconciles_existing_install_source_after_migration_before
         monkeypatch.setattr(module.metrics_collector, "start", _noop_async)
         monkeypatch.setattr(module, "start_bridge", lambda: None)
         monkeypatch.setattr(module, "start_proactive_bridge", lambda: None)
+        async def _start_local_app_bridge() -> str:
+            calls.append(("local_app_bridge", "start"))
+            return "http://127.0.0.1:49123"
+
+        async def _configure_local_app_bridge():
+            calls.append(("local_app_bridge", "configure"))
+            return ()
+
+        async def _configure_local_app_installations():
+            calls.append(("local_app_installations", "configure"))
+            return ()
+
+        monkeypatch.setattr(
+            module, "start_local_app_bridge", _start_local_app_bridge
+        )
+        monkeypatch.setattr(
+            module,
+            "configure_local_app_bridge_from_registry",
+            _configure_local_app_bridge,
+        )
+        monkeypatch.setattr(
+            module,
+            "configure_local_app_installations_from_host",
+            _configure_local_app_installations,
+        )
 
         async def _migrate_layout():
             calls.append(("layout", "migrate"))
@@ -181,6 +206,9 @@ async def test_startup_reconciles_existing_install_source_after_migration_before
             ("profile_cleanup", "retry"),
             ("registry", "refresh"),
             ("start", "auto_plugin:False"),
+            ("local_app_bridge", "configure"),
+            ("local_app_installations", "configure"),
+            ("local_app_bridge", "start"),
         ]
     finally:
         with module.state.acquire_plugins_write_lock():

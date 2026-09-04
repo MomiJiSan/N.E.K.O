@@ -45,6 +45,11 @@ from plugin.sdk.shared.core.finish import normalize_structured_data
 from plugin.sdk.shared.core.result_contract import model_schema_from_type
 from plugin.sdk.shared.core.router import PluginRouter
 from plugin.sdk.plugin.ui import UI_ACTION_META_ATTR, UI_CONTEXT_META_ATTR
+from plugin.sdk.local_app import (
+    TrustedLocalAppPluginContext,
+    collect_trusted_local_app_operations,
+    get_trusted_local_app_operation,
+)
 from plugin.core.bus.types import dispatch_bus_change
 from plugin.core.zmq_transport import (
     HostTransport, ChildTransport, CH_CMD, CH_RES, CH_STS, CH_MSG, CH_COMM, CH_RESP,
@@ -922,6 +927,12 @@ def _plugin_process_runner(
         entry_meta_map: Dict[str, Any] = {}  # 存储 EventMeta 用于获取自定义配置（如 timeout）
         events_by_type: Dict[str, Dict[str, Any]] = {}
         ui_context_map: Dict[str, Any] = {}
+        trusted_local_app_operations = collect_trusted_local_app_operations(instance)
+        if trusted_local_app_operations:
+            logger.info(
+                "Plugin trusted local app operations collected: {}",
+                sorted(trusted_local_app_operations),
+            )
 
         def _get_ui_context_meta(member: Any) -> dict[str, Any] | None:
             candidates: list[Any] = [member]
@@ -1408,6 +1419,9 @@ def _plugin_process_runner(
                 if not method:
                     raise PluginEntryNotFoundError(plugin_id, entry_id)
 
+                if get_trusted_local_app_operation(method) is not None:
+                    raise PluginEntryNotFoundError(plugin_id, entry_id)
+
                 if not (asyncio.iscoroutinefunction(method) or inspect.iscoroutinefunction(method)):
                     ret["error"] = f"Entry '{entry_id}' must be 'async def'. Sync entries are not supported."
                     return
@@ -1466,6 +1480,67 @@ def _plugin_process_runner(
                 except Exception:
                     logger.exception("Failed to send response for req_id={}", req_id)
 
+        async def _handle_trusted_local_app(msg: dict):
+            req_id = str(msg.get("req_id") or "unknown")
+            operation = msg.get("operation")
+            raw_context = msg.get("context")
+            payload = msg.get("payload")
+            ret = {"req_id": req_id, "success": False, "data": None, "error": None}
+
+            try:
+                if not isinstance(operation, str) or not operation:
+                    raise ValueError("trusted local app operation is invalid")
+                if not isinstance(raw_context, dict):
+                    raise ValueError("trusted local app context is invalid")
+                if not isinstance(payload, dict):
+                    raise ValueError("trusted local app payload is invalid")
+                trusted_context = TrustedLocalAppPluginContext.from_mapping(raw_context)
+                method = trusted_local_app_operations.get(operation)
+                if method is None:
+                    raise PluginEntryNotFoundError(plugin_id, operation)
+                requested_timeout = msg.get("timeout", PLUGIN_TRIGGER_TIMEOUT)
+                if (
+                    isinstance(requested_timeout, bool)
+                    or not isinstance(requested_timeout, (int, float))
+                    or not math.isfinite(float(requested_timeout))
+                    or requested_timeout <= 0
+                ):
+                    raise ValueError("trusted local app timeout is invalid")
+                with ctx._handler_scope(f"trusted_local_app.{operation}"):
+                    result = await _run_with_watchdog(
+                        method(trusted_context, dict(payload)),
+                        f"trusted_local_app.{operation}",
+                        float(requested_timeout),
+                    )
+                if hasattr(result, "is_ok") and callable(result.is_ok):
+                    if result.is_ok():
+                        ret["success"] = True
+                        ret["data"] = result.value
+                    else:
+                        ret["error"] = str(result.error or "Unknown error")
+                else:
+                    ret["success"] = True
+                    ret["data"] = result
+            except asyncio.CancelledError:
+                ret["error"] = "Execution cancelled"
+            except asyncio.TimeoutError:
+                ret["error"] = "Execution timed out"
+            except Exception as exc:
+                logger.warning(
+                    "Trusted local app operation failed: operation={}, err_type={}",
+                    operation,
+                    type(exc).__name__,
+                )
+                ret["error"] = "Trusted local app operation failed"
+            finally:
+                try:
+                    res_sender.put(ret, timeout=10.0)
+                except Exception:
+                    logger.exception(
+                        "Failed to send trusted local app response for req_id={}",
+                        req_id,
+                    )
+
         async def _handle_trigger_custom(msg: dict):
             event_type = msg.get("event_type")
             event_id = msg.get("event_id")
@@ -1489,6 +1564,10 @@ def _plugin_process_runner(
 
             try:
                 if not method:
+                    ret["error"] = f"Custom event '{event_type}.{event_id}' not found"
+                    return
+
+                if get_trusted_local_app_operation(method) is not None:
                     ret["error"] = f"Custom event '{event_type}.{event_id}' not found"
                     return
 
@@ -1673,6 +1752,18 @@ def _plugin_process_runner(
                         logger.info("[Plugin Process] Cancel sent for run_id={}", run_id)
                     continue
 
+                # Only the host communication manager emits this command type.
+                if msg_type == "CANCEL_TRUSTED_LOCAL_APP":
+                    request_id = msg.get("req_id")
+                    task = (
+                        _run_tasks.get(f"trusted:{request_id}")
+                        if isinstance(request_id, str) and request_id
+                        else None
+                    )
+                    if task and not task.done():
+                        task.cancel()
+                    continue
+
                 # ── FREEZE ──
                 if msg_type == "FREEZE":
                     req_id = msg.get("req_id", "unknown")
@@ -1741,6 +1832,17 @@ def _plugin_process_runner(
                     task = asyncio.create_task(_handle_trigger_custom(msg))
                     _run_tasks[task_key] = task
                     task.add_done_callback(lambda _t, key=task_key: _run_tasks.pop(key, None))
+                    continue
+
+                # ── TRUSTED_LOCAL_APP_INVOKE ──
+                if msg_type == "TRUSTED_LOCAL_APP_INVOKE":
+                    req_id = str(msg.get("req_id") or uuid.uuid4())
+                    task_key = f"trusted:{req_id}"
+                    task = asyncio.create_task(_handle_trusted_local_app(msg))
+                    _run_tasks[task_key] = task
+                    task.add_done_callback(
+                        lambda _t, key=task_key: _run_tasks.pop(key, None)
+                    )
                     continue
 
                 # ── UI_CONTEXT ──
@@ -2142,6 +2244,22 @@ class PluginHost:
         # 发送 TRIGGER 命令到子进程并等待结果
         # 委托给通信资源管理器处理
         return await self.comm_manager.trigger(entry_id, args, timeout)
+
+    async def trigger_trusted_local_app(
+        self,
+        *,
+        context: dict[str, str],
+        operation: str,
+        payload: dict[str, object],
+        timeout: float = PLUGIN_TRIGGER_TIMEOUT,
+    ) -> Any:
+        """Invoke a dedicated handler over the host-only IPC command path."""
+        return await self.comm_manager.trigger_trusted_local_app(
+            context=context,
+            operation=operation,
+            payload=payload,
+            timeout=timeout,
+        )
 
     async def cancel_run(self, run_id: str) -> None:
         """Propagate a run cancellation to the child process.
