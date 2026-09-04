@@ -4,6 +4,8 @@
 
 正式声纹拒绝完成安全清理后的独立 ASR 恢复由 [Owner 声纹拒绝后的 ASR 恢复合同](./owner-voice-identity-deny-recovery-contract) 约束；该运行时合同不改变本文的录入、验证、Profile 提交或热加载行为。
 
+Provider 给出可信 exact boundary 时的子回合局部 DROP/FORWARD 由 [Owner 声纹 exact 子回合局部裁决合同](./owner-voice-identity-exact-interval-contract) 约束；该能力只消费已经激活的 Profile，不改变录入段数、匹配阈值或 Profile schema。
+
 ## 1. 目标与适用范围
 
 本合同解决两个问题：

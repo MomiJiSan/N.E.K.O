@@ -2,6 +2,8 @@
 
 > **状态：Current contract。** 本文记录独立 ASR 在正式声纹拒绝并完成安全清理后的恢复边界。代码与测试具有最终权威；本文不改变声纹录入、匹配阈值、ASR 路由或 Provider 策略。
 
+可信 Provider exact boundary 下的子回合局部 DROP/FORWARD 由 [Owner 声纹 exact 子回合局部裁决合同](./owner-voice-identity-exact-interval-contract) 约束。局部裁决没有启动 transport-wide cleanup 时，不进入本文的拒绝恢复状态机。
+
 ## 1. 目标与非目标
 
 正式声纹拒绝必须继续 fail-closed：被拒绝语音、迟到 transcript 和旧 Provider 回调都不得重新进入 Core。安全清理成功后，运行时使用拒绝后的连续 Silero 静音重新建立边界，使 Owner 的下一次真实起声可以直接恢复 ASR，不需要先说一句用于“唤醒”链路的牺牲语音。
@@ -71,16 +73,33 @@ Runtime 在 prepare 和 feed 的每个 `await` 后重新核对 cleanup、session
 
 若 feed 期间发生新 cleanup、session epoch 变化、Detector 替换、lifecycle 替换或 ingress 失效，迟到结果不能推进状态，也不能把当前帧发送给 Provider。Detector 在 `ARMED` 中被替换时，新 Detector 仍须产生真实 onset，不能因为重建本身直接进入 `OPEN`。
 
-## 6. 保持不变的安全合同
+## 6. Transcript DROP 的单一所有者
 
-- `_finish_speaker_deny_cleanup()` 的清理顺序和成功条件保持不变；
+正式拒绝进入 cleanup 后，`_SpeakerDenyCleanupOperation` 是 transcript DROP 的唯一写入者。已经发布的 Provider callback 只完成以下移交：
+
+- 校验 cleanup generation、speaker lease、session epoch、Runtime identity 与 dispatcher identity；
+- 将 `FinalKey → TranscriptDispatcher` 幂等登记到 `provisional_reservations`；
+- 不调用 `resolve_reserved(DROP)`，不删除 dispatcher 映射，不退休 Provider turn ownership，也不等待 cleanup settlement。
+
+cleanup 在 transport、session 和旧 callback 按既有顺序停止后封闭 reservation 成员集合，再统一写入 DROP。安全确认只接受：
+
+- `APPLIED`；
+- `ALREADY_SAME`，且既存 disposition 明确为 `DROP`。
+
+`NOT_RESERVED`、既存 `FORWARD`、不同 dispatcher、ownership 漂移或 Runtime 被替换均不是安全成功。DROP tombstone 被确认后，cleanup 才能删除映射、退休 ownership，并继续完成 namespace、boundary proof、speaker evidence lease 与 lifecycle 清理。任何一步无法证明时保持 fail-closed，并进入 `QUARANTINED`。
+
+该单写者合同同时适用于迟到 callback、callback 取消以及 cleanup settlement 前后的交错，避免 callback 与 cleanup 对同一 reservation 双写后把已经安全删除的内容误判成清理失败。
+
+## 7. 保持不变的安全合同
+
+- `_finish_speaker_deny_cleanup()` 继续按 transport、session、callback、transcript、namespace/proof、speaker lease 与 lifecycle 的既有安全顺序收口；
 - 被拒绝 partial/final、旧 transcript reservation 和旧 callback 不得复活；
 - Provider close 或其他清理证明失败继续进入 `QUARANTINED`；
 - 不重放拒绝期间丢弃的 PCM；
 - 不改变声纹 enforce/fail-open 判定、`unsupported_asr_route` 或用户提示；
 - 不新增日志、数据库、配置、指标或原始音频持久化。
 
-## 7. 自动化与实际验收
+## 8. 自动化与实际验收
 
 自动化测试至少覆盖：
 
@@ -89,6 +108,7 @@ Runtime 在 prepare 和 feed 的每个 `await` 后重新核对 cleanup、session
 3. prepare 幂等、generation/epoch 失效、semantic FIFO 和取消安全；
 4. 旧 socket 高 sequence、迟到 prepare/feed 和新 cleanup 接管不能打开链路；
 5. Provider close 失败继续 `QUARANTINED`，拒绝内容永不进入 transcript/Core；
-6. 普通非 rearm Detector 的事件与 throttle 行为保持不变。
+6. callback 只移交 reservation，cleanup 是唯一 DROP 写入者；`NOT_RESERVED`、冲突 `FORWARD` 和 dispatcher 替换均不能伪装成安全成功；
+7. 普通非 rearm Detector 的事件与 throttle 行为保持不变。
 
 自动化不能替代真实麦克风验收。实际流程必须用非 Owner 触发一次正式拒绝，确认被拒绝内容未进入 Core，安静至少 500 ms，再由 Owner 只说一句正常长句；该句必须立即进入 ASR。还需在 `WAIT_SILENCE` 中制造一次 session/Detector 重建，并确认角色切换或 socket 重连后的旧帧不能打开新链路。
