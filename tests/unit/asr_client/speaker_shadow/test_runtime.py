@@ -20,6 +20,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCaptureDisposition,
     SpeakerShadowCompletion,
     SpeakerShadowConfig,
+    SpeakerShadowDeferredAnchorRequest,
     SpeakerShadowObservation,
     SpeakerShadowReconcileSource,
     SpeakerShadowTerminalCoverageRequest,
@@ -253,6 +254,148 @@ async def test_deferred_candidate_buffers_then_scores_in_order_after_activation(
     assert completions == [SpeakerShadowCompletion(candidate, "scored", 1_500)]
     assert runtime.snapshot()["retained_pcm_bytes"] == 0
     await runtime.close()
+
+
+async def test_anchor_pending_caps_primary_at_terminal_scoring_window() -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+        on_observation=observe,
+    )
+    candidate = _candidate(9_002)
+    hold_worker = asyncio.Event()
+    fake_worker = asyncio.create_task(hold_worker.wait())
+    runtime._worker_task = fake_worker  # type: ignore[assignment]
+    try:
+        assert runtime.defer_candidate(candidate)
+        first = runtime.submit_capture(
+            _pcm(1_000),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        assert first.accepted_sample_count == 16_000
+        receipt = runtime.anchor_deferred_candidate(
+            SpeakerShadowDeferredAnchorRequest(
+                candidate=candidate,
+                expected_observed_sample_count=16_000,
+                discard_prefix_sample_count=0,
+                anchor_revision=1,
+            )
+        )
+        assert receipt is not None
+
+        crossing = runtime.submit_capture(
+            _pcm(3_000),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        assert crossing.accepted_sample_count == 32_000
+        assert crossing.cumulative_sample_count == 48_000
+        assert crossing.disposition is SpeakerShadowCaptureDisposition.COMPLETE
+        assert crossing.decision_state is SpeakerShadowCaptureDecisionState.PENDING
+        assert observations == []
+
+        hold_worker.set()
+        await fake_worker
+        runtime._worker_task = None
+        assert runtime._ensure_worker()
+        assert (
+            await runtime.wait_deferred_anchor_settled(
+                receipt,
+                deadline=time.monotonic() + 2.0,
+            )
+            == "applied"
+        )
+        await runtime.wait_idle()
+        assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
+    finally:
+        hold_worker.set()
+        await asyncio.gather(fake_worker, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("prefix_tag", "suffix_tag", "score", "would_block"),
+    (
+        pytest.param(0x11, 0x70, 0.70, False, id="low-prefix-owner-suffix"),
+        pytest.param(0x70, 0x11, 0.20, True, id="high-prefix-nonowner-suffix"),
+    ),
+)
+async def test_nonzero_anchor_scores_only_canonical_suffix(
+    prefix_tag: int,
+    suffix_tag: int,
+    score: float,
+    would_block: bool,
+) -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    prefix_pcm = _tagged_pcm(500, prefix_tag)
+    suffix_pcm = _tagged_pcm(1_500, suffix_tag)
+    config = _provider_gate_config(similarity_thresholds=(0.40,))
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(
+            score_value=score,
+            expected_pcm=suffix_pcm,
+        ),
+        config=config,
+        on_observation=observe,
+    )
+    candidate = _candidate(9_003 + prefix_tag)
+    try:
+        assert config.similarity_thresholds == (0.40,)
+        assert runtime.defer_candidate(candidate)
+        assert runtime.submit(
+            prefix_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        assert runtime.submit(
+            suffix_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=candidate,
+        )
+        await runtime.wait_idle()
+        assert observations == []
+        assert runtime.snapshot()["evaluated_candidate_count"] == 0
+        assert runtime.snapshot()["backend_loaded_count"] == 0
+
+        receipt = runtime.anchor_deferred_candidate(
+            SpeakerShadowDeferredAnchorRequest(
+                candidate=candidate,
+                expected_observed_sample_count=32_000,
+                discard_prefix_sample_count=8_000,
+                anchor_revision=1,
+            )
+        )
+        assert receipt is not None
+        assert receipt.discarded_sample_count == 8_000
+        assert receipt.retained_sample_count == 24_000
+        assert (
+            await runtime.wait_deferred_anchor_settled(
+                receipt,
+                deadline=time.monotonic() + 2.0,
+            )
+            == "applied"
+        )
+        await runtime.wait_idle()
+
+        assert len(observations) == 1
+        observation = observations[0]
+        assert observation.similarity == pytest.approx(score)
+        assert observation.checkpoint_ms == 1_500
+        assert observation.audio_ms == 1_500
+        assert observation.would_block == ((0.40, would_block),)
+        assert runtime.snapshot()["backend_loaded_count"] == 1
+    finally:
+        await runtime.close()
 
 
 async def test_reconcile_deferred_tail_into_head_preserves_checkpoint_continuity() -> (
@@ -1671,6 +1814,242 @@ async def test_terminal_coverage_preserves_scored_window_for_long_exact_range() 
         assert scored.disposition is SpeakerShadowCaptureDisposition.COMPLETE
         assert scored.decision_state is SpeakerShadowCaptureDecisionState.SCORED
         assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        await runtime.close()
+
+
+async def test_prepared_terminal_coverage_defers_consumption_until_commit() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+    )
+    target = _candidate(9_320)
+    continuation = _candidate(9_321)
+    suffix = _candidate(9_322)
+    try:
+        await _finalize_provider_candidate_score(runtime, target)
+        assert runtime.defer_coverage_candidate(continuation)
+        initial_pcm = _tagged_pcm(500, 0x31)
+        assert runtime.submit_capture(
+            initial_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=continuation,
+        ).accepted_sample_count == 8_000
+        await runtime.wait_idle()
+
+        receipt = runtime.prepare_finalized_candidate_coverage(
+            SpeakerShadowTerminalCoverageRequest(
+                sources=(
+                    _reconcile_source(target, 3_000),
+                    _reconcile_source(continuation, 500),
+                ),
+                target=target,
+                provider_exact_start_sample=0,
+                provider_exact_end_sample=56_000,
+                scored_window_start_sample=0,
+                scored_window_end_sample=48_000,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        assert runtime.terminal_coverage_status(receipt) == "pending"
+        assert runtime._buffers[continuation].pcm16 == bytearray(initial_pcm)
+
+        staged_pcm = _tagged_pcm(100, 0x41)
+        staged = runtime.submit_capture(
+            staged_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=continuation,
+        )
+        assert staged.accepted_sample_count == 1_600
+        assert runtime._buffers[continuation].pcm16 == bytearray(initial_pcm)
+
+        assert runtime.commit_finalized_candidate_coverage(receipt)
+        await runtime.wait_idle()
+        assert runtime.terminal_coverage_status(receipt) == "applied"
+        assert runtime._finalized[target].terminal_reason == "scored"
+        assert runtime._finalized[continuation].terminal_reason == "dropped"
+        assert runtime._buffers[suffix].pcm16 == bytearray(staged_pcm)
+    finally:
+        await runtime.close()
+
+
+async def test_aborted_terminal_coverage_restores_staged_pcm_to_continuation() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+    )
+    target = _candidate(9_323)
+    continuation = _candidate(9_324)
+    suffix = _candidate(9_325)
+    try:
+        await _finalize_provider_candidate_score(runtime, target)
+        assert runtime.defer_coverage_candidate(continuation)
+        initial_pcm = _tagged_pcm(500, 0x51)
+        assert runtime.submit(
+            initial_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=continuation,
+        )
+        await runtime.wait_idle()
+
+        receipt = runtime.prepare_finalized_candidate_coverage(
+            SpeakerShadowTerminalCoverageRequest(
+                sources=(
+                    _reconcile_source(target, 3_000),
+                    _reconcile_source(continuation, 500),
+                ),
+                target=target,
+                provider_exact_start_sample=0,
+                provider_exact_end_sample=56_000,
+                scored_window_start_sample=0,
+                scored_window_end_sample=48_000,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        staged_pcm = _tagged_pcm(100, 0x61)
+        assert runtime.submit(
+            staged_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=continuation,
+        )
+
+        assert runtime.abort_finalized_candidate_coverage(receipt)
+        await runtime.wait_idle()
+        assert runtime.terminal_coverage_status(receipt) == "stale"
+        assert suffix not in runtime._candidate_tokens
+        assert runtime._buffers[continuation].pcm16 == bytearray(
+            initial_pcm + staged_pcm
+        )
+        assert runtime._finalized[target].terminal_reason == "scored"
+    finally:
+        await runtime.close()
+
+
+async def test_prepared_terminal_coverage_capacity_rejects_without_consuming() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(buffered_candidate_capacity=2),
+    )
+    targets = tuple(_candidate(9_326 + index) for index in range(3))
+    try:
+        for target in targets:
+            await _finalize_provider_candidate_score(runtime, target)
+
+        def request(
+            target: SpeakerShadowCandidateKey,
+        ) -> SpeakerShadowTerminalCoverageRequest:
+            return SpeakerShadowTerminalCoverageRequest(
+                sources=(_reconcile_source(target, 3_000),),
+                target=target,
+                provider_exact_start_sample=0,
+                provider_exact_end_sample=48_000,
+                scored_window_start_sample=0,
+                scored_window_end_sample=48_000,
+            )
+
+        first = runtime.prepare_finalized_candidate_coverage(request(targets[0]))
+        second = runtime.prepare_finalized_candidate_coverage(request(targets[1]))
+        assert first is not None and second is not None
+        assert runtime.terminal_coverage_status(first) == "pending"
+        assert runtime.terminal_coverage_status(second) == "pending"
+
+        assert runtime.prepare_finalized_candidate_coverage(request(targets[2])) is None
+        assert runtime.terminal_coverage_status(first) == "pending"
+        assert runtime.terminal_coverage_status(second) == "pending"
+        assert runtime._finalized[targets[2]].terminal_reason == "scored"
+
+        assert runtime.commit_finalized_candidate_coverage(first)
+        assert runtime.abort_finalized_candidate_coverage(second)
+        await runtime.wait_idle()
+        assert runtime.terminal_coverage_status(first) == "applied"
+        assert runtime.terminal_coverage_status(second) == "stale"
+    finally:
+        await runtime.close()
+
+
+async def test_target_only_terminal_prepare_stages_pcm_into_suffix_on_commit() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+    )
+    target = _candidate(9_329)
+    suffix = _candidate(9_330)
+    staged_pcm = _tagged_pcm(100, 0x71)
+    try:
+        await _finalize_provider_candidate_score(runtime, target)
+        receipt = runtime.prepare_finalized_candidate_coverage(
+            SpeakerShadowTerminalCoverageRequest(
+                sources=(_reconcile_source(target, 3_000),),
+                target=target,
+                provider_exact_start_sample=0,
+                provider_exact_end_sample=48_000,
+                scored_window_start_sample=0,
+                scored_window_end_sample=48_000,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+
+        staged = runtime.submit_capture(
+            staged_pcm,
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=target,
+        )
+        assert staged.accepted_sample_count == 1_600
+        assert staged.decision_state is SpeakerShadowCaptureDecisionState.PENDING
+        assert suffix not in runtime._buffers
+        assert runtime._finalized[target].terminal_reason == "scored"
+
+        assert runtime.commit_finalized_candidate_coverage(receipt)
+        await runtime.wait_idle()
+        assert runtime.terminal_coverage_status(receipt) == "applied"
+        assert runtime._buffers[suffix].pcm16 == bytearray(staged_pcm)
+        assert runtime._finalized[target].terminal_reason == "scored"
+    finally:
+        await runtime.close()
+
+
+async def test_target_only_terminal_abort_reports_unrecoverable_staged_pcm() -> None:
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.2),
+        config=_provider_gate_config(),
+    )
+    target = _candidate(9_331)
+    suffix = _candidate(9_332)
+    try:
+        await _finalize_provider_candidate_score(runtime, target)
+        receipt = runtime.prepare_finalized_candidate_coverage(
+            SpeakerShadowTerminalCoverageRequest(
+                sources=(_reconcile_source(target, 3_000),),
+                target=target,
+                provider_exact_start_sample=0,
+                provider_exact_end_sample=48_000,
+                scored_window_start_sample=0,
+                scored_window_end_sample=48_000,
+                suffix=suffix,
+            )
+        )
+        assert receipt is not None
+        assert runtime.submit(
+            _tagged_pcm(100, 0x72),
+            sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            candidate=target,
+        )
+        before_abort = runtime.snapshot()
+
+        assert not runtime.abort_finalized_candidate_coverage(receipt)
+        after_abort = runtime.snapshot()
+        assert runtime.terminal_coverage_status(receipt) == "stale"
+        assert suffix not in runtime._candidate_tokens
+        assert runtime._finalized[target].terminal_reason == "scored"
+        assert after_abort["dropped_frame_count"] == (
+            before_abort["dropped_frame_count"] + 1
+        )
+        assert after_abort["dropped_audio_ms"] == (
+            before_abort["dropped_audio_ms"] + 100
+        )
     finally:
         await runtime.close()
 

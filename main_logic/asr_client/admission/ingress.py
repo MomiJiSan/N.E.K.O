@@ -110,7 +110,9 @@ class _IngressItem:
     terminal_claim: SpeakerLeaseTerminalClaim | None = None
     prepares_speaker_lease_transition: bool = False
     commits_speaker_lease_terminal_claim: bool = False
-    exact_operation: Literal["promote", "activate", "abort", "post"] | None = None
+    exact_operation: (
+        Literal["promote", "activate", "abort", "unavailable", "post"] | None
+    ) = None
     exact_promotion_scope: ExactIntervalPromotionScope | None = None
     exact_promotion_receipt: ExactIntervalPromotionReceipt | None = None
     exact_activation_receipt: ExactIntervalActivationReceipt | None = None
@@ -734,6 +736,72 @@ class AdmissionIngressLane:
             self.abort_exact_interval_promotion_nowait(receipt)
         )
 
+    def fail_exact_interval_unavailable_nowait(
+        self,
+        receipt: ExactIntervalPromotionReceipt | ExactIntervalActivationReceipt,
+    ) -> asyncio.Future[ExactIntervalAbortResult]:
+        """Queue fail-open compensation for one exact ownership token."""
+
+        if not isinstance(
+            receipt,
+            (ExactIntervalPromotionReceipt, ExactIntervalActivationReceipt),
+        ):
+            raise TypeError(
+                "receipt must be ExactIntervalPromotionReceipt or "
+                "ExactIntervalActivationReceipt"
+            )
+        turn_token = (
+            receipt.scope.turn_token
+            if isinstance(receipt, ExactIntervalPromotionReceipt)
+            else receipt.turn_token
+        )
+        lease_token = (
+            receipt.scope.parent_lease_token
+            if isinstance(receipt, ExactIntervalPromotionReceipt)
+            else None
+        )
+        loop = self._checked_loop()
+        self._reserve_capacity(
+            "speaker_control",
+            turn_token,
+            None,
+            speaker_lease_token=lease_token,
+        )
+        result: asyncio.Future[_IngressResult] = loop.create_future()
+        self._items.append(
+            _IngressItem(
+                turn_token=turn_token,
+                speaker_lease_token=lease_token,
+                event=None,
+                now=None,
+                result=result,
+                capacity_class="speaker_control",
+                coalescing_key=None,
+                exact_operation="unavailable",
+                exact_promotion_receipt=(
+                    receipt
+                    if isinstance(receipt, ExactIntervalPromotionReceipt)
+                    else None
+                ),
+                exact_activation_receipt=(
+                    receipt
+                    if isinstance(receipt, ExactIntervalActivationReceipt)
+                    else None
+                ),
+            )
+        )
+        assert self._available is not None
+        self._available.set()
+        return cast(asyncio.Future[ExactIntervalAbortResult], result)
+
+    async def fail_exact_interval_unavailable(
+        self,
+        receipt: ExactIntervalPromotionReceipt | ExactIntervalActivationReceipt,
+    ) -> ExactIntervalAbortResult:
+        return await asyncio.shield(
+            self.fail_exact_interval_unavailable_nowait(receipt)
+        )
+
     def post_exact_interval_nowait(
         self,
         receipt: ExactIntervalActivationReceipt,
@@ -1105,6 +1173,17 @@ class AdmissionIngressLane:
                             effects = (
                                 await self._coordinator.abort_exact_interval_promotion(
                                     item.exact_promotion_receipt
+                                )
+                            )
+                        elif item.exact_operation == "unavailable":
+                            unavailable_receipt = (
+                                item.exact_activation_receipt
+                                or item.exact_promotion_receipt
+                            )
+                            assert unavailable_receipt is not None
+                            effects = (
+                                await self._coordinator.fail_exact_interval_unavailable(
+                                    unavailable_receipt
                                 )
                             )
                         elif item.exact_operation == "post":

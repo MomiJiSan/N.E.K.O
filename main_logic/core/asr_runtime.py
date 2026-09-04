@@ -1392,6 +1392,19 @@ class AsrRuntimeMixin:
     ) -> bool | VoiceIdentityActivationResult:
         """Update future and active independent-ASR speaker verification."""
 
+        if factory is not None and (
+            getattr(self, "_asr_route_mode", "blocked") != "independent"
+            or not self._asr_runtime.speaker_verifier_route_supported()
+        ):
+            self._asr_runtime.record_unsupported_speaker_route()
+            close = getattr(factory, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            return VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+
         try:
             updated = await self._asr_runtime.set_speaker_verifier_factory(
                 factory,
@@ -1404,11 +1417,6 @@ class AsrRuntimeMixin:
         if updated or factory is None:
             self._speaker_shadow_factory = factory
         if updated:
-            if (
-                factory is not None
-                and getattr(self, "_asr_route_mode", "blocked") != "independent"
-            ):
-                return VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
             return VoiceIdentityActivationResult.READY
         close = getattr(factory, "close", None)
         if callable(close):

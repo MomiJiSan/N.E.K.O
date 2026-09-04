@@ -72,6 +72,8 @@ from main_logic.asr_client.endpointing.detector_runtime import (
     DetectorRuntime,
     ProviderExactSpeakerIntervalCommitResult,
     ProviderExactSpeakerIntervalReservation,
+    ProviderSpeakerEvidenceAnchorResult,
+    ProviderSpeakerEvidenceAnchorStatus,
     ProviderSpeakerEvidenceLease,
     ProviderSpeakerEvidenceUpdate,
 )
@@ -98,6 +100,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCaptureDisposition,
     SpeakerShadowCaptureResult,
     SpeakerShadowCandidateKey,
+    SpeakerShadowConfig,
 )
 from main_logic.asr_client.transcript import (
     TranscriptResolutionOutcome,
@@ -199,6 +202,8 @@ class _RejectionDetector:
         self.observe_provider_audio = MagicMock()
         self._provider_evidence_owner = object()
         self._provider_evidence_lease: ProviderSpeakerEvidenceLease | None = None
+        self._provider_anchor_starts: dict[ProviderSpeakerEvidenceLease, int] = {}
+        self._provider_anchor_revisions: dict[ProviderSpeakerEvidenceLease, int] = {}
         self.abandon_provider_speaker_evidence_lease = AsyncMock(return_value=True)
         self.provisional_pending = False
         self.ready_rejection = False
@@ -245,6 +250,40 @@ class _RejectionDetector:
             last_progress_at=10.0,
         )
 
+    async def anchor_provider_speaker_evidence(
+        self,
+        lease: ProviderSpeakerEvidenceLease,
+        *,
+        audio_start_sample_16k: int,
+        deadline: float,
+    ) -> ProviderSpeakerEvidenceAnchorResult:
+        assert deadline > runtime_module.time.monotonic()
+        anchored_start = self._provider_anchor_starts.get(lease)
+        anchor_revision = self._provider_anchor_revisions.get(lease, 0)
+        if anchored_start is None:
+            self._provider_anchor_starts[lease] = audio_start_sample_16k
+            anchor_revision += 1
+            self._provider_anchor_revisions[lease] = anchor_revision
+            status = ProviderSpeakerEvidenceAnchorStatus.APPLIED
+        elif anchored_start == audio_start_sample_16k:
+            status = ProviderSpeakerEvidenceAnchorStatus.IDEMPOTENT
+        else:
+            status = ProviderSpeakerEvidenceAnchorStatus.CONFLICT
+        return ProviderSpeakerEvidenceAnchorResult(
+            status=status,
+            lease=lease,
+            candidate=lease.candidate,
+            detector_epoch=self.detector_epoch,
+            timeline_generation=1,
+            lease_generation=lease.lease_generation,
+            anchor_revision=anchor_revision,
+            anchor_start_sample_16k=audio_start_sample_16k,
+            buffer_origin_sample_16k=0,
+            observed_through_sample_16k=160,
+            pcm_through_sequence_no=0,
+            shadow_runtime_generation=1,
+        )
+
     async def prepare_candidate_rejection(self, _candidate):
         self.prepare_entered.set()
         if self.block_prepare:
@@ -274,6 +313,15 @@ class _RejectionDetector:
             lease_generation=speaker_evidence_lease.lease_generation,
             candidate_generation=3,
             shadow_runtime_generation=1,
+            anchor_revision=self._provider_anchor_revisions.get(
+                speaker_evidence_lease,
+                0,
+            ),
+            anchor_start_sample_16k=self._provider_anchor_starts.get(
+                speaker_evidence_lease,
+                boundary.start_sample_16k,
+            ),
+            provider_pcm_through_sequence_no=0,
             _owner=self,
             _token=object(),
         )
@@ -1131,17 +1179,17 @@ async def test_buffered_activation_arms_speaker_before_provider_wire(
     )
     await asyncio.wait_for(observation_entered.wait(), 1)
 
-    # The physical parent exists before observation completes, while Provider
-    # wire remains closed until that observation returns.
+    # Before Provider started, only a deferred PCM ledger exists; Admission
+    # remains unopened while Provider wire is still fenced.
     record = await runtime._asr_admission.get_record(turn_token)
     assert record is not None
     assert record.candidate_binding_state.value == "unbound"
     candidate = runtime._asr_current_speaker_candidate
     lease_token = runtime._asr_current_speaker_lease
     assert candidate is not None
-    assert lease_token is not None
-    assert runtime._asr_admission_candidate_leases[candidate] == lease_token
-    assert await runtime._asr_admission.get_speaker_lease(lease_token) is not None
+    assert lease_token is None
+    assert runtime._asr_admission_candidate_leases == {}
+    assert candidate in runtime._asr_provider_speaker_ledgers
     session = runtime._asr_session
     assert session is not None
     session.stream_audio.assert_not_awaited()
@@ -1154,7 +1202,7 @@ async def test_buffered_activation_arms_speaker_before_provider_wire(
     await _close_dispatchers(runtime)
 
 
-async def test_active_enqueue_holds_fast_final_until_two_lows_drop() -> None:
+async def test_active_enqueue_keeps_pre_exact_lows_out_of_admission() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
     session, _lifecycle, turn_token = _install_active_candidate(
@@ -1172,10 +1220,12 @@ async def test_active_enqueue_holds_fast_final_until_two_lows_drop() -> None:
             generation=provider_key.generation,
             buffer_epoch=provider_key.buffer_epoch,
             utterance_id=provider_key.utterance_id,
+            audio_start_sample_16k=0,
         ),
         runtime._asr_session_epoch,
     )
-    candidate = detector.lease.shadow_candidate
+    candidate = runtime._asr_current_speaker_candidate
+    assert candidate is not None
     assert runtime._accept_speaker_candidate_binding(
         candidate,
         turn_token,
@@ -1252,19 +1302,20 @@ async def test_active_enqueue_holds_fast_final_until_two_lows_drop() -> None:
     )
     await _drain_runtime_admission(runtime)
     record = await runtime._asr_admission.get_record(turn_token)
-    assert record is None
-    assert runtime._speaker_rejection_metrics["speaker_deny_latched_count"] == 1
+    assert record is not None
+    assert record.last_speaker_sequence_no == 0
+    assert runtime._speaker_rejection_metrics["speaker_deny_latched_count"] == 0
     runtime._callbacks.on_final.assert_not_awaited()
 
     observation_release.set()
     await asyncio.wait_for(submission, 1)
-    assert provider_wire_seen.is_set() is False
-    session.stream_audio.assert_not_awaited()
+    assert provider_wire_seen.is_set() is True
+    session.stream_audio.assert_awaited_once()
     await _close_dispatchers(runtime)
 
 
 @pytest.mark.parametrize("evidence_order", ("low_high", "high_low"))
-async def test_deferred_mixed_evidence_fences_before_terminal_commit(
+async def test_deferred_mixed_evidence_remains_provisional_before_exact(
     evidence_order: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1280,8 +1331,14 @@ async def test_deferred_mixed_evidence_fences_before_terminal_commit(
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
     candidate = runtime._asr_current_speaker_candidate
-    lease_token = runtime._asr_current_speaker_lease
     assert candidate is not None
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
+    lease_token = runtime._asr_current_speaker_lease
     assert lease_token is not None
     prepare = MagicMock(
         wraps=runtime._asr_admission_ingress.prepare_speaker_lease_transition_nowait
@@ -1291,16 +1348,13 @@ async def test_deferred_mixed_evidence_fences_before_terminal_commit(
         "prepare_speaker_lease_transition_nowait",
         prepare,
     )
-    original_commit = (
-        runtime._asr_admission_ingress.commit_speaker_lease_terminal_claim_nowait
-    )
     committed_claims: list[SpeakerLeaseTerminalClaim] = []
 
     def commit_after_fence(claim: SpeakerLeaseTerminalClaim):
         assert runtime._asr_deny_transport_state is DenyTransportState.DENY_FENCED
         assert runtime._asr_session is None
         committed_claims.append(claim)
-        return original_commit(claim)
+        raise AssertionError("provisional evidence cannot commit Admission")
 
     monkeypatch.setattr(
         runtime._asr_admission_ingress,
@@ -1327,21 +1381,21 @@ async def test_deferred_mixed_evidence_fences_before_terminal_commit(
         )
     await _drain_runtime_admission(runtime)
 
-    assert prepare.call_count == 2
-    assert len(committed_claims) == 1
-    assert (
-        committed_claims[0].expected_terminal_state
-        is SpeakerLeaseState.MIXED_DENY_LATCHED
-    )
-    assert runtime._speaker_rejection_metrics["speaker_deny_latched_count"] == 1
-    session.close.assert_awaited_once_with()
-    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
+    assert prepare.call_count == 0
+    assert committed_claims == []
+    assert runtime._speaker_rejection_metrics["speaker_deny_latched_count"] == 0
+    session.close.assert_not_awaited()
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    ledger = runtime._asr_provider_speaker_ledgers[candidate]
+    assert tuple(ledger.events)
+    parent = await runtime._asr_admission.get_speaker_lease(lease_token)
+    assert parent is not None
+    assert parent.state is SpeakerLeaseState.COLLECTING
+    assert parent.last_speaker_sequence_no == 0
     await _close_dispatchers(runtime)
 
 
-async def test_stale_mixed_claim_never_closes_replacement_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_stale_provisional_mixed_facts_never_close_replacement_session() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
     old_session, _lifecycle, turn_token = _install_active_candidate(
@@ -1354,23 +1408,14 @@ async def test_stale_mixed_claim_never_closes_replacement_session(
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
     candidate = runtime._asr_current_speaker_candidate
-    lease_token = runtime._asr_current_speaker_lease
     assert candidate is not None
-    assert lease_token is not None
-    commit_entered = asyncio.Event()
-    commit_result: asyncio.Future[SpeakerLeaseTransitionReceipt] = (
-        asyncio.get_running_loop().create_future()
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
     )
-
-    def defer_stale_commit(_claim: SpeakerLeaseTerminalClaim):
-        commit_entered.set()
-        return commit_result
-
-    monkeypatch.setattr(
-        runtime._asr_admission_ingress,
-        "commit_speaker_lease_terminal_claim_nowait",
-        defer_stale_commit,
-    )
+    assert runtime._asr_current_speaker_lease is not None
     assert runtime._accept_speaker_evidence_fact(
         SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         activation_generation="profile-generation",
@@ -1381,29 +1426,15 @@ async def test_stale_mixed_claim_never_closes_replacement_session(
         activation_generation="profile-generation",
         enforce=True,
     )
-    await asyncio.wait_for(commit_entered.wait(), 1)
     replacement_session = SimpleNamespace(close=AsyncMock())
     runtime._asr_session = replacement_session
     runtime._asr_session_epoch += 1
-    commit_result.set_result(
-        SpeakerLeaseTransitionReceipt(
-            lease_token=lease_token,
-            before_state=SpeakerLeaseState.FIRST_LOW,
-            after_state=SpeakerLeaseState.FIRST_LOW,
-            outcome=SpeakerLeaseTransitionOutcome.STALE,
-            terminal_sequence_no=None,
-            capture_through_sequence_no=None,
-            frozen_children=(),
-            child_results=(),
-            diagnostics=(),
-        )
-    )
     await _drain_runtime_admission(runtime)
 
     replacement_session.close.assert_not_awaited()
     old_session.close.assert_not_awaited()
     assert runtime._asr_session is replacement_session
-    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
     await _close_dispatchers(runtime)
 
 
@@ -1692,7 +1723,12 @@ async def test_continuous_provider_frames_reuse_one_settled_parent_lease() -> No
     assert detector.ensure_provider_speaker_evidence_lease.await_count == 1
     assert runtime._asr_provider_speaker_evidence_lease == evidence_lease
     assert runtime._asr_current_speaker_lease == lease_token
-    assert runtime._asr_speaker_lease_nonce == 1
+    # Provider PCM is buffered under a deferred speaker ledger until the
+    # canonical Provider start establishes the candidate's true origin.
+    # Admission must therefore remain unopened before started settlement.
+    assert runtime._asr_speaker_lease_nonce == 0
+    assert runtime._asr_current_speaker_lease is None
+    assert len(runtime._asr_provider_speaker_ledgers) == 1
     detector.abandon_provider_speaker_evidence_lease.assert_not_awaited()
     await _close_dispatchers(runtime)
 
@@ -1719,15 +1755,24 @@ async def test_cancelled_parent_open_retires_late_admission_commit(
         return await original_open(lease_token, candidate)
 
     monkeypatch.setattr(runtime._asr_admission, "open_speaker_lease", block_parent_open)
-    arming = asyncio.create_task(
-        runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    started = asyncio.create_task(
+        runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(
+                0,
+                0,
+                1,
+                audio_start_sample_16k=0,
+            ),
+            runtime._asr_session_epoch,
+        )
     )
     await asyncio.wait_for(open_entered.wait(), 1)
-    runtime._cancel_provider_speaker_arming_tasks()
+    started.cancel()
     open_release.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(arming, 1)
+        await asyncio.wait_for(started, 1)
     lease_token = runtime_module.SpeakerCaptureLeaseToken(
         session_generation=runtime._asr_session_epoch,
         start_generation=runtime._asr_start_generation,
@@ -1738,7 +1783,7 @@ async def test_cancelled_parent_open_retires_late_admission_commit(
     assert await runtime._asr_admission.get_speaker_lease(lease_token) is None
     assert runtime._asr_admission_candidate_leases == {}
     assert runtime._asr_current_speaker_lease is None
-    detector.abandon_provider_speaker_evidence_lease.assert_awaited_once()
+    assert detector._provider_evidence_lease is not None
     await _close_dispatchers(runtime)
 
 
@@ -1820,7 +1865,7 @@ async def test_provider_started_gate_active_never_reserves_child() -> None:
     await _close_dispatchers(runtime)
 
 
-async def test_published_started_failure_abandons_without_releasing(
+async def test_legacy_deferred_flush_hook_cannot_break_started_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -1846,26 +1891,27 @@ async def test_published_started_failure_abandons_without_releasing(
         fail_after_publication,
     )
 
-    assert not await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     await _drain_runtime_admission(runtime)
 
     final_key = FinalKey.from_turn(turn_token)
     dispatcher.release.assert_not_called()
-    assert dispatcher.resolve_reserved.call_args.args == (
-        final_key,
-        AdmissionDisposition.ABANDON,
-    )
-    assert final_key not in dispatcher._reservations
-    assert runtime._asr_provider_turn_ownerships == {}
-    assert runtime._asr_admission_reservation_dispatchers == {}
-    assert runtime._asr_provider_started_turns == {}
+    dispatcher.resolve_reserved.assert_not_called()
+    assert final_key in dispatcher._reservations
+    assert turn_token in runtime._asr_provider_turn_ownerships
+    assert runtime._asr_admission_reservation_dispatchers[final_key] is dispatcher
+    assert runtime._asr_provider_started_turns == {
+        ProviderUtteranceKey(0, 0, 1): turn_token
+    }
     await _close_dispatchers(runtime)
 
 
-async def test_provider_started_deferred_deny_settles_without_binding_failure() -> None:
+async def test_provider_started_keeps_pre_exact_lows_provisional() -> None:
     callbacks = _callbacks()
     runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
@@ -1879,9 +1925,8 @@ async def test_provider_started_deferred_deny_settles_without_binding_failure() 
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
     candidate = runtime._asr_current_speaker_candidate
-    lease_token = runtime._asr_current_speaker_lease
     assert candidate is not None
-    assert lease_token is not None
+    assert runtime._asr_current_speaker_lease is None
     assert runtime._accept_speaker_evidence_fact(
         SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
         activation_generation="profile-generation",
@@ -1896,28 +1941,47 @@ async def test_provider_started_deferred_deny_settles_without_binding_failure() 
     dispatcher.resolve_reserved = MagicMock(wraps=dispatcher.resolve_reserved)
 
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     await _drain_runtime_admission(runtime)
+    lease_token = runtime._asr_current_speaker_lease
+    assert lease_token is not None
+    parent = await runtime._asr_admission.get_speaker_lease(lease_token)
+    assert parent is not None
+    assert parent.state is SpeakerLeaseState.COLLECTING
+    assert parent.last_speaker_sequence_no == 0
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
 
-    session.close.assert_awaited_once_with()
-    assert runtime._asr_session is None
-    assert lifecycle.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
-    assert runtime._asr_provider_started_turns == {}
-    assert runtime._asr_admission_turn_leases == {}
-    assert runtime._asr_deny_cleanup_active is False
-    assert runtime._ingress_token_matches(turn_token.ingress)
-    assert callbacks.on_prepare_turn.await_count == 0
-    assert callbacks.on_failure.await_count == 0
-    assert callbacks.on_status.await_count == 0
-    assert await runtime._asr_admission.get_speaker_lease(lease_token) is None
-    drop_calls = [
-        call
-        for call in dispatcher.resolve_reserved.call_args_list
-        if call.args[1] is AdmissionDisposition.DROP
-    ]
-    assert len(drop_calls) == 1
+    key = ProviderUtteranceKey(0, 0, 1)
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase="ordered",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=1,
+            boundary_quality="unknown",
+            audio_range=None,
+        ),
+        runtime._asr_session_epoch,
+    )
+    await runtime._handle_provider_final(
+        key,
+        "provisional-lows-forward",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
+
+    session.close.assert_not_awaited()
+    assert callbacks.on_final.await_args.args[0].text == "provisional-lows-forward"
+    assert not any(
+        item.args[1] is AdmissionDisposition.DROP
+        for item in dispatcher.resolve_reserved.call_args_list
+    )
     await _close_dispatchers(runtime)
 
 
@@ -1932,12 +1996,20 @@ async def test_active_deny_cleanup_callback_only_handoffs_drop_ownership() -> No
     )
     await _open_runtime_admission_turn(runtime, turn_token)
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
     lease_token = runtime._asr_current_speaker_lease
     candidate = runtime._asr_current_speaker_candidate
     assert lease_token is not None
     assert candidate is not None
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     ownership = runtime._asr_provider_turn_ownerships[turn_token]
@@ -1989,6 +2061,12 @@ async def test_active_deny_cleanup_effect_without_ownership_only_handoffs() -> N
     )
     await _open_runtime_admission_turn(runtime, turn_token)
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
     lease_token = runtime._asr_current_speaker_lease
     candidate = runtime._asr_current_speaker_candidate
     assert lease_token is not None
@@ -2003,6 +2081,7 @@ async def test_active_deny_cleanup_effect_without_ownership_only_handoffs() -> N
     )
     final_key = FinalKey.from_turn(turn_token)
     dispatcher = MagicMock()
+    runtime._asr_provider_turn_ownerships.pop(turn_token, None)
     runtime._asr_admission_reservation_dispatchers[final_key] = dispatcher
     cleanup = runtime._begin_speaker_deny_cleanup(
         lease_token,
@@ -2037,12 +2116,20 @@ async def test_active_deny_cleanup_rejects_replacement_dispatcher() -> None:
     )
     await _open_runtime_admission_turn(runtime, turn_token)
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
     lease_token = runtime._asr_current_speaker_lease
     candidate = runtime._asr_current_speaker_candidate
     assert lease_token is not None
     assert candidate is not None
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     ownership = runtime._asr_provider_turn_ownerships[turn_token]
@@ -2100,12 +2187,20 @@ async def test_cleanup_owner_accepts_only_exact_drop_tombstone(
     )
     await _open_runtime_admission_turn(runtime, turn_token)
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
     lease_token = runtime._asr_current_speaker_lease
     candidate = runtime._asr_current_speaker_candidate
     assert lease_token is not None
     assert candidate is not None
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     ownership = runtime._asr_provider_turn_ownerships[turn_token]
@@ -2182,10 +2277,15 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
     )
     await _open_runtime_admission_turn(runtime, turn_token)
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
-    lease_token = runtime._asr_current_speaker_lease
     candidate = runtime._asr_current_speaker_candidate
-    assert lease_token is not None
     assert candidate is not None
+    lease_token = SpeakerCaptureLeaseToken(
+        session_generation=runtime._asr_session_epoch,
+        start_generation=runtime._asr_start_generation,
+        transport_generation=runtime._asr_lifecycle.snapshot.transport_generation,
+        detector_epoch=detector.detector_epoch,
+        lease_nonce=1,
+    )
     attach_entered = asyncio.Event()
     attach_release = asyncio.Event()
     original_attach = runtime._asr_admission.attach_turn_to_speaker_lease
@@ -2202,7 +2302,9 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
     )
     started = asyncio.create_task(
         runtime._handle_provider_utterance_started(
-            ProviderUtteranceStartedNotification(0, 0, 1),
+            ProviderUtteranceStartedNotification(
+                0, 0, 1, audio_start_sample_16k=0
+            ),
             runtime._asr_session_epoch,
         )
     )
@@ -2224,7 +2326,7 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
     await runtime._apply_speaker_lease_result(lease_token, deny_receipt)
     attach_release.set()
 
-    assert await asyncio.wait_for(started, 1)
+    assert not await asyncio.wait_for(started, 1)
     await _drain_runtime_admission(runtime)
 
     final_key = FinalKey.from_turn(turn_token)
@@ -2237,7 +2339,7 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
     await _close_dispatchers(runtime)
 
 
-async def test_deny_cleanup_transition_failure_quarantines_and_keeps_fence(
+async def test_pre_exact_lows_never_enter_deny_cleanup_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -2273,33 +2375,22 @@ async def test_deny_cleanup_transition_failure_quarantines_and_keeps_fence(
     monkeypatch.setattr(lifecycle, "transition", fail_deny_transition)
 
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     await _drain_runtime_admission(runtime)
 
-    session.close.assert_awaited_once_with()
-    assert runtime._asr_provider_turn_ownerships == {}
-    final_key = FinalKey.from_turn(turn_token)
-    assert runtime._asr_admission_reservation_dispatchers == {
-        final_key: runtime._asr_transcript_dispatcher
-    }
-    assert runtime._asr_transcript_dispatcher._resolved[final_key] is (
-        AdmissionDisposition.DROP
-    )
-    assert runtime._asr_speaker_deny_cleanups
-    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
-    assert runtime._asr_deny_cleanup_active is True
-    assert lifecycle.snapshot.state is VoiceLifecycleState.BLOCKED
-    assert lifecycle.snapshot.reason_code == "ASR_DENY_CLEANUP_FAILED"
-    runtime._callbacks.on_status.assert_awaited_once()
-    assert runtime._callbacks.on_status.await_args.args[0].code == (
-        "ASR_DENY_CLEANUP_FAILED"
-    )
+    session.close.assert_not_awaited()
+    assert runtime._asr_speaker_deny_cleanups == {}
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    runtime._callbacks.on_status.assert_not_awaited()
     await _close_dispatchers(runtime)
 
 
-async def test_deny_typed_drop_failure_quarantines_and_keeps_fence(
+async def test_pre_exact_lows_never_attempt_drop_tombstone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -2335,22 +2426,21 @@ async def test_deny_typed_drop_failure_quarantines_and_keeps_fence(
     monkeypatch.setattr(dispatcher, "resolve_reserved", fail_drop)
 
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
         runtime._asr_session_epoch,
     )
     await _drain_runtime_admission(runtime)
 
     final_key = FinalKey.from_turn(turn_token)
-    session.close.assert_awaited_once_with()
+    session.close.assert_not_awaited()
     assert final_key in dispatcher._reservations
     assert final_key not in dispatcher._resolved
-    assert runtime._asr_speaker_deny_cleanups
-    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
-    assert runtime._asr_deny_cleanup_active is True
-    runtime._callbacks.on_status.assert_awaited_once()
-    assert runtime._callbacks.on_status.await_args.args[0].code == (
-        "ASR_DENY_CLEANUP_FAILED"
-    )
+    assert runtime._asr_speaker_deny_cleanups == {}
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    assert runtime._asr_deny_cleanup_active is False
+    runtime._callbacks.on_status.assert_not_awaited()
     await _close_dispatchers(runtime)
 
 
@@ -2368,8 +2458,13 @@ async def test_provider_started_identity_drift_detaches_exact_child(
     await runtime._asr_admission_ingress.start()
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
-    lease_token = runtime._asr_current_speaker_lease
-    assert lease_token is not None
+    lease_token = SpeakerCaptureLeaseToken(
+        session_generation=runtime._asr_session_epoch,
+        start_generation=runtime._asr_start_generation,
+        transport_generation=runtime._asr_lifecycle.snapshot.transport_generation,
+        detector_epoch=detector.detector_epoch,
+        lease_nonce=1,
+    )
     attach = runtime._asr_admission.attach_turn_to_speaker_lease
 
     async def attach_then_drift(child_turn, parent_lease, provider_key):
@@ -2385,7 +2480,12 @@ async def test_provider_started_identity_drift_detaches_exact_child(
     key = ProviderUtteranceKey(0, 0, 1)
 
     assert not await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0,
+            0,
+            1,
+            audio_start_sample_16k=0,
+        ),
         runtime._asr_session_epoch,
     )
 
@@ -2413,8 +2513,13 @@ async def test_cancelled_provider_started_detaches_late_child(
     await runtime._asr_admission_ingress.start()
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
-    lease_token = runtime._asr_current_speaker_lease
-    assert lease_token is not None
+    lease_token = SpeakerCaptureLeaseToken(
+        session_generation=runtime._asr_session_epoch,
+        start_generation=runtime._asr_start_generation,
+        transport_generation=runtime._asr_lifecycle.snapshot.transport_generation,
+        detector_epoch=detector.detector_epoch,
+        lease_nonce=1,
+    )
     attach = runtime._asr_admission.attach_turn_to_speaker_lease
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -2432,7 +2537,12 @@ async def test_cancelled_provider_started_detaches_late_child(
     key = ProviderUtteranceKey(0, 0, 1)
     started = asyncio.create_task(
         runtime._handle_provider_utterance_started(
-            ProviderUtteranceStartedNotification(0, 0, 1),
+            ProviderUtteranceStartedNotification(
+                0,
+                0,
+                1,
+                audio_start_sample_16k=0,
+            ),
             runtime._asr_session_epoch,
         )
     )
@@ -2466,11 +2576,9 @@ async def test_provider_started_alias_conflict_never_attaches_child(
     await runtime._asr_admission_ingress.start()
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
-    lease_token = runtime._asr_current_speaker_lease
     key = ProviderUtteranceKey(0, 0, 1)
     assert runtime._accept_provider_timeline(key)
     correlator = runtime._asr_provider_correlator
-    assert lease_token is not None
     assert correlator is not None
 
     def reject_alias(_key, _turn_token):
@@ -2479,20 +2587,24 @@ async def test_provider_started_alias_conflict_never_attaches_child(
     monkeypatch.setattr(correlator, "bind_ordered", reject_alias)
 
     assert not await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0,
+            0,
+            1,
+            audio_start_sample_16k=0,
+        ),
         runtime._asr_session_epoch,
     )
 
     assert await runtime._asr_admission.get_record(turn_token) is None
-    parent = await runtime._asr_admission.get_speaker_lease(lease_token)
-    assert parent is not None and not parent.child_bindings
+    assert runtime._asr_current_speaker_lease is None
     assert runtime._asr_admission_turn_leases == {}
     assert runtime._asr_provider_started_turns == {}
     assert correlator.record_for(key) is None
     await _close_dispatchers(runtime)
 
 
-async def test_duplicate_provider_started_rechecks_admission_binding(
+async def test_duplicate_same_provider_started_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -2506,7 +2618,9 @@ async def test_duplicate_provider_started_rechecks_admission_binding(
     await runtime._asr_admission_ingress.start()
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
-    notification = ProviderUtteranceStartedNotification(0, 0, 1)
+    notification = ProviderUtteranceStartedNotification(
+        0, 0, 1, audio_start_sample_16k=0
+    )
     assert await runtime._handle_provider_utterance_started(
         notification,
         runtime._asr_session_epoch,
@@ -2517,7 +2631,7 @@ async def test_duplicate_provider_started_rechecks_admission_binding(
         AsyncMock(return_value=None),
     )
 
-    assert not await runtime._handle_provider_utterance_started(
+    assert await runtime._handle_provider_utterance_started(
         notification,
         runtime._asr_session_epoch,
     )
@@ -2560,7 +2674,7 @@ async def test_occupied_provider_started_fails_without_deferred_child_leak() -> 
     await _close_dispatchers(runtime)
 
 
-async def test_deferred_parent_event_overflow_fails_closed_without_child() -> None:
+async def test_provisional_ledger_overflow_fails_open_with_bound_child() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
     _session, _lifecycle, turn_token = _install_active_candidate(
@@ -2573,52 +2687,98 @@ async def test_deferred_parent_event_overflow_fails_closed_without_child() -> No
     runtime._asr_admission_ingress_started = True
     assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
     candidate = runtime._asr_current_speaker_candidate
-    lease_token = runtime._asr_current_speaker_lease
     assert candidate is not None
-    assert lease_token is not None
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
     for sequence_no in range(
         1,
-        runtime_module._MAX_DEFERRED_PROVIDER_SPEAKER_LEASE_EVENTS + 1,
+        runtime_module._MAX_PROVIDER_PROVISIONAL_SPEAKER_EVENTS + 1,
     ):
         assert runtime._accept_speaker_evidence_fact(
             SpeakerLow(candidate, sequence_no, SpeakerCheckpointKind.FIRST),
             activation_generation="profile-generation",
             enforce=True,
         )
-    assert not runtime._accept_speaker_evidence_fact(
+    assert runtime._accept_speaker_evidence_fact(
         SpeakerLow(
             candidate,
-            runtime_module._MAX_DEFERRED_PROVIDER_SPEAKER_LEASE_EVENTS + 1,
+            runtime_module._MAX_PROVIDER_PROVISIONAL_SPEAKER_EVENTS + 1,
             SpeakerCheckpointKind.FIRST,
         ),
         activation_generation="profile-generation",
         enforce=True,
     )
 
-    assert not await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
-        runtime._asr_session_epoch,
-    )
-    assert await runtime._asr_admission.get_record(turn_token) is None
+    ledger = runtime._asr_provider_speaker_ledgers[candidate]
+    assert ledger.poisoned_reason == "ledger_capacity"
+    lease_token = runtime._asr_current_speaker_lease
+    assert lease_token is not None
+    assert await runtime._publish_provider_ledger_unavailable(ledger)
+    assert await runtime._asr_admission.get_record(turn_token) is not None
     parent = await runtime._asr_admission.get_speaker_lease(lease_token)
-    assert parent is None
-    assert lease_token not in runtime._asr_deferred_provider_speaker_lease_events
-    assert lease_token not in runtime._asr_deferred_provider_speaker_lease_overflow
-    assert runtime._asr_provider_turn_ownerships == {}
-    assert runtime._asr_admission_reservation_dispatchers == {}
+    assert parent is not None and parent.state is SpeakerLeaseState.UNAVAILABLE
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_ledger_poisoned_reason_overflow_count"] == 1
+    assert diagnostics["speaker_unavailable_reason_overflow_count"] == 1
     await _close_dispatchers(runtime)
 
 
 @pytest.mark.parametrize(
-    ("verdict", "expected_state"),
-    [
-        ("high", SpeakerLeaseState.ALLOW),
-        ("unavailable", SpeakerLeaseState.UNAVAILABLE),
-    ],
+    ("reason", "expected_category"),
+    (
+        ("provider_pcm_sequence_gap", "gap"),
+        ("ledger_capacity", "overflow"),
+        ("anchor_unavailable", "anchor"),
+        ("exact_prepare_unavailable", "prepare"),
+        ("turn_identity_conflict", "identity"),
+        ("speaker_sequence_reorder", "sequence"),
+        ("speaker_evidence_unavailable", "proof"),
+    ),
 )
-async def test_parent_terminal_before_started_attaches_then_forwards_final(
+async def test_provider_ledger_poison_diagnostics_use_bounded_reason_codes(
+    reason: str,
+    expected_category: str,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    candidate = runtime._asr_current_speaker_candidate
+    assert candidate is not None
+    ledger = runtime._asr_provider_speaker_ledgers[candidate]
+
+    runtime._poison_provider_speaker_ledger(ledger, reason)
+
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_ledger_poisoned_count"] == 1
+    assert diagnostics[
+        f"speaker_ledger_poisoned_reason_{expected_category}_count"
+    ] == 1
+    assert diagnostics[
+        f"speaker_unavailable_reason_{expected_category}_count"
+    ] == 1
+    assert sum(
+        diagnostics[f"speaker_ledger_poisoned_reason_{category}_count"]
+        for category in runtime_module._SPEAKER_FAILURE_REASON_CATEGORIES
+    ) == 1
+    await _close_dispatchers(runtime)
+
+
+@pytest.mark.parametrize("verdict", ("high", "unavailable"))
+async def test_parent_provisional_after_started_forwards_on_unknown_boundary(
     verdict: str,
-    expected_state: SpeakerLeaseState,
 ) -> None:
     callbacks = _callbacks()
     runtime = IndependentAsrRuntime(callbacks)
@@ -2634,6 +2794,16 @@ async def test_parent_terminal_before_started_attaches_then_forwards_final(
     runtime._asr_admission_ingress_started = True
     runtime._asr_admission_reservation_dispatchers[FinalKey.from_turn(turn_token)] = (
         runtime._asr_transcript_dispatcher
+    )
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    evidence_lease = runtime._asr_provider_speaker_evidence_lease
+    assert evidence_lease is not None
+    key = ProviderUtteranceKey(0, 0, 1)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
     )
     identities = tuple(
         DetectorIngressIdentity(
@@ -2709,10 +2879,7 @@ async def test_parent_terminal_before_started_attaches_then_forwards_final(
         assert result.status is AsrSubmitStatus.ACCEPTED
         await runtime._asr_audio_dispatcher.wait_idle()
 
-    evidence_lease = runtime._asr_provider_speaker_evidence_lease
-    lease_token = runtime._asr_current_speaker_lease
-    assert evidence_lease is not None
-    assert lease_token is not None
+    assert runtime._asr_provider_speaker_evidence_lease == evidence_lease
     if verdict == "high":
         # HIGH_SEEN is non-terminal: the next frame must still reach the
         # observer, and capture close is what makes the lease ALLOW.
@@ -2727,16 +2894,11 @@ async def test_parent_terminal_before_started_attaches_then_forwards_final(
     else:
         assert detector.observe_provider_audio_ordered.await_count == 1
     assert session.stream_audio.await_count == 2
+    lease_token = runtime._asr_current_speaker_lease
+    assert lease_token is not None
     parent = await runtime._asr_admission.get_speaker_lease(lease_token)
     assert parent is not None and parent.state is SpeakerLeaseState.COLLECTING
-
-    key = ProviderUtteranceKey(0, 0, 1)
-    assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
-        runtime._asr_session_epoch,
-    )
-    parent = await runtime._asr_admission.get_speaker_lease(lease_token)
-    assert parent is not None and parent.state is expected_state
+    assert parent.last_speaker_sequence_no == 0
     assert parent.child_bindings[0].provider_key == key
 
     await runtime._handle_provider_endpoint_notification(
@@ -3196,7 +3358,7 @@ async def test_provider_ordered_observation_missing_identity_uses_legacy_fallbac
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "missing_update"])
-async def test_enforced_provider_ordered_observation_failure_fails_closed(
+async def test_enforced_provider_ordered_observation_failure_fails_open_for_asr(
     failure_mode: str,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -3241,11 +3403,18 @@ async def test_enforced_provider_ordered_observation_failure_fails_closed(
     )
     await runtime._asr_audio_dispatcher.wait_idle()
 
-    assert result.status is AsrSubmitStatus.UNAVAILABLE
+    assert result.status is AsrSubmitStatus.ACCEPTED
     detector.observe_provider_audio_ordered.assert_awaited_once()
     detector.observe_provider_audio.assert_not_called()
-    session.stream_audio.assert_not_awaited()
-    runtime._callbacks.on_failure.assert_awaited_once()
+    session.stream_audio.assert_awaited_once()
+    runtime._callbacks.on_failure.assert_not_awaited()
+    evidence = runtime._asr_provider_speaker_evidence_lease
+    assert evidence is not None
+    ledger = runtime._asr_provider_speaker_ledgers[evidence.candidate]
+    assert ledger.poisoned_reason in {
+        "provider_pcm_observation_failed",
+        "provider_pcm_receipt_missing",
+    }
     await _close_dispatchers(runtime)
 
 
@@ -3964,7 +4133,7 @@ async def test_smart_turn_final_does_not_query_provider_micro_event() -> None:
     await _close_dispatchers(runtime)
 
 
-async def test_provider_keys_share_one_authoritative_speaker_lease(
+async def test_pre_anchor_low_never_becomes_formal_provider_deny(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import numpy as np
@@ -4058,12 +4227,8 @@ async def test_provider_keys_share_one_authoritative_speaker_lease(
     runtime._asr_detector = detector
 
     key_a = ProviderUtteranceKey(0, 0, 1)
-    key_b = ProviderUtteranceKey(0, 0, 2)
     assert await runtime._arm_speaker_authority_for_provider_audio(first_turn)
-    assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
-        runtime._asr_session_epoch,
-    )
+    assert runtime._asr_current_speaker_lease is None
 
     first_feed = await detector.feed(
         b"\x01\x00" * 160,
@@ -4084,14 +4249,24 @@ async def test_provider_keys_share_one_authoritative_speaker_lease(
     )
     await shadow.wait_idle()
     await _drain_runtime_admission(runtime)
+    assert scoring_host.score_count == 0
+    assert runtime._speaker_verifier_diagnostics()["speaker_deny_latched_count"] == 0
 
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0, 0, 1, audio_start_sample_16k=0
+        ),
+        runtime._asr_session_epoch,
+    )
+    await shadow.wait_idle()
+    await _drain_runtime_admission(runtime)
+    assert scoring_host.score_count == 1
     lease_token = runtime._asr_current_speaker_lease
-    candidate = runtime._asr_current_speaker_candidate
     assert lease_token is not None
-    assert candidate is not None
     first_lease = await runtime._asr_admission.get_speaker_lease(lease_token)
     assert first_lease is not None
-    assert first_lease.state is SpeakerLeaseState.FIRST_LOW
+    assert first_lease.state is SpeakerLeaseState.COLLECTING
+    assert first_lease.last_speaker_sequence_no == 0
     assert first_lease.child_bindings[0].provider_key == key_a
 
     await runtime._handle_provider_endpoint_notification(
@@ -4105,66 +4280,28 @@ async def test_provider_keys_share_one_authoritative_speaker_lease(
         ),
         runtime._asr_session_epoch,
     )
-    lifecycle.transition(VoiceLifecycleEvent.TURN_SEALED)
-    assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 2),
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase="ordered",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=1,
+            boundary_quality="unknown",
+            audio_range=None,
+        ),
         runtime._asr_session_epoch,
     )
-    assert not runtime._asr_deferred_provider_started_keys
-    second_turn = runtime._asr_provider_started_turns[key_b]
-    assert second_turn != first_turn
-
-    second_feed = await detector.feed(
-        b"\x02\x00" * 160,
-        ingress_token=first_turn.ingress,
-        speech_probability=0.9,
-        rnnoise_available=True,
-    )
-    assert second_feed.identity is not None
-    assert await runtime._observe_admitted_provider_audio(
-        lifecycle,
-        detector,
-        b"\x12\x00" * 24_000,
-        sample_rate_hz=16_000,
-        identity=second_feed.identity,
-        split_before_audio=False,
-        evidence_complete=True,
-        turn_token=first_turn,
-    )
-    await shadow.wait_idle()
-    await _drain_runtime_admission(runtime)
-
-    denied_lease = await runtime._asr_admission.get_speaker_lease(lease_token)
-    # Formal denial retires the complete physical lease only after every child
-    # transcript is tombstoned and the old Provider transport has closed.
-    assert denied_lease is None
-    assert scoring_host.score_count == 2
-    assert runtime._speaker_verifier_diagnostics()["speaker_deny_latched_count"] == 1
-    session.close.assert_awaited_once_with()
-    assert lifecycle.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
-    assert runtime._asr_provider_started_turns == {}
-    assert runtime._asr_deny_cleanup_active is False
-
-    first_record = await runtime._asr_admission.get_record(first_turn)
-    second_record = await runtime._asr_admission.get_record(second_turn)
-    # Deny fan-out performs immediate best-effort Provider cleanup. Both child
-    # records may therefore already be retired before either late final lands.
-    assert first_record is None
-    assert second_record is None
     await runtime._handle_provider_final(
         key_a,
         "first",
         runtime._asr_session_epoch,
         "qwen",
     )
-    await runtime._handle_provider_final(
-        key_b,
-        "second",
-        runtime._asr_session_epoch,
-        "qwen",
-    )
+    await _drain_runtime_admission(runtime)
     await runtime.wait_transcript_idle()
-    runtime._callbacks.on_final.assert_not_awaited()
+    runtime._callbacks.on_final.assert_awaited_once()
+    assert runtime._callbacks.on_final.await_args.args[0].text == "first"
+    session.close.assert_not_awaited()
 
     await detector.close()
     composition.close()
@@ -4192,40 +4329,31 @@ async def _install_exact_provider_parent(
     )
     await runtime._asr_admission_ingress.start()
     runtime._asr_admission_ingress_started = True
-    await runtime._asr_admission_ingress.open_turn(turn_token)
-    evidence = await detector.ensure_provider_speaker_evidence_lease()
-    lease_token = SpeakerCaptureLeaseToken(
-        session_generation=runtime._asr_session_epoch,
-        start_generation=runtime._asr_start_generation,
-        transport_generation=lifecycle.snapshot.transport_generation,
-        detector_epoch=detector.detector_epoch,
-        lease_nonce=1,
-    )
-    await runtime._asr_admission_ingress.open_speaker_lease(
-        lease_token,
-        evidence.candidate,
-    )
-    runtime._asr_provider_speaker_evidence_lease = evidence
-    runtime._asr_current_speaker_lease = lease_token
-    runtime._asr_current_speaker_candidate = evidence.candidate
-    runtime._asr_admission_candidate_leases[evidence.candidate] = lease_token
-    runtime._asr_admission_candidate_turns[evidence.candidate] = turn_token
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    evidence = runtime._asr_provider_speaker_evidence_lease
+    assert evidence is not None
     runtime._asr_provider_exact_session = session
     key = ProviderUtteranceKey(0, 0, 1)
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 1),
+        ProviderUtteranceStartedNotification(
+            0,
+            0,
+            1,
+            audio_start_sample_16k=0,
+        ),
         runtime._asr_session_epoch,
     )
-    first_low = await runtime._asr_admission_ingress.post_speaker_lease(
-        lease_token,
-        SpeakerLeaseLow(
+    lease_token = runtime._asr_current_speaker_lease
+    assert lease_token is not None
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(
             evidence.candidate,
             1,
             SpeakerCheckpointKind.FIRST,
         ),
+        activation_generation="profile-generation",
+        enforce=True,
     )
-    await runtime._apply_speaker_lease_result(lease_token, first_low)
-    runtime._asr_provider_speaker_sequence = 1
     boundary = ProviderAudioRange(0, 160)
     return (
         session,
@@ -4294,6 +4422,225 @@ async def _install_exact_provider_interval(
         transaction.target_candidate,
         transaction.successor_candidate,
     )
+
+
+async def _install_nonzero_anchor_provider_parent(
+    runtime: IndependentAsrRuntime,
+    detector: _RejectionDetector,
+    *,
+    pre_anchor_fact: SpeakerLow | SpeakerHigh,
+) -> tuple[
+    SimpleNamespace,
+    VoiceInputLifecycleController,
+    VoiceTurnToken,
+    ProviderUtteranceKey,
+    SpeakerCaptureLeaseToken,
+    ProviderSpeakerEvidenceLease,
+    ProviderAudioRange,
+]:
+    session, lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    assert await runtime._arm_speaker_authority_for_provider_audio(turn_token)
+    evidence = runtime._asr_provider_speaker_evidence_lease
+    assert evidence is not None
+    assert pre_anchor_fact.candidate == evidence.candidate
+    runtime._asr_provider_exact_session = session
+
+    assert runtime._accept_speaker_evidence_fact(
+        pre_anchor_fact,
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    ledger = runtime._asr_provider_speaker_ledgers[evidence.candidate]
+    assert ledger.state is runtime_module._ProviderSpeakerLedgerState.UNANCHORED_DEFERRED
+    assert tuple(ledger.events) == ()
+    assert ledger.last_speaker_sequence_no == 0
+    assert runtime._asr_current_speaker_lease is None
+
+    key = ProviderUtteranceKey(0, 0, 1)
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            0,
+            0,
+            1,
+            audio_start_sample_16k=80,
+        ),
+        runtime._asr_session_epoch,
+    )
+    lease_token = runtime._asr_current_speaker_lease
+    assert lease_token is not None
+    lease = await runtime._asr_admission.get_speaker_lease(lease_token)
+    assert lease is not None
+    assert lease.state is SpeakerLeaseState.COLLECTING
+    assert lease.last_speaker_sequence_no == 0
+    return (
+        session,
+        lifecycle,
+        turn_token,
+        key,
+        lease_token,
+        evidence,
+        ProviderAudioRange(80, 160),
+    )
+
+
+async def test_nonzero_preroll_low_is_discarded_before_owner_suffix_forwards(
+) -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    evidence = await detector.ensure_provider_speaker_evidence_lease()
+    (
+        session,
+        lifecycle,
+        turn_token,
+        _key,
+        lease_token,
+        anchored_evidence,
+        boundary,
+    ) = await _install_nonzero_anchor_provider_parent(
+        runtime,
+        detector,
+        pre_anchor_fact=SpeakerLow(
+            evidence.candidate,
+            1,
+            SpeakerCheckpointKind.FIRST,
+        ),
+    )
+    assert anchored_evidence == evidence
+    threshold = SpeakerShadowConfig().similarity_thresholds[0]
+    owner_suffix_similarity = 0.70
+    assert threshold == 0.40
+    assert owner_suffix_similarity >= threshold
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerHigh(evidence.candidate, 1),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+
+    for phase in ("boundary", "ordered"):
+        await runtime._handle_provider_endpoint_notification(
+            ProviderEndpointNotification(
+                phase=phase,
+                generation=0,
+                buffer_epoch=0,
+                utterance_id=1,
+                boundary_quality="exact",
+                audio_range=boundary,
+            ),
+            runtime._asr_session_epoch,
+        )
+    transaction = runtime._asr_provider_exact_intervals[
+        ProviderUtteranceKey(0, 0, 1)
+    ]
+    await runtime._handle_provider_final(
+        transaction.provider_key,
+        "owner-suffix-forward",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    assert runtime._close_speaker_evidence(
+        CaptureClosed(transaction.target_candidate, 1),
+        activation_generation="profile-generation",
+        enforce=True,
+        evidence_complete=True,
+    )
+    await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    assert callbacks.on_final.await_args.args[0].text == "owner-suffix-forward"
+    assert lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    session.close.assert_not_awaited()
+    parent = await runtime._asr_admission.get_speaker_lease(lease_token)
+    assert parent is not None
+    assert parent.terminal_disposition is None
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_pre_anchor_fact_ignored_count"] == 1
+    assert diagnostics["speaker_deny_latched_count"] == 0
+    assert await runtime._asr_admission.get_record(turn_token) is None
+    await _close_dispatchers(runtime)
+
+
+async def test_nonzero_preroll_high_cannot_mask_non_owner_suffix_drop(
+) -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    evidence = await detector.ensure_provider_speaker_evidence_lease()
+    (
+        session,
+        lifecycle,
+        _turn_token,
+        key,
+        _lease_token,
+        anchored_evidence,
+        boundary,
+    ) = await _install_nonzero_anchor_provider_parent(
+        runtime,
+        detector,
+        pre_anchor_fact=SpeakerHigh(evidence.candidate, 1),
+    )
+    assert anchored_evidence == evidence
+    threshold = SpeakerShadowConfig().similarity_thresholds[0]
+    non_owner_suffix_similarity = 0.20
+    assert threshold == 0.40
+    assert non_owner_suffix_similarity < threshold
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(
+            evidence.candidate,
+            1,
+            SpeakerCheckpointKind.FIRST,
+        ),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    for phase in ("boundary", "ordered"):
+        await runtime._handle_provider_endpoint_notification(
+            ProviderEndpointNotification(
+                phase=phase,
+                generation=0,
+                buffer_epoch=0,
+                utterance_id=1,
+                boundary_quality="exact",
+                audio_range=boundary,
+            ),
+            runtime._asr_session_epoch,
+        )
+    transaction = runtime._asr_provider_exact_intervals[key]
+    await runtime._handle_provider_final(
+        key,
+        "non-owner-suffix-drop",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(
+            transaction.target_candidate,
+            2,
+            SpeakerCheckpointKind.SECOND,
+        ),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_not_awaited()
+    assert lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    session.close.assert_not_awaited()
+    diagnostics = runtime._speaker_verifier_diagnostics()
+    assert diagnostics["speaker_pre_anchor_fact_ignored_count"] == 1
+    assert transaction.resolved_disposition is AdmissionDisposition.DROP
+    await _close_dispatchers(runtime)
 
 
 async def test_exact_interval_completion_low_drops_only_child_without_transport_abort(
@@ -4391,6 +4738,182 @@ async def test_exact_interval_final_first_uses_exact_seal_and_forwards_child(
     await _close_dispatchers(runtime)
 
 
+@pytest.mark.parametrize("conflict_phase", ("boundary", "ordered"))
+async def test_post_commit_exact_conflict_keeps_final_fail_open(
+    conflict_phase: str,
+) -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    (
+        session,
+        lifecycle,
+        turn_token,
+        key,
+        _lease_token,
+        _target,
+        _successor,
+    ) = await _install_exact_provider_interval(
+        runtime,
+        detector,
+        ordered=False,
+    )
+    transaction = runtime._asr_provider_exact_intervals[key]
+    conflicting_range = ProviderAudioRange(0, 80)
+    await runtime._send_independent_asr_preview(
+        "held-partial",
+        runtime._asr_session_epoch,
+    )
+    callbacks.on_partial.assert_not_awaited()
+    assert runtime._asr_quarantined_partials == {turn_token: "held-partial"}
+    if conflict_phase == "boundary":
+        await runtime._handle_provider_endpoint_notification(
+            ProviderEndpointNotification(
+                phase="ordered",
+                generation=0,
+                buffer_epoch=0,
+                utterance_id=1,
+                boundary_quality="exact",
+                audio_range=ProviderAudioRange(0, 160),
+            ),
+            runtime._asr_session_epoch,
+        )
+
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase=conflict_phase,
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=1,
+            boundary_quality="exact",
+            audio_range=conflicting_range,
+        ),
+        runtime._asr_session_epoch,
+    )
+
+    record = await runtime._asr_admission.get_record(turn_token)
+    assert record is not None
+    assert record.capture_state is CaptureState.UNAVAILABLE
+    assert record.speaker_lease_token is None
+    assert record.exact_interval_hold_id is None
+    assert transaction.resolved_disposition is AdmissionDisposition.FORWARD
+    assert key not in runtime._asr_provider_exact_intervals
+    assert lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+    callbacks.on_partial.assert_awaited_once()
+    assert callbacks.on_partial.await_args.args[0].text == "held-partial"
+    assert runtime._asr_quarantined_partials == {}
+    assert runtime._speaker_verifier_diagnostics()[
+        "speaker_unavailable_reason_prepare_count"
+    ] == 1
+
+    await runtime._handle_provider_final(
+        key,
+        f"{conflict_phase}-conflict-forward",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
+
+    callbacks.on_final.assert_awaited_once()
+    assert callbacks.on_partial.await_count == 1
+    assert (
+        callbacks.on_final.await_args.args[0].text
+        == f"{conflict_phase}-conflict-forward"
+    )
+    session.close.assert_not_awaited()
+    assert lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+    await _close_dispatchers(runtime)
+
+
+async def test_poisoned_exact_fifo_replays_queued_final_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    (
+        session,
+        lifecycle,
+        _turn_token,
+        key,
+        _lease_token,
+        target,
+        _successor,
+    ) = await _install_exact_provider_interval(runtime, detector)
+    transaction = runtime._asr_provider_exact_intervals[key]
+    await _drain_runtime_admission(runtime)
+
+    apply_entered = asyncio.Event()
+    apply_release = asyncio.Event()
+    original_apply = runtime._apply_exact_interval_event
+
+    async def gated_apply(observed_transaction, event):
+        if isinstance(event, SpeakerLeaseUnavailable) and event.sequence_no == 2:
+            apply_entered.set()
+            await apply_release.wait()
+        return await original_apply(observed_transaction, event)
+
+    monkeypatch.setattr(runtime, "_apply_exact_interval_event", gated_apply)
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerUnavailable(target, 2),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    await apply_entered.wait()
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(target, 2, SpeakerCheckpointKind.COMPLETION_CONFIRMATION),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    final_task = asyncio.create_task(
+        runtime._handle_provider_final(
+            key,
+            "poisoned-fifo-forward",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+    )
+    for _ in range(10):
+        if any(
+            isinstance(item.event, ProviderFinalReceived)
+            for item in transaction.event_queue
+        ):
+            break
+        await asyncio.sleep(0)
+    assert any(
+        isinstance(item.event, ProviderFinalReceived)
+        for item in transaction.event_queue
+    )
+
+    apply_release.set()
+    await final_task
+    await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
+
+    settled_record = await runtime._asr_admission.get_record(
+        transaction.turn_token
+    )
+    assert callbacks.on_final.await_count == 1, (
+        settled_record.capture_state if settled_record else None,
+        settled_record.evidence_state if settled_record else None,
+        settled_record.admission_state if settled_record else None,
+        settled_record.terminal_disposition if settled_record else None,
+        settled_record.pending_final if settled_record else None,
+        transaction.resolved_disposition,
+        {
+            turn: context.settled.is_set()
+            for turn, context in runtime._asr_admission_final_contexts.items()
+        },
+    )
+    assert callbacks.on_final.await_args.args[0].text == "poisoned-fifo-forward"
+    assert not runtime._asr_admission_final_contexts
+    assert transaction.resolved_disposition is AdmissionDisposition.FORWARD
+    assert lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
+    session.close.assert_not_awaited()
+    await _close_dispatchers(runtime)
+
+
 async def test_exact_interval_drop_preserves_successor_for_new_provider_turn(
 ) -> None:
     callbacks = _callbacks()
@@ -4410,7 +4933,12 @@ async def test_exact_interval_drop_preserves_successor_for_new_provider_turn(
 
     key_b = ProviderUtteranceKey(0, 0, 2)
     assert await runtime._handle_provider_utterance_started(
-        ProviderUtteranceStartedNotification(0, 0, 2),
+        ProviderUtteranceStartedNotification(
+            0,
+            0,
+            2,
+            audio_start_sample_16k=160,
+        ),
         runtime._asr_session_epoch,
     )
     second_turn = runtime._asr_provider_started_turns[key_b]
@@ -4640,6 +5168,88 @@ async def test_exact_interval_cancel_during_replay_drains_remaining_callbacks(
     await _close_dispatchers(runtime)
 
 
+async def test_exact_interval_commit_order_is_prepare_promote_activate_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    (
+        _session,
+        _lifecycle,
+        _turn_token,
+        key,
+        _lease_token,
+        _evidence,
+        boundary,
+    ) = await _install_exact_provider_parent(runtime, detector)
+    order: list[str] = []
+    original_prepare = detector.prepare_provider_exact_speaker_interval
+    original_promote = runtime._asr_admission_ingress.promote_exact_interval_nowait
+    original_activate = runtime._asr_admission_ingress.activate_exact_interval_nowait
+    original_commit = detector.commit_provider_exact_speaker_interval
+
+    async def traced_prepare(*args, **kwargs):
+        order.append("detector_prepare")
+        return await original_prepare(*args, **kwargs)
+
+    def traced_promote(scope):
+        order.append("admission_promote")
+        return original_promote(scope)
+
+    def traced_activate(receipt):
+        order.append("admission_activate")
+        return original_activate(receipt)
+
+    def traced_commit(reservation):
+        order.append("detector_commit")
+        return original_commit(reservation)
+
+    monkeypatch.setattr(
+        detector,
+        "prepare_provider_exact_speaker_interval",
+        traced_prepare,
+    )
+    monkeypatch.setattr(
+        runtime._asr_admission_ingress,
+        "promote_exact_interval_nowait",
+        traced_promote,
+    )
+    monkeypatch.setattr(
+        runtime._asr_admission_ingress,
+        "activate_exact_interval_nowait",
+        traced_activate,
+    )
+    monkeypatch.setattr(
+        detector,
+        "commit_provider_exact_speaker_interval",
+        traced_commit,
+    )
+
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase="boundary",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=1,
+            boundary_quality="exact",
+            audio_range=boundary,
+        ),
+        runtime._asr_session_epoch,
+    )
+
+    assert order == [
+        "detector_prepare",
+        "admission_promote",
+        "admission_activate",
+        "detector_commit",
+    ]
+    assert key in runtime._asr_provider_exact_intervals
+    assert runtime._asr_provider_speaker_key_ledgers[key].state is (
+        runtime_module._ProviderSpeakerLedgerState.EXACT_DRAINING
+    )
+    await _close_dispatchers(runtime)
+
+
 @pytest.mark.parametrize(
     "method_name",
     ("promote_exact_interval_nowait", "activate_exact_interval_nowait"),
@@ -4713,17 +5323,18 @@ async def test_exact_interval_cancelled_waiter_compensates_staged_split(
 
 
 @pytest.mark.parametrize("failed_side", ("detector", "admission"))
-async def test_exact_interval_failed_rollback_starts_parent_cleanup(
+async def test_exact_interval_failed_pcm_rollback_marks_speaker_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     failed_side: str,
 ) -> None:
-    runtime = IndependentAsrRuntime(_callbacks())
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
     (
         session,
         _lifecycle,
         _turn_token,
-        _key,
+        key,
         _lease_token,
         _evidence,
         boundary,
@@ -4785,8 +5396,32 @@ async def test_exact_interval_failed_rollback_starts_parent_cleanup(
         await task
     await _drain_runtime_admission(runtime)
 
-    assert runtime._asr_deny_transport_state is not DenyTransportState.OPEN
-    session.close.assert_awaited()
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    session.close.assert_not_awaited()
+    await runtime._handle_provider_endpoint_notification(
+        ProviderEndpointNotification(
+            phase="ordered",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=1,
+            boundary_quality="unknown",
+            audio_range=None,
+        ),
+        runtime._asr_session_epoch,
+    )
+    await runtime._handle_provider_final(
+        key,
+        f"{failed_side}-rollback-forward",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
+    callbacks.on_final.assert_awaited_once()
+    assert (
+        callbacks.on_final.await_args.args[0].text
+        == f"{failed_side}-rollback-forward"
+    )
     await _close_dispatchers(runtime)
 
 
@@ -4948,15 +5583,16 @@ async def test_exact_interval_reset_blocks_while_resolution_effect_is_in_flight(
     await _close_dispatchers(runtime)
 
 
-async def test_exact_interval_different_pending_boundary_fails_parent_group(
+async def test_exact_interval_different_pending_boundary_fails_open_for_text(
 ) -> None:
-    runtime = IndependentAsrRuntime(_callbacks())
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
     (
         session,
         _lifecycle,
-        _turn_token,
-        _key,
+        turn_token,
+        key,
         _lease_token,
         _evidence,
         boundary,
@@ -4992,10 +5628,20 @@ async def test_exact_interval_different_pending_boundary_fails_parent_group(
     await asyncio.sleep(0)
     detector.exact_prepare_release.set()
     await asyncio.gather(first, conflict)
+    await runtime._handle_provider_final(
+        key,
+        "boundary-conflict-forward",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
     await _drain_runtime_admission(runtime)
+    await runtime.wait_transcript_idle()
 
-    assert runtime._asr_deny_transport_state is not DenyTransportState.OPEN
-    session.close.assert_awaited()
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    session.close.assert_not_awaited()
+    assert await runtime._asr_admission.get_record(turn_token) is None
+    callbacks.on_final.assert_awaited_once()
+    assert callbacks.on_final.await_args.args[0].text == "boundary-conflict-forward"
     await _close_dispatchers(runtime)
 
 
@@ -5446,7 +6092,7 @@ async def test_deny_rearm_silence_then_onset_forwards_same_frame() -> None:
     await _close_dispatchers(runtime)
 
 
-async def test_formal_deny_cleanup_rearms_rebuilt_session_for_owner_frame() -> None:
+async def test_pre_exact_lows_do_not_close_or_rebuild_provider_session() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     denied_detector = _RejectionDetector()
     denied_session, lifecycle, denied_turn = _install_active_candidate(
@@ -5476,75 +6122,10 @@ async def test_formal_deny_cleanup_rearms_rebuilt_session_for_owner_frame() -> N
     )
     await _drain_runtime_admission(runtime)
 
-    assert denied_session.close.await_count == 1
-    assert runtime._asr_session is None
-    assert lifecycle.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
-    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
-
-    owner_detector = _RejectionDetector()
-    runtime._asr_session_epoch += 1
-    owner_session, _owner_lifecycle, owner_turn = _install_active_candidate(
-        runtime,
-        owner_detector,
-        provider="qwen",
-        endpointing_mode="provider",
-    )
-    owner_identity = DetectorIngressIdentity(
-        ingress_token=owner_turn.ingress,
-        detector_epoch=owner_detector.detector_epoch,
-        sequence_no=2,
-    )
-    owner_detector.feed = AsyncMock(  # type: ignore[attr-defined]
-        side_effect=(
-            DetectorFeedResult(
-                events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
-                throttle_available=True,
-            ),
-            DetectorFeedResult(
-                events=(SpeechActivityEvent.SPEECH_STARTED,),
-                throttle_available=True,
-            ),
-            DetectorFeedResult(
-                events=(SpeechActivityEvent.SPEECH_STARTED,),
-                throttle_available=True,
-                identity=owner_identity,
-                candidate=DetectorCandidateKey(owner_detector.detector_epoch, 0),
-            ),
-        )
-    )
-
-    await runtime.submit(
-        ProcessedVoiceFrame(
-            b"\x00\x00" * 160,
-            16_000,
-            0.0,
-            False,
-            ingress_sequence=1,
-            captured_at=1.0,
-        ),
-        ingress_token=owner_turn.ingress,
-    )
-    assert runtime._asr_deny_transport_state is DenyTransportState.ARMED
-    owner_pcm = b"\x2a\x00" * 160
-    submitted = await runtime.submit(
-        ProcessedVoiceFrame(
-            owner_pcm,
-            16_000,
-            0.9,
-            True,
-            ingress_sequence=2,
-            captured_at=2.0,
-        ),
-        ingress_token=owner_turn.ingress,
-    )
-    await runtime._asr_audio_dispatcher.wait_idle()
-
-    assert submitted.status is AsrSubmitStatus.ACCEPTED
+    denied_session.close.assert_not_awaited()
+    assert runtime._asr_session is denied_session
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
     assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
-    assert owner_detector.feed.await_args_list[1].args[0] == owner_pcm
-    assert owner_detector.feed.await_args_list[2].args[0] == owner_pcm
-    owner_session.stream_audio.assert_awaited()
-    assert owner_pcm in owner_session.stream_audio.await_args.args[0]
     assert runtime._callbacks.on_partial.await_count == 0
     assert runtime._callbacks.on_final.await_count == 0
     await _close_dispatchers(runtime)
@@ -5767,7 +6348,7 @@ async def test_deny_rearm_onset_cannot_forward_after_new_cleanup_takes_over() ->
     await _close_dispatchers(runtime)
 
 
-async def test_deny_provider_close_failure_quarantines_transport() -> None:
+async def test_pre_exact_lows_never_invoke_provider_close() -> None:
     callbacks = _callbacks()
     runtime = IndependentAsrRuntime(callbacks)
     detector = _RejectionDetector()
@@ -5799,8 +6380,9 @@ async def test_deny_provider_close_failure_quarantines_transport() -> None:
     )
     await _drain_runtime_admission(runtime)
 
-    assert runtime._asr_deny_transport_state is DenyTransportState.QUARANTINED
-    assert lifecycle.snapshot.state is VoiceLifecycleState.BLOCKED
-    assert callbacks.on_status.await_count == 1
-    assert callbacks.on_status.await_args.args[0].code == "ASR_DENY_CLEANUP_FAILED"
+    session.close.assert_not_awaited()
+    assert runtime._asr_session is session
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    callbacks.on_status.assert_not_awaited()
     await _close_dispatchers(runtime)

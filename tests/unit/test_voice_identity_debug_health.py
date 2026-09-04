@@ -1,6 +1,52 @@
 from __future__ import annotations
 
 from main_routers import debug_router
+from main_logic.voice_identity_service.diagnostics import (
+    VOICE_IDENTITY_DIAGNOSTIC_COUNTERS,
+)
+
+
+_SPEAKER_FAILURE_REASON_CATEGORIES = {
+    "gap",
+    "overflow",
+    "anchor",
+    "prepare",
+    "identity",
+    "sequence",
+    "proof",
+}
+
+
+def test_exact_interval_diagnostics_expose_only_bounded_reason_counters() -> None:
+    expected = {
+        "speaker_anchor_deferred_count",
+        "speaker_anchor_success_count",
+        "speaker_anchor_evicted_count",
+        "speaker_anchor_conflict_count",
+        "speaker_provisional_fact_count",
+        "speaker_pre_anchor_fact_ignored_count",
+        "speaker_ledger_poisoned_count",
+        "speaker_exact_prepare_count",
+        "speaker_exact_commit_count",
+        "speaker_exact_abort_count",
+        "speaker_unavailable_count",
+        "unsupported_asr_route_count",
+        *{
+            f"speaker_ledger_poisoned_reason_{reason}_count"
+            for reason in _SPEAKER_FAILURE_REASON_CATEGORIES
+        },
+        *{
+            f"speaker_unavailable_reason_{reason}_count"
+            for reason in _SPEAKER_FAILURE_REASON_CATEGORIES
+        },
+    }
+
+    assert expected <= VOICE_IDENTITY_DIAGNOSTIC_COUNTERS
+    assert not any(
+        name.startswith("speaker_unavailable_reason_")
+        and name not in expected
+        for name in VOICE_IDENTITY_DIAGNOSTIC_COUNTERS
+    )
 
 
 def test_debug_health_voice_identity_diagnostics_keep_only_safe_counters(
@@ -27,6 +73,8 @@ def test_debug_health_voice_identity_diagnostics_keep_only_safe_counters(
             "micro_event_fail_open_count": 1,
             "micro_event_stale_fence_count": 0,
             "micro_event_rnnoise_unavailable_count": 1,
+            "speaker_unavailable_reason_anchor_count": 1,
+            "speaker_unavailable_reason_private_audio_count": 1,
             "similarity": 0.12,
             "embedding": [1.0, 0.0],
             "unexpected": 99,
@@ -53,4 +101,5 @@ def test_debug_health_voice_identity_diagnostics_keep_only_safe_counters(
         "micro_event_fail_open_count": 1,
         "micro_event_stale_fence_count": 0,
         "micro_event_rnnoise_unavailable_count": 1,
+        "speaker_unavailable_reason_anchor_count": 1,
     }

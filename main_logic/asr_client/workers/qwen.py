@@ -337,7 +337,8 @@ async def _qwen_open_provider_item(
     state.next_utterance_id += 1
     state.last_utterance_id = key[2]
     state.item_keys[canonical_item_id] = key
-    state.item_start_samples_16k[canonical_item_id] = start_sample_16k
+    canonical_start = None if ambiguous else start_sample_16k
+    state.item_start_samples_16k[canonical_item_id] = canonical_start
     state.provider_item_order.append(canonical_item_id)
     if item_id:
         state.provider_item_aliases[item_id] = canonical_item_id
@@ -356,6 +357,7 @@ async def _qwen_open_provider_item(
             generation=key[0],
             buffer_epoch=key[1],
             utterance_id=key[2],
+            audio_start_sample_16k=canonical_start,
         )
     )
     return canonical_item_id
@@ -366,10 +368,14 @@ async def _qwen_mark_provider_item_ambiguous(
     state: _QwenConnectionState,
     item_id: str,
 ) -> None:
+    if item_id in state.ambiguous_provider_items:
+        return
     state.ambiguous_provider_items.add(item_id)
     state.item_start_samples_16k[item_id] = None
-    if state.item_boundaries.get(item_id) is not None:
-        await _qwen_emit_provider_endpoint(response_queue, state, item_id, None)
+    # Boundary revocation is the single ordered poison event for late start
+    # conflicts. Emitting a second started event here would require two queue
+    # slots atomically and can deadlock a bounded worker response queue.
+    await _qwen_emit_provider_endpoint(response_queue, state, item_id, None)
 
 
 async def _qwen_resolve_provider_item(

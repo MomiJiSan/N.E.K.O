@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal, TypeAlias
 
 
 ProviderBoundaryQuality: TypeAlias = Literal["exact", "unknown"]
 ProviderEndpointPhase: TypeAlias = Literal["boundary", "ordered"]
+
+
+class ProviderStartedSettlement(str, Enum):
+    """Provider-start callback outcome separated from speaker availability."""
+
+    FAILED_IDENTITY = "failed_identity"
+    BOUND_EXACT_PENDING = "bound_exact_pending"
+    BOUND_SPEAKER_UNAVAILABLE = "bound_speaker_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +50,7 @@ class ProviderUtteranceStartedNotification:
     generation: int
     buffer_epoch: int
     utterance_id: int
+    audio_start_sample_16k: int | None = None
 
     def __post_init__(self) -> None:
         ProviderUtteranceKey(
@@ -48,6 +58,12 @@ class ProviderUtteranceStartedNotification:
             buffer_epoch=self.buffer_epoch,
             utterance_id=self.utterance_id,
         )
+        if self.audio_start_sample_16k is not None and (
+            isinstance(self.audio_start_sample_16k, bool)
+            or not isinstance(self.audio_start_sample_16k, int)
+            or self.audio_start_sample_16k < 0
+        ):
+            raise ValueError("ASR_PROVIDER_AUDIO_START_INVALID")
 
     @property
     def key(self) -> ProviderUtteranceKey:

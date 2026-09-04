@@ -15,6 +15,7 @@ from main_logic.asr_client.endpointing.detector_runtime import (
     DetectorFeedResult,
     DetectorRuntime,
     ProviderExactSpeakerIntervalReservation,
+    ProviderSpeakerEvidenceAnchorStatus,
     SmartTurnLease,
     SmartTurnReadiness,
     _AudioItem,
@@ -1193,6 +1194,23 @@ async def _open_provider_candidate(
     return result.candidate, result.identity, token
 
 
+async def _anchor_provider_evidence(
+    detector: DetectorRuntime,
+    lease,
+    *,
+    start_sample_16k: int = 0,
+) -> None:
+    result = await detector.anchor_provider_speaker_evidence(
+        lease,
+        audio_start_sample_16k=start_sample_16k,
+        deadline=asyncio.get_running_loop().time() + 1.0,
+    )
+    assert result.status in {
+        ProviderSpeakerEvidenceAnchorStatus.APPLIED,
+        ProviderSpeakerEvidenceAnchorStatus.IDEMPOTENT,
+    }
+
+
 async def _open_real_terminal_provider_candidate(
     *,
     duration_ms: int,
@@ -1387,6 +1405,7 @@ async def test_provider_exact_interval_preserves_pcm_arriving_before_commit() ->
             speaker_evidence_lease=lease,
         )
         assert first is not None
+        await _anchor_provider_evidence(detector, lease)
         reservation = await detector.prepare_provider_exact_speaker_interval(
             ProviderAudioRange(0, 12_800),
             speaker_evidence_lease=lease,
@@ -1454,6 +1473,7 @@ async def test_provider_exact_interval_empty_successor_accepts_future_pcm() -> N
             speaker_evidence_lease=lease,
         )
         assert first is not None
+        await _anchor_provider_evidence(detector, lease)
         reservation = await detector.prepare_provider_exact_speaker_interval(
             ProviderAudioRange(0, 12_800),
             speaker_evidence_lease=lease,
@@ -1514,6 +1534,7 @@ async def test_provider_exact_interval_abort_returns_staged_pcm_to_parent() -> N
             split_before_audio=False,
             speaker_evidence_lease=lease,
         )
+        await _anchor_provider_evidence(detector, lease)
         reservation = await detector.prepare_provider_exact_speaker_interval(
             ProviderAudioRange(0, 12_800),
             speaker_evidence_lease=lease,
@@ -1565,6 +1586,7 @@ async def test_provider_exact_interval_abort_restore_failure_is_not_reported_saf
             split_before_audio=False,
             speaker_evidence_lease=lease,
         )
+        await _anchor_provider_evidence(detector, lease)
         reservation = await detector.prepare_provider_exact_speaker_interval(
             ProviderAudioRange(0, 12_800),
             speaker_evidence_lease=lease,
@@ -1615,6 +1637,7 @@ async def test_provider_exact_interval_rejects_forged_and_stale_timeline_authori
             split_before_audio=False,
             speaker_evidence_lease=lease,
         )
+        await _anchor_provider_evidence(detector, lease)
         reservation = await detector.prepare_provider_exact_speaker_interval(
             ProviderAudioRange(0, 6_400),
             speaker_evidence_lease=lease,
@@ -1629,6 +1652,11 @@ async def test_provider_exact_interval_rejects_forged_and_stale_timeline_authori
             lease_generation=reservation.lease_generation,
             candidate_generation=reservation.candidate_generation,
             shadow_runtime_generation=reservation.shadow_runtime_generation,
+            anchor_revision=reservation.anchor_revision,
+            anchor_start_sample_16k=reservation.anchor_start_sample_16k,
+            provider_pcm_through_sequence_no=(
+                reservation.provider_pcm_through_sequence_no
+            ),
             _owner=object(),
             _token=reservation._token,
         )
@@ -1671,6 +1699,7 @@ async def test_provider_exact_interval_rejects_sequence_gap_and_overlapping_segm
             split_before_audio=False,
             speaker_evidence_lease=lease,
         )
+        await _anchor_provider_evidence(detector, lease)
         assert await detector.observe_provider_audio_ordered(
             _speaker_pcm(100),
             sample_rate_hz=16_000,
@@ -1717,6 +1746,7 @@ async def test_provider_exact_interval_rejects_sequence_gap_and_overlapping_segm
             split_before_audio=False,
             speaker_evidence_lease=lease,
         )
+        await _anchor_provider_evidence(overlap_detector, lease)
         assert await overlap_detector.observe_provider_audio_ordered(
             _speaker_pcm(100),
             sample_rate_hz=16_000,
@@ -1763,6 +1793,7 @@ async def test_provider_exact_interval_lifecycle_invalidates_reservation_immedia
             split_before_audio=False,
             speaker_evidence_lease=lease,
         )
+        await _anchor_provider_evidence(detector, lease)
         reservation = await detector.prepare_provider_exact_speaker_interval(
             ProviderAudioRange(0, 1_600),
             speaker_evidence_lease=lease,
@@ -1877,7 +1908,7 @@ async def test_provider_speaker_evidence_sequence_gap_abandons_without_renewing(
         await detector.close()
 
 
-async def test_real_provider_speaker_evidence_lease_keeps_two_low_scores_across_split() -> (
+async def test_real_provider_speaker_evidence_scores_only_after_canonical_anchor() -> (
     None
 ):
     observations: list[SpeakerShadowObservation] = []
@@ -1914,6 +1945,12 @@ async def test_real_provider_speaker_evidence_lease_keeps_two_low_scores_across_
         )
         assert first is not None
         await shadow.wait_idle()
+        assert observations == []
+        await _anchor_provider_evidence(
+            detector,
+            evidence_lease,
+            start_sample_16k=24_000,
+        )
         second = await detector.observe_provider_audio_ordered(
             _speaker_pcm(1_500),
             sample_rate_hz=16_000,
@@ -1935,14 +1972,12 @@ async def test_real_provider_speaker_evidence_lease_keeps_two_low_scores_across_
                 speaker_evidence_lease=evidence_lease,
             )
             assert update is not None and update.lease == evidence_lease
-            assert (
-                update.capture.disposition is SpeakerShadowCaptureDisposition.COMPLETE
-            )
+            await shadow.wait_idle()
 
         assert [item.checkpoint_ms for item in observations] == [1_500, 3_000]
         assert {item.candidate for item in observations} == {evidence_lease.candidate}
-        assert second.capture.cumulative_sample_count == 48_000
-        assert shadow.snapshot()["retained_pcm_bytes"] == 0
+        assert second.capture.cumulative_sample_count == 24_000
+        assert len(detector._provider_speaker_evidence_state.coverage_candidates) >= 2
 
         unknown = await detector.retire_provider_speaker_boundary_unknown()
         assert unknown is not None and unknown.boundary_exact is False
@@ -1951,6 +1986,307 @@ async def test_real_provider_speaker_evidence_lease_keeps_two_low_scores_across_
         assert await detector.finish_provider_speaker_evidence_lease(evidence_lease)
         await shadow.wait_idle()
         assert shadow.snapshot()["finished_candidate_count"] == 1
+    finally:
+        await detector.close()
+
+
+async def test_provider_speaker_anchor_future_duplicate_and_conflict_are_fenced() -> (
+    None
+):
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+
+        pending = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=1_600,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert pending.status is ProviderSpeakerEvidenceAnchorStatus.PENDING
+        assert pending.buffer_origin_sample_16k == 0
+
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=lease,
+        )
+        applied = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=1_600,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert applied.status is ProviderSpeakerEvidenceAnchorStatus.APPLIED
+        assert applied.anchor_revision == 1
+        assert applied.buffer_origin_sample_16k == 0
+        assert applied.anchor_start_sample_16k == 1_600
+
+        duplicate = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=1_600,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert duplicate.status is ProviderSpeakerEvidenceAnchorStatus.IDEMPOTENT
+        assert duplicate.anchor_revision == applied.anchor_revision
+
+        conflict = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=0,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert conflict.status is ProviderSpeakerEvidenceAnchorStatus.CONFLICT
+        assert not await detector.finish_provider_speaker_evidence_lease(lease)
+    finally:
+        await detector.close()
+
+
+async def test_provider_speaker_anchor_evicted_prefix_is_unavailable_without_score() -> (
+    None
+):
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+        on_observation=observe,
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        for sequence_no in range(1, 6):
+            assert await detector.observe_provider_audio_ordered(
+                _speaker_pcm(1_000),
+                sample_rate_hz=16_000,
+                identity=identity,
+                sequence_no=sequence_no,
+                split_before_audio=False,
+                speaker_evidence_lease=lease,
+            )
+        await shadow.wait_idle()
+        assert observations == []
+
+        unavailable = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=0,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert unavailable.status is ProviderSpeakerEvidenceAnchorStatus.UNAVAILABLE
+        assert unavailable.buffer_origin_sample_16k == 0
+        assert not await detector.finish_provider_speaker_evidence_lease(lease)
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_long_utterance_commits_continuation_coverage() -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        applied = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=0,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert applied.status is ProviderSpeakerEvidenceAnchorStatus.APPLIED
+        assert applied.observed_through_sample_16k == 0
+        duplicate = await detector.anchor_provider_speaker_evidence(
+            lease,
+            audio_start_sample_16k=0,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+        assert duplicate.status is ProviderSpeakerEvidenceAnchorStatus.IDEMPOTENT
+        assert duplicate.observed_through_sample_16k == 0
+
+        final_capture = None
+        for sequence_no in range(1, 13):
+            update = await detector.observe_provider_audio_ordered(
+                _speaker_pcm(1_000),
+                sample_rate_hz=16_000,
+                identity=identity,
+                sequence_no=sequence_no,
+                split_before_audio=False,
+                speaker_evidence_lease=lease,
+            )
+            assert update is not None
+            final_capture = update.capture
+            await shadow.wait_idle()
+
+        state = detector._provider_speaker_evidence_state
+        assert state is not None
+        assert len(state.coverage_candidates) == 4
+        assert state.completed_window_sample_count == 48_000
+        assert final_capture is not None
+        assert final_capture.decision_state is SpeakerShadowCaptureDecisionState.PENDING
+
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 192_000),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+        committed = detector.commit_provider_exact_speaker_interval(reservation)
+        assert committed is not None
+        assert committed.snapshot.boundary_exact is True
+        assert committed.snapshot.evidence_complete is True
+        await shadow.wait_idle()
+        assert shadow.snapshot()["retained_pcm_bytes"] == 0
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_at_primary_completion_stages_successor_pcm() -> None:
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        await _anchor_provider_evidence(detector, lease)
+        for sequence_no in range(1, 4):
+            update = await detector.observe_provider_audio_ordered(
+                _speaker_pcm(1_000),
+                sample_rate_hz=16_000,
+                identity=identity,
+                sequence_no=sequence_no,
+                split_before_audio=False,
+                speaker_evidence_lease=lease,
+            )
+            assert update is not None
+            await shadow.wait_idle()
+
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 48_000),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+        next_pcm = await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=4,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+        assert next_pcm is not None
+        assert next_pcm.capture.accepted_sample_count == 1_600
+
+        committed = detector.commit_provider_exact_speaker_interval(reservation)
+        assert committed is not None
+        assert committed.successor_evidence_lease is not None
+        assert (
+            committed.successor_evidence_lease.candidate
+            == reservation.suffix_candidate
+        )
+        await shadow.wait_idle()
+        suffix = reservation.suffix_candidate
+        assert suffix is not None
+        assert shadow._buffers[suffix].sample_count == 1_600
+    finally:
+        await detector.close()
+
+
+async def test_provider_exact_primary_abort_fences_unrecoverable_successor_pcm() -> (
+    None
+):
+    shadow = SpeakerShadowRuntime(
+        backend_factory=_LowScoreSpeakerBackendFactory(),
+        config=_provider_speaker_config(),
+    )
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert lease is not None
+        await _anchor_provider_evidence(detector, lease)
+        for sequence_no in range(1, 4):
+            assert await detector.observe_provider_audio_ordered(
+                _speaker_pcm(1_000),
+                sample_rate_hz=16_000,
+                identity=identity,
+                sequence_no=sequence_no,
+                split_before_audio=False,
+                speaker_evidence_lease=lease,
+            )
+            await shadow.wait_idle()
+
+        reservation = await detector.prepare_provider_exact_speaker_interval(
+            ProviderAudioRange(0, 48_000),
+            speaker_evidence_lease=lease,
+        )
+        assert reservation is not None
+        assert await detector.observe_provider_audio_ordered(
+            _speaker_pcm(100),
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=4,
+            split_before_audio=True,
+            speaker_evidence_lease=lease,
+        )
+
+        assert not detector.abort_provider_exact_speaker_interval(reservation)
+        assert detector._provider_speaker_evidence_state is None
+        assert not await detector.finish_provider_speaker_evidence_lease(lease)
+        assert reservation.suffix_candidate not in shadow._candidate_tokens
     finally:
         await detector.close()
 

@@ -1792,6 +1792,105 @@ async def test_exact_promotion_abort_after_activated_fact_is_conflict() -> None:
     assert aborted.outcome is ExactIntervalOutcome.CONFLICT
 
 
+async def test_exact_unavailable_compensation_detaches_hold_and_forwards_final() -> None:
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease, turn, key = _lease(), _turn(1), _key(1)
+    target, successor = _candidate(1), _candidate(2)
+    await coordinator.open_speaker_lease(lease, target)
+    await coordinator.attach_turn_to_speaker_lease(turn, lease, key)
+    parent = await coordinator.get_speaker_lease(lease)
+    child = await coordinator.get_record(turn)
+    assert parent is not None and child is not None
+    promoted = await coordinator.promote_exact_interval_tail_child(
+        _exact_scope(
+            parent,
+            child,
+            turn_token=turn,
+            provider_key=key,
+            target=target,
+            successor=successor,
+        )
+    )
+    assert promoted.receipt is not None
+    activated = await coordinator.activate_exact_interval(promoted.receipt)
+    assert activated.receipt is not None
+    first_low = await coordinator.post_exact_interval(
+        activated.receipt,
+        SpeakerLeaseLow(target, 1, SpeakerCheckpointKind.FIRST),
+    )
+    assert first_low.outcome is ExactIntervalOutcome.HELD
+
+    unavailable = await coordinator.fail_exact_interval_unavailable(
+        activated.receipt
+    )
+    replay = await coordinator.fail_exact_interval_unavailable(activated.receipt)
+
+    assert unavailable.outcome is ExactIntervalOutcome.ABORTED
+    assert replay.outcome is ExactIntervalOutcome.STALE
+    compensated = await coordinator.get_record(turn)
+    assert compensated is not None
+    assert compensated.exact_interval_hold_id is None
+    assert compensated.capture_state is CaptureState.UNAVAILABLE
+    assert compensated.evidence_state is EvidenceState.UNAVAILABLE
+    parent_after = await coordinator.get_speaker_lease(lease)
+    assert parent_after is not None
+    assert parent_after.candidate == successor
+    assert parent_after.state is SpeakerLeaseState.COLLECTING
+
+    effects = await coordinator.post(
+        turn,
+        ProviderFinalReceived(_final(key, "kept")),
+        now=10.0,
+    )
+    assert any(isinstance(effect, ResolveReserved) for effect in effects)
+    resolved = await coordinator.get_record(turn)
+    assert resolved is not None
+    assert resolved.admission_state is AdmissionState.FORWARDED
+
+
+async def test_exact_unavailable_compensation_never_rewrites_formal_deny() -> None:
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease, turn, key = _lease(), _turn(1), _key(1)
+    target = _candidate(1)
+    await coordinator.open_speaker_lease(lease, target)
+    await coordinator.attach_turn_to_speaker_lease(turn, lease, key)
+    parent = await coordinator.get_speaker_lease(lease)
+    child = await coordinator.get_record(turn)
+    assert parent is not None and child is not None
+    promoted = await coordinator.promote_exact_interval_tail_child(
+        _exact_scope(
+            parent,
+            child,
+            turn_token=turn,
+            provider_key=key,
+            target=target,
+            successor=None,
+        )
+    )
+    assert promoted.receipt is not None
+    activated = await coordinator.activate_exact_interval(promoted.receipt)
+    assert activated.receipt is not None
+    await coordinator.post_exact_interval(
+        activated.receipt,
+        SpeakerLeaseLow(target, 1, SpeakerCheckpointKind.FIRST),
+    )
+    denied = await coordinator.post_exact_interval(
+        activated.receipt,
+        SpeakerLeaseLow(target, 2, SpeakerCheckpointKind.SECOND),
+    )
+    assert denied.outcome is ExactIntervalOutcome.HELD
+
+    unavailable = await coordinator.fail_exact_interval_unavailable(
+        activated.receipt
+    )
+
+    assert unavailable.outcome is ExactIntervalOutcome.CONFLICT
+    held = await coordinator.get_record(turn)
+    assert held is not None
+    assert held.exact_interval_hold_id == activated.receipt.interval_id
+    assert held.evidence_state is EvidenceState.DENY_LATCHED
+
+
 async def test_exact_promotion_requires_matching_boundary_proof_key() -> None:
     coordinator = VoiceTurnAdmissionCoordinator()
     lease, turn, key = _lease(), _turn(1), _key(1)

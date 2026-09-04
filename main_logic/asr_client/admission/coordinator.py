@@ -790,6 +790,91 @@ class VoiceTurnAdmissionCoordinator:
             self._exact_interval_records.pop(receipt._token, None)
             return ExactIntervalAbortResult(ExactIntervalOutcome.ABORTED)
 
+    async def fail_exact_interval_unavailable(
+        self,
+        receipt: ExactIntervalPromotionReceipt | ExactIntervalActivationReceipt,
+    ) -> ExactIntervalAbortResult:
+        """CAS one unpublished exact hold into a fail-open ordinary child.
+
+        This is deliberately different from promotion rollback.  Once exact
+        ownership or Detector commit is uncertain, restoring the provisional
+        parent would make its pre-anchor facts authoritative again.  Instead,
+        retain the already-promoted parent/successor topology, retire the exact
+        evidence token, and mark only the bound text child unavailable.
+
+        A DROP fact is sticky: once exact evidence reaches a deny terminal,
+        this compensation refuses to rewrite the record. Non-terminal exact
+        facts may still degrade to unavailable when later proof is missing.
+        """
+
+        if not isinstance(
+            receipt,
+            (ExactIntervalPromotionReceipt, ExactIntervalActivationReceipt),
+        ):
+            raise TypeError(
+                "receipt must be ExactIntervalPromotionReceipt or "
+                "ExactIntervalActivationReceipt"
+            )
+        async with self._lock:
+            if receipt._owner is not self._exact_interval_owner:
+                return ExactIntervalAbortResult(ExactIntervalOutcome.CONFLICT)
+            exact = self._exact_interval_records.get(receipt._token)
+            if exact is None:
+                return ExactIntervalAbortResult(ExactIntervalOutcome.STALE)
+            if isinstance(receipt, ExactIntervalPromotionReceipt):
+                receipt_matches = exact.promotion_receipt is receipt
+            else:
+                receipt_matches = exact.activation_receipt is receipt
+            if not receipt_matches:
+                return ExactIntervalAbortResult(ExactIntervalOutcome.STALE)
+
+            evidence = exact.evidence
+            if (
+                evidence.terminal_disposition is AdmissionDisposition.DROP
+                or evidence.state
+                in {
+                    SpeakerLeaseState.DENY_LATCHED,
+                    SpeakerLeaseState.MIXED_DENY_LATCHED,
+                }
+            ):
+                return ExactIntervalAbortResult(ExactIntervalOutcome.CONFLICT)
+
+            scope = exact.promotion_receipt.scope
+            child = self._records.get(scope.turn_token)
+            if (
+                child is None
+                or child.record_generation != scope.child_record_generation
+                or child.logical_revision != exact.child_logical_revision
+                or child.exact_interval_hold_id
+                != exact.promotion_receipt.interval_id
+                or child.terminal_disposition is not None
+            ):
+                return ExactIntervalAbortResult(ExactIntervalOutcome.STALE)
+
+            self._records[scope.turn_token] = replace(
+                child,
+                logical_revision=child.logical_revision + 1,
+                speaker_candidate=scope.target_candidate,
+                capture_state=CaptureState.UNAVAILABLE,
+                evidence_state=EvidenceState.UNAVAILABLE,
+                last_speaker_sequence_no=0,
+                capture_through_sequence_no=None,
+                partial_settlement_disposition=AdmissionDisposition.FORWARD,
+                exact_interval_hold_id=None,
+            )
+            if (
+                self._exact_interval_candidate_bindings.get(
+                    scope.target_candidate
+                )
+                is receipt._token
+            ):
+                self._exact_interval_candidate_bindings.pop(
+                    scope.target_candidate,
+                    None,
+                )
+            self._exact_interval_records.pop(receipt._token, None)
+            return ExactIntervalAbortResult(ExactIntervalOutcome.ABORTED)
+
     @staticmethod
     def _exact_interval_evidence_projection(
         state: SpeakerLeaseState,

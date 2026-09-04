@@ -474,6 +474,7 @@ async def test_qwen_server_vad_emits_exact_canonical_boundary(monkeypatch) -> No
         }
     )
     started = await _next_event(responses, "utterance_started")
+    assert started.audio_start_sample_16k == 320
     await websocket.server_send(
         {
             "type": "input_audio_buffer.speech_stopped",
@@ -592,6 +593,7 @@ async def test_qwen_conflicting_late_speech_start_revokes_exact_authority(
         }
     )
     started = await _next_event(responses, "utterance_started")
+    assert started.audio_start_sample_16k == 0
     await websocket.server_send(
         {
             "type": "input_audio_buffer.speech_stopped",
@@ -609,7 +611,8 @@ async def test_qwen_conflicting_late_speech_start_revokes_exact_authority(
             "audio_start_ms": 20,
         }
     )
-    invalidated = await _next_event(responses, "provider_endpoint")
+    invalidated = await _next_event(responses)
+    assert invalidated.kind == "provider_endpoint"
     assert invalidated.utterance_id == started.utterance_id
     assert invalidated.boundary_quality == "unknown"
     assert invalidated.audio_range is None

@@ -37,6 +37,7 @@ from main_logic.asr_client.runtime import (
 from main_logic.asr_client._provider_events import (
     ProviderAudioRange,
     ProviderEndpointNotification,
+    ProviderUtteranceStartedNotification,
     ProviderUtteranceKey,
 )
 from main_logic.asr_client.endpointing.detector_runtime import DetectorFeedResult, DetectorRuntime
@@ -283,7 +284,7 @@ async def test_external_voice_suppression_resets_native_audio_turn() -> None:
     runtime._abort_independent_asr.assert_not_awaited()
 
 
-async def test_native_route_installs_future_verifier_but_reports_unsupported() -> None:
+async def test_native_route_rejects_verifier_before_installation() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
     runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=True)
@@ -295,7 +296,51 @@ async def test_native_route_installs_future_verifier_but_reports_unsupported() -
     )
 
     assert result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+    assert runtime._speaker_shadow_factory is None
+    runtime._asr_runtime.set_speaker_verifier_factory.assert_not_awaited()
+    factory.close.assert_called_once_with()
+
+
+async def test_provider_route_without_exact_interval_rejects_verifier() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "openai")
+    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=True)
+    factory = MagicMock()
+    assert runtime._asr_runtime._speaker_verifier_diagnostics()[
+        "unsupported_asr_route_count"
+    ] == 0
+
+    result = await runtime.set_speaker_verifier_factory(
+        factory,
+        activation_generation="profile-generation",
+    )
+
+    assert result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+    assert runtime._speaker_shadow_factory is None
+    runtime._asr_runtime.set_speaker_verifier_factory.assert_not_awaited()
+    factory.close.assert_called_once_with()
+    assert runtime._asr_runtime._speaker_verifier_diagnostics()[
+        "unsupported_asr_route_count"
+    ] == 1
+
+
+async def test_smart_turn_route_retains_verifier_support() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "qwen")
+    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=True)
+    factory = MagicMock()
+
+    result = await runtime.set_speaker_verifier_factory(
+        factory,
+        activation_generation="profile-generation",
+    )
+
+    assert result is VoiceIdentityActivationResult.READY
     assert runtime._speaker_shadow_factory is factory
+    runtime._asr_runtime.set_speaker_verifier_factory.assert_awaited_once_with(
+        factory,
+        activation_generation="profile-generation",
+    )
 
 
 async def test_core_forgets_future_verifier_when_physical_detach_degrades() -> None:
@@ -11112,7 +11157,7 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     profile.close()
 
 
-async def test_provider_candidate_is_bound_before_speaker_observation(
+async def test_provider_candidate_is_bound_only_after_canonical_start(
     monkeypatch,
 ) -> None:
     import main_logic.asr_client.runtime as runtime_module
@@ -11133,7 +11178,7 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
 
     class _Gate:
         def feed(self, _pcm16: bytes):
-            return ()
+            return (SpeechActivityEvent.SPEECH_STARTED,)
 
         def reset(self) -> None:
             return None
@@ -11168,9 +11213,52 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
         enabled = True
         enforces_admission = True
         activation_generation = "speaker-observation-order"
+        generation = 0
 
         def __init__(self) -> None:
             self.candidate = None
+            self.deferred_candidate = None
+            self.anchored = False
+
+        def defer_candidate(self, candidate) -> bool:
+            self.deferred_candidate = candidate
+            return True
+
+        def activate_candidate(self, candidate) -> bool:
+            return candidate == self.deferred_candidate
+
+        def anchor_deferred_candidate(self, request):
+            if request.candidate != self.deferred_candidate:
+                return None
+            return SimpleNamespace(
+                runtime_generation=self.generation,
+                operation_id=1,
+                candidate=request.candidate,
+                anchor_revision=request.anchor_revision,
+                observed_sample_count=request.expected_observed_sample_count,
+                discarded_sample_count=request.discard_prefix_sample_count,
+                retained_sample_count=(
+                    request.expected_observed_sample_count
+                    - request.discard_prefix_sample_count
+                ),
+                _owner=self,
+            )
+
+        def deferred_anchor_status(self, _receipt):
+            return "applied" if self.anchored else "pending"
+
+        async def wait_deferred_anchor_settled(self, receipt, *, deadline):
+            del deadline
+            self.anchored = True
+            self.candidate = receipt.candidate
+            call_order.append(
+                (
+                    "observe",
+                    receipt.candidate.detector_epoch,
+                    receipt.candidate.shadow_generation,
+                )
+            )
+            return "applied"
 
         def submit(
             self,
@@ -11180,6 +11268,12 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
             candidate,
         ) -> bool:
             assert sample_rate_hz == 16_000
+            if not self.anchored:
+                assert candidate == self.deferred_candidate
+                # Deferred PCM was retained successfully, but it must not be
+                # treated as scored/observable until canonical started rebases
+                # the candidate.
+                return True
             call_order.append(
                 (
                     "observe",
@@ -11257,10 +11351,12 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
         lease_generation=7,
         route_generation=11,
     )
-    original_open_speaker_lease = runtime._asr_admission_ingress.open_speaker_lease
+    original_open_speaker_lease_nowait = (
+        runtime._asr_admission_ingress.open_speaker_lease_nowait
+    )
 
-    async def traced_open_speaker_lease(lease_token, candidate):
-        record = await original_open_speaker_lease(lease_token, candidate)
+    def traced_open_speaker_lease_nowait(lease_token, candidate):
+        future = original_open_speaker_lease_nowait(lease_token, candidate)
         call_order.append(
             (
                 "lease",
@@ -11268,26 +11364,54 @@ async def test_provider_candidate_is_bound_before_speaker_observation(
                 candidate.shadow_generation,
             )
         )
-        return record
+        return future
 
-    runtime._asr_admission_ingress.open_speaker_lease = traced_open_speaker_lease
+    runtime._asr_admission_ingress.open_speaker_lease_nowait = (
+        traced_open_speaker_lease_nowait
+    )
 
     submit_result = await runtime.submit(
         ProcessedVoiceFrame(
             pcm16,
             16_000,
-            0.0,
-            False,
+            0.9,
+            True,
         ),
         ingress_token=ingress_token,
     )
     await runtime._asr_audio_dispatcher.wait_idle()
     speaker_shadow = detector_ref._speaker_shadow
     assert isinstance(speaker_shadow, _SpeakerShadow)
-    assert speaker_shadow.candidate is not None
+    assert speaker_shadow.candidate is None
+    assert call_order == []
+    assert runtime._asr_current_speaker_lease is None
+    assert provider_session.wire_pcm == [pcm16], (
+        submit_result,
+        runtime._asr_lifecycle.snapshot,
+        runtime._asr_audio_dispatcher.active_turn,
+        runtime._asr_current_speaker_candidate,
+        runtime._asr_provider_speaker_ledgers,
+    )
+
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=1,
+            audio_start_sample_16k=0,
+        ),
+        runtime._asr_session_epoch,
+    )
+    assert speaker_shadow.candidate is not None, (
+        speaker_shadow.deferred_candidate,
+        speaker_shadow.anchored,
+        runtime._asr_provider_speaker_ledgers,
+        runtime._asr_provider_speaker_key_ledgers,
+        runtime._speaker_verifier_diagnostics(),
+    )
 
     assert submit_result.status is AsrSubmitStatus.ACCEPTED
-    assert call_order[:2] == [("lease", 0, 0), ("observe", 0, 0)]
+    assert call_order[:2] == [("observe", 0, 0), ("lease", 0, 0)]
     lease_token = runtime._asr_current_speaker_lease
     assert lease_token is not None
     lease_record = await runtime._asr_admission.get_speaker_lease(lease_token)

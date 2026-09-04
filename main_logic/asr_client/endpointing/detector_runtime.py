@@ -8,7 +8,7 @@ import math
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, TypeAlias
 
@@ -67,12 +67,16 @@ from ..speaker_shadow.contracts import (
     SpeakerShadowCaptureStatus,
     SpeakerShadowCandidateKey,
     SpeakerShadowDecisionStatus,
+    SpeakerShadowDeferredAnchorControl,
+    SpeakerShadowDeferredAnchorReceipt,
+    SpeakerShadowDeferredAnchorRequest,
     SpeakerShadowDeferredCandidateControl,
     SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowExactIntervalControl,
     SpeakerShadowObserver,
     SpeakerShadowReconcileSource,
     SpeakerShadowReconciliationSettlement,
+    SpeakerShadowPreparedTerminalCoverageControl,
     SpeakerShadowScope,
     SpeakerShadowTerminalCoverageControl,
     SpeakerShadowTerminalCoverageReceipt,
@@ -1490,6 +1494,32 @@ class ProviderSpeakerEvidenceLease:
     _owner: object
 
 
+class ProviderSpeakerEvidenceAnchorStatus(Enum):
+    """Settlement of one canonical Provider speech-start anchor."""
+
+    PENDING = "pending"
+    APPLIED = "applied"
+    IDEMPOTENT = "idempotent"
+    UNAVAILABLE = "unavailable"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSpeakerEvidenceAnchorResult:
+    status: ProviderSpeakerEvidenceAnchorStatus
+    lease: ProviderSpeakerEvidenceLease
+    candidate: SpeakerShadowCandidateKey
+    detector_epoch: int
+    timeline_generation: int
+    lease_generation: int
+    anchor_revision: int
+    anchor_start_sample_16k: int
+    buffer_origin_sample_16k: int
+    observed_through_sample_16k: int
+    pcm_through_sequence_no: int | None
+    shadow_runtime_generation: int
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderExactSpeakerIntervalReservation:
     """Opaque, one-shot Detector reservation for one exact Provider range."""
@@ -1502,6 +1532,9 @@ class ProviderExactSpeakerIntervalReservation:
     lease_generation: int
     candidate_generation: int
     shadow_runtime_generation: int
+    anchor_revision: int
+    anchor_start_sample_16k: int
+    provider_pcm_through_sequence_no: int
     _owner: object
     _token: object
 
@@ -1657,21 +1690,40 @@ class _ProviderSpeakerEvidenceState:
     lease: ProviderSpeakerEvidenceLease
     timeline_generation: int
     start_sample_16k: int
+    buffer_origin_sample_16k: int
     last_sequence_no: int | None = None
     last_progress_at: float | None = None
     cumulative_sample_count: int = 0
     completed_window_sample_count: int = 0
     capture_state: _ProviderShadowCaptureState = _ProviderShadowCaptureState.COLLECTING
     binding_published: bool = False
+    anchor_revision: int = 0
+    anchor_start_sample_16k: int | None = None
+    pending_anchor_start_sample_16k: int | None = None
+    anchor_observed_through_sample_16k: int | None = None
+    anchor_pcm_through_sequence_no: int | None = None
+    anchor_receipt: SpeakerShadowDeferredAnchorReceipt | None = None
+    coverage_candidates: list["_ProviderSpeakerCoverageCandidate"] = field(
+        default_factory=list
+    )
+    active_candidate: SpeakerShadowCandidateKey | None = None
+
+
+@dataclass(slots=True)
+class _ProviderSpeakerCoverageCandidate:
+    candidate: SpeakerShadowCandidateKey
+    start_sample_16k: int
+    end_sample_16k: int
 
 
 @dataclass(slots=True)
 class _ProviderExactSpeakerIntervalRecord:
     reservation: ProviderExactSpeakerIntervalReservation
     state: _ProviderSpeakerEvidenceState
-    shadow_control: SpeakerShadowExactIntervalControl
-    shadow_receipt: SpeakerShadowBatchReconcileReceipt
+    shadow_control: SpeakerShadowExactIntervalControl | SpeakerShadowPreparedTerminalCoverageControl
+    shadow_receipt: SpeakerShadowBatchReconcileReceipt | SpeakerShadowTerminalCoverageReceipt
     segment_fingerprint: tuple[tuple[int, ...], ...]
+    coverage_fingerprint: tuple[tuple[object, int, int], ...]
     prepared_cursor_16k: int
     next_shadow_generation: int
 
@@ -2418,10 +2470,17 @@ class DetectorRuntime:
         shadow = self._speaker_shadow
         retired = False
         if isinstance(shadow, SpeakerShadowCandidateLifecycleControl):
-            try:
-                retired = bool(shadow.abandon_candidate(state.lease.candidate))
-            except Exception:
-                retired = False
+            for coverage in state.coverage_candidates or (
+                _ProviderSpeakerCoverageCandidate(
+                    state.lease.candidate,
+                    state.start_sample_16k,
+                    state.start_sample_16k,
+                ),
+            ):
+                try:
+                    retired = bool(shadow.abandon_candidate(coverage.candidate)) or retired
+                except Exception:
+                    continue
         self._speaker_rejection_prepare_diagnostics[
             "provider_speaker_evidence_lease_abandoned_count"
         ] += 1
@@ -2446,6 +2505,19 @@ class DetectorRuntime:
             candidate = self._allocate_provider_segment_candidate()
             if candidate is None:
                 return None
+            shadow = self._speaker_shadow
+            control = (
+                shadow
+                if isinstance(shadow, SpeakerShadowDeferredCandidateControl)
+                else None
+            )
+            try:
+                deferred = bool(control is not None and control.defer_candidate(candidate))
+            except Exception:
+                deferred = False
+            if not deferred:
+                self._speaker_candidate_owner_generations.pop(candidate, None)
+                return None
             lease = ProviderSpeakerEvidenceLease(
                 detector_epoch=self._detector_epoch,
                 lease_generation=self._provider_speaker_evidence_generation,
@@ -2453,15 +2525,270 @@ class DetectorRuntime:
                 _owner=self._provider_speaker_evidence_owner,
             )
             self._provider_speaker_evidence_generation += 1
-            self._provider_speaker_evidence_state = _ProviderSpeakerEvidenceState(
+            state = _ProviderSpeakerEvidenceState(
                 lease=lease,
                 timeline_generation=self._provider_audio_timeline_generation,
                 start_sample_16k=self._provider_audio_sample_cursor_16k,
+                buffer_origin_sample_16k=self._provider_audio_sample_cursor_16k,
+                active_candidate=candidate,
             )
+            state.coverage_candidates.append(
+                _ProviderSpeakerCoverageCandidate(
+                    candidate=candidate,
+                    start_sample_16k=self._provider_audio_sample_cursor_16k,
+                    end_sample_16k=self._provider_audio_sample_cursor_16k,
+                )
+            )
+            self._provider_speaker_evidence_state = state
             self._speaker_rejection_prepare_diagnostics[
                 "provider_speaker_evidence_lease_opened_count"
             ] += 1
             return lease
+
+    @staticmethod
+    def _provider_speaker_anchor_result(
+        state: _ProviderSpeakerEvidenceState,
+        *,
+        status: ProviderSpeakerEvidenceAnchorStatus,
+        anchor_start_sample_16k: int,
+        observed_through_sample_16k: int,
+        pcm_through_sequence_no: int | None,
+        shadow_runtime_generation: int,
+    ) -> ProviderSpeakerEvidenceAnchorResult:
+        return ProviderSpeakerEvidenceAnchorResult(
+            status=status,
+            lease=state.lease,
+            candidate=state.lease.candidate,
+            detector_epoch=state.lease.detector_epoch,
+            timeline_generation=state.timeline_generation,
+            lease_generation=state.lease.lease_generation,
+            anchor_revision=state.anchor_revision,
+            anchor_start_sample_16k=anchor_start_sample_16k,
+            buffer_origin_sample_16k=state.buffer_origin_sample_16k,
+            observed_through_sample_16k=observed_through_sample_16k,
+            pcm_through_sequence_no=pcm_through_sequence_no,
+            shadow_runtime_generation=shadow_runtime_generation,
+        )
+
+    async def anchor_provider_speaker_evidence(
+        self,
+        lease: ProviderSpeakerEvidenceLease,
+        *,
+        audio_start_sample_16k: int,
+        deadline: float,
+    ) -> ProviderSpeakerEvidenceAnchorResult:
+        """Align one deferred evidence lease before any checkpoint may score."""
+
+        receipt: SpeakerShadowDeferredAnchorReceipt | None = None
+        control: SpeakerShadowDeferredAnchorControl | None = None
+        prepared_state: _ProviderSpeakerEvidenceState | None = None
+        prepared_cursor = 0
+        prepared_sequence: int | None = None
+        if (
+            type(audio_start_sample_16k) is not int
+            or audio_start_sample_16k < 0
+            or type(deadline) not in {int, float}
+            or not math.isfinite(deadline)
+        ):
+            raise ValueError("provider speaker anchor arguments are invalid")
+
+        async with self._lock:
+            state = self._provider_speaker_evidence_state_for(lease)
+            shadow = self._speaker_shadow
+            control = (
+                shadow
+                if isinstance(shadow, SpeakerShadowDeferredAnchorControl)
+                else None
+            )
+            cursor = self._provider_audio_sample_cursor_16k
+            shadow_generation = getattr(shadow, "generation", -1)
+            if state is None:
+                return ProviderSpeakerEvidenceAnchorResult(
+                    status=ProviderSpeakerEvidenceAnchorStatus.UNAVAILABLE,
+                    lease=lease,
+                    candidate=lease.candidate,
+                    detector_epoch=lease.detector_epoch,
+                    timeline_generation=self._provider_audio_timeline_generation,
+                    lease_generation=lease.lease_generation,
+                    anchor_revision=0,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    buffer_origin_sample_16k=0,
+                    observed_through_sample_16k=cursor,
+                    pcm_through_sequence_no=self._provider_segment_last_sequence_no,
+                    shadow_runtime_generation=shadow_generation,
+                )
+            if state.anchor_start_sample_16k is not None:
+                status = (
+                    ProviderSpeakerEvidenceAnchorStatus.IDEMPOTENT
+                    if state.anchor_start_sample_16k == audio_start_sample_16k
+                    else ProviderSpeakerEvidenceAnchorStatus.CONFLICT
+                )
+                result = self._provider_speaker_anchor_result(
+                    state,
+                    status=status,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=(
+                        state.anchor_observed_through_sample_16k
+                        if state.anchor_observed_through_sample_16k is not None
+                        else cursor
+                    ),
+                    pcm_through_sequence_no=state.anchor_pcm_through_sequence_no,
+                    shadow_runtime_generation=shadow_generation,
+                )
+                if status is ProviderSpeakerEvidenceAnchorStatus.CONFLICT:
+                    self._abandon_provider_speaker_evidence_locked(state)
+                return result
+            if (
+                state.pending_anchor_start_sample_16k is not None
+                and state.pending_anchor_start_sample_16k != audio_start_sample_16k
+            ):
+                result = self._provider_speaker_anchor_result(
+                    state,
+                    status=ProviderSpeakerEvidenceAnchorStatus.CONFLICT,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=cursor,
+                    pcm_through_sequence_no=state.last_sequence_no,
+                    shadow_runtime_generation=shadow_generation,
+                )
+                self._abandon_provider_speaker_evidence_locked(state)
+                return result
+            if audio_start_sample_16k > cursor:
+                state.pending_anchor_start_sample_16k = audio_start_sample_16k
+                return self._provider_speaker_anchor_result(
+                    state,
+                    status=ProviderSpeakerEvidenceAnchorStatus.PENDING,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=cursor,
+                    pcm_through_sequence_no=state.last_sequence_no,
+                    shadow_runtime_generation=shadow_generation,
+                )
+            if control is None or audio_start_sample_16k < state.start_sample_16k:
+                result = self._provider_speaker_anchor_result(
+                    state,
+                    status=ProviderSpeakerEvidenceAnchorStatus.UNAVAILABLE,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=cursor,
+                    pcm_through_sequence_no=state.last_sequence_no,
+                    shadow_runtime_generation=shadow_generation,
+                )
+                self._abandon_provider_speaker_evidence_locked(state)
+                return result
+
+            if state.anchor_receipt is None:
+                state.anchor_revision += 1
+                try:
+                    receipt = control.anchor_deferred_candidate(
+                        SpeakerShadowDeferredAnchorRequest(
+                            candidate=state.lease.candidate,
+                            expected_observed_sample_count=(
+                                cursor - state.start_sample_16k
+                            ),
+                            discard_prefix_sample_count=(
+                                audio_start_sample_16k - state.start_sample_16k
+                            ),
+                            anchor_revision=state.anchor_revision,
+                        )
+                    )
+                except Exception:
+                    receipt = None
+                if receipt is None:
+                    result = self._provider_speaker_anchor_result(
+                        state,
+                        status=ProviderSpeakerEvidenceAnchorStatus.UNAVAILABLE,
+                        anchor_start_sample_16k=audio_start_sample_16k,
+                        observed_through_sample_16k=cursor,
+                        pcm_through_sequence_no=state.last_sequence_no,
+                        shadow_runtime_generation=shadow_generation,
+                    )
+                    self._abandon_provider_speaker_evidence_locked(state)
+                    return result
+                state.anchor_receipt = receipt
+                state.pending_anchor_start_sample_16k = audio_start_sample_16k
+                state.anchor_observed_through_sample_16k = cursor
+                state.anchor_pcm_through_sequence_no = state.last_sequence_no
+            else:
+                receipt = state.anchor_receipt
+            prepared_state = state
+            prepared_cursor = (
+                state.anchor_observed_through_sample_16k
+                if state.anchor_observed_through_sample_16k is not None
+                else cursor
+            )
+            prepared_sequence = state.anchor_pcm_through_sequence_no
+
+        assert prepared_state is not None and control is not None and receipt is not None
+        try:
+            status = await control.wait_deferred_anchor_settled(
+                receipt,
+                deadline=float(deadline),
+            )
+        except Exception:
+            status = "failed"
+
+        async with self._lock:
+            state = self._provider_speaker_evidence_state_for(lease)
+            if (
+                state is not prepared_state
+                or state.timeline_generation != self._provider_audio_timeline_generation
+                or state.anchor_receipt is not receipt
+                or state.pending_anchor_start_sample_16k != audio_start_sample_16k
+            ):
+                return self._provider_speaker_anchor_result(
+                    prepared_state,
+                    status=ProviderSpeakerEvidenceAnchorStatus.UNAVAILABLE,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=prepared_cursor,
+                    pcm_through_sequence_no=prepared_sequence,
+                    shadow_runtime_generation=receipt.runtime_generation,
+                )
+            if status == "pending":
+                return self._provider_speaker_anchor_result(
+                    state,
+                    status=ProviderSpeakerEvidenceAnchorStatus.PENDING,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=prepared_cursor,
+                    pcm_through_sequence_no=prepared_sequence,
+                    shadow_runtime_generation=receipt.runtime_generation,
+                )
+            if status != "applied":
+                result = self._provider_speaker_anchor_result(
+                    state,
+                    status=ProviderSpeakerEvidenceAnchorStatus.UNAVAILABLE,
+                    anchor_start_sample_16k=audio_start_sample_16k,
+                    observed_through_sample_16k=prepared_cursor,
+                    pcm_through_sequence_no=prepared_sequence,
+                    shadow_runtime_generation=receipt.runtime_generation,
+                )
+                self._abandon_provider_speaker_evidence_locked(state)
+                return result
+
+            state.anchor_start_sample_16k = audio_start_sample_16k
+            state.pending_anchor_start_sample_16k = None
+            state.start_sample_16k = audio_start_sample_16k
+            state.cumulative_sample_count = (
+                self._provider_audio_sample_cursor_16k - audio_start_sample_16k
+            )
+            if state.coverage_candidates:
+                primary = state.coverage_candidates[0]
+                primary.start_sample_16k = audio_start_sample_16k
+                primary.end_sample_16k = self._provider_audio_sample_cursor_16k
+            while self._provider_speaker_segments and (
+                self._provider_speaker_segments[0].end_sample_16k
+                <= audio_start_sample_16k
+            ):
+                self._provider_speaker_segments.popleft()
+            if self._provider_speaker_segments:
+                self._provider_speaker_segments[0].start_sample_16k = (
+                    audio_start_sample_16k
+                )
+            return self._provider_speaker_anchor_result(
+                state,
+                status=ProviderSpeakerEvidenceAnchorStatus.APPLIED,
+                anchor_start_sample_16k=audio_start_sample_16k,
+                observed_through_sample_16k=prepared_cursor,
+                pcm_through_sequence_no=prepared_sequence,
+                shadow_runtime_generation=receipt.runtime_generation,
+            )
 
     async def finish_provider_speaker_evidence_lease(
         self,
@@ -2487,6 +2814,12 @@ class DetectorRuntime:
             if not accepted:
                 self._abandon_provider_speaker_evidence_locked(state)
                 return False
+            if isinstance(shadow, SpeakerShadowCandidateLifecycleControl):
+                for coverage in state.coverage_candidates[1:]:
+                    try:
+                        shadow.abandon_candidate(coverage.candidate)
+                    except Exception:
+                        pass
             self._provider_speaker_evidence_state = None
             self._speaker_rejection_prepare_diagnostics[
                 "provider_speaker_evidence_lease_finished_count"
@@ -2536,11 +2869,20 @@ class DetectorRuntime:
             return False
         self._provider_exact_interval_records.pop(token, None)
         try:
-            aborted = bool(
-                record.shadow_control.abort_exact_interval(record.shadow_receipt)
-            )
+            if type(record.shadow_receipt) is SpeakerShadowTerminalCoverageReceipt:
+                aborted = bool(
+                    record.shadow_control.abort_finalized_candidate_coverage(
+                        record.shadow_receipt
+                    )
+                )
+            else:
+                aborted = bool(
+                    record.shadow_control.abort_exact_interval(record.shadow_receipt)
+                )
         except Exception:
             aborted = False
+        if not aborted:
+            self._abandon_provider_speaker_evidence_locked(record.state)
         state_candidate = record.state.lease.candidate
         for candidate in (
             record.reservation.target_candidate,
@@ -2586,6 +2928,23 @@ class DetectorRuntime:
                 )
             ):
                 return False
+        current_coverage = record.state.coverage_candidates
+        if len(current_coverage) != len(record.coverage_fingerprint):
+            return False
+        for index, (candidate, start_sample, end_sample) in enumerate(
+            record.coverage_fingerprint
+        ):
+            current = current_coverage[index]
+            if current.candidate != candidate or current.start_sample_16k != start_sample:
+                return False
+            if (
+                index < len(record.coverage_fingerprint) - 1
+                and current.end_sample_16k != end_sample
+            ) or (
+                index == len(record.coverage_fingerprint) - 1
+                and current.end_sample_16k < end_sample
+            ):
+                return False
         return bool(
             segments[0].start_sample_16k == record.state.start_sample_16k
             and segments[-1].end_sample_16k
@@ -2622,24 +2981,32 @@ class DetectorRuntime:
                 speaker_evidence_lease
             )
             shadow = self._speaker_shadow
-            control = (
+            live_control = (
                 shadow
                 if isinstance(shadow, SpeakerShadowExactIntervalControl)
+                else None
+            )
+            terminal_control = (
+                shadow
+                if isinstance(shadow, SpeakerShadowPreparedTerminalCoverageControl)
                 else None
             )
             segments = tuple(self._provider_speaker_segments)
             cursor = self._provider_audio_sample_cursor_16k
             if (
                 state is None
-                or control is None
+                or (live_control is None and terminal_control is None)
                 or state.capture_state is _ProviderShadowCaptureState.UNAVAILABLE
+                or state.anchor_start_sample_16k is None
+                or state.pending_anchor_start_sample_16k is not None
+                or state.anchor_revision <= 0
                 or state.timeline_generation
                 != self._provider_audio_timeline_generation
                 or not self._provider_segment_ordered_mode
                 or self._provider_segment_alignment_lost
                 or not segments
                 or state.start_sample_16k < 0
-                or boundary.start_sample_16k < state.start_sample_16k
+                or boundary.start_sample_16k != state.anchor_start_sample_16k
                 or boundary.end_sample_16k > cursor
                 or state.cumulative_sample_count
                 != cursor - state.start_sample_16k
@@ -2650,6 +3017,10 @@ class DetectorRuntime:
             if (
                 segments[0].start_sample_16k != state.start_sample_16k
                 or segments[-1].end_sample_16k != cursor
+                or not state.coverage_candidates
+                or state.coverage_candidates[0].candidate != state.lease.candidate
+                or state.coverage_candidates[0].start_sample_16k
+                != state.start_sample_16k
             ):
                 return None
             for index, segment in enumerate(segments):
@@ -2665,6 +3036,16 @@ class DetectorRuntime:
                     )
                 ):
                     return None
+            for index, coverage in enumerate(state.coverage_candidates):
+                if (
+                    coverage.end_sample_16k <= coverage.start_sample_16k
+                    or (
+                        index > 0
+                        and state.coverage_candidates[index - 1].end_sample_16k
+                        != coverage.start_sample_16k
+                    )
+                ):
+                    return None
 
             expected_generation = self._candidate_generation
             while expected_generation in self._provider_preseal_entries:
@@ -2674,11 +3055,6 @@ class DetectorRuntime:
             source_candidate = state.lease.candidate
             target_candidate = source_candidate
             allocated: list[SpeakerShadowCandidateKey] = []
-            if boundary.start_sample_16k != state.start_sample_16k:
-                target_candidate = self._allocate_provider_segment_candidate()
-                if target_candidate is None:
-                    return None
-                allocated.append(target_candidate)
             # Always reserve a successor. Provider PCM may arrive while the
             # upper Admission transaction is between prepare and commit; the
             # shadow reservation stages that post-boundary PCM without
@@ -2689,41 +3065,109 @@ class DetectorRuntime:
                     self._speaker_candidate_owner_generations.pop(candidate, None)
                 return None
             allocated.append(suffix_candidate)
-            request = SpeakerShadowBatchReconcileRequest(
-                sources=(
+            reconcile_sources: list[SpeakerShadowReconcileSource] = []
+            for coverage in state.coverage_candidates:
+                if coverage.start_sample_16k >= boundary.end_sample_16k:
+                    break
+                keep_end = min(
+                    coverage.end_sample_16k,
+                    boundary.end_sample_16k,
+                ) - coverage.start_sample_16k
+                reconcile_sources.append(
                     SpeakerShadowReconcileSource(
-                        candidate=source_candidate,
-                        expected_sample_count=state.cumulative_sample_count,
-                        keep_start_sample=(
-                            boundary.start_sample_16k - state.start_sample_16k
+                        candidate=coverage.candidate,
+                        expected_sample_count=(
+                            coverage.end_sample_16k - coverage.start_sample_16k
                         ),
-                        keep_end_sample=(
-                            boundary.end_sample_16k - state.start_sample_16k
-                        ),
-                    ),
-                ),
-                target=target_candidate,
-                suffix=suffix_candidate,
-                finish_target=True,
-            )
-            try:
-                receipt = control.prepare_exact_interval(request)
-            except Exception:
-                receipt = None
+                        keep_start_sample=0,
+                        keep_end_sample=keep_end,
+                    )
+                )
+                if coverage.end_sample_16k >= boundary.end_sample_16k:
+                    break
+            if (
+                not reconcile_sources
+                or sum(
+                    source.keep_end_sample - source.keep_start_sample
+                    for source in reconcile_sources
+                )
+                != boundary.end_sample_16k - boundary.start_sample_16k
+            ):
+                for candidate in allocated:
+                    self._speaker_candidate_owner_generations.pop(candidate, None)
+                return None
+
+            receipt: SpeakerShadowBatchReconcileReceipt | SpeakerShadowTerminalCoverageReceipt | None = None
+            control: SpeakerShadowExactIntervalControl | SpeakerShadowPreparedTerminalCoverageControl | None = None
+            if (
+                terminal_control is not None
+                and state.completed_window_sample_count > 0
+            ):
+                try:
+                    receipt = terminal_control.prepare_finalized_candidate_coverage(
+                        SpeakerShadowTerminalCoverageRequest(
+                            sources=tuple(reconcile_sources),
+                            target=target_candidate,
+                            provider_exact_start_sample=0,
+                            provider_exact_end_sample=(
+                                boundary.end_sample_16k - boundary.start_sample_16k
+                            ),
+                            scored_window_start_sample=0,
+                            scored_window_end_sample=(
+                                state.completed_window_sample_count
+                            ),
+                            suffix=suffix_candidate,
+                        )
+                    )
+                except Exception:
+                    receipt = None
+                if type(receipt) is SpeakerShadowTerminalCoverageReceipt:
+                    control = terminal_control
+            if receipt is None and live_control is not None and len(reconcile_sources) == 1:
+                try:
+                    receipt = live_control.prepare_exact_interval(
+                        SpeakerShadowBatchReconcileRequest(
+                            sources=tuple(reconcile_sources),
+                            target=target_candidate,
+                            suffix=suffix_candidate,
+                            finish_target=True,
+                        )
+                    )
+                except Exception:
+                    receipt = None
+                if type(receipt) is SpeakerShadowBatchReconcileReceipt:
+                    control = live_control
             expected_target_samples = (
                 boundary.end_sample_16k - boundary.start_sample_16k
             )
             expected_suffix_samples = cursor - boundary.end_sample_16k
+            receipt_valid = bool(
+                (
+                    type(receipt) is SpeakerShadowBatchReconcileReceipt
+                    and receipt.target_sample_count == expected_target_samples
+                    and receipt.suffix_sample_count == expected_suffix_samples
+                )
+                or (
+                    type(receipt) is SpeakerShadowTerminalCoverageReceipt
+                    and receipt.covered_sample_count == expected_target_samples
+                    and receipt.terminal_preserved
+                )
+            )
             if not (
-                type(receipt) is SpeakerShadowBatchReconcileReceipt
+                receipt_valid
+                and receipt is not None
                 and receipt.target == target_candidate
                 and receipt.suffix == suffix_candidate
-                and receipt.target_sample_count == expected_target_samples
-                and receipt.suffix_sample_count == expected_suffix_samples
+                and control is not None
             ):
                 if type(receipt) is SpeakerShadowBatchReconcileReceipt:
                     try:
-                        control.abort_exact_interval(receipt)
+                        live_control.abort_exact_interval(receipt)
+                    except Exception:
+                        pass
+                elif type(receipt) is SpeakerShadowTerminalCoverageReceipt:
+                    try:
+                        terminal_control.abort_finalized_candidate_coverage(receipt)
                     except Exception:
                         pass
                 for candidate in allocated:
@@ -2740,6 +3184,9 @@ class DetectorRuntime:
                 lease_generation=state.lease.lease_generation,
                 candidate_generation=expected_generation,
                 shadow_runtime_generation=receipt.runtime_generation,
+                anchor_revision=state.anchor_revision,
+                anchor_start_sample_16k=state.anchor_start_sample_16k,
+                provider_pcm_through_sequence_no=state.last_sequence_no or 0,
                 _owner=self._provider_exact_interval_owner,
                 _token=reservation_token,
             )
@@ -2751,6 +3198,14 @@ class DetectorRuntime:
                     shadow_receipt=receipt,
                     segment_fingerprint=(
                         self._provider_exact_interval_segment_fingerprint(segments)
+                    ),
+                    coverage_fingerprint=tuple(
+                        (
+                            coverage.candidate,
+                            coverage.start_sample_16k,
+                            coverage.end_sample_16k,
+                        )
+                        for coverage in state.coverage_candidates
                     ),
                     prepared_cursor_16k=cursor,
                     next_shadow_generation=self._speaker_shadow_generation,
@@ -2803,6 +3258,11 @@ class DetectorRuntime:
             and reservation.candidate_generation == self._candidate_generation
             and reservation.shadow_runtime_generation
             == record.shadow_receipt.runtime_generation
+            and reservation.anchor_revision == state.anchor_revision
+            and reservation.anchor_start_sample_16k
+            == state.anchor_start_sample_16k
+            and reservation.provider_pcm_through_sequence_no
+            <= (state.last_sequence_no or 0)
             and record.next_shadow_generation == self._speaker_shadow_generation
             and record.shadow_control is self._speaker_shadow
             and state.capture_state is not _ProviderShadowCaptureState.UNAVAILABLE
@@ -2834,6 +3294,7 @@ class DetectorRuntime:
                 lease=successor_lease,
                 timeline_generation=state.timeline_generation,
                 start_sample_16k=boundary.end_sample_16k,
+                buffer_origin_sample_16k=boundary.end_sample_16k,
                 last_sequence_no=state.last_sequence_no,
                 last_progress_at=state.last_progress_at,
                 cumulative_sample_count=(
@@ -2841,6 +3302,14 @@ class DetectorRuntime:
                 ),
                 completed_window_sample_count=0,
                 capture_state=_ProviderShadowCaptureState.COLLECTING,
+                active_candidate=reservation.suffix_candidate,
+            )
+            successor_state.coverage_candidates.append(
+                _ProviderSpeakerCoverageCandidate(
+                    candidate=reservation.suffix_candidate,
+                    start_sample_16k=boundary.end_sample_16k,
+                    end_sample_16k=self._provider_audio_sample_cursor_16k,
+                )
             )
             if successor_sample_count > 0:
                 survivor = _ProviderSpeakerSegment(
@@ -2875,9 +3344,16 @@ class DetectorRuntime:
             boundary_exact=True,
         )
         try:
-            committed = bool(
-                record.shadow_control.commit_exact_interval(record.shadow_receipt)
-            )
+            if type(record.shadow_receipt) is SpeakerShadowTerminalCoverageReceipt:
+                committed = bool(
+                    record.shadow_control.commit_finalized_candidate_coverage(
+                        record.shadow_receipt
+                    )
+                )
+            else:
+                committed = bool(
+                    record.shadow_control.commit_exact_interval(record.shadow_receipt)
+                )
         except Exception:
             committed = False
         if not committed:
@@ -4503,7 +4979,7 @@ class DetectorRuntime:
         token = self._deny_rearm_token
         adapter = self._semantic_adapter
         if adapter is not None:
-            adapter_token = adapter.deny_rearm_token
+            adapter_token = getattr(adapter, "deny_rearm_token", None)
             token = (
                 adapter_token
                 if adapter_token == self._deny_rearm_requested_token
@@ -4949,6 +5425,151 @@ class DetectorRuntime:
             candidate=candidate,
         )
 
+    def _submit_provider_evidence_capture_locked(
+        self,
+        state: _ProviderSpeakerEvidenceState,
+        pcm16: bytes,
+        *,
+        sample_start_16k: int,
+    ) -> SpeakerShadowCaptureResult:
+        """Capture all canonical PCM, rotating buffer-only coverage owners."""
+
+        shadow = self._speaker_shadow
+        if not isinstance(shadow, SpeakerShadowCaptureStatus):
+            return self._unavailable_provider_speaker_evidence_update(
+                state,
+                sequence_no=state.last_sequence_no or 0,
+            ).capture
+        input_samples = len(pcm16) // 2
+        offset = 0
+        last_capture: SpeakerShadowCaptureResult | None = None
+        while offset < input_samples:
+            candidate = state.active_candidate or state.lease.candidate
+            try:
+                capture = shadow.submit_capture(
+                    bytes(memoryview(pcm16)[offset * 2 :]),
+                    sample_rate_hz=16_000,
+                    candidate=candidate,
+                )
+            except Exception:
+                capture = None
+            if (
+                type(capture) is not SpeakerShadowCaptureResult
+                or capture.disposition is SpeakerShadowCaptureDisposition.UNAVAILABLE
+            ):
+                return SpeakerShadowCaptureResult(
+                    disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                    accepted_sample_count=0,
+                    cumulative_sample_count=state.cumulative_sample_count,
+                    completed_window_sample_count=state.completed_window_sample_count,
+                    decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+                )
+            accepted = capture.accepted_sample_count
+            if accepted > input_samples - offset:
+                return SpeakerShadowCaptureResult(
+                    disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                    accepted_sample_count=0,
+                    cumulative_sample_count=state.cumulative_sample_count,
+                    completed_window_sample_count=state.completed_window_sample_count,
+                    decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+                )
+            if candidate == state.lease.candidate:
+                state.completed_window_sample_count = max(
+                    state.completed_window_sample_count,
+                    capture.completed_window_sample_count,
+                )
+                if capture.disposition is SpeakerShadowCaptureDisposition.COMPLETE:
+                    state.capture_state = _ProviderShadowCaptureState.COMPLETE
+                    state.completed_window_sample_count = max(
+                        state.completed_window_sample_count,
+                        capture.cumulative_sample_count,
+                    )
+            if accepted:
+                entry = next(
+                    (
+                        item
+                        for item in reversed(state.coverage_candidates)
+                        if item.candidate == candidate
+                    ),
+                    None,
+                )
+                if entry is None:
+                    return SpeakerShadowCaptureResult(
+                        disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                        accepted_sample_count=0,
+                        cumulative_sample_count=state.cumulative_sample_count,
+                        completed_window_sample_count=state.completed_window_sample_count,
+                        decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+                    )
+                entry.end_sample_16k += accepted
+                offset += accepted
+                last_capture = capture
+            if offset >= input_samples:
+                break
+            if accepted == 0 and capture.disposition is not SpeakerShadowCaptureDisposition.COMPLETE:
+                return SpeakerShadowCaptureResult(
+                    disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                    accepted_sample_count=0,
+                    cumulative_sample_count=state.cumulative_sample_count,
+                    completed_window_sample_count=state.completed_window_sample_count,
+                    decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+                )
+
+            continuation = self._allocate_provider_segment_candidate()
+            defer_coverage = getattr(shadow, "defer_coverage_candidate", None)
+            try:
+                deferred = bool(
+                    continuation is not None
+                    and callable(defer_coverage)
+                    and defer_coverage(continuation)
+                )
+            except Exception:
+                deferred = False
+            if continuation is None or not deferred:
+                if continuation is not None:
+                    self._speaker_candidate_owner_generations.pop(continuation, None)
+                return SpeakerShadowCaptureResult(
+                    disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                    accepted_sample_count=0,
+                    cumulative_sample_count=state.cumulative_sample_count,
+                    completed_window_sample_count=state.completed_window_sample_count,
+                    decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+                )
+            continuation_start = sample_start_16k + offset
+            state.active_candidate = continuation
+            state.coverage_candidates.append(
+                _ProviderSpeakerCoverageCandidate(
+                    candidate=continuation,
+                    start_sample_16k=continuation_start,
+                    end_sample_16k=continuation_start,
+                )
+            )
+
+        if last_capture is None:
+            return SpeakerShadowCaptureResult(
+                disposition=SpeakerShadowCaptureDisposition.UNAVAILABLE,
+                accepted_sample_count=0,
+                cumulative_sample_count=state.cumulative_sample_count,
+                completed_window_sample_count=state.completed_window_sample_count,
+                decision_state=SpeakerShadowCaptureDecisionState.UNAVAILABLE,
+            )
+        total_cumulative = (
+            sample_start_16k + input_samples - state.start_sample_16k
+        )
+        return SpeakerShadowCaptureResult(
+            disposition=(
+                SpeakerShadowCaptureDisposition.COMPLETE
+                if state.capture_state is _ProviderShadowCaptureState.COMPLETE
+                else SpeakerShadowCaptureDisposition.ACCEPTED
+            ),
+            accepted_sample_count=input_samples,
+            cumulative_sample_count=total_cumulative,
+            completed_window_sample_count=state.completed_window_sample_count,
+            # COMPLETE means the primary scoring window is fully captured;
+            # only the ordered evidence callback may publish a score fact.
+            decision_state=SpeakerShadowCaptureDecisionState.PENDING,
+        )
+
     async def observe_provider_audio_ordered(
         self,
         pcm16: bytes,
@@ -5264,7 +5885,10 @@ class DetectorRuntime:
                 self._mark_provider_micro_event_ambiguous(segment.detector_candidate)
             candidate = segment.candidate
             if evidence_state is not None:
-                candidate = evidence_state.lease.candidate
+                candidate = (
+                    evidence_state.active_candidate
+                    or evidence_state.lease.candidate
+                )
                 if not evidence_state.binding_published:
                     self._publish_speaker_candidate_binding(
                         candidate,
@@ -5278,10 +5902,19 @@ class DetectorRuntime:
             if candidate is not None and shadow is not None and may_submit:
                 try:
                     if isinstance(shadow, SpeakerShadowCaptureStatus):
-                        capture = shadow.submit_capture(
-                            pcm16,
-                            sample_rate_hz=sample_rate_hz,
-                            candidate=candidate,
+                        capture = (
+                            self._submit_provider_evidence_capture_locked(
+                                evidence_state,
+                                pcm16,
+                                sample_start_16k=sample_start_16k,
+                            )
+                            if evidence_state is not None
+                            and sample_rate_hz == 16_000
+                            else shadow.submit_capture(
+                                pcm16,
+                                sample_rate_hz=sample_rate_hz,
+                                candidate=candidate,
+                            )
                         )
                         if type(capture) is not SpeakerShadowCaptureResult:
                             capture_state = _ProviderShadowCaptureState.UNAVAILABLE
@@ -5349,9 +5982,7 @@ class DetectorRuntime:
                 evidence_state.capture_state = capture_state
                 if isinstance(shadow, SpeakerShadowCaptureStatus):
                     assert type(capture) is SpeakerShadowCaptureResult
-                    evidence_state.cumulative_sample_count = (
-                        capture.cumulative_sample_count
-                    )
+                    evidence_state.cumulative_sample_count = capture.cumulative_sample_count
                     evidence_state.completed_window_sample_count = max(
                         evidence_state.completed_window_sample_count,
                         capture.completed_window_sample_count,

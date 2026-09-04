@@ -19,6 +19,7 @@ from main_logic.asr_client._provider_events import (
     ProviderAudioRange,
     ProviderEndpointNotification,
     ProviderFinalNotification,
+    ProviderStartedSettlement,
     ProviderUtteranceKey,
     ProviderUtteranceStartedNotification,
 )
@@ -1407,12 +1408,411 @@ async def test_provider_utterance_started_notification_exposes_stable_key() -> N
 
     assert notification.key == ProviderUtteranceKey(2, 3, 4)
     assert notification.namespace == (2, 3)
+    assert notification.audio_start_sample_16k is None
+    assert (
+        ProviderUtteranceStartedNotification(2, 3, 4, 320).audio_start_sample_16k == 320
+    )
     with pytest.raises(ValueError, match="ASR_PROVIDER_ENDPOINT_KEY_INVALID"):
         ProviderUtteranceStartedNotification(
             generation=2,
             buffer_epoch=3,
             utterance_id=0,
         )
+    for invalid_start in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="ASR_PROVIDER_AUDIO_START_INVALID"):
+            ProviderUtteranceStartedNotification(2, 3, 4, invalid_start)  # type: ignore[arg-type]
+
+
+async def test_provider_start_uses_canonical_cursor_and_clear_rebases_it() -> None:
+    starts: list[ProviderUtteranceStartedNotification] = []
+
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        starts.append(notification)
+        return ProviderStartedSettlement.BOUND_EXACT_PENDING
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+    )
+    await session.connect()
+    assert session._response_queue is not None
+
+    await session.stream_audio(b"\x00\x00" * 1_600)
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=10,
+            audio_start_sample_16k=320,
+        )
+    )
+    await _drain_session_pipelines(session)
+
+    await session.clear_audio_buffer()
+    await session.stream_audio(b"\x00\x00" * 800)
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            generation=0,
+            buffer_epoch=1,
+            utterance_id=11,
+            audio_start_sample_16k=160,
+        )
+    )
+    await _drain_session_pipelines(session)
+
+    assert [item.audio_start_sample_16k for item in starts] == [320, 1_760]
+    await session.close()
+
+
+async def test_provider_future_start_preserves_canonical_authority() -> None:
+    starts: list[int | None] = []
+
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        starts.append(notification.audio_start_sample_16k)
+        return ProviderStartedSettlement.BOUND_EXACT_PENDING
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 160)
+    assert session._response_queue is not None
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=10,
+            audio_start_sample_16k=320,
+        )
+    )
+    await _drain_session_pipelines(session)
+
+    # DetectorRuntime owns the bounded wait for a start ahead of its current
+    # cursor. Infra must preserve that authority instead of converting it to
+    # an indistinguishable missing-start proof.
+    assert starts == [320]
+    await session.close()
+
+
+async def test_provider_exact_validation_ignores_simulated_24k_wire_cursor() -> None:
+    endpoints: list[ProviderEndpointNotification] = []
+
+    async def on_endpoint(notification: ProviderEndpointNotification) -> None:
+        endpoints.append(notification)
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_endpoint=on_endpoint,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_600)
+    # Simulate a worker whose transport expands the canonical 16 kHz input to
+    # 24 kHz. A forged range beyond canonical coverage must remain unknown.
+    session._provider_wire_audio_bytes = 2_400 * 2
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for event in (
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            audio_start_sample_16k=100,
+            **common,
+        ),
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(100, 2_000),
+            **common,
+        ),
+        _AsrWorkerEvent(kind="final", text="hello", **common),
+    ):
+        await session._response_queue.put(event)
+    await _drain_session_pipelines(session)
+
+    assert [item.boundary_quality for item in endpoints] == ["unknown", "unknown"]
+    await session.close()
+
+
+async def test_speaker_unavailable_started_settlement_keeps_text_key_alive() -> None:
+    finals: list[tuple[ProviderUtteranceKey, str]] = []
+
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        assert notification.audio_start_sample_16k is None
+        return ProviderStartedSettlement.BOUND_SPEAKER_UNAVAILABLE
+
+    async def on_final(key: ProviderUtteranceKey, text: str) -> None:
+        finals.append((key, text))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+        on_provider_final=on_final,
+    )
+    await session.connect()
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="utterance_started", **common)
+    )
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="final", text="still delivered", **common)
+    )
+    await _drain_session_pipelines(session)
+
+    assert session._provider_started_failed_keys == {}
+    assert finals == [(ProviderUtteranceKey(0, 0, 10), "still delivered")]
+    await session.close()
+
+
+async def test_failed_identity_started_settlement_latches_text_key() -> None:
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        del notification
+        return ProviderStartedSettlement.FAILED_IDENTITY
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+    )
+    await session.connect()
+    assert session._response_queue is not None
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            generation=0,
+            buffer_epoch=0,
+            utterance_id=10,
+        )
+    )
+    await asyncio.wait_for(
+        _wait_until(lambda: (0, 0, 10) in session._provider_started_failed_keys),
+        1,
+    )
+
+    assert (0, 0, 10) in session._provider_started_failed_keys
+    await session.close()
+
+
+async def test_conflicting_provider_start_revokes_proof_without_latching_text() -> None:
+    starts: list[int | None] = []
+    finals: list[str] = []
+    endpoints: list[tuple[str, str]] = []
+
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        starts.append(notification.audio_start_sample_16k)
+        return (
+            ProviderStartedSettlement.BOUND_EXACT_PENDING
+            if notification.audio_start_sample_16k is not None
+            else ProviderStartedSettlement.BOUND_SPEAKER_UNAVAILABLE
+        )
+
+    async def on_final(key: ProviderUtteranceKey, text: str) -> None:
+        del key
+        finals.append(text)
+
+    async def on_endpoint(notification: ProviderEndpointNotification) -> None:
+        endpoints.append((notification.phase, notification.boundary_quality))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+        on_provider_endpoint=on_endpoint,
+        on_provider_final=on_final,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    for start in (100, 100):
+        await session._response_queue.put(
+            _AsrWorkerEvent(
+                kind="utterance_started",
+                audio_start_sample_16k=start,
+                **common,
+            )
+        )
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="unknown",
+            **common,
+        )
+    )
+    for start in (200, 300):
+        await session._response_queue.put(
+            _AsrWorkerEvent(
+                kind="utterance_started",
+                audio_start_sample_16k=start,
+                **common,
+            )
+        )
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="provider_endpoint",
+            boundary_quality="exact",
+            audio_range=ProviderAudioRange(100, 900),
+            **common,
+        )
+    )
+    await session._response_queue.put(
+        _AsrWorkerEvent(kind="final", text="kept", **common)
+    )
+    await _drain_session_pipelines(session)
+
+    assert starts == [100]
+    assert endpoints == [("boundary", "unknown"), ("ordered", "unknown")]
+    assert session._provider_started_failed_keys == {}
+    assert finals == ["kept"]
+    await session.close()
+
+
+async def test_conflict_queued_behind_failed_started_never_reenters_callback() -> None:
+    starts: list[int | None] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        starts.append(notification.audio_start_sample_16k)
+        entered.set()
+        await release.wait()
+        return ProviderStartedSettlement.FAILED_IDENTITY
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            audio_start_sample_16k=100,
+            **common,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            audio_start_sample_16k=200,
+            **common,
+        )
+    )
+    await asyncio.wait_for(session._response_queue.join(), 1)
+    release.set()
+    assert session._callback_queue is not None
+    await asyncio.wait_for(session._callback_queue.join(), 1)
+
+    assert starts == [100]
+    assert (0, 0, 10) in session._provider_started_failed_keys
+    await session.close()
+
+
+async def test_conflicting_start_cannot_strand_callback_fifo_on_clear() -> None:
+    callback_calls = 0
+    release_ignored_callback = asyncio.Event()
+
+    async def on_started(
+        notification: ProviderUtteranceStartedNotification,
+    ) -> ProviderStartedSettlement:
+        del notification
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            return ProviderStartedSettlement.BOUND_EXACT_PENDING
+        while not release_ignored_callback.is_set():
+            try:
+                await release_ignored_callback.wait()
+            except asyncio.CancelledError:
+                continue
+        return ProviderStartedSettlement.BOUND_SPEAKER_UNAVAILABLE
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker,
+        api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(),
+        on_connection_error=AsyncMock(),
+        on_provider_utterance_started=on_started,
+    )
+    await session.connect()
+    await session.stream_audio(b"\x00\x00" * 1_000)
+    assert session._response_queue is not None
+    common = {"generation": 0, "buffer_epoch": 0, "utterance_id": 10}
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            audio_start_sample_16k=100,
+            **common,
+        )
+    )
+    await _drain_session_pipelines(session)
+    await session._response_queue.put(
+        _AsrWorkerEvent(
+            kind="utterance_started",
+            audio_start_sample_16k=200,
+            **common,
+        )
+    )
+    await asyncio.wait_for(session._response_queue.join(), 1)
+    await asyncio.sleep(0)
+    await session.clear_audio_buffer()
+    assert session._callback_queue is not None
+    drained = True
+    try:
+        await asyncio.wait_for(asyncio.shield(session._callback_queue.join()), 0.1)
+    except asyncio.TimeoutError:
+        drained = False
+    finally:
+        release_ignored_callback.set()
+
+    assert drained
+    assert callback_calls == 1
+    await session.close()
 
 
 async def test_provider_started_callback_is_idempotent_and_precedes_boundary_final():

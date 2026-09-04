@@ -54,6 +54,12 @@ SpeakerShadowReconciliationStatus = Literal[
     "failed",
     "stale",
 ]
+SpeakerShadowDeferredAnchorStatus = Literal[
+    "pending",
+    "applied",
+    "failed",
+    "stale",
+]
 
 
 class SpeakerShadowCaptureDisposition(StrEnum):
@@ -104,6 +110,48 @@ class SpeakerShadowCandidateKey:
             raise ValueError("shadow_generation must be a non-negative integer")
         if self.scope not in ("provider_candidate", "smart_turn_turn"):
             raise ValueError("scope must be a supported speaker-shadow scope")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowDeferredAnchorRequest:
+    """Rebase one buffer-only candidate onto a canonical speech origin.
+
+    Both sample counts are relative to the candidate's original deferred
+    capture origin. The runtime must fail rather than silently trim a prefix
+    that has already fallen outside its bounded rolling buffer.
+    """
+
+    candidate: SpeakerShadowCandidateKey
+    expected_observed_sample_count: int
+    discard_prefix_sample_count: int
+    anchor_revision: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.candidate, SpeakerShadowCandidateKey)
+            or type(self.expected_observed_sample_count) is not int
+            or type(self.discard_prefix_sample_count) is not int
+            or type(self.anchor_revision) is not int
+            or self.expected_observed_sample_count < 0
+            or self.discard_prefix_sample_count < 0
+            or self.discard_prefix_sample_count > self.expected_observed_sample_count
+            or self.anchor_revision <= 0
+        ):
+            raise ValueError("speaker-shadow deferred anchor request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerShadowDeferredAnchorReceipt:
+    """Opaque receipt for one ordered deferred-candidate rebase."""
+
+    runtime_generation: int
+    operation_id: int
+    candidate: SpeakerShadowCandidateKey
+    anchor_revision: int
+    observed_sample_count: int
+    discarded_sample_count: int
+    retained_sample_count: int
+    _owner: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,6 +758,28 @@ class SpeakerShadowDeferredCandidateControl(Protocol):
 
 
 @runtime_checkable
+class SpeakerShadowDeferredAnchorControl(Protocol):
+    """Optional ordered control for canonical deferred-candidate anchoring."""
+
+    def anchor_deferred_candidate(
+        self,
+        request: SpeakerShadowDeferredAnchorRequest,
+    ) -> SpeakerShadowDeferredAnchorReceipt | None: ...
+
+    def deferred_anchor_status(
+        self,
+        receipt: SpeakerShadowDeferredAnchorReceipt,
+    ) -> SpeakerShadowDeferredAnchorStatus: ...
+
+    async def wait_deferred_anchor_settled(
+        self,
+        receipt: SpeakerShadowDeferredAnchorReceipt,
+        *,
+        deadline: float,
+    ) -> SpeakerShadowDeferredAnchorStatus: ...
+
+
+@runtime_checkable
 class SpeakerShadowCandidateReconciliationControl(Protocol):
     """Optional sample-exact ownership transfer between ordered candidates.
 
@@ -795,6 +865,26 @@ class SpeakerShadowTerminalCoverageControl(Protocol):
         self,
         receipt: SpeakerShadowTerminalCoverageReceipt,
     ) -> None: ...
+
+
+@runtime_checkable
+class SpeakerShadowPreparedTerminalCoverageControl(Protocol):
+    """Two-phase finalized coverage used by an upper atomic transaction."""
+
+    def prepare_finalized_candidate_coverage(
+        self,
+        request: SpeakerShadowTerminalCoverageRequest,
+    ) -> SpeakerShadowTerminalCoverageReceipt | None: ...
+
+    def commit_finalized_candidate_coverage(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> bool: ...
+
+    def abort_finalized_candidate_coverage(
+        self,
+        receipt: SpeakerShadowTerminalCoverageReceipt,
+    ) -> bool: ...
 
 
 @runtime_checkable

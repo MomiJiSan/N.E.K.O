@@ -36,10 +36,12 @@ from ._registry_meta import (
     AsrCoreCapabilities,
     AsrEndpointingMode as _AsrEndpointingMode,
     AsrProviderAvailability as _AsrProviderAvailability,
+    AsrSpeakerExactIntervalCapability,
 )
 from ._provider_events import (
     ProviderEndpointNotification,
     ProviderFinalNotification,
+    ProviderStartedSettlement,
     ProviderUtteranceKey,
     ProviderUtteranceStartedNotification,
 )
@@ -427,7 +429,8 @@ def _create_asr_session_from_selection(
     on_speech_activity: Callable[[SpeechActivityEvent], Awaitable[None]] | None = None,
     on_turn_endpointed: Callable[[], Awaitable[None]] | None = None,
     on_provider_utterance_started: Callable[
-        [ProviderUtteranceStartedNotification], Awaitable[None]
+        [ProviderUtteranceStartedNotification],
+        Awaitable[ProviderStartedSettlement | None],
     ]
     | None = None,
     on_provider_endpoint: Callable[[ProviderEndpointNotification], Awaitable[None]]
