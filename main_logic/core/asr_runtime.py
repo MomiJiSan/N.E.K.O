@@ -1394,9 +1394,9 @@ class AsrRuntimeMixin:
 
         if factory is not None and (
             getattr(self, "_asr_route_mode", "blocked") != "independent"
-            or not self._asr_runtime.speaker_verifier_route_supported()
+            or not self._asr_runtime._speaker_verifier_route_supported()
         ):
-            self._asr_runtime.record_unsupported_speaker_route()
+            self._asr_runtime._record_unsupported_speaker_route()
             close = getattr(factory, "close", None)
             if callable(close):
                 try:

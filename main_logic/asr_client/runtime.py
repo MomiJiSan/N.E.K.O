@@ -742,7 +742,7 @@ class IndependentAsrRuntime:
     def display_name(self) -> str:
         return self._callbacks.display_name()
 
-    def speaker_verifier_route_supported(self) -> bool:
+    def _speaker_verifier_route_supported(self) -> bool:
         """Report whether the active route can enforce speaker admission.
 
         Smart/local endpointing retains its existing ownership model. A
@@ -761,7 +761,7 @@ class IndependentAsrRuntime:
             is AsrSpeakerExactIntervalCapability.CANONICAL_16K_EXACT_INTERVAL
         )
 
-    def record_unsupported_speaker_route(self) -> None:
+    def _record_unsupported_speaker_route(self) -> None:
         """Count one rejected verifier installation without route details."""
 
         self._ensure_asr_runtime_state()
