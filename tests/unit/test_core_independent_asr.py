@@ -10619,6 +10619,7 @@ async def test_provider_fence_failure_forwards_final_without_speaker_authority()
         is_voice_source=True,
         source="independent_asr",
         metadata={"provider": "openai"},
+        source_game_route_identity=None,
     )
     assert final_key in dispatcher._resolved
     assert final_key not in dispatcher._reservations
