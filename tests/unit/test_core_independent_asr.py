@@ -90,6 +90,73 @@ from utils import preferences
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize(
+    ("value", "fallback", "expected"),
+    [
+        (
+            "  ASR_QWEN_PROVIDER_ERROR: private provider text  ",
+            "ASR_INDEPENDENT_FAILED",
+            "ASR_QWEN_PROVIDER_ERROR",
+        ),
+        (
+            "prefix ASR_QWEN_PROVIDER_ERROR: private provider text",
+            "ASR_INDEPENDENT_FAILED",
+            "ASR_INDEPENDENT_FAILED",
+        ),
+        (
+            "asr_qwen_provider_error: private provider text",
+            "ASR_INDEPENDENT_FAILED",
+            "ASR_INDEPENDENT_FAILED",
+        ),
+        (
+            f"ASR_{'A' * 61}: private provider text",
+            "ASR_INDEPENDENT_FAILED",
+            "ASR_INDEPENDENT_FAILED",
+        ),
+        (
+            "ASR_QWEN-PROVIDER-ERROR: private provider text",
+            "ASR_INDEPENDENT_FAILED",
+            "ASR_INDEPENDENT_FAILED",
+        ),
+        (
+            "provider failure",
+            "invalid fallback",
+            "ASR_INDEPENDENT_FAILED",
+        ),
+    ],
+)
+async def test_extract_asr_reason_code_accepts_only_safe_prefixes(
+    value,
+    fallback,
+    expected,
+) -> None:
+    assert (
+        asr_runtime_module._extract_asr_reason_code(value, fallback=fallback)
+        == expected
+    )
+
+
+async def test_extract_asr_reason_code_survives_broken_stringification() -> None:
+    class _BrokenString:
+        def __str__(self) -> str:
+            raise RuntimeError("must not escape")
+
+    assert (
+        asr_runtime_module._extract_asr_reason_code(
+            _BrokenString(),
+            fallback="ASR_ENDPOINTING_FAILED",
+        )
+        == "ASR_ENDPOINTING_FAILED"
+    )
+    assert (
+        asr_runtime_module._extract_asr_reason_code(
+            "provider failure",
+            fallback=_BrokenString(),
+        )
+        == "ASR_INDEPENDENT_FAILED"
+    )
+
+
 class _Runtime(AsrRuntimeMixin):
     def __init__(self) -> None:
         self._init_asr_runtime_state()
@@ -5325,7 +5392,9 @@ async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback
     for attempt in range(3):
         session = type("Soniox", (), {})()
         session.connect = AsyncMock(
-            side_effect=RuntimeError(f"private provider detail {attempt}")
+            side_effect=RuntimeError(
+                f"ASR_SONIOX_CONNECT_{attempt}: private provider detail {attempt}"
+            )
         )
         session.close = AsyncMock()
         sessions.append(session)
@@ -5379,14 +5448,61 @@ async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback
     statuses = [
         json.loads(call.args[0]) for call in runtime.send_status.await_args_list
     ]
-    assert statuses[-1] == {
-        "code": "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
-        "details": {
-            "provider": "soniox",
-            "session_epoch": runtime._asr_session_epoch,
-        },
-    }
+    terminal = statuses[-1]
+    assert terminal["code"] == "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE"
+    assert terminal["details"]["provider"] == "soniox"
+    assert terminal["details"]["session_epoch"] == runtime._asr_session_epoch
+    assert terminal["details"]["reason_code"] == "ASR_SONIOX_CONNECT_2"
+    incident_id = terminal["details"]["incident_id"]
+    assert incident_id.startswith("asr-failure-")
+    assert len(incident_id) == len("asr-failure-") + 32
+    assert all(character in "0123456789abcdef" for character in incident_id[-32:])
     assert "private provider detail" not in str(runtime.send_status.await_args_list)
+
+
+async def test_single_connect_failure_reports_safe_reason_without_lifecycle(
+    monkeypatch,
+) -> None:
+    runtime = _Runtime()
+    runtime.core_api_type = "qwen"
+    selection = _selection("qwen", "manual")
+    session = SimpleNamespace(
+        connect=AsyncMock(
+            side_effect=RuntimeError(
+                "ASR_QWEN_PROVIDER_ERROR: https://provider.invalid?api_key=secret"
+            )
+        ),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(return_value={"independentAsrEnabled": True}),
+    )
+    monkeypatch.setattr(
+        asr_runtime_module,
+        "_resolve_asr_selection",
+        MagicMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        asr_runtime_module,
+        "_create_asr_session_from_selection",
+        MagicMock(return_value=session),
+    )
+
+    await runtime._start_independent_asr_if_enabled("audio")
+
+    payloads = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    assert [payload["code"] for payload in payloads] == ["ASR_INDEPENDENT_FAILED"]
+    terminal = payloads[0]
+    assert terminal["details"]["reason_code"] == "ASR_QWEN_PROVIDER_ERROR"
+    assert terminal["details"]["incident_id"].startswith("asr-failure-")
+    assert "provider.invalid" not in str(runtime.send_status.await_args_list)
+    assert "secret" not in str(runtime.send_status.await_args_list)
+    assert runtime._asr_route_mode == "blocked"
+    session.close.assert_awaited_once_with()
 
 
 async def test_failed_soniox_candidate_cannot_invalidate_successful_successor(
@@ -5901,13 +6017,15 @@ async def test_adopted_restart_cancellation_fails_closed_and_propagates(
     statuses = [
         json.loads(call.args[0]) for call in runtime.send_status.await_args_list
     ]
-    assert {
-        "code": "ASR_INDEPENDENT_FAILED",
-        "details": {
-            "provider": "qwen",
-            "session_epoch": started_epoch + 1,
-        },
-    } in statuses
+    terminal = next(
+        payload
+        for payload in statuses
+        if payload["code"] == "ASR_INDEPENDENT_FAILED"
+    )
+    assert terminal["details"]["provider"] == "qwen"
+    assert terminal["details"]["session_epoch"] == started_epoch + 1
+    assert terminal["details"]["reason_code"] == "ASR_INDEPENDENT_FAILED"
+    assert terminal["details"]["incident_id"].startswith("asr-failure-")
 
 
 async def test_adopted_restart_exception_fails_closed_without_retry(
@@ -5955,13 +6073,15 @@ async def test_adopted_restart_exception_fails_closed_without_retry(
     statuses = [
         json.loads(call.args[0]) for call in runtime.send_status.await_args_list
     ]
-    assert {
-        "code": "ASR_INDEPENDENT_FAILED",
-        "details": {
-            "provider": "qwen",
-            "session_epoch": started_epoch + 1,
-        },
-    } in statuses
+    terminal = next(
+        payload
+        for payload in statuses
+        if payload["code"] == "ASR_INDEPENDENT_FAILED"
+    )
+    assert terminal["details"]["provider"] == "qwen"
+    assert terminal["details"]["session_epoch"] == started_epoch + 1
+    assert terminal["details"]["reason_code"] == "ASR_INDEPENDENT_FAILED"
+    assert terminal["details"]["incident_id"].startswith("asr-failure-")
 
 
 async def test_selection_failure_is_reported_without_escaping_session_start(
@@ -7940,6 +8060,10 @@ async def test_old_failure_callback_cannot_detach_replacement_runtime() -> None:
     new_session.close.assert_not_awaited()
     new_detector.close.assert_not_awaited()
     assert runtime._asr_route_mode == "independent"
+    assert [
+        json.loads(call.args[0])["code"]
+        for call in runtime.send_status.await_args_list
+    ] == ["ASR_LIFECYCLE_STATE"]
 
 
 async def test_old_detector_endpoint_cannot_seal_replacement_runtime() -> None:
@@ -8562,6 +8686,100 @@ async def test_provider_error_without_audio_closes_and_blocks_omni() -> None:
     assert runtime._asr_session_epoch == epoch + 1
     assert runtime._asr_route_mode == "blocked"
     asr.close.assert_awaited_once_with()
+
+
+async def test_provider_error_reports_one_correlated_safe_reason(
+    monkeypatch,
+) -> None:
+    runtime, sessions, callbacks, _detector = (
+        await _start_runtime_with_callback_candidates(
+            monkeypatch,
+            candidate_count=1,
+        )
+    )
+    runtime.send_status.reset_mock()
+    provider_error = callbacks[0]["on_connection_error"]
+
+    await provider_error(
+        "  ASR_QWEN_PROVIDER_ERROR: https://provider.invalid?api_key=secret  "
+    )
+    await provider_error("ASR_SECOND_ERROR: must be stale")
+    await asyncio.sleep(0)
+
+    payloads = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    assert [payload["code"] for payload in payloads] == [
+        "ASR_LIFECYCLE_STATE",
+        "ASR_INDEPENDENT_FAILED",
+    ]
+    lifecycle, terminal = payloads
+    assert lifecycle["details"]["state"] == "blocked"
+    assert lifecycle["details"]["reason_code"] == "ASR_QWEN_PROVIDER_ERROR"
+    assert terminal["details"]["reason_code"] == "ASR_QWEN_PROVIDER_ERROR"
+    incident_id = lifecycle["details"]["incident_id"]
+    assert incident_id == terminal["details"]["incident_id"]
+    assert incident_id.startswith("asr-failure-")
+    assert "provider.invalid" not in str(runtime.send_status.await_args_list)
+    assert "secret" not in str(runtime.send_status.await_args_list)
+    assert "ASR_SECOND_ERROR" not in str(runtime.send_status.await_args_list)
+    sessions[0].close.assert_awaited_once_with()
+
+
+async def test_internal_failure_uses_status_code_as_reason() -> None:
+    runtime = _Runtime()
+    runtime._asr_session = SimpleNamespace(is_ready=True, close=AsyncMock())
+    _install_ready_lifecycle(runtime, "qwen")
+    epoch = runtime._asr_session_epoch
+
+    await runtime._handle_independent_asr_error(
+        epoch,
+        "qwen",
+        status_code="ASR_ENDPOINTING_FAILED",
+        reason_code="ASR_NOT_AN_EXPLICIT_CODE: private detail",
+    )
+
+    payloads = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    lifecycle, terminal = payloads
+    assert lifecycle["code"] == "ASR_LIFECYCLE_STATE"
+    assert terminal["code"] == "ASR_ENDPOINTING_FAILED"
+    assert lifecycle["details"]["reason_code"] == "ASR_ENDPOINTING_FAILED"
+    assert terminal["details"]["reason_code"] == "ASR_ENDPOINTING_FAILED"
+    assert "private detail" not in str(runtime.send_status.await_args_list)
+    assert (
+        lifecycle["details"]["incident_id"]
+        == terminal["details"]["incident_id"]
+    )
+
+
+async def test_broken_reason_stringification_cannot_interrupt_failure_cleanup() -> None:
+    class _BrokenString:
+        def __str__(self) -> str:
+            raise RuntimeError("private provider failure")
+
+    runtime = _Runtime()
+    session = SimpleNamespace(is_ready=True, close=AsyncMock())
+    runtime._asr_session = session
+    _install_ready_lifecycle(runtime, "qwen")
+    epoch = runtime._asr_session_epoch
+
+    await runtime._handle_independent_asr_error(
+        epoch,
+        "qwen",
+        reason_code=_BrokenString(),
+    )
+    await asyncio.sleep(0)
+
+    assert runtime._asr_session is None
+    assert runtime._asr_route_mode == "blocked"
+    session.close.assert_awaited_once_with()
+    payloads = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    assert payloads[-1]["details"]["reason_code"] == "ASR_INDEPENDENT_FAILED"
+    assert "private provider failure" not in str(runtime.send_status.await_args_list)
 
 
 async def test_blocked_route_consumes_audio_without_an_asr_or_omni_send() -> None:

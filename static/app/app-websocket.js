@@ -1284,10 +1284,30 @@
         return true;
     }
 
-    function showAsrIncidentToast(incidentId, message, durationMs) {
-        var normalizedIncident = typeof incidentId === 'string'
-            ? incidentId.trim()
+    function normalizeAsrReasonCode(value) {
+        if (typeof value !== 'string') return '';
+        var normalized = value.trim();
+        return /^ASR_[A-Z0-9_]{1,60}$/.test(normalized) ? normalized : '';
+    }
+
+    function normalizeAsrIncidentId(value) {
+        if (typeof value !== 'string') return '';
+        var normalized = value.trim();
+        if (!normalized || normalized.length > 128) return '';
+        return /^(?:asr-failure-|asr-deny-)[A-Za-z0-9_-]+$/.test(normalized)
+            ? normalized
             : '';
+    }
+
+    function formatAsrFailureMessage(baseMessage, reasonCode) {
+        var normalizedReason = normalizeAsrReasonCode(reasonCode);
+        return normalizedReason
+            ? baseMessage + ' [' + normalizedReason + ']'
+            : baseMessage;
+    }
+
+    function showAsrIncidentToast(incidentId, message, durationMs) {
+        var normalizedIncident = normalizeAsrIncidentId(incidentId);
         if (normalizedIncident && _seenAsrIncidentIds[normalizedIncident]) {
             return false;
         }
@@ -2469,6 +2489,9 @@
         // ---- onopen ----
         S.socket.onopen = function () {
             if (S.socket !== _thisSocket) return;
+            _latestAsrControlIdentity = null;
+            _seenAsrIncidentIds = Object.create(null);
+            _seenAsrIncidentOrder = [];
             console.log(window.t('console.websocketConnected'));
 
             if (S._conversationLanguageClearPending) {
@@ -3396,18 +3419,27 @@
                         }
                     } catch (_) { }
 
+                    var statusReasonCode = normalizeAsrReasonCode(
+                        statusDetails && statusDetails.reason_code
+                    );
+                    var statusIncidentId = normalizeAsrIncidentId(
+                        statusDetails && statusDetails.incident_id
+                    );
+                    var isAsrStatus = typeof statusCode === 'string'
+                        && statusCode.indexOf('ASR_') === 0;
                     var isAsrControlStatus = statusCode === 'ASR_LIFECYCLE_STATE'
                         || statusCode === 'ASR_AUDIO_PREPROCESSING_FAILED'
                         || statusCode === 'ASR_DENY_CLEANUP_FAILED'
-                        || (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0);
+                        || (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0)
+                        || (isAsrStatus && !!statusIncidentId);
                     if (isAsrControlStatus && !acceptAsrControlIdentity(statusDetails)) {
                         return;
                     }
 
                     if (statusCode === 'ASR_LIFECYCLE_STATE') {
                         var lifecycleState = (statusDetails && statusDetails.state) || '';
-                        var lifecycleReasonCode = (statusDetails && statusDetails.reason_code) || '';
-                        var lifecycleIncidentId = (statusDetails && statusDetails.incident_id) || '';
+                        var lifecycleReasonCode = statusReasonCode;
+                        var lifecycleIncidentId = statusIncidentId;
                         var lifecycleProvider = (statusDetails && statusDetails.provider) || '';
                         var allowedLifecycleStates = [
                             'off', 'local_listen', 'prewarming', 'active',
@@ -3461,7 +3493,7 @@
                                 }
                                 showAsrIncidentToast(
                                     lifecycleIncidentId,
-                                    blockedMessage,
+                                    formatAsrFailureMessage(blockedMessage, lifecycleReasonCode),
                                     5000
                                 );
                             }
@@ -3491,8 +3523,11 @@
                         // microphone keeps running.
                         tearDownBlockedVoiceRoute();
                         showAsrIncidentToast(
-                            statusDetails && statusDetails.incident_id,
-                            window.t ? window.t('microphone.audioPreprocessingFailed') : 'Microphone audio processing failed. Voice input has stopped for this session. Please start a new voice session.',
+                            statusIncidentId,
+                            formatAsrFailureMessage(
+                                window.t ? window.t('microphone.audioPreprocessingFailed') : 'Microphone audio processing failed. Voice input has stopped for this session. Please start a new voice session.',
+                                statusReasonCode
+                            ),
                             5000
                         );
                         return;
@@ -3501,8 +3536,11 @@
                     if (statusCode === 'ASR_DENY_CLEANUP_FAILED') {
                         tearDownBlockedVoiceRoute();
                         showAsrIncidentToast(
-                            statusDetails && statusDetails.incident_id,
-                            window.t ? window.t('microphone.independentAsrCleanupFailed') : 'Voice session cleanup failed. Please restart the microphone.',
+                            statusIncidentId,
+                            formatAsrFailureMessage(
+                                window.t ? window.t('microphone.independentAsrCleanupFailed') : 'Voice session cleanup failed. Please restart the microphone.',
+                                statusReasonCode
+                            ),
                             5000
                         );
                         return;
@@ -3559,22 +3597,46 @@
                         // for it, so run the same teardown here. The per-code
                         // toasts below already say the right thing.
                         tearDownBlockedVoiceRoute();
-                        var statusIncidentId = statusDetails && statusDetails.incident_id;
                         if (statusCode === 'ASR_INDEPENDENT_PROVIDER_UNAVAILABLE') {
                             showAsrIncidentToast(
                                 statusIncidentId,
-                                window.t
-                                    ? window.t('microphone.independentAsrProviderUnavailable', { providerKey: asrProvider || 'unknown' })
-                                    : ((asrProvider || 'ASR') + ' is temporarily unavailable. Voice input has stopped for this session. It did not switch to another speech recognition service. Please start a new voice session later.'),
+                                formatAsrFailureMessage(
+                                    window.t
+                                        ? window.t('microphone.independentAsrProviderUnavailable', { providerKey: asrProvider || 'unknown' })
+                                        : ((asrProvider || 'ASR') + ' is temporarily unavailable. Voice input has stopped for this session. It did not switch to another speech recognition service. Please start a new voice session later.'),
+                                    statusReasonCode
+                                ),
                                 5000
                             );
                             return;
                         }
                         showAsrIncidentToast(
                             statusIncidentId,
-                            statusCode === 'ASR_INDEPENDENT_FAILED'
-                                ? (window.t ? window.t('microphone.independentAsrFallback') : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.')
-                                : (window.t ? window.t('microphone.independentAsrRuntimeFailed') : 'Independent ASR stopped because of a runtime error. Please restart the microphone.'),
+                            formatAsrFailureMessage(
+                                statusCode === 'ASR_INDEPENDENT_FAILED'
+                                    ? (window.t ? window.t('microphone.independentAsrFallback') : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.')
+                                    : (window.t ? window.t('microphone.independentAsrRuntimeFailed') : 'Independent ASR stopped because of a runtime error. Please restart the microphone.'),
+                                statusReasonCode
+                            ),
+                            5000
+                        );
+                        return;
+                    }
+
+                    // Runtime failures normally arrive after a BLOCKED lifecycle
+                    // notification. Keep the terminal status independently useful
+                    // when that earlier delivery is lost, without weakening the
+                    // ASR identity fence: only a validated incident reaches here.
+                    if (isAsrStatus && statusIncidentId) {
+                        tearDownBlockedVoiceRoute();
+                        showAsrIncidentToast(
+                            statusIncidentId,
+                            formatAsrFailureMessage(
+                                window.t
+                                    ? window.t('microphone.independentAsrRuntimeFailed')
+                                    : 'Independent ASR stopped because of a runtime error. Please restart the microphone.',
+                                statusReasonCode
+                            ),
                             5000
                         );
                         return;

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+import uuid
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -192,6 +194,8 @@ _MAX_BUFFERED_PROVIDER_SPEAKER_SPANS = 8
 _MAX_PROVIDER_BOUNDARY_SNAPSHOTS = 8
 _MAX_DEFERRED_PROVIDER_SPEAKER_LEASE_EVENTS = 8
 _MAX_SPEAKER_EVIDENCE_BRIDGE_RECORDS = 256
+_ASR_REASON_CODE_RE = re.compile(r"^(ASR_[A-Z0-9_]{1,60})(?::|$)")
+_ASR_REASON_CODE_FULL_RE = re.compile(r"^ASR_[A-Z0-9_]{1,60}$")
 _PROVIDER_MICRO_EVENT_SHADOW_CONFIG = ProviderMicroEventConfig(
     mode="shadow",
     calibration_revision=None,
@@ -295,6 +299,25 @@ def _uses_smart_turn_endpointing(provider_policy: Any) -> bool:
     """Honor the endpoint authority independently of transport shape."""
 
     return bool(provider_policy.endpoint_authority == "smart_turn")
+
+
+def _extract_asr_reason_code(value: Any, *, fallback: Any) -> str:
+    """Return only a bounded ASR code, never provider error text."""
+
+    try:
+        candidate = str(value).strip()
+    except Exception:
+        candidate = ""
+    match = _ASR_REASON_CODE_RE.match(candidate)
+    if match is not None:
+        return match.group(1)
+    try:
+        fallback_code = str(fallback).strip()
+    except Exception:
+        fallback_code = ""
+    if _ASR_REASON_CODE_FULL_RE.fullmatch(fallback_code) is not None:
+        return fallback_code
+    return "ASR_INDEPENDENT_FAILED"
 
 
 class AsrStartStatus(Enum):
@@ -5932,14 +5955,20 @@ class IndependentAsrRuntime:
                     callback=handle,
                 )
 
-            async def on_error(_message: str) -> None:
+            async def on_error(message: str) -> None:
                 if not is_adopted_candidate():
                     return
+                reason_code = _extract_asr_reason_code(
+                    message,
+                    fallback="ASR_INDEPENDENT_FAILED",
+                )
                 await self._run_provider_callback(
                     session_ref=candidate_session,
                     session_epoch=epoch,
                     callback=lambda: self._handle_independent_asr_error(
-                        epoch, candidate_provider
+                        epoch,
+                        candidate_provider,
+                        reason_code=reason_code,
                     ),
                 )
 
@@ -6299,7 +6328,7 @@ class IndependentAsrRuntime:
             if asr_session is not None:
                 await self._close_asr_session(asr_session)
             raise
-        except Exception:
+        except Exception as exc:
             if detector_ref is not None and self._asr_detector is detector_ref:
                 self._asr_detector = None
                 try:
@@ -6316,12 +6345,19 @@ class IndependentAsrRuntime:
                     if policy.connect_max_attempts > 1
                     else "ASR_INDEPENDENT_FAILED"
                 )
+                reason_code = _extract_asr_reason_code(
+                    exc,
+                    fallback=failure_code,
+                )
+                incident_id = f"asr-failure-{uuid.uuid4().hex}"
                 failure_identity = self._capture_runtime_identity()
                 delivered = await self._send_asr_status(
                     failure_code,
                     provider,
                     session_epoch=epoch,
                     expected_identity=failure_identity,
+                    reason_code=reason_code,
+                    incident_id=incident_id,
                 )
                 if not delivered or not operation_is_current():
                     return stale_result(provider)
@@ -9882,6 +9918,7 @@ class IndependentAsrRuntime:
         *,
         status_code: str = "ASR_INDEPENDENT_FAILED",
         expected_identity: _AsrRuntimeIdentity | None = None,
+        reason_code: str | None = None,
     ) -> None:
         if epoch != self._asr_session_epoch or (
             expected_identity is not None
@@ -9893,6 +9930,24 @@ class IndependentAsrRuntime:
         self._asr_session_epoch += 1
         failure_epoch = self._asr_session_epoch
         self._asr_audio_generation += 1
+        try:
+            explicit_reason = str(reason_code).strip()
+        except Exception:
+            explicit_reason = ""
+        try:
+            status_reason = str(status_code).strip()
+        except Exception:
+            status_reason = ""
+        effective_reason = (
+            explicit_reason
+            if _ASR_REASON_CODE_FULL_RE.fullmatch(explicit_reason) is not None
+            else (
+                status_reason
+                if _ASR_REASON_CODE_FULL_RE.fullmatch(status_reason) is not None
+                else "ASR_INDEPENDENT_FAILED"
+            )
+        )
+        incident_id = f"asr-failure-{uuid.uuid4().hex}"
         transcript_dispatcher = self._asr_transcript_dispatcher
         detector_dispatcher = self._asr_detector_dispatcher
         audio_dispatcher = self._asr_audio_dispatcher
@@ -9958,6 +10013,8 @@ class IndependentAsrRuntime:
                 provider=provider,
                 session_epoch=failure_epoch,
                 expected_identity=failure_identity,
+                reason_code=effective_reason,
+                incident_id=incident_id,
             )
             if not delivered or not self._runtime_identity_matches(failure_identity):
                 return
@@ -9981,6 +10038,8 @@ class IndependentAsrRuntime:
                 provider,
                 session_epoch=failure_epoch,
                 expected_identity=failure_identity,
+                reason_code=effective_reason,
+                incident_id=incident_id,
             )
         finally:
             # A dispatcher can report its own failure from inside its worker.
