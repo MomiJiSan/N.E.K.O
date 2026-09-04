@@ -180,6 +180,7 @@ class _RejectionDetector:
         self.release_deferred_turn = AsyncMock()
         self.release_speaker_candidate_binding = MagicMock(return_value=True)
         self.endpointing_ready = MagicMock(return_value=True)
+        self.prepare_deny_rearm = AsyncMock(return_value=True)
         self.observe_provider_audio_ordered = AsyncMock(
             side_effect=self._observe_provider_audio_ordered
         )
@@ -3893,6 +3894,405 @@ async def test_deny_rearm_rejects_gap_then_arms_on_contiguous_silero_pause() -> 
         ingress_token=turn_token.ingress,
     )
     assert runtime._asr_deny_transport_state is DenyTransportState.ARMED
+    detector.prepare_deny_rearm.assert_awaited_once_with(
+        cleanup_generation=runtime._asr_deny_cleanup_generation,
+        cutoff_sequence=12,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_rearm_silence_then_onset_forwards_same_frame() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    onset_identity = DetectorIngressIdentity(
+        ingress_token=turn_token.ingress,
+        detector_epoch=detector.detector_epoch,
+        sequence_no=2,
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=(
+            DetectorFeedResult(
+                events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
+                throttle_available=True,
+            ),
+            DetectorFeedResult(
+                events=(SpeechActivityEvent.SPEECH_RESUMED,),
+                throttle_available=True,
+            ),
+            DetectorFeedResult(
+                events=(SpeechActivityEvent.SPEECH_RESUMED,),
+                throttle_available=True,
+                identity=onset_identity,
+                candidate=DetectorCandidateKey(detector.detector_epoch, 11),
+            ),
+        )
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+    runtime._asr_rearm_cutoff_sequence = 0
+    runtime._asr_rearm_last_sequence = 0
+    runtime._asr_rearm_last_captured_at = 0.0
+
+    silence = await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x00\x00" * 160,
+            16_000,
+            0.0,
+            False,
+            ingress_sequence=1,
+            captured_at=1.0,
+        ),
+        ingress_token=turn_token.ingress,
+    )
+    owner_pcm = b"\x21\x00" * 160
+    owner = await runtime.submit(
+        ProcessedVoiceFrame(
+            owner_pcm,
+            16_000,
+            0.9,
+            True,
+            ingress_sequence=2,
+            captured_at=2.0,
+        ),
+        ingress_token=turn_token.ingress,
+    )
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    assert silence.status is AsrSubmitStatus.ACCEPTED
+    assert owner.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    assert detector.feed.await_count == 3
+    assert detector.feed.await_args_list[1].args[0] == owner_pcm
+    assert detector.feed.await_args_list[2].args[0] == owner_pcm
+    session.stream_audio.assert_awaited()
+    assert owner_pcm in session.stream_audio.await_args.args[0]
+    await _close_dispatchers(runtime)
+
+
+async def test_formal_deny_cleanup_rearms_rebuilt_session_for_owner_frame() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    denied_detector = _RejectionDetector()
+    denied_session, lifecycle, denied_turn = _install_active_candidate(
+        runtime,
+        denied_detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    await runtime._asr_admission_ingress.start()
+    runtime._asr_admission_ingress_started = True
+    assert await runtime._arm_speaker_authority_for_provider_audio(denied_turn)
+    denied_candidate = runtime._asr_current_speaker_candidate
+    assert denied_candidate is not None
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(denied_candidate, 1, SpeakerCheckpointKind.FIRST),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert runtime._accept_speaker_evidence_fact(
+        SpeakerLow(denied_candidate, 2, SpeakerCheckpointKind.SECOND),
+        activation_generation="profile-generation",
+        enforce=True,
+    )
+    assert await runtime._handle_provider_utterance_started(
+        ProviderUtteranceStartedNotification(0, 0, 1),
+        runtime._asr_session_epoch,
+    )
+    await _drain_runtime_admission(runtime)
+
+    assert denied_session.close.await_count == 1
+    assert runtime._asr_session is None
+    assert lifecycle.snapshot.state is VoiceLifecycleState.LOCAL_LISTEN
+    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
+
+    owner_detector = _RejectionDetector()
+    runtime._asr_session_epoch += 1
+    owner_session, _owner_lifecycle, owner_turn = _install_active_candidate(
+        runtime,
+        owner_detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    owner_identity = DetectorIngressIdentity(
+        ingress_token=owner_turn.ingress,
+        detector_epoch=owner_detector.detector_epoch,
+        sequence_no=2,
+    )
+    owner_detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=(
+            DetectorFeedResult(
+                events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
+                throttle_available=True,
+            ),
+            DetectorFeedResult(
+                events=(SpeechActivityEvent.SPEECH_STARTED,),
+                throttle_available=True,
+            ),
+            DetectorFeedResult(
+                events=(SpeechActivityEvent.SPEECH_STARTED,),
+                throttle_available=True,
+                identity=owner_identity,
+                candidate=DetectorCandidateKey(owner_detector.detector_epoch, 0),
+            ),
+        )
+    )
+
+    await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x00\x00" * 160,
+            16_000,
+            0.0,
+            False,
+            ingress_sequence=1,
+            captured_at=1.0,
+        ),
+        ingress_token=owner_turn.ingress,
+    )
+    assert runtime._asr_deny_transport_state is DenyTransportState.ARMED
+    owner_pcm = b"\x2a\x00" * 160
+    submitted = await runtime.submit(
+        ProcessedVoiceFrame(
+            owner_pcm,
+            16_000,
+            0.9,
+            True,
+            ingress_sequence=2,
+            captured_at=2.0,
+        ),
+        ingress_token=owner_turn.ingress,
+    )
+    await runtime._asr_audio_dispatcher.wait_idle()
+
+    assert submitted.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
+    assert owner_detector.feed.await_args_list[1].args[0] == owner_pcm
+    assert owner_detector.feed.await_args_list[2].args[0] == owner_pcm
+    owner_session.stream_audio.assert_awaited()
+    assert owner_pcm in owner_session.stream_audio.await_args.args[0]
+    assert runtime._callbacks.on_partial.await_count == 0
+    assert runtime._callbacks.on_final.await_count == 0
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_rearm_stale_high_sequence_cannot_poison_current_ingress() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
+            throttle_available=True,
+        )
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+    runtime._asr_rearm_cutoff_sequence = 10
+    runtime._asr_rearm_last_sequence = 10
+    runtime._asr_rearm_last_captured_at = 10.0
+    runtime._asr_last_ingress_sequence = 10
+    runtime._asr_last_captured_at = 10.0
+    current = turn_token.ingress
+    stale = VoiceIngressToken(
+        session_epoch=current.session_epoch,
+        connection_id="old-connection",
+        lease_generation=max(0, current.lease_generation - 1),
+        route_generation=max(0, current.route_generation - 1),
+        audio_generation=current.audio_generation,
+    )
+
+    stale_result = await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x7f\x00" * 160,
+            16_000,
+            0.0,
+            False,
+            ingress_sequence=999,
+            captured_at=999.0,
+        ),
+        ingress_token=stale,
+    )
+    current_result = await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x00\x00" * 160,
+            16_000,
+            0.0,
+            False,
+            ingress_sequence=11,
+            captured_at=11.0,
+        ),
+        ingress_token=current,
+    )
+
+    assert stale_result.status is AsrSubmitStatus.STALE
+    assert current_result.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_last_ingress_sequence == 11
+    assert runtime._asr_rearm_cutoff_sequence == 10
+    assert runtime._asr_deny_transport_state is DenyTransportState.ARMED
+    detector.feed.assert_awaited_once()
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_rearm_late_prepare_cannot_arm_new_cleanup() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    prepare_entered = asyncio.Event()
+    prepare_release = asyncio.Event()
+
+    async def block_prepare(**_kwargs) -> bool:
+        prepare_entered.set()
+        await prepare_release.wait()
+        return True
+
+    detector.prepare_deny_rearm.side_effect = block_prepare
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
+            throttle_available=True,
+        )
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+    runtime._asr_rearm_cutoff_sequence = 0
+    runtime._asr_rearm_last_sequence = 0
+    runtime._asr_rearm_last_captured_at = 0.0
+
+    pending = asyncio.create_task(
+        runtime.submit(
+            ProcessedVoiceFrame(
+                b"\x00\x00" * 160,
+                16_000,
+                0.0,
+                False,
+                ingress_sequence=1,
+                captured_at=1.0,
+            ),
+            ingress_token=turn_token.ingress,
+        )
+    )
+    await asyncio.wait_for(prepare_entered.wait(), 1)
+    runtime._asr_deny_cleanup_generation += 1
+    runtime._asr_rearm_cutoff_sequence = 1
+    prepare_release.set()
+    result = await asyncio.wait_for(pending, 1)
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
+    detector.feed.assert_not_awaited()
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_rearm_late_feed_from_replaced_detector_cannot_arm() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    _session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    feed_entered = asyncio.Event()
+    feed_release = asyncio.Event()
+
+    async def block_feed(*_args, **_kwargs) -> DetectorFeedResult:
+        feed_entered.set()
+        await feed_release.wait()
+        return DetectorFeedResult(
+            events=(SpeechActivityEvent.CANDIDATE_PAUSE,),
+            throttle_available=True,
+        )
+
+    detector.feed = AsyncMock(side_effect=block_feed)  # type: ignore[attr-defined]
+    runtime._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
+    runtime._asr_rearm_cutoff_sequence = 0
+    runtime._asr_rearm_last_sequence = 0
+    runtime._asr_rearm_last_captured_at = 0.0
+
+    pending = asyncio.create_task(
+        runtime.submit(
+            ProcessedVoiceFrame(
+                b"\x00\x00" * 160,
+                16_000,
+                0.0,
+                False,
+                ingress_sequence=1,
+                captured_at=1.0,
+            ),
+            ingress_token=turn_token.ingress,
+        )
+    )
+    await asyncio.wait_for(feed_entered.wait(), 1)
+    runtime._asr_detector = _RejectionDetector()
+    feed_release.set()
+    result = await asyncio.wait_for(pending, 1)
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE
+    runtime._asr_deny_transport_state = DenyTransportState.OPEN
+    await _close_dispatchers(runtime)
+
+
+async def test_deny_rearm_onset_cannot_forward_after_new_cleanup_takes_over() -> None:
+    runtime = IndependentAsrRuntime(_callbacks())
+    detector = _RejectionDetector()
+    session, _lifecycle, turn_token = _install_active_candidate(
+        runtime,
+        detector,
+        provider="qwen",
+        endpointing_mode="provider",
+    )
+    detector.feed = AsyncMock(  # type: ignore[attr-defined]
+        return_value=DetectorFeedResult(
+            events=(SpeechActivityEvent.SPEECH_RESUMED,),
+            throttle_available=True,
+        )
+    )
+    runtime._asr_deny_transport_state = DenyTransportState.ARMED
+    runtime._asr_rearm_cutoff_sequence = 0
+    runtime._asr_rearm_last_sequence = 0
+    runtime._asr_rearm_last_captured_at = 0.0
+
+    async def supersede_during_activity(*_args, **_kwargs) -> bool:
+        runtime._asr_deny_cleanup_generation += 1
+        runtime._asr_deny_transport_state = DenyTransportState.DENY_FENCED
+        return True
+
+    runtime._handle_independent_asr_activity = AsyncMock(  # type: ignore[method-assign]
+        side_effect=supersede_during_activity
+    )
+
+    result = await runtime.submit(
+        ProcessedVoiceFrame(
+            b"\x2b\x00" * 160,
+            16_000,
+            0.9,
+            True,
+            ingress_sequence=1,
+            captured_at=1.0,
+        ),
+        ingress_token=turn_token.ingress,
+    )
+
+    assert result.status is AsrSubmitStatus.ACCEPTED
+    assert runtime._asr_deny_transport_state is DenyTransportState.DENY_FENCED
+    detector.feed.assert_awaited_once()
+    session.stream_audio.assert_not_awaited()
     runtime._asr_deny_transport_state = DenyTransportState.OPEN
     await _close_dispatchers(runtime)
 

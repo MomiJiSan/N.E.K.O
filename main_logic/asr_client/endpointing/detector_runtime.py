@@ -102,6 +102,7 @@ class _AudioItem:
     pcm16: bytes
     duration_us: int
     detector_identity: DetectorIngressIdentity | None = None
+    deny_rearm_boundary: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +110,12 @@ class _ResetItem:
     identity: _Identity
     completed: asyncio.Future[None]
     requester: asyncio.Task[object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DenyRearmItem:
+    token: tuple[int, int, int]
+    completed: asyncio.Future[bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +149,11 @@ class _CompleteConfirmationItem:
 
 
 _ControlItem: TypeAlias = (
-    _ResetItem | _CloseItem | _EvaluationResultItem | _CompleteConfirmationItem
+    _ResetItem
+    | _DenyRearmItem
+    | _CloseItem
+    | _EvaluationResultItem
+    | _CompleteConfirmationItem
 )
 _QueueItem: TypeAlias = _AudioItem | _ControlItem
 
@@ -297,6 +308,7 @@ class _VoiceTurnAdapter:
         self._commit_dispatched: set[_Identity] = set()
         self._successor_audio_fence: tuple[_Identity, int, _Identity] | None = None
         self._smart_turn_pin_count = 0
+        self._deny_rearm_token: tuple[int, int, int] | None = None
 
     async def start(self) -> None:
         if self._closed:
@@ -345,6 +357,14 @@ class _VoiceTurnAdapter:
     def smart_turn_coalesced_evaluation_count(self) -> int:
         return self._smart_turn_coalesced_evaluation_count
 
+    @property
+    def deny_rearm_token(self) -> tuple[int, int, int] | None:
+        return self._deny_rearm_token
+
+    def consume_deny_rearm(self, token: tuple[int, int, int]) -> None:
+        if self._deny_rearm_token == token:
+            self._deny_rearm_token = None
+
     async def wait_idle(self) -> None:
         """Drain detector work for tests and shutdown; never use per PCM frame."""
 
@@ -379,6 +399,7 @@ class _VoiceTurnAdapter:
         pcm16: bytes,
         sample_rate_hz: int = 16_000,
         detector_identity: DetectorIngressIdentity | None = None,
+        deny_rearm_boundary: bool = False,
     ) -> None:
         if len(pcm16) % 2:
             raise ValueError("ASR_INVALID_PCM: Voice Turn requires PCM16LE")
@@ -418,6 +439,7 @@ class _VoiceTurnAdapter:
                 pcm16,
                 duration_us,
                 detector_identity,
+                deny_rearm_boundary,
             ),
             duration_us=duration_us,
         )
@@ -453,6 +475,14 @@ class _VoiceTurnAdapter:
         if not completed.done():
             completed.cancel()
         raise RuntimeError("ASR_VOICE_TURN_FAILED: adapter stopped during reset")
+
+    async def prepare_deny_rearm(self, token: tuple[int, int, int]) -> bool:
+        """Order a post-deny Silero boundary behind accepted detector audio."""
+
+        self._ensure_running()
+        completed = asyncio.get_running_loop().create_future()
+        self._queue.put_control_nowait(_DenyRearmItem(token, completed))
+        return bool(await asyncio.shield(completed))
 
     async def close(self) -> None:
         close_task = self._close_task
@@ -511,6 +541,11 @@ class _VoiceTurnAdapter:
                     await self._process_reset(item.identity, requester=item.requester)
                     if not item.completed.done():
                         item.completed.set_result(None)
+                    continue
+                if isinstance(item, _DenyRearmItem):
+                    prepared = await self._process_deny_rearm(item.token)
+                    if not item.completed.done():
+                        item.completed.set_result(prepared)
                     continue
                 if isinstance(item, _EvaluationResultItem):
                     await self._process_evaluation_result(item)
@@ -589,7 +624,14 @@ class _VoiceTurnAdapter:
                 pcm16=item.pcm16,
                 duration_us=item.duration_us,
                 detector_identity=item.detector_identity,
+                deny_rearm_boundary=item.deny_rearm_boundary,
             )
+        if item.deny_rearm_boundary:
+            await self._process_deny_rearm_audio(item)
+            return
+        if self._deny_rearm_token is not None:
+            await asyncio.to_thread(self._gate.reset)
+            self._deny_rearm_token = None
         defers_for_evaluation = self._evaluation_task is not None
         if defers_for_evaluation:
             self._evaluation_tail.append(item)
@@ -667,6 +709,31 @@ class _VoiceTurnAdapter:
             "candidate_pause",
             item.detector_identity,
         )
+
+    async def _process_deny_rearm_audio(self, item: _AudioItem) -> None:
+        """Produce only Silero activity for a post-deny boundary frame."""
+
+        if self._vad_degraded:
+            return
+        if not self._vad_load_attempted:
+            self._vad_load_attempted = True
+            try:
+                self._vad_available = bool(await asyncio.to_thread(self._vad.load))
+            except Exception:
+                self._vad_available = False
+        if not self._vad_available:
+            self._vad_degraded = True
+            return
+        try:
+            events = await asyncio.to_thread(self._gate.feed, item.pcm16)
+        except Exception:
+            self._vad_degraded = True
+            return
+        for event in events:
+            if self._on_activity is not None:
+                await self._on_activity(event)
+        if SpeechActivityEvent.CANDIDATE_PAUSE in events:
+            self._deny_rearm_token = None
 
     async def _process_without_vad(self, item: _AudioItem) -> None:
         """Keep SmartTurn authoritative when Silero cannot provide candidates."""
@@ -986,11 +1053,36 @@ class _VoiceTurnAdapter:
         self._smart_turn_audio_evidence.discard()
         await self._coordinator.reset()
         await asyncio.to_thread(self._gate.reset)
+        self._deny_rearm_token = None
         self._commit_dispatched.clear()
         self._fallback_speech_started = False
         self._fallback_audio_bytes = 0
         if self._smart_turn_pin_count == 0:
             self._schedule_smart_turn_unload(identity)
+
+    async def _process_deny_rearm(self, token: tuple[int, int, int]) -> bool:
+        if self._closed or self._failed or self._vad_degraded:
+            return False
+        if self._deny_rearm_token == token:
+            return True
+        if not self._vad_load_attempted:
+            self._vad_load_attempted = True
+            try:
+                self._vad_available = bool(await asyncio.to_thread(self._vad.load))
+            except Exception:
+                self._vad_available = False
+        if not self._vad_available:
+            self._vad_degraded = True
+            return False
+        prepare = getattr(self._gate, "prepare_post_deny_silence_boundary", None)
+        if not callable(prepare):
+            return False
+        try:
+            await asyncio.to_thread(prepare)
+        except Exception:
+            return False
+        self._deny_rearm_token = token
+        return True
 
     async def _process_close(self) -> None:
         await self._publish_pending_complete_before_close()
@@ -1810,6 +1902,8 @@ class DetectorRuntime:
         self._detector_epoch = 0
         self._sequence_no = 0
         self._ingress_token: VoiceIngressToken | None = None
+        self._deny_rearm_token: tuple[int, int, int] | None = None
+        self._deny_rearm_requested_token: tuple[int, int, int] | None = None
         self._candidate_open = False
         self._candidate_generation = 0
         self._bound_turns: dict[DetectorCandidateKey, BoundDetectorTurn] = {}
@@ -3944,6 +4038,157 @@ class DetectorRuntime:
         await self._reset_speaker_shadow(speaker_shadow)
         await self._drain_provider_segment_expiry_tasks()
 
+    def _active_deny_rearm_token(self) -> tuple[int, int, int] | None:
+        token = self._deny_rearm_token
+        adapter = self._semantic_adapter
+        if adapter is not None:
+            adapter_token = adapter.deny_rearm_token
+            token = (
+                adapter_token
+                if adapter_token == self._deny_rearm_requested_token
+                else None
+            )
+        if token is None or token[2] != self._detector_epoch:
+            return None
+        return token
+
+    def _consume_deny_rearm_token(self, token: tuple[int, int, int]) -> None:
+        if self._deny_rearm_token == token:
+            self._deny_rearm_token = None
+        if self._deny_rearm_requested_token == token:
+            self._deny_rearm_requested_token = None
+        adapter = self._semantic_adapter
+        if adapter is not None:
+            adapter.consume_deny_rearm(token)
+
+    async def prepare_deny_rearm(
+        self,
+        *,
+        cleanup_generation: int,
+        cutoff_sequence: int,
+        expected_detector_epoch: int,
+    ) -> bool:
+        """Prepare one ordered, Silero-only post-deny boundary proof."""
+
+        values = (cleanup_generation, cutoff_sequence, expected_detector_epoch)
+        if any(type(value) is not int or value < 0 for value in values):
+            return False
+        token = values
+        adapter: _VoiceTurnAdapter | None = None
+        direct_result: bool | None = None
+        cancelled: asyncio.CancelledError | None = None
+        async with self._lock:
+            if (
+                self._closed
+                or expected_detector_epoch != self._detector_epoch
+                or not self._available
+            ):
+                return False
+            active = self._active_deny_rearm_token()
+            if active == token:
+                return True
+            requested = self._deny_rearm_requested_token
+            if (
+                requested is not None
+                and requested[2] == expected_detector_epoch
+                and token[:2] < requested[:2]
+            ):
+                return False
+            self._deny_rearm_requested_token = token
+            adapter = self._semantic_adapter
+            if adapter is None:
+                if not self._load_attempted:
+                    load_task = asyncio.create_task(
+                        asyncio.to_thread(self._vad.load),
+                        name="detector-runtime-deny-rearm-vad-load",
+                    )
+                    try:
+                        loaded = bool(await asyncio.shield(load_task))
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                        try:
+                            loaded = bool(await asyncio.shield(load_task))
+                        except Exception:
+                            loaded = False
+                    except Exception:
+                        loaded = False
+                    self._load_attempted = True
+                    self._available = loaded
+                if not self._available:
+                    direct_result = False
+                else:
+                    prepare = getattr(
+                        self._gate,
+                        "prepare_post_deny_silence_boundary",
+                        None,
+                    )
+                    if callable(prepare):
+                        try:
+                            prepare()
+                        except Exception:
+                            direct_result = False
+                        else:
+                            direct_result = bool(
+                                self._deny_rearm_requested_token == token
+                            )
+                            if direct_result:
+                                self._deny_rearm_token = token
+                    else:
+                        direct_result = False
+            elif adapter.failed:
+                return False
+
+        if adapter is None:
+            if cancelled is not None:
+                raise cancelled
+            return bool(direct_result)
+
+        try:
+            await self._ensure_semantic_started(adapter)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        async with self._lock:
+            if (
+                self._closed
+                or adapter is not self._semantic_adapter
+                or expected_detector_epoch != self._detector_epoch
+                or self._deny_rearm_requested_token != token
+            ):
+                return False
+
+        operation = asyncio.create_task(
+            adapter.prepare_deny_rearm(token),
+            name="detector-runtime-deny-rearm",
+        )
+        cancelled = None
+        try:
+            prepared = bool(await asyncio.shield(operation))
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            try:
+                prepared = bool(await asyncio.shield(operation))
+            except Exception:
+                prepared = False
+        except Exception:
+            prepared = False
+
+        async with self._lock:
+            valid = bool(
+                prepared
+                and not self._closed
+                and adapter is self._semantic_adapter
+                and expected_detector_epoch == self._detector_epoch
+                and self._deny_rearm_requested_token == token
+                and adapter.deny_rearm_token == token
+            )
+            if valid:
+                self._deny_rearm_token = token
+        if cancelled is not None:
+            raise cancelled
+        return valid
+
     async def feed(
         self,
         pcm16: bytes,
@@ -3964,6 +4209,7 @@ class DetectorRuntime:
             rnnoise_available = speech_probability is not None
         adapter = self._semantic_adapter
         if adapter is not None:
+            deny_rearm_token = self._active_deny_rearm_token()
             self._events.clear()
             effective_ingress = (
                 ingress_token
@@ -4012,6 +4258,12 @@ class DetectorRuntime:
                     throttle_action=submitted.throttle_action,
                 )
             events = tuple(self._events)
+            if (
+                deny_rearm_token is not None
+                and SpeechActivityEvent.CANDIDATE_PAUSE in events
+            ):
+                async with self._lock:
+                    self._consume_deny_rearm_token(deny_rearm_token)
             if any(
                 event
                 in {
@@ -4040,6 +4292,12 @@ class DetectorRuntime:
                     "detector_feed_unavailable_count"
                 ] += 1
                 return DetectorFeedResult((), False)
+            if (
+                self._active_deny_rearm_token() is None
+                and self._deny_rearm_token is not None
+            ):
+                self._gate.reset()
+                self._deny_rearm_token = None
             effective_ingress = ingress_token or VoiceIngressToken(
                 session_epoch=0,
                 connection_id="detector-feed-compat",
@@ -4056,8 +4314,11 @@ class DetectorRuntime:
                 available=bool(rnnoise_available),
             )
             candidate_admission_open = bool(
-                self._candidate_open or self._provider_candidate_fence is not None
+                self._candidate_open
+                or self._provider_candidate_fence is not None
+                or self._active_deny_rearm_token() is not None
             )
+            deny_rearm_token = self._active_deny_rearm_token()
             throttle = self._throttle_policy.decide(
                 evidence,
                 candidate_open=candidate_admission_open,
@@ -4125,7 +4386,8 @@ class DetectorRuntime:
                     False,
                     throttle_action=throttle.action,
                 )
-            self._candidate_open = True
+            if deny_rearm_token is None:
+                self._candidate_open = True
             self._sequence_no += 1
             identity = DetectorIngressIdentity(
                 ingress_token=effective_ingress,
@@ -4136,32 +4398,38 @@ class DetectorRuntime:
                 self._detector_epoch,
                 self._candidate_generation,
             )
-            self._observe_provider_micro_event(
-                candidate,
-                silero=silero_result,
-                events=events,
-                rnnoise=throttle.evidence.rnnoise,
-                onset_threshold=throttle.onset_threshold,
-                chunk_duration_ms=(len(pcm16) * 1_000 + 31_999) // 32_000,
-            )
+            if deny_rearm_token is None:
+                self._observe_provider_micro_event(
+                    candidate,
+                    silero=silero_result,
+                    events=events,
+                    rnnoise=throttle.evidence.rnnoise,
+                    onset_threshold=throttle.onset_threshold,
+                    chunk_duration_ms=(len(pcm16) * 1_000 + 31_999) // 32_000,
+                )
+                if (
+                    throttle.action is ThrottleAction.PREWARM
+                    and self._on_event is not None
+                    and self._policy_event_candidate != candidate
+                ):
+                    self._policy_event_candidate = candidate
+                    await self._on_event(DetectorTransportPrewarmEvent(identity))
+                if any(
+                    event
+                    in {
+                        SpeechActivityEvent.SPEECH_STARTED,
+                        SpeechActivityEvent.SPEECH_RESUMED,
+                    }
+                    for event in events
+                ):
+                    self._speech_active = True
+                for event in events:
+                    self._throttle_policy.observe_silero(event)
             if (
-                throttle.action is ThrottleAction.PREWARM
-                and self._on_event is not None
-                and self._policy_event_candidate != candidate
+                deny_rearm_token is not None
+                and SpeechActivityEvent.CANDIDATE_PAUSE in events
             ):
-                self._policy_event_candidate = candidate
-                await self._on_event(DetectorTransportPrewarmEvent(identity))
-            if any(
-                event
-                in {
-                    SpeechActivityEvent.SPEECH_STARTED,
-                    SpeechActivityEvent.SPEECH_RESUMED,
-                }
-                for event in events
-            ):
-                self._speech_active = True
-            for event in events:
-                self._throttle_policy.observe_silero(event)
+                self._consume_deny_rearm_token(deny_rearm_token)
         return DetectorFeedResult(
             events,
             True,
@@ -5451,9 +5719,10 @@ class DetectorRuntime:
             speech_probability,
             available=rnnoise_available,
         )
+        deny_rearm_token = self._active_deny_rearm_token()
         throttle = self._throttle_policy.decide(
             evidence,
-            candidate_open=self._candidate_open,
+            candidate_open=bool(self._candidate_open or deny_rearm_token is not None),
             allow_baseline_update=allow_baseline_update,
         )
         if throttle.action is ThrottleAction.SKIP_IDLE_PCM:
@@ -5464,7 +5733,8 @@ class DetectorRuntime:
                 None,
                 throttle.action,
             )
-        self._candidate_open = True
+        if deny_rearm_token is None:
+            self._candidate_open = True
         await self._ensure_semantic_started(adapter)
         next_sequence = self._sequence_no + 1
         identity = DetectorIngressIdentity(
@@ -5480,6 +5750,7 @@ class DetectorRuntime:
                 pcm16=pcm16,
                 sample_rate_hz=sample_rate_hz,
                 detector_identity=identity,
+                deny_rearm_boundary=deny_rearm_token is not None,
             )
         except asyncio.QueueFull:
             self._detector_epoch += 1
@@ -5528,7 +5799,8 @@ class DetectorRuntime:
         )
         control_event_emitted = False
         if (
-            self._on_event is not None
+            deny_rearm_token is None
+            and self._on_event is not None
             and self._policy_event_candidate != candidate
             and throttle.action in {ThrottleAction.PREWARM, ThrottleAction.PROCESS_PCM}
         ):

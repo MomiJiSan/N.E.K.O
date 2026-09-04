@@ -2,6 +2,8 @@
 
 > **状态：Current contract。** 本文记录桌面端 Owner 声纹录入、音频处理域、独立验证和 Profile 提交的当前行为。代码与测试始终具有最终权威；历史 Phase 4C 文档只描述各阶段当时的边界，不覆盖本文。
 
+正式声纹拒绝完成安全清理后的独立 ASR 恢复由 [Owner 声纹拒绝后的 ASR 恢复合同](./owner-voice-identity-deny-recovery-contract) 约束；该运行时合同不改变本文的录入、验证、Profile 提交或热加载行为。
+
 ## 1. 目标与适用范围
 
 本合同解决两个问题：

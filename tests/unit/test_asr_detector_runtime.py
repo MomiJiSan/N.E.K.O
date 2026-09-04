@@ -20,6 +20,7 @@ from main_logic.asr_client.endpointing.detector_runtime import (
     _ResetItem,
     _VoiceTurnAdapter,
 )
+from main_logic.asr_client.endpointing.config import SmartTurnConfig
 from main_logic.asr_client.endpointing.detector import (
     DetectorActivityEvent,
     DetectorCandidateKey,
@@ -33,7 +34,10 @@ from main_logic.asr_client.endpointing.detector import (
 from main_logic.asr_client.endpointing.micro_event_policy import (
     ProviderMicroEventConfig,
 )
-from main_logic.asr_client.endpointing.silero_vad import SileroFeedResult
+from main_logic.asr_client.endpointing.silero_vad import (
+    SileroActivityGate,
+    SileroFeedResult,
+)
 from main_logic.asr_client.lifecycle import (
     VoiceIngressToken,
     VoiceInputLifecycleController,
@@ -83,6 +87,14 @@ class _Vad:
         self.closed = True
 
 
+class _SileroVadStub:
+    def __init__(self) -> None:
+        self.reset_calls = 0
+
+    def reset_stream(self) -> None:
+        self.reset_calls += 1
+
+
 class _Gate:
     def __init__(self, events=()) -> None:
         self.events = tuple(events)
@@ -94,6 +106,39 @@ class _Gate:
 
     def reset(self) -> None:
         return None
+
+
+class _DenyRearmGate(_Gate):
+    def __init__(self, events=()) -> None:
+        super().__init__(events)
+        self.prepare_calls = 0
+        self.operations: list[str] = []
+        self.prepare_started = asyncio.Event()
+        self.prepare_error: Exception | None = None
+
+    def feed(self, pcm16: bytes):
+        self.operations.append("audio")
+        return super().feed(pcm16)
+
+    def prepare_post_deny_silence_boundary(self) -> None:
+        self.prepare_calls += 1
+        self.operations.append("prepare")
+        self.prepare_started.set()
+        if self.prepare_error is not None:
+            raise self.prepare_error
+
+
+class _BlockingDenyRearmGate(_DenyRearmGate):
+    def __init__(self) -> None:
+        super().__init__()
+        self.feed_started = threading.Event()
+        self.feed_release = threading.Event()
+
+    def feed(self, pcm16: bytes):
+        self.feed_started.set()
+        if not self.feed_release.wait(timeout=2):
+            raise TimeoutError("test did not release blocked Silero feed")
+        return super().feed(pcm16)
 
 
 class _LowScoreSpeakerBackendFactory:
@@ -6952,3 +6997,238 @@ async def test_provider_micro_event_reset_and_close_clear_sealed_snapshot() -> N
     assert close_fence is not None
     await close_detector.close()
     assert close_detector.sealed_provider_micro_event_decision(close_fence) is None
+
+
+def _post_deny_silero_gate() -> SileroActivityGate:
+    return SileroActivityGate(
+        _SileroVadStub(),  # type: ignore[arg-type]
+        SmartTurnConfig(enabled=True),
+    )
+
+
+async def test_detector_deny_rearm_prepare_is_idempotent_per_identity() -> None:
+    gate = _DenyRearmGate()
+    detector = DetectorRuntime(vad=_Vad(), gate=gate)
+
+    first = await detector.prepare_deny_rearm(
+        cleanup_generation=3,
+        cutoff_sequence=17,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+    duplicate = await detector.prepare_deny_rearm(
+        cleanup_generation=3,
+        cutoff_sequence=17,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+    new_cutoff = await detector.prepare_deny_rearm(
+        cleanup_generation=3,
+        cutoff_sequence=18,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+    new_cleanup = await detector.prepare_deny_rearm(
+        cleanup_generation=4,
+        cutoff_sequence=18,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    assert (first, duplicate, new_cutoff, new_cleanup) == (True, True, True, True)
+    assert gate.prepare_calls == 3
+    await detector.close()
+
+
+async def test_detector_deny_rearm_rejects_stale_epoch_and_closed_runtime() -> None:
+    gate = _DenyRearmGate()
+    detector = DetectorRuntime(vad=_Vad(), gate=gate)
+
+    stale = await detector.prepare_deny_rearm(
+        cleanup_generation=1,
+        cutoff_sequence=0,
+        expected_detector_epoch=detector.detector_epoch + 1,
+    )
+    await detector.close()
+    closed = await detector.prepare_deny_rearm(
+        cleanup_generation=1,
+        cutoff_sequence=0,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    assert stale is False
+    assert closed is False
+    assert gate.prepare_calls == 0
+
+
+async def test_detector_deny_rearm_fails_closed_when_silero_is_unavailable() -> None:
+    detector = DetectorRuntime(vad=_Vad(available=False), gate=_DenyRearmGate())
+
+    prepared = await detector.prepare_deny_rearm(
+        cleanup_generation=1,
+        cutoff_sequence=0,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    assert prepared is False
+    await detector.close()
+
+
+async def test_detector_deny_rearm_fails_closed_on_gate_exception() -> None:
+    gate = _DenyRearmGate()
+    gate.prepare_error = RuntimeError("forced gate failure")
+    detector = DetectorRuntime(vad=_Vad(), gate=gate)
+
+    prepared = await detector.prepare_deny_rearm(
+        cleanup_generation=1,
+        cutoff_sequence=0,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    assert prepared is False
+    assert gate.prepare_calls == 1
+    await detector.close()
+
+
+async def test_semantic_deny_rearm_prepare_is_ordered_after_admitted_audio() -> None:
+    gate = _DenyRearmGate()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_smart_turn_policy(),
+        coordinator=_SemanticCoordinator(),
+        on_turn_complete=AsyncMock(),
+    )
+
+    submitted = await detector.submit_audio(
+        b"\x01\x00" * 160,
+        ingress_token=_ingress_token(),
+        sample_rate_hz=16_000,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    prepared = await detector.prepare_deny_rearm(
+        cleanup_generation=1,
+        cutoff_sequence=1,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    assert submitted.status is DetectorSubmitStatus.ACCEPTED
+    assert prepared is True
+    assert gate.operations == ["audio", "prepare"]
+    await detector.close()
+
+
+async def test_semantic_deny_rearm_audio_emits_no_normal_control_event() -> None:
+    on_event = AsyncMock()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_DenyRearmGate(),
+        resource_optimization_enabled=False,
+        provider_policy=_smart_turn_policy(),
+        coordinator=_SemanticCoordinator(),
+        on_event=on_event,
+    )
+    prepared = await detector.prepare_deny_rearm(
+        cleanup_generation=1,
+        cutoff_sequence=0,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    submitted = await detector.submit_audio(
+        b"\x00\x00" * 160,
+        ingress_token=_ingress_token(),
+        sample_rate_hz=16_000,
+        speech_probability=0.0,
+        rnnoise_available=True,
+    )
+
+    assert prepared is True
+    assert submitted.status is DetectorSubmitStatus.ACCEPTED
+    assert submitted.control_event_emitted is False
+    assert detector.candidate_open is False
+    on_event.assert_not_awaited()
+    await detector.close()
+
+
+async def test_semantic_deny_rearm_cancel_completes_or_leaves_no_partial_token() -> (
+    None
+):
+    gate = _BlockingDenyRearmGate()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=gate,
+        provider_policy=_smart_turn_policy(),
+        coordinator=_SemanticCoordinator(),
+        on_turn_complete=AsyncMock(),
+    )
+    submitted = await detector.submit_audio(
+        b"\x01\x00" * 160,
+        ingress_token=_ingress_token(),
+        sample_rate_hz=16_000,
+        speech_probability=0.9,
+        rnnoise_available=True,
+    )
+    assert submitted.status is DetectorSubmitStatus.ACCEPTED
+    assert await asyncio.to_thread(gate.feed_started.wait, 1)
+    preparation = asyncio.create_task(
+        detector.prepare_deny_rearm(
+            cleanup_generation=5,
+            cutoff_sequence=8,
+            expected_detector_epoch=detector.detector_epoch,
+        )
+    )
+    await asyncio.sleep(0)
+    preparation.cancel()
+    gate.feed_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(preparation, 1)
+    retry = await detector.prepare_deny_rearm(
+        cleanup_generation=5,
+        cutoff_sequence=8,
+        expected_detector_epoch=detector.detector_epoch,
+    )
+
+    assert retry is True
+    assert gate.prepare_calls == 1
+    assert gate.operations == ["audio", "prepare"]
+    await detector.close()
+
+
+def test_silero_deny_rearm_accepts_initial_continuous_silence_boundary() -> None:
+    gate = _post_deny_silero_gate()
+    gate.prepare_post_deny_silence_boundary()
+
+    result = gate.process_probabilities([0.0] * 10)
+
+    assert result == (SpeechActivityEvent.CANDIDATE_PAUSE,)
+
+
+def test_silero_deny_rearm_requires_complete_silence_window() -> None:
+    gate = _post_deny_silero_gate()
+    gate.prepare_post_deny_silence_boundary()
+
+    result = gate.process_probabilities([0.0] * 9)
+
+    assert result == ()
+
+
+@pytest.mark.parametrize("interruption_probability", [0.5, 0.4])
+def test_silero_deny_rearm_interruption_restarts_silence_proof(
+    interruption_probability: float,
+) -> None:
+    gate = _post_deny_silero_gate()
+    gate.prepare_post_deny_silence_boundary()
+
+    interrupted = gate.process_probabilities(
+        [0.0] * 5 + [interruption_probability] + [0.0] * 5
+    )
+    completed = gate.process_probabilities([0.0] * 5)
+
+    assert interrupted == ()
+    assert completed == (SpeechActivityEvent.CANDIDATE_PAUSE,)
+
+
+def test_silero_normal_initial_silence_remains_event_free() -> None:
+    gate = _post_deny_silero_gate()
+
+    result = gate.process_probabilities([0.0] * 20)
+
+    assert result == ()

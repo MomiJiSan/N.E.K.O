@@ -6738,6 +6738,36 @@ class IndependentAsrRuntime:
             self._asr_last_captured_at = float(captured_at)
         return valid
 
+    def _deny_rearm_identity_matches(
+        self,
+        *,
+        cleanup_generation: int,
+        session_epoch: int,
+        detector: DetectorRuntime,
+        detector_epoch: int,
+        lifecycle: VoiceInputLifecycleController,
+        ingress_token: VoiceIngressToken,
+        cutoff_sequence: int,
+        state: DenyTransportState,
+        last_sequence: int,
+        last_captured_at: float,
+    ) -> bool:
+        """Confirm that one post-DENY detector operation still owns re-arm."""
+
+        return bool(
+            self._asr_deny_cleanup_generation == cleanup_generation
+            and self._asr_session_epoch == session_epoch
+            and self._asr_detector is detector
+            and detector.detector_epoch == detector_epoch
+            and self._asr_lifecycle is lifecycle
+            and self._asr_current_ingress_token == ingress_token
+            and self._ingress_token_matches(ingress_token)
+            and self._asr_rearm_cutoff_sequence == cutoff_sequence
+            and self._asr_deny_transport_state is state
+            and self._asr_rearm_last_sequence == last_sequence
+            and self._asr_rearm_last_captured_at == last_captured_at
+        )
+
     async def _submit_deny_rearm_frame(
         self,
         frame: ProcessedVoiceFrame,
@@ -6748,25 +6778,79 @@ class IndependentAsrRuntime:
         """Use only contiguous post-cleanup Silero facts to re-arm egress."""
 
         sequence = frame.ingress_sequence
-        captured_at = float(frame.captured_at)
+        captured_at = frame.captured_at
+        captured_at_valid = bool(
+            isinstance(captured_at, (int, float))
+            and not isinstance(captured_at, bool)
+            and captured_at > 0
+        )
+        effective_captured_at = float(captured_at) if captured_at_valid else 0.0
+        previous_sequence = self._asr_rearm_last_sequence
+        previous_captured_at = self._asr_rearm_last_captured_at
         contiguous = bool(
             identity_valid
             and sequence > self._asr_rearm_cutoff_sequence
-            and sequence == self._asr_rearm_last_sequence + 1
-            and captured_at > self._asr_rearm_last_captured_at
+            and sequence == previous_sequence + 1
+            and effective_captured_at > previous_captured_at
         )
         if not contiguous:
-            if identity_valid:
-                self._asr_rearm_cutoff_sequence = sequence
-                self._asr_rearm_last_sequence = sequence
-                self._asr_rearm_last_captured_at = captured_at
+            valid_sequence = (
+                sequence if type(sequence) is int and sequence > 0 else 0
+            )
+            cutoff_sequence = max(
+                self._asr_rearm_cutoff_sequence,
+                self._asr_rearm_last_sequence,
+                self._asr_last_ingress_sequence,
+                valid_sequence,
+            )
+            self._asr_rearm_cutoff_sequence = cutoff_sequence
+            self._asr_rearm_last_sequence = cutoff_sequence
+            self._asr_rearm_last_captured_at = max(
+                self._asr_rearm_last_captured_at,
+                self._asr_last_captured_at,
+                effective_captured_at if identity_valid else 0.0,
+            )
+            self._asr_deny_transport_state = DenyTransportState.WAIT_SILENCE
             return False
-        self._asr_rearm_last_sequence = sequence
-        self._asr_rearm_last_captured_at = captured_at
         detector = self._asr_detector
         lifecycle = self._asr_lifecycle
         if detector is None or lifecycle is None:
             return False
+        cleanup_generation = self._asr_deny_cleanup_generation
+        session_epoch = self._asr_session_epoch
+        detector_epoch = detector.detector_epoch
+        cutoff_sequence = self._asr_rearm_cutoff_sequence
+        state = self._asr_deny_transport_state
+        if state not in {
+            DenyTransportState.WAIT_SILENCE,
+            DenyTransportState.ARMED,
+        }:
+            return False
+
+        if state is DenyTransportState.WAIT_SILENCE:
+            try:
+                prepared = await detector.prepare_deny_rearm(
+                    cleanup_generation=cleanup_generation,
+                    cutoff_sequence=cutoff_sequence,
+                    expected_detector_epoch=detector_epoch,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return False
+            if not prepared or not self._deny_rearm_identity_matches(
+                cleanup_generation=cleanup_generation,
+                session_epoch=session_epoch,
+                detector=detector,
+                detector_epoch=detector_epoch,
+                lifecycle=lifecycle,
+                ingress_token=ingress_token,
+                cutoff_sequence=cutoff_sequence,
+                state=state,
+                last_sequence=previous_sequence,
+                last_captured_at=previous_captured_at,
+            ):
+                return False
         try:
             result = await detector.feed(
                 frame.pcm16,
@@ -6778,10 +6862,25 @@ class IndependentAsrRuntime:
             )
         except Exception:
             return False
+        if not self._deny_rearm_identity_matches(
+            cleanup_generation=cleanup_generation,
+            session_epoch=session_epoch,
+            detector=detector,
+            detector_epoch=detector_epoch,
+            lifecycle=lifecycle,
+            ingress_token=ingress_token,
+            cutoff_sequence=cutoff_sequence,
+            state=state,
+            last_sequence=previous_sequence,
+            last_captured_at=previous_captured_at,
+        ):
+            return False
         if not result.endpointing_available:
             return False
+        self._asr_rearm_last_sequence = sequence
+        self._asr_rearm_last_captured_at = effective_captured_at
         events = tuple(result.events)
-        if self._asr_deny_transport_state is DenyTransportState.WAIT_SILENCE:
+        if state is DenyTransportState.WAIT_SILENCE:
             if SpeechActivityEvent.CANDIDATE_PAUSE not in events:
                 return False
             self._asr_deny_transport_state = DenyTransportState.ARMED
@@ -6810,9 +6909,19 @@ class IndependentAsrRuntime:
         self._asr_deny_cleanup_active = False
         await self._handle_independent_asr_activity(
             onset,
-            self._asr_session_epoch,
+            session_epoch,
         )
-        return True
+        return bool(
+            self._asr_deny_cleanup_generation == cleanup_generation
+            and self._asr_session_epoch == session_epoch
+            and self._asr_detector is detector
+            and detector.detector_epoch == detector_epoch
+            and self._asr_lifecycle is lifecycle
+            and self._asr_current_ingress_token == ingress_token
+            and self._ingress_token_matches(ingress_token)
+            and self._asr_rearm_cutoff_sequence == cutoff_sequence
+            and self._asr_deny_transport_state is DenyTransportState.OPEN
+        )
 
     async def submit(
         self,
@@ -6823,8 +6932,6 @@ class IndependentAsrRuntime:
         """Submit one normalized frame to the independent-ASR hard route."""
 
         self._ensure_asr_runtime_state()
-        identity_valid = self._capture_frame_identity_is_new(frame)
-        deny_cleanup_generation = self._asr_deny_cleanup_generation
         if self._asr_deny_transport_state in {
             DenyTransportState.DENY_FENCED,
             DenyTransportState.RETIRING,
@@ -6835,7 +6942,34 @@ class IndependentAsrRuntime:
             return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
         if not self._ingress_token_matches(ingress_token):
             return AsrSubmitResult(AsrSubmitStatus.STALE)
+        previous_ingress_token = self._asr_current_ingress_token
+        deny_rearm_pending = self._asr_deny_transport_state in {
+            DenyTransportState.WAIT_SILENCE,
+            DenyTransportState.ARMED,
+        }
+        ingress_identity_changed = bool(
+            deny_rearm_pending
+            and previous_ingress_token is not None
+            and previous_ingress_token != ingress_token
+        )
+        if ingress_identity_changed and previous_ingress_token is not None:
+            previous_order = (
+                previous_ingress_token.route_generation,
+                previous_ingress_token.lease_generation,
+            )
+            incoming_order = (
+                ingress_token.route_generation,
+                ingress_token.lease_generation,
+            )
+            if incoming_order <= previous_order:
+                # A late socket may share the current session/audio epochs.
+                # Reject it before its sequence can poison the new route.
+                return AsrSubmitResult(AsrSubmitStatus.STALE)
         self._asr_current_ingress_token = ingress_token
+        identity_valid = self._capture_frame_identity_is_new(frame)
+        if ingress_identity_changed:
+            identity_valid = False
+        deny_cleanup_generation = self._asr_deny_cleanup_generation
         if self._asr_deny_transport_state in {
             DenyTransportState.WAIT_SILENCE,
             DenyTransportState.ARMED,
@@ -6846,6 +6980,13 @@ class IndependentAsrRuntime:
                 identity_valid=identity_valid,
             )
             if not rearmed:
+                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+            if (
+                self._asr_deny_transport_state is not DenyTransportState.OPEN
+                or self._asr_deny_cleanup_generation != deny_cleanup_generation
+                or self._asr_current_ingress_token != ingress_token
+                or not self._ingress_token_matches(ingress_token)
+            ):
                 return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
         authority_reset_task = self._asr_provider_authority_reset_task
         if authority_reset_task is not None:

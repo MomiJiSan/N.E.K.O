@@ -14,6 +14,7 @@ These documents preserve design intent and implementation context. They are grou
 - [Deep topic hooks](./deep-topic-hooks)
 - [LLM prompt budget](./llm-prompt-budget)
 - [Owner voice identity enrollment and independent verification](./owner-voice-identity-enrollment-contract)
+- [Owner voice identity denial recovery](./owner-voice-identity-deny-recovery-contract)
 - [Proactive reason-code guide](./proactive-reason-code-guide.zh-CN)
 - [User activity tracker](./user-activity-tracker)
 - [Voice design architecture](./voice-design-architecture)

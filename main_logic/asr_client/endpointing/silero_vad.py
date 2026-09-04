@@ -106,6 +106,23 @@ class SileroActivityGate:
         self._silence_windows = 0
         self._speech_confirmed = False
         self._candidate_emitted = False
+        self._post_deny_silence_boundary = False
+
+    def prepare_post_deny_silence_boundary(self) -> None:
+        """Require a fresh Silero-only pause after a denied utterance.
+
+        The denied speech already supplied the logical onset, but its recurrent
+        VAD state must not leak into the replacement detector.  Treat the gate
+        as speech-confirmed solely until a new, uninterrupted silence boundary
+        is emitted.  Normal detector initialization remains unchanged.
+        """
+
+        self._vad.reset_stream()
+        self._speech_windows = 0
+        self._silence_windows = 0
+        self._speech_confirmed = True
+        self._candidate_emitted = False
+        self._post_deny_silence_boundary = True
 
     def feed(self, pcm16_le: bytes) -> tuple[SpeechActivityEvent, ...]:
         return self.feed_with_evidence(pcm16_le).events
@@ -166,9 +183,12 @@ class SileroActivityGate:
                     and self._silence_windows >= self._candidate_silence_windows
                 ):
                     self._candidate_emitted = True
+                    self._post_deny_silence_boundary = False
                     events.append(SpeechActivityEvent.CANDIDATE_PAUSE)
             else:
                 ambiguous_window_count += 1
+                if self._post_deny_silence_boundary:
+                    self._silence_windows = 0
         return SileroFeedResult(
             events=tuple(events),
             window_count=window_count,
