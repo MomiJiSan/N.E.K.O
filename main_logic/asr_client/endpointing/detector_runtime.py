@@ -7027,6 +7027,7 @@ class DetectorRuntime:
         new_shadow: SpeakerShadowObserver | None,
         *,
         owner_generation: str | None,
+        operation=None,
     ) -> None:
         """Atomically replace speaker observation for the next candidate.
 
@@ -7039,7 +7040,27 @@ class DetectorRuntime:
         bounded so verifier cleanup cannot stall endpointing or ASR.
         """
 
+        from ..speaker_verifier_contracts import (
+            SpeakerVerifierInstallOutcome as Outcome,
+            SpeakerVerifierOwnershipState as Ownership,
+        )
+
+        if operation is not None:
+            operation.ownership_state = Ownership.DETECTOR
+
         async def bounded_close(shadow: SpeakerShadowObserver) -> None:
+            if operation is not None:
+                # Typed ownership needs an actual close result; the legacy
+                # helper intentionally swallows failures and is not a receipt.
+                task = asyncio.create_task(shadow.close())
+                operation.cleanup_tasks.append(task)
+                done, _ = await asyncio.wait(
+                    {task}, timeout=_SPEAKER_SHADOW_REPLACEMENT_CLOSE_SECONDS
+                )
+                operation.cleanup_pending = not done or task.cancelled()
+                if done and not task.cancelled() and task.exception() is not None:
+                    operation.cleanup_pending = True
+                return
             try:
                 await asyncio.wait_for(
                     self._close_speaker_shadow(shadow),
@@ -7055,6 +7076,8 @@ class DetectorRuntime:
         try:
             async with self._lock:
                 if self._closed:
+                    if operation is not None:
+                        operation.outcome = Outcome.STALE
                     if new_shadow is not self._speaker_shadow:
                         rejected_shadow = new_shadow
                 elif new_shadow is self._speaker_shadow:
@@ -7064,6 +7087,8 @@ class DetectorRuntime:
                     if new_shadow is None:
                         self._speaker_owner_generation = owner_generation
                     installed = True
+                    if operation is not None:
+                        operation.outcome = Outcome.INSTALLED
                     return
                 else:
                     self._sealed_provider_candidate_rejection = None
@@ -7111,6 +7136,8 @@ class DetectorRuntime:
                     )
                     self._speaker_owner_generation = owner_generation
                     installed = True
+                    if operation is not None:
+                        operation.outcome = Outcome.INSTALLED
 
             cleanup_shadow = (
                 detached_shadow if detached_shadow is not None else rejected_shadow
@@ -7142,6 +7169,13 @@ class DetectorRuntime:
                     await asyncio.shield(cleanup_task)
                 except asyncio.CancelledError:
                     continue
+            raise
+        except Exception:
+            if operation is not None and not installed and new_shadow is not None:
+                # Acceptance preceded the first await. Ordinary pre-swap
+                # exceptions have the same cleanup owner as cancellation.
+                cleanup_task = asyncio.create_task(bounded_close(new_shadow))
+                await asyncio.shield(cleanup_task)
             raise
         finally:
             await self._drain_provider_segment_expiry_tasks()

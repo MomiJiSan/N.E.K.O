@@ -88,6 +88,12 @@ claim 只能消费一次。prepare 后父状态、generation 或 owner 发生变
 
 ## 3. exact 资格证明
 
+### 安装身份的前置边界
+
+声纹事实除下列 utterance / PCM 身份外，还必须属于当前安装实例及已提交、未撤销的激活权限。资料 generation 相同不代表安装相同；路由重启、重新启用和回滚必须隔离旧实例回调。安装退休或权限撤销只使尚无正式 DENY 的句子沿既有 `UNAVAILABLE` fail-open 收口，不能恢复已拒绝文本，也不绕过 exact 前的 provisional 隔离。实例生命周期、健康和 READY 由 [安装生命周期合同](./owner-voice-identity-installation-lifecycle-contract) 约束；本节不修改后续 exact promotion、reducer 或 DROP/FORWARD 语义。
+
+### 区间证明
+
 局部能力只有在下列事实同时成立时才能启动：
 
 - Provider boundary 含合法 start/end，且属于当前 Provider timeline generation 与 key；

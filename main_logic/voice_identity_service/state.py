@@ -11,6 +11,7 @@ class VoiceIdentityEffectiveReason(StrEnum):
 
     DISABLED = "disabled"
     READY = "ready"
+    ACTIVATION_PENDING = "activation_pending"
     NO_PROFILE = "no_profile"
     MODEL_UNAVAILABLE = "model_unavailable"
     PROFILE_INCOMPATIBLE = "profile_incompatible"

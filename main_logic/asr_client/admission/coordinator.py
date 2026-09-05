@@ -967,6 +967,8 @@ class VoiceTurnAdmissionCoordinator:
         self,
         receipt: ExactIntervalActivationReceipt,
         event: SpeakerLeaseEvent | ProviderFinalReceived,
+        *,
+        authority_is_current: Callable[[], bool] | None = None,
     ) -> ExactIntervalTransitionReceipt:
         """Apply one local exact fact; never fan out or abort provider transport."""
 
@@ -1011,9 +1013,24 @@ class VoiceTurnAdmissionCoordinator:
                     receipt,
                     ExactIntervalOutcome.STALE,
                 )
+            evidence = exact.evidence
+            if evidence.terminal_disposition is None and authority_is_current is not None:
+                try:
+                    authority_current = authority_is_current() is True
+                except Exception:
+                    authority_current = False
+                if not authority_current:
+                    # Check after taking the writer lock, not merely at enqueue.
+                    # Runtime owns the unavailable/final replay transaction. A
+                    # formal terminal above this boundary is never revoked.
+                    return ExactIntervalTransitionReceipt(
+                        interval_id=receipt.interval_id,
+                        outcome=ExactIntervalOutcome.HELD,
+                        disposition=None,
+                        effects=(),
+                    )
             exact.post_started = True
 
-            evidence = exact.evidence
             if isinstance(event, ProviderFinalReceived):
                 if event.final.provider_key != scope.provider_key:
                     return self._exact_interval_transition_failure(

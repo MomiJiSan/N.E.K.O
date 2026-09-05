@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -101,6 +103,10 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCaptureResult,
     SpeakerShadowCandidateKey,
     SpeakerShadowConfig,
+)
+from main_logic.asr_client.speaker_verifier_contracts import (
+    SpeakerVerifierInstallOutcome,
+    SpeakerVerifierOwnershipState,
 )
 from main_logic.asr_client.transcript import (
     TranscriptResolutionOutcome,
@@ -3520,10 +3526,29 @@ async def _close_dispatchers(runtime: IndependentAsrRuntime) -> None:
         await asyncio.gather(*transcript_workers, return_exceptions=True)
 
 
+def _verifier_supported_route(runtime, detector) -> None:
+    runtime._asr_detector = detector
+    runtime._asr_lifecycle = VoiceInputLifecycleController(
+        provider_policy=resolve_provider_policy("qwen", "provider"),
+        shadow_mode=False,
+    )
+    runtime._asr_lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
+
+
+def _accept_verifier_handoff(detector, shadow, owner_generation, operation) -> None:
+    assert operation.identity.detector_identity == id(detector)
+    assert operation.identity.installation_id == owner_generation
+    assert operation.identity.activation_revision == "new-profile"
+    assert owner_generation != "new-profile"
+    operation.ownership_state = SpeakerVerifierOwnershipState.DETECTOR
+    detector._speaker_shadow = shadow
+    operation.outcome = SpeakerVerifierInstallOutcome.INSTALLED
+
+
 async def test_verifier_factory_hot_replaces_active_detector_and_closes_old() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
-    runtime._asr_detector = detector
+    _verifier_supported_route(runtime, detector)
     old_factory = MagicMock()
     old_factory.close = MagicMock()
     runtime._speaker_verifier_factory = old_factory
@@ -3532,27 +3557,37 @@ async def test_verifier_factory_hot_replaces_active_detector_and_closes_old() ->
     factory = MagicMock(return_value=shadow)
     factory.enforces_admission = True
 
+    async def install(new_shadow, *, owner_generation, operation):
+        _accept_verifier_handoff(detector, new_shadow, owner_generation, operation)
+
+    detector.replace_speaker_verifier.side_effect = install
+
     updated = await runtime.set_speaker_verifier_factory(
         factory,
         activation_generation="new-profile",
     )
 
     assert updated is True
-    detector.replace_speaker_verifier.assert_awaited_once_with(
-        shadow,
-        owner_generation="new-profile",
-    )
+    detector.replace_speaker_verifier.assert_awaited_once()
+    installed = runtime._speaker_verifier_install_receipt
+    assert installed is not None and installed.identity is not None
+    assert installed.outcome is SpeakerVerifierInstallOutcome.INSTALLED
+    assert installed.ownership_state is SpeakerVerifierOwnershipState.DETECTOR
+    assert detector._speaker_shadow is shadow
     assert runtime._speaker_verifier_factory is factory
-    assert runtime._speaker_verifier_activation_generation == "new-profile"
+    assert runtime._speaker_verifier_activation_generation == installed.identity.installation_id
+    assert installed.identity.activation_revision == "new-profile"
     assert runtime._speaker_verifier_enforces_admission is True
     old_factory.close.assert_called_once_with()
+    await detector._speaker_shadow.close()
+    factory.close()
 
 
 async def test_verifier_factory_failure_fences_old_activation_fail_open() -> None:
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
     detector.replace_speaker_verifier.side_effect = RuntimeError("swap failed")
-    runtime._asr_detector = detector
+    _verifier_supported_route(runtime, detector)
     old_factory = MagicMock()
     runtime._speaker_verifier_factory = old_factory
     runtime._speaker_verifier_activation_generation = "old-profile"
@@ -3566,11 +3601,13 @@ async def test_verifier_factory_failure_fences_old_activation_fail_open() -> Non
     )
 
     assert updated is False
-    shadow.close.assert_not_awaited()
+    # A failed call before explicit transfer leaves cleanup with the installer.
+    shadow.close.assert_awaited_once_with()
     assert runtime._speaker_verifier_factory is None
-    assert runtime._speaker_verifier_activation_generation == "new-profile"
+    assert runtime._speaker_verifier_activation_generation is None
     assert runtime._speaker_verifier_enforces_admission is False
     old_factory.close.assert_called_once_with()
+    factory.close.assert_called_once_with()
 
 
 async def test_verifier_failure_after_new_binding_retires_collecting_authority() -> (
@@ -3593,11 +3630,21 @@ async def test_verifier_failure_after_new_binding_retires_collecting_authority()
     factory = MagicMock(return_value=shadow)
     factory.enforces_admission = True
     new_candidate = SpeakerShadowCandidateKey(7, 999, "provider_candidate")
+    old_candidate = _shadow_candidate()
+    assert runtime._accept_speaker_candidate_binding(
+        old_candidate, turn_token, detector=detector,
+        activation_generation="old-profile",
+    )
+    await _drain_runtime_admission(runtime)
+    prior = await runtime._asr_admission.get_record(turn_token)
+    assert prior is not None and prior.capture_state is CaptureState.COLLECTING
 
-    async def publish_then_fail(new_shadow, *, owner_generation) -> None:
+    async def publish_then_fail(new_shadow, *, owner_generation, operation) -> None:
         assert new_shadow is shadow
-        assert owner_generation == "new-profile"
-        assert runtime._accept_speaker_candidate_binding(
+        _accept_verifier_handoff(detector, new_shadow, owner_generation, operation)
+        # The old test published new permission before installation committed.
+        # Explicit transfer alone must no longer authorize a collecting candidate.
+        assert not runtime._accept_speaker_candidate_binding(
             new_candidate,
             turn_token,
             detector=detector,
@@ -3606,7 +3653,7 @@ async def test_verifier_failure_after_new_binding_retires_collecting_authority()
         await _drain_runtime_admission(runtime)
         record = await runtime._asr_admission.get_record(turn_token)
         assert record is not None
-        assert record.capture_state is CaptureState.COLLECTING
+        assert record.capture_state is not CaptureState.COLLECTING
         raise RuntimeError("swap failed after install")
 
     detector.replace_speaker_verifier.side_effect = publish_then_fail
@@ -3625,6 +3672,8 @@ async def test_verifier_failure_after_new_binding_retires_collecting_authority()
         shadow.close.assert_not_awaited()
         old_factory.close.assert_called_once_with()
     finally:
+        await detector._speaker_shadow.close()
+        shadow.close.assert_awaited_once_with()
         await _close_dispatchers(runtime)
 
 
@@ -3633,7 +3682,7 @@ async def test_cancelled_verifier_swap_keeps_transferred_shadow_owned_by_detecto
 ):
     runtime = IndependentAsrRuntime(_callbacks())
     detector = _RejectionDetector()
-    runtime._asr_detector = detector
+    _verifier_supported_route(runtime, detector)
     old_factory = MagicMock()
     old_factory.close = MagicMock()
     runtime._speaker_verifier_factory = old_factory
@@ -3643,11 +3692,11 @@ async def test_cancelled_verifier_swap_keeps_transferred_shadow_owned_by_detecto
     factory.enforces_admission = True
     entered = asyncio.Event()
 
-    async def block_after_handoff(new_shadow, *, owner_generation) -> None:
+    async def block_after_handoff(new_shadow, *, owner_generation, operation) -> None:
         assert new_shadow is shadow
-        assert owner_generation == "new-profile"
-        assert runtime._speaker_verifier_activation_generation == "new-profile"
-        assert runtime._speaker_verifier_enforces_admission is True
+        _accept_verifier_handoff(detector, new_shadow, owner_generation, operation)
+        assert runtime._speaker_verifier_activation_generation is None
+        assert runtime._speaker_verifier_enforces_admission is False
         entered.set()
         await asyncio.Event().wait()
 
@@ -3658,16 +3707,20 @@ async def test_cancelled_verifier_swap_keeps_transferred_shadow_owned_by_detecto
             activation_generation="new-profile",
         )
     )
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), 1)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await task
     shadow.close.assert_not_awaited()
     assert runtime._speaker_verifier_factory is None
-    assert runtime._speaker_verifier_activation_generation == "new-profile"
+    assert runtime._speaker_verifier_activation_generation is None
     assert runtime._speaker_verifier_enforces_admission is False
     old_factory.close.assert_called_once_with()
+    factory.close.assert_called_once_with()
+    assert detector._speaker_shadow is shadow
+    await detector._speaker_shadow.close()
+    shadow.close.assert_awaited_once_with()
 
 
 async def test_sealed_provider_rejection_suppresses_only_exact_final() -> None:
@@ -4824,6 +4877,120 @@ async def test_post_commit_exact_conflict_keeps_final_fail_open(
     session.close.assert_not_awaited()
     assert lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
     await _close_dispatchers(runtime)
+
+
+class _ExactRetirementWriterLock(asyncio.Lock):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = asyncio.Event()
+
+    async def acquire(self) -> bool:
+        if self.locked():
+            self.waiting.set()
+        return await super().acquire()
+
+
+async def _assert_exact_retirement_preserves_queued_final(monkeypatch, *, mutate=False):
+    callbacks = _callbacks()
+    runtime = IndependentAsrRuntime(callbacks)
+    detector = _RejectionDetector()
+    session, _, turn, key, _, target, _ = await _install_exact_provider_interval(runtime, detector)
+    await _drain_runtime_admission(runtime)
+    transaction = runtime._asr_provider_exact_intervals[key]
+    await runtime._send_independent_asr_preview("retired-partial", runtime._asr_session_epoch)
+    callbacks.on_partial.assert_not_awaited()
+    assert runtime._asr_quarantined_partials == {turn: "retired-partial"}
+
+    if mutate:
+        # Restore the old omission in memory only: the current LOW is not final,
+        # so failing open clears the FIFO without retaining its accepted final.
+        source = textwrap.dedent(inspect.getsource(runtime_module.IndependentAsrRuntime._apply_exact_interval_event))
+        omitted = """queued.event for queued in transaction.event_queue
+                    if isinstance(queued.event, ProviderFinalReceived)"""
+        assert omitted in source
+        source = source.replace(omitted, "queued.event for queued in ()", 1)
+        namespace = {}
+        exec(compile(source, "<queued-final-retention-mutation>", "exec"), runtime_module.__dict__, namespace)
+        monkeypatch.setattr(runtime, "_apply_exact_interval_event",
+            namespace["_apply_exact_interval_event"].__get__(runtime))
+
+    writer = _ExactRetirementWriterLock()
+    runtime._asr_admission._lock = writer
+    final_queued = asyncio.Event()
+    final_ready = asyncio.Event()
+    release_final = asyncio.Event()
+    enqueue = runtime._enqueue_exact_interval_event
+    post_exact = runtime._post_exact_interval_event
+
+    async def gate_final_post(observed_transaction, event):
+        if isinstance(event, ProviderFinalReceived):
+            final_ready.set()
+            await release_final.wait()
+        return await post_exact(observed_transaction, event)
+
+    def observed_enqueue(observed_transaction, event, *, waiter=None):
+        accepted = enqueue(observed_transaction, event, waiter=waiter)
+        if accepted and isinstance(event, ProviderFinalReceived):
+            final_queued.set()
+        return accepted
+
+    monkeypatch.setattr(runtime, "_enqueue_exact_interval_event", observed_enqueue)
+    monkeypatch.setattr(runtime, "_post_exact_interval_event", gate_final_post)
+    final_task = None
+    try:
+        final_task = asyncio.create_task(runtime._handle_provider_final(
+            key, "retired-final", runtime._asr_session_epoch, "qwen",
+        ))
+        await asyncio.wait_for(final_ready.wait(), 1)
+        await writer.acquire()
+        try:
+            assert runtime._accept_speaker_evidence_fact(
+                SpeakerLow(target, 2, SpeakerCheckpointKind.COMPLETION_CONFIRMATION),
+                activation_generation="profile-generation", enforce=True,
+            )
+            await asyncio.wait_for(writer.waiting.wait(), 1)
+            release_final.set()
+            await asyncio.wait_for(final_queued.wait(), 1)
+            assert any(isinstance(item.event, ProviderFinalReceived) for item in transaction.event_queue)
+            runtime.retire_speaker_verifier_authority()
+        finally:
+            writer.release()
+        await asyncio.wait_for(final_task, 1)
+        await _drain_runtime_admission(runtime)
+        await runtime.wait_transcript_idle()
+
+        settled = await runtime._asr_admission.get_record(turn)
+        assert callbacks.on_final.await_count == 1, (
+            "accepted final was lost during retirement",
+            transaction.resolved_disposition,
+            None if settled is None else (settled.capture_state, settled.evidence_state,
+                settled.exact_interval_hold_id, settled.logical_revision),
+            runtime._asr_admission_final_contexts,
+            runtime._speaker_verifier_diagnostics(),
+        )
+        assert callbacks.on_final.await_args.args[0].text == "retired-final"
+        # The canonical final is already pending: existing admission semantics
+        # retire its cached partial instead of briefly replaying stale draft text.
+        callbacks.on_partial.assert_not_awaited()
+        assert transaction.resolved_disposition is AdmissionDisposition.FORWARD
+        assert not runtime._asr_admission_final_contexts
+        assert not runtime._asr_quarantined_partials
+        session.close.assert_not_awaited()
+    finally:
+        if final_task is not None and not final_task.done():
+            final_task.cancel()
+            await asyncio.gather(final_task, return_exceptions=True)
+        await _close_dispatchers(runtime)
+
+
+@pytest.mark.parametrize("iteration", range(50))
+async def test_installation_retirement_after_exact_enqueue_preserves_final_once(monkeypatch, iteration):
+    await _assert_exact_retirement_preserves_queued_final(monkeypatch)
+
+
+async def test_queued_final_retention_mutation_is_detected(monkeypatch):
+    with pytest.raises(AssertionError, match="accepted final was lost during retirement"):
+        await _assert_exact_retirement_preserves_queued_final(monkeypatch, mutate=True)
 
 
 async def test_poisoned_exact_fifo_replays_queued_final_exactly_once(

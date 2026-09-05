@@ -2976,6 +2976,7 @@
         "reasonEnrollmentActive": "正在錄入新聲紋，獨立 ASR 將暫時放行",
         "reasonRuntimeDegraded": "聲紋執行環境暫時不可用，獨立 ASR 將正常放行",
         "reasonUnsupportedAsrRoute": "目前語音路線不支援聲紋過濾",
+        "reasonActivationPending": "設定已儲存，等待語音鏈路就緒",
         "reasonShadowMode": "影子模式僅觀察不攔截，獨立 ASR 將正常放行",
         "enrollmentComplete": "Owner 聲紋已保存並啟用。",
         "microphoneDenied": "無法使用麥克風，請檢查權限與裝置。",

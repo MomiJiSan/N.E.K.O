@@ -40,6 +40,7 @@ from ._provider_events import (
     ProviderUtteranceStartedNotification,
 )
 from .audio import AsrAudioDispatcher
+from .speaker_verifier_installation import SpeakerVerifierInstallationMixin
 from .admission.contracts import (
     AbortProviderTransport,
     AdmissionDisposition,
@@ -731,7 +732,7 @@ class _SpeakerDenyCleanupOperation:
     settled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
-class IndependentAsrRuntime:
+class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
     """Own one independent ASR session without reading Core manager state."""
 
     def __init__(self, callbacks: AsrRuntimeCallbacks) -> None:
@@ -1128,132 +1129,27 @@ class IndependentAsrRuntime:
         *,
         activation_generation: str,
     ) -> bool:
-        old_factory = self._speaker_verifier_factory
-        if (
-            factory is old_factory
-            and activation_generation == self._speaker_verifier_activation_generation
-            and not self._speaker_verifier_degraded
-        ):
-            return True
+        """Compatibility adapter; production uses typed installation receipts."""
+        from .speaker_verifier_contracts import (
+            SpeakerVerifierAuthority, SpeakerVerifierInstallOutcome,
+            SpeakerVerifierSpec,
+        )
 
-        # Revocation is a logical authority barrier, not a cleanup result.
-        # Publish it before yielding so every callback from the old observer
-        # becomes stale even if physical detector replacement later fails.
-        revoking = factory is None
-        if revoking:
-            self._speaker_verifier_factory = None
-            self._speaker_verifier_activation_generation = activation_generation
-            self._speaker_verifier_enforces_admission = False
-            if old_factory is not None:
-                self._close_speaker_verifier_factory(old_factory)
-
-        async def fence_failed_replacement() -> None:
-            self._speaker_verifier_factory = None
-            self._speaker_verifier_enforces_admission = False
-            self._speaker_verifier_degraded = True
-            if old_factory is not None and old_factory is not factory:
-                self._close_speaker_verifier_factory(old_factory)
-            await self._revoke_runtime_speaker_authority_for_verifier_change()
-
-        detector = self._asr_detector
-        if detector is not None:
-            new_shadow: SpeakerShadowObserver | None = None
-            if factory is not None:
-                try:
-                    new_shadow = factory()
-                except Exception:
-                    return False
-                if new_shadow is None:
-                    return False
-                # Publish the new callback identity before Detector can install
-                # the observer. replace_speaker_verifier transfers ownership at
-                # call entry and may yield while closing the detached observer.
-                self._speaker_verifier_activation_generation = activation_generation
-                self._speaker_verifier_enforces_admission = (
-                    _speaker_factory_enforces_admission(factory)
-                )
-            await self._revoke_runtime_speaker_authority_for_verifier_change()
-            try:
-                await detector.replace_speaker_verifier(
-                    new_shadow,
-                    owner_generation=activation_generation,
-                )
-            except asyncio.CancelledError:
-                if not revoking:
-                    cleanup = asyncio.create_task(
-                        fence_failed_replacement(),
-                        name="speaker-verifier-replacement-cancel-fence",
-                    )
-                    await asyncio.shield(cleanup)
-                raise
-            except Exception:
-                if not revoking:
-                    await fence_failed_replacement()
-                return False
-            if self._asr_detector is not detector:
-                # The detached detector owns and closes ``new_shadow``. Apply
-                # the same activation to the replacement, if one appeared.
-                replacement = self._asr_detector
-                if replacement is not None:
-                    replacement_shadow: SpeakerShadowObserver | None = None
-                    if factory is not None:
-                        try:
-                            replacement_shadow = factory()
-                        except Exception:
-                            if not revoking:
-                                await fence_failed_replacement()
-                            return False
-                        if replacement_shadow is None:
-                            if not revoking:
-                                await fence_failed_replacement()
-                            return False
-                    try:
-                        await replacement.replace_speaker_verifier(
-                            replacement_shadow,
-                            owner_generation=activation_generation,
-                        )
-                    except asyncio.CancelledError:
-                        if not revoking:
-                            cleanup = asyncio.create_task(
-                                fence_failed_replacement(),
-                                name=("speaker-verifier-replacement-cancel-fence"),
-                            )
-                            await asyncio.shield(cleanup)
-                        raise
-                    except Exception:
-                        if not revoking:
-                            await fence_failed_replacement()
-                        return False
-                    if self._asr_detector is not replacement:
-                        if not revoking:
-                            await fence_failed_replacement()
-                        return False
-        else:
-            if not revoking:
-                self._speaker_verifier_activation_generation = activation_generation
-                self._speaker_verifier_enforces_admission = (
-                    _speaker_factory_enforces_admission(factory)
-                )
-            await self._revoke_runtime_speaker_authority_for_verifier_change()
-
-        if self._asr_terminal_close_requested:
-            self._speaker_verifier_factory = None
-            self._speaker_verifier_activation_generation = None
-            self._speaker_verifier_enforces_admission = False
-            self._speaker_verifier_degraded = False
-            if old_factory is not None and not revoking:
-                self._close_speaker_verifier_factory(old_factory)
-            return revoking
-        if not revoking:
-            self._speaker_verifier_factory = factory
-            self._speaker_verifier_activation_generation = activation_generation
-            self._speaker_verifier_enforces_admission = (
-                _speaker_factory_enforces_admission(factory)
-            )
-            if old_factory is not None and old_factory is not factory:
-                self._close_speaker_verifier_factory(old_factory)
-        self._speaker_verifier_degraded = False
-        return True
+        authority = SpeakerVerifierAuthority()
+        authority.commit()
+        identity = self.create_speaker_verifier_install_identity(
+            id(self), self._asr_start_generation, activation_generation
+        )
+        spec = SpeakerVerifierSpec(
+            activation_generation, activation_generation, factory is not None,
+            _speaker_factory_enforces_admission(factory), authority,
+            (lambda runtime, installation: factory) if factory is not None else None,
+        )
+        receipt = await self._install_speaker_verifier_locked(spec, identity)
+        return receipt.outcome in {
+            SpeakerVerifierInstallOutcome.INSTALLED,
+            SpeakerVerifierInstallOutcome.REVOKED,
+        }
 
     async def _revoke_runtime_speaker_authority_for_verifier_change(self) -> None:
         """Fence every optional speaker capability without revising text."""
@@ -1263,8 +1159,14 @@ class IndependentAsrRuntime:
         self._speaker_verifier_degraded = True
         candidate_turns = tuple(self._asr_admission_candidate_turns.items())
         pending_turns = tuple(self._asr_speaker_authority_pending_turns.items())
+        exact_turns = {
+            transaction.turn_token
+            for transaction in self._asr_provider_exact_intervals.values()
+        }
         if self._asr_admission_ingress_started:
             for candidate, turn_token in candidate_turns:
+                if turn_token in exact_turns:
+                    continue
                 try:
                     future = self._asr_admission_ingress.post_nowait(
                         turn_token,
@@ -1274,6 +1176,8 @@ class IndependentAsrRuntime:
                     continue
                 self._consume_admission_future(turn_token, future)
             for turn_token, owner_generation in pending_turns:
+                if turn_token in exact_turns:
+                    continue
                 try:
                     future = self._asr_admission_ingress.post_nowait(
                         turn_token,
@@ -1289,6 +1193,8 @@ class IndependentAsrRuntime:
         self._asr_admission_candidate_turns.clear()
         self._asr_speaker_authority_pending_turns.clear()
         for turn_token in await self._asr_admission.live_turn_tokens():
+            if turn_token in exact_turns:
+                continue
             try:
                 await self._post_admission_event(
                     turn_token,
@@ -1889,7 +1795,7 @@ class IndependentAsrRuntime:
         try:
             while transaction.event_queue:
                 item = transaction.event_queue.popleft()
-                if transaction.queue_poisoned:
+                if not self._speaker_exact_installation_is_current(transaction):
                     receipt = None
                     fail_open_finals = [
                         queued.event
@@ -2067,6 +1973,7 @@ class IndependentAsrRuntime:
             future = self._asr_admission_ingress.post_exact_interval_nowait(
                 transaction.activation,
                 event,
+                authority_is_current=lambda: self._speaker_exact_installation_is_current(transaction),
             )
         except Exception:
             await self._fail_exact_interval_group(
@@ -2101,6 +2008,19 @@ class IndependentAsrRuntime:
                 raise cancelled
             return None
         if receipt.outcome is ExactIntervalOutcome.HELD:
+            if not self._speaker_exact_installation_is_current(transaction):
+                pending_finals = (
+                    [event] if isinstance(event, ProviderFinalReceived) else [
+                        queued.event for queued in transaction.event_queue
+                        if isinstance(queued.event, ProviderFinalReceived)
+                    ]
+                )
+                failed_open = await self._fail_exact_interval_unavailable(
+                    transaction, "ASR_SPEAKER_INSTALLATION_RETIRED"
+                )
+                if failed_open:
+                    for final_event in pending_finals[:1]:
+                        await self._post_admission_event(transaction.turn_token, final_event)
             if cancelled is not None:
                 raise cancelled
             return receipt
@@ -2874,6 +2794,13 @@ class IndependentAsrRuntime:
         )
         metrics["rejection_in_progress_count"] = int(
             bool(getattr(self, "_asr_admission_rejection_executions", ()))
+        )
+        metrics.update({
+            f"speaker_installation_{name}_count": value
+            for name, value in getattr(self, "_speaker_installation_diagnostics", {}).items()
+        })
+        metrics["speaker_retired_cleanup_pending_count"] = len(
+            getattr(self, "_speaker_retired_cleanup", ())
         )
         return metrics
 
@@ -7454,11 +7381,9 @@ class IndependentAsrRuntime:
             async with self._speaker_verifier_lock:
                 if not operation_is_current():
                     return stale_result(provider)
-                current_factory = (
-                    speaker_shadow_factory
-                    if self._speaker_verifier_activation_generation is None
-                    else self._speaker_verifier_factory
-                )
+                # Only an explicitly supplied legacy observer belongs to this
+                # start. Core reconciles its desired spec after route startup.
+                current_factory = speaker_shadow_factory
                 factory_activation = getattr(
                     current_factory,
                     "activation_generation",

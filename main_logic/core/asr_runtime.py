@@ -14,6 +14,7 @@ import struct
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, ClassVar, Literal
+from uuid import uuid4
 
 from websockets import exceptions as web_exceptions
 
@@ -29,6 +30,13 @@ from main_logic.asr_client.runtime import (
     SpeakerShadowFactory,
 )
 from main_logic.asr_client.lifecycle import VoiceLifecycleState
+from main_logic.asr_client.speaker_verifier_contracts import (
+    SpeakerVerifierAuthority,
+    SpeakerVerifierAuthorityState,
+    SpeakerVerifierInstallOutcome,
+    SpeakerVerifierInstallReceipt,
+    SpeakerVerifierSpec,
+)
 from main_logic.voice_input import (
     BuiltinVoiceInputConsumer,
     VoiceInputConsumerCapabilities,
@@ -1132,6 +1140,7 @@ class AsrRuntimeMixin:
         )
 
     def _begin_asr_route_operation(self) -> int:
+        self._retire_core_speaker_installation()
         self._asr_route_operation_generation += 1
         return self._asr_route_operation_generation
 
@@ -1146,6 +1155,7 @@ class AsrRuntimeMixin:
             raise ValueError("MICROPHONE_ROUTE_INVALID")
         leaving_blocked = self._asr_route_mode == "blocked" and mode != "blocked"
         if mode != self._asr_route_mode:
+            self._retire_core_speaker_installation()
             self._microphone_route_generation += 1
         if mode != "blocked":
             # A live route means no committed pipeline failure owns it any
@@ -1384,47 +1394,166 @@ class AsrRuntimeMixin:
             else:
                 await self._abort_independent_asr(normalized)
 
+    def _retire_core_speaker_installation(self) -> None:
+        """Fence evidence before route teardown can suspend; retain the goal."""
+        runtime = getattr(self, "_asr_runtime", None)
+        retire = getattr(runtime, "retire_speaker_verifier_authority", None)
+        if callable(retire):
+            retire()
+        self._speaker_verifier_install_receipt = None
+        self._speaker_verifier_install_fence = None
+        self._speaker_shadow_factory = None
+
+    @property
+    def speaker_verifier_participating(self) -> bool:
+        # Text sessions are not failed voice installations. During start the
+        # route may be ready before Core publishes is_active.
+        return bool(
+            getattr(self, "input_mode", "audio") == "audio"
+            and (
+                getattr(self, "_asr_route_mode", "blocked") != "blocked"
+                or getattr(self, "is_active", False)
+            )
+        )
+
+    def _speaker_installation_fence(self) -> tuple:
+        return (
+            id(self._asr_runtime),
+            self._asr_route_operation_generation,
+            self._microphone_route_generation,
+            id(getattr(self, "session", None)),
+            self._capture_ingress_token().session_epoch,
+            id(getattr(self._asr_runtime, "_asr_detector", None)),
+        )
+
+    def speaker_verifier_installation_status(
+        self, activation_revision: str,
+    ) -> SpeakerVerifierInstallReceipt:
+        spec = getattr(self, "_speaker_verifier_spec", None)
+        if spec is None or spec.activation_revision != activation_revision:
+            return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.STALE)
+        if not spec.requested_enabled or spec.revocable_authority.state is SpeakerVerifierAuthorityState.REVOKED:
+            return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.REVOKED)
+        if not self.speaker_verifier_participating:
+            return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.DEFERRED_ROUTE)
+        if (
+            self._asr_route_mode != "independent"
+            or not self._asr_runtime._speaker_verifier_route_supported()
+        ):
+            return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.UNSUPPORTED_ROUTE)
+        receipt = getattr(self, "_speaker_verifier_install_receipt", None)
+        if (
+            receipt is None
+            or getattr(self, "_speaker_verifier_install_fence", None) != self._speaker_installation_fence()
+            or receipt.identity is None
+            or receipt.identity.activation_revision != activation_revision
+        ):
+            return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.DEFERRED_ROUTE)
+        actual = getattr(self._asr_runtime, "_speaker_verifier_install_receipt", None)
+        if receipt.outcome is SpeakerVerifierInstallOutcome.INSTALLED and (
+            actual is None
+            or actual.identity != receipt.identity
+            or not self._asr_runtime._speaker_install_identity_current(receipt.identity)
+        ):
+            return SpeakerVerifierInstallReceipt(receipt.identity, SpeakerVerifierInstallOutcome.STALE)
+        if receipt.outcome is SpeakerVerifierInstallOutcome.INSTALLED:
+            receipt = actual
+        if receipt.outcome is SpeakerVerifierInstallOutcome.INSTALLED and getattr(self._asr_runtime, "_speaker_verifier_degraded", False):
+            return replace(receipt, outcome=SpeakerVerifierInstallOutcome.FAILED)
+        return receipt
+
+    async def set_speaker_verifier_spec(
+        self, spec: SpeakerVerifierSpec | None,
+    ) -> SpeakerVerifierInstallReceipt:
+        self._ensure_asr_runtime_state()
+        if getattr(self, "_speaker_verifier_spec", None) is not spec:
+            self._retire_core_speaker_installation()
+            self._speaker_verifier_spec = spec
+        return await self.reconcile_speaker_verifier()
+
+    async def reconcile_speaker_verifier(self) -> SpeakerVerifierInstallReceipt:
+        """One owner per manager, with queued callers coalescing to latest spec."""
+        self._ensure_asr_runtime_state()
+        lock = getattr(self, "_speaker_verifier_reconcile_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._speaker_verifier_reconcile_lock = lock
+        requested = getattr(self, "_speaker_verifier_spec", None)
+        async with lock:
+            spec = getattr(self, "_speaker_verifier_spec", None)
+            if requested is not spec:
+                return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.STALE)
+            if spec is not None and spec.requested_enabled and spec.revocable_authority.state is not SpeakerVerifierAuthorityState.REVOKED:
+                status = self.speaker_verifier_installation_status(spec.activation_revision)
+                if status.outcome in {
+                    SpeakerVerifierInstallOutcome.INSTALLED,
+                    SpeakerVerifierInstallOutcome.DEFERRED_ROUTE,
+                    SpeakerVerifierInstallOutcome.UNSUPPORTED_ROUTE,
+                } and (status.outcome is not SpeakerVerifierInstallOutcome.DEFERRED_ROUTE or not self.speaker_verifier_participating):
+                    return status
+            fence = self._speaker_installation_fence()
+            identity = self._asr_runtime.create_speaker_verifier_install_identity(
+                manager_identity=id(self),
+                route_generation=self._asr_route_operation_generation,
+                activation_revision=spec.activation_revision if spec is not None else "disabled",
+            )
+            receipt = await self._asr_runtime.install_speaker_verifier(spec, identity)
+            if (
+                getattr(self, "_speaker_verifier_spec", None) is not spec
+                or fence != self._speaker_installation_fence()
+            ):
+                self._asr_runtime.retire_speaker_verifier_authority()
+                return replace(receipt, outcome=SpeakerVerifierInstallOutcome.STALE)
+            self._speaker_verifier_install_receipt = receipt
+            self._speaker_verifier_install_fence = fence
+            return receipt
+
     async def set_speaker_verifier_factory(
         self,
         factory: SpeakerShadowFactory | None,
         *,
         activation_generation: str,
     ) -> bool | VoiceIdentityActivationResult:
-        """Update future and active independent-ASR speaker verification."""
+        """Compatibility adapter; a supplied instance cannot be rebuilt.
 
-        if factory is not None and (
-            getattr(self, "_asr_route_mode", "blocked") != "independent"
-            or not self._asr_runtime._speaker_verifier_route_supported()
-        ):
-            self._asr_runtime._record_unsupported_speaker_route()
-            close = getattr(factory, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-            return VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+        Persistent configuration must use a spec's lazy factory_builder. This
+        one-shot adapter never carries a closed factory across route changes.
+        """
+        authority = SpeakerVerifierAuthority()
+        authority.commit()
+        consumed = False
 
+        def build(_runtime, _identity):
+            nonlocal consumed
+            if consumed:
+                raise RuntimeError("legacy speaker factory requires a fresh configuration")
+            consumed = True
+            return factory
+
+        spec = SpeakerVerifierSpec(
+            profile_generation=activation_generation if factory is not None else None,
+            activation_revision=uuid4().hex,
+            requested_enabled=factory is not None,
+            enforce=bool(getattr(factory, "enforces_admission", True)),
+            revocable_authority=authority,
+            factory_builder=build if factory is not None else None,
+        )
         try:
-            updated = await self._asr_runtime.set_speaker_verifier_factory(
-                factory,
-                activation_generation=activation_generation,
-            )
-        except asyncio.CancelledError:
-            if factory is None:
-                self._speaker_shadow_factory = None
-            raise
-        if updated or factory is None:
-            self._speaker_shadow_factory = factory
-        if updated:
+            receipt = await self.set_speaker_verifier_spec(spec)
+        finally:
+            if not consumed and factory is not None:
+                consumed = True
+                self._asr_runtime._close_speaker_verifier_factory(factory)
+        if receipt.outcome is SpeakerVerifierInstallOutcome.INSTALLED:
             return VoiceIdentityActivationResult.READY
-        close = getattr(factory, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-        return False
+        if receipt.outcome is SpeakerVerifierInstallOutcome.REVOKED and factory is None:
+            return VoiceIdentityActivationResult.READY
+        if receipt.outcome is SpeakerVerifierInstallOutcome.UNSUPPORTED_ROUTE:
+            self._asr_runtime._record_unsupported_speaker_route()
+            return VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+        if receipt.outcome is SpeakerVerifierInstallOutcome.DEFERRED_ROUTE:
+            return VoiceIdentityActivationResult.ACTIVATION_PENDING
+        return VoiceIdentityActivationResult.RUNTIME_DEGRADED
 
     def set_independent_asr_handshake(self, value: object) -> None:
         # Record the frontend's authoritative independent-ASR toggle carried by
@@ -1700,8 +1829,6 @@ class AsrRuntimeMixin:
             # automatic detection when it is unset or unsupported.
             "user_language": getattr(self, "user_language", None),
         }
-        if self._speaker_shadow_factory is not None:
-            start_kwargs["speaker_shadow_factory"] = self._speaker_shadow_factory
         result = await self._asr_runtime.start(**start_kwargs)
         current_epoch = self._capture_ingress_token().session_epoch
         if not core_start_is_current():
@@ -1739,6 +1866,8 @@ class AsrRuntimeMixin:
         self._independent_asr_provider = result.provider
         if result.status is AsrStartStatus.READY:
             self._set_microphone_route("independent")
+            if getattr(self, "_speaker_verifier_spec", None) is not None:
+                await self.reconcile_speaker_verifier()
         else:
             # Independent ASR was ENABLED and failed to start (provider connect,
             # credentials, config). Unlike a runtime failure this emits no
@@ -2102,6 +2231,8 @@ class AsrRuntimeMixin:
             # current abstract route so the replacement inherits the visual
             # delivery policy without restarting ASR or touching PCM routing.
             self._set_microphone_route(self._asr_route_mode)
+            if getattr(self, "_speaker_verifier_spec", None) is not None:
+                await self.reconcile_speaker_verifier()
             return
         await self._start_independent_asr_if_enabled(
             str(getattr(self, "input_mode", "audio") or "audio"),

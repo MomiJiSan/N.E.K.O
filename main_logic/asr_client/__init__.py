@@ -83,6 +83,7 @@ class VoiceIdentityActivationResult(Enum):
     """Outcome of applying a profile to the currently active ASR route."""
 
     READY = "ready"
+    ACTIVATION_PENDING = "activation_pending"
     UNSUPPORTED_ASR_ROUTE = "unsupported_asr_route"
     RUNTIME_DEGRADED = "runtime_degraded"
 

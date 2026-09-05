@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, TypeAlias, cast
 
@@ -116,6 +117,7 @@ class _IngressItem:
     exact_promotion_scope: ExactIntervalPromotionScope | None = None
     exact_promotion_receipt: ExactIntervalPromotionReceipt | None = None
     exact_activation_receipt: ExactIntervalActivationReceipt | None = None
+    exact_authority_is_current: Callable[[], bool] | None = None
 
 
 _IngressResult: TypeAlias = (
@@ -806,6 +808,8 @@ class AdmissionIngressLane:
         self,
         receipt: ExactIntervalActivationReceipt,
         event: SpeakerLeaseEvent | ProviderFinalReceived,
+        *,
+        authority_is_current: Callable[[], bool] | None = None,
     ) -> asyncio.Future[ExactIntervalTransitionReceipt]:
         """Queue one exact child fact in the shared bounded speaker FIFO."""
 
@@ -831,6 +835,7 @@ class AdmissionIngressLane:
                 coalescing_key=None,
                 exact_operation="post",
                 exact_activation_receipt=receipt,
+                exact_authority_is_current=authority_is_current,
             )
         )
         assert self._available is not None
@@ -841,9 +846,13 @@ class AdmissionIngressLane:
         self,
         receipt: ExactIntervalActivationReceipt,
         event: SpeakerLeaseEvent | ProviderFinalReceived,
+        *,
+        authority_is_current: Callable[[], bool] | None = None,
     ) -> ExactIntervalTransitionReceipt:
         return await asyncio.shield(
-            self.post_exact_interval_nowait(receipt, event)
+            self.post_exact_interval_nowait(
+                receipt, event, authority_is_current=authority_is_current
+            )
         )
 
     def _speaker_transition_follower(
@@ -1195,6 +1204,7 @@ class AdmissionIngressLane:
                                     SpeakerLeaseEvent | ProviderFinalReceived,
                                     item.event,
                                 ),
+                                authority_is_current=item.exact_authority_is_current,
                             )
                         elif item.opens_speaker_lease:
                             assert item.speaker_lease_token is not None

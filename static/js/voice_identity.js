@@ -52,6 +52,7 @@
         secure_storage_unavailable: 'voiceIdentity.reasonSecureStorageUnavailable',
         enrollment_active: 'voiceIdentity.reasonEnrollmentActive',
         runtime_degraded: 'voiceIdentity.reasonRuntimeDegraded',
+        activation_pending: 'voiceIdentity.reasonActivationPending',
         unsupported_asr_route: 'voiceIdentity.reasonUnsupportedAsrRoute',
         shadow_mode: 'voiceIdentity.reasonShadowMode'
     });
@@ -287,6 +288,9 @@
         if (state.effectiveEnabled) return translate('voiceIdentity.profileReady', 'Owner 声纹已保存并启用');
         if (!state.requestedEnabled || state.effectiveReason === 'disabled') {
             return translate('voiceIdentity.profileSavedDisabled', 'Owner 声纹已保存，过滤当前关闭');
+        }
+        if (state.effectiveReason === 'activation_pending') {
+            return translate(EFFECTIVE_REASON_KEYS.activation_pending, '设置已保存，等待语音链路就绪');
         }
         return translate(EFFECTIVE_REASON_KEYS[state.effectiveReason] || 'voiceIdentity.reasonRuntimeDegraded', '声纹暂时不可用，独立 ASR 将正常放行');
     }

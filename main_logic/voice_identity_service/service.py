@@ -92,6 +92,24 @@ ActivationCallback = Callable[
     Awaitable[bool | VoiceIdentityActivationResult],
 ]
 RuntimeStatusCallback = Callable[[], VoiceIdentityActivationResult]
+
+
+class PreparedVoiceActivation(Protocol):
+    result: VoiceIdentityActivationResult
+
+
+class VoiceActivationTransaction(Protocol):
+    async def prepare_activation(
+        self, profile: SpeakerProfile | None, generation: str,
+    ) -> PreparedVoiceActivation: ...
+
+    def commit_activation(self, prepared: PreparedVoiceActivation) -> VoiceIdentityActivationResult: ...
+
+    def revoke_prepared_activation(self, prepared: PreparedVoiceActivation) -> None: ...
+
+    async def abort_activation(self, prepared: PreparedVoiceActivation) -> VoiceIdentityActivationResult: ...
+
+
 VoiceIdentityRuntimeMode = Literal["off", "shadow", "enforce"]
 EnrollmentPhase = Literal[
     "collecting_reference",
@@ -234,6 +252,7 @@ class VoiceIdentityService:
         model_timeout_seconds: float = 30.0,
         activation_timeout_seconds: float = 5.0,
         runtime_status_callback: RuntimeStatusCallback | None = None,
+        activation_transaction: VoiceActivationTransaction | None = None,
         speech_validator_factory: EnrollmentSpeechValidatorFactory | None = None,
         enrollment_audio_normalizer_factory: (
             EnrollmentAudioNormalizerFactory | None
@@ -295,6 +314,7 @@ class VoiceIdentityService:
         )
         self._runtime_noise_reduction_enabled = enrollment_noise_reduction_enabled
         self._activation_callback = activation_callback
+        self._activation_transaction = activation_transaction
         self._runtime_status_callback = runtime_status_callback
         self._runtime_mode: VoiceIdentityRuntimeMode = runtime_mode
         self._enrollment_ttl_seconds = float(enrollment_ttl_seconds)
@@ -1101,6 +1121,7 @@ class VoiceIdentityService:
         new_profile: SpeakerProfile | None = None
         staged: VoiceIdentityProfileWrite | None = None
         activation_changed = False
+        prepared_activation: PreparedVoiceActivation | None = None
         activation_result = VoiceIdentityActivationResult.READY
         preference_changed = False
         succeeded = False
@@ -1151,11 +1172,22 @@ class VoiceIdentityService:
                 and contract_matches_runtime
             ):
                 activation_cancellations: list[asyncio.CancelledError] = []
-                activation_result = await _await_cancellation_safe(
-                    self._activate(new_profile, profile_id),
-                    name="voice-identity-enrollment-activation",
-                    cancellations=activation_cancellations,
-                )
+                if self._activation_transaction is not None:
+                    prepared_activation = await _await_cancellation_safe(
+                        asyncio.wait_for(
+                            self._activation_transaction.prepare_activation(new_profile, profile_id),
+                            timeout=self._activation_timeout_seconds,
+                        ),
+                        name="voice-identity-enrollment-activation-prepare",
+                        cancellations=activation_cancellations,
+                    )
+                    activation_result = prepared_activation.result
+                else:
+                    activation_result = await _await_cancellation_safe(
+                        self._activate(new_profile, profile_id),
+                        name="voice-identity-enrollment-activation",
+                        cancellations=activation_cancellations,
+                    )
                 activation_changed = True
                 self._require_commit_fence(
                     session,
@@ -1165,7 +1197,7 @@ class VoiceIdentityService:
                 )
                 if activation_cancellations:
                     raise activation_cancellations[0]
-                if not activation_result:
+                if activation_result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                     raise VoiceIdentityServiceError("runtime_degraded")
             elif desired_requested and self._runtime_mode != "off":
                 activation_cancellations = []
@@ -1183,7 +1215,7 @@ class VoiceIdentityService:
                 )
                 if activation_cancellations:
                     raise activation_cancellations[0]
-                if not activation_result:
+                if activation_result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                     raise VoiceIdentityServiceError("runtime_degraded")
 
             if desired_requested != old_requested:
@@ -1225,6 +1257,20 @@ class VoiceIdentityService:
             self._profile_audio_contract = new_audio_contract
             new_profile = None
             self._requested_enabled = desired_requested
+            # Disk has settled. Publish Service's profile and activation authority
+            # in one no-await segment; cancellation after durable commit must not
+            # compensate back to the previous disk profile.
+            if prepared_activation is not None:
+                if self._closed or self._enrollment is not session:
+                    # Shutdown or explicit enrollment retirement already owns
+                    # runtime teardown. Keep the durable profile settlement but
+                    # never grant a superseded operation fresh authority.
+                    self._activation_transaction.revoke_prepared_activation(prepared_activation)
+                    activation_result = VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                else:
+                    activation_result = self._activation_transaction.commit_activation(
+                        prepared_activation,
+                    )
             if (
                 desired_requested
                 and self._runtime_mode != "off"
@@ -1258,12 +1304,26 @@ class VoiceIdentityService:
             raise VoiceIdentityServiceError("runtime_degraded") from exc
         finally:
             if not succeeded:
+                if prepared_activation is not None:
+                    # Retire permissions before even the staged-file abort await.
+                    self._activation_transaction.revoke_prepared_activation(prepared_activation)
+                    abort_cancellations: list[asyncio.CancelledError] = []
+                    old_activation_restore_result = await _await_cancellation_safe(
+                        self._activation_transaction.abort_activation(prepared_activation),
+                        name="voice-identity-enrollment-activation-abort",
+                        cancellations=abort_cancellations,
+                    )
                 if staged is not None:
                     try:
-                        await staged.aabort()
+                        file_abort_cancellations: list[asyncio.CancelledError] = []
+                        await _await_cancellation_safe(
+                            staged.aabort(),
+                            name="voice-identity-enrollment-file-abort",
+                            cancellations=file_abort_cancellations,
+                        )
                     except Exception:
                         pass
-                if activation_changed:
+                if prepared_activation is None and activation_changed:
                     rollback_profile = old_profile if old_activation_requested else None
                     rollback_generation = (
                         old_profile.generation
@@ -1274,7 +1334,7 @@ class VoiceIdentityService:
                         rollback_profile,
                         rollback_generation,
                     )
-                    if not old_activation_restore_result:
+                    if old_activation_restore_result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                         failure_reason = VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
                 if preference_changed:
                     try:
@@ -1286,7 +1346,7 @@ class VoiceIdentityService:
                 if (
                     old_activation_requested
                     and old_activation_restore_result is not None
-                    and old_activation_restore_result
+                    and old_activation_restore_result is not VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 ):
                     self._apply_activation_result(old_activation_restore_result)
                 elif old_effective:

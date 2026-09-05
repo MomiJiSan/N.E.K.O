@@ -342,7 +342,7 @@ async def test_inactive_blocked_managers_do_not_override_active_route_status() -
     )
     assert (
         await registry.register_manager(late_inactive)
-        is VoiceIdentityActivationResult.READY
+        is VoiceIdentityActivationResult.ACTIVATION_PENDING
     )
     assert registry.activation_status() is VoiceIdentityActivationResult.READY
 
@@ -1867,6 +1867,7 @@ async def test_runtime_install_and_wrapper_lifecycle(
             *args,
             runtime_mode: str,
             runtime_status_callback,
+            activation_transaction,
             enrollment_ttl_seconds: float,
             speech_validator_factory,
             enrollment_noise_reduction_enabled: bool,

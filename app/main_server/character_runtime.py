@@ -1815,6 +1815,7 @@ async def _init_character_resources(k: str, is_new_character: bool):
         mgr = rs.session_manager
         has_active_session = mgr is not None and mgr.is_active
         has_starting_session = mgr is not None and mgr.is_starting and not mgr.is_active
+        desired_bound_manager = None
 
         if has_active_session:
             # 有活跃session，不重新创建session_manager，只更新配置
@@ -1893,11 +1894,28 @@ async def _init_character_resources(k: str, is_new_character: bool):
                 new_mgr.websocket = old_websocket
                 logger.info(f"已恢复 {k} 的WebSocket连接")
 
+            # Bind the lazy desired voice configuration before any websocket
+            # handler can obtain this manager. Idle registration creates no
+            # model, but is still a required publication precondition.
+            from .voice_identity_runtime import (
+                register_voice_identity_manager,
+                unregister_voice_identity_manager,
+            )
+
+            try:
+                await register_voice_identity_manager(new_mgr)
+            except BaseException:
+                try:
+                    await unregister_voice_identity_manager(new_mgr)
+                finally:
+                    await _terminal_close_session_manager(new_mgr, character_name=k)
+                raise
             rs.session_manager = new_mgr
+            desired_bound_manager = new_mgr
 
         from .voice_identity_runtime import register_voice_identity_manager
 
-        if rs.session_manager is not None:
+        if rs.session_manager is not None and rs.session_manager is not desired_bound_manager:
             await register_voice_identity_manager(rs.session_manager)
 
     # 检查并启动同步连接器 task

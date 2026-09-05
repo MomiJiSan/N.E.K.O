@@ -90,6 +90,36 @@ def _profile(identity: SpeakerModelIdentity | None = None) -> SpeakerProfile:
         reference.close()
 
 
+@pytest.mark.parametrize("iteration", range(50))
+def test_shadow_constructor_failure_closes_unadopted_backend_factory(monkeypatch, iteration):
+    import main_logic.voice_identity_service.asr_composition as module
+
+    created = []
+    original = module.CampPlusBackendFactory
+
+    def backend_factory(embedding):
+        backend = original(embedding)
+        created.append(backend)
+        return backend
+
+    def broken_shadow(**kwargs):
+        raise RuntimeError("injected observer construction failure")
+
+    monkeypatch.setattr(module, "CampPlusBackendFactory", backend_factory)
+    monkeypatch.setattr(module, "SpeakerShadowRuntime", broken_shadow)
+    profile = _profile()
+    factory = module.OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(), profile, activation_generation="activation-1", enforce=True
+    )
+    try:
+        with pytest.raises(RuntimeError, match="injected observer"):
+            factory()
+        assert len(created) == 1 and created[0]._closed
+    finally:
+        factory.close()
+        profile.close()
+
+
 def test_composition_emits_stateless_ordered_low_facts_then_close() -> None:
     sink = _EvidenceSink()
     profile = _profile()

@@ -325,10 +325,21 @@ async def test_provider_route_without_exact_interval_rejects_verifier() -> None:
 
 
 async def test_smart_turn_route_retains_verifier_support() -> None:
+    from main_logic.asr_client.speaker_verifier_contracts import (
+        SpeakerVerifierInstallOutcome,
+        SpeakerVerifierInstallReceipt,
+    )
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
-    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=True)
     factory = MagicMock()
+
+    async def install(spec, identity):
+        assert spec.factory_builder(runtime._asr_runtime, identity) is factory
+        receipt = SpeakerVerifierInstallReceipt(identity, SpeakerVerifierInstallOutcome.INSTALLED)
+        runtime._asr_runtime._speaker_verifier_install_receipt = receipt
+        return receipt
+
+    runtime._asr_runtime.install_speaker_verifier = AsyncMock(side_effect=install)
 
     result = await runtime.set_speaker_verifier_factory(
         factory,
@@ -336,25 +347,29 @@ async def test_smart_turn_route_retains_verifier_support() -> None:
     )
 
     assert result is VoiceIdentityActivationResult.READY
-    assert runtime._speaker_shadow_factory is factory
-    runtime._asr_runtime.set_speaker_verifier_factory.assert_awaited_once_with(
-        factory,
-        activation_generation="profile-generation",
-    )
+    assert runtime._speaker_shadow_factory is None
+    assert runtime._speaker_verifier_spec.profile_generation == "profile-generation"
+    runtime._asr_runtime.install_speaker_verifier.assert_awaited_once()
 
 
 async def test_core_forgets_future_verifier_when_physical_detach_degrades() -> None:
+    from main_logic.asr_client.speaker_verifier_contracts import (
+        SpeakerVerifierInstallOutcome,
+        SpeakerVerifierInstallReceipt,
+    )
     runtime = _Runtime()
     runtime._speaker_shadow_factory = MagicMock()
-    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=False)
+    runtime._asr_runtime.install_speaker_verifier = AsyncMock(return_value=
+        SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.FAILED))
 
     updated = await runtime.set_speaker_verifier_factory(
         None,
         activation_generation="revoked-profile",
     )
 
-    assert updated is False
+    assert updated is VoiceIdentityActivationResult.RUNTIME_DEGRADED
     assert runtime._speaker_shadow_factory is None
+    assert not runtime._speaker_verifier_spec.requested_enabled
 
 
 class _TestSmartTurnLease:
@@ -7046,7 +7061,9 @@ async def test_core_passes_only_configured_speaker_shadow_factory(
 
     await runtime._start_independent_asr_if_enabled("audio")
 
-    assert start_mock.await_args.kwargs["speaker_shadow_factory"] is factory
+    # A previous route's factory is not a rebuildable desired configuration.
+    assert "speaker_shadow_factory" not in start_mock.await_args.kwargs
+    assert runtime._speaker_shadow_factory is None
     factory.assert_not_called()
 
 
@@ -10435,8 +10452,16 @@ async def test_start_installs_latest_verifier_published_during_connect(
     monkeypatch,
 ) -> None:
     import main_logic.asr_client.runtime as runtime_module
+    from main_logic.asr_client.speaker_verifier_contracts import (
+        SpeakerVerifierAuthority,
+        SpeakerVerifierInstallOutcome,
+        SpeakerVerifierSpec,
+    )
 
     runtime = _Runtime()
+    runtime.core_api_type = "qwen"
+    runtime.input_mode = "audio"
+    runtime.is_active = False
     selection = _selection("qwen", "provider")
     connect_started = asyncio.Event()
     connect_release = asyncio.Event()
@@ -10460,32 +10485,49 @@ async def test_start_installs_latest_verifier_published_during_connect(
         "_create_asr_session_from_selection",
         lambda _core_type, **_kwargs: session,
     )
-    detector_factory = MagicMock(return_value=_ReadyDetector())
-    monkeypatch.setattr(runtime_module, "DetectorRuntime", detector_factory)
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(return_value={
+            "independentAsrEnabled": True,
+            "voiceInputResourceOptimizationEnabled": False,
+        }),
+    )
     stale_shadow = SimpleNamespace(close=AsyncMock())
     current_shadow = SimpleNamespace(close=AsyncMock())
     stale_factory = MagicMock(return_value=stale_shadow)
     current_factory = MagicMock(return_value=current_shadow)
 
-    start_task = asyncio.create_task(
-        runtime._asr_runtime.start(
-            route_key="qwen",
-            resource_optimization_enabled=True,
-            speaker_shadow_factory=stale_factory,
+    def spec(factory, revision):
+        authority = SpeakerVerifierAuthority()
+        authority.commit()
+        return SpeakerVerifierSpec(
+            revision, revision, True, True, authority,
+            lambda _runtime, _identity: factory,
         )
-    )
-    await asyncio.wait_for(connect_started.wait(), 1.0)
-    assert await runtime._asr_runtime.set_speaker_verifier_factory(
-        current_factory,
-        activation_generation="current-profile",
-    )
-    connect_release.set()
-    result = await asyncio.wait_for(start_task, 1.0)
 
-    assert result.status is AsrStartStatus.READY
-    stale_factory.assert_not_called()
-    current_factory.assert_called_once_with()
-    assert detector_factory.call_args.kwargs["speaker_shadow"] is current_shadow
+    assert (await runtime.set_speaker_verifier_spec(spec(stale_factory, "old"))).outcome is SpeakerVerifierInstallOutcome.DEFERRED_ROUTE
+
+    start_task = asyncio.create_task(
+        runtime._start_independent_asr_if_enabled("audio")
+    )
+    try:
+        await asyncio.wait_for(connect_started.wait(), 1.0)
+        pending = await runtime.set_speaker_verifier_spec(spec(current_factory, "current"))
+        assert pending.outcome is SpeakerVerifierInstallOutcome.DEFERRED_ROUTE
+        current_factory.assert_not_called()
+        connect_release.set()
+        await asyncio.wait_for(start_task, 1.0)
+
+        assert runtime._asr_route_mode == "independent"
+        stale_factory.assert_not_called()
+        current_factory.assert_called_once_with()
+        assert runtime._asr_runtime._asr_detector._speaker_shadow is current_shadow
+        assert runtime.speaker_verifier_installation_status("current").outcome is SpeakerVerifierInstallOutcome.INSTALLED
+    finally:
+        connect_release.set()
+        await asyncio.gather(start_task, return_exceptions=True)
+        await runtime._asr_runtime.close()
 
 
 async def test_failed_detector_construction_closes_created_speaker_shadow(

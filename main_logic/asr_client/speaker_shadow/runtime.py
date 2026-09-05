@@ -626,11 +626,14 @@ class SpeakerShadowRuntime:
         on_evidence: EvidenceCallback | None = None,
         on_backend_degraded: Callable[[], None] | None = None,
         on_backend_recovered: Callable[[], None] | None = None,
+        on_health_changed: Callable[[int, frozenset[str]], None] | None = None,
     ) -> None:
         self._config = config or SpeakerShadowConfig()
         self._backend_factory = backend_factory
         self._on_backend_degraded = on_backend_degraded
         self._on_backend_recovered = on_backend_recovered
+        self._on_health_changed = on_health_changed
+        self._health_revision = 0
         if on_observation is not None and not (
             inspect.iscoroutinefunction(on_observation)
             or inspect.iscoroutinefunction(getattr(on_observation, "__call__", None))
@@ -4577,10 +4580,11 @@ class SpeakerShadowRuntime:
         self._clear_degraded_cause("backend_unavailable")
 
     def _set_degraded_cause(self, cause: _DegradedCause) -> None:
-        if cause in self._degraded_causes:
+        if self._closed or cause in self._degraded_causes:
             return
         notify = not self._degraded_causes
         self._degraded_causes.add(cause)
+        self._publish_health_snapshot()
         if not notify:
             return
         self._metrics.delivery_degraded_count += 1
@@ -4596,6 +4600,7 @@ class SpeakerShadowRuntime:
         if cause not in self._degraded_causes:
             return
         self._degraded_causes.discard(cause)
+        self._publish_health_snapshot()
         if self._degraded_causes:
             return
         if self._closed:
@@ -4607,6 +4612,17 @@ class SpeakerShadowRuntime:
             callback()
         except Exception:
             self._metrics.callback_failure_count += 1
+
+    def _publish_health_snapshot(self) -> None:
+        if self._closed:
+            return
+        self._health_revision += 1
+        callback = self._on_health_changed
+        if callback is not None:
+            try:
+                callback(self._health_revision, frozenset(self._degraded_causes))
+            except Exception:
+                self._metrics.callback_failure_count += 1
 
     async def _unload_backend(self) -> bool:
         host = self._backend_host

@@ -1596,6 +1596,28 @@ test('backend degradation reason is preserved when no profile exists', async () 
     assert.equal(harness.elements.get('voice-identity-start').disabled, true);
 });
 
+test('pending activation preserves the saved request without presenting ready', async () => {
+    const statusGate = deferred();
+    const harness = createHarness({ initialProfile: true, initialRequested: true, statusGate });
+    const initializing = harness.startInitialization();
+    statusGate.resolve(jsonResponse({
+        requested_enabled: true,
+        effective_enabled: false,
+        effective_reason: 'activation_pending',
+        has_profile: true,
+        enrollment: null,
+        profile_generation: 'profile-0',
+        runtime_mode: 'enforce',
+    }));
+    await initializing;
+
+    // The fallback remains actionable even before locale loading settles.
+    assert.equal(harness.elements.get('voice-identity-profile-status').textContent,
+        '设置已保存，等待语音链路就绪');
+    assert.equal(harness.elements.get('voice-identity-filter').checked, true);
+    assert.equal(harness.elements.get('voice-identity-delete').disabled, false);
+});
+
 test('model unavailability disables enrollment and shows actionable status', async () => {
     const harness = createHarness({
         initialEffectiveReason: 'model_unavailable',

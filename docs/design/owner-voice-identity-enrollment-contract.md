@@ -155,7 +155,11 @@ match_percent = round(
 
 客户端准备操作同样使用不可变身份上下文，至少绑定 operation nonce、enrollment ID、profile ID、segment index 和基于 `performance.now()` 的 deadline。所有 timer 回调及 deadline 到达点都必须重新校验该上下文；取消、页面隐藏、窗口关闭、TTL 到期、服务端退休、BFCache 恢复同步或新 operation 接管时必须中止准备。旧 timer 只能返回 stale，不能迟到创建 AudioWorklet、采集 PCM、上传 Segment，且旧 operation 的 `finally` 不得清除后继准备态。
 
-旧 Profile 和启用偏好在第四段验证及完整提交成功前保持不变。通过后才依次 stage Profile、激活 Runtime、保存 preference 并提交加密文件；任一步失败都必须回滚本轮未提交状态。
+第四段验证成功前不 stage、不激活、不写 preference、不替换旧 Profile。验证通过后依次 stage Profile、prepare activation、保存 preference、提交加密 Profile、swap Service Profile，最后 commit activation authority。暂存安装可准备或挂载新实例，但在持久化与配置结算前不能作为正式证据来源；继续使用现有 enrollment suppression，不增加第二套抑制机制。
+
+持久化提交、实际安装、待恢复义务是三个不同状态，不是跨磁盘与多个 manager 的物理原子事务。尚未提交时，失败补偿先同步撤销新激活权限，再恢复旧 Profile 的新 activation revision；个别 manager 暂处 unsupported 只表示恢复待定，不能当作恢复成功。磁盘提交已确定完成后取消，必须结算 Service / 激活权限或明确进入待协调状态，再传播取消，不得盲目回滚已提交资料。旧操作在 shutdown 或新操作接管后不得重新激活 Profile。
+
+具体安装身份、取消清理、补偿和 READY 汇总由 [安装生命周期合同](./owner-voice-identity-installation-lifecycle-contract) 约束。已保存而未生效时公开原因是 `activation_pending` 且 `effective_enabled=false`，不应显示保护已就绪；此调整不改变本合同的录入算法、音频域、时长、质量门或 schema。
 
 Profile 使用 schema/AAD v3，保存合同 ID、合同 revision、录入时降噪快照和通过验证后的 reference centroid。旧 schema 明确不兼容，不能静默补字段或跨音频域继续比较。
 

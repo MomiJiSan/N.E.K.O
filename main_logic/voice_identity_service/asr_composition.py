@@ -6,6 +6,12 @@ import copy
 import threading
 from typing import Protocol
 
+from main_logic.asr_client.speaker_verifier_contracts import (
+    SpeakerVerifierAuthority,
+    SpeakerVerifierInstallIdentity,
+    SpeakerVerifierHealthEvent,
+)
+
 from main_logic.asr_client.admission.contracts import (
     CaptureClosed,
     SpeakerCheckpointKind,
@@ -78,6 +84,8 @@ class OwnerVoiceAsrCompositionFactory:
         *,
         activation_generation: str,
         enforce: bool,
+        authority: SpeakerVerifierAuthority | None = None,
+        installation_identity: SpeakerVerifierInstallIdentity | None = None,
     ) -> None:
         required_methods = (
             "_accept_speaker_evidence_fact",
@@ -97,6 +105,8 @@ class OwnerVoiceAsrCompositionFactory:
         self._profile = copy.copy(profile)
         self._activation_generation = activation_generation
         self._enforce = enforce
+        self._authority = authority
+        self._installation_identity = installation_identity
         self._lock = threading.Lock()
         self._closed = False
         self._diagnostics = {
@@ -115,6 +125,18 @@ class OwnerVoiceAsrCompositionFactory:
     @property
     def activation_generation(self) -> str:
         return self._activation_generation
+
+    def bind_installation(
+        self, identity: SpeakerVerifierInstallIdentity, authority: SpeakerVerifierAuthority
+    ) -> None:
+        """Bind a legacy one-shot factory before any observer is constructed."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("composition factory is closed")
+            if self._installation_identity is not None and self._installation_identity != identity:
+                raise RuntimeError("composition factory already belongs to another installation")
+            self._installation_identity = identity
+            self._authority = authority
 
     @property
     def enforces_admission(self) -> bool:
@@ -150,13 +172,20 @@ class OwnerVoiceAsrCompositionFactory:
             reference.close()
 
         runtime = self._runtime
-        generation = self._activation_generation
+        identity = self._installation_identity
+        generation = identity.installation_id if identity is not None else self._activation_generation
         enforce = self._enforce
 
         def on_evidence(event: SpeakerShadowEvidenceEvent) -> None:
             with self._lock:
                 factory_closed = self._closed
-            if factory_closed:
+            permitted = (
+                self._authority is None or self._authority.permits_evidence
+            ) and (
+                identity is None
+                or runtime.speaker_verifier_installation_permits_evidence(identity)
+            )
+            if factory_closed or not permitted:
                 if isinstance(event, SpeakerShadowCompletion):
                     with self._lock:
                         self._diagnostics["speaker_completion_stale_count"] += 1
@@ -244,31 +273,45 @@ class OwnerVoiceAsrCompositionFactory:
                 activation_generation=generation,
             )
 
-        return SpeakerShadowRuntime(
-            backend_factory=backend_factory,
-            config=SpeakerShadowConfig(
-                enabled=True,
-                similarity_thresholds=(OwnerVoicePolicy.SIMILARITY_THRESHOLD,),
-                minimum_audio_ms=OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
-                maximum_audio_ms=MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS,
-                observation_checkpoints_ms=(
-                    OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
-                    OwnerVoicePolicy.SECOND_CHECKPOINT_MS,
+        def on_health_changed(revision: int, causes: frozenset[str]) -> None:
+            with self._lock:
+                if self._closed:
+                    return
+            if identity is not None:
+                runtime._accept_speaker_verifier_health(
+                    SpeakerVerifierHealthEvent(identity, revision, causes)
+                )
+
+        try:
+            return SpeakerShadowRuntime(
+                backend_factory=backend_factory,
+                config=SpeakerShadowConfig(
+                    enabled=True,
+                    similarity_thresholds=(OwnerVoicePolicy.SIMILARITY_THRESHOLD,),
+                    minimum_audio_ms=OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
+                    maximum_audio_ms=MAX_SPEAKER_SHADOW_CANDIDATE_AUDIO_MS,
+                    observation_checkpoints_ms=(
+                        OwnerVoicePolicy.FIRST_CHECKPOINT_MS,
+                        OwnerVoicePolicy.SECOND_CHECKPOINT_MS,
+                    ),
+                    completion_confirmation_scopes=(
+                        ("provider_candidate",) if enforce else ()
+                    ),
+                    pending_observation_gate_scopes=(
+                        ("provider_candidate",) if enforce else ()
+                    ),
+                    backend_prewarm_scopes=(
+                        ("provider_candidate",) if enforce else ()
+                    ),
                 ),
-                completion_confirmation_scopes=(
-                    ("provider_candidate",) if enforce else ()
-                ),
-                pending_observation_gate_scopes=(
-                    ("provider_candidate",) if enforce else ()
-                ),
-                backend_prewarm_scopes=(
-                    ("provider_candidate",) if enforce else ()
-                ),
-            ),
-            on_evidence=on_evidence,
-            on_backend_degraded=on_backend_degraded,
-            on_backend_recovered=on_backend_recovered,
-        )
+                on_evidence=on_evidence,
+                on_backend_degraded=on_backend_degraded if identity is None else None,
+                on_backend_recovered=on_backend_recovered if identity is None else None,
+                on_health_changed=on_health_changed if identity is not None else None,
+            )
+        except BaseException:
+            backend_factory.close()
+            raise
 
     @staticmethod
     def _checkpoint_kind(
