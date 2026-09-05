@@ -15,6 +15,8 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import Any, Literal
 
+from .diagnostics import SpeakerShadowDiagnostic
+
 from .contracts import (
     CompletionCallback,
     EvidenceCallback,
@@ -512,6 +514,11 @@ class _CandidateToken:
     anchor_queued: bool = False
     anchor_applied: bool = False
     rolling_buffer_deferred: bool = True
+    # Diagnostics only: never consulted by scoring or admission decisions.
+    score_attempt_count: int = 0
+    score_input_sample_count: int = 0
+    score_outcome: str = "not_started"
+    finish_sample_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -646,12 +653,20 @@ class SpeakerShadowRuntime:
         on_backend_degraded: Callable[[], None] | None = None,
         on_backend_recovered: Callable[[], None] | None = None,
         on_health_changed: Callable[[int, frozenset[str]], None] | None = None,
+        on_diagnostic: Callable[[SpeakerShadowDiagnostic], None] | None = None,
     ) -> None:
         self._config = config or SpeakerShadowConfig()
         self._backend_factory = backend_factory
         self._on_backend_degraded = on_backend_degraded
         self._on_backend_recovered = on_backend_recovered
         self._on_health_changed = on_health_changed
+        if on_diagnostic is not None and (
+            not callable(on_diagnostic)
+            or inspect.iscoroutinefunction(on_diagnostic)
+            or inspect.iscoroutinefunction(getattr(on_diagnostic, "__call__", None))
+        ):
+            raise TypeError("SpeakerShadowRuntime diagnostic callback must be synchronous")
+        self._on_diagnostic = on_diagnostic
         self._health_revision = 0
         if on_observation is not None and not (
             inspect.iscoroutinefunction(on_observation)
@@ -4452,12 +4467,16 @@ class SpeakerShadowRuntime:
         self._active_evaluation = (generation, candidate)
         self._active_evaluation_terminal = terminal
         self._active_pcm_bytes = len(pcm16)
+        token.score_input_sample_count = len(pcm16) // 2
+        token.score_outcome = "waiting_backend"
         try:
             backend_host = await self._ensure_backend()
             if not self._identity_is_current(generation, candidate, token):
+                token.score_outcome = "stale_before_score"
                 self._metrics.stale_result_count += 1
                 return
             if backend_host is None:
+                token.score_outcome = "backend_unavailable"
                 self._mark_backend_degraded()
                 self._publish_unavailable_observation(
                     generation=generation,
@@ -4470,6 +4489,9 @@ class SpeakerShadowRuntime:
                 self._finalize_candidate(candidate, "failed", token=token)
                 return
             started = time.perf_counter()
+            token.score_attempt_count += 1
+            token.score_outcome = "in_progress"
+            self._emit_diagnostic(token, "speaker_score_started", generation=generation)
             try:
                 similarity = float(
                     await backend_host.score(
@@ -4481,8 +4503,10 @@ class SpeakerShadowRuntime:
                     raise ValueError("speaker cosine similarity must be within [-1, 1]")
                 self._mark_backend_recovered()
             except asyncio.CancelledError:
+                token.score_outcome = "cancelled"
                 raise
             except _BackendHostTimeout:
+                token.score_outcome = "timeout"
                 self._metrics.backend_timeout_count += 1
                 self._discard_backend_host(backend_host)
                 self._metrics.inference_failure_count += 1
@@ -4499,6 +4523,7 @@ class SpeakerShadowRuntime:
                     self._finalize_candidate(candidate, "failed", token=token)
                 return
             except Exception:
+                token.score_outcome = "failed"
                 if not backend_host.alive:
                     self._discard_backend_host(backend_host)
                 self._metrics.inference_failure_count += 1
@@ -4519,6 +4544,7 @@ class SpeakerShadowRuntime:
                     (time.perf_counter() - started) * 1_000
                 )
             if not self._identity_is_current(generation, candidate, token):
+                token.score_outcome = "stale_after_score"
                 self._metrics.stale_result_count += 1
                 return
 
@@ -4527,6 +4553,7 @@ class SpeakerShadowRuntime:
                 for threshold in self._config.similarity_thresholds
             )
             blocked_at_any_threshold = any(blocked for _, blocked in would_block)
+            token.score_outcome = "completed"
             token.last_checkpoint_ms = (
                 checkpoint_ms
                 if checkpoint_ms is not None
@@ -4614,7 +4641,12 @@ class SpeakerShadowRuntime:
                 ):
                     token.last_delivered_checkpoint_ms = checkpoint_ms
             return blocked_at_any_threshold
+        except asyncio.CancelledError:
+            if token.score_outcome == "waiting_backend":
+                token.score_outcome = "cancelled_before_score"
+            raise
         finally:
+            self._emit_diagnostic(token, "speaker_score_finished", generation=generation)
             if self._active_evaluation == (generation, candidate):
                 self._active_evaluation = None
                 self._active_evaluation_terminal = False
@@ -4952,6 +4984,9 @@ class SpeakerShadowRuntime:
             pending.finish = marker
             return
         # Only an accepted QUEUED marker outranks the tombstone watermark.
+        finishing_buffer = self._buffers.get(marker.candidate)
+        if finishing_buffer is not None and finishing_buffer.token is marker.token:
+            marker.token.finish_sample_count = finishing_buffer.sample_count
         self._mark_finish_processed(marker.token)
         if marker.token.terminal_reason is not None:
             self._record_token_finish(marker.token)
@@ -5116,6 +5151,7 @@ class SpeakerShadowRuntime:
         )
         if not token.evidence_closed:
             token.evidence_closed = True
+            self._emit_diagnostic(token, "speaker_capture_closed")
             self._publish_evidence(completion, token=token)
         legacy_completion = SpeakerShadowCompletion(
             candidate=marker.candidate,
@@ -5364,6 +5400,7 @@ class SpeakerShadowRuntime:
             return
         if token is not None:
             token.terminal_reason = terminal_reason
+            self._emit_diagnostic(token, "speaker_candidate_terminal")
             if self._candidate_tokens.get(candidate) is token:
                 self._candidate_tokens.pop(candidate, None)
         previous = self._finalized.pop(candidate, None)
@@ -5396,6 +5433,44 @@ class SpeakerShadowRuntime:
         while len(self._finalized) > self._config.finalized_candidate_capacity:
             evicted_candidate, _ = self._finalized.popitem(last=False)
             self._record_evicted_candidate(evicted_candidate)
+
+    def _emit_diagnostic(
+        self, token: _CandidateToken, stage: str, *, generation: int | None = None,
+    ) -> None:
+        callback = self._on_diagnostic
+        if callback is None:
+            return
+        try:
+            buffer = self._buffers.get(token.candidate)
+            callback(SpeakerShadowDiagnostic(
+                candidate=token.candidate,
+                stage=stage,
+                worker_generation=self._generation if generation is None else generation,
+                sample_rate_hz=token.sample_rate_hz,
+                accepted_sample_count=token.accepted_sample_count,
+                buffered_sample_count=(
+                    buffer.sample_count if buffer is not None and buffer.token is token else None
+                ),
+                finish_sample_count=token.finish_sample_count,
+                minimum_sample_count=(
+                    (self._config.observation_checkpoints_ms or (self._config.minimum_audio_ms,))[0]
+                    * token.sample_rate_hz // 1000
+                    if token.sample_rate_hz > 0 else None
+                ),
+                score_attempt_count=token.score_attempt_count,
+                score_input_sample_count=token.score_input_sample_count,
+                score_outcome=token.score_outcome,
+                scored_sample_count=token.scored_sample_count,
+                last_checkpoint_ms=token.last_checkpoint_ms,
+                terminal_reason=token.terminal_reason,
+                evidence_sequence_no=token.evidence_sequence_no,
+                anchor_applied=token.anchor_applied,
+                anchor_discard_prefix_sample_count=token.anchor_discard_prefix_sample_count,
+                scoring_deferred=token.scoring_deferred,
+            ))
+        except Exception:
+            # Telemetry has no effect on evidence integrity or lifecycle.
+            pass
 
     def _candidate_was_evicted(
         self,

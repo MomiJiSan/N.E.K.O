@@ -31,7 +31,11 @@ from main_logic.voice_turn.contracts import (
 )
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 
+from utils.logger_config import get_module_logger
 from ._infra import logger, _READY_TIMEOUT_SECONDS
+from .diagnostic_logging import submit_resolution_log
+from .speaker_diagnostics import diagnostic_context, speaker_diagnostic_scalars
+from .speaker_shadow.diagnostics import SpeakerShadowDiagnostic
 from ._provider_events import (
     ProviderEndpointNotification,
     ProviderFinalNotification,
@@ -184,6 +188,8 @@ from .transcript import (
     TranscriptTerminalSettlement,
 )
 
+
+asr_diagnostic_logger = get_module_logger("asr_diagnostics", "Main")
 
 # The frontend gives a voice start this long before it cancels and fires
 # end_session (app-buttons.js, and the automatic-restart path in
@@ -4199,6 +4205,7 @@ class IndependentAsrRuntime:
         else:
             context = self._asr_admission_final_contexts.pop(effect.turn_token, None)
             existing.late_context = context
+            self._schedule_asr_resolution_log(effect, stage="admission_decision")
         ownership = self._asr_provider_turn_ownerships.get(effect.turn_token)
         ownership_cleanup = (
             self._asr_speaker_deny_cleanups.get(ownership.speaker_lease_token)
@@ -4334,6 +4341,12 @@ class IndependentAsrRuntime:
                 )
             )
         existing.core_resolution_succeeded = resolved
+        self._schedule_asr_resolution_log(
+            effect,
+            stage="transcript_resolution",
+            outcome=receipt.outcome.value if receipt is not None else "missing_receipt",
+            applied=resolved,
+        )
         if (
             effect.disposition is AdmissionDisposition.DROP
             and exact_transaction is not None
@@ -10711,6 +10724,7 @@ class IndependentAsrRuntime:
             or epoch != self._asr_session_epoch
         ):
             return _ProviderStartedOutcome.STALE
+        self._schedule_provider_boundary_diagnostic(notification, epoch)
         if self._deny_transport_blocks_provider_egress():
             return _ProviderStartedOutcome.DENIED_SETTLED
 
@@ -11003,6 +11017,7 @@ class IndependentAsrRuntime:
             or epoch != self._asr_session_epoch
         ):
             return
+        self._schedule_provider_boundary_diagnostic(notification, epoch)
         if notification.phase == "boundary":
             await self._handle_provider_boundary_notification(
                 notification,
@@ -13074,6 +13089,142 @@ class IndependentAsrRuntime:
                             None,
                         )
 
+    def _schedule_asr_resolution_log(
+        self,
+        effect: ResolveReserved,
+        *,
+        stage: str,
+        outcome: str | None = None,
+        applied: bool | None = None,
+    ) -> None:
+        """Snapshot the ticket's verdict before cleanup, with bounded off-loop I/O.
+
+        Dispatcher acceptance is deliberately separate from Provider ack,
+        history writes and client presentation; it proves none of those.
+        """
+        try:
+            metadata = self._asr_admission.snapshot_resolution_diagnostics(effect.ticket)
+            metadata.update(diagnostic_context(self, effect.turn_token.ingress.session_epoch))
+            metadata.update(stage=stage, dispatcher_outcome=outcome, dispatcher_applied=applied)
+            self._schedule_asr_diagnostic_metadata(metadata)
+        except Exception:
+            pass
+
+    def _schedule_provider_boundary_diagnostic(
+        self,
+        notification: ProviderUtteranceStartedNotification | ProviderEndpointNotification,
+        epoch: int,
+    ) -> None:
+        try:
+            metadata = diagnostic_context(self, epoch)
+            started = isinstance(notification, ProviderUtteranceStartedNotification)
+            audio_range = None if started else notification.audio_range
+            metadata.update(
+                stage="provider_started_received" if started else "provider_endpoint_received",
+                provider_generation=notification.generation,
+                provider_buffer_epoch=notification.buffer_epoch,
+                provider_utterance_id=notification.utterance_id,
+                provider_start_sample_16k=(
+                    notification.audio_start_sample_16k if started
+                    else audio_range.start_sample_16k if audio_range is not None else None
+                ),
+                provider_end_sample_16k=(audio_range.end_sample_16k if audio_range is not None else None),
+                boundary_quality=None if started else notification.boundary_quality,
+                boundary_phase=None if started else notification.phase,
+            )
+            self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+        except Exception:
+            pass
+
+    def _accept_speaker_diagnostic(
+        self, event: SpeakerShadowDiagnostic, *, activation_generation: str, source: object,
+    ) -> None:
+        """Read existing ownership only; never attach a candidate or admit text."""
+        if (
+            activation_generation != self._speaker_verifier_activation_generation
+            or source is None
+            or source is not getattr(self._asr_detector, "_speaker_shadow", None)
+        ):
+            return
+        try:
+            candidate = event.candidate
+            exact = self._asr_provider_exact_candidates.get(candidate)
+            ledger = self._asr_provider_speaker_ledgers.get(candidate)
+            owner = exact if exact is not None else ledger
+            if owner is None or not self._runtime_identity_matches(owner.runtime_identity):
+                # A detached/old candidate cannot borrow the current turn's key.
+                return
+            key = owner.provider_key
+            turn = owner.turn_token
+            metadata = diagnostic_context(self, owner.runtime_identity.session_epoch)
+            metadata.update(speaker_diagnostic_scalars(event))
+            metadata.update(
+                provider_generation=key.generation if key is not None else None,
+                provider_buffer_epoch=key.buffer_epoch if key is not None else None,
+                provider_utterance_id=key.utterance_id if key is not None else None,
+                turn_id=turn.turn_id if turn is not None else None,
+                provider_start_sample_16k=(
+                    exact.reservation.boundary.start_sample_16k if exact is not None
+                    else ledger.anchor_start_sample_16k
+                ),
+                provider_end_sample_16k=(
+                    exact.reservation.boundary.end_sample_16k if exact is not None else None
+                ),
+                audio_observed_through_sample_16k=(
+                    ledger.observed_through_sample_16k if ledger is not None else None
+                ),
+                interval_state="exact" if exact is not None else ledger.state.value,
+                candidate_role=(
+                    "exact_target" if exact is not None and candidate == exact.target_candidate
+                    else "exact_source" if exact is not None else "provisional"
+                ),
+            )
+            # Reserve space for final verdicts even during diagnostic bursts.
+            self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+        except Exception:
+            pass
+
+    def _schedule_asr_diagnostic_metadata(self, metadata: dict, *, capacity: int = 16) -> None:
+        """One bounded delivery path for both decisions and their explanations."""
+        try:
+            if sum(
+                task.get_name() == "asr-resolution-log" and not task.done()
+                for task in self._asr_close_tasks
+            ) >= capacity:
+                self._asr_resolution_log_dropped = (
+                    getattr(self, "_asr_resolution_log_dropped", 0) + 1
+                )
+                return
+            metadata.update(
+                diagnostic_records_dropped=getattr(self, "_asr_resolution_log_dropped", 0),
+            )
+            pending = submit_resolution_log(metadata)
+            if pending is None:
+                self._asr_resolution_log_dropped = metadata["diagnostic_records_dropped"] + 1
+                return
+            self._asr_resolution_log_dropped = 0
+
+            async def persist() -> None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.wrap_future(pending), timeout=0.2,
+                    )
+                except Exception:
+                    pass
+                finally:
+                    # Timed-out queued writes are cancelled; an already
+                    # running writer can still persist its captured record.
+                    if pending.cancelled():
+                        self._asr_resolution_log_dropped = (
+                            getattr(self, "_asr_resolution_log_dropped", 0) + 1
+                        )
+
+            task = asyncio.create_task(persist(), name="asr-resolution-log")
+            self._track_terminal_close_tasks({task})
+        except Exception:
+            # Diagnostics cannot fail or delay the authoritative decision.
+            pass
+
     def _schedule_asr_incident_log(
         self,
         *,
@@ -13158,7 +13309,7 @@ class IndependentAsrRuntime:
             try:
                 # Do not pass runtime objects, exception text, conversation,
                 # PCM or speaker vectors to the logging worker.
-                await asyncio.to_thread(logger.warning, "ASR incident %s", metadata)
+                await asyncio.to_thread(asr_diagnostic_logger.warning, "ASR incident %s", metadata)
             except Exception:
                 # Diagnostic I/O cannot replace the authoritative ASR failure.
                 pass

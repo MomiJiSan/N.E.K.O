@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from main_logic.asr_client import runtime as runtime_module
+from main_logic.asr_client.runtime import asr_diagnostic_logger
 from tests.unit.test_core_independent_asr import _Runtime, _install_ready_lifecycle
 from tests.unit.asr_client.test_provider_speaker_continuity import (
     _active_real_stack,
@@ -32,7 +33,7 @@ async def test_failure_log_preserves_safe_first_reason_and_status_incident(monke
     runtime._asr_sealed_provider_key = runtime_module.ProviderUtteranceKey(3, 4, 5)
     epoch = runtime._asr_session_epoch
     logs = []
-    monkeypatch.setattr(runtime_module.logger, "warning", lambda *args: logs.append(args))
+    monkeypatch.setattr(asr_diagnostic_logger, "warning", lambda *args: logs.append(args))
 
     await runtime._handle_independent_asr_error(
         epoch, "qwen", status_code="ASR_AUDIO_ORDERING_FAILED",
@@ -80,7 +81,7 @@ async def test_slow_or_failed_logger_does_not_delay_route_cleanup(monkeypatch, f
         if fail_writer:
             raise OSError("private log sink failure")
 
-    monkeypatch.setattr(runtime_module.logger, "warning", warning)
+    monkeypatch.setattr(asr_diagnostic_logger, "warning", warning)
     try:
         await asyncio.wait_for(runtime._handle_independent_asr_error(epoch, "qwen"), 1)
         assert await asyncio.to_thread(entered.wait, 1)
@@ -107,7 +108,7 @@ async def test_failure_snapshot_is_queued_before_cancellable_invalidation(monkey
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(runtime_module.logger, "warning", lambda *args: logs.append(args))
+    monkeypatch.setattr(asr_diagnostic_logger, "warning", lambda *args: logs.append(args))
     monkeypatch.setattr(runtime._asr_runtime, "_finish_admission_invalidation", pause_invalidation)
     task = asyncio.create_task(runtime._handle_independent_asr_error(runtime._asr_session_epoch, "qwen"))
     await asyncio.wait_for(entered.wait(), 1)
@@ -123,7 +124,7 @@ async def test_failure_snapshot_is_queued_before_cancellable_invalidation(monkey
 async def test_degradation_and_terminal_logs_correlate_without_overwriting_first_reason(monkeypatch):
     core, runtime, detector, shadow, lifecycle, session, turn = await _active_real_stack()
     logs = []
-    monkeypatch.setattr(runtime_module.logger, "warning", lambda *args: logs.append(args))
+    monkeypatch.setattr(asr_diagnostic_logger, "warning", lambda *args: logs.append(args))
     try:
         await _submit_pcm(runtime, turn, sequence=1)
         evidence = runtime._asr_provider_speaker_evidence_lease
@@ -154,7 +155,7 @@ async def test_degradation_and_terminal_logs_correlate_without_overwriting_first
 async def test_incident_records_are_bounded_and_snapshot_values_are_not_live(monkeypatch):
     runtime = _Runtime()
     logs = []
-    monkeypatch.setattr(runtime_module.logger, "warning", lambda *args: logs.append(args))
+    monkeypatch.setattr(asr_diagnostic_logger, "warning", lambda *args: logs.append(args))
     original_epoch = runtime._asr_session_epoch
     for index in range(12):
         runtime._schedule_asr_incident_log(
@@ -177,7 +178,7 @@ async def test_safe_failure_record_reaches_file_after_route_cleanup(tmp_path):
     _install_ready_lifecycle(runtime, "qwen")
     destination = tmp_path / "incident.log"
     handler = logging.FileHandler(destination, encoding="utf-8")
-    runtime_module.logger.addHandler(handler)
+    asr_diagnostic_logger.addHandler(handler)
     try:
         await runtime._handle_independent_asr_error(
             runtime._asr_session_epoch, "qwen",
@@ -186,7 +187,7 @@ async def test_safe_failure_record_reaches_file_after_route_cleanup(tmp_path):
         await _join_close_tasks(runtime)
         assert runtime._asr_session is None
     finally:
-        runtime_module.logger.removeHandler(handler)
+        asr_diagnostic_logger.removeHandler(handler)
         handler.close()
     persisted = await asyncio.to_thread(destination.read_text, encoding="utf-8")
     assert "ASR_SPEAKER_LEASE_OWNER_CONFLICT" in persisted

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import threading
+import weakref
 from typing import Protocol
 
 from main_logic.asr_client.speaker_verifier_contracts import (
@@ -35,6 +36,7 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowObservation,
 )
 from main_logic.asr_client.speaker_shadow.runtime import SpeakerShadowRuntime
+from main_logic.asr_client.speaker_shadow.diagnostics import SpeakerShadowDiagnostic
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
 
@@ -43,6 +45,10 @@ from .policy import OwnerVoiceClassification, OwnerVoicePolicy
 
 class _OwnerVoiceEvidenceSink(Protocol):
     """One-way bridge; it has no transcript or reservation operations."""
+
+    def _accept_speaker_diagnostic(
+        self, event: SpeakerShadowDiagnostic, *, activation_generation: str, source: object,
+    ) -> None: ...
 
     def _accept_speaker_evidence_fact(
         self,
@@ -175,6 +181,13 @@ class OwnerVoiceAsrCompositionFactory:
         identity = self._installation_identity
         generation = identity.installation_id if identity is not None else self._activation_generation
         enforce = self._enforce
+        source_ref = None
+
+        def on_diagnostic(event: SpeakerShadowDiagnostic) -> None:
+            if source_ref is not None:
+                runtime._accept_speaker_diagnostic(
+                    event, activation_generation=generation, source=source_ref(),
+                )
 
         def on_evidence(event: SpeakerShadowEvidenceEvent) -> None:
             with self._lock:
@@ -283,7 +296,7 @@ class OwnerVoiceAsrCompositionFactory:
                 )
 
         try:
-            return SpeakerShadowRuntime(
+            shadow = SpeakerShadowRuntime(
                 backend_factory=backend_factory,
                 config=SpeakerShadowConfig(
                     enabled=True,
@@ -305,10 +318,13 @@ class OwnerVoiceAsrCompositionFactory:
                     ),
                 ),
                 on_evidence=on_evidence,
+                on_diagnostic=on_diagnostic,
                 on_backend_degraded=on_backend_degraded if identity is None else None,
                 on_backend_recovered=on_backend_recovered if identity is None else None,
                 on_health_changed=on_health_changed if identity is not None else None,
             )
+            source_ref = weakref.ref(shadow)
+            return shadow
         except BaseException:
             backend_factory.close()
             raise

@@ -17,6 +17,7 @@ from .contracts import (
     AdmissionState,
     AdmissionBulkResult,
     AdmissionEffect,
+    AdmissionResolutionTicket,
     AdmissionEvent,
     BoundaryState,
     CandidateBindingState,
@@ -60,6 +61,7 @@ from .contracts import (
     VoiceTurnAdmissionRecord,
 )
 from .reducer import hold_exact_interval_final, reduce, resolve_exact_interval
+from .diagnostics import resolution_diagnostics
 from .speaker_leases import (
     MAX_SPEAKER_LEASE_CHILDREN,
     MAX_SPEAKER_LEASES,
@@ -1608,6 +1610,16 @@ class VoiceTurnAdmissionCoordinator:
             )
             self._records[turn_token] = reduced
             return effects
+
+    def snapshot_resolution_diagnostics(
+        self, ticket: AdmissionResolutionTicket,
+    ) -> dict[str, str | int | bool | None]:
+        """Read on the owning event loop, without yielding or exposing records.
+
+        All writers commit synchronously while holding the writer lock. This
+        diagnostic-only copy adds no await to the delivery/cleanup transaction.
+        """
+        return resolution_diagnostics(self._records.get(ticket.turn_token), ticket)
 
     async def get_record(
         self,
