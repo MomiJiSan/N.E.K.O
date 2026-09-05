@@ -58,6 +58,11 @@ async def test_provider_namespace_reset_retires_every_owned_proof() -> None:
     runtime._asr_admission_effect_task_turns = {}
     runtime._asr_sealed_provider_key = None
     runtime._asr_provider_exact_session = None
+    runtime._asr_provider_exact_intervals = {}
+    runtime._asr_provider_exact_pending = {}
+    runtime._asr_provider_exact_candidates = {}
+    runtime._asr_provider_speaker_ledgers = {}
+    runtime._asr_provider_speaker_key_ledgers = {}
     runtime._asr_provider_started_turns = {}
     runtime._asr_deferred_provider_started_keys = deque()
 
@@ -104,11 +109,17 @@ async def test_provider_namespace_retirement_counts_actual_proof_ownership_once(
     runtime._asr_provider_correlator = correlator
     runtime._asr_provider_correlator_namespace = (1, 2)
     runtime._asr_provider_boundary_proofs = {proof.proof_id: object()}
+    runtime._asr_provider_boundary_completions = {}
     runtime._asr_detector = None
     runtime._asr_admission_effect_tasks = set()
     runtime._asr_admission_effect_task_turns = {}
     runtime._asr_sealed_provider_key = None
     runtime._asr_provider_exact_session = None
+    runtime._asr_provider_exact_intervals = {}
+    runtime._asr_provider_exact_pending = {}
+    runtime._asr_provider_exact_candidates = {}
+    runtime._asr_provider_speaker_ledgers = {}
+    runtime._asr_provider_speaker_key_ledgers = {}
     runtime._asr_provider_started_turns = {}
     runtime._asr_deferred_provider_started_keys = deque()
     runtime._speaker_rejection_metrics = runtime_module._new_speaker_rejection_metrics()
@@ -143,6 +154,8 @@ async def test_speaker_alias_is_retained_until_capture_closed_is_queued() -> Non
     runtime._asr_admission_ingress_started = True
     runtime._asr_admission_candidate_turns = {candidate: turn_token}
     runtime._asr_admission_candidate_leases = {}
+    runtime._asr_provider_exact_candidates = {}
+    runtime._asr_provider_speaker_ledgers = {}
     runtime._asr_admission_effect_tasks = set()
     runtime._asr_admission_effect_task_turns = {}
     runtime._admission_effect_done = runtime._asr_admission_effect_tasks.discard
@@ -308,6 +321,8 @@ async def test_provider_final_callback_waits_only_admission_settlement() -> None
     runtime._asr_provider_correlator = MagicMock()
     runtime._asr_provider_correlator.is_completed.return_value = False
     runtime._asr_provider_started_turns = {}
+    runtime._asr_provider_exact_pending = {}
+    runtime._asr_provider_exact_intervals = {}
     runtime._asr_provider_speaker_evidence_lease = None
     runtime._asr_detector = None
     runtime._accept_provider_timeline = MagicMock(return_value=True)
@@ -429,6 +444,9 @@ async def test_admission_settlement_does_not_wait_blocked_core_delivery() -> Non
     runtime = object.__new__(IndependentAsrRuntime)
     runtime._asr_admission_resolutions = {}
     runtime._asr_provider_turn_ownerships = {}
+    runtime._asr_provider_exact_intervals = {}
+    runtime._asr_speaker_deny_cleanups = {}
+    runtime._asr_current_speaker_lease = None
     runtime._asr_admission_reservation_dispatchers = {
         final_key: dispatcher,
     }

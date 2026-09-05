@@ -29,36 +29,43 @@ from .speaker_verifier_contracts import (
 )
 
 
-class SpeakerVerifierInstallationMixin:
-    """Used by IndependentAsrRuntime; all mutable ownership lives on Runtime."""
+class SpeakerVerifierInstallation:
+    """Explicit Runtime-owned component; no inheritance or attribute proxy.
+
+    Mutable session state stays on the owning Runtime so existing identity
+    fences, callbacks and cleanup owners all observe the same snapshot.
+    """
+
+    def __init__(self, runtime) -> None:
+        self._runtime = runtime
 
     def _ensure_speaker_installation_state(self) -> None:
-        if hasattr(self, "_speaker_installation_serial"):
+        if hasattr(self._runtime, "_speaker_installation_serial"):
             return
-        self._speaker_installation_serial = 0
-        self._speaker_installation_identity = None
-        self._speaker_installation_shadow = None
-        self._speaker_installation_pending = None
-        self._speaker_installation_health = {}
-        self._speaker_installation_spec = None
-        self._speaker_verifier_install_receipt = None
-        self._speaker_retired_cleanup = set()
-        self._speaker_installation_diagnostics = {}
+        self._runtime._speaker_installation_serial = 0
+        self._runtime._speaker_installation_identity = None
+        self._runtime._speaker_installation_shadow = None
+        self._runtime._speaker_installation_pending = None
+        self._runtime._speaker_installation_health = {}
+        self._runtime._speaker_installation_spec = None
+        self._runtime._speaker_verifier_install_receipt = None
+        self._runtime._speaker_retired_cleanup = set()
+        self._runtime._speaker_installation_diagnostics = {}
 
     def _count_speaker_installation(self, reason: str) -> None:
-        counts = self._speaker_installation_diagnostics
+        counts = self._runtime._speaker_installation_diagnostics
         counts[reason] = counts.get(reason, 0) + 1
 
     def create_speaker_verifier_install_identity(
         self, manager_identity: int, route_generation: int, activation_revision: str
     ) -> SpeakerVerifierInstallIdentity:
-        self._ensure_asr_runtime_state()
+        self._runtime._ensure_asr_runtime_state()
         self._ensure_speaker_installation_state()
-        detector = self._asr_detector
+        detector = self._runtime._asr_detector
         return SpeakerVerifierInstallIdentity(
             manager_identity=manager_identity,
-            runtime_identity=id(self),
-            session_generation=self._asr_session_epoch,
+            runtime_identity=id(self._runtime),
+            session_generation=self._runtime._asr_session_epoch,
             route_generation=route_generation,
             detector_identity=id(detector) if detector is not None else 0,
             detector_epoch=getattr(detector, "_detector_epoch", 0),
@@ -67,8 +74,8 @@ class SpeakerVerifierInstallationMixin:
         )
 
     def _speaker_install_identity_current(self, identity) -> bool:
-        detector = self._asr_detector
-        committed = identity == getattr(self, "_speaker_installation_identity", None)
+        detector = self._runtime._asr_detector
+        committed = identity == getattr(self._runtime, "_speaker_installation_identity", None)
         # Candidate reset advances Detector's audio epoch without replacing its
         # installed observer. During prepare that change invalidates the receipt;
         # after commit the captured mount owner, not a per-turn epoch, is proof.
@@ -76,16 +83,16 @@ class SpeakerVerifierInstallationMixin:
             not getattr(detector, "_closed", False)
             and getattr(detector, "_speaker_shadow", None) is not None
             and getattr(detector, "_speaker_shadow", None)
-            is self._speaker_installation_shadow
+            is self._runtime._speaker_installation_shadow
             and getattr(detector, "_speaker_owner_generation", None)
             == identity.installation_id
             if committed
             else identity.detector_epoch == getattr(detector, "_detector_epoch", 0)
         )
         return (
-            not self._asr_terminal_close_requested
-            and identity.runtime_identity == id(self)
-            and identity.session_generation == self._asr_session_epoch
+            not self._runtime._asr_terminal_close_requested
+            and identity.runtime_identity == id(self._runtime)
+            and identity.session_generation == self._runtime._asr_session_epoch
             and identity.detector_identity
             == (id(detector) if detector is not None else 0)
             and detector_proof
@@ -93,9 +100,9 @@ class SpeakerVerifierInstallationMixin:
 
     def speaker_verifier_installation_permits_evidence(self, identity) -> bool:
         self._ensure_speaker_installation_state()
-        spec = self._speaker_installation_spec
+        spec = self._runtime._speaker_installation_spec
         return (
-            identity == self._speaker_installation_identity
+            identity == self._runtime._speaker_installation_identity
             and self._speaker_install_identity_current(identity)
             and spec is not None
             and spec.revocable_authority.permits_evidence
@@ -103,109 +110,109 @@ class SpeakerVerifierInstallationMixin:
 
     def retire_speaker_verifier_authority(self) -> None:
         """No await: stale producers lose permission before route mutation."""
-        self._ensure_asr_runtime_state()
+        self._runtime._ensure_asr_runtime_state()
         self._ensure_speaker_installation_state()
-        self._speaker_installation_serial += 1
-        self._speaker_installation_identity = None
-        self._speaker_installation_shadow = None
-        self._speaker_installation_pending = None
-        self._speaker_installation_health.clear()
-        self._speaker_verifier_activation_generation = None
-        self._speaker_verifier_enforces_admission = False
-        receipt = self._speaker_verifier_install_receipt
+        self._runtime._speaker_installation_serial += 1
+        self._runtime._speaker_installation_identity = None
+        self._runtime._speaker_installation_shadow = None
+        self._runtime._speaker_installation_pending = None
+        self._runtime._speaker_installation_health.clear()
+        self._runtime._speaker_verifier_activation_generation = None
+        self._runtime._speaker_verifier_enforces_admission = False
+        receipt = self._runtime._speaker_verifier_install_receipt
         if receipt is not None:
-            self._speaker_verifier_install_receipt = replace(
+            self._runtime._speaker_verifier_install_receipt = replace(
                 receipt, outcome=Outcome.REVOKED
             )
         # Existing reducer terminals remain sticky. Its ordered unavailable path
         # settles nonterminal sentences when the async reconciliation follows.
-        for owner in self._asr_admission_capabilities.values():
+        for owner in self._runtime._asr_admission_capabilities.values():
             owner.revoked = True
-        for ledger in tuple(self._asr_provider_speaker_ledgers.values()):
-            self._poison_provider_speaker_ledger(ledger, "installation_retired")
-        for transaction in tuple(self._asr_provider_exact_intervals.values()):
+        for ledger in tuple(self._runtime._asr_provider_speaker_ledgers.values()):
+            self._runtime._poison_provider_speaker_ledger(ledger, "installation_retired")
+        for transaction in tuple(self._runtime._asr_provider_exact_intervals.values()):
             if transaction.resolved_disposition is None:
                 transaction.queue_poisoned = True
-                self._schedule_exact_interval_event(
+                self._runtime._schedule_exact_interval_event(
                     transaction,
                     SpeakerLeaseUnavailable(transaction.target_candidate, 1),
                 )
-        if self._asr_admission_ingress_started:
+        if self._runtime._asr_admission_ingress_started:
             exact_turns = {
                 transaction.turn_token
-                for transaction in self._asr_provider_exact_intervals.values()
+                for transaction in self._runtime._asr_provider_exact_intervals.values()
             }
             events = [
                 (turn, SpeakerAuthorityUnavailable(candidate))
                 for candidate, turn in tuple(
-                    self._asr_admission_candidate_turns.items()
+                    self._runtime._asr_admission_candidate_turns.items()
                 )
                 if turn not in exact_turns
             ] + [
                 (turn, SpeakerAuthorityUnarmed(generation))
                 for turn, generation in tuple(
-                    self._asr_speaker_authority_pending_turns.items()
+                    self._runtime._asr_speaker_authority_pending_turns.items()
                 )
                 if turn not in exact_turns
             ]
             for turn, event in events:
                 try:
-                    future = self._asr_admission_ingress.post_nowait(turn, event)
+                    future = self._runtime._asr_admission_ingress.post_nowait(turn, event)
                 except (AdmissionIngressClosedError, AdmissionIngressCapacityError):
                     continue
-                self._consume_admission_future(turn, future)
+                self._runtime._consume_admission_future(turn, future)
 
     def _accept_speaker_verifier_health(
         self, event: SpeakerVerifierHealthEvent
     ) -> None:
         self._ensure_speaker_installation_state()
         if event.identity not in (
-            self._speaker_installation_identity,
-            self._speaker_installation_pending,
+            self._runtime._speaker_installation_identity,
+            self._runtime._speaker_installation_pending,
         ) or not self._speaker_install_identity_current(event.identity):
             self._count_speaker_installation("stale_health_event")
             return
-        previous = self._speaker_installation_health.get(event.identity)
+        previous = self._runtime._speaker_installation_health.get(event.identity)
         if previous is not None and event.health_revision <= previous.health_revision:
             if (
                 event.health_revision == previous.health_revision
                 and event.causes != previous.causes
             ):
                 self._count_speaker_installation("health_revision_conflict")
-                self._speaker_installation_health[event.identity] = replace(
+                self._runtime._speaker_installation_health[event.identity] = replace(
                     previous, causes=previous.causes | {"health_revision_conflict"}
                 )
-                self._speaker_verifier_degraded = True
+                self._runtime._speaker_verifier_degraded = True
             return
-        self._speaker_installation_health[event.identity] = event
-        if event.identity == self._speaker_installation_identity:
-            self._speaker_verifier_degraded = bool(event.causes)
-            receipt = self._speaker_verifier_install_receipt
+        self._runtime._speaker_installation_health[event.identity] = event
+        if event.identity == self._runtime._speaker_installation_identity:
+            self._runtime._speaker_verifier_degraded = bool(event.causes)
+            receipt = self._runtime._speaker_verifier_install_receipt
             if receipt is not None:
-                self._speaker_verifier_install_receipt = replace(
+                self._runtime._speaker_verifier_install_receipt = replace(
                     receipt, health_revision=event.health_revision
                 )
 
     def _speaker_exact_installation_is_current(self, transaction) -> bool:
         if transaction.queue_poisoned:
             return False
-        spec = getattr(self, "_speaker_installation_spec", None)
+        spec = getattr(self._runtime, "_speaker_installation_spec", None)
         if spec is None:
             return True  # Legacy explicit observer, no typed installation.
-        identity = self._speaker_installation_identity
+        identity = self._runtime._speaker_installation_identity
         return (
             identity is not None
             and self.speaker_verifier_installation_permits_evidence(identity)
         )
 
     def _own_speaker_cleanup(self, task) -> None:
-        self._speaker_retired_cleanup.add(task)
+        self._runtime._speaker_retired_cleanup.add(task)
 
         def settled(done):
             if done.cancelled():
                 return  # Cancellation is not physical-close proof.
             if done.exception() is None:
-                self._speaker_retired_cleanup.discard(done)
+                self._runtime._speaker_retired_cleanup.discard(done)
             else:
                 self._count_speaker_installation("retired_cleanup_failed")
 
@@ -222,7 +229,7 @@ class SpeakerVerifierInstallationMixin:
     async def install_speaker_verifier(
         self, spec: SpeakerVerifierSpec | None, identity: SpeakerVerifierInstallIdentity
     ) -> SpeakerVerifierInstallReceipt:
-        self._ensure_asr_runtime_state()
+        self._runtime._ensure_asr_runtime_state()
         self._ensure_speaker_installation_state()
         if spec is None:
             spec = SpeakerVerifierSpec(
@@ -233,17 +240,17 @@ class SpeakerVerifierInstallationMixin:
                 SpeakerVerifierAuthority(),
                 None,
             )
-        async with self._speaker_verifier_lock:
+        async with self._runtime._speaker_verifier_lock:
             receipt = await self._install_speaker_verifier_locked(spec, identity)
             # The inner finally may have retained a timed-out unadopted close.
             # Report that after cleanup settlement, not before entering finally.
             receipt = replace(
                 receipt,
-                cleanup_pending=receipt.cleanup_pending or bool(self._speaker_retired_cleanup),
+                cleanup_pending=receipt.cleanup_pending or bool(self._runtime._speaker_retired_cleanup),
             )
-            actual = self._speaker_verifier_install_receipt
+            actual = self._runtime._speaker_verifier_install_receipt
             if actual is not None and actual.identity == receipt.identity:
-                self._speaker_verifier_install_receipt = receipt
+                self._runtime._speaker_verifier_install_receipt = receipt
             return receipt
 
     async def _install_speaker_verifier_locked(self, spec, identity):
@@ -254,7 +261,7 @@ class SpeakerVerifierInstallationMixin:
         ):
             self._count_speaker_installation("install_stale")
             return SpeakerVerifierInstallReceipt(identity, Outcome.STALE)
-        detector = self._asr_detector
+        detector = self._runtime._asr_detector
         enabled = spec.requested_enabled and spec.factory_builder is not None
         if (
             enabled
@@ -266,26 +273,26 @@ class SpeakerVerifierInstallationMixin:
             self.retire_speaker_verifier_authority()
             self._count_speaker_installation("install_deferred")
             return SpeakerVerifierInstallReceipt(identity, Outcome.DEFERRED_ROUTE)
-        if enabled and spec.enforce and not self._speaker_verifier_route_supported():
+        if enabled and spec.enforce and not self._runtime._speaker_verifier_route_supported():
             self.retire_speaker_verifier_authority()
             self._count_speaker_installation("install_unsupported")
             return SpeakerVerifierInstallReceipt(identity, Outcome.UNSUPPORTED_ROUTE)
-        if enabled and len(self._speaker_retired_cleanup) >= 2:
+        if enabled and len(self._runtime._speaker_retired_cleanup) >= 2:
             self.retire_speaker_verifier_authority()
             self._count_speaker_installation("retired_cleanup_capacity")
-            self._speaker_verifier_degraded = True
+            self._runtime._speaker_verifier_degraded = True
             return SpeakerVerifierInstallReceipt(
                 identity, Outcome.FAILED, cleanup_pending=True
             )
 
         self.retire_speaker_verifier_authority()
-        serial = self._speaker_installation_serial
-        self._speaker_installation_pending = identity
-        self._speaker_installation_health[identity] = SpeakerVerifierHealthEvent(
+        serial = self._runtime._speaker_installation_serial
+        self._runtime._speaker_installation_pending = identity
+        self._runtime._speaker_installation_health[identity] = SpeakerVerifierHealthEvent(
             identity, 0
         )
-        old_factory = self._speaker_verifier_factory
-        self._speaker_verifier_factory = None
+        old_factory = self._runtime._speaker_verifier_factory
+        self._runtime._speaker_verifier_factory = None
         factory = None
         shadow = None
         operation = SpeakerVerifierReplacementOperation(identity)
@@ -293,8 +300,8 @@ class SpeakerVerifierInstallationMixin:
 
         def current():
             return (
-                serial == self._speaker_installation_serial
-                and self._speaker_installation_pending == identity
+                serial == self._runtime._speaker_installation_serial
+                and self._runtime._speaker_installation_pending == identity
                 and self._speaker_install_identity_current(identity)
                 and (
                     not enabled
@@ -305,14 +312,14 @@ class SpeakerVerifierInstallationMixin:
 
         try:
             if enabled:
-                factory = spec.factory_builder(self, identity)
+                factory = spec.factory_builder(self._runtime, identity)
                 bind = getattr(factory, "bind_installation", None)
                 if callable(bind):
                     bind(identity, spec.revocable_authority)
                 shadow = factory()
                 if shadow is None:
                     raise RuntimeError("speaker factory returned no observer")
-            await self._revoke_runtime_speaker_authority_for_verifier_change()
+            await self._runtime._revoke_runtime_speaker_authority_for_verifier_change()
             if not current():
                 return SpeakerVerifierInstallReceipt(identity, Outcome.STALE)
             if detector is not None:
@@ -338,7 +345,7 @@ class SpeakerVerifierInstallationMixin:
                     operation.ownership_state,
                     cleanup_pending=operation.cleanup_pending,
                 )
-            health = self._speaker_installation_health[identity]
+            health = self._runtime._speaker_installation_health[identity]
             receipt = SpeakerVerifierInstallReceipt(
                 identity,
                 Outcome.INSTALLED if enabled else Outcome.REVOKED,
@@ -347,16 +354,16 @@ class SpeakerVerifierInstallationMixin:
                 operation.cleanup_pending,
             )
             # Linearization point: no await between ownership proof and snapshot.
-            self._speaker_installation_identity = identity if enabled else None
-            self._speaker_installation_shadow = shadow if enabled else None
-            self._speaker_installation_spec = spec
-            self._speaker_verifier_activation_generation = (
+            self._runtime._speaker_installation_identity = identity if enabled else None
+            self._runtime._speaker_installation_shadow = shadow if enabled else None
+            self._runtime._speaker_installation_spec = spec
+            self._runtime._speaker_verifier_activation_generation = (
                 identity.installation_id if enabled else None
             )
-            self._speaker_verifier_factory = factory
-            self._speaker_verifier_enforces_admission = enabled and spec.enforce
-            self._speaker_verifier_degraded = bool(health.causes)
-            self._speaker_verifier_install_receipt = receipt
+            self._runtime._speaker_verifier_factory = factory
+            self._runtime._speaker_verifier_enforces_admission = enabled and spec.enforce
+            self._runtime._speaker_verifier_degraded = bool(health.causes)
+            self._runtime._speaker_verifier_install_receipt = receipt
             committed = True
             self._count_speaker_installation("installed" if enabled else "revoked")
             return receipt
@@ -365,8 +372,8 @@ class SpeakerVerifierInstallationMixin:
             raise
         except Exception:
             self._count_speaker_installation("install_failed")
-            if serial == self._speaker_installation_serial:
-                self._speaker_verifier_degraded = True
+            if serial == self._runtime._speaker_installation_serial:
+                self._runtime._speaker_verifier_degraded = True
             return SpeakerVerifierInstallReceipt(
                 identity,
                 Outcome.FAILED,
@@ -377,7 +384,7 @@ class SpeakerVerifierInstallationMixin:
             for task in operation.cleanup_tasks:
                 self._own_speaker_cleanup(task)
             if not committed:
-                if serial == self._speaker_installation_serial:
+                if serial == self._runtime._speaker_installation_serial:
                     self.retire_speaker_verifier_authority()
                 if (
                     shadow is not None
@@ -390,8 +397,8 @@ class SpeakerVerifierInstallationMixin:
                     except asyncio.CancelledError:
                         self._own_speaker_cleanup(cleanup)
                 if factory is not None:
-                    self._close_speaker_verifier_factory(factory)
+                    self._runtime._close_speaker_verifier_factory(factory)
             if old_factory is not None and old_factory is not factory:
-                self._close_speaker_verifier_factory(old_factory)
-            if self._speaker_installation_pending == identity:
-                self._speaker_installation_pending = None
+                self._runtime._close_speaker_verifier_factory(old_factory)
+            if self._runtime._speaker_installation_pending == identity:
+                self._runtime._speaker_installation_pending = None

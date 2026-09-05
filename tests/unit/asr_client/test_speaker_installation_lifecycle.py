@@ -312,7 +312,7 @@ async def test_install_regressions_reject_old_ordering(monkeypatch, mutation):
     import textwrap
     import main_logic.asr_client.speaker_verifier_installation as module
 
-    method = module.SpeakerVerifierInstallationMixin._install_speaker_verifier_locked
+    method = module.SpeakerVerifierInstallation._install_speaker_verifier_locked
     source = textwrap.dedent(inspect.getsource(method))
     if mutation == "erase_health":
         source = source.replace("bool(health.causes)", "False")
@@ -325,7 +325,7 @@ async def test_install_regressions_reject_old_ordering(monkeypatch, mutation):
     namespace = dict(vars(module))
     exec(compile(source, "<installation-order-mutation>", "exec"), namespace)
     monkeypatch.setattr(
-        module.SpeakerVerifierInstallationMixin,
+        module.SpeakerVerifierInstallation,
         method.__name__,
         namespace[method.__name__],
     )

@@ -40,7 +40,13 @@ from ._provider_events import (
     ProviderUtteranceStartedNotification,
 )
 from .audio import AsrAudioDispatcher
-from .speaker_verifier_installation import SpeakerVerifierInstallationMixin
+from .speaker_verifier_installation import SpeakerVerifierInstallation
+from .speaker_verifier_contracts import (
+    SpeakerVerifierHealthEvent,
+    SpeakerVerifierInstallIdentity,
+    SpeakerVerifierInstallReceipt,
+    SpeakerVerifierSpec,
+)
 from .admission.contracts import (
     AbortProviderTransport,
     AdmissionDisposition,
@@ -768,7 +774,7 @@ class _SpeakerDenyCleanupOperation:
     settled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
-class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
+class IndependentAsrRuntime:
     """Own one independent ASR session without reading Core manager state."""
 
     def __init__(self, callbacks: AsrRuntimeCallbacks) -> None:
@@ -778,6 +784,59 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
     @property
     def display_name(self) -> str:
         return self._callbacks.display_name()
+
+    def _get_speaker_verifier_installation(self) -> SpeakerVerifierInstallation:
+        component = getattr(self, "_speaker_verifier_installation", None)
+        if component is None:
+            component = SpeakerVerifierInstallation(self)
+            self._speaker_verifier_installation = component
+        return component
+
+    def create_speaker_verifier_install_identity(
+        self, manager_identity: int, route_generation: int, activation_revision: str
+    ) -> SpeakerVerifierInstallIdentity:
+        return self._get_speaker_verifier_installation().create_speaker_verifier_install_identity(
+            manager_identity, route_generation, activation_revision
+        )
+
+    async def install_speaker_verifier(
+        self, spec: SpeakerVerifierSpec | None, identity: SpeakerVerifierInstallIdentity
+    ) -> SpeakerVerifierInstallReceipt:
+        return await self._get_speaker_verifier_installation().install_speaker_verifier(
+            spec, identity
+        )
+
+    def retire_speaker_verifier_authority(self) -> None:
+        self._get_speaker_verifier_installation().retire_speaker_verifier_authority()
+
+    def speaker_verifier_installation_permits_evidence(
+        self, identity: SpeakerVerifierInstallIdentity
+    ) -> bool:
+        return self._get_speaker_verifier_installation().speaker_verifier_installation_permits_evidence(
+            identity
+        )
+
+    def _speaker_install_identity_current(
+        self, identity: SpeakerVerifierInstallIdentity
+    ) -> bool:
+        return self._get_speaker_verifier_installation()._speaker_install_identity_current(
+            identity
+        )
+
+    def _accept_speaker_verifier_health(self, event: SpeakerVerifierHealthEvent) -> None:
+        self._get_speaker_verifier_installation()._accept_speaker_verifier_health(event)
+
+    def _speaker_exact_installation_is_current(self, transaction) -> bool:
+        return self._get_speaker_verifier_installation()._speaker_exact_installation_is_current(
+            transaction
+        )
+
+    async def _install_speaker_verifier_locked(
+        self, spec: SpeakerVerifierSpec, identity: SpeakerVerifierInstallIdentity
+    ) -> SpeakerVerifierInstallReceipt:
+        return await self._get_speaker_verifier_installation()._install_speaker_verifier_locked(
+            spec, identity
+        )
 
     def _speaker_verifier_route_supported(self) -> bool:
         """Report whether the active route can enforce speaker admission.
