@@ -1558,6 +1558,26 @@ class ProviderSpeakerEvidenceUpdate:
     last_progress_at: float
 
 
+class ProviderSpeakerEvidenceSettlementStatus(Enum):
+    RETIRED = "retired"
+    ALREADY_RETIRED = "already_retired"
+    LIVE = "live"
+    CONFLICT = "conflict"
+    UNPROVEN = "unproven"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSpeakerEvidenceSettlement:
+    """Detector-issued physical retirement; never an admission decision."""
+
+    lease: ProviderSpeakerEvidenceLease
+    detector_epoch: int
+    timeline_generation: int
+    operation_serial: int
+    status: ProviderSpeakerEvidenceSettlementStatus
+    reason: str
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderAudioAccountingReceipt:
     """Ordered local PCM observation, without speaker capture authority."""
@@ -1567,6 +1587,7 @@ class ProviderAudioAccountingReceipt:
     sequence_no: int
     start_sample_16k: int
     end_sample_16k: int
+    evidence_settlement: ProviderSpeakerEvidenceSettlement | None = None
 
 
 class SmartTurnReadiness(Enum):
@@ -2055,6 +2076,10 @@ class DetectorRuntime:
         self._provider_segment_retired_expiry_tasks: set[asyncio.Task[None]] = set()
         self._provider_speaker_evidence_owner = object()
         self._provider_speaker_evidence_generation = 0
+        self._provider_speaker_evidence_settlement_serial = 0
+        self._provider_speaker_evidence_settlements: dict[
+            int, tuple[ProviderSpeakerEvidenceSettlement, ProviderSpeakerEvidenceSettlement]
+        ] = {}
         self._provider_speaker_evidence_state: _ProviderSpeakerEvidenceState | None = (
             None
         )
@@ -2451,7 +2476,7 @@ class DetectorRuntime:
             or lease.detector_epoch != self._detector_epoch
             or lease.candidate.detector_epoch != self._detector_epoch
             or state is None
-            or state.lease != lease
+            or state.lease is not lease
         ):
             return None
         return state
@@ -2478,12 +2503,15 @@ class DetectorRuntime:
     def _abandon_provider_speaker_evidence_locked(
         self,
         state: _ProviderSpeakerEvidenceState,
+        *,
+        reason: str = "abandoned",
     ) -> bool:
         if self._provider_speaker_evidence_state is not state:
             return False
         # Revoke the Detector handle first.  A callback or cleanup failure in
         # the optional observer control cannot make the lease current again.
         self._provider_speaker_evidence_state = None
+        self._record_provider_speaker_evidence_retirement(state, reason=reason)
         state.capture_state = _ProviderShadowCaptureState.UNAVAILABLE
         shadow = self._speaker_shadow
         retired = False
@@ -2503,6 +2531,85 @@ class DetectorRuntime:
             "provider_speaker_evidence_lease_abandoned_count"
         ] += 1
         return retired
+
+    def _record_provider_speaker_evidence_retirement(
+        self, state: _ProviderSpeakerEvidenceState, *, reason: str,
+    ) -> ProviderSpeakerEvidenceSettlement:
+        self._provider_speaker_evidence_settlement_serial += 1
+        values = dict(
+            lease=state.lease, detector_epoch=state.lease.detector_epoch,
+            timeline_generation=state.timeline_generation,
+            operation_serial=self._provider_speaker_evidence_settlement_serial,
+            reason=reason,
+        )
+        retired = ProviderSpeakerEvidenceSettlement(
+            **values, status=ProviderSpeakerEvidenceSettlementStatus.RETIRED,
+        )
+        confirmed = ProviderSpeakerEvidenceSettlement(
+            **values, status=ProviderSpeakerEvidenceSettlementStatus.ALREADY_RETIRED,
+        )
+        self._provider_speaker_evidence_settlements[state.lease.lease_generation] = (
+            retired, confirmed,
+        )
+        while len(self._provider_speaker_evidence_settlements) > _PROVIDER_SEGMENT_FIFO_LIMIT:
+            oldest = next(iter(self._provider_speaker_evidence_settlements))
+            self._provider_speaker_evidence_settlements.pop(oldest)
+        return retired
+
+    def validate_provider_speaker_evidence_settlement(
+        self, settlement: ProviderSpeakerEvidenceSettlement, *,
+        lease: ProviderSpeakerEvidenceLease, timeline_generation: int | None = None,
+    ) -> bool:
+        """Accept retained issued objects only, fenced to this live timeline."""
+        if (
+            type(settlement) is not ProviderSpeakerEvidenceSettlement
+            or type(lease) is not ProviderSpeakerEvidenceLease
+            or type(lease.lease_generation) is not int
+            or self._closed
+            or settlement.lease is not lease
+            or lease._owner is not self._provider_speaker_evidence_owner
+            or settlement.detector_epoch != self._detector_epoch
+            or settlement.timeline_generation != self._provider_audio_timeline_generation
+            or (timeline_generation is not None
+                and settlement.timeline_generation != timeline_generation)
+        ):
+            return False
+        issued = self._provider_speaker_evidence_settlements.get(lease.lease_generation, ())
+        return any(settlement is item for item in issued)
+
+    async def confirm_provider_speaker_evidence_retirement(
+        self, lease: ProviderSpeakerEvidenceLease,
+    ) -> ProviderSpeakerEvidenceSettlement:
+        """Confirm local retirement without acquiring an owner or replaying PCM."""
+        async with self._lock:
+            issued = self._provider_speaker_evidence_settlements.get(
+                lease.lease_generation
+                if type(lease) is ProviderSpeakerEvidenceLease
+                and type(lease.lease_generation) is int else -1,
+                (),
+            )
+            if issued and self.validate_provider_speaker_evidence_settlement(
+                issued[1], lease=lease,
+            ):
+                return issued[1]
+            state = self._provider_speaker_evidence_state
+            status = ProviderSpeakerEvidenceSettlementStatus.UNPROVEN
+            if (
+                type(lease) is ProviderSpeakerEvidenceLease
+                and lease._owner is self._provider_speaker_evidence_owner
+                and lease.detector_epoch == self._detector_epoch
+                and not self._closed
+                and state is not None
+            ):
+                status = (
+                    ProviderSpeakerEvidenceSettlementStatus.LIVE
+                    if state.lease is lease else ProviderSpeakerEvidenceSettlementStatus.CONFLICT
+                )
+            return ProviderSpeakerEvidenceSettlement(
+                lease=lease, detector_epoch=self._detector_epoch,
+                timeline_generation=self._provider_audio_timeline_generation,
+                operation_serial=0, status=status, reason="unconfirmed",
+            )
 
     async def ensure_provider_speaker_evidence_lease(
         self,
@@ -2548,6 +2655,9 @@ class DetectorRuntime:
                 timeline_generation=self._provider_audio_timeline_generation,
                 start_sample_16k=self._provider_audio_sample_cursor_16k,
                 buffer_origin_sample_16k=self._provider_audio_sample_cursor_16k,
+                # Empty evidence starts at the already-accounted canonical
+                # cursor. Its fence names earlier PCM; it grants no samples.
+                last_sequence_no=self._provider_segment_last_sequence_no,
                 active_candidate=candidate,
             )
             state.coverage_candidates.append(
@@ -2723,7 +2833,9 @@ class DetectorRuntime:
                 state.anchor_receipt = receipt
                 state.pending_anchor_start_sample_16k = audio_start_sample_16k
                 state.anchor_observed_through_sample_16k = cursor
-                state.anchor_pcm_through_sequence_no = state.last_sequence_no
+                # Zero denotes an empty anchored timeline, without imposing
+                # a synthetic prior dispatch sequence on its first PCM frame.
+                state.anchor_pcm_through_sequence_no = state.last_sequence_no or 0
             else:
                 receipt = state.anchor_receipt
             prepared_state = state
@@ -2839,6 +2951,7 @@ class DetectorRuntime:
                     except Exception:
                         pass
             self._provider_speaker_evidence_state = None
+            self._record_provider_speaker_evidence_retirement(state, reason="finished")
             self._speaker_rejection_prepare_diagnostics[
                 "provider_speaker_evidence_lease_finished_count"
             ] += 1
@@ -2982,6 +3095,7 @@ class DetectorRuntime:
         """Reserve an exact live-evidence interval without publishing work."""
 
         async with self._lock:
+            self._prune_completed_provider_preseals()
             for record in tuple(self._provider_exact_interval_records.values()):
                 if (
                     record.reservation.detector_epoch == self._detector_epoch
@@ -3382,6 +3496,10 @@ class DetectorRuntime:
 
         self._provider_exact_interval_records.pop(reservation._token, None)
         self._provider_speaker_evidence_state = successor_state
+        self._record_provider_speaker_evidence_retirement(state, reason="exact_transfer")
+        # This commit consumes g exactly once.  The published suffix and the
+        # next prepare must agree on g+1 before binding callbacks can run.
+        self._candidate_generation = reservation.candidate_generation + 1
         if successor_lease is not None:
             self._provider_speaker_evidence_generation += 1
         self._retire_provider_segment_expiry_task()
@@ -3778,6 +3896,7 @@ class DetectorRuntime:
     def _reserve_provider_unknown_preseal_locked(
         self,
     ) -> ProviderSpeakerPresealVerdict:
+        self._prune_completed_provider_preseals()
         candidate_generation = self._candidate_generation
         while candidate_generation in self._provider_preseal_entries:
             candidate_generation += 1
@@ -3802,6 +3921,19 @@ class DetectorRuntime:
                 "provider_speaker_segment_unknown_retired_count"
             ] += 1
         return verdict
+
+    def _prune_completed_provider_preseals(self) -> None:
+        """Make one slot without evicting pending proof or revoke authority."""
+        for generation, entry in tuple(self._provider_preseal_entries.items()):
+            if len(self._provider_preseal_entries) < _PROVIDER_SEGMENT_FIFO_LIMIT:
+                break
+            if (
+                entry.completed and entry.revoked and entry.reconciliation is None
+                and entry.shadow_candidate is None
+                and generation not in self._provider_boundary_completion_entries
+                and generation not in self._provider_boundary_snapshots
+            ):
+                self._provider_preseal_entries.pop(generation)
 
     async def complete_provider_speaker_boundary(
         self,
@@ -5733,6 +5865,7 @@ class DetectorRuntime:
         if speaker_evidence_lease is not None and (
             speaker_evidence_lease._owner is not self._provider_speaker_evidence_owner
             or speaker_evidence_lease.detector_epoch != self._detector_epoch
+            or type(speaker_evidence_lease.lease_generation) is not int
         ):
             return None
         if state is not None and state.lease is not speaker_evidence_lease:
@@ -5750,8 +5883,19 @@ class DetectorRuntime:
         if sample_count <= 0 or remainder:
             return None
 
+        settlement = None
         if state is not None:
-            self._abandon_provider_speaker_evidence_locked(state)
+            self._abandon_provider_speaker_evidence_locked(state, reason="evidence_unavailable")
+            settlement = self._provider_speaker_evidence_settlements[state.lease.lease_generation][0]
+        elif speaker_evidence_lease is not None:
+            issued = self._provider_speaker_evidence_settlements.get(
+                speaker_evidence_lease.lease_generation, ()
+            )
+            if not issued or not self.validate_provider_speaker_evidence_settlement(
+                issued[1], lease=speaker_evidence_lease,
+            ):
+                return None
+            settlement = issued[1]
         self._mark_provider_segments_incomplete()
         self._provider_legacy_segment_evidence_complete = False
         self._provider_segment_successor_evidence_incomplete = True
@@ -5768,6 +5912,7 @@ class DetectorRuntime:
             sequence_no=sequence_no,
             start_sample_16k=start_sample_16k,
             end_sample_16k=self._provider_audio_sample_cursor_16k,
+            evidence_settlement=settlement,
         )
 
     async def observe_provider_audio_ordered(
@@ -6249,6 +6394,7 @@ class DetectorRuntime:
         """Atomically reserve one exact speaker range before ordered sealing."""
 
         async with self._lock:
+            self._prune_completed_provider_preseals()
             if self._closed or self._semantic_adapter is not None:
                 return None
             if type(boundary) is not ProviderAudioRange:

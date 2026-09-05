@@ -152,6 +152,7 @@ from .endpointing.detector_runtime import (
     DetectorRuntime,
     ProviderExactSpeakerIntervalReservation,
     ProviderSpeakerEvidenceLease,
+    ProviderSpeakerEvidenceSettlement,
     ProviderSpeakerEvidenceUpdate,
     SmartTurnLease,
 )
@@ -645,6 +646,9 @@ class _ProviderSpeakerProvisionalLedger:
     )
     close_event: SpeakerLeaseCaptureClosed | None = None
     poisoned_reason: str | None = None
+    # Physical retirement does not settle the Provider text/admission owner.
+    # In particular, unanchored unavailable audio still belongs to this turn.
+    evidence_turn_token: VoiceTurnToken | None = None
 
     @property
     def candidate(self) -> SpeakerShadowCandidateKey:
@@ -1465,6 +1469,12 @@ class IndependentAsrRuntime:
             f"asr-failure-{uuid.uuid4().hex}",
         )
         self._asr_speaker_degradation_incident = incident
+        self._schedule_asr_incident_log(
+            incident_id=incident.incident_id,
+            reason_code=incident.reason_code,
+            stage="evidence_unavailable",
+            source_session_epoch=identity.session_epoch,
+        )
 
         async def notify() -> None:
             if (
@@ -6357,6 +6367,97 @@ class IndependentAsrRuntime:
             for candidate_turn in self._asr_admission_candidate_turns.values()
         )
 
+    def _unavailable_provider_speaker_ledger_for_turn(
+        self,
+        turn_token: VoiceTurnToken,
+    ) -> _ProviderSpeakerProvisionalLedger | None:
+        """Keep degraded turn ownership after its physical handle is retired."""
+
+        for ledger in self._asr_provider_speaker_ledgers.values():
+            if (
+                ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE
+                and turn_token in {ledger.turn_token, ledger.evidence_turn_token}
+                and ledger.activation_generation
+                == self._speaker_verifier_activation_generation
+                and self._runtime_identity_matches(ledger.runtime_identity)
+            ):
+                return ledger
+        return None
+
+    def _consume_provider_speaker_evidence_settlement(
+        self,
+        settlement: ProviderSpeakerEvidenceSettlement | None,
+        *,
+        lease: ProviderSpeakerEvidenceLease,
+        detector: DetectorRuntime,
+        identity: _AsrRuntimeIdentity,
+        owner_generation: str | None,
+        turn_token: VoiceTurnToken | None,
+        timeline_generation: int | None = None,
+    ) -> bool:
+        """CAS current physical aliases without retiring logical final owners."""
+
+        validate = getattr(detector, "validate_provider_speaker_evidence_settlement", None)
+        if (
+            not self._runtime_identity_matches(identity)
+            or self._speaker_verifier_activation_generation != owner_generation
+            or detector is not self._asr_detector
+            or not callable(validate)
+            or not validate(settlement, lease=lease, timeline_generation=timeline_generation)
+        ):
+            return False
+        ledger = self._asr_provider_speaker_ledgers.get(lease.candidate)
+        if ledger is not None and ledger.evidence_lease is lease:
+            if ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE:
+                ledger.evidence_turn_token = (
+                    ledger.evidence_turn_token or ledger.turn_token or turn_token
+                )
+        if self._asr_provider_speaker_evidence_lease is lease:
+            self._asr_provider_speaker_evidence_lease = None
+            if self._asr_current_speaker_candidate == lease.candidate:
+                self._asr_current_speaker_candidate = None
+                logical_lease = self._asr_admission_candidate_leases.get(lease.candidate)
+                if self._asr_current_speaker_lease == logical_lease:
+                    self._asr_current_speaker_lease = None
+        return True
+
+    async def _confirm_provider_speaker_evidence_retirement(
+        self,
+        lease: ProviderSpeakerEvidenceLease,
+        *,
+        detector: DetectorRuntime,
+        identity: _AsrRuntimeIdentity,
+        owner_generation: str | None,
+        turn_token: VoiceTurnToken | None,
+        deadline: float | None = None,
+    ) -> bool:
+        """Confirm an earlier local retirement; never repeat Provider audio."""
+
+        confirm = getattr(detector, "confirm_provider_speaker_evidence_retirement", None)
+        if not callable(confirm):
+            return False
+        timeout = _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            return False
+        try:
+            settlement = await asyncio.wait_for(
+                confirm(lease), timeout=timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return self._consume_provider_speaker_evidence_settlement(
+            settlement,
+            lease=lease,
+            detector=detector,
+            identity=identity,
+            owner_generation=owner_generation,
+            turn_token=turn_token,
+        )
+
     async def _arm_speaker_authority_for_provider_audio(
         self,
         turn_token: VoiceTurnToken,
@@ -6382,6 +6483,13 @@ class IndependentAsrRuntime:
         ):
             return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
         if lifecycle.provider_policy.endpoint_authority == "provider":
+            unavailable = self._unavailable_provider_speaker_ledger_for_turn(turn_token)
+            if unavailable is not None:
+                return _SpeakerArmingResult(
+                    _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE,
+                    owner_generation,
+                    unavailable.poisoned_reason,
+                )
             evidence_lease = self._asr_provider_speaker_evidence_lease
             candidate = (
                 evidence_lease.candidate if evidence_lease is not None else None
@@ -6490,6 +6598,13 @@ class IndependentAsrRuntime:
     ) -> _SpeakerArmingResult:
         """Settle the physical Provider lease before any matching PCM is queued."""
 
+        unavailable = self._unavailable_provider_speaker_ledger_for_turn(turn_token)
+        if unavailable is not None:
+            return _SpeakerArmingResult(
+                _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE,
+                owner_generation,
+                unavailable.poisoned_reason,
+            )
         existing = self._asr_provider_speaker_arming_tasks.get(turn_token)
         if existing is not None:
             return await asyncio.shield(existing)
@@ -6532,7 +6647,27 @@ class IndependentAsrRuntime:
                         owner_generation,
                         "ASR_SPEAKER_LEASE_UNSUPPORTED",
                     )
-                evidence = await ensure_evidence_lease()
+                previous_evidence = self._asr_provider_speaker_evidence_lease
+                if previous_evidence is not None:
+                    await self._confirm_provider_speaker_evidence_retirement(
+                        previous_evidence,
+                        detector=detector,
+                        identity=identity,
+                        owner_generation=owner_generation,
+                        turn_token=turn_token,
+                    )
+                    if not self._provider_speaker_arming_operation_is_current(
+                        turn_token, owner_generation, identity, lifecycle, detector
+                    ):
+                        return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
+                evidence = await asyncio.wait_for(
+                    ensure_evidence_lease(),
+                    timeout=_PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS,
+                )
+                # Remember the exact acquired resource before the post-await
+                # fence, so a stale operation can retire only its own handle.
+                if type(evidence) is ProviderSpeakerEvidenceLease:
+                    evidence_lease = evidence
                 if not self._provider_speaker_arming_operation_is_current(
                     turn_token,
                     owner_generation,
@@ -6586,6 +6721,7 @@ class IndependentAsrRuntime:
                         activation_generation=owner_generation,
                         detector_epoch=evidence_lease.detector_epoch,
                         lease_generation=evidence_lease.lease_generation,
+                        evidence_turn_token=turn_token,
                     )
                     self._asr_provider_speaker_ledgers[candidate] = ledger
                     self._speaker_rejection_metrics[
@@ -6650,7 +6786,10 @@ class IndependentAsrRuntime:
                     )
                     if callable(abandon):
                         try:
-                            await abandon(evidence_lease)
+                            await asyncio.wait_for(
+                                abandon(evidence_lease),
+                                timeout=_PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS,
+                            )
                         except asyncio.CancelledError as exc:
                             cancelled_error = cancelled_error or exc
                         except Exception:
@@ -6690,8 +6829,16 @@ class IndependentAsrRuntime:
             and self._speaker_verifier_activation_generation == owner_generation
             and self._runtime_identity_matches(identity)
             and self._asr_lifecycle is lifecycle
-            and lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
-            and lifecycle.current_turn_token == turn_token
+            and (
+                (
+                    lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+                    and lifecycle.current_turn_token == turn_token
+                )
+                or (
+                    lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+                    and lifecycle.pending_turn_token == turn_token
+                )
+            )
             and self._asr_detector is detector
         )
 
@@ -6872,6 +7019,7 @@ class IndependentAsrRuntime:
             ingress_token=turn_token.ingress,
         )
         ordered_observation_started = False
+        activation_generation = self._speaker_verifier_activation_generation
         try:
             if _uses_smart_turn_endpointing(lifecycle.provider_policy):
                 self._observe_provider_speaker_shadow(
@@ -6894,6 +7042,8 @@ class IndependentAsrRuntime:
                     if evidence_lease is not None
                     else None
                 )
+                if ledger is None:
+                    ledger = self._unavailable_provider_speaker_ledger_for_turn(turn_token)
                 accounting_only = bool(
                     speaker_evidence_unavailable
                     or (
@@ -6942,7 +7092,7 @@ class IndependentAsrRuntime:
                     sample_count, remainder = divmod(
                         len(pcm16) // 2 * 16_000, sample_rate_hz
                     )
-                    return bool(
+                    accounted = bool(
                         type(update) is ProviderAudioAccountingReceipt
                         and update.detector_epoch == identity.detector_epoch
                         and (
@@ -6954,6 +7104,22 @@ class IndependentAsrRuntime:
                         and not remainder
                         and update.end_sample_16k - update.start_sample_16k
                         == sample_count
+                    )
+                    if not accounted:
+                        return False
+                    if evidence_lease is not None:
+                        return self._consume_provider_speaker_evidence_settlement(
+                            update.evidence_settlement,
+                            lease=evidence_lease,
+                            detector=detector,
+                            identity=observation_identity,
+                            owner_generation=activation_generation,
+                            turn_token=turn_token,
+                            timeline_generation=update.timeline_generation,
+                        )
+                    return bool(
+                        self._speaker_verifier_activation_generation == activation_generation
+                        and self._asr_provider_speaker_evidence_lease is None
                     )
                 if self._speaker_verifier_enforces_admission and (
                     type(update) is not ProviderSpeakerEvidenceUpdate
@@ -10018,6 +10184,18 @@ class IndependentAsrRuntime:
 
         if self._asr_provider_turn_ownerships.get(ownership.turn_token) is ownership:
             self._asr_provider_turn_ownerships.pop(ownership.turn_token, None)
+            ledger = self._asr_provider_speaker_key_ledgers.get(ownership.provider_key)
+            if (
+                ledger is not None
+                and ledger.turn_token == ownership.turn_token
+                and ledger.candidate not in self._asr_provider_exact_candidates
+                and self._asr_provider_speaker_evidence_lease is not ledger.evidence_lease
+                and self._asr_current_speaker_candidate != ledger.candidate
+            ):
+                ledger.state = _ProviderSpeakerLedgerState.RESOLVED
+                self._asr_provider_speaker_key_ledgers.pop(ownership.provider_key, None)
+                if self._asr_provider_speaker_ledgers.get(ledger.candidate) is ledger:
+                    self._asr_provider_speaker_ledgers.pop(ledger.candidate, None)
         ownership.state = _ProviderTurnOwnershipState.RETIRED
 
     async def _wait_provider_turn_effects(
@@ -10206,20 +10384,39 @@ class IndependentAsrRuntime:
         *,
         identity: _AsrRuntimeIdentity,
         detector: DetectorRuntime,
+        turn_token: VoiceTurnToken | None = None,
     ) -> bool:
         """Bind deferred PCM to one canonical Provider start or fail open."""
 
         start = notification.audio_start_sample_16k
         key = notification.key
+        anchored_turn = turn_token or identity.turn_token
         if ledger.provider_key not in {None, key}:
             self._poison_provider_speaker_ledger(ledger, "provider_key_conflict")
             return False
-        if ledger.turn_token not in {None, identity.turn_token}:
+        if ledger.turn_token not in {None, anchored_turn}:
             self._poison_provider_speaker_ledger(ledger, "turn_identity_conflict")
             return False
         ledger.provider_key = key
-        ledger.turn_token = identity.turn_token
+        ledger.turn_token = anchored_turn
         self._asr_provider_speaker_key_ledgers[key] = ledger
+
+        def anchor_is_current() -> bool:
+            lifecycle = identity.lifecycle
+            return bool(
+                self._runtime_identity_matches(identity)
+                and self._asr_provider_speaker_key_ledgers.get(key) is ledger
+                and ledger.turn_token == anchored_turn
+                and (
+                    anchored_turn is None
+                    or (
+                        lifecycle is not None
+                        and anchored_turn in {
+                            lifecycle.current_turn_token, lifecycle.pending_turn_token
+                        }
+                    )
+                )
+            )
         if ledger.poisoned_reason is not None:
             # Preserve identity binding, but never rehabilitate a ledger that
             # already observed a gap/conflict/overflow before started.
@@ -10247,7 +10444,7 @@ class IndependentAsrRuntime:
                 raise
             except Exception:
                 result = None
-            if not self._runtime_identity_matches(identity):
+            if not anchor_is_current():
                 return False
             status = getattr(getattr(result, "status", None), "value", None)
             if status != "pending":
@@ -10264,8 +10461,10 @@ class IndependentAsrRuntime:
                 raise
             except Exception:
                 observed = False
-            if not observed or not self._runtime_identity_matches(identity):
+            if not observed or not anchor_is_current():
                 break
+        if not anchor_is_current():
+            return False
         status = getattr(getattr(result, "status", None), "value", None)
         if status == "conflict":
             self._speaker_rejection_metrics["speaker_anchor_conflict_count"] += 1
@@ -10606,13 +10805,25 @@ class IndependentAsrRuntime:
         try:
             if self._speaker_verifier_enforces_admission:
                 detector = self._asr_detector
+                unavailable_ledger = self._unavailable_provider_speaker_ledger_for_turn(turn_token)
+                if (
+                    self._asr_provider_speaker_evidence_lease is None
+                    and unavailable_ledger is None
+                    and self._speaker_verifier_activation_generation is not None
+                    and state in {VoiceLifecycleState.ACTIVE, VoiceLifecycleState.DRAINING}
+                ):
+                    arming = await self._await_provider_speaker_parent_lease(
+                        lifecycle, turn_token, self._speaker_verifier_activation_generation
+                    )
+                    if not arming or not self._runtime_identity_matches(identity):
+                        raise RuntimeError("ASR_PROVIDER_STARTED_IDENTITY_FAILED")
                 evidence_lease = self._asr_provider_speaker_evidence_lease
                 ledger = (
                     self._asr_provider_speaker_ledgers.get(
                         evidence_lease.candidate
                     )
                     if evidence_lease is not None
-                    else None
+                    else unavailable_ledger
                 )
                 anchor_ok = bool(
                     detector is not None
@@ -10622,10 +10833,11 @@ class IndependentAsrRuntime:
                         notification,
                         identity=identity,
                         detector=detector,
+                        turn_token=turn_token,
                     )
                 )
                 attached = False
-                if ledger is not None and detector is not None:
+                if ledger is not None and detector is not None and evidence_lease is not None:
                     lease_token = await self._open_provider_speaker_parent(
                         ledger,
                         turn_token=turn_token,
@@ -11764,8 +11976,15 @@ class IndependentAsrRuntime:
                 for other_key, other_turn in self._asr_provider_started_turns.items()
             )
         )
-        evidence_lease = self._asr_provider_speaker_evidence_lease
+        final_ledger = self._asr_provider_speaker_key_ledgers.get(key)
+        evidence_lease = (
+            final_ledger.evidence_lease
+            if final_ledger is not None
+            else None
+        )
         detector = self._asr_detector
+        final_identity = self._capture_runtime_identity()
+        activation_generation = self._speaker_verifier_activation_generation
         if (
             not has_started_successor
             and evidence_lease is not None
@@ -11778,21 +11997,34 @@ class IndependentAsrRuntime:
             )
             if callable(finish_evidence):
                 try:
-                    finished = bool(await finish_evidence(evidence_lease))
+                    await asyncio.wait_for(
+                        finish_evidence(evidence_lease),
+                        timeout=max(0.0, final_deadline - time.monotonic()),
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    finished = False
+                    pass
                 if (
-                    epoch != self._asr_session_epoch
-                    or detector is not self._asr_detector
+                    not self._runtime_identity_matches(final_identity)
+                    or activation_generation != self._speaker_verifier_activation_generation
                     or self._asr_sealed_provider_key != key
                 ):
                     return
-                if finished and (
-                    self._asr_provider_speaker_evidence_lease == evidence_lease
+                await self._confirm_provider_speaker_evidence_retirement(
+                    evidence_lease,
+                    detector=detector,
+                    identity=final_identity,
+                    owner_generation=activation_generation,
+                    turn_token=current_turn,
+                    deadline=final_deadline,
+                )
+                if (
+                    not self._runtime_identity_matches(final_identity)
+                    or activation_generation != self._speaker_verifier_activation_generation
+                    or self._asr_sealed_provider_key != key
                 ):
-                    self._asr_provider_speaker_evidence_lease = None
+                    return
         await self._handle_independent_asr_final(
             text,
             epoch,
@@ -12842,6 +13074,98 @@ class IndependentAsrRuntime:
                             None,
                         )
 
+    def _schedule_asr_incident_log(
+        self,
+        *,
+        incident_id: str,
+        reason_code: str,
+        stage: str,
+        source_session_epoch: int,
+    ) -> None:
+        """Snapshot safe incident metadata before cleanup; persist off-loop."""
+
+        # A broken or slow sink must neither gate failure retirement nor grow
+        # an unbounded executor queue during repeated reconnect failures.
+        if sum(
+            task.get_name() == "asr-incident-log" and not task.done()
+            for task in self._asr_close_tasks
+        ) >= 4:
+            return
+        from config.application import APP_VERSION
+
+        lease = self._asr_provider_speaker_evidence_lease
+        key = self._asr_sealed_provider_key
+        identity = self._capture_runtime_identity()
+        previous = self._asr_speaker_degradation_incident
+        metadata = {
+            "schema": 1,
+            "app_version": APP_VERSION,
+            "incident_id": incident_id,
+            "reason_code": (
+                reason_code
+                if type(reason_code) is str
+                and _ASR_REASON_CODE_FULL_RE.fullmatch(reason_code) is not None
+                else "ASR_INDEPENDENT_FAILED"
+            ),
+            "stage": stage,
+            "source_session_epoch": source_session_epoch,
+            "session_epoch": identity.session_epoch,
+            "start_generation": identity.start_generation,
+            "audio_generation": identity.audio_generation,
+            "transport_generation": identity.transport_generation,
+            "candidate_generation": (
+                identity.detector._candidate_generation
+                if type(identity.detector) is DetectorRuntime else None
+            ),
+            "timeline_generation": (
+                identity.detector._provider_audio_timeline_generation
+                if type(identity.detector) is DetectorRuntime else None
+            ),
+            "detector_epoch": (
+                lease.detector_epoch
+                if type(lease) is ProviderSpeakerEvidenceLease else None
+            ),
+            "lease_generation": (
+                lease.lease_generation
+                if type(lease) is ProviderSpeakerEvidenceLease else None
+            ),
+            "shadow_generation": (
+                lease.candidate.shadow_generation
+                if type(lease) is ProviderSpeakerEvidenceLease else None
+            ),
+            "provider_generation": (
+                key.generation if type(key) is ProviderUtteranceKey else None
+            ),
+            "provider_buffer_epoch": (
+                key.buffer_epoch if type(key) is ProviderUtteranceKey else None
+            ),
+            "provider_utterance_id": (
+                key.utterance_id if type(key) is ProviderUtteranceKey else None
+            ),
+            "preceding_incident_id": (
+                previous.incident_id
+                if previous is not None
+                and previous.incident_id != incident_id
+                and previous.identity.session_epoch == source_session_epoch
+                and previous.identity.start_generation == identity.start_generation
+                and previous.identity.transport_generation == identity.transport_generation
+                and previous.identity.detector is identity.detector
+                else None
+            ),
+        }
+
+        async def persist() -> None:
+            try:
+                # Do not pass runtime objects, exception text, conversation,
+                # PCM or speaker vectors to the logging worker.
+                await asyncio.to_thread(logger.warning, "ASR incident %s", metadata)
+            except Exception:
+                # Diagnostic I/O cannot replace the authoritative ASR failure.
+                pass
+
+        task = asyncio.create_task(persist(), name="asr-incident-log")
+        self._track_terminal_close_tasks({task})
+
     async def _handle_independent_asr_error(
         self,
         epoch: int,
@@ -12881,6 +13205,12 @@ class IndependentAsrRuntime:
         )
         incident_id = f"asr-failure-{uuid.uuid4().hex}"
         transcript_dispatcher = self._asr_transcript_dispatcher
+        self._schedule_asr_incident_log(
+            incident_id=incident_id,
+            reason_code=effective_reason,
+            stage="blocked",
+            source_session_epoch=epoch,
+        )
         detector_dispatcher = self._asr_detector_dispatcher
         audio_dispatcher = self._asr_audio_dispatcher
         if self._asr_admission_ingress_started:

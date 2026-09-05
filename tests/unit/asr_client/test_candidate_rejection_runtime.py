@@ -76,6 +76,7 @@ from main_logic.asr_client.endpointing.detector_runtime import (
     ProviderExactSpeakerIntervalReservation,
     ProviderSpeakerEvidenceAnchorResult,
     ProviderSpeakerEvidenceAnchorStatus,
+    ProviderSpeakerEvidenceSettlementStatus,
     ProviderSpeakerEvidenceLease,
     ProviderSpeakerEvidenceUpdate,
 )
@@ -245,12 +246,23 @@ class _RejectionDetector:
         samples = len(pcm16) // 2
         if kwargs.get("accounting_only"):
             assert kwargs["evidence_complete"] is False
+            settlement = runtime_module.ProviderSpeakerEvidenceSettlement(
+                lease=lease,
+                detector_epoch=self.detector_epoch,
+                timeline_generation=kwargs.get("expected_timeline_generation", 0),
+                operation_serial=sequence_no,
+                status=ProviderSpeakerEvidenceSettlementStatus.RETIRED,
+                reason="accounting_only",
+            )
+            self._provider_last_evidence_settlement = settlement
+            self._provider_evidence_lease = None
             return runtime_module.ProviderAudioAccountingReceipt(
                 detector_epoch=self.detector_epoch,
                 timeline_generation=kwargs.get("expected_timeline_generation", 0),
                 sequence_no=sequence_no,
                 start_sample_16k=0,
                 end_sample_16k=samples,
+                evidence_settlement=settlement,
             )
         return ProviderSpeakerEvidenceUpdate(
             lease=lease,
@@ -263,6 +275,20 @@ class _RejectionDetector:
             ),
             sequence_no=sequence_no,
             last_progress_at=10.0,
+        )
+
+    def validate_provider_speaker_evidence_settlement(
+        self, settlement, *, lease, timeline_generation=None,
+    ):
+        return bool(
+            settlement is getattr(self, "_provider_last_evidence_settlement", None)
+            and settlement is not None
+            and settlement.lease is lease
+            and settlement.detector_epoch == self.detector_epoch
+            and (
+                timeline_generation is None
+                or settlement.timeline_generation == timeline_generation
+            )
         )
 
     async def anchor_provider_speaker_evidence(
@@ -2929,8 +2955,8 @@ async def test_parent_provisional_after_started_forwards_on_unknown_boundary(
         assert result.status is AsrSubmitStatus.ACCEPTED
         await runtime._asr_audio_dispatcher.wait_idle()
 
-    assert runtime._asr_provider_speaker_evidence_lease == evidence_lease
     if verdict == "high":
+        assert runtime._asr_provider_speaker_evidence_lease is evidence_lease
         # HIGH_SEEN is non-terminal: the next frame must still reach the
         # observer, and capture close is what makes the lease ALLOW.
         assert detector.observe_provider_audio_ordered.await_count == 2
@@ -2942,10 +2968,12 @@ async def test_parent_provisional_after_started_forwards_on_unknown_boundary(
         )
         await _drain_runtime_admission(runtime)
     else:
+        assert runtime._asr_provider_speaker_evidence_lease is None
+        assert runtime._asr_current_speaker_candidate is None
         assert detector.observe_provider_audio_ordered.await_count == 2
         assert detector.observe_provider_audio_ordered.await_args.kwargs["accounting_only"]
     assert session.stream_audio.await_count == 2
-    lease_token = runtime._asr_current_speaker_lease
+    lease_token = runtime._asr_admission_turn_leases.get(turn_token)
     assert lease_token is not None
     parent = await runtime._asr_admission.get_speaker_lease(lease_token)
     assert parent is not None and parent.state is SpeakerLeaseState.COLLECTING

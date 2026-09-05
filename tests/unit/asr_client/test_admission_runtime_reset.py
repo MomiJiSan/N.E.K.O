@@ -323,7 +323,10 @@ async def test_provider_final_callback_waits_only_admission_settlement() -> None
     runtime._asr_provider_started_turns = {}
     runtime._asr_provider_exact_pending = {}
     runtime._asr_provider_exact_intervals = {}
+    runtime._asr_provider_speaker_key_ledgers = {}
     runtime._asr_provider_speaker_evidence_lease = None
+    runtime._speaker_verifier_activation_generation = None
+    runtime._capture_runtime_identity = MagicMock()
     runtime._asr_detector = None
     runtime._accept_provider_timeline = MagicMock(return_value=True)
 
