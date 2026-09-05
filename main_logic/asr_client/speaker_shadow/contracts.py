@@ -822,6 +822,18 @@ class SpeakerShadowBatchReconciliationControl(Protocol):
 
 
 @runtime_checkable
+class SpeakerShadowReconciliationCompletionControl(Protocol):
+    """Optional retirement of an applied receipt after ownership transfer."""
+
+    def complete_reconciliation(
+        self,
+        receipt: SpeakerShadowReconciliationReceipt,
+        *,
+        successor: SpeakerShadowCandidateKey | None,
+    ) -> Literal["completed", "already_completed", "pending", "stale", "invalid"]: ...
+
+
+@runtime_checkable
 class SpeakerShadowExactIntervalControl(Protocol):
     """Optional staged ownership transfer for one exact Provider interval.
 

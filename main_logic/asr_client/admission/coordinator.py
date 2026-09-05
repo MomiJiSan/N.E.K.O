@@ -1056,6 +1056,24 @@ class VoiceTurnAdmissionCoordinator:
                     )
                 reduced, _diagnostics = reduce_speaker_lease(evidence, event)
                 if reduced is evidence:
+                    if (
+                        isinstance(event, SpeakerLeaseCaptureClosed)
+                        and evidence.terminal_disposition is AdmissionDisposition.DROP
+                        and type(event.through_sequence_no) is int
+                        and event.through_sequence_no
+                        == evidence.last_speaker_sequence_no
+                        == evidence.terminal_sequence_no
+                    ):
+                        # A denied exact child can finish capture before its
+                        # Provider final arrives. The reducer keeps DENY
+                        # immutable; this matching lifecycle fence is a held
+                        # no-op, not a stale owner that should abort the group.
+                        return ExactIntervalTransitionReceipt(
+                            interval_id=receipt.interval_id,
+                            outcome=ExactIntervalOutcome.HELD,
+                            disposition=None,
+                            effects=(),
+                        )
                     return self._exact_interval_transition_failure(
                         receipt,
                         ExactIntervalOutcome.STALE,

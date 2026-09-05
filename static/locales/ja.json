@@ -1018,6 +1018,7 @@
         "independentAsrActive": "独立 ASR を使用中：{{providerKey}}",
         "independentAsrFallback": "独立 ASR を利用できないため、この音声セッションの入力を停止しました。独立 ASR の設定を確認してから、新しい音声セッションを開始してください。",
         "independentAsrCleanupFailed": "音声セッションのクリーンアップに失敗しました。マイクを再起動してください。",
+        "speakerEvidenceUnavailable": "話者認証を一時的に利用できません。音声認識は継続し、既存のポリシーに従って処理します。",
         "independentAsrRuntimeFailed": "独立 ASR の実行時エラーにより、音声入力を停止しました。マイクを再起動してください。",
         "audioPreprocessingFailed": "マイク音声の処理に失敗しました。このセッションの音声入力は停止しました。新しい音声セッションを開始してください。",
         "independentAsrProviderUnavailable": "{{providerKey}} は一時的に利用できません。この音声セッションの入力を停止しました。別の音声認識サービスには切り替えていません。後でもう一度音声セッションを開始してください。",

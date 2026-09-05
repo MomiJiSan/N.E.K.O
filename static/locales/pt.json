@@ -1018,6 +1018,7 @@
         "independentAsrActive": "ASR independente ativo: {{providerKey}}",
         "independentAsrFallback": "O ASR independente não está disponível. A entrada de voz foi interrompida nesta sessão. Verifique a configuração do ASR independente e depois inicie uma nova sessão de voz.",
         "independentAsrCleanupFailed": "Falha ao limpar a sessão de voz. Reinicie o microfone.",
+        "speakerEvidenceUnavailable": "A verificação de voz está temporariamente indisponível. O reconhecimento de fala continua de acordo com a política existente.",
         "independentAsrRuntimeFailed": "O ASR independente parou devido a um erro de execução. Reinicie o microfone.",
         "audioPreprocessingFailed": "Falha ao processar o áudio do microfone. A entrada de voz foi interrompida nesta sessão. Inicie uma nova sessão de voz.",
         "independentAsrProviderUnavailable": "{{providerKey}} está temporariamente indisponível. A entrada de voz foi interrompida nesta sessão. O sistema não mudou para outro serviço de reconhecimento de voz. Inicie uma nova sessão de voz mais tarde.",

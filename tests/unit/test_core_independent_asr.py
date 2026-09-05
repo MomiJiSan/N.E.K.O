@@ -6331,11 +6331,13 @@ async def test_websocket_core_submits_one_external_turn_after_local_history() ->
 
 @pytest.mark.parametrize("accepted", [True, False])
 @pytest.mark.parametrize("observer_raises", [False, True])
-async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payload(
+async def test_audio_activation_observes_before_dispatch_and_retires_rejected_payload(
     accepted: bool,
     observer_raises: bool,
 ) -> None:
     runtime = _Runtime()
+    session = SimpleNamespace(is_ready=True, close=AsyncMock())
+    runtime._asr_session = session
     _install_ready_lifecycle(runtime, "openai")
     component = runtime._asr_runtime
     lifecycle = component._asr_lifecycle
@@ -6345,11 +6347,20 @@ async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payloa
     if observer_raises:
         detector.observe_provider_audio.side_effect = RuntimeError("observer failed")
     token = component._capture_turn_token(lifecycle)
+    epoch = component._asr_session_epoch
     payload = b"\x01\x00" * 320
-    activate = MagicMock(return_value=accepted)
+
+    def accept_after_observation(*_args, **_kwargs):
+        detector.observe_provider_audio.assert_called_once()
+        return accepted
+
+    activate = MagicMock(side_effect=accept_after_observation)
+    abort = MagicMock()
     component._asr_audio_dispatcher = SimpleNamespace(
         active_turn=None,
         activate=activate,
+        abort=abort,
+        close=AsyncMock(),
     )
 
     result = await component._activate_asr_audio_dispatcher(
@@ -6361,14 +6372,23 @@ async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payloa
     assert result is accepted
     activate.assert_called_once()
     assert activate.call_args.args[2] is payload
+    detector.observe_provider_audio.assert_called_once()
+    assert detector.observe_provider_audio.call_args.args[0] is payload
+    assert detector.observe_provider_audio.call_args.kwargs == {
+        "sample_rate_hz": 16_000,
+    }
     if accepted:
-        detector.observe_provider_audio.assert_called_once()
-        assert detector.observe_provider_audio.call_args.args[0] is payload
-        assert detector.observe_provider_audio.call_args.kwargs == {
-            "sample_rate_hz": 16_000,
-        }
+        abort.assert_not_called()
+        session.close.assert_not_awaited()
+        assert component._asr_session is session
+        assert component._asr_session_epoch == epoch
     else:
-        detector.observe_provider_audio.assert_not_called()
+        # Ordered observation may already have committed its sample positions;
+        # enqueue refusal retires that physical timeline instead of replaying it.
+        abort.assert_called()
+        session.close.assert_awaited_once()
+        assert component._asr_session is None
+        assert component._asr_session_epoch > epoch
 
 
 async def test_buffered_resume_spans_preserve_pcm_boundary() -> None:
@@ -11002,6 +11022,9 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
 
     class _ScoringHost:
         alive = True
+        loaded = True
+        timed_out = False
+        was_terminated = False
 
         async def score(
             self,
@@ -11011,6 +11034,17 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
         ) -> float:
             assert timeout_seconds > 0
             return 0.20
+
+        async def close(self, *, timeout_seconds: float) -> bool:
+            assert timeout_seconds > 0
+            self.alive = False
+            self.loaded = False
+            return True
+
+        async def terminate(self) -> None:
+            self.alive = False
+            self.loaded = False
+            self.was_terminated = True
 
     async def on_turn_abandoned(_turn_token: VoiceTurnToken) -> None:
         return None
@@ -11059,12 +11093,6 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
         original_evidence_callback(event)
 
     monkeypatch.setattr(shadow, "_on_evidence", capture_evidence)
-    monkeypatch.setattr(
-        shadow,
-        "_ensure_backend",
-        AsyncMock(return_value=_ScoringHost()),
-    )
-
     def on_speaker_candidate_bound(
         candidate,
         turn_token,
@@ -11142,6 +11170,10 @@ async def test_owner_voice_composition_preserves_detector_candidate_class_identi
     detector_candidate = detector._speaker_shadow_candidate
     assert detector_candidate is not None
     detector.observe_provider_audio(checkpoint_pcm16, sample_rate_hz=16_000)
+    # Install after Detector initialization has reset the Shadow lifecycle.
+    # Exercise real readiness checks with a cached, loaded host; a mocked
+    # _ensure_backend return alone leaves its ownership cache unset.
+    shadow._backend_host = _ScoringHost()
     await shadow.wait_idle()
     async def wait_for_reject_requested() -> None:
         for _ in range(200):

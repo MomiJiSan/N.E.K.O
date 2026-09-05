@@ -3428,6 +3428,7 @@
                     var isAsrStatus = typeof statusCode === 'string'
                         && statusCode.indexOf('ASR_') === 0;
                     var isAsrControlStatus = statusCode === 'ASR_LIFECYCLE_STATE'
+                        || statusCode === 'ASR_SPEAKER_EVIDENCE_UNAVAILABLE'
                         || statusCode === 'ASR_AUDIO_PREPROCESSING_FAILED'
                         || statusCode === 'ASR_DENY_CLEANUP_FAILED'
                         || (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0)
@@ -3616,6 +3617,23 @@
                                 statusCode === 'ASR_INDEPENDENT_FAILED'
                                     ? (window.t ? window.t('microphone.independentAsrFallback') : 'Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.')
                                     : (window.t ? window.t('microphone.independentAsrRuntimeFailed') : 'Independent ASR stopped because of a runtime error. Please restart the microphone.'),
+                                statusReasonCode
+                            ),
+                            5000
+                        );
+                        return;
+                    }
+
+                    // Evidence degradation leaves the ASR route and microphone
+                    // active. Consume it before the terminal incident fallback,
+                    // after the same session and revision fence as other ASR statuses.
+                    if (statusCode === 'ASR_SPEAKER_EVIDENCE_UNAVAILABLE') {
+                        showAsrIncidentToast(
+                            statusIncidentId,
+                            formatAsrFailureMessage(
+                                window.t
+                                    ? window.t('microphone.speakerEvidenceUnavailable')
+                                    : 'Speaker verification is temporarily unavailable. Speech recognition continues under the existing policy.',
                                 statusReasonCode
                             ),
                             5000

@@ -519,6 +519,7 @@ class _ReconciliationRecord:
     marker: _CandidateBatchReconciliation
     state: Literal["pending", "applied", "failed"] = "pending"
     settled: asyncio.Event = field(default_factory=asyncio.Event)
+    completed: bool = False
 
 
 @dataclass(slots=True)
@@ -546,6 +547,7 @@ class _TerminalCoverageRecord:
     marker: _CandidateTerminalCoverage
     state: Literal["pending", "applied", "failed"] = "pending"
     settled: asyncio.Event = field(default_factory=asyncio.Event)
+    completed: bool = False
 
 
 @dataclass(slots=True)
@@ -591,6 +593,22 @@ class _CompletionEnvelope:
     completion: SpeakerShadowCompletion
 
 
+@dataclass(frozen=True, slots=True)
+class _BackendReady:
+    generation: int
+    available: bool
+
+
+@dataclass(slots=True)
+class _PendingBackendCandidate:
+    generation: int
+    candidate: SpeakerShadowCandidateKey
+    token: _CandidateToken
+    buffer: _CandidateBuffer
+    allow_frozen: bool = False
+    finish: _CandidateFinished | None = None
+
+
 _STOP = object()
 _COMPLETION_STOP = object()
 _QueueItem = (
@@ -602,6 +620,7 @@ _QueueItem = (
     | _CandidateBatchReconciliation
     | _CandidateTerminalCoverage
     | _CandidateFinished
+    | _BackendReady
     | object
 )
 
@@ -710,6 +729,10 @@ class SpeakerShadowRuntime:
         self._reset_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._host_start_task: asyncio.Task[_BackendProcessHost] | None = None
+        self._backend_load_task: asyncio.Task[None] | None = None
+        self._pending_backend_candidates: OrderedDict[
+            SpeakerShadowCandidateKey, _PendingBackendCandidate
+        ] = OrderedDict()
         self._active_evaluation: tuple[int, SpeakerShadowCandidateKey] | None = None
         self._active_evaluation_terminal = False
         self._active_terminal_token: _CandidateToken | None = None
@@ -1457,6 +1480,8 @@ class SpeakerShadowRuntime:
                 SPEAKER_SHADOW_SAMPLE_RATE_HZ,
                 accepted_sample_count=suffix_sample_count,
                 pcm_frozen=True,
+                deferred_requested=True,
+                scoring_deferred=True,
             )
             if suffix is not None
             else None
@@ -2161,6 +2186,42 @@ class SpeakerShadowRuntime:
             return
         self._revoke_candidate_batch_reconciliation(record.marker)
 
+    def complete_reconciliation(
+        self,
+        receipt: SpeakerShadowReconciliationReceipt,
+        *,
+        successor: SpeakerShadowCandidateKey | None,
+    ) -> Literal["completed", "already_completed", "pending", "stale", "invalid"]:
+        """Retire an applied proof's authority after its successor was handed off.
+
+        The exact receipt is the capability; its immutable suffix records the
+        original transfer even after that suffix enters another batch. Normal
+        completion never rewrites a score or resurrects a terminal candidate.
+        The bounded receipt registry retains the idempotence tombstone.
+        """
+        if type(receipt) is SpeakerShadowBatchReconcileReceipt:
+            status = self.reconciliation_status(receipt)
+            record = self._reconciliations.get(receipt.batch_id)
+        elif type(receipt) is SpeakerShadowTerminalCoverageReceipt:
+            status = self.terminal_coverage_status(receipt)
+            record = self._terminal_coverages.get(receipt.batch_id)
+        else:
+            return "stale"
+        if status == "stale" or self._closed or self._resetting:
+            return "stale"
+        if record is None or record.marker.receipt is not receipt:
+            return "stale"
+        if successor != record.marker.suffix:
+            return "invalid"
+        if record.completed:
+            return "already_completed"
+        if status == "pending":
+            return "pending"
+        if status != "applied":
+            return "invalid"
+        record.completed = True
+        return "completed"
+
     def _revoke_candidate_batch_reconciliation(
         self,
         marker: _CandidateBatchReconciliation,
@@ -2168,7 +2229,12 @@ class SpeakerShadowRuntime:
         """Revoke one owned batch exactly once, including reset/close drains."""
 
         record = self._reconciliations.get(marker.batch_id)
-        if record is None or record.marker is not marker or record.state == "failed":
+        if (
+            record is None
+            or record.marker is not marker
+            or record.state == "failed"
+            or record.completed
+        ):
             return
         self._metrics.reconciliation_batch_revoked_count += 1
         self._fail_candidate_batch_reconciliation(marker)
@@ -2184,7 +2250,12 @@ class SpeakerShadowRuntime:
         marker: _CandidateTerminalCoverage,
     ) -> None:
         record = self._terminal_coverages.get(marker.batch_id)
-        if record is None or record.marker is not marker or record.state == "failed":
+        if (
+            record is None
+            or record.marker is not marker
+            or record.state == "failed"
+            or record.completed
+        ):
             return
         self._metrics.reconciliation_batch_revoked_count += 1
         self._fail_terminal_coverage(marker)
@@ -2995,6 +3066,12 @@ class SpeakerShadowRuntime:
                     break
             await asyncio.sleep(0)
         await self._queue.join()
+        load = self._backend_load_task
+        while load is not None and not load.done():
+            await asyncio.shield(load)
+            # Loading publishes a same-queue marker; it is part of accepted work.
+            await self._queue.join()
+            load = self._backend_load_task
         await asyncio.sleep(0)
         while True:
             callback = self._completion_callback_task
@@ -3048,6 +3125,7 @@ class SpeakerShadowRuntime:
         owned_tokens = list(self._owned_candidate_tokens())
         observation = self._observation_task
         try:
+            await self._cancel_backend_load()
             if observation is not None and not observation.done():
                 cancelled = await self._cancel_callback_bounded(observation)
                 if not cancelled:
@@ -3116,6 +3194,7 @@ class SpeakerShadowRuntime:
             except Exception:
                 # Reset already ran its mandatory local cleanup in ``finally``.
                 pass
+        await self._cancel_backend_load()
         self._cancel_observation_callback()
         self._drain_queue(revoke_pending_batches=True)
         self._drain_completion_queue()
@@ -3180,7 +3259,9 @@ class SpeakerShadowRuntime:
             try:
                 if item is _STOP:
                     return
-                if isinstance(item, _CandidateFinished):
+                if isinstance(item, _BackendReady):
+                    await self._process_backend_ready(item)
+                elif isinstance(item, _CandidateFinished):
                     self._active_terminal_token = item.token
                     await self._process_finish(item)
                 elif isinstance(item, _CandidateDeferred):
@@ -3273,7 +3354,11 @@ class SpeakerShadowRuntime:
                 ):
                     self._active_terminal_token = None
                 item = None
-            if self._queue.empty() and self._backend_host is None:
+            if (
+                self._queue.empty()
+                and self._backend_host is None
+                and (self._backend_load_task is None or self._backend_load_task.done())
+            ):
                 return
 
     def _retire_queued_item(self, item: _QueueItem) -> None:
@@ -3587,7 +3672,10 @@ class SpeakerShadowRuntime:
                 reserved.source.candidate,
                 token=reserved.token,
             )
-        if marker.suffix is not None and marker.suffix_token is not None:
+        if (
+            marker.suffix is not None and marker.suffix_token is not None
+            and not (record is not None and record.marker is marker and record.completed)
+        ):
             self._drop_candidate(marker.suffix, token=marker.suffix_token)
 
     async def _process_candidate_batch_reconciliation(
@@ -3833,7 +3921,10 @@ class SpeakerShadowRuntime:
             self._abandon_terminal(marker.target, token=target_token)
         elif target_token.finish_state is _FinishState.OPEN:
             self._drop_candidate(marker.target, token=target_token)
-        if marker.suffix is not None and marker.suffix_token is not None:
+        if (
+            marker.suffix is not None and marker.suffix_token is not None
+            and not (record is not None and record.marker is marker and record.completed)
+        ):
             self._drop_candidate(marker.suffix, token=marker.suffix_token)
 
     async def _process_prefix_reconciliation(
@@ -4138,31 +4229,121 @@ class SpeakerShadowRuntime:
             and candidate.scope in self._config.backend_prewarm_scopes
         ):
             buffer.backend_prewarm_attempted = True
-            backend_host = await self._ensure_backend()
-            if not self._identity_is_current(
-                generation,
-                candidate,
-                token,
-            ):
-                self._metrics.stale_result_count += 1
-                retained_buffer = self._buffers.get(candidate)
-                if retained_buffer is buffer:
-                    self._buffers.pop(candidate, None)
-                    self._wipe_bytearray(buffer.pcm16)
-                return False
-            if backend_host is None:
-                self._mark_backend_degraded()
-                retained_buffer = self._buffers.get(candidate)
-                if retained_buffer is buffer:
-                    self._buffers.pop(candidate, None)
-                    self._wipe_bytearray(buffer.pcm16)
-                self._finalize_candidate(
-                    candidate,
-                    "failed",
-                    token=token,
-                )
-                return False
+            self._defer_until_backend_ready(
+                generation=generation,
+                candidate=candidate,
+                token=token,
+                buffer=buffer,
+            )
         return True
+
+    def _defer_until_backend_ready(
+        self,
+        *,
+        generation: int,
+        candidate: SpeakerShadowCandidateKey,
+        token: _CandidateToken,
+        buffer: _CandidateBuffer,
+        allow_frozen: bool = False,
+    ) -> bool:
+        """Keep bounded references, never duplicate PCM or wait on the worker."""
+        host = self._backend_host
+        if host is not None and host.alive and host.loaded:
+            return False
+        pending = self._pending_backend_candidates
+        for key, previous in tuple(pending.items()):
+            if self._buffers.get(key) is not previous.buffer:
+                pending.pop(key, None)
+                if previous.finish is not None:
+                    self._recover_failed_finish(previous.finish)
+        previous = pending.get(candidate)
+        if (
+            previous is None
+            or previous.token is not token
+            or previous.buffer is not buffer
+        ):
+            if len(pending) >= self._config.buffered_candidate_capacity:
+                self._drop_candidate(candidate, token=token)
+                return True
+            previous = _PendingBackendCandidate(generation, candidate, token, buffer)
+            pending[candidate] = previous
+        previous.allow_frozen |= allow_frozen
+        task = self._backend_load_task
+        if task is None or task.done():
+            self._backend_load_task = asyncio.create_task(
+                self._load_backend_and_notify(generation),
+                name="speaker-shadow-backend-load",
+            )
+        return True
+
+    async def _load_backend_and_notify(self, generation: int) -> None:
+        host = await self._ensure_backend()
+        if generation != self._generation or self._closed or self._resetting:
+            return
+        # One marker per load, on the existing ordered queue. Its put may wait
+        # for capacity, but it never holds the PCM/control worker.
+        await self._queue.put(_BackendReady(generation, host is not None))
+        self._ensure_worker()
+
+    async def _process_backend_ready(self, marker: _BackendReady) -> None:
+        if marker.generation != self._generation or self._closed or self._resetting:
+            return
+        pending = tuple(self._pending_backend_candidates.values())
+        self._pending_backend_candidates.clear()
+        for index, item in enumerate(pending):
+            if (
+                not self._identity_is_current(item.generation, item.candidate, item.token)
+                or self._buffers.get(item.candidate) is not item.buffer
+            ):
+                if item.finish is not None:
+                    self._recover_failed_finish(item.finish)
+                continue
+            try:
+                if not marker.available:
+                    self._finalize_candidate(item.candidate, "failed", token=item.token)
+                    self._buffers.pop(item.candidate, None)
+                    self._wipe_bytearray(item.buffer.pcm16)
+                elif not item.token.scoring_deferred:
+                    await self._process_buffer_checkpoints(
+                        generation=item.generation,
+                        candidate=item.candidate,
+                        token=item.token,
+                        buffer=item.buffer,
+                        allow_frozen=item.allow_frozen,
+                    )
+                if item.finish is not None:
+                    await self._process_finish(item.finish)
+            except asyncio.CancelledError:
+                if not self._closed and not self._resetting:
+                    for remaining in pending[index:]:
+                        self._recover_pending_backend_work(remaining)
+                raise
+            except Exception:
+                self._metrics.inference_failure_count += 1
+                self._recover_pending_backend_work(item)
+
+    def _recover_pending_backend_work(self, item: _PendingBackendCandidate) -> None:
+        if item.generation != self._generation or self._closed or self._resetting:
+            return
+        if self._buffers.get(item.candidate) is item.buffer:
+            self._buffers.pop(item.candidate, None)
+            self._wipe_bytearray(item.buffer.pcm16)
+        if item.finish is not None:
+            self._recover_failed_finish(item.finish)
+        elif self._candidate_tokens.get(item.candidate) is item.token:
+            self._finalize_candidate(item.candidate, "failed", token=item.token)
+
+    async def _cancel_backend_load(self) -> None:
+        task = self._backend_load_task
+        self._pending_backend_candidates.clear()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if self._backend_load_task is task:
+            self._backend_load_task = None
 
     async def _process_buffer_checkpoints(
         self,
@@ -4175,6 +4356,18 @@ class SpeakerShadowRuntime:
     ) -> None:
         explicit_checkpoints = self._config.observation_checkpoints_ms
         checkpoints = explicit_checkpoints or (self._config.minimum_audio_ms,)
+        if (
+            buffer.next_checkpoint_index < len(checkpoints)
+            and buffer.audio_ms >= checkpoints[buffer.next_checkpoint_index]
+            and self._defer_until_backend_ready(
+                generation=generation,
+                candidate=candidate,
+                token=token,
+                buffer=buffer,
+                allow_frozen=allow_frozen,
+            )
+        ):
+            return
         while buffer.next_checkpoint_index < len(checkpoints):
             if token.pcm_frozen and not allow_frozen:
                 return
@@ -4753,6 +4946,10 @@ class SpeakerShadowRuntime:
                 token=marker.token,
             )
         ):
+            return
+        pending = self._pending_backend_candidates.get(marker.candidate)
+        if pending is not None and pending.token is marker.token:
+            pending.finish = marker
             return
         # Only an accepted QUEUED marker outranks the tombstone watermark.
         self._mark_finish_processed(marker.token)

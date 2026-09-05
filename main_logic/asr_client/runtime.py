@@ -140,6 +140,7 @@ from .endpointing.detector import (
     ProviderSpeakerBoundarySnapshot,
 )
 from .endpointing.detector_runtime import (
+    ProviderAudioAccountingReceipt,
     DetectorCandidateRejectionCommitResult,
     DetectorCandidateRejectionLease,
     DetectorRuntime,
@@ -427,6 +428,26 @@ class AsrRuntimeCallbacks:
 SpeakerShadowFactory = Callable[[], SpeakerShadowObserver | None]
 
 
+class _SpeakerArmingStatus(Enum):
+    ARMED = "armed"
+    EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+    STALE = "stale"
+    INVARIANT_FAILURE = "invariant_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeakerArmingResult:
+    status: _SpeakerArmingStatus
+    owner_generation: str | None = None
+    reason_code: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.status in {
+            _SpeakerArmingStatus.ARMED,
+            _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class _AsrRuntimeIdentity:
     start_generation: int
@@ -442,6 +463,21 @@ class _AsrRuntimeIdentity:
     transport_task: asyncio.Task[None] | None
     ingress_token: VoiceIngressToken | None = None
     turn_token: VoiceTurnToken | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderBoundaryCompletion:
+    snapshot: ProviderSpeakerBoundarySnapshot
+    successor_evidence_lease: ProviderSpeakerEvidenceLease | None
+    detector: DetectorRuntime
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeakerEvidenceDegradation:
+    identity: _AsrRuntimeIdentity
+    activation_generation: str
+    reason_code: str
+    incident_id: str
 
 
 @dataclass(slots=True)
@@ -1326,6 +1362,70 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             self._speaker_rejection_metrics[
                 f"speaker_unavailable_reason_{category}_count"
             ] += 1
+            self._schedule_speaker_evidence_unavailable(
+                ledger.runtime_identity,
+                reason,
+                activation_generation=ledger.activation_generation,
+            )
+
+    def _schedule_speaker_evidence_unavailable(
+        self,
+        identity: _AsrRuntimeIdentity,
+        reason: str | None,
+        *,
+        activation_generation: str | None,
+    ) -> None:
+        """Notify evidence degradation once without changing ASR admission."""
+
+        if (
+            activation_generation is None
+            or activation_generation != self._speaker_verifier_activation_generation
+            or not self._speaker_verifier_enforces_admission
+            or self._asr_terminal_close_requested
+            or not self._runtime_identity_matches(identity)
+        ):
+            return
+        previous = self._asr_speaker_degradation_incident
+        if (
+            previous is not None
+            and previous.activation_generation == activation_generation
+            and self._runtime_identity_matches(previous.identity)
+        ):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reason_code = (reason or "ASR_SPEAKER_EVIDENCE_UNAVAILABLE").upper()
+        if not reason_code.startswith("ASR_"):
+            reason_code = "ASR_" + reason_code
+        if _ASR_REASON_CODE_FULL_RE.fullmatch(reason_code) is None:
+            reason_code = "ASR_SPEAKER_EVIDENCE_UNAVAILABLE"
+        incident = _SpeakerEvidenceDegradation(
+            identity, activation_generation, reason_code,
+            f"asr-failure-{uuid.uuid4().hex}",
+        )
+        self._asr_speaker_degradation_incident = incident
+
+        async def notify() -> None:
+            if (
+                self._asr_speaker_degradation_incident is not incident
+                or activation_generation != self._speaker_verifier_activation_generation
+                or not self._runtime_identity_matches(identity)
+            ):
+                return
+            await self._send_asr_status(
+                "ASR_SPEAKER_EVIDENCE_UNAVAILABLE",
+                identity.provider or "unknown",
+                session_epoch=identity.session_epoch,
+                expected_identity=identity,
+                reason_code=incident.reason_code,
+                incident_id=incident.incident_id,
+            )
+
+        task = loop.create_task(notify(), name="asr-speaker-evidence-degraded")
+        self._asr_owned_cleanup_tasks.add(task)
+        task.add_done_callback(self._owned_cleanup_done)
 
     def _record_provider_provisional_speaker_event(
         self,
@@ -3238,6 +3338,9 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             int,
             ProviderSpeakerBoundarySnapshot,
         ] = {}
+        self._asr_provider_boundary_completions: dict[
+            BoundaryProof, _ProviderBoundaryCompletion
+        ] = {}
         self._asr_provider_exact_intervals: dict[
             ProviderUtteranceKey,
             _ProviderExactIntervalTransaction,
@@ -3308,7 +3411,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         ) = None
         self._asr_provider_speaker_arming_tasks: dict[
             VoiceTurnToken,
-            asyncio.Task[str | None],
+            asyncio.Task[_SpeakerArmingResult],
         ] = {}
         self._asr_buffered_provider_speaker_observation: (
             _BufferedProviderSpeakerObservation | None
@@ -3321,6 +3424,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         self._speaker_verifier_enforces_admission = False
         self._speaker_verifier_degraded = False
         self._speaker_verifier_health_generation = 0
+        self._asr_speaker_degradation_incident: _SpeakerEvidenceDegradation | None = None
         self._speaker_verifier_lock = asyncio.Lock()
         self._speaker_rejection_metrics = _new_speaker_rejection_metrics()
         self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
@@ -3468,6 +3572,8 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             self._asr_provider_turn_ownerships = {}
         if not hasattr(self, "_asr_provider_turn_ownerships"):
             self._asr_provider_turn_ownerships = {}
+        if not hasattr(self, "_asr_provider_boundary_completions"):
+            self._asr_provider_boundary_completions = {}
         if not hasattr(self, "_asr_deny_cleanup_generation"):
             self._asr_deny_cleanup_generation = 0
             self._asr_deny_cleanup_active = False
@@ -3582,6 +3688,8 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             )
         if not hasattr(self, "_speaker_verifier_health_generation"):
             self._speaker_verifier_health_generation = 0
+        if not hasattr(self, "_asr_speaker_degradation_incident"):
+            self._asr_speaker_degradation_incident = None
         if not hasattr(self, "_speaker_verifier_lock"):
             self._speaker_verifier_lock = asyncio.Lock()
 
@@ -5022,9 +5130,12 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         self,
         proofs: tuple[BoundaryProof, ...],
         detector: DetectorRuntime | None,
+        *,
+        completion: bool = False,
     ) -> None:
         if detector is None:
             for proof in proofs:
+                self._asr_provider_boundary_completions.pop(proof, None)
                 snapshot = self._asr_provider_boundary_proofs.pop(
                     proof.proof_id,
                     None,
@@ -5035,20 +5146,124 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     ] += 1
             return
         identity = self._capture_runtime_identity()
+        owned_proofs = tuple(
+            (
+                proof,
+                self._asr_provider_boundary_proofs.get(proof.proof_id),
+                self._asr_provider_boundary_completions.get(proof),
+            )
+            for proof in proofs
+        )
+
+        async def retire_unsettled_completion(reason_code: str) -> None:
+            # The correlator has already consumed these proofs. Move their
+            # cleanup responsibility to one tracked session retirement before
+            # yielding; repeated callers cannot schedule unbounded retries.
+            claimed = False
+            for old_proof, old_snapshot, old_owner in owned_proofs:
+                if (
+                    old_snapshot is None
+                    or (old_owner is not None and old_owner.detector is not detector)
+                    or self._asr_provider_boundary_proofs.get(old_proof.proof_id)
+                    is not old_snapshot
+                    or self._asr_provider_boundary_completions.get(old_proof)
+                    is not old_owner
+                ):
+                    continue
+                self._asr_provider_boundary_proofs.pop(old_proof.proof_id, None)
+                self._asr_provider_boundary_completions.pop(old_proof, None)
+                self._speaker_rejection_metrics[
+                    "admission_boundary_proof_retired_count"
+                ] += 1
+                claimed = True
+            if (
+                not claimed
+                or identity.detector is not detector
+                or not self._runtime_identity_matches(identity)
+            ):
+                return
+            self._asr_audio_dispatcher.abort()
+            task = asyncio.create_task(
+                self._handle_independent_asr_error(
+                    identity.session_epoch,
+                    identity.provider or "unknown",
+                    status_code="ASR_AUDIO_ORDERING_FAILED",
+                    reason_code=reason_code,
+                    expected_identity=identity,
+                ),
+                name="asr-boundary-completion-retirement",
+            )
+            self._asr_owned_cleanup_tasks.add(task)
+            task.add_done_callback(self._owned_cleanup_done)
+            # The failure handler installs its epoch fence before its first
+            # await. Do not join it here: invalidation may itself join this
+            # admission effect (or the effect awaiting this operation).
+            await asyncio.sleep(0)
+
         for proof in proofs:
-            snapshot = self._asr_provider_boundary_proofs.pop(
+            snapshot = self._asr_provider_boundary_proofs.get(
                 proof.proof_id,
                 None,
             )
             if snapshot is not None:
+                owner = self._asr_provider_boundary_completions.get(proof)
+                if owner is not None and (
+                    owner.snapshot is not snapshot or owner.detector is not detector
+                ):
+                    continue
+                if completion and owner is not None:
+                    complete = getattr(
+                        detector, "complete_provider_speaker_boundary", None
+                    )
+                    if not callable(complete):
+                        await retire_unsettled_completion(
+                            "ASR_BOUNDARY_COMPLETION_UNSUPPORTED"
+                        )
+                        return
+                    try:
+                        result = await asyncio.wait_for(
+                            complete(
+                                snapshot,
+                                successor_evidence_lease=owner.successor_evidence_lease,
+                                deadline=(
+                                    time.monotonic()
+                                    + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
+                                ),
+                            ),
+                            timeout=_PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.CancelledError:
+                        await retire_unsettled_completion(
+                            "ASR_BOUNDARY_COMPLETION_CANCELLED"
+                        )
+                        raise
+                    except Exception:
+                        await retire_unsettled_completion(
+                            "ASR_BOUNDARY_COMPLETION_FAILED"
+                        )
+                        return
+                    if result not in {"completed", "already_completed", "stale"}:
+                        # A pending receipt is not a completed proof. Retire the
+                        # physical session instead of revoking a live successor
+                        # and continuing with inconsistent evidence ownership.
+                        await retire_unsettled_completion(
+                            "ASR_BOUNDARY_COMPLETION_UNSETTLED"
+                        )
+                        return
+                else:
+                    await self._retire_provider_speaker_boundary_unknown(
+                        detector,
+                        identity,
+                        snapshot,
+                    )
+                if self._asr_provider_boundary_proofs.get(proof.proof_id) is not snapshot:
+                    continue
+                self._asr_provider_boundary_proofs.pop(proof.proof_id, None)
+                if self._asr_provider_boundary_completions.get(proof) is owner:
+                    self._asr_provider_boundary_completions.pop(proof, None)
                 self._speaker_rejection_metrics[
                     "admission_boundary_proof_retired_count"
                 ] += 1
-                await self._retire_provider_speaker_boundary_unknown(
-                    detector,
-                    identity,
-                    snapshot,
-                )
 
     async def _settle_admission_final(
         self,
@@ -5143,6 +5358,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     await self._retire_admission_boundary_proofs(
                         completion.retired_proofs,
                         detector,
+                        completion=True,
                     )
                     if not completion.completed:
                         degraded = True
@@ -5906,6 +6122,9 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         *,
         buffered_pcm16: bytes | None = None,
     ) -> bool:
+        physical_identity = self._capture_runtime_identity(
+            ingress_token=turn_token.ingress,
+        )
         detector = self._asr_detector
         session_ref = self._asr_session
         if (
@@ -5926,7 +6145,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             else buffered_pcm16
         )
         if payload:
-            armed_generation = await self._arm_speaker_authority_for_provider_audio(
+            arming = await self._arm_speaker_authority_for_provider_audio(
                 turn_token
             )
             if (
@@ -5939,9 +6158,30 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 return False
             if (
                 self._speaker_verifier_enforces_admission
-                and armed_generation != self._speaker_verifier_activation_generation
+                and (
+                    not arming
+                    or arming.owner_generation
+                    != self._speaker_verifier_activation_generation
+                )
             ):
+                if arming.status is _SpeakerArmingStatus.INVARIANT_FAILURE:
+                    await self._handle_independent_asr_error(
+                        self._asr_session_epoch,
+                        self._asr_provider or "unknown",
+                        status_code="ASR_AUDIO_ORDERING_FAILED",
+                        reason_code=arming.reason_code,
+                        expected_identity=self._capture_runtime_identity(
+                            ingress_token=turn_token.ingress,
+                            turn_token=turn_token,
+                        ),
+                    )
                 return False
+            if arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE:
+                self._schedule_speaker_evidence_unavailable(
+                    physical_identity,
+                    arming.reason_code,
+                    activation_generation=arming.owner_generation,
+                )
         spans = (
             buffered_observation.spans
             if buffered_observation is not None
@@ -5973,7 +6213,11 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     split_before_audio=False,
                     evidence_complete=False,
                     turn_token=turn_token,
+                    speaker_evidence_unavailable=(
+                        arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
+                    ),
                 ):
+                    await self._retire_partial_provider_audio(physical_identity)
                     return False
             else:
                 for span in spans:
@@ -5990,7 +6234,11 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                             and span.evidence_complete
                         ),
                         turn_token=turn_token,
+                        speaker_evidence_unavailable=(
+                            arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
+                        ),
                     ):
+                        await self._retire_partial_provider_audio(physical_identity)
                         return False
             if (
                 self._asr_session is not session_ref
@@ -5999,13 +6247,50 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 or lifecycle.current_turn_token != turn_token
                 or not self._ingress_token_matches(turn_token.ingress)
             ):
+                await self._retire_partial_provider_audio(physical_identity)
                 return False
-        return self._asr_audio_dispatcher.activate(
-            turn_token,
-            session_ref,
-            payload,
-            sample_rate_hz=16_000,
+        try:
+            activated = self._asr_audio_dispatcher.activate(
+                turn_token,
+                session_ref,
+                payload,
+                sample_rate_hz=16_000,
+            )
+        except Exception:
+            if payload:
+                await self._retire_partial_provider_audio(physical_identity)
+            raise
+        if not activated and payload:
+            await self._retire_partial_provider_audio(physical_identity)
+        return activated
+
+    async def _retire_partial_provider_audio(
+        self,
+        identity: _AsrRuntimeIdentity,
+    ) -> None:
+        """Fence uncertain local accounting without replaying accepted PCM."""
+
+        if not self._runtime_identity_matches(identity):
+            return
+        self._asr_audio_dispatcher.abort()
+        task = asyncio.create_task(
+            self._handle_independent_asr_error(
+                identity.session_epoch,
+                identity.provider or "unknown",
+                status_code="ASR_AUDIO_ORDERING_FAILED",
+                reason_code="ASR_AUDIO_ADMISSION_PARTIAL",
+                expected_identity=identity,
+            ),
+            name="asr-partial-audio-retirement",
         )
+        self._asr_owned_cleanup_tasks.add(task)
+        task.add_done_callback(self._owned_cleanup_done)
+        if asyncio.current_task() in self._asr_admission_effect_task_turns:
+            # Invalidation joins admission effects. Let this effect unwind
+            # after the failure task has installed its epoch fence.
+            await asyncio.sleep(0)
+        else:
+            await asyncio.shield(task)
 
     def _turn_has_speaker_candidate(self, turn_token: VoiceTurnToken) -> bool:
         return turn_token in self._asr_admission_turn_leases or any(
@@ -6016,15 +6301,19 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
     async def _arm_speaker_authority_for_provider_audio(
         self,
         turn_token: VoiceTurnToken,
-    ) -> str | None:
+    ) -> _SpeakerArmingResult:
         """Publish HOLD authority before the first Provider PCM can escape."""
 
         owner_generation = self._speaker_verifier_activation_generation
-        if (
-            not self._speaker_verifier_enforces_admission
-            or owner_generation is None
-        ):
-            return owner_generation
+        if not self._speaker_verifier_enforces_admission:
+            return _SpeakerArmingResult(
+                _SpeakerArmingStatus.ARMED, owner_generation
+            )
+        if owner_generation is None:
+            return _SpeakerArmingResult(
+                _SpeakerArmingStatus.INVARIANT_FAILURE,
+                reason_code="ASR_SPEAKER_OWNER_MISSING",
+            )
         lifecycle = self._asr_lifecycle
         if (
             lifecycle is None
@@ -6032,7 +6321,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             or lifecycle.current_turn_token != turn_token
             or not self._ingress_token_matches(turn_token.ingress)
         ):
-            return None
+            return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
         if lifecycle.provider_policy.endpoint_authority == "provider":
             evidence_lease = self._asr_provider_speaker_evidence_lease
             candidate = (
@@ -6054,6 +6343,12 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 and ledger is not None
                 and ledger.evidence_lease == evidence_lease
                 and ledger.activation_generation == owner_generation
+                and self._runtime_identity_matches(ledger.runtime_identity)
+                and ledger.turn_token in {None, turn_token}
+                and ledger.state not in {
+                    _ProviderSpeakerLedgerState.EXACT_DRAINING,
+                    _ProviderSpeakerLedgerState.RESOLVED,
+                }
                 and (
                     lease_token is None
                     or (
@@ -6067,14 +6362,22 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     )
                 )
             ):
-                return owner_generation
+                return _SpeakerArmingResult(
+                    _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
+                    if ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE
+                    else _SpeakerArmingStatus.ARMED,
+                    owner_generation,
+                    ledger.poisoned_reason,
+                )
             return await self._await_provider_speaker_parent_lease(
                 lifecycle,
                 turn_token,
                 owner_generation,
             )
         if self._turn_has_speaker_candidate(turn_token):
-            return owner_generation
+            return _SpeakerArmingResult(
+                _SpeakerArmingStatus.ARMED, owner_generation
+            )
         identity = self._capture_runtime_identity(
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
@@ -6083,7 +6386,9 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             self._asr_speaker_authority_pending_turns.get(turn_token)
             == owner_generation
         ):
-            return owner_generation
+            return _SpeakerArmingResult(
+                _SpeakerArmingStatus.ARMED, owner_generation
+            )
         self._asr_speaker_authority_pending_turns[turn_token] = owner_generation
         self._asr_speaker_authoritative_turns.add(turn_token)
         try:
@@ -6099,7 +6404,11 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 self._asr_speaker_authority_pending_turns.pop(turn_token, None)
             if not self._turn_has_speaker_candidate(turn_token):
                 self._asr_speaker_authoritative_turns.discard(turn_token)
-            return None
+            return _SpeakerArmingResult(
+                _SpeakerArmingStatus.INVARIANT_FAILURE,
+                owner_generation,
+                "ASR_SPEAKER_AUTHORITY_UNAVAILABLE",
+            )
         if (
             not self._speaker_verifier_enforces_admission
             or self._speaker_verifier_activation_generation != owner_generation
@@ -6111,15 +6420,15 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 turn_token,
                 owner_generation,
             )
-            return None
-        return owner_generation
+            return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
+        return _SpeakerArmingResult(_SpeakerArmingStatus.ARMED, owner_generation)
 
     async def _await_provider_speaker_parent_lease(
         self,
         lifecycle: VoiceInputLifecycleController,
         turn_token: VoiceTurnToken,
         owner_generation: str,
-    ) -> str | None:
+    ) -> _SpeakerArmingResult:
         """Settle the physical Provider lease before any matching PCM is queued."""
 
         existing = self._asr_provider_speaker_arming_tasks.get(turn_token)
@@ -6135,9 +6444,12 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         )
         detector = identity.detector
         if detector is None:
-            return None
+            return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
+        physical_identity = self._capture_runtime_identity(
+            ingress_token=turn_token.ingress,
+        )
 
-        async def establish() -> str | None:
+        async def establish() -> _SpeakerArmingResult:
             evidence_lease: ProviderSpeakerEvidenceLease | None = None
             committed = False
             cancelled_error: asyncio.CancelledError | None = None
@@ -6149,18 +6461,19 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     lifecycle,
                     detector,
                 ):
-                    return None
+                    return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
                 ensure_evidence_lease = getattr(
                     detector,
                     "ensure_provider_speaker_evidence_lease",
                     None,
                 )
                 if not callable(ensure_evidence_lease):
-                    return None
+                    return _SpeakerArmingResult(
+                        _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE,
+                        owner_generation,
+                        "ASR_SPEAKER_LEASE_UNSUPPORTED",
+                    )
                 evidence = await ensure_evidence_lease()
-                if type(evidence) is not ProviderSpeakerEvidenceLease:
-                    return None
-                evidence_lease = evidence
                 if not self._provider_speaker_arming_operation_is_current(
                     turn_token,
                     owner_generation,
@@ -6168,27 +6481,49 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     lifecycle,
                     detector,
                 ):
-                    return None
+                    return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
+                if evidence is None and (
+                    self._asr_provider_speaker_evidence_lease is None
+                    and self._asr_current_speaker_candidate is None
+                ):
+                    return _SpeakerArmingResult(
+                        _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE,
+                        owner_generation,
+                        "ASR_SPEAKER_LEASE_UNAVAILABLE",
+                    )
+                if type(evidence) is not ProviderSpeakerEvidenceLease:
+                    return _SpeakerArmingResult(
+                        _SpeakerArmingStatus.INVARIANT_FAILURE,
+                        owner_generation,
+                        "ASR_SPEAKER_LEASE_INVALID",
+                    )
+                evidence_lease = evidence
                 candidate = evidence_lease.candidate
                 if candidate.detector_epoch != detector.detector_epoch:
-                    return None
+                    return _SpeakerArmingResult(_SpeakerArmingStatus.STALE)
                 current_evidence = self._asr_provider_speaker_evidence_lease
                 if current_evidence not in {None, evidence_lease}:
-                    return None
+                    return _SpeakerArmingResult(
+                        _SpeakerArmingStatus.INVARIANT_FAILURE,
+                        owner_generation,
+                        "ASR_SPEAKER_LEASE_OWNER_CONFLICT",
+                    )
                 current_candidate = self._asr_current_speaker_candidate
                 if current_candidate not in {None, candidate}:
-                    return None
+                    return _SpeakerArmingResult(
+                        _SpeakerArmingStatus.INVARIANT_FAILURE,
+                        owner_generation,
+                        "ASR_SPEAKER_CANDIDATE_OWNER_CONFLICT",
+                    )
 
                 # Provider PCM is buffer-only until a canonical started anchor
                 # arrives.  In particular, do not open an Admission parent and
                 # do not publish any LOW/HIGH fact from the provisional prefix.
-                self._asr_provider_speaker_evidence_lease = evidence_lease
-                self._asr_current_speaker_candidate = candidate
                 ledger = self._asr_provider_speaker_ledgers.get(candidate)
                 if ledger is None:
                     ledger = _ProviderSpeakerProvisionalLedger(
                         evidence_lease=evidence_lease,
-                        runtime_identity=identity,
+                        runtime_identity=physical_identity,
                         activation_generation=owner_generation,
                         detector_epoch=evidence_lease.detector_epoch,
                         lease_generation=evidence_lease.lease_generation,
@@ -6199,19 +6534,42 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     ] += 1
                 elif (
                     ledger.evidence_lease != evidence_lease
-                    or ledger.runtime_identity != identity
+                    or ledger.runtime_identity != physical_identity
                     or ledger.activation_generation != owner_generation
+                    or ledger.turn_token not in {None, turn_token}
+                    or ledger.state in {
+                        _ProviderSpeakerLedgerState.EXACT_DRAINING,
+                        _ProviderSpeakerLedgerState.RESOLVED,
+                    }
                 ):
-                    return None
+                    return _SpeakerArmingResult(
+                        _SpeakerArmingStatus.INVARIANT_FAILURE,
+                        owner_generation,
+                        "ASR_SPEAKER_LEDGER_OWNER_CONFLICT",
+                    )
+                # Publish only after both physical ownership and logical
+                # binding have passed; no await may split this adoption.
+                self._asr_provider_speaker_evidence_lease = evidence_lease
+                self._asr_current_speaker_candidate = candidate
                 committed = True
-                return owner_generation
+                return _SpeakerArmingResult(
+                    _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
+                    if ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE
+                    else _SpeakerArmingStatus.ARMED,
+                    owner_generation,
+                    ledger.poisoned_reason,
+                )
             except asyncio.CancelledError as exc:
                 # Reset/close owns cancellation. Finish exact uncommitted cleanup
                 # without letting the old operation mutate its replacement, then
                 # preserve cancellation for the owner awaiting this task.
                 cancelled_error = exc
             except Exception:
-                return None
+                return _SpeakerArmingResult(
+                    _SpeakerArmingStatus.INVARIANT_FAILURE,
+                    owner_generation,
+                    "ASR_SPEAKER_ARMING_FAILED",
+                )
             finally:
                 evidence_was_adopted = bool(
                     evidence_lease is not None
@@ -6248,7 +6606,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         self._asr_provider_speaker_arming_tasks[turn_token] = task
         self._asr_owned_cleanup_tasks.add(task)
 
-        def finish(done: asyncio.Task[str | None]) -> None:
+        def finish(done: asyncio.Task[_SpeakerArmingResult]) -> None:
             if self._asr_provider_speaker_arming_tasks.get(turn_token) is done:
                 self._asr_provider_speaker_arming_tasks.pop(turn_token, None)
             self._owned_cleanup_done(done)
@@ -6442,6 +6800,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         split_before_audio: bool,
         evidence_complete: bool,
         turn_token: VoiceTurnToken,
+        speaker_evidence_unavailable: bool = False,
     ) -> bool:
         if not pcm16:
             return True
@@ -6450,6 +6809,10 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             ingress_token=turn_token.ingress,
             turn_token=turn_token,
         )
+        physical_identity = self._capture_runtime_identity(
+            ingress_token=turn_token.ingress,
+        )
+        ordered_observation_started = False
         try:
             if _uses_smart_turn_endpointing(lifecycle.provider_policy):
                 self._observe_provider_speaker_shadow(
@@ -6472,24 +6835,26 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     if evidence_lease is not None
                     else None
                 )
+                accounting_only = bool(
+                    speaker_evidence_unavailable
+                    or (
+                        ledger is not None
+                        and ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE
+                    )
+                )
                 if self._speaker_verifier_enforces_admission:
                     candidate = (
                         evidence_lease.candidate
                         if evidence_lease is not None
                         else None
                     )
-                    if (
+                    if not accounting_only and (
                         candidate is None
                         or ledger is None
                         or ledger.evidence_lease != evidence_lease
                         or self._asr_current_speaker_candidate != candidate
                     ):
                         return False
-                    if ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE:
-                        # Speaker proof is already unavailable for this
-                        # utterance, but Provider text/audio identity remains
-                        # healthy and must continue to the ASR transport.
-                        return self._runtime_identity_matches(observation_identity)
                 # Number ordered-observer dispatch attempts only. Explicit
                 # fallback revokes incomplete evidence directly.
                 self._asr_provider_speaker_sequence += 1
@@ -6503,9 +6868,34 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 }
                 if evidence_lease is not None:
                     ordered_kwargs["speaker_evidence_lease"] = evidence_lease
+                if accounting_only:
+                    ordered_kwargs["accounting_only"] = True
+                    ordered_kwargs["evidence_complete"] = False
+                    if ledger is not None and ledger.timeline_generation >= 0:
+                        ordered_kwargs["expected_timeline_generation"] = (
+                            ledger.timeline_generation
+                        )
+                ordered_observation_started = True
                 update = await observe_ordered(pcm16, **ordered_kwargs)
                 if not self._runtime_identity_matches(observation_identity):
                     return False
+                if accounting_only:
+                    sample_count, remainder = divmod(
+                        len(pcm16) // 2 * 16_000, sample_rate_hz
+                    )
+                    return bool(
+                        type(update) is ProviderAudioAccountingReceipt
+                        and update.detector_epoch == identity.detector_epoch
+                        and (
+                            "expected_timeline_generation" not in ordered_kwargs
+                            or update.timeline_generation
+                            == ordered_kwargs["expected_timeline_generation"]
+                        )
+                        and update.sequence_no == sequence_no
+                        and not remainder
+                        and update.end_sample_16k - update.start_sample_16k
+                        == sample_count
+                    )
                 if self._speaker_verifier_enforces_admission and (
                     type(update) is not ProviderSpeakerEvidenceUpdate
                     or update.lease != evidence_lease
@@ -6515,7 +6905,9 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                             ledger,
                             "provider_pcm_receipt_missing",
                         )
-                    return self._runtime_identity_matches(observation_identity)
+                    # No receipt means ordered accounting itself is unknown.
+                    # Retire this ASR timeline rather than sending across a gap.
+                    return False
                 if (
                     type(update) is ProviderSpeakerEvidenceUpdate
                     and update.lease == evidence_lease
@@ -6546,6 +6938,10 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                             "speaker_capture_unavailable",
                         )
             else:
+                if self._speaker_verifier_enforces_admission:
+                    # Missing ingress provenance cannot justify exact evidence
+                    # or advance the canonical Provider timeline.
+                    return False
                 self._observe_provider_speaker_shadow(
                     detector,
                     pcm16,
@@ -6553,8 +6949,12 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 )
             return self._runtime_identity_matches(observation_identity)
         except asyncio.CancelledError:
+            if ordered_observation_started:
+                await self._retire_partial_provider_audio(physical_identity)
             raise
         except Exception:
+            if not self._runtime_identity_matches(physical_identity):
+                return False
             evidence_lease = self._asr_provider_speaker_evidence_lease
             ledger = (
                 self._asr_provider_speaker_ledgers.get(
@@ -6568,16 +6968,22 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     ledger,
                     "provider_pcm_observation_failed",
                 )
-                return self._runtime_identity_matches(observation_identity)
+                return False
             return bool(
-                not self._speaker_verifier_enforces_admission
+                not ordered_observation_started
+                and not self._speaker_verifier_enforces_admission
                 and self._runtime_identity_matches(observation_identity)
             )
         finally:
-            await self._unarm_speaker_authority_after_observation(
-                turn_token,
-                owner_generation,
-            )
+            try:
+                await self._unarm_speaker_authority_after_observation(
+                    turn_token,
+                    owner_generation,
+                )
+            except asyncio.CancelledError:
+                if ordered_observation_started:
+                    await self._retire_partial_provider_audio(physical_identity)
+                raise
 
     @staticmethod
     def _observe_provider_speaker_shadow(
@@ -8508,7 +8914,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                         expected_identity=identity,
                     )
                     return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
-            armed_generation = await self._arm_speaker_authority_for_provider_audio(
+            arming = await self._arm_speaker_authority_for_provider_audio(
                 turn_token
             )
             if not deny_cleanup_is_current():
@@ -8523,12 +8929,29 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
             if (
                 self._speaker_verifier_enforces_admission
-                and armed_generation != self._speaker_verifier_activation_generation
+                and (
+                    not arming
+                    or arming.owner_generation
+                    != self._speaker_verifier_activation_generation
+                )
             ):
+                if arming.status is _SpeakerArmingStatus.STALE:
+                    return AsrSubmitResult(AsrSubmitStatus.STALE)
+                await self._handle_independent_asr_error(
+                    identity.session_epoch,
+                    identity.provider or "unknown",
+                    status_code="ASR_AUDIO_ORDERING_FAILED",
+                    reason_code=arming.reason_code or "ASR_SPEAKER_ARMING_FAILED",
+                    expected_identity=identity,
+                )
                 return AsrSubmitResult(
-                    AsrSubmitStatus.STALE
-                    if not ingress_is_current()
-                    else AsrSubmitStatus.UNAVAILABLE
+                    AsrSubmitStatus.UNAVAILABLE
+                )
+            if arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE:
+                self._schedule_speaker_evidence_unavailable(
+                    identity,
+                    arming.reason_code,
+                    activation_generation=arming.owner_generation,
                 )
             split_payload_is_ambiguous = bool(
                 split_before_provider_audio
@@ -8553,6 +8976,9 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                     split_payload_is_ambiguous or pre_roll_ownership_is_ambiguous
                 ),
                 turn_token=turn_token,
+                speaker_evidence_unavailable=(
+                    arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
+                ),
             ):
                 if not ingress_is_current():
                     return AsrSubmitResult(AsrSubmitStatus.STALE)
@@ -10876,6 +11302,13 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
                 self._asr_provider_boundary_proofs[proof.proof_id] = (
                     transaction.snapshot
                 )
+                self._asr_provider_boundary_completions[proof] = (
+                    _ProviderBoundaryCompletion(
+                        transaction.snapshot,
+                        transaction.successor_evidence_lease,
+                        detector,
+                    )
+                )
                 ledger.state = _ProviderSpeakerLedgerState.EXACT_DRAINING
                 if ledger.poisoned_reason is not None:
                     self._enqueue_exact_interval_event(
@@ -12369,6 +12802,7 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
         self._asr_session_epoch += 1
         failure_epoch = self._asr_session_epoch
         self._asr_audio_generation += 1
+        retirement_identity = self._capture_runtime_identity()
         try:
             explicit_reason = str(reason_code).strip()
         except Exception:
@@ -12400,6 +12834,17 @@ class IndependentAsrRuntime(SpeakerVerifierInstallationMixin):
             )
         else:
             transcript_dispatcher.invalidate_all()
+        if (
+            self._asr_session_epoch != failure_epoch
+            or self._asr_start_generation != retirement_identity.start_generation
+            or self._asr_session is not retirement_identity.session
+            or self._asr_detector is not retirement_identity.detector
+            or self._asr_lifecycle is not retirement_identity.lifecycle
+        ):
+            # Admission settlement may outlive a successful start/reconnect.
+            # Its old failure owns no authority to detach the replacement or
+            # publish a BLOCKED notification for that replacement.
+            return
         detector_dispatcher.invalidate_all()
         audio_dispatcher.abort()
         self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()

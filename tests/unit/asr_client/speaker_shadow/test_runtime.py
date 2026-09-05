@@ -3671,11 +3671,14 @@ async def test_reset_invalidates_in_flight_backend_prewarm() -> None:
     await _wait_until(load_started.is_set)
 
     await runtime.reset()
-    load_release.set()
     await runtime.wait_idle()
 
     metrics = runtime.snapshot()
-    assert metrics["stale_result_count"] == 1
+    # Reset now cancels the separately owned cold load and reaps its host.
+    # Do not touch the multiprocessing Event after terminating its waiter.
+    assert runtime._backend_load_task is None
+    assert metrics["backend_process_count"] == 0
+    assert metrics["load_count"] == 0
     assert metrics["retained_pcm_bytes"] == 0
     assert runtime.requires_provisional_decision(candidate) is False
     await runtime.close()
@@ -4731,6 +4734,9 @@ async def test_finalized_tombstone_before_marker_still_delivers_completion(
         config=_config(minimum_audio_ms=20, queue_capacity=2),
         on_completion=complete,
     )
+    # This test isolates a warm scoring tombstone before its finish marker;
+    # cold loading is now deliberately independent of the frame worker.
+    assert await runtime._ensure_backend() is not None
     process_frame = runtime._process_frame
 
     async def pause_after_frame(frame: _AudioFrame) -> None:
@@ -5681,4 +5687,7 @@ async def test_permanently_blocked_backend_close_is_bounded_and_leaves_no_resour
     assert metrics["backend_process_count"] == 0
     assert metrics["retained_pcm_bytes"] == 0
     assert metrics["backend_process_termination_count"] >= 1
-    assert metrics["shutdown_timeout_count"] + metrics["backend_timeout_count"] >= 1
+    if blocked_stage == "load":
+        assert runtime._backend_load_task is None
+    else:
+        assert metrics["shutdown_timeout_count"] + metrics["backend_timeout_count"] >= 1

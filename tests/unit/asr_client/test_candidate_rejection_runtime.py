@@ -243,6 +243,15 @@ class _RejectionDetector:
         assert type(lease) is ProviderSpeakerEvidenceLease
         sequence_no = kwargs["sequence_no"]
         samples = len(pcm16) // 2
+        if kwargs.get("accounting_only"):
+            assert kwargs["evidence_complete"] is False
+            return runtime_module.ProviderAudioAccountingReceipt(
+                detector_epoch=self.detector_epoch,
+                timeline_generation=kwargs.get("expected_timeline_generation", 0),
+                sequence_no=sequence_no,
+                start_sample_16k=0,
+                end_sample_16k=samples,
+            )
         return ProviderSpeakerEvidenceUpdate(
             lease=lease,
             capture=SpeakerShadowCaptureResult(
@@ -360,6 +369,37 @@ class _RejectionDetector:
             target_candidate=reservation.target_candidate,
             successor_evidence_lease=successor,
         )
+
+    async def complete_provider_speaker_boundary(
+        self,
+        snapshot: ProviderSpeakerBoundarySnapshot,
+        *,
+        successor_evidence_lease: ProviderSpeakerEvidenceLease | None,
+        deadline: float | None = None,
+    ) -> str:
+        # This Detector-only fixture models immediately applied exact commits;
+        # the cross-layer suite exercises real Shadow receipt settlement.
+        if (
+            type(snapshot) is not ProviderSpeakerBoundarySnapshot
+            or snapshot._owner is not self
+            or snapshot.detector_epoch != self.detector_epoch
+        ):
+            return "stale"
+        if snapshot.successor_present and (
+            type(successor_evidence_lease) is not ProviderSpeakerEvidenceLease
+            or successor_evidence_lease._owner is not self._provider_evidence_owner
+            or successor_evidence_lease.detector_epoch != self.detector_epoch
+        ):
+            return "invalid"
+        if deadline is not None and runtime_module.time.monotonic() >= deadline:
+            return "pending"
+        completed = getattr(self, "_completed_boundary_snapshots", None)
+        if completed is None:
+            completed = self._completed_boundary_snapshots = []
+        if any(previous is snapshot for previous in completed):
+            return "already_completed"
+        completed.append(snapshot)
+        return "completed"
 
     async def seal_provider_candidate(
         self,
@@ -1534,7 +1574,7 @@ async def test_observation_without_candidate_unarms_pending_authority() -> None:
     owner_generation = await runtime._arm_speaker_authority_for_provider_audio(
         turn_token
     )
-    assert owner_generation == "profile-generation"
+    assert owner_generation.owner_generation == "profile-generation"
 
     assert await runtime._observe_admitted_provider_audio(
         lifecycle,
@@ -1676,8 +1716,10 @@ async def test_cancelled_observation_still_unarms_pending_authority() -> None:
     await _drain_runtime_admission(runtime)
 
     record = await runtime._asr_admission.get_record(turn_token)
-    assert record is not None
-    assert record.evidence_state.value == "none"
+    # Cancellation cannot establish whether the ordered observer committed.
+    # Retire the physical timeline along with its pending authority.
+    assert record is None
+    assert runtime._asr_session is None
     assert turn_token not in runtime._asr_speaker_authority_pending_turns
     await _close_dispatchers(runtime)
 
@@ -2840,6 +2882,8 @@ async def test_parent_provisional_after_started_forwards_on_unknown_boundary(
     )
 
     async def publish_terminal_update(pcm16: bytes, **kwargs):
+        if kwargs.get("accounting_only"):
+            return await detector._observe_provider_audio_ordered(pcm16, **kwargs)
         lease = kwargs["speaker_evidence_lease"]
         candidate = lease.candidate
         sequence_no = kwargs["sequence_no"]
@@ -2898,7 +2942,8 @@ async def test_parent_provisional_after_started_forwards_on_unknown_boundary(
         )
         await _drain_runtime_admission(runtime)
     else:
-        assert detector.observe_provider_audio_ordered.await_count == 1
+        assert detector.observe_provider_audio_ordered.await_count == 2
+        assert detector.observe_provider_audio_ordered.await_args.kwargs["accounting_only"]
     assert session.stream_audio.await_count == 2
     lease_token = runtime._asr_current_speaker_lease
     assert lease_token is not None
@@ -3271,7 +3316,7 @@ async def test_provider_ordered_observation_drift_is_stale_after_audio_admission
     await _close_dispatchers(runtime)
 
 
-async def test_provider_ordered_observation_missing_identity_uses_legacy_fallback() -> (
+async def test_provider_ordered_observation_missing_identity_retires_timeline() -> (
     None
 ):
     runtime = IndependentAsrRuntime(_callbacks())
@@ -3333,8 +3378,8 @@ async def test_provider_ordered_observation_missing_identity_uses_legacy_fallbac
 
     assert [result.status for result in results] == [
         AsrSubmitStatus.ACCEPTED,
-        AsrSubmitStatus.ACCEPTED,
-        AsrSubmitStatus.ACCEPTED,
+        AsrSubmitStatus.UNAVAILABLE,
+        AsrSubmitStatus.UNAVAILABLE,
     ]
     assert detector.observe_provider_audio_ordered.await_args_list == [
         call(
@@ -3346,25 +3391,14 @@ async def test_provider_ordered_observation_missing_identity_uses_legacy_fallbac
             evidence_complete=True,
             speaker_evidence_lease=detector._provider_evidence_lease,
         ),
-        call(
-            third_pcm16,
-            sample_rate_hz=16_000,
-            identity=third_identity,
-            sequence_no=2,
-            split_before_audio=False,
-            evidence_complete=True,
-            speaker_evidence_lease=detector._provider_evidence_lease,
-        ),
     ]
-    detector.observe_provider_audio.assert_called_once_with(
-        fallback_pcm16,
-        sample_rate_hz=16_000,
-    )
+    detector.observe_provider_audio.assert_not_called()
+    assert runtime._asr_session is None
     await _close_dispatchers(runtime)
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "missing_update"])
-async def test_enforced_provider_ordered_observation_failure_fails_open_for_asr(
+async def test_unknown_provider_audio_accounting_retires_asr_timeline(
     failure_mode: str,
 ) -> None:
     runtime = IndependentAsrRuntime(_callbacks())
@@ -3409,18 +3443,16 @@ async def test_enforced_provider_ordered_observation_failure_fails_open_for_asr(
     )
     await runtime._asr_audio_dispatcher.wait_idle()
 
-    assert result.status is AsrSubmitStatus.ACCEPTED
+    assert result.status is AsrSubmitStatus.UNAVAILABLE
     detector.observe_provider_audio_ordered.assert_awaited_once()
     detector.observe_provider_audio.assert_not_called()
-    session.stream_audio.assert_awaited_once()
-    runtime._callbacks.on_failure.assert_not_awaited()
-    evidence = runtime._asr_provider_speaker_evidence_lease
-    assert evidence is not None
-    ledger = runtime._asr_provider_speaker_ledgers[evidence.candidate]
-    assert ledger.poisoned_reason in {
-        "provider_pcm_observation_failed",
-        "provider_pcm_receipt_missing",
-    }
+    session.stream_audio.assert_not_awaited()
+    runtime._callbacks.on_failure.assert_awaited_once()
+    assert runtime._asr_session is None
+    assert runtime._asr_session_epoch > turn_token.ingress.session_epoch
+    status = runtime._callbacks.on_status.await_args.args[0]
+    assert status.code == "ASR_AUDIO_ORDERING_FAILED"
+    assert status.incident_id
     await _close_dispatchers(runtime)
 
 
@@ -4221,6 +4253,11 @@ async def test_pre_anchor_low_never_becomes_formal_provider_deny(
 
     class _LowScoreHost:
         alive = True
+        loaded = True
+        timed_out = False
+        was_terminated = False
+        pcm_bytes_in_use = 0
+        process_count = 0
 
         def __init__(self) -> None:
             self.score_count = 0
@@ -4234,6 +4271,13 @@ async def test_pre_anchor_low_never_becomes_formal_provider_deny(
             assert timeout_seconds > 0
             self.score_count += 1
             return 0.20
+
+        async def close(self, *, timeout_seconds: float) -> bool:
+            self.alive = False
+            return True
+
+        async def terminate(self) -> None:
+            self.alive = False
 
     runtime = IndependentAsrRuntime(_callbacks())
     placeholder = _RejectionDetector()
@@ -4266,11 +4310,7 @@ async def test_pre_anchor_low_never_becomes_formal_provider_deny(
     )
     shadow = composition()
     scoring_host = _LowScoreHost()
-    monkeypatch.setattr(
-        shadow,
-        "_ensure_backend",
-        AsyncMock(return_value=scoring_host),
-    )
+    monkeypatch.setattr(shadow, "_backend_host", scoring_host)
     detector = DetectorRuntime(
         vad=_Vad(),
         gate=_Gate(),
@@ -6551,5 +6591,9 @@ async def test_pre_exact_lows_never_invoke_provider_close() -> None:
     assert runtime._asr_session is session
     assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
     assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
-    callbacks.on_status.assert_not_awaited()
+    callbacks.on_failure.assert_not_awaited()
+    assert all(
+        item.args[0].code == "ASR_SPEAKER_EVIDENCE_UNAVAILABLE"
+        for item in callbacks.on_status.await_args_list
+    )
     await _close_dispatchers(runtime)

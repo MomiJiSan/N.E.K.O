@@ -1018,6 +1018,7 @@
         "independentAsrActive": "Independent ASR active: {{providerKey}}",
         "independentAsrFallback": "Independent ASR unavailable. Voice input has stopped for this session. Check the independent ASR configuration, then start a new voice session.",
         "independentAsrCleanupFailed": "Voice session cleanup failed. Please restart the microphone.",
+        "speakerEvidenceUnavailable": "Speaker verification is temporarily unavailable. Speech recognition continues under the existing policy.",
         "independentAsrRuntimeFailed": "Independent ASR stopped because of a runtime error. Please restart the microphone.",
         "audioPreprocessingFailed": "Microphone audio processing failed. Voice input has stopped for this session. Please start a new voice session.",
         "independentAsrProviderUnavailable": "{{providerKey}} is temporarily unavailable. Voice input has stopped for this session. It did not switch to another speech recognition service. Please start a new voice session later.",

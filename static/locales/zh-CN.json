@@ -1018,6 +1018,7 @@
         "independentAsrActive": "当前使用独立 ASR：{{providerKey}}",
         "independentAsrFallback": "独立 ASR 不可用，本次语音输入已停止。请检查独立 ASR 配置，然后重新开始语音会话。",
         "independentAsrCleanupFailed": "语音会话清理失败，请重启麦克风。",
+        "speakerEvidenceUnavailable": "声纹验证暂不可用，语音识别继续，按现有策略处理。",
         "independentAsrRuntimeFailed": "独立 ASR 运行失败，语音输入已停止。请重启麦克风。",
         "audioPreprocessingFailed": "麦克风音频处理失败，本次会话的语音输入已停止。请重新开始一次语音会话。",
         "independentAsrProviderUnavailable": "{{providerKey}} 暂时不可用，本次语音输入已停止。未切换到其他语音识别服务，请稍后重新开始语音会话。",
