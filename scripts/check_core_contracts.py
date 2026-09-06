@@ -3310,6 +3310,9 @@ def run(root: Path) -> list[Violation]:
                 "abort",
                 "wait_transcript_idle",
                 "has_pending_transcript_delivery",
+                # Read-only, identity-checked permission for bounded Core PCM
+                # storage while Runtime serializes an exact turn handoff.
+                "has_pending_turn_handoff",
                 "set_speaker_verifier_factory",
                 # Typed installation lifecycle API; Runtime still composes its
                 # implementation and may not inherit or expose arbitrary APIs.

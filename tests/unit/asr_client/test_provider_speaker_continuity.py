@@ -17,6 +17,8 @@ import pytest
 
 from tests.unit import test_asr_detector_runtime as detector_fixture
 from tests.unit.test_core_independent_asr import _Runtime
+from tests.unit.test_core_independent_asr import _selection
+import main_logic.asr_client.runtime as runtime_module
 from tests.unit.asr_client.test_candidate_rejection_runtime import (
     _drain_runtime_admission,
 )
@@ -249,6 +251,7 @@ async def test_real_exact_three_finals_keep_successor_and_core_delivery(
                 runtime._asr_session_epoch,
             )
             turn = runtime._asr_provider_started_turns[key]
+            interval_ledger = runtime._asr_provider_speaker_key_ledgers[key]
             boundary = ProviderAudioRange((utterance - 1) * 25_600, utterance * 25_600)
             boundary_operation = runtime._handle_provider_endpoint_notification(
                 ProviderEndpointNotification(
@@ -314,6 +317,10 @@ async def test_real_exact_three_finals_keep_successor_and_core_delivery(
             await _drain_runtime_admission(runtime)
             await runtime.wait_transcript_idle()
             await core._voice_input_registry.wait_idle()
+            assert interval_ledger.state is (
+                runtime_module._ProviderSpeakerLedgerState.RESOLVED
+            )
+            assert key not in runtime._asr_provider_speaker_key_ledgers
             if transaction is not None:
                 assert transaction.successor_candidate in shadow._candidate_tokens, (
                     runtime._speaker_verifier_diagnostics()
@@ -1204,3 +1211,172 @@ async def test_pending_old_speaker_degradation_cannot_notify_replacement_session
     finally:
         await _close_stack(core)
         await session.close()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("cancel_callback", [False, True])
+async def test_exact_unavailable_cleanup_preserves_ledger_owner(
+    monkeypatch: pytest.MonkeyPatch, restart: bool, cancel_callback: bool
+) -> None:
+    """A late boundary owns its old ledger, even if new numeric keys repeat."""
+    core, runtime, detector, shadow, lifecycle, session, turn = (
+        await _active_real_stack(score=0.95)
+    )
+    entered, release, closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    tasks: list[asyncio.Task] = []
+    partial_calls = []
+
+    async def deliver_partial(event):
+        partial_calls.append(event)
+        entered.set()
+        await release.wait()
+
+    runtime._callbacks = replace(runtime._callbacks, on_partial=deliver_partial)
+    key = ProviderUtteranceKey(0, 0, 1)
+    try:
+        for sequence in range(1, 17):
+            submitted = await _submit_pcm(runtime, turn, sequence=sequence)
+            assert submitted.status is AsrSubmitStatus.ACCEPTED
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        boundary = asyncio.create_task(runtime._handle_provider_endpoint_notification(
+            ProviderEndpointNotification(
+                phase="boundary", generation=0, buffer_epoch=0, utterance_id=1,
+                boundary_quality="exact", audio_range=ProviderAudioRange(0, 25_600),
+            ), runtime._asr_session_epoch,
+        ))
+        tasks.append(boundary)
+        async with asyncio.timeout(2):
+            while key not in runtime._asr_provider_exact_intervals:
+                assert not boundary.done()
+                await asyncio.sleep(0)
+        transaction = runtime._asr_provider_exact_intervals[key]
+        old_ledger = runtime._asr_provider_speaker_key_ledgers[key]
+        successor = runtime._asr_provider_speaker_ledgers[
+            transaction.successor_candidate
+        ]
+        await runtime._send_independent_asr_preview(
+            "synthetic preview", runtime._asr_session_epoch
+        )
+        assert transaction.turn_token in runtime._asr_quarantined_partials
+        conflict = asyncio.create_task(runtime._handle_provider_endpoint_notification(
+            ProviderEndpointNotification(
+                phase="boundary", generation=0, buffer_epoch=0, utterance_id=1,
+                boundary_quality="unknown", audio_range=None,
+            ), runtime._asr_session_epoch,
+        ))
+        tasks.append(conflict)
+        await asyncio.wait_for(entered.wait(), 2)
+        core.continuity_score_host.ready.set()
+
+        if restart:
+            async def close_transport():
+                closing.set()
+                if cancel_callback:
+                    conflict.cancel()
+                    _, remaining = await asyncio.wait((conflict,), timeout=0.2)
+                    for task in remaining:
+                        task.cancel()
+
+            session.close.side_effect = close_transport
+            stop = asyncio.create_task(runtime.stop_session())
+            tasks.append(stop)
+            await asyncio.wait_for(closing.wait(), 2)
+            # Stop now owns/cancels the internal partial callback before the
+            # transport closes; it must no longer survive into the new session.
+            await asyncio.wait_for(asyncio.gather(conflict, return_exceptions=True), 1)
+            assert conflict.cancelled()
+            new_session = SimpleNamespace(
+                is_ready=True, connect=AsyncMock(), close=AsyncMock(),
+                stream_audio=AsyncMock(), signal_user_activity_end=AsyncMock(),
+            )
+            monkeypatch.setattr(runtime_module, "_resolve_asr_selection",
+                                lambda _: _selection("qwen", "provider"))
+            monkeypatch.setattr(runtime_module, "_create_asr_session_from_selection",
+                                lambda *args, **kwargs: new_session)
+            real_detector = detector_fixture.DetectorRuntime
+            monkeypatch.setattr(runtime_module, "DetectorRuntime", lambda **kwargs:
+                real_detector(vad=detector_fixture._Vad(),
+                              gate=detector_fixture._Gate(), **kwargs))
+
+            def factory():
+                return detector_fixture.SpeakerShadowRuntime(
+                    backend_factory=partial(_ConstantBackend, 0.95),
+                    config=detector_fixture._provider_speaker_config(),
+                )
+
+            factory.enforces_admission = True
+            await asyncio.wait_for(runtime.start(
+                route_key="qwen", resource_optimization_enabled=False,
+                speaker_shadow_factory=factory,
+            ), 2)
+            assert runtime._asr_session is new_session
+            new_lifecycle = runtime._asr_lifecycle
+            new_lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+            new_lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+            runtime._asr_current_ingress_token = core._capture_ingress_token()
+            new_turn = runtime._capture_turn_token(new_lifecycle)
+            await runtime._prepare_independent_asr_turn(runtime._asr_session_epoch)
+            assert runtime._asr_audio_dispatcher.activate(new_turn, new_session, b"")
+            assert (await _submit_pcm(runtime, new_turn, sequence=1)).status is (
+                AsrSubmitStatus.ACCEPTED
+            )
+            assert await runtime._handle_provider_utterance_started(
+                ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+                runtime._asr_session_epoch,
+            )
+            new_ledger = runtime._asr_provider_speaker_key_ledgers[key]
+            new_state = new_ledger.state
+            assert new_ledger is not old_ledger
+            assert new_ledger.turn_token != transaction.turn_token
+            assert runtime._asr_detector is not transaction.detector
+        elif cancel_callback:
+            conflict.cancel()
+
+        release.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 2
+        )
+        if cancel_callback or restart:
+            assert isinstance(results[1], asyncio.CancelledError), results
+        else:
+            assert results[1] is None, results
+        assert all(not isinstance(result, Exception) for result in results), results
+        assert len(partial_calls) == 1
+        assert partial_calls[0].turn_token == transaction.turn_token
+        assert not transaction.event_queue
+        assert all(task.done() for task in tasks)
+        assert old_ledger.state is runtime_module._ProviderSpeakerLedgerState.RESOLVED
+        if restart:
+            assert runtime._asr_provider_speaker_key_ledgers.get(key) is new_ledger
+            assert runtime._asr_provider_speaker_ledgers.get(new_ledger.candidate) is (
+                new_ledger
+            )
+            assert new_ledger.state is new_state
+            assert (await _submit_pcm(runtime, new_turn, sequence=2)).status is (
+                AsrSubmitStatus.ACCEPTED
+            )
+            assert new_ledger.last_pcm_sequence_no == 2
+            new_shadow = runtime._asr_detector._speaker_shadow
+            await new_shadow.wait_idle()
+            assert new_shadow._buffers[new_ledger.candidate].sample_count == 3_200
+            runtime._retire_exact_interval_runtime_aliases(transaction)
+            assert runtime._asr_provider_speaker_key_ledgers.get(key) is new_ledger
+            new_session.close.assert_not_awaited()
+        else:
+            assert key not in runtime._asr_provider_speaker_key_ledgers
+            assert runtime._asr_provider_speaker_ledgers.get(successor.candidate) is (
+                successor
+            )
+            assert runtime._asr_provider_speaker_evidence_lease == successor.evidence_lease
+            session.close.assert_not_awaited()
+    finally:
+        release.set()
+        core.continuity_score_host.ready.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _close_stack(core)

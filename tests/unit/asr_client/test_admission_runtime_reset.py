@@ -55,6 +55,7 @@ async def test_provider_namespace_reset_retires_every_owned_proof() -> None:
     runtime._asr_provider_boundary_proofs = {proof.proof_id: snapshot}
     runtime._asr_detector = MagicMock()
     runtime._asr_admission_effect_tasks = set()
+    runtime._asr_exact_callback_tasks = set()
     runtime._asr_admission_effect_task_turns = {}
     runtime._asr_sealed_provider_key = None
     runtime._asr_provider_exact_session = None
@@ -97,6 +98,7 @@ async def test_provider_namespace_reset_retires_every_owned_proof() -> None:
 async def test_provider_namespace_retirement_counts_actual_proof_ownership_once(
 ) -> None:
     runtime = object.__new__(IndependentAsrRuntime)
+    runtime._asr_exact_callback_tasks = set()
     proof = BoundaryProof(
         proof_id=8,
         owner_generation=3,
@@ -380,6 +382,7 @@ async def test_old_route_settlement_cannot_clear_new_provider_owner() -> None:
     runtime._asr_smart_turn_lease = None
     runtime._asr_provider_correlator = MagicMock()
     runtime._asr_sealed_provider_key = new_key
+    runtime._asr_provider_exact_intervals = {}
     runtime._asr_provider_started_turns = {old_key: new_turn}
     runtime._asr_admission_turn_leases = {old_turn: old_lease}
     runtime._asr_admission_candidate_leases = {}

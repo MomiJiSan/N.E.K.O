@@ -1790,10 +1790,28 @@ class _RealtimeAsrSessionImpl:
                     if remaining <= 0:
                         settlement.outcome = "predecessor_timeout"
                         return settlement
-                    await asyncio.wait_for(asyncio.shield(predecessor), timeout=remaining)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(predecessor), timeout=remaining)
+                    except asyncio.CancelledError:
+                        # A predecessor can lose its optional speaker proof
+                        # without cancelling this independently keyed boundary.
+                        # Clear/close and chain revocation still cancel us.
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
                 if not await wait_for_started(key, started_settlement, deadline=deadline):
                     settlement.outcome = "started_unavailable"
                     return settlement
+                if (
+                    asyncio.current_task() not in self._provider_boundary_chain_tasks
+                    or key in self._provider_started_failed_keys
+                    or self._provider_started_failed_namespace == key[:2]
+                ):
+                    settlement.outcome = "revoked_or_stale"
+                    return settlement
+                # The chain owns queued controls; the per-key map owns only
+                # the latest final receipt. A later unknown must still follow
+                # its earlier exact control in order, even for the same key.
                 succeeded = await self._emit_provider_boundary(
                     notification, deadline=deadline, settlement=settlement,
                 )

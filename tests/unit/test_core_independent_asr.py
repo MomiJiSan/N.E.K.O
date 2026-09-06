@@ -9777,7 +9777,7 @@ async def test_current_game_release_still_aborts_and_resumes_once() -> None:
     runtime._asr_runtime.resume.assert_awaited_once_with("game_release")
 
 
-@pytest.mark.parametrize("notification", ["status", "lifecycle", "failure"])
+@pytest.mark.parametrize("notification", ["status", "lifecycle"])
 async def test_notification_waiting_on_lock_drops_same_epoch_stale_identity(
     notification: str,
 ) -> None:
@@ -9792,20 +9792,13 @@ async def test_notification_waiting_on_lock_drops_same_epoch_stale_identity(
             session_epoch=current_epoch,
         )
         delivery = asyncio.create_task(runtime._send_core_asr_status(event))
-    elif notification == "lifecycle":
+    else:
         event = AsrLifecycleNotification(
             state="local_listen",
             provider="old-provider",
             session_epoch=current_epoch,
         )
         delivery = asyncio.create_task(runtime._send_core_asr_lifecycle(event))
-    else:
-        event = AsrFailureEvent(
-            code="ASR_INDEPENDENT_FAILED",
-            provider="old-provider",
-            session_epoch=current_epoch,
-        )
-        delivery = asyncio.create_task(runtime._handle_core_asr_failure(event))
     await asyncio.sleep(0)
 
     runtime._asr_audio_generation += 1

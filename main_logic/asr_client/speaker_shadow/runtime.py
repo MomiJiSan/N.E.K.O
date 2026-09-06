@@ -3640,6 +3640,14 @@ class SpeakerShadowRuntime:
             self._fail_terminal_coverage(marker)
             return
 
+        # This validated marker already owns a terminal queue reservation.
+        # Retain its finish authority while retiring sources below: inserting
+        # their tombstones may evict the scored target. The marker owns that
+        # token until the await-free scored finish, without pinning the table
+        # or reviving an abandoned/already-processed finish.
+        if marker.target_token.finish_state is _FinishState.OPEN:
+            marker.target_token.finish_state = _FinishState.QUEUED
+
         for reserved in marker.reserved_sources:
             removed = self._buffers.pop(reserved.source.candidate, None)
             if removed is not None:

@@ -24,6 +24,7 @@ from main_logic.asr_client import (
 )
 from main_logic.asr_client.runtime import (
     ASR_CONNECT_TOTAL_BUDGET_SECONDS,
+    ASR_HANDOFF_BUFFER_RESERVE_US,
     AsrRuntimeCallbacks,
     AsrStartStatus,
     IndependentAsrRuntime,
@@ -150,8 +151,17 @@ class _AudioDurationQueue:
             raise ValueError("audio queue limits must be positive")
         self.capacity_us = capacity_us
         self.maxsize = max_frames
+        self._normal_capacity_us = capacity_us
+        self._normal_max_frames = max_frames
+        self._handoff_capacity_us = capacity_us + ASR_HANDOFF_BUFFER_RESERVE_US
+        self._handoff_max_frames = (
+            max_frames * self._handoff_capacity_us + capacity_us - 1
+        ) // capacity_us
+        self._handoff_owner: tuple[VoiceIngressToken, int] | None = None
         self._duration_us = 0
-        self._queue: asyncio.Queue[_QueuedMicFrame] = asyncio.Queue(maxsize=max_frames)
+        self._queue: asyncio.Queue[_QueuedMicFrame] = asyncio.Queue(
+            maxsize=self._handoff_max_frames,
+        )
 
     @property
     def duration_us(self) -> int:
@@ -163,10 +173,19 @@ class _AudioDurationQueue:
     def empty(self) -> bool:
         return self._queue.empty()
 
-    def put_nowait(self, frame: _QueuedMicFrame) -> None:
+    def put_nowait(self, frame: _QueuedMicFrame, *, handoff_reserve: bool = False) -> None:
+        owner = (frame.token, frame.audio_stream_epoch)
+        if handoff_reserve and self._handoff_owner in (None, owner):
+            self._handoff_owner = owner
+            self.capacity_us = self._handoff_capacity_us
+            self.maxsize = self._handoff_max_frames
+        # A different ingress cannot borrow an old owner's drain allowance.
+        same_owner = self._handoff_owner == owner
+        capacity_us = self.capacity_us if same_owner else self._normal_capacity_us
+        max_frames = self.maxsize if same_owner else self._normal_max_frames
         if (
-            self._queue.qsize() >= self.maxsize
-            or self._duration_us + frame.duration_us > self.capacity_us
+            self._queue.qsize() >= max_frames
+            or self._duration_us + frame.duration_us > capacity_us
         ):
             raise asyncio.QueueFull
         self._queue.put_nowait(frame)
@@ -175,12 +194,26 @@ class _AudioDurationQueue:
     async def get(self) -> _QueuedMicFrame:
         frame = await self._queue.get()
         self._duration_us -= frame.duration_us
+        self._trim_handoff_reserve()
         return frame
 
     def get_nowait(self) -> _QueuedMicFrame:
         frame = self._queue.get_nowait()
         self._duration_us -= frame.duration_us
+        self._trim_handoff_reserve()
         return frame
+
+    def _trim_handoff_reserve(self) -> None:
+        # Retain headroom while the backlog drains after the handoff Future
+        # resolves. Shrinking immediately would reject the next live frame
+        # solely because this already-accepted backlog still exceeds 2 s.
+        if (
+            self._duration_us <= self._normal_capacity_us
+            and self._queue.qsize() <= self._normal_max_frames
+        ):
+            self._handoff_owner = None
+            self.capacity_us = self._normal_capacity_us
+            self.maxsize = self._normal_max_frames
 
     def task_done(self) -> None:
         self._queue.task_done()
@@ -2518,7 +2551,13 @@ class AsrRuntimeMixin:
             return
         self._ensure_audio_stream_worker()
         try:
-            self._audio_stream_queue.put_nowait(frame)
+            self._audio_stream_queue.put_nowait(
+                frame,
+                handoff_reserve=(
+                    self._asr_route_mode == "independent"
+                    and self._asr_runtime.has_pending_turn_handoff(frame.token)
+                ),
+            )
             sequence_owned = False
         except asyncio.QueueFull:
             try:
@@ -2532,7 +2571,13 @@ class AsrRuntimeMixin:
                         return
                     frame = replace(frame, token=rebound)
                 try:
-                    self._audio_stream_queue.put_nowait(frame)
+                    self._audio_stream_queue.put_nowait(
+                        frame,
+                        handoff_reserve=(
+                            self._asr_route_mode == "independent"
+                            and self._asr_runtime.has_pending_turn_handoff(frame.token)
+                        ),
+                    )
                     sequence_owned = False
                 except asyncio.QueueFull:
                     self._clear_audio_stream_queue("ingress_backpressure")
@@ -3795,7 +3840,12 @@ class AsrRuntimeMixin:
     ) -> None:
         del reason
         try:
-            await self._send_core_asr_preview_clear(context.external_turn_id)
+            # Registry owns this cancellation even if its waiter goes away.
+            # Optional display I/O must not retain the keyed turn/pause forever.
+            async with asyncio.timeout(1.0):
+                await self._send_core_asr_preview_clear(context.external_turn_id)
+        except TimeoutError:
+            logger.debug("[%s] cancelled ASR turn preview clear timed out", self.lanlan_name)
         finally:
             # Registry cancellation has already consumed the keyed route. Even
             # if websocket preview cleanup is itself cancelled, the response
@@ -4425,21 +4475,17 @@ class AsrRuntimeMixin:
                 ).session_epoch
             )
 
-        async with self._asr_notification_lock:
-            if not failure_is_current():
-                return
-
-        # Registry cancellation may execute consumer callbacks. Those
-        # callbacks are allowed to publish status/lifecycle notifications,
-        # which acquire _asr_notification_lock themselves. Keep the entire
-        # cancellation path outside that lock, and re-fence after releasing it
-        # in case a newer route operation landed while this task was queued.
+        # Runtime re-fences its failure identity after display delivery and
+        # enters this callback directly. Commit the current route/lease fence
+        # before our first suspension: display serialization must not defer
+        # mandatory retirement beyond the caller's notification deadline.
+        # Consumer cancellation can still publish through the notification
+        # lock independently once the physical input has been fenced.
         if not failure_is_current():
             return
         self._set_microphone_route("blocked")
         self._invalidate_voice_pcm_sync("independent_asr_failure")
         post_transition_identity = self._capture_core_asr_operation_identity()
-        await self._voice_input_registry.wait_idle()
         # Fail-safe for clients that never receive or never honour the
         # teardown notice (an older build, a third-party client, a
         # throttled background tab). The route is fail-closed for the rest
@@ -4447,8 +4493,11 @@ class AsrRuntimeMixin:
         # game owner is exempt: the galgame route holds the lease through
         # its built-in Registry consumer and must not be collaterally
         # revoked.
-        # No notice of its own -- the BLOCKED lifecycle event that produced
-        # this failure already reached the client.
+        # No notice of its own -- Runtime already attempted BLOCKED delivery.
+        # Revoke before joining Registry: its consumer can await display I/O,
+        # and the caller's notification deadline can cancel this callback.
+        # The revoke fences the lease/PCM synchronously before its first await;
+        # Core's keyed Registry cancellation owns its bounded preview cleanup.
         #
         # Re-captured AFTER this handler's own mutations, and that is the
         # whole point: ``source_identity`` was taken while the route was
@@ -4472,6 +4521,7 @@ class AsrRuntimeMixin:
                 post_transition_identity
             ),
         )
+        await self._voice_input_registry.wait_idle()
 
     async def _send_core_asr_status(self, event: AsrStatusEvent) -> None:
         source_identity = self._capture_core_asr_operation_identity()

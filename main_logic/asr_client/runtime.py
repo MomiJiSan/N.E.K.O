@@ -74,6 +74,7 @@ from .admission.contracts import (
     ExactIntervalActivationReceipt,
     ExactIntervalOutcome,
     ExactIntervalPromotionReceipt,
+    ExactIntervalPromotionResult,
     ExactIntervalPromotionScope,
     ExactIntervalTransitionReceipt,
     EvidenceState,
@@ -216,6 +217,15 @@ _CANDIDATE_REJECTION_REINSTALL_ATTEMPTS = 2
 _SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS = 0.2
 _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS = 0.2
 _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS = 1.0
+_EXACT_LIFECYCLE_NOTIFICATION_TIMEOUT_SECONDS = 0.2
+# Core's normal response cancellation can itself take 3s. Preparation needs
+# its own larger budget; the display-only 200ms limit is not suitable here.
+_EXACT_PENDING_PREPARE_TIMEOUT_SECONDS = 5.0
+# Core may reserve this much additional ingress while the serial PCM consumer
+# waits for an exact handoff. Keep storage and the operation's budget coupled.
+ASR_HANDOFF_BUFFER_RESERVE_US = 6_000_000
+_EXACT_PENDING_HANDOFF_TIMEOUT_SECONDS = ASR_HANDOFF_BUFFER_RESERVE_US / 1_000_000
+_EXACT_HANDOFF_FAILURE_NOTIFICATION_TIMEOUT_SECONDS = 1.0
 _ASR_TERMINAL_HARD_CLOSE_RESERVE_SECONDS = 0.6
 _ASR_TERMINAL_CLOSE_JOIN_SLICE_SECONDS = 0.1
 _MAX_BUFFERED_PROVIDER_SPEAKER_SPANS = 8
@@ -483,6 +493,18 @@ class _ProviderBoundaryCompletion:
     snapshot: ProviderSpeakerBoundarySnapshot
     successor_evidence_lease: ProviderSpeakerEvidenceLease | None
     detector: DetectorRuntime
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTurnHandoff:
+    """One exact settlement owns activation until buffered PCM is queued."""
+
+    identity: _AsrRuntimeIdentity
+    completion: asyncio.Future[bool]
+
+
+class _PendingTurnPreparationError(RuntimeError):
+    """A required successor preparation could not finish safely."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1967,6 +1989,7 @@ class IndependentAsrRuntime:
     ) -> None:
         """Serialize exact facts, close, and final under one task owner."""
 
+        item: _ProviderExactIntervalQueueItem | None = None
         try:
             while transaction.event_queue:
                 item = transaction.event_queue.popleft()
@@ -2006,6 +2029,13 @@ class IndependentAsrRuntime:
                 if transaction.resolved_disposition is not None:
                     break
         finally:
+            if item is not None:
+                # None means settlement was interrupted, never permission to
+                # replay an input that Admission may already have applied.
+                transaction.completed_events.setdefault(item.event, None)
+                for waiter in item.waiters:
+                    if not waiter.done():
+                        waiter.set_result(None)
             while transaction.event_queue:
                 item = transaction.event_queue.popleft()
                 for waiter in item.waiters:
@@ -2053,15 +2083,15 @@ class IndependentAsrRuntime:
                     f"{transaction.provider_key.utterance_id}"
                 ),
             )
-            cancelled: asyncio.CancelledError | None = None
+            self._track_exact_callback_task(partial_settlement)
             try:
-                await asyncio.shield(partial_settlement)
-            except asyncio.CancelledError as exc:
-                cancelled = exc
-                await asyncio.shield(partial_settlement)
-            self._retire_exact_interval_runtime_aliases(transaction)
-            if cancelled is not None:
-                raise cancelled
+                await self._wait_exact_callback_task(partial_settlement)
+            except TimeoutError:
+                # Preview delivery is optional; its timeout cannot revoke the
+                # already established unavailable disposition of this turn.
+                pass
+            finally:
+                self._retire_exact_interval_runtime_aliases(transaction)
             return True
         if self._exact_interval_runtime_is_current(transaction):
             await self._fail_exact_interval_group(transaction, reason_code)
@@ -3291,6 +3321,7 @@ class IndependentAsrRuntime:
         self._asr_provider = None
         self._asr_turn_prepared = False
         self._asr_final_lock = asyncio.Lock()
+        self._asr_pending_turn_handoff: _PendingTurnHandoff | None = None
         self._asr_admission = VoiceTurnAdmissionCoordinator(capacity=8)
         self._asr_admission_ingress = AdmissionIngressLane(
             self._asr_admission,
@@ -3339,6 +3370,7 @@ class IndependentAsrRuntime:
             asyncio.Task[None],
         ] = {}
         self._asr_admission_effect_tasks: set[asyncio.Task[Any]] = set()
+        self._asr_exact_callback_tasks: set[asyncio.Task[Any]] = set()
         self._asr_admission_effect_task_turns: dict[
             asyncio.Task[Any],
             VoiceTurnToken | None,
@@ -3728,6 +3760,8 @@ class IndependentAsrRuntime:
             self._asr_provider_exact_session = None
         if not hasattr(self, "_asr_provider_exact_intervals"):
             self._asr_provider_exact_intervals = {}
+        if not hasattr(self, "_asr_exact_callback_tasks"):
+            self._asr_exact_callback_tasks = set()
         if not hasattr(self, "_asr_provider_exact_pending"):
             self._asr_provider_exact_pending = {}
         if not hasattr(self, "_asr_provider_exact_candidates"):
@@ -3827,6 +3861,39 @@ class IndependentAsrRuntime:
     ) -> None:
         self._asr_admission_effect_tasks.add(task)
         self._asr_admission_effect_task_turns[task] = turn_token
+
+    def _track_exact_callback_task(self, task: asyncio.Task[None]) -> None:
+        """Own callbacks separately from effects that invalidation must drain."""
+
+        self._asr_exact_callback_tasks.add(task)
+        # A callback may itself await stop/start. Do not put it in the retired
+        # turn's effect join, which would then wait for its own caller.
+        self._track_admission_effect_task(task, None)
+
+        def done(completed: asyncio.Task[None]) -> None:
+            self._asr_exact_callback_tasks.discard(completed)
+            self._admission_effect_done(completed)
+
+        task.add_done_callback(done)
+
+    async def _wait_exact_callback_task(self, task: asyncio.Task[None]) -> None:
+        """Allow accepted callbacks to finish, with a bounded cancellation grace."""
+
+        deadline = time.monotonic() + _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS
+        try:
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, deadline - time.monotonic()))
+            if not done:
+                task.cancel()
+                raise TimeoutError("ASR_EXACT_CALLBACK_TIMEOUT")
+            task.result()
+        except asyncio.CancelledError:
+            try:
+                if not task.done():
+                    await asyncio.wait({task}, timeout=max(0.0, deadline - time.monotonic()))
+            finally:
+                if not task.done():
+                    task.cancel()
+            raise
 
     def _admission_effect_done(self, task: asyncio.Task[Any]) -> None:
         self._asr_admission_effect_tasks.discard(task)
@@ -5352,9 +5419,95 @@ class IndependentAsrRuntime:
         ticket: AdmissionResolutionTicket,
         context: _AdmissionFinalContext,
     ) -> None:
+        transaction = self._asr_provider_exact_intervals.get(context.provider_key)
+        if not (
+            transaction is not None
+            and transaction.turn_token == context.turn_token
+            and transaction.runtime_identity == context.runtime_identity
+            and self._runtime_identity_matches(context.runtime_identity)
+            and context.lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
+        ):
+            await self._settle_admission_final_owned(ticket, context)
+            return
+        # Publish before the first await and before exposing WARM_IDLE/ACTIVE.
+        # Submit owns no new queue: it waits before interpreting lifecycle or
+        # dispatching live PCM, so the reserved pending prefix stays first.
+        handoff = _PendingTurnHandoff(
+            self._capture_runtime_identity(ingress_token=context.turn_token.ingress),
+            asyncio.get_running_loop().create_future(),
+        )
+        self._asr_pending_turn_handoff = handoff
+        completed = False
+        failure_reason = "ASR_PENDING_TURN_HANDOFF_FAILED"
+        try:
+            async with asyncio.timeout(_EXACT_PENDING_HANDOFF_TIMEOUT_SECONDS):
+                await self._settle_admission_final_owned(ticket, context)
+            completed = self._runtime_identity_matches(handoff.identity)
+        except _PendingTurnPreparationError as exc:
+            failure_reason = str(exc)
+            raise
+        finally:
+            failed_current = not completed and self._runtime_identity_matches(handoff.identity)
+            if failed_current:
+                # Error invalidation joins this effect: never await it while
+                # holding the final lock. The failed gate blocks new PCM until
+                # the owned cleanup installs its generation fence and resets it.
+                cleanup = asyncio.create_task(
+                    self._handle_independent_asr_error(
+                        context.epoch, context.provider,
+                        status_code="ASR_CORE_TRANSCRIPT_BACKPRESSURE",
+                        reason_code=failure_reason,
+                        expected_identity=handoff.identity,
+                        notification_timeout_seconds=(
+                            _EXACT_HANDOFF_FAILURE_NOTIFICATION_TIMEOUT_SECONDS
+                        ),
+                    ),
+                    name="asr-pending-turn-handoff-failure",
+                )
+                self._asr_owned_cleanup_tasks.add(cleanup)
+                cleanup.add_done_callback(self._owned_cleanup_done)
+            if not failed_current and self._asr_pending_turn_handoff is handoff:
+                self._asr_pending_turn_handoff = None
+            if not handoff.completion.done():
+                handoff.completion.set_result(completed)
+
+    def has_pending_turn_handoff(self, ingress_token: VoiceIngressToken) -> bool:
+        """Authorize bounded Core ingress storage for this physical owner only."""
+
+        handoff = getattr(self, "_asr_pending_turn_handoff", None)
+        return bool(
+            handoff is not None
+            and not handoff.completion.done()
+            and handoff.identity.ingress_token == ingress_token
+            and self._runtime_identity_matches(handoff.identity)
+        )
+
+    async def _await_pending_turn_handoff(self, identity: _AsrRuntimeIdentity) -> bool:
+        """Wait without cancelling the activation owner or replaying input."""
+
+        handoff = getattr(self, "_asr_pending_turn_handoff", None)
+        if handoff is None:
+            return True
+        done, _ = await asyncio.wait(
+            {handoff.completion}, timeout=_EXACT_PENDING_HANDOFF_TIMEOUT_SECONDS,
+        )
+        completed = bool(done and handoff.completion.result())
+        return bool(completed and self._runtime_identity_matches(identity))
+
+    async def _settle_admission_final_owned(
+        self,
+        ticket: AdmissionResolutionTicket,
+        context: _AdmissionFinalContext,
+    ) -> None:
         """Settle Provider and lifecycle after disposition is tombstoned."""
 
         degraded = False
+        exact_transaction = self._asr_provider_exact_intervals.get(context.provider_key)
+        bounded_exact_notification = bool(
+            exact_transaction is not None
+            and exact_transaction.turn_token == context.turn_token
+            and exact_transaction.runtime_identity == context.runtime_identity
+        )
         owned_lease_token = self._asr_admission_turn_leases.get(context.turn_token)
         successor_present = False
         detector = context.detector
@@ -5452,9 +5605,13 @@ class IndependentAsrRuntime:
                 == context.turn_token
             ):
                 self._asr_provider_started_turns.pop(context.provider_key, None)
+        notify_lifecycle = (
+            self._send_exact_lifecycle_state
+            if bounded_exact_notification else self._send_asr_lifecycle_state
+        )
         delivered = bool(
             owns_current_turn
-            and await self._send_asr_lifecycle_state(
+            and await notify_lifecycle(
                 VoiceLifecycleState.WARM_IDLE,
                 provider=context.provider,
                 session_epoch=context.epoch,
@@ -5463,8 +5620,22 @@ class IndependentAsrRuntime:
         )
         if not delivered:
             degraded = True
-        elif has_pending_turn:
-            await self._activate_pending_independent_turn(context.epoch)
+        if has_pending_turn and (
+            delivered
+            or (
+                bounded_exact_notification
+                and owns_current_turn
+                and self._runtime_identity_matches(context.runtime_identity)
+            )
+        ):
+            # A display timeout is not a failed final. Only the same physical
+            # owner may activate its pending turn after this optional await.
+            if bounded_exact_notification:
+                await self._activate_pending_independent_turn(
+                    context.epoch, bounded_notification=True,
+                )
+            else:
+                await self._activate_pending_independent_turn(context.epoch)
         if detector is not None and fence is not None:
             try:
                 await detector.release_deferred_turn()
@@ -8258,6 +8429,9 @@ class IndependentAsrRuntime:
         for pending in self._asr_provider_exact_pending.values():
             pending.conflicted = True
             pending.completion.set()
+        for task in tuple(self._asr_exact_callback_tasks):
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
         for transaction in tuple(self._asr_provider_exact_intervals.values()):
             self._retire_exact_interval_runtime_aliases(transaction)
         self._asr_provider_correlator = None
@@ -8275,6 +8449,10 @@ class IndependentAsrRuntime:
     def _reset_asr_turn_state(self) -> None:
         """Reset per-turn bookkeeping shared by close/abort/error teardown."""
 
+        handoff = getattr(self, "_asr_pending_turn_handoff", None)
+        self._asr_pending_turn_handoff = None
+        if handoff is not None and not handoff.completion.done():
+            handoff.completion.set_result(False)
         self._cancel_provider_speaker_arming_tasks()
         self._asr_turn_prepared = False
         self._asr_received_audio = False
@@ -8505,11 +8683,21 @@ class IndependentAsrRuntime:
             lifecycle.stop()
         self._asr_provider_speaker_sequence = 0
         self._asr_buffered_provider_speaker_observation = None
+        exact_callbacks = {
+            task for task in self._asr_exact_callback_tasks
+            if task is not asyncio.current_task() and not task.done()
+        }
         self._reset_asr_turn_state()
         self._asr_session_factory = None
         self._asr_transport_selection = None
 
         async def finish_detached_cleanup() -> None:
+            await self._bounded_terminal_task_join(
+                exact_callbacks,
+                deadline=time.monotonic() + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS,
+                label="exact callback stop",
+                cancel_first=False,
+            )
             if admission_cleanup_task is not None:
                 await asyncio.gather(
                     admission_cleanup_task,
@@ -8761,6 +8949,9 @@ class IndependentAsrRuntime:
         """Submit one normalized frame to the independent-ASR hard route."""
 
         self._ensure_asr_runtime_state()
+        handoff_identity = self._capture_runtime_identity(ingress_token=ingress_token)
+        if not await self._await_pending_turn_handoff(handoff_identity):
+            return AsrSubmitResult(AsrSubmitStatus.STALE)
         if self._asr_deny_transport_state in {
             DenyTransportState.DENY_FENCED,
             DenyTransportState.RETIRING,
@@ -9039,6 +9230,8 @@ class IndependentAsrRuntime:
                         or not self._voice_input_resource_optimization_enabled
                     )
                     if continuous_provider_wake:
+                        if not await self._await_pending_turn_handoff(identity):
+                            return AsrSubmitResult(AsrSubmitStatus.STALE)
                         if not await self._ensure_continuous_provider_wake(
                             lifecycle,
                             identity.session_epoch,
@@ -9066,6 +9259,8 @@ class IndependentAsrRuntime:
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
             if not deny_cleanup_is_current():
                 return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+            if not await self._await_pending_turn_handoff(identity):
+                return AsrSubmitResult(AsrSubmitStatus.STALE)
             decision = (
                 lifecycle.accept_audio(pcm16, sample_rate_hz=sample_rate_hz)
                 if lifecycle is not None
@@ -9534,8 +9729,9 @@ class IndependentAsrRuntime:
         self._begin_asr_start_operation()
         self._asr_audio_generation += 1
         transcript_dispatcher = self._asr_transcript_dispatcher
+        admission_cleanup = None
         if self._asr_admission_ingress_started:
-            await self._finish_admission_invalidation(
+            admission_cleanup = self._finish_admission_invalidation(
                 self._asr_admission_ingress.invalidate_all_nowait(RouteReplaced()),
                 transcript_dispatcher,
                 self._asr_provider_correlator,
@@ -9544,11 +9740,11 @@ class IndependentAsrRuntime:
             )
         else:
             transcript_dispatcher.invalidate_all()
-        self._asr_detector_dispatcher.invalidate_all()
-        self._asr_audio_dispatcher.abort()
-        self._asr_provider_speaker_sequence = 0
-        self._asr_buffered_provider_speaker_observation = None
-        self._reset_asr_turn_state()
+        # Seize the physical resources and register their close owner before
+        # the first suspension. Admission must finish before transcript
+        # teardown, but it must not retain the old Provider connection when
+        # this caller is cancelled. Turn bookkeeping still settles afterward,
+        # under the post-detach identity fence.
         lease, self._asr_smart_turn_lease = self._asr_smart_turn_lease, None
         for task_name in (
             "_asr_transport_task",
@@ -9562,16 +9758,29 @@ class IndependentAsrRuntime:
         asr_session, self._asr_session = self._asr_session, None
         lifecycle = self._asr_lifecycle
         if lifecycle is not None:
-            lifecycle.metrics.asr_abort_discarded_command_count = (
-                self._asr_audio_dispatcher.asr_abort_discarded_command_count
-            )
             lifecycle.invalidate_transport()
         post_detach = self._capture_runtime_identity()
+
+        async def settle_abort() -> None:
+            if admission_cleanup is not None:
+                await admission_cleanup
+            if not self._runtime_identity_matches(post_detach):
+                return
+            self._asr_detector_dispatcher.invalidate_all()
+            self._asr_audio_dispatcher.abort()
+            self._asr_provider_speaker_sequence = 0
+            self._asr_buffered_provider_speaker_observation = None
+            self._reset_asr_turn_state()
+            if lifecycle is not None:
+                lifecycle.metrics.asr_abort_discarded_command_count = (
+                    self._asr_audio_dispatcher.asr_abort_discarded_command_count
+                )
 
         async def finish_abort() -> None:
             try:
                 if lease is not None:
-                    await lease.release()
+                    async with asyncio.timeout(_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS):
+                        await lease.release()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -9582,7 +9791,8 @@ class IndependentAsrRuntime:
             finally:
                 if asr_session is not None:
                     try:
-                        await asr_session.close()
+                        async with asyncio.timeout(_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS):
+                            await asr_session.close()
                     except Exception:
                         logger.warning(
                             "[%s] independent ASR abort failed reason=%s",
@@ -9590,10 +9800,15 @@ class IndependentAsrRuntime:
                             reason,
                         )
 
+        admission_cleanup_task = self._schedule_owned_cleanup(
+            settle_abort(),
+            name="independent-asr-abort-admission",
+        )
         cleanup_task = self._schedule_owned_cleanup(
             finish_abort(),
             name="independent-asr-abort-transport",
         )
+        await asyncio.shield(admission_cleanup_task)
         await asyncio.shield(cleanup_task)
         return post_detach
 
@@ -11095,7 +11310,18 @@ class IndependentAsrRuntime:
         ledger = self._asr_provider_speaker_key_ledgers.get(
             transaction.provider_key
         )
-        if ledger is not None:
+        # Numeric Provider/candidate keys can repeat after stop/start while an
+        # old settlement is still awaiting a callback. Fence the ledger by its
+        # captured physical and admission owners, not by the current Runtime:
+        # detach also calls this helper after clearing the live session refs.
+        if (
+            ledger is not None
+            and ledger.runtime_identity.session is transaction.session
+            and ledger.runtime_identity.detector is transaction.detector
+            and ledger.turn_token == transaction.turn_token
+            and ledger.lease_token == transaction.parent_lease_token
+            and ledger.candidate == transaction.parent_candidate
+        ):
             ledger.state = _ProviderSpeakerLedgerState.RESOLVED
             if self._asr_provider_speaker_ledgers.get(ledger.candidate) is ledger:
                 self._asr_provider_speaker_ledgers.pop(ledger.candidate, None)
@@ -11112,6 +11338,7 @@ class IndependentAsrRuntime:
         promotion: ExactIntervalPromotionReceipt | None,
         identity: _AsrRuntimeIdentity,
         lease_token: SpeakerCaptureLeaseToken,
+        promotion_future: asyncio.Future[ExactIntervalPromotionResult] | None = None,
     ) -> bool:
         _detector_aborted = True
         if reservation is not None:
@@ -11122,6 +11349,15 @@ class IndependentAsrRuntime:
             except Exception:
                 _detector_aborted = False
         admission_aborted = promotion is None
+        if promotion is None and promotion_future is not None:
+            # Cancellation can escape the second shield before the caller
+            # receives a promotion that the FIFO has already accepted.
+            try:
+                promoted = await asyncio.shield(promotion_future)
+                promotion = promoted.receipt
+                admission_aborted = promoted.outcome is not ExactIntervalOutcome.PROMOTED
+            except Exception:
+                admission_aborted = False
         if promotion is not None:
             try:
                 future = (
@@ -11200,8 +11436,18 @@ class IndependentAsrRuntime:
         pending: _ProviderExactIntervalPending,
         transaction: _ProviderExactIntervalTransaction | None = None,
     ) -> None:
+        session = self._asr_session
+        epoch = self._asr_session_epoch
+        correlator = self._asr_provider_correlator
+
         async def drain() -> None:
             while pending.deferred:
+                if (
+                    self._asr_session is not session
+                    or self._asr_session_epoch != epoch
+                    or self._asr_provider_correlator is not correlator
+                ):
+                    return
                 kind, args, kwargs = pending.deferred.popleft()
                 if kind == "ordered":
                     await self._handle_ordered_provider_endpoint(*args, **kwargs)
@@ -11212,23 +11458,23 @@ class IndependentAsrRuntime:
             drain(),
             name="provider-exact-interval-replay",
         )
-        cancelled: asyncio.CancelledError | None = None
+        self._track_exact_callback_task(replay)
         try:
-            await asyncio.shield(replay)
-        except asyncio.CancelledError as exc:
-            # Detector commit cannot be rolled back. Finish the already
-            # accepted FIFO callbacks before cancellation escapes so no exact
-            # HOLD is orphaned with the remaining deque silently discarded.
-            cancelled = exc
-            try:
-                await asyncio.shield(replay)
-            except Exception:
-                if transaction is not None:
-                    await self._fail_exact_interval_group(
-                        transaction,
-                        "ASR_EXACT_INTERVAL_REPLAY_FAILED",
-                    )
-                raise
+            await self._wait_exact_callback_task(replay)
+        except asyncio.CancelledError:
+            if (
+                transaction is not None
+                and (not replay.done() or replay.cancelled())
+                and self._exact_interval_runtime_is_current(transaction)
+            ):
+                # An interrupted accepted FIFO cannot be blindly replayed.
+                # Publish the existing failure fence without another await.
+                self._start_exact_parent_cleanup(
+                    transaction.parent_lease_token,
+                    "ASR_EXACT_INTERVAL_REPLAY_FAILED",
+                    turn_token=transaction.turn_token,
+                )
+            raise
         except Exception:
             if transaction is not None:
                 await self._fail_exact_interval_group(
@@ -11236,8 +11482,6 @@ class IndependentAsrRuntime:
                     "ASR_EXACT_INTERVAL_REPLAY_FAILED",
                 )
             raise
-        if cancelled is not None:
-            raise cancelled
 
     async def _handle_provider_boundary_notification(
         self,
@@ -11348,6 +11592,7 @@ class IndependentAsrRuntime:
         deadline = time.monotonic() + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
         reservation: ProviderExactSpeakerIntervalReservation | None = None
         promotion: ExactIntervalPromotionReceipt | None = None
+        promotion_future: asyncio.Future[ExactIntervalPromotionResult] | None = None
         cancelled: asyncio.CancelledError | None = None
         exact_result: ProviderBoundaryResult | None = None
         rollback_safe = True
@@ -11634,39 +11879,44 @@ class IndependentAsrRuntime:
                 )
         except asyncio.CancelledError as exc:
             cancelled = exc
-            rollback_safe = await self._abort_exact_interval_setup(
-                detector=detector,
-                reservation=reservation,
-                promotion=promotion,
-                identity=identity,
-                lease_token=lease_token,
-            )
         except Exception:
-            if exact_result is None:
-                rollback_safe = await self._abort_exact_interval_setup(
-                    detector=detector,
-                    reservation=reservation,
-                    promotion=promotion,
-                    identity=identity,
-                    lease_token=lease_token,
-                )
-            if cancelled is not None:
-                pass
-        if exact_result is None:
-            self._speaker_rejection_metrics["speaker_exact_abort_count"] += 1
-            if ledger.state is _ProviderSpeakerLedgerState.EXACT_PREPARING:
-                ledger.state = _ProviderSpeakerLedgerState.UNAVAILABLE
-                if ledger.poisoned_reason is None:
-                    self._poison_provider_speaker_ledger(
-                        ledger,
-                        "exact_prepare_unavailable",
+            pass
+        finally:
+            try:
+                if exact_result is None:
+                    async with asyncio.timeout(_ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS):
+                        rollback_safe = await self._abort_exact_interval_setup(
+                            detector=detector,
+                            reservation=reservation,
+                            promotion=promotion,
+                            identity=identity,
+                            lease_token=lease_token,
+                            promotion_future=promotion_future,
+                        )
+                        self._speaker_rejection_metrics["speaker_exact_abort_count"] += 1
+                        if ledger.state is _ProviderSpeakerLedgerState.EXACT_PREPARING:
+                            ledger.state = _ProviderSpeakerLedgerState.UNAVAILABLE
+                            if ledger.poisoned_reason is None:
+                                self._poison_provider_speaker_ledger(
+                                    ledger, "exact_prepare_unavailable",
+                                )
+                            await self._publish_provider_ledger_unavailable(ledger)
+            except (asyncio.CancelledError, TimeoutError):
+                if self._runtime_identity_matches(identity):
+                    self._start_exact_parent_cleanup(
+                        lease_token,
+                        "ASR_EXACT_INTERVAL_ROLLBACK_FAILED",
+                        turn_token=turn_token,
                     )
-                await self._publish_provider_ledger_unavailable(ledger)
-        if final_lock_acquired:
-            self._asr_final_lock.release()
-        if self._asr_provider_exact_pending.get(key) is pending:
-            self._asr_provider_exact_pending.pop(key, None)
-        pending.completion.set()
+                raise
+            finally:
+                # These local ownership releases must survive cancellation of
+                # the rollback itself. Completion is a wakeup, not a commit.
+                if final_lock_acquired:
+                    self._asr_final_lock.release()
+                if self._asr_provider_exact_pending.get(key) is pending:
+                    self._asr_provider_exact_pending.pop(key, None)
+                pending.completion.set()
         if cancelled is not None:
             # Cancellation before Detector commit must not strand callbacks
             # that arrived behind the pending fence. Once both staged sides
@@ -11884,7 +12134,7 @@ class IndependentAsrRuntime:
                 lifecycle,
                 sealed_token,
             )
-        await self._send_asr_lifecycle_state(
+        await self._send_exact_lifecycle_state(
             VoiceLifecycleState.DRAINING,
             provider=self._asr_provider or "unknown",
             session_epoch=epoch,
@@ -12604,7 +12854,9 @@ class IndependentAsrRuntime:
                 expected_identity=transaction.identity,
             )
 
-    async def _activate_pending_independent_turn(self, epoch: int) -> None:
+    async def _activate_pending_independent_turn(
+        self, epoch: int, *, bounded_notification: bool = False,
+    ) -> None:
         """Start the pending turn after the previous final completes."""
 
         if epoch != self._asr_session_epoch:
@@ -12659,15 +12911,33 @@ class IndependentAsrRuntime:
             return
         if not self._runtime_identity_matches(identity):
             return
-        delivered = await self._send_asr_lifecycle_state(
+        notify_lifecycle = (
+            self._send_exact_lifecycle_state
+            if bounded_notification else self._send_asr_lifecycle_state
+        )
+        delivered = await notify_lifecycle(
             VoiceLifecycleState.ACTIVE,
             provider=identity.provider or "unknown",
             session_epoch=epoch,
             expected_identity=identity,
         )
-        if not delivered:
+        # begin_pending_turn already consumed this owner's buffered PCM. A
+        # display timeout must not strand it, but a replaced owner cannot
+        # prepare or activate the successor after this await.
+        if not self._runtime_identity_matches(identity):
             return
-        await self._prepare_independent_asr_turn(epoch)
+        if not delivered and not bounded_notification:
+            return
+        if bounded_notification:
+            try:
+                async with asyncio.timeout(_EXACT_PENDING_PREPARE_TIMEOUT_SECONDS):
+                    await self._prepare_independent_asr_turn(epoch)
+            except TimeoutError:
+                raise _PendingTurnPreparationError("ASR_PENDING_TURN_PREPARE_TIMEOUT") from None
+            if self._runtime_identity_matches(identity) and not self._asr_turn_prepared:
+                raise _PendingTurnPreparationError("ASR_PENDING_TURN_PREPARE_REJECTED")
+        else:
+            await self._prepare_independent_asr_turn(epoch)
         if not self._runtime_identity_matches(identity):
             return
         asr_session = identity.session
@@ -13328,6 +13598,7 @@ class IndependentAsrRuntime:
         status_code: str = "ASR_INDEPENDENT_FAILED",
         expected_identity: _AsrRuntimeIdentity | None = None,
         reason_code: str | None = None,
+        notification_timeout_seconds: float | None = None,
     ) -> None:
         if epoch != self._asr_session_epoch or (
             expected_identity is not None
@@ -13435,24 +13706,35 @@ class IndependentAsrRuntime:
             task.add_done_callback(self._asr_close_tasks.discard)
         failure_identity = self._capture_runtime_identity()
         try:
-            delivered = await self._send_asr_lifecycle_state(
-                VoiceLifecycleState.BLOCKED,
-                provider=provider,
-                session_epoch=failure_epoch,
-                expected_identity=failure_identity,
-                reason_code=effective_reason,
-                incident_id=incident_id,
-            )
+            # Only the exact-handoff cleanup supplies a budget. Its owned task
+            # is joined by stop_session: display backpressure cannot own stop.
+            # The physical session is already fenced and detached above.
+            try:
+                async with asyncio.timeout(notification_timeout_seconds):
+                    delivered = await self._send_asr_lifecycle_state(
+                        VoiceLifecycleState.BLOCKED,
+                        provider=provider,
+                        session_epoch=failure_epoch,
+                        expected_identity=failure_identity,
+                        reason_code=effective_reason,
+                        incident_id=incident_id,
+                    )
+            except TimeoutError:
+                # A lost display notice cannot skip Core's route invalidation.
+                # It has its own budget and the same post-await identity fence.
+                delivered = True
+                logger.debug("[%s] exact ASR failure lifecycle notice timed out", self.display_name)
             if not delivered or not self._runtime_identity_matches(failure_identity):
                 return
             try:
-                await self._callbacks.on_failure(
-                    AsrFailureEvent(
-                        code=status_code,
-                        provider=provider,
-                        session_epoch=failure_epoch,
+                async with asyncio.timeout(notification_timeout_seconds):
+                    await self._callbacks.on_failure(
+                        AsrFailureEvent(
+                            code=status_code,
+                            provider=provider,
+                            session_epoch=failure_epoch,
+                        )
                     )
-                )
             except Exception:
                 logger.debug(
                     "[%s] independent ASR failure callback failed",
@@ -13460,13 +13742,19 @@ class IndependentAsrRuntime:
                 )
             if not self._runtime_identity_matches(failure_identity):
                 return
-            await self._send_asr_status(
-                status_code,
-                provider,
-                session_epoch=failure_epoch,
-                expected_identity=failure_identity,
-                reason_code=effective_reason,
-                incident_id=incident_id,
+            async with asyncio.timeout(notification_timeout_seconds):
+                await self._send_asr_status(
+                    status_code,
+                    provider,
+                    session_epoch=failure_epoch,
+                    expected_identity=failure_identity,
+                    reason_code=effective_reason,
+                    incident_id=incident_id,
+                )
+        except TimeoutError:
+            logger.debug(
+                "[%s] exact ASR handoff failure notification timed out",
+                self.display_name,
             )
         finally:
             # A dispatcher can report its own failure from inside its worker.
@@ -13524,6 +13812,34 @@ class IndependentAsrRuntime:
                 self.display_name,
             )
         return self._runtime_identity_matches(expected_identity)
+
+    async def _send_exact_lifecycle_state(
+        self,
+        state: VoiceLifecycleState,
+        *,
+        provider: str,
+        session_epoch: int,
+        expected_identity: _AsrRuntimeIdentity,
+    ) -> bool:
+        """Bound optional notifications without cancelling final settlement."""
+
+        try:
+            async with asyncio.timeout(_EXACT_LIFECYCLE_NOTIFICATION_TIMEOUT_SECONDS):
+                return await self._send_asr_lifecycle_state(
+                    state,
+                    provider=provider,
+                    session_epoch=session_epoch,
+                    expected_identity=expected_identity,
+                )
+        except TimeoutError:
+            # Keep this in the settlement task: no notification child can
+            # outlive stop/close. External cancellation must still propagate.
+            logger.debug(
+                "[%s] exact ASR lifecycle notification timed out state=%s",
+                self.display_name,
+                state.value,
+            )
+            return False
 
     async def _send_asr_lifecycle_state(
         self,

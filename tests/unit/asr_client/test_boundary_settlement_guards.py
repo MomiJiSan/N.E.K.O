@@ -95,6 +95,101 @@ async def test_completed_receipt_cannot_survive_revocation(action):
         await session.close()
 
 
+@pytest.mark.parametrize("retire", [None, "cancel", "clear", "close", "revoke", "replace"])
+async def test_cancelled_predecessor_only_releases_current_successor(retire):
+    entered, release = asyncio.Event(), asyncio.Event()
+    events, finals = [], []
+
+    async def endpoint(notification):
+        events.append((notification.phase, notification.utterance_id,
+                       notification.boundary_quality))
+        if notification.phase == "boundary" and notification.utterance_id == 1:
+            entered.set()
+            await release.wait()
+            raise asyncio.CancelledError
+
+    async def final(key, text):
+        finals.append(key)
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=_recording_worker, api_key="",
+        config=AsrSessionConfig(endpointing_mode="provider"),
+        on_input_transcript=AsyncMock(), on_connection_error=AsyncMock(),
+        on_provider_endpoint=endpoint, on_provider_final=final,
+    )
+    try:
+        await session.connect()
+        await session.stream_audio(b"\x00\x00" * 2000)
+        for utterance in (1, 2):
+            common = dict(generation=0, buffer_epoch=0, utterance_id=utterance)
+            await session._response_queue.put(_AsrWorkerEvent(
+                kind="utterance_started", audio_start_sample_16k=(utterance-1)*1000,
+                **common,
+            ))
+            await session._response_queue.put(_AsrWorkerEvent(
+                kind="provider_endpoint", boundary_quality="exact",
+                audio_range=ProviderAudioRange((utterance-1)*1000, utterance*1000),
+                **common,
+            ))
+        await asyncio.wait_for(session._response_queue.join(), 1)
+        await asyncio.wait_for(entered.wait(), 1)
+        tasks = tuple(session._provider_boundary_tasks.values())
+        successor = session._provider_boundary_tasks[(0, 0, 2)]
+        if retire == "cancel":
+            successor.cancel()
+        elif retire == "clear":
+            await session.clear_audio_buffer()
+        elif retire == "close":
+            await session.close()
+        elif retire == "revoke":
+            session._revoke_provider_boundary_chain()
+        elif retire == "replace":
+            # A conflicting endpoint replaces only this key's queued proof.
+            await session._response_queue.put(_AsrWorkerEvent(
+                kind="provider_endpoint", generation=0, buffer_epoch=0,
+                utterance_id=2, boundary_quality="exact",
+                audio_range=ProviderAudioRange(1000, 1900),
+            ))
+            await asyncio.wait_for(session._response_queue.join(), 1)
+            replacement = session._provider_boundary_tasks[(0, 0, 2)]
+            assert replacement is not successor
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+        if retire == "replace":
+            assert await successor
+            assert await asyncio.wait_for(asyncio.shield(replacement), 1)
+        elif retire is not None:
+            assert successor.cancelled()
+            assert events == [("boundary", 1, "exact")]
+            assert finals == []
+            return
+        for utterance in (1, 2):
+            # Duplicate provider finals must not cause duplicate delivery.
+            for _ in range(2):
+                await session._response_queue.put(_AsrWorkerEvent(
+                    kind="final", generation=0, buffer_epoch=0,
+                    utterance_id=utterance, text="fixture",
+                ))
+        await _drain_session_pipelines(session)
+        assert [(key.generation, key.buffer_epoch, key.utterance_id)
+                for key in finals] == [(0, 0, 1), (0, 0, 2)]
+        successor_quality = "unknown" if retire == "replace" else "exact"
+        expected = [("boundary", 1, "exact"), ("boundary", 2, "exact")]
+        if retire == "replace":
+            expected.append(("boundary", 2, "unknown"))
+        expected.extend([
+            ("ordered", 1, "unknown"), ("ordered", 2, successor_quality),
+        ])
+        assert events == expected
+        assert not session._provider_boundary_tasks
+        assert not session._provider_boundary_deadlines
+    finally:
+        release.set()
+        await session.close()
+        assert not session._provider_boundary_chain_tasks
+        assert not session._provider_boundary_retired_tasks
+
+
 async def test_waiter_cancel_is_propagated_and_close_reaps_callback():
     entered, release = asyncio.Event(), asyncio.Event()
     async def callback(n):
