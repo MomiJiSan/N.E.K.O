@@ -3670,6 +3670,13 @@ class SpeakerShadowRuntime:
         record.settled.set()
         self._metrics.reconciliation_batch_applied_count += 1
 
+        # Coverage of an already-scored window still closes its evidence
+        # stream. Reuse ordered finish for exactly-once publication without
+        # rescoring or touching resources transferred to the suffix.
+        await self._process_finish(
+            _CandidateFinished(marker.generation, marker.target, marker.target_token)
+        )
+
     def _fail_terminal_coverage(
         self,
         marker: _CandidateTerminalCoverage,

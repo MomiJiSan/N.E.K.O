@@ -39,6 +39,7 @@ from ._provider_events import (
     ProviderUtteranceStartedNotification,
 )
 from .provider_policy import AsrProviderPolicy
+from .boundary_settlement import BoundarySettlement
 from .transcript import SegmentAggregator
 
 
@@ -483,13 +484,13 @@ class _RealtimeAsrSessionImpl:
         self._provider_recovered_callback_items: deque[_CallbackItem] = deque()
         self._provider_boundary_tasks: dict[
             _UtteranceKey,
-            asyncio.Task[bool],
+            asyncio.Task[bool | BoundarySettlement],
         ] = {}
         self._provider_boundary_deadlines: dict[_UtteranceKey, float] = {}
         self._provider_boundary_chain_namespace: tuple[int, int] | None = None
         self._provider_boundary_failed_namespace: tuple[int, int] | None = None
-        self._provider_boundary_chain_tail: asyncio.Task[bool] | None = None
-        self._provider_boundary_chain_tasks: set[asyncio.Task[bool]] = set()
+        self._provider_boundary_chain_tail: asyncio.Task[bool | BoundarySettlement] | None = None
+        self._provider_boundary_chain_tasks: set[asyncio.Task[bool | BoundarySettlement]] = set()
         self._provider_boundary_retired_tasks: set[asyncio.Task[Any]] = set()
         self._logical_turn_id = 1
         self._physical_segment_audio_bytes = 0
@@ -1601,6 +1602,7 @@ class _RealtimeAsrSessionImpl:
         notification: ProviderEndpointNotification,
         *,
         deadline: float | None = None,
+        settlement: BoundarySettlement | None = None,
     ) -> bool:
         callback = self._on_provider_endpoint
         if callback is None:
@@ -1614,7 +1616,8 @@ class _RealtimeAsrSessionImpl:
                 if remaining <= 0:
                     return False
                 callback_task = asyncio.create_task(
-                    callback(notification),
+                    settlement.invoke(callback, notification)
+                    if settlement is not None else callback(notification),
                     name="asr-provider-boundary-settlement",
                 )
                 done, _ = await asyncio.wait(
@@ -1625,6 +1628,11 @@ class _RealtimeAsrSessionImpl:
                     self._retire_provider_boundary_task(callback_task)
                     return False
                 await callback_task
+                if settlement is not None and (
+                    settlement.completed_at is None
+                    or settlement.completed_at > deadline
+                ):
+                    return False
         except asyncio.CancelledError:
             if callback_task is not None and not callback_task.done():
                 self._retire_provider_boundary_task(callback_task)
@@ -1771,25 +1779,40 @@ class _RealtimeAsrSessionImpl:
         predecessor = self._provider_boundary_chain_tail
         started_settlement = self._provider_started_settlements.get(key)
         deadline = time.monotonic() + _PROVIDER_BOUNDARY_CALLBACK_TIMEOUT_SECONDS
+        settlement = BoundarySettlement.create(self, key, deadline)
+        settlement.record("provider_boundary_scheduled")
 
-        async def emit_after_predecessor() -> bool:
-            if predecessor is not None:
-                try:
-                    await asyncio.shield(predecessor)
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-            if not await wait_for_started(
-                key,
-                started_settlement,
-                deadline=deadline,
-            ):
-                return False
-            return await self._emit_provider_boundary(
-                notification,
-                deadline=deadline,
-            )
+        async def emit_after_predecessor() -> BoundarySettlement:
+            try:
+                if predecessor is not None:
+                    # Chain waiting shares the same execution budget.
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        settlement.outcome = "predecessor_timeout"
+                        return settlement
+                    await asyncio.wait_for(asyncio.shield(predecessor), timeout=remaining)
+                if not await wait_for_started(key, started_settlement, deadline=deadline):
+                    settlement.outcome = "started_unavailable"
+                    return settlement
+                succeeded = await self._emit_provider_boundary(
+                    notification, deadline=deadline, settlement=settlement,
+                )
+                settlement.outcome = (
+                    "completed" if succeeded else
+                    "callback_failed" if settlement.callback_outcome == "failed" else
+                    "callback_cancelled" if settlement.callback_outcome == "cancelled" else
+                    "callback_timeout"
+                )
+                return settlement
+            except asyncio.TimeoutError:
+                settlement.outcome = "predecessor_timeout"
+                return settlement
+            except asyncio.CancelledError:
+                settlement.outcome = "cancelled"
+                raise
+            finally:
+                settlement.settled_at = time.monotonic()
+                settlement.record("provider_boundary_settled")
 
         task = asyncio.create_task(
             emit_after_predecessor(),
@@ -1803,9 +1826,9 @@ class _RealtimeAsrSessionImpl:
 
     def _track_provider_boundary_chain_task(
         self,
-        task: asyncio.Task[bool],
+        task: asyncio.Task[bool | BoundarySettlement],
     ) -> None:
-        def release(done: asyncio.Task[bool]) -> None:
+        def release(done: asyncio.Task[bool | BoundarySettlement]) -> None:
             self._provider_boundary_chain_tasks.discard(done)
             if self._provider_boundary_chain_tail is done:
                 self._provider_boundary_chain_tail = None
@@ -1839,34 +1862,68 @@ class _RealtimeAsrSessionImpl:
         key: _UtteranceKey,
         *,
         not_after: float | None = None,
+        final_received_at: float | None = None,
     ) -> bool:
-        task = self._provider_boundary_tasks.pop(key, None)
-        deadline = self._provider_boundary_deadlines.pop(key, None)
-        if task is None:
+        task = self._provider_boundary_tasks.get(key)
+        deadline = self._provider_boundary_deadlines.get(key)
+        if task is None or deadline is None:
             return False
-        if deadline is None:
-            return False
-        if not_after is not None:
-            deadline = min(deadline, not_after)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            self._revoke_provider_boundary_chain()
-            return False
+        result = None
+        disposition = "unavailable"
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=remaining,
+            if task.done():
+                # Consume completion evidence before considering a wait budget.
+                result = task.result()
+            else:
+                wait_deadline = min(deadline, not_after) if not_after is not None else deadline
+                remaining = wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            current = bool(
+                self._provider_boundary_tasks.get(key) is task
+                and self._state is _SessionState.READY
+                and key[:2] == (self._generation, self._buffer_epoch)
+                and key not in self._provider_started_failed_keys
+                and self._provider_started_failed_namespace != key[:2]
             )
+            if not current:
+                disposition = "revoked_or_stale"
+                return False
+            if not_after is not None and time.monotonic() > not_after:
+                disposition = "final_deadline_expired"
+                return False
+            # Overflow tasks and bare booleans are not exact completion proofs.
+            accepted = isinstance(result, BoundarySettlement) and bool(result)
+            disposition = "accepted" if accepted else "callback_unavailable"
+            return accepted
         except asyncio.TimeoutError:
-            self._revoke_provider_boundary_chain()
+            disposition = "wait_timeout"
+            if self._provider_boundary_tasks.get(key) is task:
+                self._revoke_provider_boundary_chain()
             return False
         except asyncio.CancelledError:
+            disposition = "cancelled"
             current = asyncio.current_task()
             if current is not None and current.cancelling():
                 raise
             # Clear, close, conflict, and bounded overflow all revoke optional
             # speaker authority. The ordered unknown endpoint remains valid.
             return False
+        finally:
+            observation = result
+            if not isinstance(observation, BoundarySettlement):
+                # A cancelled/pending task has no completed receipt to read.
+                # Report absence explicitly; never invent completion times.
+                observation = BoundarySettlement.create(self, key, deadline)
+                observation.scheduled_at = None
+                observation.callback_outcome = "unknown"
+                observation.outcome = "no_completed_receipt"
+            observation.record("provider_boundary_consumed", consumed_at=time.monotonic(),
+                final_received_at=final_received_at, disposition=disposition)
+            if self._provider_boundary_tasks.get(key) is task:
+                self._provider_boundary_tasks.pop(key, None)
+                self._provider_boundary_deadlines.pop(key, None)
 
     def _retire_provider_boundary_task(
         self,
@@ -2189,6 +2246,7 @@ class _RealtimeAsrSessionImpl:
                                             item.utterance_id,
                                         ),
                                         not_after=item.final_admission_deadline,
+                                        final_received_at=item.final_received_at,
                                     )
                                 )
                             if (

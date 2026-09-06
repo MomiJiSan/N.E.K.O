@@ -143,8 +143,12 @@ async def test_terminal_coverage_completion_preserves_scored_verdict_and_success
         assert runtime.complete_reconciliation(receipt, successor=successor) == "pending"
         await runtime.wait_idle()
         assert runtime.complete_reconciliation(receipt, successor=successor) == "completed"
+        completed = runtime._finalized[target]
+        assert completed.token is original.token
+        assert completed.terminal_reason == original.terminal_reason == "scored"
+        assert completed.finish_seen
         runtime.revoke_terminal_coverage(receipt)
-        assert runtime._finalized[target] is original
+        assert runtime._finalized[target] is completed
         assert runtime.submit(_pcm(100), sample_rate_hz=16_000, candidate=successor)
         await runtime.wait_idle()
         assert runtime._buffers[successor].sample_count == 1_600

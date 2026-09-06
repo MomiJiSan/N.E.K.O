@@ -13116,7 +13116,10 @@ class IndependentAsrRuntime:
         epoch: int,
     ) -> None:
         try:
+            from .boundary_settlement import boundary_transport_ref
+
             metadata = diagnostic_context(self, epoch)
+            metadata["diagnostic_transport_ref"] = boundary_transport_ref(self._asr_session)
             started = isinstance(notification, ProviderUtteranceStartedNotification)
             audio_range = None if started else notification.audio_range
             metadata.update(
