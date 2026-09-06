@@ -20,6 +20,7 @@ from main_logic.voice_turn.contracts import (
 )
 
 from .._provider_events import ProviderAudioRange
+from ..failure_diagnostics import AudioFailureContext
 from .config import SmartTurnConfig
 from .coordinator import CoordinatorState, TurnCoordinator
 from .detector import (
@@ -73,6 +74,7 @@ from ..speaker_shadow.contracts import (
     SpeakerShadowDeferredCandidateControl,
     SpeakerShadowDeferredCandidateStatus,
     SpeakerShadowExactIntervalControl,
+    SpeakerShadowExactIntervalScoreControl,
     SpeakerShadowObserver,
     SpeakerShadowReconcileSource,
     SpeakerShadowReconciliationSettlement,
@@ -1537,6 +1539,8 @@ class ProviderExactSpeakerIntervalReservation:
     provider_pcm_through_sequence_no: int
     _owner: object
     _token: object
+    source_candidate: SpeakerShadowCandidateKey | None = None
+    score_reusable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1546,6 +1550,9 @@ class ProviderExactSpeakerIntervalCommitResult:
     snapshot: ProviderSpeakerBoundarySnapshot
     target_candidate: SpeakerShadowCandidateKey
     successor_evidence_lease: ProviderSpeakerEvidenceLease | None
+    score_reusable: bool = True
+    provider_pcm_through_sequence_no: int | None = None
+    observed_through_sample_16k: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3231,11 +3238,45 @@ class DetectorRuntime:
                     self._speaker_candidate_owner_generations.pop(candidate, None)
                 return None
 
+            score_reusable = True
+            if (
+                live_control is not None
+                and len(reconcile_sources) == 1
+                and isinstance(shadow, SpeakerShadowExactIntervalScoreControl)
+                and shadow.exact_interval_requires_fresh_target(reconcile_sources[0])
+            ):
+                # An immutable checkpoint extending beyond this exact prefix
+                # cannot be relabelled. Split its real PCM into a fresh target
+                # instead; minimum duration and score-range guards still apply.
+                target_candidate = self._allocate_provider_segment_candidate()
+                if target_candidate is None:
+                    for candidate in allocated:
+                        self._speaker_candidate_owner_generations.pop(candidate, None)
+                    return None
+                allocated.append(target_candidate)
+                score_reusable = False
+                # A late boundary can precede an already-completed score and
+                # several later buffer-only coverage owners. Retain the full
+                # current cursor in one ordered split; post-boundary sources
+                # contribute only to the suffix, never to target scoring.
+                reconcile_sources = [
+                    SpeakerShadowReconcileSource(
+                        candidate=coverage.candidate,
+                        expected_sample_count=coverage.end_sample_16k - coverage.start_sample_16k,
+                        keep_start_sample=0,
+                        keep_end_sample=max(0, min(
+                            coverage.end_sample_16k, boundary.end_sample_16k,
+                        ) - coverage.start_sample_16k),
+                    )
+                    for coverage in state.coverage_candidates
+                ]
+
             receipt: SpeakerShadowBatchReconcileReceipt | SpeakerShadowTerminalCoverageReceipt | None = None
             control: SpeakerShadowExactIntervalControl | SpeakerShadowPreparedTerminalCoverageControl | None = None
             if (
                 terminal_control is not None
                 and state.completed_window_sample_count > 0
+                and score_reusable
             ):
                 try:
                     receipt = terminal_control.prepare_finalized_candidate_coverage(
@@ -3257,7 +3298,9 @@ class DetectorRuntime:
                     receipt = None
                 if type(receipt) is SpeakerShadowTerminalCoverageReceipt:
                     control = terminal_control
-            if receipt is None and live_control is not None and len(reconcile_sources) == 1:
+            if receipt is None and live_control is not None and (
+                len(reconcile_sources) == 1 or not score_reusable
+            ):
                 try:
                     receipt = live_control.prepare_exact_interval(
                         SpeakerShadowBatchReconcileRequest(
@@ -3323,6 +3366,8 @@ class DetectorRuntime:
                 provider_pcm_through_sequence_no=state.last_sequence_no or 0,
                 _owner=self._provider_exact_interval_owner,
                 _token=reservation_token,
+                source_candidate=source_candidate,
+                score_reusable=score_reusable,
             )
             self._provider_exact_interval_records[reservation_token] = (
                 _ProviderExactSpeakerIntervalRecord(
@@ -3540,6 +3585,9 @@ class DetectorRuntime:
             snapshot=snapshot,
             target_candidate=reservation.target_candidate,
             successor_evidence_lease=successor_lease,
+            score_reusable=reservation.score_reusable,
+            provider_pcm_through_sequence_no=state.last_sequence_no or 0,
+            observed_through_sample_16k=self._provider_audio_sample_cursor_16k,
         )
 
     def _allocate_provider_segment_candidate(
@@ -5853,6 +5901,7 @@ class DetectorRuntime:
         identity: DetectorIngressIdentity,
         sequence_no: int,
         speaker_evidence_lease: ProviderSpeakerEvidenceLease | None,
+        failure_context: AudioFailureContext | None = None,
     ) -> ProviderAudioAccountingReceipt | None:
         """Advance a valid ordered timeline without allocating a candidate.
 
@@ -5867,8 +5916,10 @@ class DetectorRuntime:
             or speaker_evidence_lease.detector_epoch != self._detector_epoch
             or type(speaker_evidence_lease.lease_generation) is not int
         ):
+            self._record_provider_audio_failure(failure_context, "accounting_lease_identity")
             return None
         if state is not None and state.lease is not speaker_evidence_lease:
+            self._record_provider_audio_failure(failure_context, "accounting_other_owner")
             return None
         previous_sequence = self._provider_segment_last_sequence_no
         if previous_sequence is not None and sequence_no != previous_sequence + 1:
@@ -5878,9 +5929,11 @@ class DetectorRuntime:
                 else "provider_speaker_segment_sequence_gap_count"
             )
             self._speaker_rejection_prepare_diagnostics[diagnostic] += 1
+            self._record_provider_audio_failure(failure_context, "accounting_sequence")
             return None
         sample_count, remainder = divmod(len(pcm16) // 2 * 16_000, sample_rate_hz)
         if sample_count <= 0 or remainder:
+            self._record_provider_audio_failure(failure_context, "accounting_sample_alignment")
             return None
 
         settlement = None
@@ -5894,6 +5947,7 @@ class DetectorRuntime:
             if not issued or not self.validate_provider_speaker_evidence_settlement(
                 issued[1], lease=speaker_evidence_lease,
             ):
+                self._record_provider_audio_failure(failure_context, "accounting_retirement_unproven")
                 return None
             settlement = issued[1]
         self._mark_provider_segments_incomplete()
@@ -5915,6 +5969,19 @@ class DetectorRuntime:
             evidence_settlement=settlement,
         )
 
+    def _record_provider_audio_failure(
+        self, context: AudioFailureContext | None, check: str,
+    ) -> None:
+        if context is not None:
+            state = self._provider_speaker_evidence_state
+            context.fail(check, actual={
+                "detector_epoch": self._detector_epoch,
+                "timeline_generation": self._provider_audio_timeline_generation,
+                "sequence_no": self._provider_segment_last_sequence_no,
+                "sample_cursor_16k": self._provider_audio_sample_cursor_16k,
+                "lease_generation": state.lease.lease_generation if state is not None else None,
+            })
+
     async def observe_provider_audio_ordered(
         self,
         pcm16: bytes,
@@ -5927,6 +5994,7 @@ class DetectorRuntime:
         speaker_evidence_lease: ProviderSpeakerEvidenceLease | None = None,
         accounting_only: bool = False,
         expected_timeline_generation: int | None = None,
+        failure_context: AudioFailureContext | None = None,
     ) -> ProviderSpeakerEvidenceUpdate | ProviderAudioAccountingReceipt | None:
         """Assign admitted Provider PCM to a physical-segment FIFO.
 
@@ -5956,6 +6024,7 @@ class DetectorRuntime:
                 and type(speaker_evidence_lease) is not ProviderSpeakerEvidenceLease
             )
         ):
+            self._record_provider_audio_failure(failure_context, "audio_argument_invalid")
             return
         async with self._lock:
             if (
@@ -5970,6 +6039,15 @@ class DetectorRuntime:
                     != self._provider_audio_timeline_generation
                 )
             ):
+                check = (
+                    "detector_closed" if self._closed else
+                    "detector_semantic_owner" if self._semantic_adapter is not None else
+                    "detector_epoch_changed" if identity.detector_epoch != self._detector_epoch else
+                    "detector_ingress_changed" if identity.ingress_token != self._ingress_token else
+                    "detector_sequence_ahead" if identity.sequence_no > self._sequence_no else
+                    "audio_timeline_changed"
+                )
+                self._record_provider_audio_failure(failure_context, check)
                 return
             if accounting_only:
                 return self._account_provider_audio_without_evidence_locked(
@@ -5978,6 +6056,7 @@ class DetectorRuntime:
                     identity=identity,
                     sequence_no=sequence_no,
                     speaker_evidence_lease=speaker_evidence_lease,
+                    failure_context=failure_context,
                 )
             evidence_state = (
                 self._provider_speaker_evidence_state_for(speaker_evidence_lease)
@@ -5988,6 +6067,16 @@ class DetectorRuntime:
                 self._speaker_rejection_prepare_diagnostics[
                     "provider_speaker_evidence_lease_stale_count"
                 ] += 1
+                state = self._provider_speaker_evidence_state
+                check = (
+                    "speaker_lease_foreign_owner"
+                    if speaker_evidence_lease._owner is not self._provider_speaker_evidence_owner else
+                    "speaker_lease_epoch_changed"
+                    if speaker_evidence_lease.detector_epoch != self._detector_epoch
+                    or speaker_evidence_lease.candidate.detector_epoch != self._detector_epoch else
+                    "speaker_lease_retired" if state is None else "speaker_lease_other_owner"
+                )
+                self._record_provider_audio_failure(failure_context, check)
                 return None
             previous_sequence = self._provider_segment_last_sequence_no
             evidence_previous_sequence = (
@@ -6000,6 +6089,7 @@ class DetectorRuntime:
                 self._speaker_rejection_prepare_diagnostics[
                     "provider_speaker_segment_sequence_stale_count"
                 ] += 1
+                self._record_provider_audio_failure(failure_context, "audio_sequence_stale")
                 return
             self._provider_segment_last_sequence_no = sequence_no
             sequence_gap = bool(
@@ -6061,6 +6151,7 @@ class DetectorRuntime:
                 sample_rate_hz,
             )
             if canonical_sample_count <= 0 or canonical_remainder:
+                self._record_provider_audio_failure(failure_context, "audio_sample_alignment")
                 self._provider_segment_alignment_lost = True
                 self._mark_provider_segments_incomplete()
                 self._mark_provider_micro_event_ambiguous(
@@ -6077,6 +6168,7 @@ class DetectorRuntime:
 
             sealed_through = self._provider_speaker_sealed_through_sequence_no
             if sealed_through is not None and identity.sequence_no <= sealed_through:
+                self._record_provider_audio_failure(failure_context, "audio_after_sealed_fence")
                 fence = self._provider_candidate_fence
                 if (
                     fence is not None
@@ -6140,6 +6232,7 @@ class DetectorRuntime:
                 if len(self._provider_speaker_segments) >= (
                     _PROVIDER_SEGMENT_FIFO_LIMIT
                 ):
+                    self._record_provider_audio_failure(failure_context, "audio_segment_capacity")
                     self._speaker_rejection_prepare_diagnostics[
                         "provider_speaker_segment_overflow_fail_open_count"
                     ] += 1

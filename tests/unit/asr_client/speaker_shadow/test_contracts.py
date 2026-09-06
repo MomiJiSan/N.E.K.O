@@ -185,12 +185,13 @@ def test_config_preserves_legacy_positional_argument_order() -> None:
 
     assert config.idle_unload_seconds == 60.0
     assert config.completion_confirmation_scopes == ()
-    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-5:] == (
+    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-6:] == (
         "completion_confirmation_scopes",
         "pending_observation_gate_scopes",
         "backend_prewarm_scopes",
         "terminal_queue_capacity",
         "completion_queue_capacity",
+        "exact_boundary_pcm_retention_seconds",
     )
 
 

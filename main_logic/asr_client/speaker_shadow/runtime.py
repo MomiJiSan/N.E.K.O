@@ -547,6 +547,7 @@ class _PreparedExactIntervalRecord:
     source_reconciliation_batch_id: int | None
     reserved_data_slots: int
     suffix_scratch_pcm16: bytearray = field(default_factory=bytearray)
+    source_states: tuple[tuple[_FinishState, bool, int | None], ...] = ()
 
 
 @dataclass(slots=True)
@@ -575,6 +576,7 @@ class _CandidateBuffer:
     backend_prewarm_attempted: bool = False
     observed_sample_count: int = 0
     retained_start_sample_count: int = 0
+    exact_boundary_deadline: float | None = None
 
     @property
     def audio_ms(self) -> int:
@@ -708,6 +710,7 @@ class SpeakerShadowRuntime:
         self._buffers: OrderedDict[SpeakerShadowCandidateKey, _CandidateBuffer] = (
             OrderedDict()
         )
+        self._terminal_pcm_expiry_handle: asyncio.TimerHandle | None = None
         self._finalized: OrderedDict[SpeakerShadowCandidateKey, _FinalizedCandidate] = (
             OrderedDict()
         )
@@ -823,7 +826,7 @@ class SpeakerShadowRuntime:
                 and token.finish_state is _FinishState.OPEN
                 and not token.pcm_frozen
             )
-        if len(self._candidate_tokens) >= self._config.buffered_candidate_capacity:
+        if self._buffer_slots_in_use() >= self._config.buffered_candidate_capacity:
             return False
         token = _CandidateToken(
             candidate,
@@ -1061,7 +1064,7 @@ class SpeakerShadowRuntime:
                 or suffix in self._buffers
                 or suffix in self._finalized
                 or self._candidate_was_evicted(suffix)
-                or len(self._candidate_tokens)
+                or self._buffer_slots_in_use()
                 >= self._config.buffered_candidate_capacity
             ):
                 return False
@@ -1296,7 +1299,7 @@ class SpeakerShadowRuntime:
 
         new_candidate_count = int(not target_is_source) + int(suffix is not None)
         if (
-            len(self._candidate_tokens) + new_candidate_count
+            self._buffer_slots_in_use() + new_candidate_count
             > self._config.buffered_candidate_capacity
         ):
             return None
@@ -1369,26 +1372,145 @@ class SpeakerShadowRuntime:
             return "stale"
         return record.state
 
+    def _retains_terminal_boundary_pcm(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        return bool(
+            candidate.scope == "provider_candidate"
+            and candidate.scope in self._config.pending_observation_gate_scopes
+            and self._config.exact_boundary_pcm_retention_seconds > 0
+        )
+
+    def _buffer_slots_in_use(self) -> int:
+        return len(set(self._candidate_tokens) | set(self._buffers))
+
+    def _candidate_pcm_is_reserved(self, candidate: SpeakerShadowCandidateKey) -> bool:
+        buffer = self._buffers.get(candidate)
+        if buffer is None:
+            return False
+        token = buffer.token
+        batch_id = token.reconciliation_batch_id
+        exact = self._prepared_exact_intervals.get(batch_id)
+        if exact is not None and any(item.token is token for item in exact.marker.sources):
+            return True
+        applied = self._reconciliations.get(batch_id)
+        if applied is not None and applied.state == "pending" and any(item.token is token for item in applied.marker.sources):
+            return True
+        markers = [item.marker for item in self._prepared_terminal_coverages.values()]
+        markers.extend(item.marker for item in self._terminal_coverages.values() if item.state == "pending")
+        return any(marker.target_token is token or any(
+            item.token is token for item in marker.reserved_sources
+        ) for marker in markers)
+
+    def _retained_terminal_source_is_current(
+        self, candidate: SpeakerShadowCandidateKey, token: _CandidateToken,
+    ) -> bool:
+        finalized = self._finalized.get(candidate)
+        buffer = self._buffers.get(candidate)
+        return bool(
+            not self._closed and not self._resetting
+            and finalized is not None and finalized.token is token
+            and finalized.terminal_reason == token.terminal_reason == "scored"
+            and buffer is not None and buffer.token is token
+            and buffer.exact_boundary_deadline is not None
+            and time.monotonic() < buffer.exact_boundary_deadline
+            and not self._candidate_was_evicted(candidate, token=token)
+        )
+
+    def _exact_source_token(self, candidate: SpeakerShadowCandidateKey) -> _CandidateToken | None:
+        token = self._candidate_tokens.get(candidate)
+        if token is not None and token.terminal_reason is None:
+            return token
+        finalized = self._finalized.get(candidate)
+        token = finalized.token if finalized is not None else None
+        return token if token is not None and self._retained_terminal_source_is_current(candidate, token) else None
+
+    def _schedule_terminal_pcm_expiry(self) -> None:
+        handle = self._terminal_pcm_expiry_handle
+        if handle is not None:
+            handle.cancel()
+        self._terminal_pcm_expiry_handle = None
+        deadlines = [buffer.exact_boundary_deadline for buffer in self._buffers.values()
+                     if buffer.exact_boundary_deadline is not None]
+        if deadlines and not self._closed and not self._resetting:
+            self._terminal_pcm_expiry_handle = asyncio.get_running_loop().call_later(
+                max(.001, min(deadlines) - time.monotonic()), self._expire_terminal_pcm,
+            )
+
+    def _expire_terminal_pcm(self) -> None:
+        self._terminal_pcm_expiry_handle = None
+        now = time.monotonic()
+        for candidate, buffer in tuple(self._buffers.items()):
+            if buffer.exact_boundary_deadline is None or now < buffer.exact_boundary_deadline:
+                continue
+            batch_id = buffer.token.reconciliation_batch_id
+            prepared = self._prepared_exact_intervals.get(batch_id)
+            if prepared is not None and any(item.token is buffer.token for item in prepared.marker.sources):
+                self._abort_prepared_exact_interval_record(prepared)
+            committed = self._reconciliations.get(batch_id)
+            if (committed is not None and committed.state == "pending"
+                    and any(item.token is buffer.token for item in committed.marker.sources)):
+                self._fail_candidate_batch_reconciliation(committed.marker)
+            if self._buffers.get(candidate) is buffer:
+                self._buffers.pop(candidate, None)
+                self._wipe_bytearray(buffer.pcm16)
+        self._schedule_terminal_pcm_expiry()
+
+    def exact_interval_requires_fresh_target(
+        self,
+        source: SpeakerShadowReconcileSource,
+    ) -> bool:
+        """Prove that owned PCM can be scored under a fresh exact identity.
+
+        This grants no score authority or reservation. The ordinary prepare
+        must still validate and freeze the actual source and queue budgets.
+        A scored source must retain its original buffer, identity and unexpired
+        boundary deadline. This neither revives its token nor reconstructs PCM.
+        """
+
+        if self._resetting or not self.enabled or type(source) is not SpeakerShadowReconcileSource:
+            return False
+        token = self._exact_source_token(source.candidate)
+        buffer = self._buffers.get(source.candidate)
+        return bool(
+            token is not None
+            and token.finish_state is _FinishState.OPEN
+            and not token.pcm_frozen
+            and token.reconciliation_batch_id is None
+            and not self._candidate_was_evicted(source.candidate, token=token)
+            and token.sample_rate_hz == SPEAKER_SHADOW_SAMPLE_RATE_HZ
+            and token.accepted_sample_count == source.expected_sample_count
+            and source.keep_start_sample == 0
+            and buffer is not None
+            and buffer.token is token
+            and buffer.sample_rate_hz == SPEAKER_SHADOW_SAMPLE_RATE_HZ
+            and source.keep_end_sample <= buffer.sample_count <= source.expected_sample_count
+            and len(buffer.pcm16) == buffer.sample_count * 2
+            and (
+                self._evaluated_through_samples(source.candidate, token) > source.keep_end_sample
+                or (
+                    self._active_evaluation == (self._generation, source.candidate)
+                    and self._active_evaluation_terminal
+                    and token.anchor_applied
+                    and self._retains_terminal_boundary_pcm(source.candidate)
+                )
+            )
+        )
+
     def prepare_exact_interval(
         self,
         request: SpeakerShadowBatchReconcileRequest,
     ) -> SpeakerShadowBatchReconcileReceipt | None:
-        """Freeze and reserve one live-candidate split without publishing it.
-
-        The Detector exact-interval seam deliberately accepts one stable
-        evidence candidate.  Existing multi-candidate and finalized coverage
-        paths keep using their immediate reconcile APIs.
-        """
+        """Reserve an ordered prefix/suffix split of bounded, owned buffers."""
 
         if (
             self._resetting
             or not self.enabled
             or type(request) is not SpeakerShadowBatchReconcileRequest
             or not request.finish_target
-            or len(request.sources) != 1
+            or not 0 < len(request.sources) <= self._config.buffered_candidate_capacity
         ):
             return None
         source = request.sources[0]
+        source_candidates = {item.candidate for item in request.sources}
         target = request.target
         suffix = request.suffix
         if (
@@ -1404,22 +1526,44 @@ class SpeakerShadowRuntime:
                     or suffix in {source.candidate, target}
                 )
             )
-            or source.keep_end_sample <= source.keep_start_sample
+            or len(source_candidates) != len(request.sources)
+            or (len(request.sources) > 1 and any(item.keep_start_sample != 0 for item in request.sources))
+            or any(item.candidate.scope != source.candidate.scope
+                   or item.candidate.detector_epoch != source.candidate.detector_epoch
+                   for item in request.sources)
+            or target in source_candidates - {source.candidate}
+            or suffix in source_candidates
         ):
             return None
-
-        source_token = self._candidate_tokens.get(source.candidate)
-        if (
-            source_token is None
-            or source_token.terminal_reason is not None
-            or source_token.finish_state is not _FinishState.OPEN
-            or source_token.pcm_frozen
-            or source_token.reconciliation_batch_id is not None
-            or source.candidate in self._finalized
-            or self._candidate_was_evicted(source.candidate, token=source_token)
-            or source_token.sample_rate_hz != SPEAKER_SHADOW_SAMPLE_RATE_HZ
-            or source_token.accepted_sample_count != source.expected_sample_count
-        ):
+        sources: list[_ReservedReconcileSource] = []
+        suffix_started = False
+        for item in request.sources:
+            token = self._exact_source_token(item.candidate)
+            if (
+                token is None or token.finish_state is not _FinishState.OPEN
+                or token.pcm_frozen or token.reconciliation_batch_id is not None
+                or self._candidate_was_evicted(item.candidate, token=token)
+                or token.sample_rate_hz != SPEAKER_SHADOW_SAMPLE_RATE_HZ
+                or token.accepted_sample_count != item.expected_sample_count
+                or (suffix_started and item.keep_end_sample != 0)
+                or (token.terminal_reason is not None and target == item.candidate)
+            ):
+                return None
+            suffix_started |= item.keep_end_sample < item.expected_sample_count
+            sources.append(_ReservedReconcileSource(item, token))
+        source_token = sources[0].token
+        protected_terminals = {
+            candidate for candidate in self._finalized
+            if candidate in source_candidates or self._candidate_pcm_is_reserved(candidate)
+        }
+        if self._active_evaluation_terminal and self._active_evaluation is not None:
+            active_generation, active_candidate = self._active_evaluation
+            if active_generation == self._generation and (
+                active_candidate in source_candidates
+                or self._candidate_pcm_is_reserved(active_candidate)
+            ):
+                protected_terminals.add(active_candidate)
+        if len(protected_terminals) > self._config.finalized_candidate_capacity:
             return None
 
         target_is_source = target == source.candidate
@@ -1441,7 +1585,7 @@ class SpeakerShadowRuntime:
                 return None
             target_token = _CandidateToken(target, SPEAKER_SHADOW_SAMPLE_RATE_HZ)
 
-        suffix_sample_count = source.expected_sample_count - source.keep_end_sample
+        suffix_sample_count = sum(item.expected_sample_count - item.keep_end_sample for item in request.sources)
         if suffix_sample_count > 0 and suffix is None:
             return None
         if suffix is not None and (
@@ -1452,16 +1596,16 @@ class SpeakerShadowRuntime:
         ):
             return None
 
-        target_sample_count = source.keep_end_sample - source.keep_start_sample
+        target_sample_count = sum(item.keep_end_sample - item.keep_start_sample for item in request.sources)
         maximum_samples = (
             SPEAKER_SHADOW_SAMPLE_RATE_HZ * self._config.maximum_audio_ms // 1_000
         )
-        if target_sample_count <= 0 or target_sample_count > maximum_samples:
+        if target_sample_count <= 0 or target_sample_count > maximum_samples or suffix_sample_count > maximum_samples:
             return None
         new_candidate_count = int(not target_is_source) + int(suffix is not None)
         reserved_data_slots = 1 + int(suffix is not None)
         if (
-            len(self._candidate_tokens) + new_candidate_count
+            self._buffer_slots_in_use() + new_candidate_count
             > self._config.buffered_candidate_capacity
             or self._queued_data_item_count + reserved_data_slots
             > self._config.queue_capacity
@@ -1513,7 +1657,7 @@ class SpeakerShadowRuntime:
         marker = _CandidateBatchReconciliation(
             generation=self._generation,
             batch_id=batch_id,
-            sources=(_ReservedReconcileSource(source, source_token),),
+            sources=tuple(sources),
             target=target,
             target_token=target_token,
             target_was_existing=target_is_source,
@@ -1526,11 +1670,13 @@ class SpeakerShadowRuntime:
         )
         record = _PreparedExactIntervalRecord(
             marker=marker,
-            source_accepted_sample_count=source_token.accepted_sample_count,
+            source_accepted_sample_count=sum(item.expected_sample_count for item in request.sources),
             source_finish_state=source_token.finish_state,
             source_pcm_frozen=source_token.pcm_frozen,
             source_reconciliation_batch_id=source_token.reconciliation_batch_id,
             reserved_data_slots=reserved_data_slots,
+            source_states=tuple((item.token.finish_state, item.token.pcm_frozen,
+                                 item.token.reconciliation_batch_id) for item in sources),
         )
 
         # No await occurs after capacity validation.  Reserve both logical
@@ -1538,8 +1684,9 @@ class SpeakerShadowRuntime:
         self._next_reconciliation_batch_id += 1
         self._queued_data_item_count += reserved_data_slots
         self._queued_terminal_count += 1
-        source_token.pcm_frozen = True
-        source_token.reconciliation_batch_id = batch_id
+        for item in sources:
+            item.token.pcm_frozen = True
+            item.token.reconciliation_batch_id = batch_id
         target_token.accepted_sample_count = target_sample_count
         target_token.pcm_frozen = True
         target_token.reconciliation_batch_id = batch_id
@@ -1575,10 +1722,10 @@ class SpeakerShadowRuntime:
         source_token = source.token
         suffix_token = marker.suffix_token
         if (
-            self._candidate_tokens.get(source.source.candidate) is not source_token
-            or source_token.terminal_reason is not None
-            or not source_token.pcm_frozen
-            or source_token.reconciliation_batch_id != marker.batch_id
+            any(self._exact_source_token(item.source.candidate) is not item.token
+                or not item.token.pcm_frozen
+                or item.token.reconciliation_batch_id != marker.batch_id
+                for item in marker.sources)
             or self._candidate_tokens.get(marker.target) is not marker.target_token
             or marker.target_token.finish_state is not _FinishState.QUEUED
             or not marker.target_token.pcm_frozen
@@ -1667,7 +1814,7 @@ class SpeakerShadowRuntime:
             return False
         self._prepared_exact_intervals.pop(marker.batch_id, None)
         staged_frame = None
-        source = marker.sources[0]
+        source = marker.sources[-1]
         source_token = source.token
         staged_audio_restored = not bool(
             restore_staged_audio and record.suffix_scratch_pcm16
@@ -1677,22 +1824,38 @@ class SpeakerShadowRuntime:
             and not self._resetting
             and not self._closed
             and record.suffix_scratch_pcm16
-            and self._candidate_tokens.get(source.source.candidate) is source_token
+            and self._exact_source_token(source.source.candidate) is source_token
             and self._ensure_worker()
         ):
-            staged_frame = _AudioFrame(
-                generation=self._generation,
-                candidate=source.source.candidate,
-                token=source_token,
-                pcm16=record.suffix_scratch_pcm16,
-                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
-                sample_count=len(record.suffix_scratch_pcm16) // 2,
-            )
-            try:
-                self._queue.put_nowait(staged_frame)
-                staged_audio_restored = True
-            except asyncio.QueueFull:
-                staged_frame = None
+            if source_token.terminal_reason == "scored":
+                buffer = self._buffers.get(source.source.candidate)
+                extra_samples = len(record.suffix_scratch_pcm16) // 2
+                if (
+                    buffer is not None and buffer.token is source_token
+                    and buffer.sample_count + extra_samples
+                    <= SPEAKER_SHADOW_SAMPLE_RATE_HZ * self._config.maximum_audio_ms // 1000
+                    and self._retained_pcm_bytes() + len(record.suffix_scratch_pcm16)
+                    <= MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES
+                ):
+                    buffer.pcm16.extend(record.suffix_scratch_pcm16)
+                    buffer.sample_count += extra_samples
+                    buffer.observed_sample_count += extra_samples
+                    source_token.accepted_sample_count = buffer.sample_count
+                    self._wipe_bytearray(record.suffix_scratch_pcm16)
+                    record.suffix_scratch_pcm16 = bytearray()
+                    staged_audio_restored = True
+            else:
+                staged_frame = _AudioFrame(
+                    generation=self._generation, candidate=source.source.candidate,
+                    token=source_token, pcm16=record.suffix_scratch_pcm16,
+                    sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                    sample_count=len(record.suffix_scratch_pcm16) // 2,
+                )
+                try:
+                    self._queue.put_nowait(staged_frame)
+                    staged_audio_restored = True
+                except asyncio.QueueFull:
+                    staged_frame = None
         retired_data_slots = record.reserved_data_slots - int(staged_frame is not None)
         self._queued_data_item_count = max(
             0,
@@ -1702,21 +1865,31 @@ class SpeakerShadowRuntime:
         if self._queued_terminal_count == 0:
             self._clear_degraded_cause("terminal_overflow")
 
-        if self._candidate_tokens.get(source.source.candidate) is source_token:
-            source_token.accepted_sample_count = (
-                record.source_accepted_sample_count
-                + (staged_frame.sample_count if staged_frame is not None else 0)
+        for index, item in enumerate(marker.sources):
+            token = item.token
+            finalized = self._finalized.get(item.source.candidate)
+            if (
+                self._candidate_tokens.get(item.source.candidate) is not token
+                and (finalized is None or finalized.token is not token)
+            ):
+                continue
+            if token.reconciliation_batch_id != marker.batch_id:
+                continue
+            if token.terminal_reason is None:
+                token.accepted_sample_count = item.source.expected_sample_count + (
+                    staged_frame.sample_count if item is source and staged_frame is not None else 0
+                )
+            finish_state, frozen, batch_id = record.source_states[index] if record.source_states else (
+                record.source_finish_state, record.source_pcm_frozen, record.source_reconciliation_batch_id,
             )
-            source_token.finish_state = record.source_finish_state
-            source_token.pcm_frozen = record.source_pcm_frozen
-            source_token.reconciliation_batch_id = (
-                record.source_reconciliation_batch_id
-            )
+            token.finish_state = finish_state
+            token.pcm_frozen = frozen
+            token.reconciliation_batch_id = batch_id
         for candidate, token in (
             (marker.target, marker.target_token),
             (marker.suffix, marker.suffix_token),
         ):
-            if candidate is None or token is None or token is source_token:
+            if candidate is None or token is None or any(token is item.token for item in marker.sources):
                 continue
             if self._candidate_tokens.get(candidate) is token:
                 self._candidate_tokens.pop(candidate, None)
@@ -1867,7 +2040,7 @@ class SpeakerShadowRuntime:
         )
         new_candidate_count = int(suffix is not None)
         if (
-            len(self._candidate_tokens) + new_candidate_count
+            self._buffer_slots_in_use() + new_candidate_count
             > self._config.buffered_candidate_capacity
         ):
             return None
@@ -2471,7 +2644,7 @@ class SpeakerShadowRuntime:
                 record
                 for record in self._prepared_exact_intervals.values()
                 if record.marker.generation == self._generation
-                and record.marker.sources[0].source.candidate == candidate
+                and record.marker.sources[-1].source.candidate == candidate
             ),
             None,
         )
@@ -2523,6 +2696,15 @@ class SpeakerShadowRuntime:
                 token=token,
             )
         if token is None:
+            if (
+                self._buffer_slots_in_use() >= self._config.buffered_candidate_capacity
+                and (self._prepared_exact_intervals
+                     or any(item.state == "pending" for item in self._reconciliations.values())
+                     or self._prepared_terminal_coverages
+                     or any(item.state == "pending" for item in self._terminal_coverages.values())
+                     or any(buffer.exact_boundary_deadline is not None for buffer in self._buffers.values()))
+            ):
+                return self._capture_result(candidate, unavailable=True)
             token = _CandidateToken(candidate, sample_rate_hz)
         elif token.sample_rate_hz == 0 and token.deferred_requested:
             token.sample_rate_hz = sample_rate_hz
@@ -2705,12 +2887,12 @@ class SpeakerShadowRuntime:
         """Retain post-boundary PCM behind an unpublished suffix reservation."""
 
         marker = record.marker
-        source = marker.sources[0]
+        source = marker.sources[-1]
         suffix_token = marker.suffix_token
         if (
             marker.suffix is None
             or suffix_token is None
-            or self._candidate_tokens.get(source.source.candidate) is not source.token
+            or self._exact_source_token(source.source.candidate) is not source.token
             or self._candidate_tokens.get(marker.suffix) is not suffix_token
             or source.token.reconciliation_batch_id != marker.batch_id
             or suffix_token.reconciliation_batch_id != marker.batch_id
@@ -3397,6 +3579,7 @@ class SpeakerShadowRuntime:
                 _AudioFrame,
                 _CandidateDeferred,
                 _CandidateActivated,
+                _CandidateAnchored,
                 _CandidatePrefixReconciliation,
             ),
         ):
@@ -3741,8 +3924,7 @@ class SpeakerShadowRuntime:
                 else _FinishState.OPEN
             )
             if (
-                self._candidate_tokens.get(source.candidate) is not token
-                or token.terminal_reason is not None
+                self._exact_source_token(source.candidate) is not token
                 or token.finish_state is not expected_finish_state
                 or not token.pcm_frozen
                 or token.reconciliation_batch_id != marker.batch_id
@@ -3823,10 +4005,11 @@ class SpeakerShadowRuntime:
                         ]
                     )
             if marker.suffix is not None:
-                last_source = marker.sources[-1].source
-                last_buffer = source_buffers[-1]
-                assert last_buffer is not None
-                suffix_pcm.extend(last_buffer.pcm16[last_source.keep_end_sample * 2 :])
+                for reserved, buffer in zip(marker.sources, source_buffers, strict=True):
+                    source = reserved.source
+                    if source.keep_end_sample < source.expected_sample_count:
+                        assert buffer is not None
+                        suffix_pcm.extend(buffer.pcm16[source.keep_end_sample * 2 :])
             if (
                 len(target_pcm) != marker.target_sample_count * 2
                 or len(suffix_pcm) != marker.suffix_sample_count * 2
@@ -3908,6 +4091,7 @@ class SpeakerShadowRuntime:
         record.settled.set()
         self._metrics.reconciliation_batch_applied_count += 1
 
+        self._schedule_terminal_pcm_expiry()
         ready = await self._prewarm_candidate_backend(
             generation=marker.generation,
             candidate=marker.target,
@@ -4175,7 +4359,13 @@ class SpeakerShadowRuntime:
         buffer = self._buffers.get(frame.candidate)
         if buffer is None:
             if len(self._buffers) >= self._config.buffered_candidate_capacity:
-                dropped_candidate, dropped_buffer = self._buffers.popitem(last=False)
+                dropped_candidate = next(
+                    (key for key in self._buffers if not self._candidate_pcm_is_reserved(key)), None,
+                )
+                if dropped_candidate is None:
+                    self._drop_candidate(frame.candidate, token=frame.token)
+                    return
+                dropped_buffer = self._buffers.pop(dropped_candidate)
                 self._metrics.dropped_audio_ms += dropped_buffer.audio_ms
                 self._wipe_bytearray(dropped_buffer.pcm16)
                 self._finalize_candidate(
@@ -4416,8 +4606,23 @@ class SpeakerShadowRuntime:
                 if explicit_checkpoints is None
                 else checkpoint_samples
             )
+            retain_boundary = bool(
+                terminal and self._retains_terminal_boundary_pcm(candidate)
+                and token.anchor_applied
+                and token.finish_state is _FinishState.OPEN
+            )
+            if (
+                retain_boundary
+                and self._retained_pcm_bytes() + score_sample_count * 2
+                > MAX_SPEAKER_SHADOW_RETAINED_PCM_BYTES
+            ):
+                # The original terminal PCM remains owned until its boundary.
+                # Account for the scoring copy before allocating it; the
+                # existing global budget separately leaves one host-copy slot.
+                self._drop_candidate(candidate, token=token)
+                return
             candidate_pcm = bytearray(buffer.pcm16[: score_sample_count * 2])
-            if terminal:
+            if terminal and not retain_boundary:
                 self._buffers.pop(candidate, None)
                 self._wipe_bytearray(buffer.pcm16)
             try:
@@ -4450,6 +4655,8 @@ class SpeakerShadowRuntime:
                 candidate,
                 token,
             ):
+                if generation == self._generation and self._retained_terminal_source_is_current(candidate, token):
+                    return
                 retained_buffer = self._buffers.get(candidate)
                 if retained_buffer is buffer:
                     self._buffers.pop(candidate, None)
@@ -5004,6 +5211,11 @@ class SpeakerShadowRuntime:
             marker.token.finish_sample_count = finishing_buffer.sample_count
         self._mark_finish_processed(marker.token)
         if marker.token.terminal_reason is not None:
+            buffer = self._buffers.get(marker.candidate)
+            if buffer is not None and buffer.token is marker.token:
+                self._buffers.pop(marker.candidate, None)
+                self._wipe_bytearray(buffer.pcm16)
+                self._schedule_terminal_pcm_expiry()
             self._record_token_finish(marker.token)
             self._enqueue_completion(
                 marker,
@@ -5396,6 +5608,8 @@ class SpeakerShadowRuntime:
             self._wipe_bytearray(buffer.pcm16)
             if token is None:
                 token = buffer.token
+            if buffer.exact_boundary_deadline is not None:
+                self._schedule_terminal_pcm_expiry()
         self._finalize_candidate(
             candidate,
             "dropped",
@@ -5439,6 +5653,17 @@ class SpeakerShadowRuntime:
             terminal_reason=terminal_reason,
             token=token,
         )
+        buffer = self._buffers.get(candidate)
+        if (
+            terminal_reason == "scored" and token is not None
+            and token.finish_state is _FinishState.OPEN
+            and token.anchor_applied
+            and self._retains_terminal_boundary_pcm(candidate)
+            and buffer is not None and buffer.token is token
+            and buffer.exact_boundary_deadline is None
+        ):
+            buffer.exact_boundary_deadline = time.monotonic() + self._config.exact_boundary_pcm_retention_seconds
+            self._schedule_terminal_pcm_expiry()
         counter_name = f"{terminal_reason}_candidate_count"
         setattr(
             self._metrics,
@@ -5446,7 +5671,18 @@ class SpeakerShadowRuntime:
             getattr(self._metrics, counter_name) + 1,
         )
         while len(self._finalized) > self._config.finalized_candidate_capacity:
-            evicted_candidate, _ = self._finalized.popitem(last=False)
+            evicted_candidate = next(
+                (key for key in self._finalized if not self._candidate_pcm_is_reserved(key)), None,
+            )
+            if evicted_candidate is None:
+                # Prepare reserves room for in-flight terminal results as well
+                # as existing tombstones. Never destroy a source if metadata
+                # outside that contract nevertheless exhausts all victims.
+                break
+            self._finalized.pop(evicted_candidate, None)
+            evicted_buffer = self._buffers.pop(evicted_candidate, None)
+            if evicted_buffer is not None:
+                self._wipe_bytearray(evicted_buffer.pcm16)
             self._record_evicted_candidate(evicted_candidate)
 
     def _emit_diagnostic(
@@ -5703,6 +5939,9 @@ class SpeakerShadowRuntime:
         )
 
     def _clear_buffers(self) -> None:
+        if self._terminal_pcm_expiry_handle is not None:
+            self._terminal_pcm_expiry_handle.cancel()
+            self._terminal_pcm_expiry_handle = None
         for buffer in self._buffers.values():
             self._wipe_bytearray(buffer.pcm16)
         self._buffers.clear()

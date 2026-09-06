@@ -16,6 +16,7 @@ from main_logic.voice_turn.contracts import VoiceTurnToken
 
 from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
+from ..speaker_evidence.contracts import EvidenceProof, EvidenceStatus, ProviderEvidenceBinding
 
 
 class ProviderBindingState(StrEnum):
@@ -106,6 +107,7 @@ class RejectionCapabilityKind(StrEnum):
 class AdmissionOperationKind(StrEnum):
     APPLY_REJECTION = "apply_rejection"
     FINAL_DEADLINE = "final_deadline"
+    EVIDENCE_DEADLINE = "evidence_deadline"
     REVOKE_CAPABILITY = "revoke_capability"
     POISON_SPEAKER_NAMESPACE = "poison_speaker_namespace"
 
@@ -652,6 +654,16 @@ class AdmissionOperationTicket:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceHoldRecord:
+    binding: ProviderEvidenceBinding
+    ticket: AdmissionOperationTicket
+    first_final_received_at: float
+    absolute_deadline: float
+    status: EvidenceStatus = EvidenceStatus.PENDING
+    proof: EvidenceProof | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionResolutionTicket:
     turn_token: VoiceTurnToken
     record_generation: int
@@ -733,10 +745,15 @@ class VoiceTurnAdmissionRecord:
     partial_settlement_disposition: AdmissionDisposition | None = None
     speaker_deny_cleanup_failed_counted: bool = False
     exact_interval_hold_id: int | None = None
+    evidence_hold_enabled: bool = False
+    evidence_hold: EvidenceHoldRecord | None = None
+    evidence_order_blocked: bool = False
 
     def __post_init__(self) -> None:
         if type(self.turn_token) is not VoiceTurnToken:
             raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.evidence_hold_enabled) is not bool:
+            raise TypeError("evidence_hold_enabled must be bool")
         if type(self.record_generation) is not int or self.record_generation < 1:
             raise ValueError("record_generation must be a positive integer")
         for name in (
@@ -916,6 +933,33 @@ class SpeakerAuthorityNamespacePoisonFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceHoldRequested:
+    binding: ProviderEvidenceBinding
+    first_final_received_at: float
+    hard_deadline: float | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not ProviderEvidenceBinding:
+            raise TypeError("binding must be ProviderEvidenceBinding")
+        if not math.isfinite(self.first_final_received_at) or self.first_final_received_at < 0:
+            raise ValueError("first final receipt time must be finite and non-negative")
+        if self.hard_deadline is not None and not math.isfinite(self.hard_deadline):
+            raise ValueError("hard deadline must be finite")
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceHoldResolved:
+    ticket: AdmissionOperationTicket
+    proof: EvidenceProof
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceDeadlineExpired:
+    ticket: AdmissionOperationTicket
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderFinalReceived:
     final: PendingProviderFinal
 
@@ -985,6 +1029,9 @@ class RouteReplaced:
 
 AdmissionEvent: TypeAlias = (
     TurnOpened
+    | EvidenceHoldRequested
+    | EvidenceHoldResolved
+    | EvidenceDeadlineExpired
     | ProviderBound
     | SpeakerAuthorityPending
     | SpeakerAuthorityUnarmed
@@ -1024,6 +1071,12 @@ class ApplyRejection:
     ticket: AdmissionOperationTicket
     capability: RejectionCapability
     absolute_deadline: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleEvidenceDeadline:
+    ticket: AdmissionOperationTicket
+    absolute_deadline: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -1129,6 +1182,7 @@ class CountDiagnostic:
 
 AdmissionEffect: TypeAlias = (
     ApplyRejection
+    | ScheduleEvidenceDeadline
     | ConstrainRejectionDeadline
     | ScheduleFinalDeadline
     | ResolveReserved
@@ -1195,6 +1249,9 @@ class SpeakerLeaseTransitionReceipt:
     frozen_children: tuple[SpeakerLeaseChildBinding, ...]
     child_results: tuple[AdmissionBulkResult, ...]
     diagnostics: tuple[AdmissionEffect, ...]
+    # Other turns released by this transition retain their own effect tickets.
+    # They must never be absorbed by the originating lease's DENY cleanup.
+    successor_effects: tuple[AdmissionEffect, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.lease_token) is not SpeakerCaptureLeaseToken:

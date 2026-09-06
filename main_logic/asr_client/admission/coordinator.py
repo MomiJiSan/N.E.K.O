@@ -12,6 +12,8 @@ from main_logic.voice_turn.contracts import VoiceTurnToken
 
 from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
+from ..speaker_evidence import EvidenceStatus
+from .evidence_hold import EVIDENCE_HOLD_EVENT_TYPES
 from .contracts import (
     AdmissionDisposition,
     AdmissionState,
@@ -24,6 +26,8 @@ from .contracts import (
     CaptureState,
     Close,
     EvidenceState,
+    EvidenceDeadlineExpired,
+    FinalDeadlineExpired,
     ExactIntervalActivationReceipt,
     ExactIntervalActivationResult,
     ExactIntervalAbortResult,
@@ -59,6 +63,7 @@ from .contracts import (
     SpeakerLow,
     SpeakerUnavailable,
     VoiceTurnAdmissionRecord,
+    TurnOpened,
 )
 from .reducer import hold_exact_interval_final, reduce, resolve_exact_interval
 from .diagnostics import resolution_diagnostics
@@ -107,6 +112,7 @@ class VoiceTurnAdmissionCoordinator:
         speaker_lease_child_capacity: int = MAX_SPEAKER_LEASE_CHILDREN,
         retired_speaker_lease_capacity: int = 256,
         clock: Callable[[], float] = time.monotonic,
+        evidence_hold_enabled: bool = False,
     ) -> None:
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("capacity must be a positive integer")
@@ -129,6 +135,9 @@ class VoiceTurnAdmissionCoordinator:
                 f"{MAX_SPEAKER_LEASE_CHILDREN}"
             )
         self._capacity = capacity
+        if type(evidence_hold_enabled) is not bool:
+            raise TypeError("evidence_hold_enabled must be bool")
+        self._evidence_hold_enabled = evidence_hold_enabled
         self._speaker_lease_capacity = speaker_lease_capacity
         self._speaker_lease_child_capacity = speaker_lease_child_capacity
         self._retired_speaker_lease_capacity = retired_speaker_lease_capacity
@@ -339,6 +348,7 @@ class VoiceTurnAdmissionCoordinator:
             if existing is None:
                 self._record_generation += 1
                 record = VoiceTurnAdmissionRecord(
+                    evidence_hold_enabled=self._evidence_hold_enabled,
                     turn_token=turn_token,
                     record_generation=self._record_generation,
                     provider_binding_state=ProviderBindingState.BOUND,
@@ -980,6 +990,8 @@ class VoiceTurnAdmissionCoordinator:
             event,
             (
                 ProviderFinalReceived,
+                *EVIDENCE_HOLD_EVENT_TYPES,
+                FinalDeadlineExpired,
                 SpeakerLeaseCaptureClosed,
                 SpeakerLeaseHigh,
                 SpeakerLeaseLow,
@@ -1016,7 +1028,10 @@ class VoiceTurnAdmissionCoordinator:
                     ExactIntervalOutcome.STALE,
                 )
             evidence = exact.evidence
-            if evidence.terminal_disposition is None and authority_is_current is not None:
+            if (
+                evidence.terminal_disposition is None and authority_is_current is not None
+                and not isinstance(event, (EvidenceDeadlineExpired, FinalDeadlineExpired))
+            ):
                 try:
                     authority_current = authority_is_current() is True
                 except Exception:
@@ -1032,6 +1047,13 @@ class VoiceTurnAdmissionCoordinator:
                         effects=(),
                     )
             exact.post_started = True
+
+            local_effects: tuple[AdmissionEffect, ...] = ()
+            if isinstance(event, (*EVIDENCE_HOLD_EVENT_TYPES, FinalDeadlineExpired)):
+                child, local_effects = reduce(child, event, self._clock())
+                exact.child_logical_revision = child.logical_revision
+                self._records[scope.turn_token] = child
+                return self._finish_exact_transition(exact, child, local_effects)
 
             if isinstance(event, ProviderFinalReceived):
                 if event.final.provider_key != scope.provider_key:
@@ -1050,6 +1072,14 @@ class VoiceTurnAdmissionCoordinator:
                     exact.child_logical_revision = updated_child.logical_revision
                     self._records[scope.turn_token] = updated_child
                     child = updated_child
+                if child.evidence_hold is not None:
+                    # The exact path normally holds a final without generic
+                    # scheduling. Independent evidence waiting still retires
+                    # the separate 200ms operation budget.
+                    from .reducer import _schedule_deadline_if_needed
+                    child, local_effects = _schedule_deadline_if_needed(child)
+                    exact.child_logical_revision = child.logical_revision
+                    self._records[scope.turn_token] = child
             else:
                 if getattr(event, "candidate", None) != scope.target_candidate:
                     return self._exact_interval_transition_failure(
@@ -1103,43 +1133,116 @@ class VoiceTurnAdmissionCoordinator:
                 evidence = reduced
                 child = updated_child
 
-            disposition = evidence.terminal_disposition
-            if (
-                disposition
-                not in {AdmissionDisposition.FORWARD, AdmissionDisposition.DROP}
-                or child.pending_final is None
-            ):
-                return ExactIntervalTransitionReceipt(
-                    interval_id=receipt.interval_id,
-                    outcome=ExactIntervalOutcome.HELD,
-                    disposition=None,
-                    effects=(),
-                )
-            try:
-                resolved, effects = resolve_exact_interval(child, disposition)
-            except ValueError:
-                return self._exact_interval_transition_failure(
-                    receipt,
-                    ExactIntervalOutcome.CONFLICT,
-                )
-            self._records[scope.turn_token] = resolved
-            self._exact_interval_records.pop(receipt._token, None)
-            if (
-                self._exact_interval_candidate_bindings.get(
-                    scope.target_candidate
-                )
-                is receipt._token
-            ):
-                self._exact_interval_candidate_bindings.pop(
-                    scope.target_candidate,
-                    None,
-                )
+            return self._finish_exact_transition(exact, child, local_effects)
+
+    @staticmethod
+    def _evidence_key_order(record: VoiceTurnAdmissionRecord) -> tuple[int, int, int]:
+        key = record.provider_key
+        return (key.generation, key.buffer_epoch, key.utterance_id) if key is not None else (-1, -1, -1)
+
+    def _with_evidence_order(self, record: VoiceTurnAdmissionRecord) -> VoiceTurnAdmissionRecord:
+        if not record.evidence_hold_enabled or record.provider_key is None:
+            return record
+        order = self._evidence_key_order(record)
+        blocked = any(
+            other.turn_token != record.turn_token
+            and other.turn_token.ingress == record.turn_token.ingress
+            and other.provider_key is not None
+            and self._evidence_key_order(other) < order
+            and other.terminal_disposition is None
+            and (other.evidence_hold is None or record.evidence_hold is None
+                 or other.evidence_hold.binding.target_range.timeline
+                 == record.evidence_hold.binding.target_range.timeline)
+            for other in self._records.values()
+        )
+        if blocked == record.evidence_order_blocked:
+            return record
+        return replace(record, evidence_order_blocked=blocked,
+                       logical_revision=record.logical_revision + 1)
+
+    def _drain_evidence_successors(self) -> tuple[AdmissionEffect, ...]:
+        effects: list[AdmissionEffect] = []
+        for before in sorted(tuple(self._records.values()), key=self._evidence_key_order):
+            child = self._records.get(before.turn_token)
+            if (child is None or not child.evidence_hold_enabled
+                or child.terminal_disposition is not None or child.pending_final is None):
+                continue
+            child = self._with_evidence_order(child)
+            self._records[child.turn_token] = child
+            exact = next((item for item in self._exact_interval_records.values()
+                          if item.activation_receipt is not None
+                          and item.promotion_receipt.scope.turn_token == child.turn_token
+                          and item.activation_receipt.interval_id == child.exact_interval_hold_id), None)
+            if exact is not None:
+                exact.child_logical_revision = child.logical_revision
+                effects.extend(self._resolve_ready_exact(exact, child).effects)
+            else:
+                child, emitted = reduce(child, TurnOpened(child.turn_token), self._clock())
+                self._records[child.turn_token] = child
+                effects.extend(emitted)
+        return tuple(effects)
+
+    def _finish_exact_transition(self, exact, child, effects):
+        result = self._resolve_ready_exact(exact, child, effects)
+        successors = self._drain_evidence_successors()
+        return replace(result, effects=(*result.effects, *successors)) if successors else result
+
+    def _resolve_ready_exact(
+        self, exact: _ExactIntervalRecord, child: VoiceTurnAdmissionRecord,
+        local_effects: tuple[AdmissionEffect, ...] = (),
+    ) -> ExactIntervalTransitionReceipt:
+        receipt = exact.activation_receipt
+        assert receipt is not None
+        child = self._with_evidence_order(child)
+        self._records[child.turn_token] = child
+        exact.child_logical_revision = child.logical_revision
+        scope = exact.promotion_receipt.scope
+        disposition = exact.evidence.terminal_disposition
+        hold = child.evidence_hold
+        if hold is not None and disposition is not AdmissionDisposition.DROP:
+            if hold.status is EvidenceStatus.PENDING:
+                disposition = None
+            elif hold.status is EvidenceStatus.DENY:
+                disposition = AdmissionDisposition.DROP
+            else:
+                disposition = AdmissionDisposition.FORWARD
+        if (
+            disposition
+            not in {AdmissionDisposition.FORWARD, AdmissionDisposition.DROP}
+            or child.pending_final is None
+            or (disposition is AdmissionDisposition.FORWARD and child.evidence_order_blocked)
+        ):
             return ExactIntervalTransitionReceipt(
                 interval_id=receipt.interval_id,
-                outcome=ExactIntervalOutcome.RESOLVED,
-                disposition=disposition,
-                effects=effects,
+                outcome=ExactIntervalOutcome.HELD,
+                disposition=None,
+                effects=local_effects,
             )
+        try:
+            resolved, effects = resolve_exact_interval(child, disposition)
+        except ValueError:
+            return self._exact_interval_transition_failure(
+                receipt,
+                ExactIntervalOutcome.CONFLICT,
+            )
+        self._records[scope.turn_token] = resolved
+        self._exact_interval_records.pop(receipt._token, None)
+        if (
+            self._exact_interval_candidate_bindings.get(
+                scope.target_candidate
+            )
+            is receipt._token
+        ):
+            self._exact_interval_candidate_bindings.pop(
+                scope.target_candidate,
+                None,
+            )
+        return ExactIntervalTransitionReceipt(
+            interval_id=receipt.interval_id,
+            outcome=ExactIntervalOutcome.RESOLVED,
+            disposition=disposition,
+            effects=(*local_effects, *effects),
+        )
 
     def _new_speaker_lease_terminal_claim(
         self,
@@ -1230,6 +1333,7 @@ class VoiceTurnAdmissionCoordinator:
             frozen_children=reduced.child_bindings,
             child_results=results,
             diagnostics=diagnostics,
+            successor_effects=self._drain_evidence_successors(),
         )
 
     async def prepare_speaker_lease_transition(
@@ -1313,6 +1417,7 @@ class VoiceTurnAdmissionCoordinator:
             frozen_children=reduced.child_bindings,
             child_results=results,
             diagnostics=diagnostics,
+            successor_effects=self._drain_evidence_successors(),
         )
 
     async def commit_speaker_lease_terminal_claim(
@@ -1428,6 +1533,7 @@ class VoiceTurnAdmissionCoordinator:
             child = self._records.get(binding.turn_token)
             if child is None:
                 continue
+            child = self._with_evidence_order(child)
             events: tuple[AdmissionEvent, ...]
             if lease.state in {
                 SpeakerLeaseState.DENY_LATCHED,
@@ -1569,6 +1675,7 @@ class VoiceTurnAdmissionCoordinator:
             record = VoiceTurnAdmissionRecord(
                 turn_token=turn_token,
                 record_generation=self._record_generation,
+                evidence_hold_enabled=self._evidence_hold_enabled,
                 provider_binding_state=(
                     ProviderBindingState.BOUND
                     if provider_key is not None
@@ -1603,13 +1710,24 @@ class VoiceTurnAdmissionCoordinator:
             record = self._records.get(turn_token)
             if record is None:
                 raise KeyError(turn_token)
+            record = self._with_evidence_order(record)
             reduced, effects = reduce(
                 record,
                 event,
                 self._clock() if now is None else now,
             )
             self._records[turn_token] = reduced
-            return effects
+            if isinstance(event, (*EVIDENCE_HOLD_EVENT_TYPES, FinalDeadlineExpired)):
+                for exact in tuple(self._exact_interval_records.values()):
+                    if (
+                        exact.promotion_receipt.scope.turn_token == turn_token
+                        and exact.activation_receipt is not None
+                        and reduced.exact_interval_hold_id == exact.activation_receipt.interval_id
+                    ):
+                        exact.child_logical_revision = reduced.logical_revision
+                        result = self._resolve_ready_exact(exact, reduced, effects)
+                        return (*result.effects, *self._drain_evidence_successors())
+            return (*effects, *self._drain_evidence_successors())
 
     def snapshot_resolution_diagnostics(
         self, ticket: AdmissionResolutionTicket,

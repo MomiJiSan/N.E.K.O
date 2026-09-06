@@ -22,7 +22,8 @@ from tests.unit.asr_client.test_provider_speaker_continuity import (
 async def _join_close_tasks(runtime):
     tasks = tuple(runtime._asr_close_tasks)
     if tasks:
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3)
+        assert all(result is None or isinstance(result, asyncio.CancelledError) for result in results)
 
 
 async def test_failure_log_preserves_safe_first_reason_and_status_incident(monkeypatch):
@@ -104,7 +105,7 @@ async def test_failure_snapshot_is_queued_before_cancellable_invalidation(monkey
     entered = asyncio.Event()
     logs = []
 
-    async def pause_invalidation(*args):
+    async def pause_invalidation(*args, **kwargs):
         entered.set()
         await asyncio.Event().wait()
 

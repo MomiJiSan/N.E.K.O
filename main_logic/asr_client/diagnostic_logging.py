@@ -15,12 +15,17 @@ _worker: Thread | None = None
 
 def _write_records() -> None:
     while True:
-        future, metadata = _QUEUE.get()
+        future, metadata, kind = _QUEUE.get()
         try:
             if not future.set_running_or_notify_cancel():
                 continue
             try:
-                logger.info("ASR resolution %s", metadata)
+                if kind == "incident":
+                    logger.warning("ASR incident %s", metadata)
+                elif kind == "cleanup":
+                    logger.info("ASR cleanup %s", metadata)
+                else:
+                    logger.info("ASR resolution %s", metadata)
             except Exception as error:
                 future.set_exception(error)
             else:
@@ -29,13 +34,15 @@ def _write_records() -> None:
             _QUEUE.task_done()
 
 
-def submit_resolution_log(metadata: dict) -> Future | None:
+def submit_resolution_log(metadata: dict, *, kind: str = "resolution") -> Future | None:
     """At most one writer and 32 queued records, across resets and runtimes.
 
     A stalled filesystem may occupy this single daemon, but cannot grow the
     default executor, hold process exit, or block the audio event loop. No
     handler or alternate log file is installed here.
     """
+    if kind not in {"resolution", "incident", "cleanup"}:
+        raise ValueError("unknown ASR diagnostic record kind")
     global _worker
     with _START_LOCK:
         if _worker is None:
@@ -43,7 +50,7 @@ def submit_resolution_log(metadata: dict) -> Future | None:
             _worker.start()
     future: Future = Future()
     try:
-        _QUEUE.put_nowait((future, metadata))
+        _QUEUE.put_nowait((future, metadata, kind))
     except Full:
         return None
     return future

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from ..speaker_evidence import EvidenceStatus
+from .evidence_hold import EVIDENCE_HOLD_EVENT_TYPES, reduce_evidence_hold
+
 from dataclasses import replace
 
 from .contracts import (
@@ -280,7 +283,7 @@ def _resolve(
     if disposition is AdmissionDisposition.DROP and (
         speaker_deny
         or record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE
-    ):
+    ) and (record.evidence_hold is None or not record.provider_boundary_deadline_expired):
         effects.append(
             AbortProviderTransport(
                 ticket=resolution_ticket,
@@ -400,6 +403,11 @@ def _settle_forward_partial_if_terminal(
 ) -> tuple[VoiceTurnAdmissionRecord, tuple[AdmissionEffect, ...]]:
     """Release a quarantined partial once speaker evidence can no longer deny."""
 
+    if record.exact_interval_hold_id is not None or (
+        record.evidence_hold is not None
+        and record.evidence_hold.status in {EvidenceStatus.PENDING, EvidenceStatus.DENY}
+    ):
+        return record, ()
     if record.partial_settlement_disposition is not None:
         return record, ()
     speaker_allows = record.evidence_state in {
@@ -474,7 +482,9 @@ def resolve_exact_interval(
         raise ValueError("exact interval resolution requires a held final")
     if (
         record.rejection_capability is not None
-        or record.rejection_apply_state is not RejectionApplyState.NOT_STARTED
+        or (record.rejection_apply_state is not RejectionApplyState.NOT_STARTED
+            and not (record.evidence_hold is not None
+                     and record.rejection_apply_state is RejectionApplyState.STALE))
         or record.partial_settlement_disposition is not None
         or record.resolution_ticket is not None
     ):
@@ -520,6 +530,9 @@ def maybe_resolve(
         return record, ()
     if record.evidence_state is EvidenceState.DENY_LATCHED:
         return _resolve(record, AdmissionDisposition.DROP)
+    hold = record.evidence_hold
+    if hold is not None and hold.status is EvidenceStatus.DENY:
+        return _resolve(record, AdmissionDisposition.DROP)
     final = record.pending_final
     if record.rejection_apply_state is RejectionApplyState.APPLIED_ACTIVE:
         return _resolve(record, AdmissionDisposition.DROP)
@@ -536,11 +549,17 @@ def maybe_resolve(
         return _resolve(record, AdmissionDisposition.DROP)
     if final is None:
         return record, ()
-    if _rejection_can_still_be_confirmed(record):
+    if hold is not None and hold.status is EvidenceStatus.PENDING:
+        return record, ()
+    if _rejection_can_still_be_confirmed(record) and not (
+        hold is not None and hold.status in {EvidenceStatus.VERIFIED, EvidenceStatus.UNAVAILABLE}
+    ):
         return record, ()
     if not final.text.strip():
         return _resolve(record, AdmissionDisposition.FORWARD)
     if record.micro_event_state is MicroEventState.PENDING:
+        return record, ()
+    if record.evidence_order_blocked:
         return record, ()
     return _resolve(record, AdmissionDisposition.FORWARD)
 
@@ -660,7 +679,10 @@ def _reduce_untracked(
             )
         return record, (CountDiagnostic("admission_late_fact_ignored"),)
 
-    if isinstance(event, TurnOpened):
+    if isinstance(event, EVIDENCE_HOLD_EVENT_TYPES):
+        record, hold_effects = reduce_evidence_hold(record, event, now)
+        effects.extend(hold_effects)
+    elif isinstance(event, TurnOpened):
         if event.turn_token != record.turn_token:
             return record, (CountDiagnostic("admission_stale_turn_opened"),)
     elif isinstance(event, ProviderBound):

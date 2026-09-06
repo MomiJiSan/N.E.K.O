@@ -380,8 +380,17 @@ class SpeakerShadowConfig:
     # pressure cannot consume their reserved admission budget.
     terminal_queue_capacity: int = 512
     completion_queue_capacity: int = 512
+    # Only Provider candidates waiting for an exact boundary retain their
+    # original buffer after terminal scoring; this never retains a second copy.
+    exact_boundary_pcm_retention_seconds: float = 2.0
 
     def __post_init__(self) -> None:
+        if (
+            type(self.exact_boundary_pcm_retention_seconds) not in {int, float}
+            or not math.isfinite(self.exact_boundary_pcm_retention_seconds)
+            or not 0 <= self.exact_boundary_pcm_retention_seconds <= 2.0
+        ):
+            raise ValueError("exact_boundary_pcm_retention_seconds must be within [0, 2]")
         if (
             not self.similarity_thresholds
             or len(self.similarity_thresholds) > MAX_SPEAKER_SHADOW_THRESHOLDS
@@ -831,6 +840,16 @@ class SpeakerShadowReconciliationCompletionControl(Protocol):
         *,
         successor: SpeakerShadowCandidateKey | None,
     ) -> Literal["completed", "already_completed", "pending", "stale", "invalid"]: ...
+
+
+@runtime_checkable
+class SpeakerShadowExactIntervalScoreControl(Protocol):
+    """Read-only qualification for splitting PCM into a new score identity."""
+
+    def exact_interval_requires_fresh_target(
+        self,
+        source: SpeakerShadowReconcileSource,
+    ) -> bool: ...
 
 
 @runtime_checkable

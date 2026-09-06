@@ -7,6 +7,9 @@ completes a future only after the coordinator lock has been released.
 
 from __future__ import annotations
 
+from .evidence_hold import EVIDENCE_HOLD_EVENT_TYPES
+from .contracts import FinalDeadlineExpired
+
 import asyncio
 from collections import deque
 from collections.abc import Callable
@@ -155,6 +158,8 @@ _SPEAKER_LEASE_EVENT_TYPES = (
     SpeakerLeaseUnavailable,
 )
 _EXACT_INTERVAL_EVENT_TYPES = (
+    *EVIDENCE_HOLD_EVENT_TYPES,
+    FinalDeadlineExpired,
     ProviderFinalReceived,
     SpeakerLeaseCaptureClosed,
     SpeakerLeaseHigh,

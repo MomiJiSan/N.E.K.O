@@ -9,7 +9,7 @@ import uuid
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -34,6 +34,7 @@ from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from utils.logger_config import get_module_logger
 from ._infra import logger, _READY_TIMEOUT_SECONDS
 from .diagnostic_logging import submit_resolution_log
+from .failure_diagnostics import AudioFailureContext, CleanupTrace, utc_now
 from .speaker_diagnostics import diagnostic_context, speaker_diagnostic_scalars
 from .speaker_shadow.diagnostics import SpeakerShadowDiagnostic
 from ._provider_events import (
@@ -78,6 +79,10 @@ from .admission.contracts import (
     ExactIntervalPromotionScope,
     ExactIntervalTransitionReceipt,
     EvidenceState,
+    EvidenceHoldRequested,
+    EvidenceHoldResolved,
+    EvidenceDeadlineExpired,
+    ScheduleEvidenceDeadline,
     FinalDeadlineExpired,
     LifecycleSettled,
     MicroEventPending,
@@ -122,6 +127,10 @@ from .admission.contracts import (
     TurnSealed,
 )
 from .admission.coordinator import AdmissionBulkResult, VoiceTurnAdmissionCoordinator
+from .speaker_evidence import (
+    AudioRangeReference, EvidenceWindow, ProviderEvidenceBinding, EvidenceProof,
+    EvidenceObservationRegistry,
+)
 from .admission.ingress import (
     AdmissionIngressCapacityError,
     AdmissionIngressClosedError,
@@ -559,6 +568,7 @@ class _AdmissionFinalContext:
     provider_fence: ProviderCandidateFence | None
     runtime_identity: _AsrRuntimeIdentity
     has_pending_turn: bool
+    audio_handoff_completed: bool = False
     settled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
@@ -613,6 +623,10 @@ class _ProviderExactIntervalTransaction:
     session: Any
     ingress_token: VoiceIngressToken
     runtime_identity: _AsrRuntimeIdentity
+    sealed_token: VoiceTransportToken | None = None
+    evidence_binding: ProviderEvidenceBinding | None = None
+    observation_binding: ProviderEvidenceBinding | None = None
+    audio_handoff_task: asyncio.Task[bool] | None = field(default=None, repr=False)
     resolved_disposition: AdmissionDisposition | None = None
     drop_tombstone_succeeded: bool | None = None
     event_queue: deque["_ProviderExactIntervalQueueItem"] = field(
@@ -809,7 +823,18 @@ class _SpeakerDenyCleanupOperation:
 class IndependentAsrRuntime:
     """Own one independent ASR session without reading Core manager state."""
 
-    def __init__(self, callbacks: AsrRuntimeCallbacks) -> None:
+    def __init__(
+        self, callbacks: AsrRuntimeCallbacks, *, evidence_hold_enabled: bool = False,
+        evidence_observation_enabled: bool = False,
+    ) -> None:
+        if type(evidence_hold_enabled) is not bool:
+            raise TypeError("evidence_hold_enabled must be bool")
+        self._asr_evidence_hold_enabled = evidence_hold_enabled
+        if type(evidence_observation_enabled) is not bool:
+            raise TypeError("evidence_observation_enabled must be bool")
+        self._asr_evidence_observation_enabled = evidence_observation_enabled
+        self._asr_evidence_observer: EvidenceObservationRegistry | None = None
+        self._asr_evidence_observer_scope: tuple[int, int, int] | None = None
         self._callbacks = callbacks
         self._init_asr_runtime_state()
 
@@ -1935,7 +1960,7 @@ class IndependentAsrRuntime:
 
         if (
             transaction.resolved_disposition is not None
-            or not self._exact_interval_runtime_is_current(transaction)
+            or not self._exact_interval_evidence_owner_is_current(transaction)
         ):
             if waiter is not None and not waiter.done():
                 waiter.set_result(None)
@@ -1993,7 +2018,10 @@ class IndependentAsrRuntime:
         try:
             while transaction.event_queue:
                 item = transaction.event_queue.popleft()
-                if not self._speaker_exact_installation_is_current(transaction):
+                if (
+                    not isinstance(item.event, (EvidenceDeadlineExpired, FinalDeadlineExpired))
+                    and not self._speaker_exact_installation_is_current(transaction)
+                ):
                     receipt = None
                     fail_open_finals = [
                         queued.event
@@ -2171,7 +2199,7 @@ class IndependentAsrRuntime:
     ) -> ExactIntervalTransitionReceipt | None:
         if (
             transaction.resolved_disposition is not None
-            or not self._exact_interval_runtime_is_current(transaction)
+            or not self._exact_interval_evidence_owner_is_current(transaction)
         ):
             return None
         try:
@@ -2197,7 +2225,7 @@ class IndependentAsrRuntime:
                 receipt = None
         except Exception:
             receipt = None
-        if not self._exact_interval_runtime_is_current(transaction):
+        if not self._exact_interval_evidence_owner_is_current(transaction):
             if cancelled is not None:
                 raise cancelled
             return None
@@ -2213,7 +2241,11 @@ class IndependentAsrRuntime:
                 raise cancelled
             return None
         if receipt.outcome is ExactIntervalOutcome.HELD:
-            if not self._speaker_exact_installation_is_current(transaction):
+            await self._execute_exact_admission_effects(receipt.effects)
+            if (
+                not isinstance(event, (EvidenceDeadlineExpired, FinalDeadlineExpired))
+                and not self._speaker_exact_installation_is_current(transaction)
+            ):
                 pending_finals = (
                     [event] if isinstance(event, ProviderFinalReceived) else [
                         queued.event for queued in transaction.event_queue
@@ -2242,48 +2274,78 @@ class IndependentAsrRuntime:
                 raise cancelled
             return None
 
-        transaction.resolved_disposition = receipt.disposition
-        resolution_ticket: AdmissionResolutionTicket | None = None
         try:
-            for effect in receipt.effects:
-                if isinstance(effect, ResolveReserved):
-                    resolution_ticket = effect.ticket
-                await self._execute_admission_effect(effect)
+            await self._execute_exact_admission_effects(receipt.effects)
         except Exception:
             await self._fail_exact_interval_group(
                 transaction,
                 "ASR_EXACT_INTERVAL_EFFECT_FAILED",
-                ticket=resolution_ticket,
             )
             if cancelled is not None:
                 raise cancelled
             return None
-        if receipt.disposition is AdmissionDisposition.DROP:
-            if (
-                resolution_ticket is None
-                or transaction.drop_tombstone_succeeded is not True
-            ):
-                # A local exact DROP is safe only after the transcript
-                # dispatcher has durably tombstoned that one child. Escalate
-                # any ambiguity to the original parent-group cleanup.
-                transaction.resolved_disposition = None
-                await self._fail_exact_interval_group(
-                    transaction,
-                    "ASR_EXACT_INTERVAL_DROP_UNSAFE",
-                    ticket=resolution_ticket,
-                )
-                if cancelled is not None:
-                    raise cancelled
-                return None
-            ownership = self._asr_provider_turn_ownerships.get(
-                transaction.turn_token
-            )
-            if ownership is not None:
-                self._retire_provider_turn_ownership(ownership)
-        self._retire_exact_interval_runtime_aliases(transaction)
         if cancelled is not None:
             raise cancelled
         return receipt
+
+    async def _execute_exact_admission_effects(
+        self, effects: tuple[AdmissionEffect, ...],
+    ) -> None:
+        """Attribute a released ordering barrier to each effect's own key."""
+        for effect in effects:
+            transaction = None
+            ownership = None
+            if isinstance(effect, ResolveReserved):
+                transaction = next(
+                    (item for item in self._asr_provider_exact_intervals.values()
+                     if item.turn_token == effect.ticket.turn_token), None,
+                )
+                if transaction is not None:
+                    if transaction.activation.child_record_generation != effect.ticket.record_generation:
+                        continue
+                    record = await self._asr_admission.get_record(effect.ticket.turn_token)
+                    if (
+                        not self._exact_interval_evidence_owner_is_current(transaction)
+                        or record is None or record.resolution_ticket != effect.ticket
+                    ):
+                        continue
+                    ownership = self._asr_provider_turn_ownerships.get(transaction.turn_token)
+            try:
+                execution = await self._execute_admission_effect(effect)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if transaction is None:
+                    raise
+                await self._fail_exact_interval_group(
+                    transaction, "ASR_EXACT_INTERVAL_EFFECT_FAILED", ticket=effect.ticket,
+                )
+                continue
+            if transaction is None:
+                continue
+            # Completion may legitimately remove old correlator/started aliases,
+            # but never authorizes an old receipt against a replacement owner.
+            if (
+                not self._runtime_identity_matches(replace(transaction.runtime_identity, turn_token=None))
+                or self._asr_provider_exact_intervals.get(transaction.provider_key) is not transaction
+                or execution is None or execution.ticket != effect.ticket
+                or not execution.owner_done or not execution.core_resolution_succeeded
+            ):
+                continue
+            transaction.resolved_disposition = effect.disposition
+            if effect.disposition is AdmissionDisposition.DROP:
+                if transaction.drop_tombstone_succeeded is not True:
+                    transaction.resolved_disposition = None
+                    await self._fail_exact_interval_group(
+                        transaction, "ASR_EXACT_INTERVAL_DROP_UNSAFE", ticket=effect.ticket,
+                    )
+                    continue
+                if (
+                    ownership is not None
+                    and self._asr_provider_turn_ownerships.get(transaction.turn_token) is ownership
+                ):
+                    self._retire_provider_turn_ownership(ownership)
+            self._retire_exact_interval_runtime_aliases(transaction)
 
     def _provider_speaker_lease_has_deferred_terminal_event(
         self,
@@ -2363,8 +2425,7 @@ class IndependentAsrRuntime:
                 raise
 
             async def execute_effects() -> None:
-                for effect in effects:
-                    await self._execute_admission_effect(effect)
+                await self._execute_exact_admission_effects(effects)
 
             if effects:
                 task = asyncio.create_task(
@@ -2659,6 +2720,7 @@ class IndependentAsrRuntime:
                     # verdict; fan-out must not multiply deny metrics.
                     continue
                 await self._execute_admission_effect(effect)
+        await self._execute_exact_admission_effects(result.successor_effects)
         record = await self._asr_admission.get_speaker_lease(lease_token)
         if record is not None and record.state in {
             SpeakerLeaseState.ALLOW,
@@ -3322,7 +3384,9 @@ class IndependentAsrRuntime:
         self._asr_turn_prepared = False
         self._asr_final_lock = asyncio.Lock()
         self._asr_pending_turn_handoff: _PendingTurnHandoff | None = None
-        self._asr_admission = VoiceTurnAdmissionCoordinator(capacity=8)
+        self._asr_admission = VoiceTurnAdmissionCoordinator(
+            capacity=8, evidence_hold_enabled=getattr(self, "_asr_evidence_hold_enabled", False),
+        )
         self._asr_admission_ingress = AdmissionIngressLane(
             self._asr_admission,
             data_capacity=64,
@@ -3611,7 +3675,9 @@ class IndependentAsrRuntime:
             self._asr_audio_sequence = 0
             self._asr_pending_detector_candidate = None
         if not hasattr(self, "_asr_admission"):
-            self._asr_admission = VoiceTurnAdmissionCoordinator(capacity=8)
+            self._asr_admission = VoiceTurnAdmissionCoordinator(
+                capacity=8, evidence_hold_enabled=getattr(self, "_asr_evidence_hold_enabled", False),
+            )
             self._asr_admission_ingress = AdmissionIngressLane(
                 self._asr_admission,
                 data_capacity=64,
@@ -3907,8 +3973,10 @@ class IndependentAsrRuntime:
         correlator: ProviderTurnCorrelator | None,
         namespace: tuple[int, int] | None,
         detector: DetectorRuntime | None,
+        *,
+        on_settled: Callable[[asyncio.Task[None]], None] | None = None,
     ) -> None:
-        """Resolve every admission reservation before dispatcher teardown."""
+        """Bound the wait while retaining the actual reservation cleanup owner."""
 
         async def finish_owned() -> None:
             try:
@@ -3946,11 +4014,38 @@ class IndependentAsrRuntime:
             finish_owned(),
             name="voice-turn-admission-invalidation-owner",
         )
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await asyncio.shield(cleanup)
-            raise
+        self._track_terminal_close_tasks({cleanup})
+        if on_settled is not None:
+            def report_settled(done: asyncio.Task[None]) -> None:
+                try:
+                    on_settled(done)
+                except Exception:
+                    logger.warning("Admission settlement observer failed")
+
+            cleanup.add_done_callback(report_settled)
+        deadline = time.monotonic() + _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS
+
+        async def supervise() -> None:
+            done, _ = await asyncio.wait(
+                {cleanup}, timeout=max(0.0, deadline - time.monotonic()),
+            )
+            if not done:
+                # Cancellation is a request, never evidence of completion.
+                # A resistant owner remains tracked until its actual done
+                # callback; neither this timeout nor caller cancellation can
+                # publish on_settled early or cancel the ingress future.
+                cleanup.cancel()
+                raise TimeoutError("ASR_ADMISSION_INVALIDATION_TIMEOUT")
+            cleanup.result()
+
+        supervisor = asyncio.create_task(
+            supervise(), name="voice-turn-admission-invalidation-deadline",
+        )
+        self._track_terminal_close_tasks({supervisor})
+        # Keep the absolute deadline alive even if the caller is cancelled.
+        # Cancellation propagates immediately instead of doing a second,
+        # potentially unbounded shielded join of the hidden owner.
+        await asyncio.shield(supervisor)
 
     def _register_admission_capability(
         self,
@@ -3997,7 +4092,9 @@ class IndependentAsrRuntime:
         )
         return capability
 
-    async def _execute_admission_effect(self, effect: AdmissionEffect) -> None:
+    async def _execute_admission_effect(
+        self, effect: AdmissionEffect,
+    ) -> _AdmissionResolutionExecution | None:
         if isinstance(effect, CountDiagnostic):
             metric_name = (
                 effect.name
@@ -4008,27 +4105,56 @@ class IndependentAsrRuntime:
                 self._speaker_rejection_metrics.get(metric_name, 0) + 1
             )
             return
-        if isinstance(effect, ScheduleFinalDeadline):
+        if isinstance(effect, (ScheduleFinalDeadline, ScheduleEvidenceDeadline)):
+            if not self._ingress_token_matches(effect.ticket.turn_token.ingress):
+                return
+            timer_identity = self._capture_runtime_identity(
+                ingress_token=effect.ticket.turn_token.ingress,
+            )
+            timer_record = await self._asr_admission.get_record(effect.ticket.turn_token)
+            if (
+                not self._runtime_identity_matches(timer_identity)
+                or timer_record is None
+                or timer_record.record_generation != effect.ticket.record_generation
+                or timer_record.terminal_disposition is not None
+            ):
+                return
+            if isinstance(effect, ScheduleEvidenceDeadline):
+                hold = timer_record.evidence_hold
+                if (
+                    hold is None or hold.ticket != effect.ticket
+                    or hold.absolute_deadline != effect.absolute_deadline
+                ):
+                    return
+            elif timer_record.deadline_operation_nonce != effect.ticket.operation_nonce:
+                return
             old = self._asr_admission_deadline_tasks.get(effect.ticket)
             if old is not None:
                 return
 
             async def expire() -> None:
                 try:
-                    remaining = effect.absolute_deadline - time.monotonic()
-                    if remaining > 0:
+                    while (remaining := effect.absolute_deadline - time.monotonic()) > 0:
                         await asyncio.sleep(remaining)
-                    await self._post_admission_event(
-                        effect.ticket.turn_token,
-                        FinalDeadlineExpired(
-                            ticket=effect.ticket,
-                            deadline=effect.absolute_deadline,
-                        ),
+                    if not self._runtime_identity_matches(timer_identity):
+                        return
+                    event = (
+                        EvidenceDeadlineExpired if isinstance(effect, ScheduleEvidenceDeadline)
+                        else FinalDeadlineExpired
+                    )(ticket=effect.ticket, deadline=effect.absolute_deadline)
+                    transaction = next(
+                        (item for item in self._asr_provider_exact_intervals.values()
+                         if item.turn_token == effect.ticket.turn_token), None,
                     )
+                    if transaction is not None:
+                        await self._post_exact_interval_event(transaction, event)
+                    else:
+                        await self._post_admission_event(effect.ticket.turn_token, event)
                 except (asyncio.CancelledError, KeyError):
                     return
                 finally:
-                    self._asr_admission_deadline_tasks.pop(effect.ticket, None)
+                    if self._asr_admission_deadline_tasks.get(effect.ticket) is asyncio.current_task():
+                        self._asr_admission_deadline_tasks.pop(effect.ticket, None)
 
             self._asr_admission_deadline_tasks[effect.ticket] = asyncio.create_task(
                 expire(),
@@ -4200,8 +4326,7 @@ class IndependentAsrRuntime:
             )
             return
         if isinstance(effect, ResolveReserved):
-            await self._resolve_admission_reservation(effect)
-            return
+            return await self._resolve_admission_reservation(effect)
         if isinstance(effect, SettlePartial):
             await self._settle_admission_partial(effect)
             return
@@ -4232,12 +4357,28 @@ class IndependentAsrRuntime:
         if isinstance(effect, AbortProviderTransport):
             await self._abort_admission_transport(effect)
 
+    def _retire_admission_record_deadlines(self, ticket: AdmissionResolutionTicket) -> None:
+        """Retire only this terminal record's local timers, without self-cancel."""
+        current = asyncio.current_task()
+        for operation, task in tuple(self._asr_admission_deadline_tasks.items()):
+            if (
+                operation.turn_token != ticket.turn_token
+                or operation.record_generation != ticket.record_generation
+                or task is current
+                or self._asr_admission_deadline_tasks.get(operation) is not task
+            ):
+                continue
+            self._asr_admission_deadline_tasks.pop(operation, None)
+            if not task.done():
+                task.cancel()
+                self._track_terminal_close_tasks({task})
+
     async def _resolve_admission_reservation(
         self,
         effect: ResolveReserved,
         *,
         cleanup_owner: _SpeakerDenyCleanupOperation | None = None,
-    ) -> None:
+    ) -> _AdmissionResolutionExecution | None:
         final_key = FinalKey.from_turn(effect.turn_token)
         envelope = None
         if effect.disposition is AdmissionDisposition.FORWARD:
@@ -4251,6 +4392,8 @@ class IndependentAsrRuntime:
             )
         execution = _AdmissionResolutionExecution(effect.ticket)
         existing = self._asr_admission_resolutions.setdefault(final_key, execution)
+        if existing.ticket == effect.ticket:
+            self._retire_admission_record_deadlines(effect.ticket)
         if existing is not execution:
             late_context = self._asr_admission_final_contexts.pop(
                 effect.turn_token,
@@ -4268,7 +4411,7 @@ class IndependentAsrRuntime:
             if existing.owner_done and cleanup_owner is None:
                 await self._settle_late_admission_context(existing)
             if cleanup_owner is None:
-                return
+                return existing if existing.owner_done and existing.core_resolution_succeeded else None
         else:
             context = self._asr_admission_final_contexts.pop(effect.turn_token, None)
             existing.late_context = context
@@ -4532,6 +4675,7 @@ class IndependentAsrRuntime:
             and effect.disposition is not AdmissionDisposition.DROP
         ):
             self._retire_provider_turn_ownership(ownership)
+        return existing
 
     def _active_deny_cleanup_for_resolution(
         self,
@@ -5458,6 +5602,8 @@ class IndependentAsrRuntime:
                         status_code="ASR_CORE_TRANSCRIPT_BACKPRESSURE",
                         reason_code=failure_reason,
                         expected_identity=handoff.identity,
+                        failed_operation="final_audio_handoff",
+                        failed_check="pending_turn_unsettled",
                         notification_timeout_seconds=(
                             _EXACT_HANDOFF_FAILURE_NOTIFICATION_TIMEOUT_SECONDS
                         ),
@@ -5523,7 +5669,8 @@ class IndependentAsrRuntime:
                 successor_present = completed
         lifecycle = context.lifecycle
         owns_current_turn = (
-            self._runtime_identity_matches(context.runtime_identity)
+            not context.audio_handoff_completed
+            and self._runtime_identity_matches(context.runtime_identity)
             and self._asr_lifecycle is lifecycle
             and lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
             and self._asr_sealed_turn_token == context.sealed_token
@@ -5570,7 +5717,7 @@ class IndependentAsrRuntime:
                     context.epoch,
                     expected_state=VoiceLifecycleState.WARM_IDLE,
                 )
-        else:
+        elif not context.audio_handoff_completed:
             degraded = True
         lease = self._asr_smart_turn_lease
         if (
@@ -5609,9 +5756,8 @@ class IndependentAsrRuntime:
             self._send_exact_lifecycle_state
             if bounded_exact_notification else self._send_asr_lifecycle_state
         )
-        delivered = bool(
-            owns_current_turn
-            and await notify_lifecycle(
+        delivered = context.audio_handoff_completed or bool(
+            owns_current_turn and await notify_lifecycle(
                 VoiceLifecycleState.WARM_IDLE,
                 provider=context.provider,
                 session_epoch=context.epoch,
@@ -5620,7 +5766,7 @@ class IndependentAsrRuntime:
         )
         if not delivered:
             degraded = True
-        if has_pending_turn and (
+        if not context.audio_handoff_completed and has_pending_turn and (
             delivered
             or (
                 bounded_exact_notification
@@ -6378,6 +6524,7 @@ class IndependentAsrRuntime:
         physical_identity = self._capture_runtime_identity(
             ingress_token=turn_token.ingress,
         )
+        failure_context = self._new_audio_failure_context("dispatcher_activation", physical_identity)
         detector = self._asr_detector
         session_ref = self._asr_session
         if (
@@ -6423,6 +6570,8 @@ class IndependentAsrRuntime:
                         self._asr_provider or "unknown",
                         status_code="ASR_AUDIO_ORDERING_FAILED",
                         reason_code=arming.reason_code,
+                        failed_operation="dispatcher_activation",
+                        failed_check="speaker_arming_invariant",
                         expected_identity=self._capture_runtime_identity(
                             ingress_token=turn_token.ingress,
                             turn_token=turn_token,
@@ -6466,11 +6615,12 @@ class IndependentAsrRuntime:
                     split_before_audio=False,
                     evidence_complete=False,
                     turn_token=turn_token,
+                    failure_context=failure_context,
                     speaker_evidence_unavailable=(
                         arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
                     ),
                 ):
-                    await self._retire_partial_provider_audio(physical_identity)
+                    await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
                     return False
             else:
                 for span in spans:
@@ -6487,11 +6637,12 @@ class IndependentAsrRuntime:
                             and span.evidence_complete
                         ),
                         turn_token=turn_token,
+                        failure_context=failure_context,
                         speaker_evidence_unavailable=(
                             arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
                         ),
                     ):
-                        await self._retire_partial_provider_audio(physical_identity)
+                        await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
                         return False
             if (
                 self._asr_session is not session_ref
@@ -6500,7 +6651,7 @@ class IndependentAsrRuntime:
                 or lifecycle.current_turn_token != turn_token
                 or not self._ingress_token_matches(turn_token.ingress)
             ):
-                await self._retire_partial_provider_audio(physical_identity)
+                await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
                 return False
         try:
             activated = self._asr_audio_dispatcher.activate(
@@ -6509,17 +6660,21 @@ class IndependentAsrRuntime:
                 payload,
                 sample_rate_hz=16_000,
             )
-        except Exception:
+        except Exception as error:
+            failure_context.fail("dispatcher_activation_exception", actual=self._audio_failure_scalars(), error=error)
             if payload:
-                await self._retire_partial_provider_audio(physical_identity)
+                await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
             raise
         if not activated and payload:
-            await self._retire_partial_provider_audio(physical_identity)
+            failure_context.fail("dispatcher_activation_rejected", actual=self._audio_failure_scalars())
+            await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
         return activated
 
     async def _retire_partial_provider_audio(
         self,
         identity: _AsrRuntimeIdentity,
+        *,
+        failure_context: AudioFailureContext | None = None,
     ) -> None:
         """Fence uncertain local accounting without replaying accepted PCM."""
 
@@ -6533,6 +6688,9 @@ class IndependentAsrRuntime:
                 status_code="ASR_AUDIO_ORDERING_FAILED",
                 reason_code="ASR_AUDIO_ADMISSION_PARTIAL",
                 expected_identity=identity,
+                failure_context=failure_context,
+                failed_operation="audio_retirement",
+                failed_check="partial_accounting",
             ),
             name="asr-partial-audio-retirement",
         )
@@ -7191,6 +7349,7 @@ class IndependentAsrRuntime:
         evidence_complete: bool,
         turn_token: VoiceTurnToken,
         speaker_evidence_unavailable: bool = False,
+        failure_context: AudioFailureContext | None = None,
     ) -> bool:
         if not pcm16:
             return True
@@ -7204,6 +7363,18 @@ class IndependentAsrRuntime:
         )
         ordered_observation_started = False
         activation_generation = self._speaker_verifier_activation_generation
+
+        def failed(
+            check: str, error: BaseException | None = None, *, actual: dict | None = None,
+        ) -> bool:
+            if failure_context is not None:
+                snapshot = self._audio_failure_scalars()
+                snapshot.update(actual or {})
+                failure_context.fail(
+                    check, actual=snapshot, error=error,
+                )
+            return False
+
         try:
             if _uses_smart_turn_endpointing(lifecycle.provider_policy):
                 self._observe_provider_speaker_shadow(
@@ -7247,11 +7418,13 @@ class IndependentAsrRuntime:
                         or ledger.evidence_lease != evidence_lease
                         or self._asr_current_speaker_candidate != candidate
                     ):
-                        return False
+                        return failed("lease_alias_mismatch")
                 # Number ordered-observer dispatch attempts only. Explicit
                 # fallback revokes incomplete evidence directly.
                 self._asr_provider_speaker_sequence += 1
                 sequence_no = self._asr_provider_speaker_sequence
+                if failure_context is not None:
+                    failure_context.expected.update(sequence_no=sequence_no, payload_samples=len(pcm16) // 2, detector_epoch=identity.detector_epoch)
                 ordered_kwargs = {
                     "sample_rate_hz": sample_rate_hz,
                     "identity": identity,
@@ -7259,6 +7432,8 @@ class IndependentAsrRuntime:
                     "split_before_audio": split_before_audio,
                     "evidence_complete": evidence_complete,
                 }
+                if type(detector) is DetectorRuntime:
+                    ordered_kwargs["failure_context"] = failure_context
                 if evidence_lease is not None:
                     ordered_kwargs["speaker_evidence_lease"] = evidence_lease
                 if accounting_only:
@@ -7271,7 +7446,7 @@ class IndependentAsrRuntime:
                 ordered_observation_started = True
                 update = await observe_ordered(pcm16, **ordered_kwargs)
                 if not self._runtime_identity_matches(observation_identity):
-                    return False
+                    return failed("observation_owner_changed")
                 if accounting_only:
                     sample_count, remainder = divmod(
                         len(pcm16) // 2 * 16_000, sample_rate_hz
@@ -7290,9 +7465,28 @@ class IndependentAsrRuntime:
                         == sample_count
                     )
                     if not accounted:
-                        return False
+                        if type(update) is not ProviderAudioAccountingReceipt:
+                            return failed("accounting_receipt_type_invalid")
+                        if update.detector_epoch != identity.detector_epoch:
+                            check = "accounting_receipt_detector_mismatch"
+                        elif (
+                            "expected_timeline_generation" in ordered_kwargs
+                            and update.timeline_generation != ordered_kwargs["expected_timeline_generation"]
+                        ):
+                            check = "accounting_receipt_timeline_mismatch"
+                        elif update.sequence_no != sequence_no:
+                            check = "accounting_receipt_sequence_mismatch"
+                        else:
+                            check = "accounting_receipt_samples_mismatch"
+                        return failed(check, actual={
+                            "detector_epoch": update.detector_epoch,
+                            "timeline_generation": update.timeline_generation,
+                            "sequence_no": update.sequence_no,
+                            "sample_cursor_16k": update.end_sample_16k,
+                            "payload_samples": update.end_sample_16k - update.start_sample_16k,
+                        })
                     if evidence_lease is not None:
-                        return self._consume_provider_speaker_evidence_settlement(
+                        settled = self._consume_provider_speaker_evidence_settlement(
                             update.evidence_settlement,
                             lease=evidence_lease,
                             detector=detector,
@@ -7301,10 +7495,11 @@ class IndependentAsrRuntime:
                             turn_token=turn_token,
                             timeline_generation=update.timeline_generation,
                         )
+                        return settled or failed("evidence_retirement_unconfirmed")
                     return bool(
                         self._speaker_verifier_activation_generation == activation_generation
                         and self._asr_provider_speaker_evidence_lease is None
-                    )
+                    ) or failed("retired_alias_replaced")
                 if self._speaker_verifier_enforces_admission and (
                     type(update) is not ProviderSpeakerEvidenceUpdate
                     or update.lease != evidence_lease
@@ -7316,7 +7511,13 @@ class IndependentAsrRuntime:
                         )
                     # No receipt means ordered accounting itself is unknown.
                     # Retire this ASR timeline rather than sending across a gap.
-                    return False
+                    if type(update) is not ProviderSpeakerEvidenceUpdate:
+                        return failed("speaker_receipt_type_invalid")
+                    return failed("speaker_receipt_lease_mismatch", actual={
+                        "lease_generation": getattr(update.lease, "lease_generation", None),
+                        "detector_epoch": getattr(update.lease, "detector_epoch", None),
+                        "sequence_no": update.sequence_no,
+                    })
                 if (
                     type(update) is ProviderSpeakerEvidenceUpdate
                     and update.lease == evidence_lease
@@ -7350,20 +7551,24 @@ class IndependentAsrRuntime:
                 if self._speaker_verifier_enforces_admission:
                     # Missing ingress provenance cannot justify exact evidence
                     # or advance the canonical Provider timeline.
-                    return False
+                    return failed("ingress_identity_missing")
                 self._observe_provider_speaker_shadow(
                     detector,
                     pcm16,
                     sample_rate_hz=sample_rate_hz,
                 )
-            return self._runtime_identity_matches(observation_identity)
+            return self._runtime_identity_matches(observation_identity) or failed(
+                "observation_owner_changed"
+            )
         except asyncio.CancelledError:
             if ordered_observation_started:
-                await self._retire_partial_provider_audio(physical_identity)
+                if failure_context is not None:
+                    failure_context.fail("observation_cancelled", actual=self._audio_failure_scalars())
+                await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
             raise
-        except Exception:
+        except Exception as error:
             if not self._runtime_identity_matches(physical_identity):
-                return False
+                return failed("physical_owner_changed", error)
             evidence_lease = self._asr_provider_speaker_evidence_lease
             ledger = (
                 self._asr_provider_speaker_ledgers.get(
@@ -7377,12 +7582,12 @@ class IndependentAsrRuntime:
                     ledger,
                     "provider_pcm_observation_failed",
                 )
-                return False
+                return failed("ordered_observation_exception", error)
             return bool(
                 not ordered_observation_started
                 and not self._speaker_verifier_enforces_admission
                 and self._runtime_identity_matches(observation_identity)
-            )
+            ) or failed("observation_exception", error)
         finally:
             try:
                 await self._unarm_speaker_authority_after_observation(
@@ -7391,7 +7596,9 @@ class IndependentAsrRuntime:
                 )
             except asyncio.CancelledError:
                 if ordered_observation_started:
-                    await self._retire_partial_provider_audio(physical_identity)
+                    if failure_context is not None:
+                        failure_context.fail("unarm_cancelled", actual=self._audio_failure_scalars())
+                    await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
                 raise
 
     @staticmethod
@@ -8434,6 +8641,8 @@ class IndependentAsrRuntime:
                 task.cancel()
         for transaction in tuple(self._asr_provider_exact_intervals.values()):
             self._retire_exact_interval_runtime_aliases(transaction)
+        self._asr_evidence_observer = None
+        self._asr_evidence_observer_scope = None
         self._asr_provider_correlator = None
         self._asr_provider_correlator_namespace = None
         self._asr_provider_started_turns.clear()
@@ -8449,6 +8658,15 @@ class IndependentAsrRuntime:
     def _reset_asr_turn_state(self) -> None:
         """Reset per-turn bookkeeping shared by close/abort/error teardown."""
 
+        # Both deadlines belong to the detached route. Keep cancelled owners
+        # tracked until they unwind; a new route gets a fresh ticket map.
+        deadline_tasks = self._asr_admission_deadline_tasks
+        self._asr_admission_deadline_tasks = {}
+        current = asyncio.current_task()
+        for task in deadline_tasks.values():
+            if task is not current and not task.done():
+                task.cancel()
+                self._track_terminal_close_tasks({task})
         handoff = getattr(self, "_asr_pending_turn_handoff", None)
         self._asr_pending_turn_handoff = None
         if handoff is not None and not handoff.completion.done():
@@ -9044,6 +9262,7 @@ class IndependentAsrRuntime:
             ):
                 return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
         identity = self._capture_runtime_identity(ingress_token=ingress_token)
+        failure_context = self._new_audio_failure_context("submit", identity)
 
         pcm16 = frame.pcm16
         sample_rate_hz = frame.sample_rate_hz
@@ -9345,6 +9564,8 @@ class IndependentAsrRuntime:
                         identity.provider or "unknown",
                         status_code="ASR_AUDIO_ORDERING_FAILED",
                         expected_identity=identity,
+                        failed_operation="submit",
+                        failed_check="dispatcher_activation_rejected",
                     )
                     return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
             arming = await self._arm_speaker_authority_for_provider_audio(
@@ -9375,6 +9596,8 @@ class IndependentAsrRuntime:
                     identity.provider or "unknown",
                     status_code="ASR_AUDIO_ORDERING_FAILED",
                     reason_code=arming.reason_code or "ASR_SPEAKER_ARMING_FAILED",
+                    failed_operation="submit",
+                    failed_check="speaker_arming_invariant",
                     expected_identity=identity,
                 )
                 return AsrSubmitResult(
@@ -9409,6 +9632,7 @@ class IndependentAsrRuntime:
                     split_payload_is_ambiguous or pre_roll_ownership_is_ambiguous
                 ),
                 turn_token=turn_token,
+                failure_context=failure_context,
                 speaker_evidence_unavailable=(
                     arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE
                 ),
@@ -9420,6 +9644,7 @@ class IndependentAsrRuntime:
                     identity.provider or "unknown",
                     status_code="ASR_AUDIO_ORDERING_FAILED",
                     expected_identity=identity,
+                    failure_context=failure_context,
                 )
                 return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
             if not deny_cleanup_is_current():
@@ -9442,16 +9667,19 @@ class IndependentAsrRuntime:
                 sample_rate_hz=sample_rate_hz,
                 sequence_no=self._asr_audio_sequence,
             ):
+                failure_context.fail("enqueue_rejected", actual=self._audio_failure_scalars())
                 await self._handle_independent_asr_error(
                     identity.session_epoch,
                     identity.provider or "unknown",
                     status_code="ASR_AUDIO_ORDERING_FAILED",
                     expected_identity=identity,
+                    failure_context=failure_context,
                 )
                 return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            failure_context.fail("submit_exception", actual=self._audio_failure_scalars(), error=exc, send_state="unknown")
             if not self._runtime_identity_matches(identity):
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
             self._asr_received_audio = True
@@ -9470,6 +9698,7 @@ class IndependentAsrRuntime:
                 identity.provider or "unknown",
                 status_code=status_code,
                 expected_identity=identity,
+                failure_context=failure_context,
             )
             return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
 
@@ -9652,6 +9881,8 @@ class IndependentAsrRuntime:
                                 connected_identity.session_epoch,
                                 connected_identity.provider or "unknown",
                                 status_code="ASR_AUDIO_ORDERING_FAILED",
+                                failed_operation="restart",
+                                failed_check="dispatcher_activation_rejected",
                                 expected_identity=connected_identity,
                             )
                             return
@@ -11265,10 +11496,28 @@ class IndependentAsrRuntime:
             is transaction
         )
 
+    def _exact_interval_evidence_owner_is_current(
+        self, transaction: _ProviderExactIntervalTransaction,
+    ) -> bool:
+        """Keep a sealed key's logical evidence without current-turn authority."""
+        return bool(
+            self._runtime_identity_matches(replace(transaction.runtime_identity, turn_token=None))
+            and self._asr_lifecycle is transaction.lifecycle
+            and self._asr_detector is transaction.detector
+            and self._asr_session is transaction.session
+            and self._asr_provider_correlator is transaction.correlator
+            and self._provider_key_timeline_is_current(transaction.provider_key)
+            and self._asr_provider_started_turns.get(transaction.provider_key)
+            == transaction.turn_token
+            and self._asr_provider_exact_intervals.get(transaction.provider_key) is transaction
+            and self._asr_provider_exact_candidates.get(transaction.target_candidate) is transaction
+        )
+
     def _retire_exact_interval_runtime_aliases(
         self,
         transaction: _ProviderExactIntervalTransaction,
     ) -> None:
+        self._retire_provider_evidence_observation(transaction)
         drain = transaction.drain_task
         current = asyncio.current_task()
         if drain is not None and drain is not current and not drain.done():
@@ -11677,12 +11926,19 @@ class IndependentAsrRuntime:
                     != ledger.anchor_revision
                     or getattr(reservation, "anchor_start_sample_16k", None)
                     != ledger.anchor_start_sample_16k
-                    or getattr(
-                        reservation,
-                        "provider_pcm_through_sequence_no",
-                        None,
+                    or type(reservation.provider_pcm_through_sequence_no) is not int
+                    or not (
+                        0 < reservation.provider_pcm_through_sequence_no
+                        <= ledger.last_pcm_sequence_no
                     )
-                    != ledger.last_pcm_sequence_no
+                    # The ledger advances only from consecutive actual
+                    # Detector receipts. Prepare may span a legal append;
+                    # anchors, timeline and the physical owner may not move.
+                    or self._asr_provider_speaker_ledgers.get(parent_candidate) is not ledger
+                    or ledger.evidence_lease is not evidence_lease
+                    or ledger.state is not _ProviderSpeakerLedgerState.EXACT_PREPARING
+                    or ledger.poisoned_reason is not None
+                    or reservation.timeline_generation != ledger.timeline_generation
                 ):
                     raise RuntimeError("ASR_EXACT_INTERVAL_PREPARE_FAILED")
                 self._speaker_rejection_metrics["speaker_exact_prepare_count"] += 1
@@ -11793,7 +12049,8 @@ class IndependentAsrRuntime:
                 self._asr_provider_exact_candidates[
                     transaction.target_candidate
                 ] = transaction
-                self._asr_provider_exact_candidates[parent_candidate] = transaction
+                if committed.score_reusable:
+                    self._asr_provider_exact_candidates[parent_candidate] = transaction
                 self._asr_admission_candidate_turns[
                     transaction.target_candidate
                 ] = turn_token
@@ -11821,7 +12078,9 @@ class IndependentAsrRuntime:
                         lease_generation=successor_lease.lease_generation,
                         lease_token=lease_token,
                         last_pcm_sequence_no=(
-                            reservation.provider_pcm_through_sequence_no
+                            committed.provider_pcm_through_sequence_no
+                            if committed.provider_pcm_through_sequence_no is not None
+                            else reservation.provider_pcm_through_sequence_no
                         ),
                     )
                     self._asr_provider_speaker_ledgers[
@@ -11846,7 +12105,7 @@ class IndependentAsrRuntime:
                         transaction,
                         SpeakerLeaseUnavailable(transaction.target_candidate, 1),
                     )
-                else:
+                elif committed.score_reusable:
                     for provisional in ledger.events:
                         promoted_event: SpeakerLeaseEvent = (
                             SpeakerLeaseLow(
@@ -12120,6 +12379,7 @@ class IndependentAsrRuntime:
                 return
             lifecycle.transition(VoiceLifecycleEvent.TURN_SEALED)
             sealed_token = self._capture_transport_token(lifecycle)
+            transaction.sealed_token = sealed_token
             self._asr_sealed_turn_token = sealed_token
             self._asr_sealed_provider_key = transaction.provider_key
             self._asr_provider_candidate_fence = None
@@ -12193,6 +12453,13 @@ class IndependentAsrRuntime:
                         },
                     )
                 )
+            return
+        old_exact = self._asr_provider_exact_intervals.get(key)
+        if old_exact is not None and old_exact.sealed_token is not None:
+            await self._handle_exact_provider_final(
+                old_exact, text, epoch, provider,
+                received_at=received_at, deadline=final_deadline,
+            )
             return
         if self._asr_sealed_provider_key != key:
             exact_before_order = self._asr_provider_exact_intervals.get(key)
@@ -12311,7 +12578,14 @@ class IndependentAsrRuntime:
     ) -> asyncio.Event | None:
         async with self._asr_final_lock:
             lifecycle = transaction.lifecycle
-            sealed_token = self._asr_sealed_turn_token
+            sealed_token = transaction.sealed_token or self._asr_sealed_turn_token
+            existing_context = self._asr_admission_final_contexts.get(transaction.turn_token)
+            if (
+                existing_context is not None
+                and self._exact_interval_evidence_owner_is_current(transaction)
+                and epoch == transaction.runtime_identity.session_epoch
+            ):
+                return existing_context.settled
             if (
                 not self._exact_interval_runtime_is_current(transaction)
                 or epoch != transaction.runtime_identity.session_epoch
@@ -12387,6 +12661,38 @@ class IndependentAsrRuntime:
                 ),
             )
             self._asr_admission_final_contexts[transaction.turn_token] = context
+            if self._asr_evidence_hold_enabled or self._asr_evidence_observation_enabled:
+                boundary = transaction.reservation.boundary
+                if boundary.end_sample_16k - boundary.start_sample_16k <= 64000:
+                    audio_range = AudioRangeReference(
+                        session_generation=epoch,
+                        transport_generation=sealed_token.transport_generation,
+                        timeline_generation=transaction.reservation.timeline_generation,
+                        start_sample_16k=boundary.start_sample_16k,
+                        end_sample_16k=boundary.end_sample_16k,
+                        first_sequence_no=None,
+                        last_sequence_no=transaction.reservation.provider_pcm_through_sequence_no,
+                    )
+                    binding = ProviderEvidenceBinding(
+                        provider_key=transaction.provider_key,
+                        turn_token=transaction.turn_token,
+                        record_generation=admission_record.record_generation,
+                        window=EvidenceWindow(transaction.proof.proof_id, 1, audio_range),
+                        target_range=audio_range,
+                        policy_version="exact-evidence-v1",
+                    )
+                    self._observe_provider_evidence(transaction, binding, admission_record)
+                    if self._asr_evidence_hold_enabled:
+                        await self._post_exact_interval_event(
+                            transaction, EvidenceHoldRequested(binding, received_at),
+                        )
+                        if not self._exact_interval_runtime_is_current(transaction):
+                            return context.settled
+                        record = await self._asr_admission.get_record(transaction.turn_token)
+                        if not self._exact_interval_runtime_is_current(transaction):
+                            return context.settled
+                        if record is not None and record.evidence_hold is not None:
+                            transaction.evidence_binding = record.evidence_hold.binding
             watchdog = self._asr_final_watchdog_task
             self._asr_final_watchdog_task = None
             if watchdog is not None and watchdog is not asyncio.current_task():
@@ -12402,7 +12708,186 @@ class IndependentAsrRuntime:
                     transaction,
                     "ASR_EXACT_INTERVAL_FINAL_UNSETTLED",
                 )
-            return context.settled
+        if (
+            transaction.evidence_binding is not None
+            and transaction.resolved_disposition is None
+            and self._exact_interval_runtime_is_current(transaction)
+        ):
+            if transaction.audio_handoff_task is None:
+                transaction.audio_handoff_task = asyncio.create_task(
+                    self._handoff_exact_evidence_audio(transaction, context, deadline),
+                    name="asr-evidence-audio-handoff",
+                )
+                self._track_admission_effect_task(transaction.audio_handoff_task, transaction.turn_token)
+                transaction.audio_handoff_task.add_done_callback(self._admission_effect_done)
+            await asyncio.shield(transaction.audio_handoff_task)
+        return context.settled
+
+    def _observe_provider_evidence(
+        self, transaction: _ProviderExactIntervalTransaction,
+        binding: ProviderEvidenceBinding, record: Any, proof: EvidenceProof | None = None,
+    ) -> EvidenceProof | None:
+        """Observe an existing Admission-owned key without producing authority."""
+        if (
+            not self._asr_evidence_observation_enabled
+            or not self._exact_interval_evidence_owner_is_current(transaction)
+            or record is None or record.terminal_disposition is not None
+            or record.provider_key != binding.provider_key
+            or record.turn_token != binding.turn_token
+            or record.record_generation != binding.record_generation
+            or binding.provider_key != transaction.provider_key
+            or binding.turn_token != transaction.turn_token
+            or (proof is not None and proof.binding != binding)
+        ):
+            return None
+        scope = binding.target_range.timeline
+        if (
+            scope[0] != transaction.runtime_identity.session_epoch
+            or transaction.sealed_token is None
+            or scope[1] != transaction.sealed_token.transport_generation
+            or scope[2] != transaction.reservation.timeline_generation
+        ):
+            return None
+        if self._asr_evidence_observer_scope != scope:
+            self._asr_evidence_observer = EvidenceObservationRegistry(active_key_capacity=8)
+            self._asr_evidence_observer_scope = scope
+        observed = self._asr_evidence_observer.observe(
+            binding, proof.scores if proof is not None else (),
+            proof.continuity if proof is not None else (),
+        )
+        if observed is not None:
+            transaction.observation_binding = binding
+        return observed
+
+    def _retire_provider_evidence_observation(
+        self, transaction: _ProviderExactIntervalTransaction,
+    ) -> None:
+        binding = transaction.observation_binding
+        if (
+            binding is not None and self._asr_evidence_observer is not None
+            and binding.target_range.timeline == self._asr_evidence_observer_scope
+        ):
+            self._asr_evidence_observer.retire(binding)
+
+    async def _submit_provider_evidence_proof(self, proof: EvidenceProof) -> bool:
+        """Accept only an explicitly bound producer proof, never infer continuity."""
+        if not self._asr_evidence_hold_enabled or type(proof) is not EvidenceProof:
+            return False
+        transaction = self._asr_provider_exact_intervals.get(proof.binding.provider_key)
+        if (
+            transaction is None or transaction.evidence_binding != proof.binding
+            or not self._exact_interval_evidence_owner_is_current(transaction)
+            or not self._speaker_exact_installation_is_current(transaction)
+        ):
+            return False
+        record = await self._asr_admission.get_record(transaction.turn_token)
+        if (
+            not self._exact_interval_evidence_owner_is_current(transaction)
+            or record is None or record.evidence_hold is None
+            or record.evidence_hold.binding != proof.binding
+        ):
+            return False
+        self._observe_provider_evidence(transaction, proof.binding, record, proof)
+        receipt = await self._post_exact_interval_event(
+            transaction, EvidenceHoldResolved(record.evidence_hold.ticket, proof),
+        )
+        return receipt is not None and receipt.outcome in {
+            ExactIntervalOutcome.HELD, ExactIntervalOutcome.RESOLVED,
+        }
+
+    async def _handoff_exact_evidence_audio(
+        self, transaction: _ProviderExactIntervalTransaction,
+        context: _AdmissionFinalContext, boundary_deadline: float,
+    ) -> bool:
+        """Retire old physical revoke rights while its text remains reserved."""
+        handoff = _PendingTurnHandoff(
+            replace(transaction.runtime_identity, turn_token=None),
+            asyncio.get_running_loop().create_future(),
+        )
+        if (
+            not self._exact_interval_runtime_is_current(transaction)
+            or self._asr_sealed_turn_token != context.sealed_token
+            or context.lifecycle.snapshot.state is not VoiceLifecycleState.DRAINING
+            or self._asr_pending_turn_handoff is not None
+        ):
+            return False
+        self._asr_pending_turn_handoff = handoff
+        completed = False
+        try:
+            async with asyncio.timeout(_EXACT_PENDING_HANDOFF_TIMEOUT_SECONDS):
+                result = await transaction.detector.complete_provider_speaker_boundary(
+                    transaction.snapshot,
+                    successor_evidence_lease=transaction.successor_evidence_lease,
+                    deadline=boundary_deadline,
+                )
+                if (
+                    result not in {"completed", "already_completed"}
+                    or not self._exact_interval_runtime_is_current(transaction)
+                    or self._asr_sealed_turn_token != context.sealed_token
+                    or context.lifecycle.snapshot.state is not VoiceLifecycleState.DRAINING
+                ):
+                    return False
+                lifecycle = context.lifecycle
+                pending = bool(
+                    lifecycle.has_pending_turn
+                    or (lifecycle.pending_turn_token is not None
+                        and lifecycle.pending_turn_token in self._asr_provider_started_turns.values())
+                )
+                lifecycle.transition(VoiceLifecycleEvent.PROVIDER_FINAL)
+                self._asr_turn_prepared = False
+                self._asr_received_audio = False
+                self._asr_sealed_turn_token = None
+                self._asr_sealed_provider_key = None
+                self._asr_provider_candidate_fence = None
+                self._asr_turn_endpointed_at = None
+                if self._asr_partial_turn_token == context.turn_token:
+                    self._asr_partial_turn_token = None
+                # This bit transfers only lifecycle authority; final settlement
+                # retains the old correlator, Admission record and transcript.
+                context.audio_handoff_completed = True
+                if not pending:
+                    lifecycle.preserve_unconfirmed_pending_audio()
+                await self._send_exact_lifecycle_state(
+                    VoiceLifecycleState.WARM_IDLE, provider=context.provider,
+                    session_epoch=context.epoch, expected_identity=handoff.identity,
+                )
+                if not self._runtime_identity_matches(handoff.identity):
+                    return False
+                if pending:
+                    await self._activate_pending_independent_turn(
+                        context.epoch, bounded_notification=True,
+                    )
+                else:
+                    self._schedule_transport_warm_expiry(
+                        context.epoch, expected_state=VoiceLifecycleState.WARM_IDLE,
+                    )
+                completed = self._runtime_identity_matches(handoff.identity)
+                return completed
+        finally:
+            failed_current = not completed and self._runtime_identity_matches(handoff.identity)
+            if failed_current:
+                cleanup = asyncio.create_task(
+                    self._handle_independent_asr_error(
+                        context.epoch, context.provider,
+                        status_code="ASR_CORE_TRANSCRIPT_BACKPRESSURE",
+                        reason_code="ASR_EVIDENCE_AUDIO_HANDOFF_FAILED",
+                        expected_identity=handoff.identity,
+                        failed_operation="evidence_audio_handoff",
+                        failed_check="boundary_or_successor_unsettled",
+                        notification_timeout_seconds=_EXACT_HANDOFF_FAILURE_NOTIFICATION_TIMEOUT_SECONDS,
+                    ), name="asr-evidence-audio-handoff-failure",
+                )
+                self._asr_exact_callback_tasks.add(cleanup)
+
+                def failed_callback_done(task: asyncio.Task[None]) -> None:
+                    self._asr_exact_callback_tasks.discard(task)
+                    self._admission_effect_done(task)
+
+                cleanup.add_done_callback(failed_callback_done)
+            if not failed_current and self._asr_pending_turn_handoff is handoff:
+                self._asr_pending_turn_handoff = None
+            if not handoff.completion.done():
+                handoff.completion.set_result(completed)
 
     async def _seal_independent_asr_provider_turn_transaction(
         self,
@@ -13457,7 +13942,9 @@ class IndependentAsrRuntime:
         except Exception:
             pass
 
-    def _schedule_asr_diagnostic_metadata(self, metadata: dict, *, capacity: int = 16) -> None:
+    def _schedule_asr_diagnostic_metadata(
+        self, metadata: dict, *, capacity: int = 16, kind: str = "resolution",
+    ) -> None:
         """One bounded delivery path for both decisions and their explanations."""
         try:
             if sum(
@@ -13471,7 +13958,7 @@ class IndependentAsrRuntime:
             metadata.update(
                 diagnostic_records_dropped=getattr(self, "_asr_resolution_log_dropped", 0),
             )
-            pending = submit_resolution_log(metadata)
+            pending = submit_resolution_log(metadata, kind=kind)
             if pending is None:
                 self._asr_resolution_log_dropped = metadata["diagnostic_records_dropped"] + 1
                 return
@@ -13498,6 +13985,37 @@ class IndependentAsrRuntime:
             # Diagnostics cannot fail or delay the authoritative decision.
             pass
 
+    def _audio_failure_scalars(
+        self, identity: _AsrRuntimeIdentity | None = None,
+    ) -> dict[str, int | None]:
+        captured = identity or self._capture_runtime_identity()
+        detector = captured.detector
+        lease = self._asr_provider_speaker_evidence_lease
+        key = self._asr_sealed_provider_key
+        turn = captured.turn_token
+        return {
+            "session_epoch": captured.session_epoch,
+            "start_generation": captured.start_generation,
+            "audio_generation": captured.audio_generation,
+            "transport_generation": captured.transport_generation,
+            "turn_id": turn.turn_id if turn is not None else None,
+            "activation_generation": self._speaker_verifier_activation_generation,
+            "candidate_generation": getattr(detector, "_candidate_generation", None),
+            "sequence_no": self._asr_provider_speaker_sequence,
+            "sample_cursor_16k": getattr(detector, "_provider_audio_sample_cursor_16k", None),
+            "timeline_generation": getattr(detector, "_provider_audio_timeline_generation", None),
+            "detector_epoch": getattr(lease, "detector_epoch", None),
+            "lease_generation": getattr(lease, "lease_generation", None),
+            "provider_generation": key.generation if type(key) is ProviderUtteranceKey else None,
+            "provider_buffer_epoch": key.buffer_epoch if type(key) is ProviderUtteranceKey else None,
+            "provider_utterance_id": key.utterance_id if type(key) is ProviderUtteranceKey else None,
+        }
+
+    def _new_audio_failure_context(
+        self, operation: str, identity: _AsrRuntimeIdentity | None = None,
+    ) -> AudioFailureContext:
+        return AudioFailureContext(operation, expected=self._audio_failure_scalars(identity))
+
     def _schedule_asr_incident_log(
         self,
         *,
@@ -13505,6 +14023,7 @@ class IndependentAsrRuntime:
         reason_code: str,
         stage: str,
         source_session_epoch: int,
+        failure_context: AudioFailureContext | None = None,
     ) -> None:
         """Snapshot safe incident metadata before cleanup; persist off-loop."""
 
@@ -13514,6 +14033,9 @@ class IndependentAsrRuntime:
             task.get_name() == "asr-incident-log" and not task.done()
             for task in self._asr_close_tasks
         ) >= 4:
+            self._asr_resolution_log_dropped = (
+                getattr(self, "_asr_resolution_log_dropped", 0) + 1
+            )
             return
         from config.application import APP_VERSION
 
@@ -13577,12 +14099,19 @@ class IndependentAsrRuntime:
                 else None
             ),
         }
+        metadata["recorded_at"] = utc_now()
+        if failure_context is not None:
+            metadata.update(failure_context.snapshot())
 
         async def persist() -> None:
             try:
                 # Do not pass runtime objects, exception text, conversation,
                 # PCM or speaker vectors to the logging worker.
-                await asyncio.to_thread(asr_diagnostic_logger.warning, "ASR incident %s", metadata)
+                pending = submit_resolution_log(metadata, kind="incident")
+                if pending is None:
+                    self._asr_resolution_log_dropped += 1
+                    return
+                await asyncio.wait_for(asyncio.wrap_future(pending), timeout=0.2)
             except Exception:
                 # Diagnostic I/O cannot replace the authoritative ASR failure.
                 pass
@@ -13599,18 +14128,26 @@ class IndependentAsrRuntime:
         expected_identity: _AsrRuntimeIdentity | None = None,
         reason_code: str | None = None,
         notification_timeout_seconds: float | None = None,
+        failure_context: AudioFailureContext | None = None,
+        failed_operation: str = "unknown",
+        failed_check: str = "unknown",
     ) -> None:
         if epoch != self._asr_session_epoch or (
             expected_identity is not None
             and not self._runtime_identity_matches(expected_identity)
         ):
             return
+        if failure_context is None:
+            failure_context = self._new_audio_failure_context(failed_operation)
+        if failure_context.detected_at is None:
+            failure_context.fail(
+                failed_check, actual=self._audio_failure_scalars(), send_state="unknown",
+            )
         # The provider callback that reported failure must not be allowed to
         # deliver a queued final into the surviving Omni session.
         self._asr_session_epoch += 1
         failure_epoch = self._asr_session_epoch
         self._asr_audio_generation += 1
-        retirement_identity = self._capture_runtime_identity()
         try:
             explicit_reason = str(reason_code).strip()
         except Exception:
@@ -13635,30 +14172,35 @@ class IndependentAsrRuntime:
             reason_code=effective_reason,
             stage="blocked",
             source_session_epoch=epoch,
+            failure_context=failure_context,
         )
         detector_dispatcher = self._asr_detector_dispatcher
         audio_dispatcher = self._asr_audio_dispatcher
+        admission_cleanup = None
+        admission_owner_settled = False
+
+        def admission_settled(done):
+            nonlocal admission_owner_settled
+            admission_owner_settled = True
+            trace.mark(
+                "admission",
+                "cancelled" if done.cancelled()
+                else "failed" if done.exception() is not None
+                else "completed",
+            )
+            trace.record("completed", stage="background_cleanup_completed")
+
         if self._asr_admission_ingress_started:
-            await self._finish_admission_invalidation(
+            admission_cleanup = self._finish_admission_invalidation(
                 self._asr_admission_ingress.invalidate_all_nowait(RouteReplaced()),
                 transcript_dispatcher,
                 self._asr_provider_correlator,
                 self._asr_provider_correlator_namespace,
                 self._asr_detector,
+                on_settled=admission_settled,
             )
         else:
             transcript_dispatcher.invalidate_all()
-        if (
-            self._asr_session_epoch != failure_epoch
-            or self._asr_start_generation != retirement_identity.start_generation
-            or self._asr_session is not retirement_identity.session
-            or self._asr_detector is not retirement_identity.detector
-            or self._asr_lifecycle is not retirement_identity.lifecycle
-        ):
-            # Admission settlement may outlive a successful start/reconnect.
-            # Its old failure owns no authority to detach the replacement or
-            # publish a BLOCKED notification for that replacement.
-            return
         detector_dispatcher.invalidate_all()
         audio_dispatcher.abort()
         self._asr_transcript_dispatcher = self._new_asr_transcript_dispatcher()
@@ -13692,23 +14234,91 @@ class IndependentAsrRuntime:
                 task.cancel()
         if lifecycle is not None:
             lifecycle.stop()
-        if detector is not None:
-            task = asyncio.create_task(detector.close())
-            self._asr_close_tasks.add(task)
-            task.add_done_callback(self._asr_close_tasks.discard)
-        if lease is not None:
-            task = asyncio.create_task(lease.release())
-            self._asr_close_tasks.add(task)
-            task.add_done_callback(self._asr_close_tasks.discard)
+        trace = CleanupTrace(
+            incident_id,
+            lambda metadata: self._schedule_asr_diagnostic_metadata(metadata, kind="cleanup"),
+        )
+        for component in ("transport", "lease", "detector", "admission"):
+            trace.mark(component, "not_required")
+        for component in ("notification", "audio_dispatcher", "detector_dispatcher"):
+            trace.mark(component, "pending")
+
+        def own_cleanup(awaitable, name):
+            # The worker is registered before any suspension or notification.
+            # A cancellation-resistant resource cannot keep the supervisor
+            # waiting forever; its real completion remains separately visible.
+            trace.mark(name, "pending")
+            cleanup_deadline = time.monotonic() + _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS
+            worker = asyncio.create_task(
+                awaitable, name="independent-asr-failure-" + name + "-worker",
+            )
+            self._asr_close_tasks.add(worker)
+            supervisor_finished = False
+
+            def reaped(done):
+                self._asr_close_tasks.discard(done)
+                outcome = (
+                    "cancelled" if done.cancelled()
+                    else "failed" if done.exception() is not None
+                    else "completed"
+                )
+                if name != "admission" or not admission_owner_settled:
+                    trace.mark(name, outcome, residual=(name == "admission"))
+                if supervisor_finished:
+                    trace.record("completed", stage="background_cleanup_completed")
+
+            worker.add_done_callback(reaped)
+
+            async def bounded_close():
+                nonlocal supervisor_finished
+                try:
+                    _, pending = await asyncio.wait(
+                        {worker}, timeout=max(0.0, cleanup_deadline - time.monotonic()),
+                    )
+                    if pending:
+                        trace.mark(name, "timed_out", residual=True)
+                        worker.cancel()
+                except asyncio.CancelledError:
+                    trace.mark(name, "cancelled", residual=not worker.done())
+                    raise
+                finally:
+                    supervisor_finished = True
+                    trace.record("completed", stage="cleanup_component_settled")
+
+            return self._schedule_owned_cleanup(
+                bounded_close(), name="independent-asr-failure-" + name,
+            )
+
+        async def close_resource(resource, *, release=False):
+            # Resolve the captured resource's method inside its worker so a
+            # broken resource cannot prevent the other owners being registered.
+            if release:
+                await resource.release()
+            else:
+                await resource.close()
+
         if asr_session is not None:
-            task = asyncio.create_task(self._close_asr_session(asr_session))
-            self._asr_close_tasks.add(task)
-            task.add_done_callback(self._asr_close_tasks.discard)
+            own_cleanup(close_resource(asr_session), "transport")
+        if lease is not None:
+            own_cleanup(close_resource(lease, release=True), "lease")
+        if detector is not None:
+            own_cleanup(close_resource(detector), "detector")
+        admission_task = None
+        if admission_cleanup is not None:
+            admission_task = own_cleanup(admission_cleanup, "admission")
+        trace.record("pending", stage="cleanup_started")
         failure_identity = self._capture_runtime_identity()
+        if notification_timeout_seconds is None:
+            notification_timeout_seconds = _ASR_TERMINAL_CLOSE_TIMEOUT_SECONDS
         try:
-            # Only the exact-handoff cleanup supplies a budget. Its owned task
-            # is joined by stop_session: display backpressure cannot own stop.
-            # The physical session is already fenced and detached above.
+            if admission_task is not None:
+                await asyncio.shield(admission_task)
+            if not self._runtime_identity_matches(failure_identity):
+                trace.mark("notification", "superseded")
+                return
+            # Notifications remain on the caller: Core.on_failure may stop
+            # the route and join owned cleanup. Owning this handler would make
+            # that callback wait on itself.
             try:
                 async with asyncio.timeout(notification_timeout_seconds):
                     delivered = await self._send_asr_lifecycle_state(
@@ -13718,13 +14328,16 @@ class IndependentAsrRuntime:
                         expected_identity=failure_identity,
                         reason_code=effective_reason,
                         incident_id=incident_id,
+                        delivery_trace=trace,
                     )
             except TimeoutError:
                 # A lost display notice cannot skip Core's route invalidation.
                 # It has its own budget and the same post-await identity fence.
                 delivered = True
+                trace.mark("notification", "timed_out")
                 logger.debug("[%s] exact ASR failure lifecycle notice timed out", self.display_name)
             if not delivered or not self._runtime_identity_matches(failure_identity):
+                trace.mark("notification", "superseded")
                 return
             try:
                 async with asyncio.timeout(notification_timeout_seconds):
@@ -13736,22 +14349,33 @@ class IndependentAsrRuntime:
                         )
                     )
             except Exception:
+                trace.mark("notification", "failed")
                 logger.debug(
                     "[%s] independent ASR failure callback failed",
                     self.display_name,
                 )
             if not self._runtime_identity_matches(failure_identity):
+                trace.mark("notification", "superseded")
                 return
             async with asyncio.timeout(notification_timeout_seconds):
-                await self._send_asr_status(
+                status_delivered = await self._send_asr_status(
                     status_code,
                     provider,
                     session_epoch=failure_epoch,
                     expected_identity=failure_identity,
                     reason_code=effective_reason,
                     incident_id=incident_id,
+                    delivery_trace=trace,
                 )
+            if not status_delivered:
+                trace.mark("notification", "superseded")
+            if trace.components["notification"] == "pending":
+                trace.mark("notification", "completed")
+        except asyncio.CancelledError:
+            trace.mark("notification", "cancelled")
+            raise
         except TimeoutError:
+            trace.mark("notification", "timed_out")
             logger.debug(
                 "[%s] exact ASR handoff failure notification timed out",
                 self.display_name,
@@ -13760,10 +14384,13 @@ class IndependentAsrRuntime:
             # A dispatcher can report its own failure from inside its worker.
             # Let lifecycle/failure/status delivery finish before closing that
             # worker, otherwise close() can cancel the authoritative callback.
-            for dispatcher in (detector_dispatcher, audio_dispatcher):
-                task = asyncio.create_task(dispatcher.close())
-                self._asr_close_tasks.add(task)
-                task.add_done_callback(self._asr_close_tasks.discard)
+            transcript_dispatcher.invalidate_all()
+            for dispatcher, component in (
+                (detector_dispatcher, "detector_dispatcher"),
+                (audio_dispatcher, "audio_dispatcher"),
+            ):
+                own_cleanup(close_resource(dispatcher), component)
+            trace.record("completed", stage="cleanup_handler_finished")
 
     async def _close_asr_session(self, asr_session: Any) -> None:
         try:
@@ -13783,6 +14410,7 @@ class IndependentAsrRuntime:
         expected_identity: _AsrRuntimeIdentity,
         reason_code: str | None = None,
         incident_id: str | None = None,
+        delivery_trace: CleanupTrace | None = None,
     ) -> bool:
         if (
             session_epoch != expected_identity.session_epoch
@@ -13807,6 +14435,8 @@ class IndependentAsrRuntime:
                 )
             )
         except Exception:
+            if delivery_trace is not None:
+                delivery_trace.mark("notification", "failed")
             logger.debug(
                 "[%s] independent ASR status delivery failed",
                 self.display_name,
@@ -13850,6 +14480,7 @@ class IndependentAsrRuntime:
         expected_identity: _AsrRuntimeIdentity,
         reason_code: str | None = None,
         incident_id: str | None = None,
+        delivery_trace: CleanupTrace | None = None,
     ) -> bool:
         if (
             session_epoch != expected_identity.session_epoch
@@ -13879,6 +14510,8 @@ class IndependentAsrRuntime:
                 )
             )
         except Exception:
+            if delivery_trace is not None:
+                delivery_trace.mark("notification", "failed")
             logger.debug(
                 "[%s] ASR lifecycle status delivery failed",
                 self.display_name,
