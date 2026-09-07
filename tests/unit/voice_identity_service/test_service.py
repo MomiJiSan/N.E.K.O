@@ -2455,6 +2455,30 @@ async def test_runtime_noise_reduction_mismatch_detaches_and_restore_reactivates
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_runtime_noise_reduction_same_value_does_not_reinstall(
+    tmp_path: Path,
+) -> None:
+    service, _model, activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+    activation_count = len(activations)
+
+    assert await service.prepare_runtime_audio_contract_change(True)
+    unchanged = await service.update_runtime_noise_reduction_enabled(True)
+
+    assert unchanged.state.effective_enabled
+    assert unchanged.state.effective_reason == "ready"
+    assert len(activations) == activation_count
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_delete_rolls_back_profile_when_preference_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1527,6 +1527,8 @@ class VoiceIdentityService:
             raise TypeError("enabled must be bool")
         async with self._operation_lock:
             self._require_initialized()
+            if enabled is self._runtime_noise_reduction_enabled:
+                return self.status()
             self._runtime_noise_reduction_enabled = enabled
             profile = self._profile
             if not self._requested_enabled:
@@ -1568,11 +1570,18 @@ class VoiceIdentityService:
                 raise cancellations[0]
             return status
 
-    async def prepare_runtime_audio_contract_change(self) -> bool:
+    async def prepare_runtime_audio_contract_change(
+        self,
+        enabled: bool | None = None,
+    ) -> bool:
         """Detach speaker evidence before a live DSP configuration transition."""
 
+        if enabled is not None and type(enabled) is not bool:
+            raise TypeError("enabled must be bool or None")
         async with self._operation_lock:
             self._require_initialized()
+            if enabled is self._runtime_noise_reduction_enabled:
+                return True
             if (
                 not self._requested_enabled
                 or self._profile is None

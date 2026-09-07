@@ -139,7 +139,7 @@ async def _apply_noise_reduction_if_current(enabled: bool):
             except VoiceIdentityServiceRegistryError:
                 service = None
             if service is not None:
-                if not await service.prepare_runtime_audio_contract_change():
+                if not await service.prepare_runtime_audio_contract_change(enabled):
                     return
         except Exception as exc:  # noqa: BLE001
             logger.warning(
