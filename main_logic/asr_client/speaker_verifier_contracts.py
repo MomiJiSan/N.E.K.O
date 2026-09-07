@@ -118,3 +118,8 @@ class SpeakerVerifierReplacementOperation:
     outcome: SpeakerVerifierInstallOutcome = SpeakerVerifierInstallOutcome.STALE
     cleanup_pending: bool = False
     cleanup_tasks: list[Any] = field(default_factory=list)
+    # The Runtime-owned physical alias expected at handoff time. Detector
+    # publishes only an issued settlement for this exact object; the Runtime
+    # then applies its own identity-fenced CAS without retiring logical finals.
+    expected_evidence_lease: Any | None = None
+    evidence_settlement: Any | None = None

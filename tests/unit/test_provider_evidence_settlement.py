@@ -7,6 +7,7 @@ import pytest
 
 from main_logic.asr_client.endpointing.detector_runtime import (
     ProviderAudioAccountingReceipt,
+    ProviderSpeakerEvidenceUpdate,
     ProviderSpeakerEvidenceSettlementStatus as Status,
 )
 from tests.unit import test_asr_detector_runtime as support
@@ -215,5 +216,50 @@ async def test_empty_timeline_anchor_does_not_constrain_first_dispatch_sequence(
         )
         assert update.capture.accepted_sample_count == 1600
         assert detector._provider_speaker_evidence_state_for(lease) is not None
+    finally:
+        await detector.close()
+
+
+@pytest.mark.asyncio
+async def test_evidence_update_carries_exact_audio_accounting_receipt():
+    detector, _, identity, lease = await _opened()
+    try:
+        update = await detector.observe_provider_audio_ordered(
+            support._speaker_pcm(100), sample_rate_hz=16000, identity=identity,
+            sequence_no=1, split_before_audio=False, speaker_evidence_lease=lease,
+        )
+
+        assert type(update) is ProviderSpeakerEvidenceUpdate
+        receipt = update.accounting_receipt
+        assert type(receipt) is ProviderAudioAccountingReceipt
+        assert receipt.detector_epoch == identity.detector_epoch
+        assert receipt.timeline_generation == detector._provider_audio_timeline_generation
+        assert receipt.sequence_no == update.sequence_no == 1
+        assert (receipt.start_sample_16k, receipt.end_sample_16k) == (0, 1600)
+        assert receipt.evidence_settlement is None
+    finally:
+        await detector.close()
+
+
+@pytest.mark.asyncio
+async def test_ordered_audio_without_evidence_update_returns_accounting_receipt():
+    shadow = support._DeferredSpeakerShadowSpy()
+    detector = support.DetectorRuntime(
+        vad=support._Vad(), gate=support._Gate(),
+        provider_policy=support._provider_endpoint_policy(), speaker_shadow=shadow,
+    )
+    try:
+        _, identity, _ = await support._open_provider_candidate(detector, turn_id=1)
+        receipt = await detector.observe_provider_audio_ordered(
+            support._speaker_pcm(100), sample_rate_hz=16000, identity=identity,
+            sequence_no=1, split_before_audio=False,
+        )
+
+        assert type(receipt) is ProviderAudioAccountingReceipt
+        assert receipt.detector_epoch == identity.detector_epoch
+        assert receipt.timeline_generation == detector._provider_audio_timeline_generation
+        assert receipt.sequence_no == 1
+        assert (receipt.start_sample_16k, receipt.end_sample_16k) == (0, 1600)
+        assert shadow.frames
     finally:
         await detector.close()

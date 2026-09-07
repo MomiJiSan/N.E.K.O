@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from functools import partial
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,7 +18,11 @@ from main_logic.asr_client._provider_events import (
     ProviderUtteranceKey,
     ProviderUtteranceStartedNotification,
 )
-from main_logic.asr_client.admission.contracts import AdmissionDisposition
+from main_logic.asr_client.admission.contracts import (
+    AdmissionDisposition,
+    SpeakerHigh,
+)
+from main_logic.asr_client.provider_policy import resolve_provider_policy
 from main_logic.voice_turn.contracts import AsrSubmitStatus
 from tests.unit.asr_client.test_candidate_rejection_runtime import (
     _drain_runtime_admission,
@@ -502,5 +507,359 @@ async def test_delayed_retirement_confirmation_cannot_clear_adopted_successor(
         assert runtime._asr_current_speaker_candidate == current_candidate
         assert runtime._asr_current_speaker_lease == current_logical
         assert detector._provider_speaker_evidence_state_for(successor) is not None
+    finally:
+        await _close_stack(core)
+
+
+def _replacement_factory():
+    shadow = detector_fixture._StableEvidenceSpeakerShadowSpy()
+    shadow.close = AsyncMock(wraps=shadow.close)
+    factory = MagicMock(return_value=shadow)
+    factory.enforces_admission = True
+    return factory, shadow
+
+
+def _enable_exact_verifier_install(runtime) -> None:
+    runtime._asr_lifecycle.provider_policy = resolve_provider_policy(
+        "qwen",
+        endpointing_mode="provider",
+    )
+
+
+async def test_verifier_replacement_settles_physical_alias_and_keeps_final_owner() -> (
+    None
+):
+    core, runtime, detector, _shadow, _lifecycle, session, turn = (
+        await _active_real_stack()
+    )
+    _enable_exact_verifier_install(runtime)
+    factory, _replacement = _replacement_factory()
+    try:
+        assert (
+            await _submit_pcm(runtime, turn, sequence=1)
+        ).status is AsrSubmitStatus.ACCEPTED
+        key = ProviderUtteranceKey(0, 0, 1)
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        old_lease = runtime._asr_provider_speaker_evidence_lease
+        assert old_lease is not None
+        ledger = runtime._asr_provider_speaker_key_ledgers[key]
+        before = (
+            detector._provider_audio_timeline_generation,
+            detector._provider_audio_sample_cursor_16k,
+            detector._provider_segment_last_sequence_no,
+        )
+
+        updated = await runtime.set_speaker_verifier_factory(
+            factory,
+            activation_generation="replacement",
+        )
+        assert updated, (
+            runtime._speaker_verifier_install_receipt,
+            runtime._speaker_installation_diagnostics,
+            runtime._speaker_verifier_activation_generation,
+        )
+
+        assert runtime._asr_provider_speaker_evidence_lease is None
+        assert runtime._asr_provider_speaker_ledgers[old_lease.candidate] is ledger
+        assert ledger.poisoned_reason == "installation_retired"
+        assert not runtime._accept_speaker_evidence_fact(
+            SpeakerHigh(
+                old_lease.candidate,
+                1,
+            ),
+            activation_generation="continuity-test",
+            enforce=True,
+        )
+        assert (
+            detector._provider_audio_timeline_generation,
+            detector._provider_audio_sample_cursor_16k,
+            detector._provider_segment_last_sequence_no,
+        ) == before
+        settlement = await detector.confirm_provider_speaker_evidence_retirement(
+            old_lease
+        )
+        assert detector.validate_provider_speaker_evidence_settlement(
+            settlement,
+            lease=old_lease,
+        )
+
+        assert (
+            await _submit_pcm(runtime, turn, sequence=2)
+        ).status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert detector._provider_audio_sample_cursor_16k == before[1] + 1_600
+        assert detector._provider_segment_last_sequence_no == 2
+        assert runtime._asr_session is session
+        session.close.assert_not_awaited()
+
+        await runtime._handle_provider_final(
+            key,
+            "final retained across replacement",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+        await _settle_deliveries(core, runtime)
+        assert [
+            call.args[0] for call in core.handle_input_transcript.await_args_list
+        ] == ["final retained across replacement"]
+        await runtime._handle_provider_final(
+            key,
+            "late duplicate",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+        await _settle_deliveries(core, runtime)
+        assert core.handle_input_transcript.await_count == 1
+    finally:
+        await _close_stack(core)
+
+
+async def test_verifier_replacement_failure_after_detector_keeps_audio_accountable() -> (
+    None
+):
+    core, runtime, detector, _shadow, _lifecycle, session, turn = (
+        await _active_real_stack()
+    )
+    _enable_exact_verifier_install(runtime)
+    factory, replacement = _replacement_factory()
+    original_replace = detector.replace_speaker_verifier
+
+    async def replace_then_fail(*args, **kwargs):
+        await original_replace(*args, **kwargs)
+        raise RuntimeError("injected post-swap failure")
+
+    detector.replace_speaker_verifier = replace_then_fail
+    try:
+        assert (
+            await _submit_pcm(runtime, turn, sequence=1)
+        ).status is AsrSubmitStatus.ACCEPTED
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        old_lease = runtime._asr_provider_speaker_evidence_lease
+        before_timeline = detector._provider_audio_timeline_generation
+
+        assert not await runtime.set_speaker_verifier_factory(
+            factory,
+            activation_generation="replacement",
+        )
+        assert detector._speaker_shadow is replacement
+        assert runtime._asr_provider_speaker_evidence_lease is None
+        settlement = await detector.confirm_provider_speaker_evidence_retirement(
+            old_lease
+        )
+        assert detector.validate_provider_speaker_evidence_settlement(
+            settlement,
+            lease=old_lease,
+        )
+
+        assert (
+            await _submit_pcm(runtime, turn, sequence=2)
+        ).status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert detector._provider_audio_timeline_generation == before_timeline
+        assert detector._provider_audio_sample_cursor_16k == 3_200
+        assert detector._provider_segment_last_sequence_no == 2
+        assert runtime._asr_session is session
+        session.close.assert_not_awaited()
+    finally:
+        await _close_stack(core)
+
+
+async def test_verifier_replacement_failure_before_detector_keeps_audio_accountable() -> (
+    None
+):
+    core, runtime, detector, _shadow, _lifecycle, session, turn = (
+        await _active_real_stack()
+    )
+    _enable_exact_verifier_install(runtime)
+    factory, replacement = _replacement_factory()
+    try:
+        assert (
+            await _submit_pcm(runtime, turn, sequence=1)
+        ).status is AsrSubmitStatus.ACCEPTED
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        old_lease = runtime._asr_provider_speaker_evidence_lease
+        before_timeline = detector._provider_audio_timeline_generation
+        detector.replace_speaker_verifier = AsyncMock(
+            side_effect=RuntimeError("injected pre-swap failure")
+        )
+
+        assert not await runtime.set_speaker_verifier_factory(
+            factory,
+            activation_generation="replacement",
+        )
+        assert runtime._asr_provider_speaker_evidence_lease is old_lease
+        replacement.close.assert_awaited_once()
+
+        assert (
+            await _submit_pcm(runtime, turn, sequence=2)
+        ).status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert runtime._asr_provider_speaker_evidence_lease is None
+        assert detector._provider_audio_timeline_generation == before_timeline
+        assert detector._provider_audio_sample_cursor_16k == 3_200
+        assert detector._provider_segment_last_sequence_no == 2
+        assert runtime._asr_session is session
+        session.close.assert_not_awaited()
+    finally:
+        await _close_stack(core)
+
+
+async def test_verifier_handoff_consumes_retirement_before_detached_cleanup() -> (
+    None
+):
+    core, runtime, detector, old_shadow, _lifecycle, session, turn = (
+        await _active_real_stack()
+    )
+    _enable_exact_verifier_install(runtime)
+    factory, _replacement = _replacement_factory()
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    original_close = old_shadow.close
+
+    async def blocked_close():
+        close_started.set()
+        await close_release.wait()
+        await original_close()
+
+    old_shadow.close = blocked_close
+    try:
+        assert (
+            await _submit_pcm(runtime, turn, sequence=1)
+        ).status is AsrSubmitStatus.ACCEPTED
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        old_lease = runtime._asr_provider_speaker_evidence_lease
+        task = asyncio.create_task(
+            runtime.set_speaker_verifier_factory(
+                factory,
+                activation_generation="replacement",
+            )
+        )
+        await asyncio.wait_for(close_started.wait(), 1.0)
+        assert await asyncio.wait_for(task, 0.1)
+        assert not close_release.is_set()
+
+        assert runtime._asr_provider_speaker_evidence_lease is None
+        settlement = await detector.confirm_provider_speaker_evidence_retirement(
+            old_lease
+        )
+        assert detector.validate_provider_speaker_evidence_settlement(
+            settlement,
+            lease=old_lease,
+        )
+        assert (
+            await _submit_pcm(runtime, turn, sequence=2)
+        ).status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert detector._provider_audio_sample_cursor_16k == 3_200
+        assert detector._provider_segment_last_sequence_no == 2
+        assert runtime._asr_session is session
+        session.close.assert_not_awaited()
+        close_release.set()
+        await asyncio.gather(*tuple(runtime._speaker_retired_cleanup))
+    finally:
+        close_release.set()
+        await _close_stack(core)
+
+
+async def test_consecutive_verifier_replacements_fence_old_callback_and_alias() -> None:
+    core, runtime, detector, _shadow, _lifecycle, session, turn = (
+        await _active_real_stack()
+    )
+    _enable_exact_verifier_install(runtime)
+    first_factory, first_shadow = _replacement_factory()
+    second_factory, second_shadow = _replacement_factory()
+    try:
+        assert (
+            await _submit_pcm(runtime, turn, sequence=1)
+        ).status is AsrSubmitStatus.ACCEPTED
+        first_key = ProviderUtteranceKey(0, 0, 1)
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        assert await runtime.set_speaker_verifier_factory(
+            first_factory,
+            activation_generation="replacement-a",
+        )
+        await runtime._handle_provider_final(
+            first_key,
+            "first unavailable owner",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+        await _settle_deliveries(core, runtime)
+
+        assert (
+            await _submit_pcm(runtime, turn, sequence=2)
+        ).status is AsrSubmitStatus.ACCEPTED
+        second_key = ProviderUtteranceKey(0, 0, 2)
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(
+                0,
+                0,
+                2,
+                audio_start_sample_16k=1_600,
+            ),
+            runtime._asr_session_epoch,
+        )
+        next_turn = runtime._asr_provider_started_turns[second_key]
+        first_lease = runtime._asr_provider_speaker_evidence_lease
+        first_activation = runtime._speaker_verifier_activation_generation
+        assert first_lease is not None and first_activation is not None
+        before = (
+            detector._provider_audio_timeline_generation,
+            detector._provider_audio_sample_cursor_16k,
+            detector._provider_segment_last_sequence_no,
+        )
+
+        assert await runtime.set_speaker_verifier_factory(
+            second_factory,
+            activation_generation="replacement-b",
+        )
+
+        assert detector._speaker_shadow is second_shadow
+        first_shadow.close.assert_awaited_once()
+        assert runtime._asr_provider_speaker_evidence_lease is None
+        assert (
+            detector._provider_audio_timeline_generation,
+            detector._provider_audio_sample_cursor_16k,
+            detector._provider_segment_last_sequence_no,
+        ) == before
+        assert not runtime._accept_speaker_evidence_fact(
+            SpeakerHigh(
+                first_lease.candidate,
+                1,
+            ),
+            activation_generation=first_activation,
+            enforce=True,
+        )
+        settlement = await detector.confirm_provider_speaker_evidence_retirement(
+            first_lease
+        )
+        assert detector.validate_provider_speaker_evidence_settlement(
+            settlement,
+            lease=first_lease,
+        )
+
+        assert (
+            await _submit_pcm(runtime, next_turn, sequence=3)
+        ).status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert detector._provider_audio_sample_cursor_16k == before[1] + 1_600
+        assert detector._provider_segment_last_sequence_no == 3
+        assert runtime._asr_session is session
+        session.close.assert_not_awaited()
     finally:
         await _close_stack(core)

@@ -21,6 +21,9 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCompletion,
     SpeakerShadowObservation,
 )
+from main_logic.asr_client.speaker_verifier_contracts import (
+    SpeakerVerifierInstallIdentity,
+)
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
 from main_logic.voice_identity.reference import SpeakerReference
@@ -116,6 +119,61 @@ def test_shadow_constructor_failure_closes_unadopted_backend_factory(monkeypatch
             factory()
         assert len(created) == 1 and created[0]._closed
     finally:
+        factory.close()
+        profile.close()
+
+
+async def test_diagnostic_configuration_failure_cannot_block_shadow_install(monkeypatch):
+    import main_logic.voice_identity_service.asr_composition as module
+
+    def fail_configuration(**_kwargs):
+        raise RuntimeError("diagnostic only")
+
+    monkeypatch.setattr(
+        module, "SpeakerScoreDiagnosticConfiguration", fail_configuration
+    )
+    profile = _profile()
+    factory = module.OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(), profile, activation_generation="activation-1", enforce=True
+    )
+    shadow = factory()
+    try:
+        assert shadow.enabled
+        assert not hasattr(shadow, "_score_diagnostic_configuration")
+    finally:
+        await shadow.close()
+        factory.close()
+        profile.close()
+
+
+async def test_installed_shadow_keeps_profile_activation_and_install_refs_distinct():
+    profile = _profile()
+    identity = SpeakerVerifierInstallIdentity(
+        1, 2, 3, 4, 5, 6, "activation-1", "installation-7"
+    )
+    factory = OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(),
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+        installation_identity=identity,
+    )
+    shadow = factory()
+    try:
+        configuration = shadow._score_diagnostic_configuration
+        refs = {
+            configuration.profile_generation_ref,
+            configuration.activation_generation_ref,
+            configuration.installation_ref,
+        }
+        assert None not in refs
+        assert len(refs) == 3
+        assert all(len(value) == 16 for value in refs)
+        assert "profile-generation" not in repr(configuration)
+        assert "activation-1" not in repr(configuration)
+        assert "installation-7" not in repr(configuration)
+    finally:
+        await shadow.close()
         factory.close()
         profile.close()
 

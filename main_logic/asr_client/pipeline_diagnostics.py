@@ -16,7 +16,40 @@ _FIELDS = frozenset({
     "frame_count", "reason", "outcome", "phase", "state", "endpoint_authority",
     "speaker_enabled", "has_text", "probability_milli", "threshold_milli",
     "transport_current", "coalesced_count", "confirmation_ms", "elapsed_ms",
+    "score_id", "score_checkpoint_kind", "score_checkpoint_ms",
+    "score_window_start_sample", "score_window_end_sample", "score_duration_ms",
+    "score_continuity", "known_missing_sample_count",
+    "known_duplicate_sample_count", "trimmed_prefix_sample_count",
+    "profile_generation_ref", "activation_generation_ref", "installation_ref",
+    "model_version", "scoring_rule_version", "quality_summary_outcome",
+    "quality_summary_version", "rms_milli", "peak_milli",
+    "near_silence_ratio_milli", "clipping_ratio_milli",
+    "near_silence_threshold_milli", "clipping_threshold_milli",
+    "voice_activity_measurement", "voice_activity_ratio_milli",
+    "evidence_path", "evidence_disposition",
 })
+
+
+_STATE_FIELDS = (
+    "detector_epoch", "timeline_generation", "sample_cursor_16k", "sequence_no",
+    "evidence_lease_generation", "evidence_timeline_generation", "retirement_count",
+    "exact_receipt_count", "boundary_snapshot_count", "closed",
+    "physical_lease_present", "logical_lease_present", "candidate_present",
+    "speaker_ledger_count", "audio_generation", "transport_generation", "session_epoch",
+)
+STATE_DIAGNOSTIC_FIELDS = frozenset({
+    "operation", "operation_id", "initiator", "reset_initiator", "reset_reason", "identity_matches",
+    "component", "proof_present", "proof_timeline_generation", "proof_detector_epoch",
+    "proof_operation_serial", "proof_lease_generation", "proof_owner_matches",
+    "proof_epoch_matches", "proof_timeline_matches", "requested_lease_generation",
+    "installation_trace_ref", "installation_initiator", "installation_reason",
+    "decision", "spec_changed", "requested_enabled", "participating", "route_supported",
+    "route_mode", "detector_present", "activation_revision", "cleanup_pending",
+    *(f"{side}_{field}" for side in ("before", "after") for field in _STATE_FIELDS),
+})
+
+
+_FIELDS = _FIELDS | STATE_DIAGNOSTIC_FIELDS
 
 
 def safe_fields(fields: dict) -> dict:
@@ -75,6 +108,12 @@ class PipelineDiagnostics:
 
     def flush(self) -> None:
         try:
+            emitters = getattr(self._runtime, "_provider_state_diagnostic_emitters", None)
+            if emitters is not None:
+                for emitter in tuple(emitters.values()):
+                    flush = getattr(emitter, "flush", None)
+                    if callable(flush):
+                        flush()
             for key, bucket in self._progress.items():
                 self._publish_audio(key, bucket)
             self._progress.clear()

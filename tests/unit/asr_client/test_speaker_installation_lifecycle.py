@@ -158,13 +158,14 @@ async def test_inflight_health_survives_install_commit_and_old_health_is_stale(
     ).outcome is Outcome.INSTALLED
     old.close_release.clear()
     spec, identity, _, shadow = target(runtime, "b")
-    task = asyncio.create_task(runtime.install_speaker_verifier(spec, identity))
+    receipt = await runtime.install_speaker_verifier(spec, identity)
     await old.close_entered.wait()
+    assert receipt.outcome is Outcome.INSTALLED
+    assert receipt.cleanup_pending
     runtime._accept_speaker_verifier_health(
         SpeakerVerifierHealthEvent(identity, 1, frozenset({"backend_unavailable"}))
     )
     old.close_release.set()
-    assert (await task).outcome is Outcome.INSTALLED
     assert runtime._speaker_verifier_degraded
     runtime._accept_speaker_verifier_health(SpeakerVerifierHealthEvent(first_id, 99))
     assert runtime._speaker_verifier_degraded
@@ -286,7 +287,7 @@ async def test_cancel_after_detector_accepts_before_lock_closes_new_shadow(itera
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("iteration", range(50))
-async def test_cancel_after_swap_keeps_detector_cleanup_ownership(iteration):
+async def test_swap_commit_does_not_wait_for_detector_owned_cleanup(iteration):
     runtime = setup_install()
     first, first_id, _, old = target(runtime)
     await runtime.install_speaker_verifier(first, first_id)
@@ -294,13 +295,19 @@ async def test_cancel_after_swap_keeps_detector_cleanup_ownership(iteration):
     spec, identity, factory, shadow = target(runtime, "b")
     task = asyncio.create_task(runtime.install_speaker_verifier(spec, identity))
     await old.close_entered.wait()
-    task.cancel()
-    old.close_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert factory.closed and old.closed
+    receipt = await asyncio.wait_for(task, 0.1)
+    assert receipt.outcome is Outcome.INSTALLED
+    assert receipt.cleanup_pending
+    assert not old.closed
+    assert not factory.closed
     assert runtime._asr_detector._speaker_shadow is shadow
-    assert not runtime.speaker_verifier_installation_permits_evidence(identity)
+    assert runtime.speaker_verifier_installation_permits_evidence(identity)
+    old.close_release.set()
+    await asyncio.wait_for(
+        asyncio.gather(*tuple(runtime._speaker_retired_cleanup)),
+        0.1,
+    )
+    assert old.closed
     await runtime._asr_detector.close()
     assert shadow.closed
 
@@ -331,8 +338,6 @@ async def test_install_regressions_reject_old_ordering(monkeypatch, mutation):
     )
     with pytest.raises(AssertionError):
         if mutation == "erase_health":
-            await test_inflight_health_survives_install_commit_and_old_health_is_stale(
-                0
-            )
+            await test_pending_health_conflict_cannot_be_erased_at_commit(0)
         else:
             await test_cancel_before_handoff_closes_created_shadow(0)

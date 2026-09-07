@@ -1,16 +1,33 @@
 """Correlated diagnostics observe real decisions without becoming authority."""
 
 import asyncio
+from collections import deque
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from main_logic.asr_client import runtime as runtime_module
 from main_logic.asr_client.pipeline_diagnostics import PipelineDiagnostics, safe_fields
+from main_logic.asr_client.admission.contracts import (
+    AdmissionDisposition,
+    CountDiagnostic,
+    ExactIntervalOutcome,
+    ExactIntervalTransitionReceipt,
+    SpeakerCaptureLeaseToken,
+    SpeakerCheckpointKind,
+    SpeakerLeaseLow,
+    SpeakerLeaseState,
+    SpeakerLeaseTransitionOutcome,
+    SpeakerLeaseTransitionReceipt,
+    SpeakerLow,
+)
 from main_logic.asr_client.endpointing.detector import DetectorIngressIdentity
 from main_logic.asr_client.endpointing.detector_runtime import _VoiceTurnAdapter
+from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
+from main_logic.asr_client.speaker_shadow.diagnostics import SpeakerShadowDiagnostic
 from main_logic.voice_turn.contracts import SpeechActivityEvent, EvaluationStatus, VoiceTranscriptEvent
 from scripts.check_asr_pipeline_log import summarize, parse_record
 from tests.unit.test_asr_voice_turn_adapter import (
@@ -20,6 +37,36 @@ from tests.unit.test_asr_voice_turn_adapter import (
 from tests.unit.test_core_independent_asr import _Runtime, _install_ready_lifecycle
 from tests.unit.asr_client.test_short_speaker_diagnostics import _join_logs, _interval
 from tests.unit.asr_client.test_provider_speaker_continuity import _active_real_stack, _close_stack
+
+
+def _score_diagnostic(
+    candidate: SpeakerShadowCandidateKey,
+    *,
+    score_id: str,
+    evidence_sequence_no: int,
+    stage: str = "speaker_score_started",
+) -> SpeakerShadowDiagnostic:
+    return SpeakerShadowDiagnostic(
+        candidate=candidate,
+        stage=stage,
+        worker_generation=1,
+        sample_rate_hz=16_000,
+        accepted_sample_count=24_000,
+        buffered_sample_count=24_000,
+        finish_sample_count=None,
+        minimum_sample_count=24_000,
+        score_attempt_count=1,
+        score_input_sample_count=24_000,
+        score_outcome="in_progress" if stage.endswith("started") else "completed",
+        scored_sample_count=0,
+        last_checkpoint_ms=1_500,
+        terminal_reason=None,
+        evidence_sequence_no=evidence_sequence_no,
+        anchor_applied=True,
+        anchor_discard_prefix_sample_count=0,
+        scoring_deferred=False,
+        score_id=score_id,
+    )
 
 
 def test_projection_and_audio_aggregation_are_bounded():
@@ -182,6 +229,35 @@ async def test_real_provider_pipeline_report_and_old_log_gaps(monkeypatch):
         await _close_stack(core)
 
 
+async def test_real_score_chain_remains_separate_from_final_text_decision(monkeypatch):
+    logs = []
+    monkeypatch.setattr(
+        runtime_module.asr_diagnostic_logger, "info", lambda _, record: logs.append(record)
+    )
+    core, runtime, detector, shadow, lifecycle, session, turn = await _active_real_stack(
+        score=.78
+    )
+    core.continuity_score_host.ready.set()
+    try:
+        await _interval(runtime, shadow, turn, 1600)
+        await core._voice_input_registry.wait_idle()
+        await _join_logs(runtime)
+        session_report = summarize(
+            "ASR resolution " + repr(record) for record in logs
+        )["sessions"][0]
+        assert len(session_report["scores"]) == 1
+        score = session_report["scores"][0]
+        assert score["score_outcome"] == "completed"
+        assert score["quality"]["status"] == "measured"
+        assert score["scored_interval"]["relative_end_sample"] == 24_000
+        assert score["evidence_observation"] == "observed"
+        assert score["final_text_decision"] == "forward"
+        assert score["final_text_observation"] == "observed"
+        assert not score["correlation_conflicts"]
+    finally:
+        await _close_stack(core)
+
+
 def test_checker_missing_truncated_dropped_and_untrusted_records():
     assert parse_record("ASR resolution __import__('os').system('PRIVATE')") is None
     assert parse_record("ASR resolution {not valid}") is None
@@ -193,6 +269,465 @@ def test_checker_missing_truncated_dropped_and_untrusted_records():
     assert report["sessions"][0]["coverage"]["smart_turn"] == "not_applicable"
     assert summarize(records * 4, max_records=2)["sessions"][0]["log_gaps"]
     assert summarize(records + [records[0].replace("a" * 24, "b" * 24)], max_sessions=1)["sessions_truncated"]
+
+
+def test_checker_preserves_first_landmarks_when_noisy_tail_is_truncated():
+    ref = "a" * 24
+    records = [
+        {"diagnostic_session_ref": ref, "session_epoch": 1,
+         "stage": "audio_received", "frame_count": 1},
+        {"diagnostic_session_ref": ref, "session_epoch": 1,
+         "stage": "speaker_verifier_installation", "phase": "entry",
+         "installation_trace_ref": "c" * 32, "installation_initiator": "core_route_start",
+         "installation_reason": "route_ready", "reason": "reconcile_requested"},
+        {"diagnostic_session_ref": ref, "session_epoch": 1,
+         "stage": "speaker_verifier_installation", "phase": "entry",
+         "installation_trace_ref": "b" * 32, "installation_initiator": "activation_prepare",
+         "installation_reason": "configuration_replace", "reason": "reconcile_requested"},
+        {"diagnostic_session_ref": ref, "session_epoch": 1,
+         "stage": "provider_state_change", "operation": "retirement_validation",
+         "reason": "accounting_retirement_unproven", "outcome": "rejected",
+         "proof_present": False},
+    ]
+    records.extend(
+        {"diagnostic_session_ref": ref, "session_epoch": 1,
+         "stage": "provider_state_change", "operation": "evidence_alias_consume",
+         "reason": "evidence_alias_consume", "outcome": "rejected",
+         "coalesced_count": sequence}
+        for sequence in range(600)
+    )
+    records.append(
+        {"diagnostic_session_ref": ref, "session_epoch": 2,
+         "stage": "speaker_verifier_installation", "phase": "result",
+         "installation_trace_ref": "b" * 32, "decision": "install_missing",
+         "reason": "install_completed", "outcome": "installed"}
+    )
+    session = summarize(
+        ("ASR resolution " + repr(record) for record in records), max_records=32,
+    )["sessions"][0]
+    assert session["log_gaps"] is True
+    assert session["records_omitted"] == len(records) - 32
+    assert session["session_epoch"] == 2
+    assert session["coverage"]["audio_input"] == "observed"
+    findings = session["session_findings"]
+    assert any(r.get("phase") == "entry" and r.get("installation_initiator") == "activation_prepare" for r in findings)
+    assert any(r.get("operation") == "retirement_validation" and r.get("proof_present") is False for r in findings)
+    assert any(r.get("phase") == "result" and r.get("outcome") == "installed" for r in findings)
+    assert len(findings) <= 32
+
+
+def test_checker_correlates_score_input_result_evidence_and_final_decision():
+    ref = "a" * 24
+    score_id = "provider_candidate_4_9_1"
+    context = {
+        "diagnostic_session_ref": ref,
+        "session_epoch": 2,
+        "turn_id": 7,
+        "provider_generation": 1,
+        "provider_buffer_epoch": 3,
+        "provider_utterance_id": 5,
+        "provider_start_sample_16k": 1_000,
+        "detector_epoch": 4,
+        "shadow_generation": 9,
+        "candidate_scope": "provider_candidate",
+        "sample_rate_hz": 16_000,
+        "score_id": score_id,
+        "score_checkpoint_kind": "checkpoint",
+        "score_checkpoint_ms": 1_500,
+        "score_window_start_sample": 0,
+        "score_window_end_sample": 24_000,
+        "score_duration_ms": 1_500,
+        "score_input_sample_count": 24_000,
+        "score_continuity": "unknown",
+        "trimmed_prefix_sample_count": 0,
+        "profile_generation_ref": "1" * 16,
+        "activation_generation_ref": "2" * 16,
+        "installation_ref": "3" * 16,
+        "model_version": "campplus_v1_0_0",
+        "scoring_rule_version": "owner_voice_v1",
+        "quality_summary_outcome": "measured",
+        "quality_summary_version": "pcm16_quality_v1",
+        "rms_milli": 125,
+        "peak_milli": 500,
+        "near_silence_ratio_milli": 250,
+        "clipping_ratio_milli": 0,
+        "near_silence_threshold_milli": 10,
+        "clipping_threshold_milli": 1_000,
+        "voice_activity_measurement": "not_measured",
+    }
+    records = [
+        {**context, "stage": "speaker_score_started", "score_outcome": "in_progress",
+         "evidence_sequence_no": 0},
+        {**context, "stage": "speaker_score_finished", "score_outcome": "completed",
+         "evidence_sequence_no": 1},
+        {"diagnostic_session_ref": ref, "session_epoch": 2, "turn_id": 7,
+         "provider_generation": 1, "provider_buffer_epoch": 3,
+         "provider_utterance_id": 5, "stage": "speaker_fact_observed",
+         "speaker_sequence_no": 1, "speaker_classification": "high"},
+        {"diagnostic_session_ref": ref, "session_epoch": 2, "turn_id": 7,
+         "provider_generation": 1, "provider_buffer_epoch": 3,
+         "provider_utterance_id": 5, "stage": "provider_final_received"},
+        {"diagnostic_session_ref": ref, "session_epoch": 2, "turn_id": 7,
+         "stage": "admission_decision", "disposition": "forward",
+         "reason_code": "ASR_SPEAKER_VERIFIED"},
+    ]
+    score = summarize(
+        "ASR resolution " + repr(record) for record in records
+    )["sessions"][0]["scores"][0]
+    assert score["score_id"] == score_id
+    assert score["start_observation"] == "observed"
+    assert score["end_observation"] == "observed"
+    assert score["score_outcome"] == "completed"
+    assert score["scored_interval"] == {
+        "relative_status": "known",
+        "relative_start_sample": 0,
+        "relative_end_sample": 24_000,
+        "timeline_status": "known",
+        "timeline_start_sample_16k": 1_000,
+        "timeline_end_sample_16k": 25_000,
+    }
+    assert score["quality"]["status"] == "measured"
+    assert score["quality"]["voice_activity"] == {
+        "status": "not_measured", "ratio_milli": None,
+    }
+    assert score["evidence_observation"] == "observed"
+    assert score["speaker_classification"] == "high"
+    assert score["final_text_observation"] == "observed"
+    assert score["final_text_decision"] == "forward"
+    assert score["final_text_reason"] == "ASR_SPEAKER_VERIFIED"
+    assert not score["correlation_conflicts"]
+
+
+def test_checker_reports_missing_end_unknown_timeline_and_score_conflict():
+    ref = "a" * 24
+    base = {
+        "diagnostic_session_ref": ref,
+        "session_epoch": 1,
+        "stage": "speaker_score_started",
+        "score_id": "provider_candidate_1_2_1",
+        "score_checkpoint_kind": "checkpoint",
+        "score_checkpoint_ms": 1_500,
+        "score_window_start_sample": 0,
+        "score_window_end_sample": 24_000,
+        "sample_rate_hz": 16_000,
+        "quality_summary_outcome": "unavailable",
+        "quality_summary_version": "pcm16_quality_v1",
+        "diagnostic_records_dropped": 2,
+    }
+    records = [base, {**base, "score_window_end_sample": 48_000}]
+    session = summarize(
+        ("ASR resolution " + repr(record) for record in records), max_records=8,
+    )["sessions"][0]
+    score = session["scores"][0]
+    assert score["end_observation"] == "not_observed"
+    assert score["score_outcome"] == "not_observed"
+    assert score["scored_interval"]["timeline_status"] == "unknown"
+    assert score["quality"]["status"] == "not_measured"
+    assert score["duplicate_start_count"] == 1
+    assert score["correlation_conflicts"] == ["score_window_end_sample"]
+    assert session["log_integrity"] == {
+        "diagnostic_drop_observed": True,
+        "records_truncated": False,
+        "score_correlation_conflicts": 1,
+    }
+
+
+def test_checker_keeps_authoritative_evidence_and_final_verdict_separate():
+    ref = "a" * 24
+    base = {
+        "diagnostic_session_ref": ref,
+        "session_epoch": 1,
+        "score_id": "provider_candidate_1_2_1",
+        "detector_epoch": 1,
+        "shadow_generation": 2,
+        "candidate_scope": "provider",
+    }
+    records = [
+        {**base, "stage": "speaker_score_started", "evidence_sequence_no": 0},
+        {
+            **base,
+            "stage": "speaker_evidence_disposition",
+            "evidence_sequence_no": 1,
+            "evidence_path": "provisional_ledger",
+            "evidence_disposition": "accepted",
+            "reason": "appended",
+        },
+        {
+            **base,
+            "stage": "speaker_evidence_disposition",
+            "evidence_sequence_no": 1,
+            "evidence_path": "exact_interval",
+            "evidence_disposition": "rejected_acceptance",
+            "reason": "conflict",
+        },
+    ]
+    score = summarize(
+        "ASR resolution " + repr(record) for record in records
+    )["sessions"][0]["scores"][0]
+    assert score["end_observation"] == "not_observed"
+    assert score["evidence_disposition_observation"] == "observed"
+    assert score["evidence_disposition"] == "rejected_acceptance"
+    assert score["evidence_disposition_history"] == [
+        {
+            "path": "provisional_ledger",
+            "disposition": "accepted",
+            "reason": "appended",
+        },
+        {
+            "path": "exact_interval",
+            "disposition": "rejected_acceptance",
+            "reason": "conflict",
+        },
+    ]
+    assert score["final_text_observation"] == "not_observed"
+    assert score["final_text_decision"] == "not_observed"
+
+
+def test_provisional_ledger_dispositions_come_from_actual_mutation(monkeypatch):
+    core = _Runtime()
+    runtime = core._asr_runtime
+    runtime._ensure_asr_runtime_state()
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+    ledger = SimpleNamespace(
+        state=runtime_module._ProviderSpeakerLedgerState.ANCHORED_SCORING,
+        poisoned_reason=None,
+        candidate=candidate,
+        close_event=None,
+        event_by_sequence={},
+        last_speaker_sequence_no=0,
+        events=deque(),
+    )
+    emitted = []
+    monkeypatch.setattr(
+        runtime, "_schedule_asr_diagnostic_metadata",
+        lambda metadata, **_kwargs: emitted.append(metadata),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_poison_provider_speaker_ledger",
+        lambda owner, reason: setattr(owner, "poisoned_reason", reason),
+    )
+
+    def remember(score_id, prior_sequence):
+        runtime._remember_speaker_score_correlation(
+            _score_diagnostic(
+                candidate, score_id=score_id,
+                evidence_sequence_no=prior_sequence,
+            ),
+            activation_generation="activation",
+            session_epoch=7,
+            provider_key=None,
+            turn_id=None,
+        )
+
+    remember("score_accepted", 0)
+    assert runtime._record_provider_provisional_speaker_event(
+        ledger, SpeakerLeaseLow(candidate, 1, SpeakerCheckpointKind.FIRST)
+    )
+    remember("score_rejected", 2)
+    assert runtime._record_provider_provisional_speaker_event(
+        ledger, SpeakerLeaseLow(candidate, 3, SpeakerCheckpointKind.FIRST)
+    )
+    ledger.poisoned_reason = None
+    ledger.state = runtime_module._ProviderSpeakerLedgerState.RESOLVED
+    remember("score_expired", 3)
+    assert not runtime._record_provider_provisional_speaker_event(
+        ledger, SpeakerLeaseLow(candidate, 4, SpeakerCheckpointKind.FIRST)
+    )
+    assert [item["evidence_disposition"] for item in emitted] == [
+        "accepted", "rejected_acceptance", "expired",
+    ]
+    assert [item["reason"] for item in emitted] == [
+        "appended", "sequence_gap", "ledger_terminal",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (SpeakerLeaseTransitionOutcome.APPLIED, "accepted"),
+        (SpeakerLeaseTransitionOutcome.STALE, "expired"),
+        (SpeakerLeaseTransitionOutcome.CONFLICT, "rejected_acceptance"),
+    ],
+)
+def test_typed_lease_receipt_maps_authoritative_disposition(
+    monkeypatch, outcome, expected,
+):
+    core = _Runtime()
+    runtime = core._asr_runtime
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+    runtime._remember_speaker_score_correlation(
+        _score_diagnostic(candidate, score_id="score_lease", evidence_sequence_no=0),
+        activation_generation="activation",
+        session_epoch=4,
+        provider_key=None,
+        turn_id=None,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        runtime, "_schedule_asr_diagnostic_metadata",
+        lambda metadata, **_kwargs: emitted.append(metadata),
+    )
+    receipt = SpeakerLeaseTransitionReceipt(
+        lease_token=SpeakerCaptureLeaseToken(1, 1, 1, 1, 1),
+        before_state=SpeakerLeaseState.COLLECTING,
+        after_state=SpeakerLeaseState.COLLECTING,
+        outcome=outcome,
+        terminal_sequence_no=None,
+        capture_through_sequence_no=None,
+        frozen_children=(),
+        child_results=(),
+        diagnostics=(),
+    )
+    runtime._schedule_speaker_lease_disposition(
+        SpeakerLeaseLow(candidate, 1, SpeakerCheckpointKind.FIRST), receipt,
+    )
+    assert emitted[-1]["evidence_disposition"] == expected
+    assert emitted[-1]["reason"] == outcome.value
+
+
+def test_late_score_callback_uses_only_original_correlation(monkeypatch):
+    core = _Runtime()
+    runtime = core._asr_runtime
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+    started = _score_diagnostic(
+        candidate, score_id="score_late", evidence_sequence_no=0,
+    )
+    runtime._remember_speaker_score_correlation(
+        started,
+        activation_generation="old_activation",
+        session_epoch=3,
+        provider_key=None,
+        turn_id=None,
+    )
+    runtime._speaker_verifier_activation_generation = "new_activation"
+    runtime._asr_session_epoch = 99
+    emitted = []
+    monkeypatch.setattr(
+        runtime, "_schedule_asr_diagnostic_metadata",
+        lambda metadata, **_kwargs: emitted.append(metadata),
+    )
+    runtime._accept_speaker_diagnostic(
+        replace(started, stage="speaker_score_finished", score_outcome="completed"),
+        activation_generation="old_activation",
+        source=object(),
+    )
+    assert len(emitted) == 1
+    stale = emitted[0]
+    assert stale["stage"] == "speaker_score_stale"
+    assert stale["session_epoch"] == 3
+    assert stale["reason"] == "activation_replaced"
+    assert stale["score_id"] == "score_late"
+    assert not any(key.startswith("provider_") or key == "turn_id" for key in stale)
+
+
+@pytest.mark.parametrize(
+    ("effects", "expected", "reason"),
+    [
+        (
+            (CountDiagnostic("admission_stale_speaker_fact"),),
+            "expired",
+            "stale_reducer_result",
+        ),
+        ((), "not_observed", "ambiguous_reducer_result"),
+    ],
+)
+async def test_direct_ingress_reports_only_what_reducer_result_proves(
+    monkeypatch, effects, expected, reason,
+):
+    core = _Runtime()
+    _install_ready_lifecycle(core)
+    runtime = core._asr_runtime
+    runtime._ensure_asr_runtime_state()
+    turn = runtime._capture_turn_token(core._asr_lifecycle)
+    candidate = SpeakerShadowCandidateKey(1, 2, "smart_turn_turn")
+    runtime._remember_speaker_score_correlation(
+        _score_diagnostic(candidate, score_id="score_direct", evidence_sequence_no=0),
+        activation_generation="activation",
+        session_epoch=turn.ingress.session_epoch,
+        provider_key=None,
+        turn_id=turn.turn_id,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        runtime, "_schedule_asr_diagnostic_metadata",
+        lambda metadata, **_kwargs: emitted.append(metadata),
+    )
+    monkeypatch.setattr(
+        runtime._asr_admission_ingress, "retire_turn", AsyncMock(return_value=None),
+    )
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(effects)
+    await runtime._consume_admission_future(
+        turn,
+        future,
+        speaker_fact=SpeakerLow(
+            candidate, 1, SpeakerCheckpointKind.FIRST,
+        ),
+    )
+    assert emitted[-1]["evidence_disposition"] == expected
+    assert emitted[-1]["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (ExactIntervalOutcome.RESOLVED, "accepted"),
+        (ExactIntervalOutcome.STALE, "expired"),
+        (ExactIntervalOutcome.CONFLICT, "rejected_acceptance"),
+        (ExactIntervalOutcome.HELD, "not_observed"),
+    ],
+)
+async def test_exact_receipt_reports_only_authoritative_disposition(
+    monkeypatch, outcome, expected,
+):
+    core = _Runtime()
+    runtime = core._asr_runtime
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+    runtime._remember_speaker_score_correlation(
+        _score_diagnostic(candidate, score_id="score_exact", evidence_sequence_no=0),
+        activation_generation="activation",
+        session_epoch=5,
+        provider_key=None,
+        turn_id=None,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        runtime, "_schedule_asr_diagnostic_metadata",
+        lambda metadata, **_kwargs: emitted.append(metadata),
+    )
+    monkeypatch.setattr(
+        runtime, "_exact_interval_evidence_owner_is_current", lambda _owner: True,
+    )
+    monkeypatch.setattr(
+        runtime, "_speaker_exact_installation_is_current", lambda _owner: True,
+    )
+    monkeypatch.setattr(
+        runtime, "_execute_exact_admission_effects", AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        runtime, "_fail_exact_interval_group", AsyncMock(return_value=None),
+    )
+    receipt = ExactIntervalTransitionReceipt(
+        interval_id=1,
+        outcome=outcome,
+        disposition=(
+            AdmissionDisposition.FORWARD
+            if outcome is ExactIntervalOutcome.RESOLVED else None
+        ),
+        effects=(),
+    )
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(receipt)
+    runtime._asr_admission_ingress = SimpleNamespace(
+        post_exact_interval_nowait=lambda *_args, **_kwargs: future,
+    )
+    transaction = SimpleNamespace(resolved_disposition=None, activation=object())
+    await runtime._apply_exact_interval_event(
+        transaction,
+        SpeakerLeaseLow(candidate, 1, SpeakerCheckpointKind.FIRST),
+    )
+    assert emitted[-1]["evidence_disposition"] == expected
 
 
 def test_checker_never_merges_reused_turn_ids_across_routes():

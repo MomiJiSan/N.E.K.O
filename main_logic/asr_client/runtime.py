@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -243,6 +243,7 @@ _MAX_DEFERRED_PROVIDER_SPEAKER_LEASE_EVENTS = 8
 _MAX_PROVIDER_PROVISIONAL_SPEAKER_EVENTS = 16
 _MAX_PROVIDER_EXACT_TRANSACTION_EVENTS = 32
 _MAX_SPEAKER_EVIDENCE_BRIDGE_RECORDS = 256
+_MAX_SPEAKER_SCORE_CORRELATIONS = 256
 _ASR_REASON_CODE_RE = re.compile(r"^(ASR_[A-Z0-9_]{1,60})(?::|$)")
 _ASR_REASON_CODE_FULL_RE = re.compile(r"^ASR_[A-Z0-9_]{1,60}$")
 _PROVIDER_MICRO_EVENT_SHADOW_CONFIG = ProviderMicroEventConfig(
@@ -522,6 +523,22 @@ class _SpeakerEvidenceDegradation:
     activation_generation: str
     reason_code: str
     incident_id: str
+
+
+@dataclass(slots=True)
+class _SpeakerScoreCorrelation:
+    """Bounded diagnostic-only bridge from one score to its next evidence fact."""
+
+    score_id: str
+    candidate: SpeakerShadowCandidateKey
+    evidence_sequence_no: int
+    activation_generation: str
+    session_epoch: int
+    provider_generation: int | None
+    provider_buffer_epoch: int | None
+    provider_utterance_id: int | None
+    turn_id: int | None
+    stale_logged: bool = False
 
 
 @dataclass(slots=True)
@@ -1560,8 +1577,16 @@ class IndependentAsrRuntime:
             _ProviderSpeakerLedgerState.EXACT_DRAINING,
             _ProviderSpeakerLedgerState.RESOLVED,
         }:
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger", disposition="expired",
+                reason="ledger_terminal",
+            )
             return False
         if ledger.poisoned_reason is not None:
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger",
+                disposition="rejected_acceptance", reason="ledger_poisoned",
+            )
             return True
         if (
             ledger.state is _ProviderSpeakerLedgerState.UNANCHORED_DEFERRED
@@ -1574,11 +1599,19 @@ class IndependentAsrRuntime:
             self._speaker_rejection_metrics[
                 "speaker_pre_anchor_fact_ignored_count"
             ] += 1
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger", disposition="expired",
+                reason="pre_anchor",
+            )
             return True
         if isinstance(event, SpeakerLeaseUnavailable):
             self._poison_provider_speaker_ledger(
                 ledger,
                 "speaker_evidence_unavailable",
+            )
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger", disposition="accepted",
+                reason="unavailable_applied",
             )
             return True
         if isinstance(event, SpeakerLeaseCaptureClosed):
@@ -1610,9 +1643,17 @@ class IndependentAsrRuntime:
             return True
         if event.candidate != ledger.candidate:
             self._poison_provider_speaker_ledger(ledger, "candidate_mismatch")
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger",
+                disposition="rejected_acceptance", reason="candidate_mismatch",
+            )
             return True
         if ledger.close_event is not None:
             self._poison_provider_speaker_ledger(ledger, "fact_after_close")
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger",
+                disposition="rejected_acceptance", reason="fact_after_close",
+            )
             return True
         existing = ledger.event_by_sequence.get(event.sequence_no)
         if existing is not None:
@@ -1621,6 +1662,15 @@ class IndependentAsrRuntime:
                     ledger,
                     "conflicting_duplicate",
                 )
+                disposition = "rejected_acceptance"
+                reason = "conflicting_duplicate"
+            else:
+                disposition = "accepted"
+                reason = "idempotent"
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger", disposition=disposition,
+                reason=reason,
+            )
             return True
         expected = ledger.last_speaker_sequence_no + 1
         if event.sequence_no != expected:
@@ -1630,14 +1680,30 @@ class IndependentAsrRuntime:
                 if event.sequence_no > expected
                 else "speaker_sequence_reorder",
             )
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger",
+                disposition="rejected_acceptance",
+                reason=(
+                    "sequence_gap" if event.sequence_no > expected
+                    else "sequence_reorder"
+                ),
+            )
             return True
         if len(ledger.events) >= _MAX_PROVIDER_PROVISIONAL_SPEAKER_EVENTS:
             self._poison_provider_speaker_ledger(ledger, "ledger_capacity")
+            self._schedule_speaker_evidence_disposition(
+                event, path="provisional_ledger",
+                disposition="rejected_acceptance", reason="ledger_capacity",
+            )
             return True
         ledger.events.append(event)
         ledger.event_by_sequence[event.sequence_no] = event
         ledger.last_speaker_sequence_no = event.sequence_no
         self._speaker_rejection_metrics["speaker_provisional_fact_count"] += 1
+        self._schedule_speaker_evidence_disposition(
+            event, path="provisional_ledger", disposition="accepted",
+            reason="appended",
+        )
         return True
 
     def _accept_speaker_evidence_fact(
@@ -1729,7 +1795,7 @@ class IndependentAsrRuntime:
             outcome="low" if isinstance(fact, SpeakerLow) else "high" if isinstance(fact, SpeakerHigh) else "unavailable",
             sequence_no=fact.sequence_no,
         )
-        self._consume_admission_future(turn_token, future)
+        self._consume_admission_future(turn_token, future, speaker_fact=fact)
         return True
 
     def _close_speaker_evidence(
@@ -1889,6 +1955,7 @@ class IndependentAsrRuntime:
                 self._consume_speaker_lease_future(
                     lease_token,
                     prior_future,
+                    event=prior,
                     expected_identity=(
                         None
                         if cleanup_owner is not None
@@ -1923,6 +1990,7 @@ class IndependentAsrRuntime:
         self._consume_speaker_lease_future(
             lease_token,
             future,
+            event=event,
             expected_identity=expected_identity,
             cleanup_owner=cleanup_owner,
             requires_terminal=cleanup_owner is not None,
@@ -2232,6 +2300,25 @@ class IndependentAsrRuntime:
                 receipt = None
         except Exception:
             receipt = None
+        if isinstance(receipt, ExactIntervalTransitionReceipt):
+            if receipt.outcome is ExactIntervalOutcome.RESOLVED:
+                evidence_disposition = "accepted"
+                evidence_reason = "resolved"
+            elif receipt.outcome is ExactIntervalOutcome.STALE:
+                evidence_disposition = "expired"
+                evidence_reason = "stale"
+            elif receipt.outcome is ExactIntervalOutcome.CONFLICT:
+                evidence_disposition = "rejected_acceptance"
+                evidence_reason = "conflict"
+            else:
+                # HELD conflates applied waiting, fenced no-op and idempotent
+                # close. The current receipt cannot prove acceptance.
+                evidence_disposition = "not_observed"
+                evidence_reason = "held_ambiguous"
+            self._schedule_speaker_evidence_disposition(
+                event, path="exact_interval",
+                disposition=evidence_disposition, reason=evidence_reason,
+            )
         if not self._exact_interval_evidence_owner_is_current(transaction):
             if cancelled is not None:
                 raise cancelled
@@ -2420,6 +2507,7 @@ class IndependentAsrRuntime:
         future: asyncio.Future[tuple[AdmissionEffect, ...]],
         *,
         suppress_terminal_errors: bool = True,
+        speaker_fact: SpeakerLow | SpeakerHigh | SpeakerUnavailable | None = None,
     ) -> asyncio.Task[tuple[AdmissionEffect, ...]]:
         """Execute effects owned by one synchronously queued ingress item."""
 
@@ -2430,6 +2518,22 @@ class IndependentAsrRuntime:
                 if suppress_terminal_errors:
                     return ()
                 raise
+
+            if speaker_fact is not None:
+                stale = any(
+                    isinstance(effect, CountDiagnostic)
+                    and effect.name == "admission_stale_speaker_fact"
+                    for effect in effects
+                )
+                self._schedule_speaker_evidence_disposition(
+                    speaker_fact,
+                    path="direct_ingress",
+                    disposition="expired" if stale else "not_observed",
+                    reason=(
+                        "stale_reducer_result" if stale
+                        else "ambiguous_reducer_result"
+                    ),
+                )
 
             async def execute_effects() -> None:
                 await self._execute_exact_admission_effects(effects)
@@ -2461,6 +2565,7 @@ class IndependentAsrRuntime:
         lease_token: SpeakerCaptureLeaseToken,
         future: asyncio.Future[Any],
         *,
+        event: SpeakerLeaseEvent | None = None,
         expected_identity: _AsrRuntimeIdentity | None = None,
         cleanup_owner: _SpeakerDenyCleanupOperation | None = None,
         requires_terminal: bool = False,
@@ -2487,6 +2592,7 @@ class IndependentAsrRuntime:
             return await self._apply_prepared_speaker_lease_transition(
                 lease_token,
                 result,
+                event=event,
                 expected_identity=expected_identity,
                 cleanup_owner=cleanup_owner,
                 requires_terminal=requires_terminal,
@@ -2505,11 +2611,14 @@ class IndependentAsrRuntime:
         lease_token: SpeakerCaptureLeaseToken,
         prepared: Any,
         *,
+        event: SpeakerLeaseEvent | None = None,
         expected_identity: _AsrRuntimeIdentity | None,
         cleanup_owner: _SpeakerDenyCleanupOperation | None,
         requires_terminal: bool = False,
     ) -> SpeakerLeaseTransitionReceipt | None:
         if isinstance(prepared, SpeakerLeaseTransitionReceipt):
+            if prepared.lease_token == lease_token and event is not None:
+                self._schedule_speaker_lease_disposition(event, prepared)
             await self._apply_speaker_lease_result(lease_token, prepared)
             if cleanup_owner is not None and requires_terminal and not (
                 prepared.lease_token == lease_token
@@ -2626,6 +2735,7 @@ class IndependentAsrRuntime:
                 "ASR_DENY_CLEANUP_TERMINAL_CONFLICT",
             )
             return None
+        self._schedule_speaker_lease_disposition(event, result)
         await self._apply_speaker_lease_result(lease_token, result)
         return result
 
@@ -2776,6 +2886,7 @@ class IndependentAsrRuntime:
                 result = await self._apply_prepared_speaker_lease_transition(
                     lease_token,
                     prepared,
+                    event=event,
                     expected_identity=expected_identity,
                     cleanup_owner=None,
                     requires_terminal=False,
@@ -5870,6 +5981,7 @@ class IndependentAsrRuntime:
             lifecycle is not None
             and detector is not None
             and self._asr_session is session_ref
+            and getattr(session_ref, "is_ready", True)
             and self._ingress_token_matches(turn_token.ingress)
             and lifecycle.snapshot.turn_id == turn_token.turn_id
             and self._asr_endpointing_ready(lifecycle, detector, turn_token)
@@ -6661,6 +6773,7 @@ class IndependentAsrRuntime:
                 or self._asr_lifecycle is not lifecycle
                 or lifecycle.current_turn_token != turn_token
                 or not self._ingress_token_matches(turn_token.ingress)
+                or not self._asr_audio_command_is_valid(turn_token, session_ref)
             ):
                 await self._retire_partial_provider_audio(physical_identity, failure_context=failure_context)
                 return False
@@ -7373,7 +7486,12 @@ class IndependentAsrRuntime:
             ingress_token=turn_token.ingress,
         )
         ordered_observation_started = False
+        # Freeze the verifier request before the Detector await.  A hot
+        # replacement may retire this evidence authority while preserving the
+        # physical Provider audio timeline; the reply must never be
+        # reinterpreted through the successor verifier's flags or aliases.
         activation_generation = self._speaker_verifier_activation_generation
+        enforcement_required = self._speaker_verifier_enforces_admission
 
         def failed(
             check: str, error: BaseException | None = None, *, actual: dict | None = None,
@@ -7413,11 +7531,15 @@ class IndependentAsrRuntime:
                 accounting_only = bool(
                     speaker_evidence_unavailable
                     or (
+                        activation_generation is None
+                        and getattr(detector, "_speaker_shadow", None) is None
+                    )
+                    or (
                         ledger is not None
                         and ledger.state is _ProviderSpeakerLedgerState.UNAVAILABLE
                     )
                 )
-                if self._speaker_verifier_enforces_admission:
+                if enforcement_required:
                     candidate = (
                         evidence_lease.candidate
                         if evidence_lease is not None
@@ -7447,71 +7569,108 @@ class IndependentAsrRuntime:
                     ordered_kwargs["failure_context"] = failure_context
                 if evidence_lease is not None:
                     ordered_kwargs["speaker_evidence_lease"] = evidence_lease
+                if ledger is not None and ledger.timeline_generation >= 0:
+                    # Pin both evidence and accounting requests to the timeline
+                    # on which their lease/ledger was captured.  A reconnect
+                    # or reset while the Detector lock is queued must not let
+                    # an old request account against a successor timeline.
+                    ordered_kwargs["expected_timeline_generation"] = (
+                        ledger.timeline_generation
+                    )
                 if accounting_only:
                     ordered_kwargs["accounting_only"] = True
                     ordered_kwargs["evidence_complete"] = False
-                    if ledger is not None and ledger.timeline_generation >= 0:
-                        ordered_kwargs["expected_timeline_generation"] = (
-                            ledger.timeline_generation
-                        )
                 ordered_observation_started = True
                 update = await observe_ordered(pcm16, **ordered_kwargs)
                 if not self._runtime_identity_matches(observation_identity):
                     return failed("observation_owner_changed")
-                if accounting_only:
-                    sample_count, remainder = divmod(
-                        len(pcm16) // 2 * 16_000, sample_rate_hz
+                receipt = (
+                    update
+                    if type(update) is ProviderAudioAccountingReceipt
+                    else update.accounting_receipt
+                    if type(update) is ProviderSpeakerEvidenceUpdate
+                    else None
+                )
+                sample_count, remainder = divmod(
+                    len(pcm16) // 2 * 16_000, sample_rate_hz
+                )
+                accounted = bool(
+                    type(receipt) is ProviderAudioAccountingReceipt
+                    and receipt.detector_epoch == identity.detector_epoch
+                    and (
+                        "expected_timeline_generation" not in ordered_kwargs
+                        or receipt.timeline_generation
+                        == ordered_kwargs["expected_timeline_generation"]
                     )
-                    accounted = bool(
-                        type(update) is ProviderAudioAccountingReceipt
-                        and update.detector_epoch == identity.detector_epoch
-                        and (
-                            "expected_timeline_generation" not in ordered_kwargs
-                            or update.timeline_generation
-                            == ordered_kwargs["expected_timeline_generation"]
-                        )
-                        and update.sequence_no == sequence_no
-                        and not remainder
-                        and update.end_sample_16k - update.start_sample_16k
-                        == sample_count
-                    )
-                    if not accounted:
-                        if type(update) is not ProviderAudioAccountingReceipt:
-                            return failed("accounting_receipt_type_invalid")
-                        if update.detector_epoch != identity.detector_epoch:
-                            check = "accounting_receipt_detector_mismatch"
-                        elif (
-                            "expected_timeline_generation" in ordered_kwargs
-                            and update.timeline_generation != ordered_kwargs["expected_timeline_generation"]
-                        ):
-                            check = "accounting_receipt_timeline_mismatch"
-                        elif update.sequence_no != sequence_no:
-                            check = "accounting_receipt_sequence_mismatch"
-                        else:
-                            check = "accounting_receipt_samples_mismatch"
-                        return failed(check, actual={
-                            "detector_epoch": update.detector_epoch,
-                            "timeline_generation": update.timeline_generation,
-                            "sequence_no": update.sequence_no,
-                            "sample_cursor_16k": update.end_sample_16k,
-                            "payload_samples": update.end_sample_16k - update.start_sample_16k,
-                        })
+                    and receipt.sequence_no == sequence_no
+                    and not remainder
+                    and receipt.start_sample_16k >= 0
+                    and receipt.end_sample_16k > receipt.start_sample_16k
+                    and receipt.end_sample_16k - receipt.start_sample_16k
+                    == sample_count
+                )
+                if not accounted:
+                    if type(receipt) is not ProviderAudioAccountingReceipt:
+                        return failed("accounting_receipt_type_invalid")
+                    if receipt.detector_epoch != identity.detector_epoch:
+                        check = "accounting_receipt_detector_mismatch"
+                    elif (
+                        "expected_timeline_generation" in ordered_kwargs
+                        and receipt.timeline_generation
+                        != ordered_kwargs["expected_timeline_generation"]
+                    ):
+                        check = "accounting_receipt_timeline_mismatch"
+                    elif receipt.sequence_no != sequence_no:
+                        check = "accounting_receipt_sequence_mismatch"
+                    else:
+                        check = "accounting_receipt_samples_mismatch"
+                    return failed(check, actual={
+                        "detector_epoch": receipt.detector_epoch,
+                        "timeline_generation": receipt.timeline_generation,
+                        "sequence_no": receipt.sequence_no,
+                        "sample_cursor_16k": receipt.end_sample_16k,
+                        "payload_samples": (
+                            receipt.end_sample_16k - receipt.start_sample_16k
+                        ),
+                    })
+
+                if type(update) is ProviderAudioAccountingReceipt:
                     if evidence_lease is not None:
-                        settled = self._consume_provider_speaker_evidence_settlement(
-                            update.evidence_settlement,
-                            lease=evidence_lease,
-                            detector=detector,
-                            identity=observation_identity,
-                            owner_generation=activation_generation,
-                            turn_token=turn_token,
-                            timeline_generation=update.timeline_generation,
+                        validate = getattr(
+                            detector,
+                            "validate_provider_speaker_evidence_settlement",
+                            None,
                         )
-                        return settled or failed("evidence_retirement_unconfirmed")
-                    return bool(
-                        self._speaker_verifier_activation_generation == activation_generation
-                        and self._asr_provider_speaker_evidence_lease is None
-                    ) or failed("retired_alias_replaced")
-                if self._speaker_verifier_enforces_admission and (
+                        if not callable(validate) or not validate(
+                            receipt.evidence_settlement,
+                            lease=evidence_lease,
+                            timeline_generation=receipt.timeline_generation,
+                        ):
+                            return failed("evidence_retirement_unconfirmed")
+                        # Mutate aliases only while this request still owns
+                        # them.  A successor installation may already have
+                        # consumed the same Detector proof; its aliases must
+                        # remain untouched.
+                        if (
+                            self._speaker_verifier_activation_generation
+                            == activation_generation
+                            and self._asr_provider_speaker_evidence_lease
+                            is evidence_lease
+                        ):
+                            settled = self._consume_provider_speaker_evidence_settlement(
+                                receipt.evidence_settlement,
+                                lease=evidence_lease,
+                                detector=detector,
+                                identity=observation_identity,
+                                owner_generation=activation_generation,
+                                turn_token=turn_token,
+                                timeline_generation=receipt.timeline_generation,
+                            )
+                            if not settled:
+                                return failed("evidence_retirement_unconfirmed")
+                    return True
+
+                if enforcement_required and (
                     type(update) is not ProviderSpeakerEvidenceUpdate
                     or update.lease != evidence_lease
                 ):
@@ -7532,6 +7691,10 @@ class IndependentAsrRuntime:
                 if (
                     type(update) is ProviderSpeakerEvidenceUpdate
                     and update.lease == evidence_lease
+                    and self._speaker_verifier_activation_generation
+                    == activation_generation
+                    and self._asr_provider_speaker_evidence_lease
+                    is evidence_lease
                 ):
                     assert ledger is not None
                     if (
@@ -9679,6 +9842,7 @@ class IndependentAsrRuntime:
                 or self._asr_detector is not detector
                 or self._asr_lifecycle is not lifecycle
                 or lifecycle.current_turn_token != turn_token
+                or not self._asr_audio_command_is_valid(turn_token, asr_session)
             ):
                 return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'observation_stale'))
             self._asr_audio_sequence += 1
@@ -13963,13 +14127,17 @@ class IndependentAsrRuntime:
         self, event: SpeakerShadowDiagnostic, *, activation_generation: str, source: object,
     ) -> None:
         """Read existing ownership only; never attach a candidate or admit text."""
-        if (
-            activation_generation != self._speaker_verifier_activation_generation
-            or source is None
-            or source is not getattr(self._asr_detector, "_speaker_shadow", None)
-        ):
-            return
         try:
+            stale_reason = None
+            if activation_generation != self._speaker_verifier_activation_generation:
+                stale_reason = "activation_replaced"
+            elif source is None or source is not getattr(
+                self._asr_detector, "_speaker_shadow", None
+            ):
+                stale_reason = "source_replaced"
+            if stale_reason is not None:
+                self._schedule_stale_speaker_score_diagnostic(event, stale_reason)
+                return
             candidate = event.candidate
             exact = self._asr_provider_exact_candidates.get(candidate)
             ledger = self._asr_provider_speaker_ledgers.get(candidate)
@@ -13982,10 +14150,18 @@ class IndependentAsrRuntime:
                     metadata = diagnostic_context(self, turn.ingress.session_epoch)
                     metadata.update(speaker_diagnostic_scalars(event))
                     metadata.update(turn_id=turn.turn_id, candidate_role="smart_turn")
+                    self._remember_speaker_score_correlation(
+                        event, activation_generation=activation_generation,
+                        session_epoch=turn.ingress.session_epoch,
+                        provider_key=None, turn_id=turn.turn_id,
+                    )
                     self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
                 return
             if not self._runtime_identity_matches(owner.runtime_identity):
                 # A detached/old candidate cannot borrow the current turn's key.
+                self._schedule_stale_speaker_score_diagnostic(
+                    event, "owner_replaced"
+                )
                 return
             key = owner.provider_key
             turn = owner.turn_token
@@ -14012,10 +14188,137 @@ class IndependentAsrRuntime:
                     else "exact_source" if exact is not None else "provisional"
                 ),
             )
+            self._remember_speaker_score_correlation(
+                event, activation_generation=activation_generation,
+                session_epoch=owner.runtime_identity.session_epoch,
+                provider_key=key,
+                turn_id=turn.turn_id if turn is not None else None,
+            )
             # Reserve space for final verdicts even during diagnostic bursts.
             self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
         except Exception:
             pass
+
+    def _remember_speaker_score_correlation(
+        self,
+        event: SpeakerShadowDiagnostic,
+        *,
+        activation_generation: str,
+        session_epoch: int,
+        provider_key: ProviderUtteranceKey | None,
+        turn_id: int | None,
+    ) -> None:
+        if (
+            event.stage != "speaker_score_started"
+            or type(event.score_id) is not str
+            or type(event.evidence_sequence_no) is not int
+        ):
+            return
+        correlations = getattr(self, "_asr_speaker_score_correlations", None)
+        if correlations is None:
+            correlations = OrderedDict()
+            self._asr_speaker_score_correlations = correlations
+        key = (event.candidate, event.evidence_sequence_no + 1)
+        correlations[key] = _SpeakerScoreCorrelation(
+            score_id=event.score_id,
+            candidate=event.candidate,
+            evidence_sequence_no=event.evidence_sequence_no + 1,
+            activation_generation=activation_generation,
+            session_epoch=session_epoch,
+            provider_generation=(provider_key.generation if provider_key else None),
+            provider_buffer_epoch=(provider_key.buffer_epoch if provider_key else None),
+            provider_utterance_id=(provider_key.utterance_id if provider_key else None),
+            turn_id=turn_id,
+        )
+        correlations.move_to_end(key)
+        while len(correlations) > _MAX_SPEAKER_SCORE_CORRELATIONS:
+            correlations.popitem(last=False)
+
+    def _speaker_score_correlation(self, event) -> _SpeakerScoreCorrelation | None:
+        sequence_no = getattr(
+            event, "sequence_no", getattr(event, "through_sequence_no", None)
+        )
+        candidate = getattr(event, "candidate", None)
+        correlations = getattr(self, "_asr_speaker_score_correlations", None)
+        if correlations is None or type(sequence_no) is not int:
+            return None
+        key = (candidate, sequence_no)
+        correlation = correlations.get(key)
+        if correlation is not None:
+            correlations.move_to_end(key)
+        return correlation
+
+    def _schedule_stale_speaker_score_diagnostic(
+        self, event: SpeakerShadowDiagnostic, reason: str,
+    ) -> None:
+        correlations = getattr(self, "_asr_speaker_score_correlations", None)
+        if correlations is None or type(event.score_id) is not str:
+            return
+        correlation = next(
+            (
+                item for item in reversed(correlations.values())
+                if item.score_id == event.score_id and item.candidate == event.candidate
+            ),
+            None,
+        )
+        if correlation is None or correlation.stale_logged:
+            return
+        correlation.stale_logged = True
+        metadata = diagnostic_context(self, correlation.session_epoch)
+        metadata.update(
+            stage="speaker_score_stale",
+            score_id=correlation.score_id,
+            detector_epoch=correlation.candidate.detector_epoch,
+            shadow_generation=correlation.candidate.shadow_generation,
+            candidate_scope=correlation.candidate.scope,
+            reason=reason,
+        )
+        self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+
+    def _schedule_speaker_evidence_disposition(
+        self, event, *, path: str, disposition: str, reason: str,
+    ) -> None:
+        try:
+            correlation = self._speaker_score_correlation(event)
+            if correlation is None:
+                return
+            metadata = diagnostic_context(self, correlation.session_epoch)
+            metadata.update(
+                stage="speaker_evidence_disposition",
+                score_id=correlation.score_id,
+                detector_epoch=correlation.candidate.detector_epoch,
+                shadow_generation=correlation.candidate.shadow_generation,
+                candidate_scope=correlation.candidate.scope,
+                evidence_sequence_no=correlation.evidence_sequence_no,
+                evidence_path=path,
+                evidence_disposition=disposition,
+                reason=reason,
+                provider_generation=correlation.provider_generation,
+                provider_buffer_epoch=correlation.provider_buffer_epoch,
+                provider_utterance_id=correlation.provider_utterance_id,
+                turn_id=correlation.turn_id,
+            )
+            self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+        except Exception:
+            pass
+
+    def _schedule_speaker_lease_disposition(
+        self, event: SpeakerLeaseEvent, receipt: SpeakerLeaseTransitionReceipt,
+    ) -> None:
+        if receipt.outcome in {
+            SpeakerLeaseTransitionOutcome.APPLIED,
+            SpeakerLeaseTransitionOutcome.IDEMPOTENT,
+            SpeakerLeaseTransitionOutcome.NON_TERMINAL,
+        }:
+            disposition = "accepted"
+        elif receipt.outcome is SpeakerLeaseTransitionOutcome.STALE:
+            disposition = "expired"
+        else:
+            disposition = "rejected_acceptance"
+        self._schedule_speaker_evidence_disposition(
+            event, path="speaker_lease", disposition=disposition,
+            reason=receipt.outcome.value,
+        )
 
     def _pipeline_observer(self):
         from .pipeline_diagnostics import PipelineDiagnostics

@@ -7,6 +7,10 @@ from dataclasses import replace
 import pytest
 
 from main_logic.asr_client import runtime as runtime_module
+from main_logic.asr_client.speaker_shadow import runtime as shadow_runtime_module
+from main_logic.asr_client.speaker_shadow.diagnostics import (
+    SpeakerScoreDiagnosticConfiguration,
+)
 from main_logic.asr_client._provider_events import (
     ProviderAudioRange, ProviderEndpointNotification, ProviderUtteranceKey,
     ProviderUtteranceStartedNotification,
@@ -293,3 +297,105 @@ async def _async_diagnostic(event):
 def test_diagnostic_callback_must_be_synchronous(callback):
     with pytest.raises(TypeError, match="diagnostic callback must be synchronous"):
         SpeakerShadowRuntime(backend_factory=None, on_diagnostic=callback)
+
+
+async def test_score_context_records_exact_model_input_and_bound_configuration():
+    core, runtime, detector, shadow, lifecycle, session, turn = await _active_real_stack(
+        score=.95
+    )
+    observed = []
+    actual = shadow._on_diagnostic
+    shadow._on_diagnostic = lambda event: (observed.append(event), actual(event))
+    core.continuity_score_host.ready.set()
+    try:
+        await _interval(runtime, shadow, turn, 1600)
+        starts = [event for event in observed if event.stage == "speaker_score_started"]
+        finishes = [event for event in observed if event.stage == "speaker_score_finished"]
+        assert len(starts) == len(finishes) == 1
+        started, finished = starts[0], finishes[0]
+        assert started.score_id == finished.score_id
+        assert started.score_window_start_sample == 0
+        assert started.score_window_end_sample == 24_000
+        assert started.score_input_sample_count == 24_000
+        assert started.score_duration_ms == 1_500
+        assert started.score_checkpoint_kind == "checkpoint"
+        assert started.score_checkpoint_ms == 1_500
+        assert started.score_continuity == "unknown"
+        assert started.known_missing_sample_count is None
+        assert started.known_duplicate_sample_count is None
+        assert started.trimmed_prefix_sample_count == 0
+        assert started.quality_summary_outcome == "measured"
+        assert started.quality_summary_version == "pcm16_quality_v1"
+        assert started.near_silence_threshold_milli == 10
+        assert started.clipping_threshold_milli == 1_000
+        assert started.voice_activity_measurement == "not_measured"
+        assert started.voice_activity_ratio_milli is None
+        assert all(
+            type(value) is int and 0 <= value <= 1_000
+            for value in (
+                started.rms_milli,
+                started.peak_milli,
+                started.near_silence_ratio_milli,
+                started.clipping_ratio_milli,
+            )
+        )
+        assert started.profile_generation_ref != started.activation_generation_ref
+        assert len(started.profile_generation_ref) == 16
+        assert len(started.activation_generation_ref) == 16
+        assert started.installation_ref is None
+        assert started.model_version == "campplus_v1_0_0"
+        assert started.scoring_rule_version == "owner_voice_v1"
+        assert finished.score_outcome == "completed"
+        assert "profile-generation" not in repr(started)
+        assert "continuity-test" not in repr(started)
+    finally:
+        await _close_stack(core)
+
+
+async def test_quality_summary_failure_cannot_change_score_or_delivery(monkeypatch):
+    core, runtime, detector, shadow, lifecycle, session, turn = await _active_real_stack(
+        score=.95
+    )
+    observed = []
+    actual = shadow._on_diagnostic
+    shadow._on_diagnostic = lambda event: (observed.append(event), actual(event))
+
+    def fail_quality(_pcm16):
+        raise RuntimeError("PRIVATE_QUALITY_ERROR")
+
+    monkeypatch.setattr(shadow_runtime_module, "_summarize_pcm_quality", fail_quality)
+    core.continuity_score_host.ready.set()
+    try:
+        await _interval(runtime, shadow, turn, 1600)
+        started = next(
+            event for event in observed if event.stage == "speaker_score_started"
+        )
+        finished = next(
+            event for event in observed if event.stage == "speaker_score_finished"
+        )
+        assert started.quality_summary_outcome == "unavailable"
+        assert started.rms_milli is None
+        assert finished.score_id == started.score_id
+        assert finished.score_outcome == "completed"
+        assert core.handle_input_transcript.await_count == 1
+        assert core.session.create_response.await_count == 1
+        assert "PRIVATE" not in repr(observed)
+    finally:
+        await _close_stack(core)
+
+
+def test_score_diagnostic_configuration_cannot_be_replaced_in_place():
+    shadow = SpeakerShadowRuntime(backend_factory=None)
+    original = SpeakerScoreDiagnosticConfiguration(
+        profile_generation_ref="a" * 16,
+        activation_generation_ref="b" * 16,
+        installation_ref="c" * 16,
+        model_version="campplus_v1_0_0",
+        scoring_rule_version="owner_voice_v1",
+    )
+    shadow.bind_score_diagnostic_configuration(original)
+    shadow.bind_score_diagnostic_configuration(original)
+    with pytest.raises(RuntimeError, match="already bound"):
+        shadow.bind_score_diagnostic_configuration(
+            replace(original, installation_ref="d" * 16)
+        )

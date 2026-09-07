@@ -275,6 +275,13 @@ class _RejectionDetector:
             ),
             sequence_no=sequence_no,
             last_progress_at=10.0,
+            accounting_receipt=runtime_module.ProviderAudioAccountingReceipt(
+                detector_epoch=self.detector_epoch,
+                timeline_generation=kwargs.get("expected_timeline_generation", 0),
+                sequence_no=sequence_no,
+                start_sample_16k=0,
+                end_sample_16k=samples,
+            ),
         )
 
     def validate_provider_speaker_evidence_settlement(
@@ -1340,6 +1347,13 @@ async def test_active_enqueue_keeps_pre_exact_lows_out_of_admission() -> None:
             ),
             sequence_no=kwargs["sequence_no"],
             last_progress_at=10.0,
+            accounting_receipt=runtime_module.ProviderAudioAccountingReceipt(
+                detector_epoch=kwargs["identity"].detector_epoch,
+                timeline_generation=kwargs.get("expected_timeline_generation", 0),
+                sequence_no=kwargs["sequence_no"],
+                start_sample_16k=0,
+                end_sample_16k=160,
+            ),
         )
 
     async def record_provider_wire(*_args, **_kwargs) -> None:
@@ -1436,11 +1450,11 @@ async def test_deferred_mixed_evidence_remains_provisional_before_exact(
     facts = (
         (
             SpeakerLow(candidate, 1, SpeakerCheckpointKind.FIRST),
-            SpeakerHigh(candidate, 2),
+            SpeakerHigh(candidate, 2, SpeakerCheckpointKind.SECOND, 3_000),
         )
         if evidence_order == "low_high"
         else (
-            SpeakerHigh(candidate, 1),
+            SpeakerHigh(candidate, 1, SpeakerCheckpointKind.FIRST, 1_500),
             SpeakerLow(candidate, 2, SpeakerCheckpointKind.FIRST),
         )
     )
@@ -1460,6 +1474,15 @@ async def test_deferred_mixed_evidence_remains_provisional_before_exact(
     assert runtime._asr_deny_transport_state is DenyTransportState.OPEN
     ledger = runtime._asr_provider_speaker_ledgers[candidate]
     assert tuple(ledger.events)
+    recorded_high = next(
+        event for event in ledger.events if isinstance(event, SpeakerLeaseHigh)
+    )
+    assert recorded_high.checkpoint_kind is (
+        SpeakerCheckpointKind.SECOND
+        if evidence_order == "low_high"
+        else SpeakerCheckpointKind.FIRST
+    )
+    assert recorded_high.audio_ms == (3_000 if evidence_order == "low_high" else 1_500)
     parent = await runtime._asr_admission.get_speaker_lease(lease_token)
     assert parent is not None
     assert parent.state is SpeakerLeaseState.COLLECTING
@@ -2944,6 +2967,13 @@ async def test_parent_provisional_after_started_forwards_on_unknown_boundary(
             ),
             sequence_no=sequence_no,
             last_progress_at=10.0,
+            accounting_receipt=runtime_module.ProviderAudioAccountingReceipt(
+                detector_epoch=kwargs["identity"].detector_epoch,
+                timeline_generation=kwargs.get("expected_timeline_generation", 0),
+                sequence_no=sequence_no,
+                start_sample_16k=0,
+                end_sample_16k=samples,
+            ),
         )
 
     detector.observe_provider_audio_ordered.side_effect = publish_terminal_update
@@ -3529,6 +3559,13 @@ async def test_concurrent_ordered_observers_reserve_unique_sequences() -> None:
             ),
             sequence_no=sequence_no,
             last_progress_at=10.0,
+            accounting_receipt=runtime_module.ProviderAudioAccountingReceipt(
+                detector_epoch=identity.detector_epoch,
+                timeline_generation=0,
+                sequence_no=sequence_no,
+                start_sample_16k=0,
+                end_sample_16k=160,
+            ),
         )
 
     detector.observe_provider_audio_ordered.side_effect = blocked_observer

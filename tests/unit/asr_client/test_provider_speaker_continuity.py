@@ -367,6 +367,18 @@ class _ObservedLock(asyncio.Lock):
         return await super().acquire()
 
 
+class _OrderedObservedLock(asyncio.Lock):
+    def __init__(self):
+        super().__init__()
+        self.contenders: asyncio.Queue[str] = asyncio.Queue()
+
+    async def acquire(self):
+        if self.locked():
+            task = asyncio.current_task()
+            self.contenders.put_nowait(task.get_name() if task is not None else "unknown")
+        return await super().acquire()
+
+
 async def test_cancelled_arming_waiter_cannot_abandon_shared_physical_lease() -> None:
     (
         core,
@@ -439,6 +451,184 @@ async def test_stale_ingress_does_not_advance_current_audio_or_close_route() -> 
         assert core._asr_route_mode == "independent"
         session.close.assert_not_awaited()
     finally:
+        await _close_stack(core)
+
+
+async def test_disabled_request_survives_verifier_install_queued_before_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successor verifier cannot reinterpret already-selected audio mode."""
+
+    (
+        core,
+        runtime,
+        detector,
+        _shadow,
+        _lifecycle,
+        session,
+        turn,
+    ) = await _active_real_stack()
+    observation_selected = asyncio.Event()
+    queue_observation = asyncio.Event()
+    request_kwargs = {}
+    lock = _OrderedObservedLock()
+    submit_task = None
+    install_task = None
+    try:
+        assert (
+            await _submit_pcm(runtime, turn, sequence=1)
+        ).status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        key = ProviderUtteranceKey(0, 0, 1)
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(
+                0,
+                0,
+                1,
+                audio_start_sample_16k=0,
+            ),
+            runtime._asr_session_epoch,
+        )
+        assert runtime._asr_provider_speaker_evidence_lease is not None
+
+        assert await runtime.set_speaker_verifier_factory(
+            None,
+            activation_generation="disabled-before-frame",
+        )
+        assert runtime._speaker_verifier_activation_generation is None
+        assert not runtime._speaker_verifier_enforces_admission
+
+        control_pcm = b"\x11\x00" * 489
+        control_before = detector._provider_audio_sample_cursor_16k
+        control_result = await runtime.submit(
+            ProcessedVoiceFrame(
+                control_pcm,
+                16_000,
+                0.9,
+                True,
+                ingress_sequence=2,
+                captured_at=0.2,
+            ),
+            ingress_token=turn.ingress,
+        )
+        assert control_result.status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert detector._provider_audio_sample_cursor_16k - control_before == 489
+        control_send_count = session.stream_audio.await_count
+
+        detector._lock = lock
+        original_observe = detector.observe_provider_audio_ordered
+        original_replace = detector.replace_speaker_verifier
+
+        async def select_then_queue_observation(*args, **kwargs):
+            request_kwargs.update(kwargs)
+            observation_selected.set()
+            await queue_observation.wait()
+            return await original_observe(*args, **kwargs)
+
+        monkeypatch.setattr(
+            detector,
+            "observe_provider_audio_ordered",
+            select_then_queue_observation,
+        )
+
+        raced_pcm = b"\x12\x00" * 489
+        race_before = detector._provider_audio_sample_cursor_16k
+        submit_task = asyncio.create_task(
+            runtime.submit(
+                ProcessedVoiceFrame(
+                    raced_pcm,
+                    16_000,
+                    0.9,
+                    True,
+                    ingress_sequence=3,
+                    captured_at=0.3,
+                ),
+                ingress_token=turn.ingress,
+            ),
+            name="queued-provider-audio",
+        )
+        await asyncio.wait_for(observation_selected.wait(), timeout=1)
+        assert request_kwargs["accounting_only"] is True
+        assert "speaker_evidence_lease" not in request_kwargs
+        assert session.stream_audio.await_count == control_send_count
+
+        await lock.acquire()
+        replacement = detector_fixture._StableEvidenceSpeakerShadowSpy()
+
+        async def commit_replacement():
+            await original_replace(
+                replacement,
+                owner_generation="enabled-after-frame-selection",
+            )
+            # This is the Runtime installation commit point.  The production
+            # installation lifecycle is covered separately; this regression
+            # isolates the ordered Detector/Runtime submission handoff.
+            runtime._speaker_verifier_activation_generation = (
+                "enabled-after-frame-selection"
+            )
+            runtime._speaker_verifier_enforces_admission = True
+            return True
+
+        install_task = asyncio.create_task(
+            commit_replacement(),
+            name="queued-verifier-install",
+        )
+        assert await asyncio.wait_for(lock.contenders.get(), timeout=1) == (
+            "queued-verifier-install"
+        )
+
+        queue_observation.set()
+        assert await asyncio.wait_for(lock.contenders.get(), timeout=1) == (
+            "queued-provider-audio"
+        )
+        lock.release()
+
+        assert await asyncio.wait_for(install_task, timeout=1)
+        result = await asyncio.wait_for(submit_task, timeout=1)
+        assert result.status is AsrSubmitStatus.ACCEPTED
+        await runtime._asr_audio_dispatcher.wait_idle()
+        assert detector._provider_audio_sample_cursor_16k - race_before == 489
+        assert detector._provider_segment_last_sequence_no == 3
+        assert session.stream_audio.await_count == control_send_count + 1
+        assert replacement.frames == []
+        assert runtime._asr_session is session
+        session.close.assert_not_awaited()
+
+        await runtime._handle_provider_final(
+            key,
+            "frame retained across verifier install",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+        await _drain_runtime_admission(runtime)
+        await runtime.wait_transcript_idle()
+        await core._voice_input_registry.wait_idle()
+        assert [
+            call.args[0] for call in core.handle_input_transcript.await_args_list
+        ] == ["frame retained across verifier install"]
+
+        await runtime._handle_provider_final(
+            key,
+            "late duplicate",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+        await _drain_runtime_admission(runtime)
+        await runtime.wait_transcript_idle()
+        await core._voice_input_registry.wait_idle()
+        assert core.handle_input_transcript.await_count == 1
+    finally:
+        queue_observation.set()
+        if lock.locked():
+            lock.release()
+        for task in (submit_task, install_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (submit_task, install_task) if task is not None),
+            return_exceptions=True,
+        )
         await _close_stack(core)
 
 
@@ -1006,6 +1196,116 @@ async def test_late_observer_exception_cannot_poison_replacement_ledger(
         await session.close()
 
 
+async def test_successful_old_observation_is_stale_after_session_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        core,
+        runtime,
+        detector,
+        _shadow,
+        _lifecycle,
+        session,
+        turn,
+    ) = await _active_real_stack()
+    observed = asyncio.Event()
+    release = asyncio.Event()
+    original_observe = detector.observe_provider_audio_ordered
+
+    async def hold_successful_receipt(*args, **kwargs):
+        result = await original_observe(*args, **kwargs)
+        observed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(
+        detector,
+        "observe_provider_audio_ordered",
+        hold_successful_receipt,
+    )
+    submitted = asyncio.create_task(_submit_pcm(runtime, turn, sequence=1))
+    replacement = None
+    try:
+        await asyncio.wait_for(observed.wait(), timeout=1)
+        assert detector._provider_audio_sample_cursor_16k == 1_600
+        assert session.stream_audio.await_count == 0
+
+        await detector.reset_provider_audio_timeline()
+        replacement = SimpleNamespace(
+            is_ready=True,
+            close=AsyncMock(),
+            stream_audio=AsyncMock(),
+            signal_user_activity_end=AsyncMock(),
+        )
+        runtime._asr_session = replacement
+        runtime._asr_provider_exact_session = replacement
+        runtime._asr_session_epoch += 1
+        runtime._asr_current_ingress_token = core._capture_ingress_token()
+        release.set()
+
+        result = await asyncio.wait_for(submitted, timeout=1)
+        assert result.status is AsrSubmitStatus.STALE
+        assert detector._provider_audio_sample_cursor_16k == 0
+        assert session.stream_audio.await_count == 0
+        assert replacement.stream_audio.await_count == 0
+        assert runtime._asr_session is replacement
+    finally:
+        release.set()
+        if not submitted.done():
+            submitted.cancel()
+            await asyncio.gather(submitted, return_exceptions=True)
+        await _close_stack(core)
+        if replacement is not None:
+            await session.close()
+
+
+async def test_successful_observation_is_not_sent_after_session_loses_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        core,
+        runtime,
+        detector,
+        _shadow,
+        _lifecycle,
+        session,
+        turn,
+    ) = await _active_real_stack()
+    observed = asyncio.Event()
+    release = asyncio.Event()
+    original_observe = detector.observe_provider_audio_ordered
+
+    async def hold_successful_receipt(*args, **kwargs):
+        result = await original_observe(*args, **kwargs)
+        observed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(
+        detector,
+        "observe_provider_audio_ordered",
+        hold_successful_receipt,
+    )
+    submitted = asyncio.create_task(_submit_pcm(runtime, turn, sequence=1))
+    try:
+        await asyncio.wait_for(observed.wait(), timeout=1)
+        assert detector._provider_audio_sample_cursor_16k == 1_600
+        assert session.stream_audio.await_count == 0
+
+        session.is_ready = False
+        release.set()
+
+        result = await asyncio.wait_for(submitted, timeout=1)
+        assert result.status is AsrSubmitStatus.STALE
+        assert session.stream_audio.await_count == 0
+    finally:
+        release.set()
+        if not submitted.done():
+            submitted.cancel()
+            await asyncio.gather(submitted, return_exceptions=True)
+        await _close_stack(core)
+
+
 async def test_enforcement_without_activation_owner_cannot_admit_audio() -> None:
     (
         core,
@@ -1065,6 +1365,43 @@ async def test_accounting_receipt_from_wrong_timeline_cannot_authorize_wire_audi
         assert second.status is AsrSubmitStatus.UNAVAILABLE
         assert not runtime._ingress_token_matches(turn.ingress)
         assert session.stream_audio.await_count == 1
+    finally:
+        await _close_stack(core)
+
+
+async def test_evidence_receipt_with_wrong_sample_range_cannot_authorize_wire_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        core,
+        runtime,
+        detector,
+        _shadow,
+        _lifecycle,
+        session,
+        turn,
+    ) = await _active_real_stack()
+    original_observe = detector.observe_provider_audio_ordered
+
+    async def wrong_sample_range(*args, **kwargs):
+        result = await original_observe(*args, **kwargs)
+        assert result.accounting_receipt is not None
+        forged = replace(
+            result.accounting_receipt,
+            end_sample_16k=result.accounting_receipt.end_sample_16k + 1,
+        )
+        return replace(result, accounting_receipt=forged)
+
+    monkeypatch.setattr(
+        detector,
+        "observe_provider_audio_ordered",
+        wrong_sample_range,
+    )
+    try:
+        result = await _submit_pcm(runtime, turn, sequence=1)
+        assert result.status is AsrSubmitStatus.UNAVAILABLE
+        assert not runtime._ingress_token_matches(turn.ingress)
+        assert session.stream_audio.await_count == 0
     finally:
         await _close_stack(core)
 

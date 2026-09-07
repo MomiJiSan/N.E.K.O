@@ -15,7 +15,12 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import Any, Literal
 
-from .diagnostics import SpeakerShadowDiagnostic
+import numpy as np
+
+from .diagnostics import (
+    SpeakerScoreDiagnosticConfiguration,
+    SpeakerShadowDiagnostic,
+)
 
 from .contracts import (
     CompletionCallback,
@@ -50,6 +55,9 @@ from .contracts import (
 )
 
 _HOST_POLL_INTERVAL_SECONDS = 0.005
+_QUALITY_SUMMARY_VERSION = "pcm16_quality_v1"
+_NEAR_SILENCE_AMPLITUDE = 328
+_CLIPPING_AMPLITUDE = 32_760
 _HostOperation = Literal["load", "score", "close"]
 _DegradedCause = Literal[
     "backend_unavailable",
@@ -60,6 +68,38 @@ _DegradedCause = Literal[
     "dispatcher_start_failure",
     "resetting",
 ]
+
+
+def _summarize_pcm_quality(pcm16: bytearray) -> _ScoreQualitySummary:
+    """Calculate bounded diagnostics from the exact model input, without copying it."""
+
+    if not pcm16 or len(pcm16) % 2:
+        raise ValueError("PCM16 quality input must contain complete samples")
+    samples = np.frombuffer(pcm16, dtype="<i2")
+    sample_count = int(samples.size)
+    if sample_count <= 0:
+        raise ValueError("PCM16 quality input must not be empty")
+    rms = math.sqrt(float(np.mean(np.square(samples, dtype=np.float64))))
+    peak = max(int(samples.max()), -int(samples.min()))
+    near_silence_count = int(
+        np.count_nonzero(
+            (samples >= -_NEAR_SILENCE_AMPLITUDE)
+            & (samples <= _NEAR_SILENCE_AMPLITUDE)
+        )
+    )
+    clipping_count = int(
+        np.count_nonzero(
+            (samples <= -_CLIPPING_AMPLITUDE)
+            | (samples >= _CLIPPING_AMPLITUDE)
+        )
+    )
+    return _ScoreQualitySummary(
+        outcome="measured",
+        rms_milli=min(1_000, round(rms * 1_000 / 32_768)),
+        peak_milli=min(1_000, round(peak * 1_000 / 32_768)),
+        near_silence_ratio_milli=round(near_silence_count * 1_000 / sample_count),
+        clipping_ratio_milli=round(clipping_count * 1_000 / sample_count),
+    )
 
 
 class _FinishState(StrEnum):
@@ -488,6 +528,71 @@ class _CandidateTerminalCoverage:
     receipt: SpeakerShadowTerminalCoverageReceipt
 
 
+@dataclass(frozen=True, slots=True)
+class _ScoreQualitySummary:
+    outcome: Literal["measured", "unavailable"]
+    rms_milli: int | None = None
+    peak_milli: int | None = None
+    near_silence_ratio_milli: int | None = None
+    clipping_ratio_milli: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ScoreDiagnosticContext:
+    score_id: str
+    checkpoint_kind: str
+    checkpoint_ms: int | None
+    window_start_sample: int
+    window_end_sample: int
+    duration_ms: int
+    continuity: Literal["unknown"]
+    known_missing_sample_count: int | None
+    known_duplicate_sample_count: int | None
+    trimmed_prefix_sample_count: int
+    configuration: SpeakerScoreDiagnosticConfiguration
+    quality: _ScoreQualitySummary
+    voice_activity_measurement: Literal["not_measured"]
+
+
+def _build_score_diagnostic_context(
+    *,
+    candidate: SpeakerShadowCandidateKey,
+    token: _CandidateToken,
+    pcm16: bytearray,
+    sample_rate_hz: int,
+    checkpoint_ms: int | None,
+    observation_kind: str,
+    attempt_no: int,
+    configuration: SpeakerScoreDiagnosticConfiguration | None,
+) -> _ScoreDiagnosticContext:
+    try:
+        quality = _summarize_pcm_quality(pcm16)
+    except Exception:
+        quality = _ScoreQualitySummary(outcome="unavailable")
+    sample_count = len(pcm16) // 2
+    return _ScoreDiagnosticContext(
+        score_id=(
+            f"{candidate.scope}_{candidate.detector_epoch}_"
+            f"{candidate.shadow_generation}_{attempt_no}"
+        ),
+        checkpoint_kind=observation_kind,
+        checkpoint_ms=checkpoint_ms,
+        window_start_sample=0,
+        window_end_sample=sample_count,
+        duration_ms=round(sample_count * 1_000 / sample_rate_hz),
+        # Shadow receives ordered PCM but owns no absolute timeline offsets or
+        # gap/duplicate proof. Unknown is safer than inferring continuity.
+        continuity="unknown",
+        known_missing_sample_count=None,
+        known_duplicate_sample_count=None,
+        trimmed_prefix_sample_count=token.anchor_discard_prefix_sample_count or 0,
+        configuration=configuration or SpeakerScoreDiagnosticConfiguration(),
+        quality=quality,
+        # Shadow has no authoritative mapping back to VAD intervals.
+        voice_activity_measurement="not_measured",
+    )
+
+
 @dataclass(slots=True)
 class _CandidateToken:
     candidate: SpeakerShadowCandidateKey
@@ -763,6 +868,20 @@ class SpeakerShadowRuntime:
         self._resetting = False
         self._closed = False
         self._factory_closed = False
+
+    def bind_score_diagnostic_configuration(
+        self, configuration: SpeakerScoreDiagnosticConfiguration,
+    ) -> None:
+        """Bind content-free scorer identity before the first score attempt."""
+
+        if not isinstance(configuration, SpeakerScoreDiagnosticConfiguration):
+            raise TypeError(
+                "configuration must be SpeakerScoreDiagnosticConfiguration"
+            )
+        existing = getattr(self, "_score_diagnostic_configuration", None)
+        if existing is not None and existing != configuration:
+            raise RuntimeError("score diagnostic configuration is already bound")
+        self._score_diagnostic_configuration = configuration
 
     @property
     def enabled(self) -> bool:
@@ -4689,6 +4808,7 @@ class SpeakerShadowRuntime:
         self._active_evaluation = (generation, candidate)
         self._active_evaluation_terminal = terminal
         self._active_pcm_bytes = len(pcm16)
+        score_context: _ScoreDiagnosticContext | None = None
         token.score_input_sample_count = len(pcm16) // 2
         token.score_outcome = "waiting_backend"
         try:
@@ -4713,7 +4833,28 @@ class SpeakerShadowRuntime:
             started = time.perf_counter()
             token.score_attempt_count += 1
             token.score_outcome = "in_progress"
-            self._emit_diagnostic(token, "speaker_score_started", generation=generation)
+            try:
+                score_context = _build_score_diagnostic_context(
+                    candidate=candidate,
+                    token=token,
+                    pcm16=pcm16,
+                    sample_rate_hz=sample_rate_hz,
+                    checkpoint_ms=checkpoint_ms,
+                    observation_kind=observation_kind,
+                    attempt_no=token.score_attempt_count,
+                    configuration=getattr(
+                        self, "_score_diagnostic_configuration", None
+                    ),
+                )
+            except Exception:
+                # Diagnostic computation and correlation are always fail-open.
+                score_context = None
+            self._emit_diagnostic(
+                token,
+                "speaker_score_started",
+                generation=generation,
+                score_context=score_context,
+            )
             try:
                 similarity = float(
                     await backend_host.score(
@@ -4868,7 +5009,12 @@ class SpeakerShadowRuntime:
                 token.score_outcome = "cancelled_before_score"
             raise
         finally:
-            self._emit_diagnostic(token, "speaker_score_finished", generation=generation)
+            self._emit_diagnostic(
+                token,
+                "speaker_score_finished",
+                generation=generation,
+                score_context=score_context,
+            )
             if self._active_evaluation == (generation, candidate):
                 self._active_evaluation = None
                 self._active_evaluation_terminal = False
@@ -5686,7 +5832,12 @@ class SpeakerShadowRuntime:
             self._record_evicted_candidate(evicted_candidate)
 
     def _emit_diagnostic(
-        self, token: _CandidateToken, stage: str, *, generation: int | None = None,
+        self,
+        token: _CandidateToken,
+        stage: str,
+        *,
+        generation: int | None = None,
+        score_context: _ScoreDiagnosticContext | None = None,
     ) -> None:
         callback = self._on_diagnostic
         if callback is None:
@@ -5718,6 +5869,90 @@ class SpeakerShadowRuntime:
                 anchor_applied=token.anchor_applied,
                 anchor_discard_prefix_sample_count=token.anchor_discard_prefix_sample_count,
                 scoring_deferred=token.scoring_deferred,
+                score_id=(score_context.score_id if score_context is not None else None),
+                score_checkpoint_kind=(
+                    score_context.checkpoint_kind if score_context is not None else None
+                ),
+                score_checkpoint_ms=(
+                    score_context.checkpoint_ms if score_context is not None else None
+                ),
+                score_window_start_sample=(
+                    score_context.window_start_sample if score_context is not None else None
+                ),
+                score_window_end_sample=(
+                    score_context.window_end_sample if score_context is not None else None
+                ),
+                score_duration_ms=(
+                    score_context.duration_ms if score_context is not None else None
+                ),
+                score_continuity=(
+                    score_context.continuity if score_context is not None else None
+                ),
+                known_missing_sample_count=(
+                    score_context.known_missing_sample_count
+                    if score_context is not None else None
+                ),
+                known_duplicate_sample_count=(
+                    score_context.known_duplicate_sample_count
+                    if score_context is not None else None
+                ),
+                trimmed_prefix_sample_count=(
+                    score_context.trimmed_prefix_sample_count
+                    if score_context is not None else None
+                ),
+                profile_generation_ref=(
+                    score_context.configuration.profile_generation_ref
+                    if score_context is not None else None
+                ),
+                activation_generation_ref=(
+                    score_context.configuration.activation_generation_ref
+                    if score_context is not None else None
+                ),
+                installation_ref=(
+                    score_context.configuration.installation_ref
+                    if score_context is not None else None
+                ),
+                model_version=(
+                    score_context.configuration.model_version
+                    if score_context is not None else None
+                ),
+                scoring_rule_version=(
+                    score_context.configuration.scoring_rule_version
+                    if score_context is not None else None
+                ),
+                quality_summary_outcome=(
+                    score_context.quality.outcome if score_context is not None else None
+                ),
+                quality_summary_version=(
+                    _QUALITY_SUMMARY_VERSION if score_context is not None else None
+                ),
+                rms_milli=(
+                    score_context.quality.rms_milli if score_context is not None else None
+                ),
+                peak_milli=(
+                    score_context.quality.peak_milli if score_context is not None else None
+                ),
+                near_silence_ratio_milli=(
+                    score_context.quality.near_silence_ratio_milli
+                    if score_context is not None else None
+                ),
+                clipping_ratio_milli=(
+                    score_context.quality.clipping_ratio_milli
+                    if score_context is not None else None
+                ),
+                near_silence_threshold_milli=(
+                    round(_NEAR_SILENCE_AMPLITUDE * 1_000 / 32_768)
+                    if score_context is not None else None
+                ),
+                clipping_threshold_milli=(
+                    round(_CLIPPING_AMPLITUDE * 1_000 / 32_768)
+                    if score_context is not None else None
+                ),
+                voice_activity_measurement=(
+                    score_context.voice_activity_measurement
+                    if score_context is not None else None
+                ),
+                voice_activity_ratio_milli=None,
             ))
         except Exception:
             # Telemetry has no effect on evidence integrity or lifecycle.

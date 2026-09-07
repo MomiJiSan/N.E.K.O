@@ -295,8 +295,48 @@ class SpeakerVerifierInstallation:
         self._runtime._speaker_verifier_factory = None
         factory = None
         shadow = None
-        operation = SpeakerVerifierReplacementOperation(identity)
+        expected_evidence_lease = (
+            self._runtime._asr_provider_speaker_evidence_lease
+        )
+        replacement_runtime_identity = None
+        replacement_turn_token = None
+        if expected_evidence_lease is not None:
+            replacement_runtime_identity = self._runtime._capture_runtime_identity()
+            ledger = self._runtime._asr_provider_speaker_ledgers.get(
+                expected_evidence_lease.candidate
+            )
+            if ledger is not None:
+                replacement_turn_token = ledger.evidence_turn_token or ledger.turn_token
+        operation = SpeakerVerifierReplacementOperation(
+            identity,
+            expected_evidence_lease=expected_evidence_lease,
+        )
+        settlement_consumed = False
         committed = False
+
+        def consume_replacement_settlement() -> None:
+            nonlocal settlement_consumed
+            if settlement_consumed:
+                return
+            settlement_consumed = True
+            settlement = operation.evidence_settlement
+            if (
+                expected_evidence_lease is None
+                or replacement_runtime_identity is None
+                or settlement is None
+            ):
+                return
+            self._runtime._consume_provider_speaker_evidence_settlement(
+                settlement,
+                lease=expected_evidence_lease,
+                detector=detector,
+                identity=replacement_runtime_identity,
+                # Authority is synchronously retired before the handoff.  A
+                # later installation must not satisfy this old alias CAS.
+                owner_generation=None,
+                turn_token=replacement_turn_token,
+                timeline_generation=settlement.timeline_generation,
+            )
 
         def current():
             return (
@@ -328,6 +368,7 @@ class SpeakerVerifierInstallation:
                     owner_generation=identity.installation_id,
                     operation=operation,
                 )
+                consume_replacement_settlement()
             elif not enabled:
                 operation.outcome = Outcome.REVOKED
                 operation.ownership_state = Ownership.CLOSED
@@ -381,6 +422,11 @@ class SpeakerVerifierInstallation:
                 cleanup_pending=operation.cleanup_pending,
             )
         finally:
+            # Detector may have committed the swap and then propagated
+            # cancellation while joining the detached observer.  Its issued
+            # settlement is already authoritative, so consume it before any
+            # cleanup await can interleave with a successor installation.
+            consume_replacement_settlement()
             for task in operation.cleanup_tasks:
                 self._own_speaker_cleanup(task)
             if not committed:

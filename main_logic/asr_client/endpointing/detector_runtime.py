@@ -1601,12 +1601,15 @@ class ProviderExactSpeakerIntervalCommitResult:
 
 @dataclass(frozen=True, slots=True)
 class ProviderSpeakerEvidenceUpdate:
-    """One ordered capture result plus its no-progress clock position."""
+    """One ordered capture result plus the corresponding PCM accounting proof."""
 
     lease: ProviderSpeakerEvidenceLease
     capture: SpeakerShadowCaptureResult
     sequence_no: int
     last_progress_at: float
+    # Optional only for compatibility with previously constructed test/fake
+    # updates. DetectorRuntime always attaches it for an accepted audio frame.
+    accounting_receipt: "ProviderAudioAccountingReceipt | None" = None
 
 
 class ProviderSpeakerEvidenceSettlementStatus(Enum):
@@ -2542,6 +2545,7 @@ class DetectorRuntime:
         state: _ProviderSpeakerEvidenceState,
         *,
         sequence_no: int,
+        accounting_receipt: ProviderAudioAccountingReceipt | None = None,
     ) -> ProviderSpeakerEvidenceUpdate:
         return ProviderSpeakerEvidenceUpdate(
             lease=state.lease,
@@ -2554,6 +2558,7 @@ class DetectorRuntime:
             ),
             sequence_no=sequence_no,
             last_progress_at=state.last_progress_at or 0.0,
+            accounting_receipt=accounting_receipt,
         )
 
     def _abandon_provider_speaker_evidence_locked(
@@ -6152,6 +6157,35 @@ class DetectorRuntime:
                     "provider_speaker_segment_sequence_gap_count"
                 ] += 1
 
+            input_sample_count = len(pcm16) // 2
+            canonical_sample_numerator = input_sample_count * 16_000
+            canonical_sample_count, canonical_remainder = divmod(
+                canonical_sample_numerator,
+                sample_rate_hz,
+            )
+            if canonical_sample_count <= 0 or canonical_remainder:
+                self._record_provider_audio_failure(failure_context, "audio_sample_alignment")
+                self._provider_segment_alignment_lost = True
+                self._mark_provider_segments_incomplete()
+                self._mark_provider_micro_event_ambiguous(
+                    DetectorCandidateKey(
+                        self._detector_epoch,
+                        self._candidate_generation,
+                    )
+                )
+                return
+            sample_start_16k = self._provider_audio_sample_cursor_16k
+            sample_end_16k = sample_start_16k + canonical_sample_count
+            self._provider_audio_sample_cursor_16k = sample_end_16k
+            self._signal_provider_audio_observation()
+            accounting_receipt = ProviderAudioAccountingReceipt(
+                detector_epoch=self._detector_epoch,
+                timeline_generation=self._provider_audio_timeline_generation,
+                sequence_no=sequence_no,
+                start_sample_16k=sample_start_16k,
+                end_sample_16k=sample_end_16k,
+            )
+
             if not self._provider_segment_ordered_mode and evidence_state is not None:
                 # Stable evidence owns one candidate across physical Provider
                 # segments, so deferred per-segment scoring is unnecessary.
@@ -6190,30 +6224,8 @@ class DetectorRuntime:
                         pcm16,
                         sample_rate_hz=sample_rate_hz,
                     )
-                    return
+                    return accounting_receipt
                 self._provider_segment_ordered_mode = True
-
-            input_sample_count = len(pcm16) // 2
-            canonical_sample_numerator = input_sample_count * 16_000
-            canonical_sample_count, canonical_remainder = divmod(
-                canonical_sample_numerator,
-                sample_rate_hz,
-            )
-            if canonical_sample_count <= 0 or canonical_remainder:
-                self._record_provider_audio_failure(failure_context, "audio_sample_alignment")
-                self._provider_segment_alignment_lost = True
-                self._mark_provider_segments_incomplete()
-                self._mark_provider_micro_event_ambiguous(
-                    DetectorCandidateKey(
-                        self._detector_epoch,
-                        self._candidate_generation,
-                    )
-                )
-                return
-            sample_start_16k = self._provider_audio_sample_cursor_16k
-            sample_end_16k = sample_start_16k + canonical_sample_count
-            self._provider_audio_sample_cursor_16k = sample_end_16k
-            self._signal_provider_audio_observation()
 
             sealed_through = self._provider_speaker_sealed_through_sequence_no
             if sealed_through is not None and identity.sequence_no <= sealed_through:
@@ -6237,6 +6249,7 @@ class DetectorRuntime:
                 unavailable = self._unavailable_provider_speaker_evidence_update(
                     evidence_state,
                     sequence_no=sequence_no,
+                    accounting_receipt=accounting_receipt,
                 )
                 self._abandon_provider_speaker_evidence_locked(evidence_state)
                 self._expire_provider_segments(observed_at)
@@ -6254,6 +6267,7 @@ class DetectorRuntime:
                     unavailable = self._unavailable_provider_speaker_evidence_update(
                         evidence_state,
                         sequence_no=sequence_no,
+                        accounting_receipt=accounting_receipt,
                     )
                     self._abandon_provider_speaker_evidence_locked(evidence_state)
                     return unavailable
@@ -6262,6 +6276,7 @@ class DetectorRuntime:
                 unavailable = self._unavailable_provider_speaker_evidence_update(
                     evidence_state,
                     sequence_no=sequence_no,
+                    accounting_receipt=accounting_receipt,
                 )
                 self._abandon_provider_speaker_evidence_locked(evidence_state)
                 return unavailable
@@ -6481,6 +6496,7 @@ class DetectorRuntime:
                     unavailable = self._unavailable_provider_speaker_evidence_update(
                         evidence_state,
                         sequence_no=sequence_no,
+                        accounting_receipt=accounting_receipt,
                     )
                     self._abandon_provider_speaker_evidence_locked(evidence_state)
                     self._schedule_provider_segment_expiry()
@@ -6518,8 +6534,10 @@ class DetectorRuntime:
                     capture=capture_result,
                     sequence_no=sequence_no,
                     last_progress_at=observed_at,
+                    accounting_receipt=accounting_receipt,
                 )
             self._schedule_provider_segment_expiry()
+            return accounting_receipt
 
     def _fail_provider_exact_reconcile_locked(
         self,
@@ -7558,18 +7576,6 @@ class DetectorRuntime:
             operation.ownership_state = Ownership.DETECTOR
 
         async def bounded_close(shadow: SpeakerShadowObserver) -> None:
-            if operation is not None:
-                # Typed ownership needs an actual close result; the legacy
-                # helper intentionally swallows failures and is not a receipt.
-                task = asyncio.create_task(shadow.close())
-                operation.cleanup_tasks.append(task)
-                done, _ = await asyncio.wait(
-                    {task}, timeout=_SPEAKER_SHADOW_REPLACEMENT_CLOSE_SECONDS
-                )
-                operation.cleanup_pending = not done or task.cancelled()
-                if done and not task.cancelled() and task.exception() is not None:
-                    operation.cleanup_pending = True
-                return
             try:
                 await asyncio.wait_for(
                     self._close_speaker_shadow(shadow),
@@ -7577,6 +7583,22 @@ class DetectorRuntime:
                 )
             except TimeoutError:
                 return
+
+        def start_operation_cleanup(
+            shadow: SpeakerShadowObserver,
+            *,
+            name: str,
+        ) -> asyncio.Task[None]:
+            """Transfer physical close to the installation-owned cleanup set."""
+
+            assert operation is not None
+            task = asyncio.create_task(shadow.close(), name=name)
+            operation.cleanup_tasks.append(task)
+            # The installation publishes the replacement immediately and owns
+            # this proof task until it confirms a physical close. A slow model
+            # shutdown therefore cannot extend the swap's linearization window.
+            operation.cleanup_pending = True
+            return task
 
         detached_shadow: SpeakerShadowObserver | None = None
         rejected_shadow: SpeakerShadowObserver | None = None
@@ -7602,7 +7624,41 @@ class DetectorRuntime:
                 else:
                     self._sealed_provider_candidate_rejection = None
                     self._sealed_provider_micro_event = None
-                    self._clear_provider_segment_state()
+                    evidence_state = self._provider_speaker_evidence_state
+                    retired_settlement = None
+                    if evidence_state is not None:
+                        self._abandon_provider_speaker_evidence_locked(
+                            evidence_state,
+                            reason="speaker_verifier_replaced",
+                        )
+                        issued = self._provider_speaker_evidence_settlements.get(
+                            evidence_state.lease.lease_generation,
+                            (),
+                        )
+                        if issued:
+                            retired_settlement = issued[0]
+                    if operation is not None:
+                        expected_lease = operation.expected_evidence_lease
+                        if (
+                            retired_settlement is not None
+                            and retired_settlement.lease is expected_lease
+                        ):
+                            operation.evidence_settlement = retired_settlement
+                        elif expected_lease is not None:
+                            issued = self._provider_speaker_evidence_settlements.get(
+                                getattr(expected_lease, "lease_generation", -1),
+                                (),
+                            )
+                            if issued and self.validate_provider_speaker_evidence_settlement(
+                                issued[1],
+                                lease=expected_lease,
+                            ):
+                                operation.evidence_settlement = issued[1]
+                    self._clear_provider_segment_state(
+                        preserve_ordered_mode=True,
+                        preserve_last_sequence=True,
+                        preserve_audio_cursor=True,
+                    )
                     # The detached observer cannot publish authoritative
                     # terminal facts into the replacement verifier generation.
                     self._speaker_candidate_turn_bindings = {}
@@ -7638,7 +7694,6 @@ class DetectorRuntime:
                     self._speaker_shadow_generation += 1
                     self._speaker_shadow_candidate = None
                     self._provider_speaker_evidence_generation += 1
-                    self._provider_speaker_evidence_state = None
                     detached_shadow, self._speaker_shadow = (
                         self._speaker_shadow,
                         new_shadow,
@@ -7652,6 +7707,12 @@ class DetectorRuntime:
                 detached_shadow if detached_shadow is not None else rejected_shadow
             )
             if cleanup_shadow is None:
+                return
+            if operation is not None:
+                start_operation_cleanup(
+                    cleanup_shadow,
+                    name="detector-speaker-verifier-replacement-cleanup",
+                )
                 return
             cleanup_task = asyncio.create_task(
                 bounded_close(cleanup_shadow),
@@ -7669,9 +7730,16 @@ class DetectorRuntime:
                 and new_shadow is not None
                 and new_shadow is not self._speaker_shadow
             ):
-                cleanup_task = asyncio.create_task(
-                    bounded_close(new_shadow),
-                    name="detector-speaker-verifier-cancel-cleanup",
+                cleanup_task = (
+                    start_operation_cleanup(
+                        new_shadow,
+                        name="detector-speaker-verifier-cancel-cleanup",
+                    )
+                    if operation is not None
+                    else asyncio.create_task(
+                        bounded_close(new_shadow),
+                        name="detector-speaker-verifier-cancel-cleanup",
+                    )
                 )
             while cleanup_task is not None and not cleanup_task.done():
                 try:
@@ -7683,7 +7751,11 @@ class DetectorRuntime:
             if operation is not None and not installed and new_shadow is not None:
                 # Acceptance preceded the first await. Ordinary pre-swap
                 # exceptions have the same cleanup owner as cancellation.
-                cleanup_task = asyncio.create_task(bounded_close(new_shadow))
+                start_operation_cleanup(
+                    new_shadow,
+                    name="detector-speaker-verifier-failed-cleanup",
+                )
+                cleanup_task = operation.cleanup_tasks[-1]
                 await asyncio.shield(cleanup_task)
             raise
         finally:

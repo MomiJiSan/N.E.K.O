@@ -14,6 +14,18 @@ _PROCESS_NONCE = secrets.token_bytes(16)
 _RUNTIME_REFS: WeakKeyDictionary = WeakKeyDictionary()
 
 
+def diagnostic_value_ref(value: str | None, *, namespace: str) -> str | None:
+    """Return a process-local opaque correlation ref without exposing the value."""
+
+    if value is None:
+        return None
+    if type(value) is not str or type(namespace) is not str or not namespace:
+        raise TypeError("diagnostic references require strings")
+    return hashlib.blake2s(
+        f"{namespace}:{value}".encode(), key=_PROCESS_NONCE, digest_size=8,
+    ).hexdigest()
+
+
 def diagnostic_context(runtime: object, epoch: int) -> dict:
     # Object addresses can be reused after teardown; weak random identities
     # prevent a new runtime at the same address borrowing an old session ref.

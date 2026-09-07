@@ -63,6 +63,8 @@ async def test_idle_registry_bind_and_real_supported_unsupported_round_trip(iter
         assert second.identity.installation_id != first.identity.installation_id
         assert second.identity.activation_revision == desired.activation_revision
         assert runtime._asr_detector._speaker_shadow is not old_shadow
+        assert second.cleanup_pending
+        await asyncio.gather(*tuple(runtime._speaker_retired_cleanup))
         assert old_shadow._closed
         assert registry.activation_status() is PublicResult.READY
         await registry.activate(None, "disabled")

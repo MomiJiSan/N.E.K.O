@@ -36,7 +36,11 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowObservation,
 )
 from main_logic.asr_client.speaker_shadow.runtime import SpeakerShadowRuntime
-from main_logic.asr_client.speaker_shadow.diagnostics import SpeakerShadowDiagnostic
+from main_logic.asr_client.speaker_shadow.diagnostics import (
+    SpeakerScoreDiagnosticConfiguration,
+    SpeakerShadowDiagnostic,
+)
+from main_logic.asr_client.speaker_diagnostics import diagnostic_value_ref
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
 
@@ -323,6 +327,26 @@ class OwnerVoiceAsrCompositionFactory:
                 on_backend_recovered=on_backend_recovered if identity is None else None,
                 on_health_changed=on_health_changed if identity is not None else None,
             )
+            try:
+                shadow.bind_score_diagnostic_configuration(
+                    SpeakerScoreDiagnosticConfiguration(
+                        profile_generation_ref=diagnostic_value_ref(
+                            self._profile.generation, namespace="speaker_profile"
+                        ),
+                        activation_generation_ref=diagnostic_value_ref(
+                            self._activation_generation, namespace="speaker_activation"
+                        ),
+                        installation_ref=diagnostic_value_ref(
+                            identity.installation_id if identity is not None else None,
+                            namespace="speaker_installation",
+                        ),
+                        model_version="campplus_v1_0_0",
+                        scoring_rule_version="owner_voice_v1",
+                    )
+                )
+            except Exception:
+                # Diagnostic identity must never decide whether scoring installs.
+                pass
             source_ref = weakref.ref(shadow)
             return shadow
         except BaseException:
