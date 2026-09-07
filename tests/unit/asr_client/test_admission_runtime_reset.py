@@ -194,6 +194,8 @@ async def test_speaker_alias_is_retained_until_capture_closed_is_queued() -> Non
 @pytest.mark.asyncio
 async def test_old_route_bulk_cleanup_does_not_wait_new_route_effects() -> None:
     runtime = object.__new__(IndependentAsrRuntime)
+    runtime._asr_close_tasks = set()
+    runtime._log_asr_background_task_failure = MagicMock()
     old_turn = VoiceTurnToken(
         VoiceIngressToken(1, "old", 1, 1, 1),
         1,
@@ -288,6 +290,8 @@ async def test_runtime_settlement_posts_retire_record_capacity() -> None:
 @pytest.mark.asyncio
 async def test_cancelled_bulk_cleanup_finishes_resolution_before_invalidation() -> None:
     runtime = object.__new__(IndependentAsrRuntime)
+    runtime._asr_close_tasks = set()
+    runtime._log_asr_background_task_failure = MagicMock()
     runtime._asr_admission_effect_task_turns = {}
     runtime._execute_admission_effect = AsyncMock()
     dispatcher = MagicMock()
@@ -309,6 +313,11 @@ async def test_cancelled_bulk_cleanup_finishes_resolution_before_invalidation() 
     bulk_future.set_result(())
     with pytest.raises(asyncio.CancelledError):
         await cleanup
+
+    await asyncio.wait_for(
+        asyncio.gather(*tuple(runtime._asr_close_tasks), return_exceptions=True),
+        timeout=1,
+    )
 
     dispatcher.invalidate_all.assert_called_once_with()
 
@@ -448,6 +457,8 @@ async def test_admission_settlement_does_not_wait_blocked_core_delivery() -> Non
     dispatcher = TranscriptDispatcher(dispatch)
     assert dispatcher.try_reserve(final_key)
     runtime = object.__new__(IndependentAsrRuntime)
+    runtime._asr_admission_deadline_tasks = {}
+    runtime._asr_admission_rejection_deadlines = {}
     runtime._asr_admission_resolutions = {}
     runtime._asr_provider_turn_ownerships = {}
     runtime._asr_provider_exact_intervals = {}

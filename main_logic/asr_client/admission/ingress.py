@@ -23,6 +23,7 @@ from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
 from .contracts import (
     AdmissionEffect,
     AdmissionBulkResult,
+    AdmissionInvalidationResult,
     AdmissionEvent,
     BoundaryExact,
     CandidateBound,
@@ -36,6 +37,8 @@ from .contracts import (
     ExactIntervalPromotionScope,
     ExactIntervalTransitionReceipt,
     ProviderFinalReceived,
+    ProviderTransportScope,
+    LEGACY_PROVIDER_TRANSPORT_SCOPE,
     Reset,
     RouteReplaced,
     SpeakerCaptureLeaseRecord,
@@ -50,6 +53,8 @@ from .contracts import (
     SpeakerLeaseUnavailable,
     SpeakerLeaseTransitionOutcome,
     SpeakerLeaseTransitionReceipt,
+    SpeakerLeaseRetirementOutcome,
+    SpeakerLeaseRetirementResult,
     SpeakerAuthorityPending,
     SpeakerAuthorityUnavailable,
     SpeakerAuthorityUnarmed,
@@ -62,6 +67,12 @@ from .coordinator import VoiceTurnAdmissionCoordinator
 
 
 _CapacityClass: TypeAlias = Literal["data", "control", "speaker_control"]
+_ControlOwner: TypeAlias = (
+    VoiceTurnToken
+    | SpeakerCaptureLeaseToken
+    | ProviderTransportScope
+    | None
+)
 
 
 class AdmissionIngressCapacityError(RuntimeError):
@@ -99,7 +110,7 @@ class _IngressItem:
     capacity_class: _CapacityClass
     coalescing_key: (
         tuple[
-            VoiceTurnToken | SpeakerCaptureLeaseToken | None,
+            _ControlOwner,
             AdmissionEvent | SpeakerLeaseEvent,
             float | None,
         ]
@@ -121,6 +132,8 @@ class _IngressItem:
     exact_promotion_receipt: ExactIntervalPromotionReceipt | None = None
     exact_activation_receipt: ExactIntervalActivationReceipt | None = None
     exact_authority_is_current: Callable[[], bool] | None = None
+    transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE
+    invalidation_transport_scope: ProviderTransportScope | None = None
 
 
 _IngressResult: TypeAlias = (
@@ -136,6 +149,8 @@ _IngressResult: TypeAlias = (
     | ExactIntervalActivationResult
     | ExactIntervalAbortResult
     | ExactIntervalTransitionReceipt
+    | AdmissionInvalidationResult
+    | SpeakerLeaseRetirementResult
 )
 
 
@@ -204,7 +219,7 @@ class AdmissionIngressLane:
         self._speaker_control_pending = 0
         self._pending_controls: dict[
             tuple[
-                VoiceTurnToken | SpeakerCaptureLeaseToken | None,
+                _ControlOwner,
                 AdmissionEvent | SpeakerLeaseEvent,
                 float | None,
             ],
@@ -381,6 +396,8 @@ class AdmissionIngressLane:
         self,
         lease_token: SpeakerCaptureLeaseToken,
         candidate: SpeakerShadowCandidateKey,
+        *,
+        transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE,
     ) -> asyncio.Future[SpeakerCaptureLeaseRecord]:
         """Allocate one parent lease through this lane's only worker."""
 
@@ -388,6 +405,8 @@ class AdmissionIngressLane:
             raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
         if type(candidate) is not SpeakerShadowCandidateKey:
             raise TypeError("candidate must be SpeakerShadowCandidateKey")
+        if type(transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope")
         loop = self._checked_loop()
         self._reserve_capacity(
             "control",
@@ -407,6 +426,7 @@ class AdmissionIngressLane:
                 coalescing_key=None,
                 opens_speaker_lease=True,
                 speaker_candidate=candidate,
+                transport_scope=transport_scope,
             )
         )
         assert self._available is not None
@@ -417,9 +437,15 @@ class AdmissionIngressLane:
         self,
         lease_token: SpeakerCaptureLeaseToken,
         candidate: SpeakerShadowCandidateKey,
+        *,
+        transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE,
     ) -> SpeakerCaptureLeaseRecord:
         return await asyncio.shield(
-            self.open_speaker_lease_nowait(lease_token, candidate)
+            self.open_speaker_lease_nowait(
+                lease_token,
+                candidate,
+                transport_scope=transport_scope,
+            )
         )
 
     def attach_turn_to_speaker_lease_nowait(
@@ -427,6 +453,8 @@ class AdmissionIngressLane:
         turn_token: VoiceTurnToken,
         lease_token: SpeakerCaptureLeaseToken,
         provider_key: ProviderUtteranceKey,
+        *,
+        transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE,
     ) -> asyncio.Future[VoiceTurnAdmissionRecord]:
         """Open and bind one Provider child in FIFO order."""
 
@@ -436,6 +464,8 @@ class AdmissionIngressLane:
             raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
         if type(provider_key) is not ProviderUtteranceKey:
             raise TypeError("provider_key must be ProviderUtteranceKey")
+        if type(transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope")
         loop = self._checked_loop()
         self._reserve_capacity(
             "control",
@@ -455,6 +485,7 @@ class AdmissionIngressLane:
                 coalescing_key=None,
                 attaches_turn_to_speaker_lease=True,
                 provider_key=provider_key,
+                transport_scope=transport_scope,
             )
         )
         assert self._available is not None
@@ -466,12 +497,15 @@ class AdmissionIngressLane:
         turn_token: VoiceTurnToken,
         lease_token: SpeakerCaptureLeaseToken,
         provider_key: ProviderUtteranceKey,
+        *,
+        transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE,
     ) -> VoiceTurnAdmissionRecord:
         return await asyncio.shield(
             self.attach_turn_to_speaker_lease_nowait(
                 turn_token,
                 lease_token,
                 provider_key,
+                transport_scope=transport_scope,
             )
         )
 
@@ -912,12 +946,38 @@ class AdmissionIngressLane:
         self,
         lease_token: SpeakerCaptureLeaseToken,
     ) -> asyncio.Future[bool]:
+        """Compatibility facade over the detailed retirement result."""
+
+        detailed = self.retire_speaker_lease_detailed_nowait(lease_token)
+        loop = self._checked_loop()
+        result: asyncio.Future[bool] = loop.create_future()
+
+        def transfer(completed: asyncio.Future[SpeakerLeaseRetirementResult]) -> None:
+            if result.done():
+                return
+            if completed.cancelled():
+                result.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                result.set_exception(error)
+                return
+            outcome = completed.result().outcome
+            result.set_result(outcome is SpeakerLeaseRetirementOutcome.RETIRED)
+
+        detailed.add_done_callback(transfer)
+        return result
+
+    def retire_speaker_lease_detailed_nowait(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> asyncio.Future[SpeakerLeaseRetirementResult]:
         if type(lease_token) is not SpeakerCaptureLeaseToken:
             raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
         loop = self._checked_loop()
         existing = self._pending_speaker_lease_retirements.get(lease_token)
         if existing is not None:
-            return self._boolean_follower(existing)
+            return self._speaker_lease_retirement_follower(existing)
         self._reserve_capacity(
             "control",
             None,
@@ -940,13 +1000,51 @@ class AdmissionIngressLane:
         self._pending_speaker_lease_retirements[lease_token] = result
         assert self._available is not None
         self._available.set()
-        return cast(asyncio.Future[bool], result)
+        return cast(asyncio.Future[SpeakerLeaseRetirementResult], result)
+
+    def _speaker_lease_retirement_follower(
+        self,
+        leader: asyncio.Future[_IngressResult],
+    ) -> asyncio.Future[SpeakerLeaseRetirementResult]:
+        assert self._loop is not None
+        follower: asyncio.Future[SpeakerLeaseRetirementResult] = (
+            self._loop.create_future()
+        )
+
+        def transfer(completed: asyncio.Future[_IngressResult]) -> None:
+            if follower.done():
+                return
+            if completed.cancelled():
+                follower.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                follower.set_exception(error)
+                return
+            result = completed.result()
+            if type(result) is not SpeakerLeaseRetirementResult:
+                follower.set_exception(
+                    RuntimeError("ASR_ADMISSION_SPEAKER_RETIREMENT_RESULT_INVALID")
+                )
+                return
+            follower.set_result(result)
+
+        leader.add_done_callback(transfer)
+        return follower
 
     async def retire_speaker_lease(
         self,
         lease_token: SpeakerCaptureLeaseToken,
     ) -> bool:
         return await asyncio.shield(self.retire_speaker_lease_nowait(lease_token))
+
+    async def retire_speaker_lease_detailed(
+        self,
+        lease_token: SpeakerCaptureLeaseToken,
+    ) -> SpeakerLeaseRetirementResult:
+        return await asyncio.shield(
+            self.retire_speaker_lease_detailed_nowait(lease_token)
+        )
 
     def _checked_loop(self) -> asyncio.AbstractEventLoop:
         if self._closing or self._closed:
@@ -1050,11 +1148,14 @@ class AdmissionIngressLane:
         event: Reset | Close | RouteReplaced,
         *,
         now: float | None = None,
-    ) -> asyncio.Future[tuple[AdmissionBulkResult, ...]]:
+        transport_scope: ProviderTransportScope | None = None,
+    ) -> asyncio.Future[AdmissionInvalidationResult]:
         """Enqueue one bulk route fence in the same FIFO as per-turn facts."""
 
         if type(event) not in {Reset, Close, RouteReplaced}:
             raise TypeError("event must be Reset, Close, or RouteReplaced")
+        if transport_scope is not None and type(transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope or None")
         if self._closing or self._closed:
             raise AdmissionIngressClosedError("ASR_ADMISSION_INGRESS_CLOSED")
         loop = asyncio.get_running_loop()
@@ -1063,14 +1164,14 @@ class AdmissionIngressLane:
         if loop is not self._loop:
             raise RuntimeError("ASR_ADMISSION_INGRESS_LOOP_MISMATCH")
         coalescing_key: tuple[
-            VoiceTurnToken | None,
+            _ControlOwner,
             AdmissionEvent,
             float | None,
-        ] = (None, event, now)
+        ] = (transport_scope, event, now)
         existing = self._pending_controls.get(coalescing_key)
         if existing is not None:
-            follower = self._effectless_follower(existing)
-            return cast(asyncio.Future[tuple[AdmissionBulkResult, ...]], follower)
+            follower = self._invalidation_follower(existing)
+            return cast(asyncio.Future[AdmissionInvalidationResult], follower)
         self._reserve_capacity("control", None, event)
         result: asyncio.Future[_IngressResult] = loop.create_future()
         self._items.append(
@@ -1082,21 +1183,64 @@ class AdmissionIngressLane:
                 result,
                 "control",
                 coalescing_key,
+                transport_scope=(
+                    transport_scope or LEGACY_PROVIDER_TRANSPORT_SCOPE
+                ),
+                invalidation_transport_scope=transport_scope,
             )
         )
         self._pending_controls[coalescing_key] = result
         self._available.set()
-        return cast(asyncio.Future[tuple[AdmissionBulkResult, ...]], result)
+        return cast(asyncio.Future[AdmissionInvalidationResult], result)
 
     async def invalidate_all(
         self,
         event: Reset | Close | RouteReplaced,
         *,
         now: float | None = None,
-    ) -> tuple[AdmissionBulkResult, ...]:
+        transport_scope: ProviderTransportScope | None = None,
+    ) -> AdmissionInvalidationResult:
         """Await a bulk route fence without bypassing ingress ordering."""
 
-        return await asyncio.shield(self.invalidate_all_nowait(event, now=now))
+        return await asyncio.shield(
+            self.invalidate_all_nowait(
+                event,
+                now=now,
+                transport_scope=transport_scope,
+            )
+        )
+
+    def _invalidation_follower(
+        self,
+        leader: asyncio.Future[_IngressResult],
+    ) -> asyncio.Future[AdmissionInvalidationResult]:
+        """Share one invalidation range without duplicating effect ownership."""
+
+        assert self._loop is not None
+        follower: asyncio.Future[AdmissionInvalidationResult] = (
+            self._loop.create_future()
+        )
+
+        def transfer_result(completed: asyncio.Future[_IngressResult]) -> None:
+            if follower.done():
+                return
+            if completed.cancelled():
+                follower.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                follower.set_exception(error)
+                return
+            result = completed.result()
+            if type(result) is not AdmissionInvalidationResult:
+                follower.set_exception(
+                    RuntimeError("ASR_ADMISSION_INVALIDATION_RESULT_INVALID")
+                )
+                return
+            follower.set_result(result.as_follower())
+
+        leader.add_done_callback(transfer_result)
+        return follower
 
     def _effectless_follower(
         self,
@@ -1218,11 +1362,12 @@ class AdmissionIngressLane:
                             effects = await self._coordinator.open_speaker_lease(
                                 item.speaker_lease_token,
                                 item.speaker_candidate,
+                                transport_scope=item.transport_scope,
                             )
                         elif item.retires_speaker_lease:
                             assert item.speaker_lease_token is not None
                             assert item.event is None
-                            effects = await self._coordinator.retire_speaker_lease(
+                            effects = await self._coordinator.retire_speaker_lease_detailed(
                                 item.speaker_lease_token,
                             )
                         elif item.attaches_turn_to_speaker_lease:
@@ -1235,6 +1380,7 @@ class AdmissionIngressLane:
                                     item.turn_token,
                                     item.speaker_lease_token,
                                     item.provider_key,
+                                    transport_scope=item.transport_scope,
                                 )
                             )
                         elif item.retires_turn:
@@ -1276,6 +1422,7 @@ class AdmissionIngressLane:
                             effects = await self._coordinator.invalidate_all(
                                 bulk_event,
                                 now=item.now,
+                                transport_scope=item.invalidation_transport_scope,
                             )
                         elif item.event is None:
                             effects = await self._coordinator.open_turn(item.turn_token)

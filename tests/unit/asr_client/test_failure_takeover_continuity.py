@@ -10,7 +10,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from main_logic.asr_client import runtime as runtime_module
+from main_logic.asr_client._provider_events import (
+    ProviderUtteranceKey,
+    ProviderUtteranceStartedNotification,
+)
+from main_logic.asr_client.admission.contracts import SpeakerCaptureLeaseToken
+from main_logic.asr_client.lifecycle import FinalKey
 from main_logic.asr_client.runtime import AsrStartStatus
+from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
 from tests.unit.test_core_independent_asr import _selection
 from tests.unit.asr_client.test_provider_speaker_continuity import (
     _active_real_stack,
@@ -19,6 +26,144 @@ from tests.unit.asr_client.test_provider_speaker_continuity import (
     detector_fixture,
 )
 from main_logic.voice_turn.contracts import AsrSubmitStatus
+
+
+async def test_restart_old_cleanup_cannot_retire_new_scope_or_dispatcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        core,
+        runtime,
+        detector,
+        shadow,
+        lifecycle,
+        session,
+        old_turn,
+    ) = await _active_real_stack()
+    provider_key = ProviderUtteranceKey(0, 0, 1)
+    retire_entered = asyncio.Event()
+    release_retire = asyncio.Event()
+    original_retire_turn = runtime._asr_admission_ingress.retire_turn
+    cleanup_tasks: set[asyncio.Task] = set()
+
+    async def hold_old_turn_retirement(turn_token):
+        if turn_token == old_turn:
+            retire_entered.set()
+            await release_retire.wait()
+        return await original_retire_turn(turn_token)
+
+    monkeypatch.setattr(
+        runtime._asr_admission_ingress,
+        "retire_turn",
+        hold_old_turn_retirement,
+    )
+    try:
+        for sequence in range(1, 17):
+            assert (
+                await _submit_pcm(runtime, old_turn, sequence=sequence)
+            ).status is AsrSubmitStatus.ACCEPTED
+        await shadow.wait_idle()
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(
+                0,
+                0,
+                1,
+                audio_start_sample_16k=0,
+            ),
+            runtime._asr_session_epoch,
+        )
+        old_scope = runtime._asr_provider_transport_scope
+        old_dispatcher = runtime._asr_transcript_dispatcher
+        old_lease = runtime._asr_admission_turn_leases[old_turn]
+        assert old_scope is not None
+        assert tuple(
+            binding.provider_key
+            for binding in await runtime._asr_admission.live_provider_binding_keys(
+                old_scope
+            )
+        ) == (provider_key,)
+
+        replacement = SimpleNamespace(
+            is_ready=True,
+            connect=AsyncMock(),
+            close=AsyncMock(),
+            stream_audio=AsyncMock(),
+            signal_user_activity_end=AsyncMock(),
+        )
+        session.is_ready = False
+        runtime._asr_session_factory = lambda _selection: replacement
+        runtime._asr_transport_selection = object()
+        tasks_before_restart = set(runtime._asr_close_tasks)
+
+        await asyncio.wait_for(runtime._restart_transport(max_attempts=1), timeout=2)
+        await asyncio.wait_for(retire_entered.wait(), timeout=2)
+        cleanup_tasks = set(runtime._asr_close_tasks) - tasks_before_restart
+
+        new_scope = runtime._asr_provider_transport_scope
+        new_dispatcher = runtime._asr_transcript_dispatcher
+        assert runtime._asr_session is replacement
+        assert new_scope is not None and new_scope != old_scope
+        assert new_dispatcher is not old_dispatcher
+
+        lifecycle.invalidate_audio()
+        runtime._asr_current_ingress_token = core._capture_ingress_token()
+        new_turn = runtime._capture_turn_token(lifecycle)
+        new_candidate = SpeakerShadowCandidateKey(
+            detector.detector_epoch,
+            10_000,
+            "provider_candidate",
+        )
+        new_lease = SpeakerCaptureLeaseToken(
+            session_generation=runtime._asr_session_epoch,
+            start_generation=runtime._asr_start_generation,
+            transport_generation=lifecycle.snapshot.transport_generation,
+            detector_epoch=detector.detector_epoch,
+            lease_nonce=old_lease.lease_nonce + 100,
+        )
+        await runtime._asr_admission_ingress.open_speaker_lease(
+            new_lease,
+            new_candidate,
+            transport_scope=new_scope,
+        )
+        await runtime._asr_admission_ingress.attach_turn_to_speaker_lease(
+            new_turn,
+            new_lease,
+            provider_key,
+            transport_scope=new_scope,
+        )
+        new_final_key = FinalKey.from_turn(new_turn)
+        assert new_dispatcher.try_reserve(new_final_key)
+
+        release_retire.set()
+        if cleanup_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                timeout=2,
+            )
+
+        assert await runtime._asr_admission.get_record(old_turn) is None
+        assert await runtime._asr_admission.get_speaker_lease(old_lease) is None
+        assert await runtime._asr_admission.live_provider_binding_keys(old_scope) == ()
+        new_record = await runtime._asr_admission.get_record(new_turn)
+        new_parent = await runtime._asr_admission.get_speaker_lease(new_lease)
+        assert new_record is not None
+        assert new_record.speaker_lease_token == new_lease
+        assert new_parent is not None
+        assert new_parent.child_bindings[0].turn_token == new_turn
+        assert tuple(
+            binding.provider_key
+            for binding in await runtime._asr_admission.live_provider_binding_keys(
+                new_scope
+            )
+        ) == (provider_key,)
+        assert runtime._asr_transcript_dispatcher is new_dispatcher
+        assert new_dispatcher.has_pending_delivery
+        assert new_final_key in new_dispatcher._reservations
+    finally:
+        release_retire.set()
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        await _close_stack(core)
 
 
 async def test_partial_audio_failure_cannot_detach_successful_start_takeover(

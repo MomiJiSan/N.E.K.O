@@ -554,6 +554,7 @@ def _install_active_candidate(
         signal_user_activity_end=AsyncMock(),
         stream_audio=AsyncMock(),
     )
+    runtime._asr_provider_transport_scope = runtime._mint_provider_transport_scope()
     runtime._asr_session = session
     runtime._asr_provider = provider
     runtime._asr_lifecycle = lifecycle
@@ -1901,10 +1902,21 @@ async def test_provider_started_commits_aliases_only_after_attach_settles(
     attach_release = asyncio.Event()
     original_attach = runtime._asr_admission.attach_turn_to_speaker_lease
 
-    async def block_attach(child_turn, lease_token, provider_key):
+    async def block_attach(
+        child_turn,
+        lease_token,
+        provider_key,
+        *,
+        transport_scope,
+    ):
         attach_entered.set()
         await attach_release.wait()
-        return await original_attach(child_turn, lease_token, provider_key)
+        return await original_attach(
+            child_turn,
+            lease_token,
+            provider_key,
+            transport_scope=transport_scope,
+        )
 
     monkeypatch.setattr(
         runtime._asr_admission,
@@ -2387,10 +2399,21 @@ async def test_provider_started_gate_change_drops_late_terminal_child(
     attach_release = asyncio.Event()
     original_attach = runtime._asr_admission.attach_turn_to_speaker_lease
 
-    async def block_attach(child_turn, parent_lease, provider_key):
+    async def block_attach(
+        child_turn,
+        parent_lease,
+        provider_key,
+        *,
+        transport_scope,
+    ):
         attach_entered.set()
         await attach_release.wait()
-        return await original_attach(child_turn, parent_lease, provider_key)
+        return await original_attach(
+            child_turn,
+            parent_lease,
+            provider_key,
+            transport_scope=transport_scope,
+        )
 
     monkeypatch.setattr(
         runtime._asr_admission,
@@ -2564,8 +2587,19 @@ async def test_provider_started_identity_drift_detaches_exact_child(
     )
     attach = runtime._asr_admission.attach_turn_to_speaker_lease
 
-    async def attach_then_drift(child_turn, parent_lease, provider_key):
-        record = await attach(child_turn, parent_lease, provider_key)
+    async def attach_then_drift(
+        child_turn,
+        parent_lease,
+        provider_key,
+        *,
+        transport_scope,
+    ):
+        record = await attach(
+            child_turn,
+            parent_lease,
+            provider_key,
+            transport_scope=transport_scope,
+        )
         runtime._asr_audio_generation += 1
         return record
 
@@ -2587,8 +2621,7 @@ async def test_provider_started_identity_drift_detaches_exact_child(
     )
 
     assert await runtime._asr_admission.get_record(turn_token) is None
-    parent = await runtime._asr_admission.get_speaker_lease(lease_token)
-    assert parent is not None and not parent.child_bindings
+    assert await runtime._asr_admission.get_speaker_lease(lease_token) is None
     assert runtime._asr_admission_turn_leases == {}
     assert runtime._asr_provider_started_turns == {}
     assert runtime._asr_provider_correlator is not None
@@ -2621,10 +2654,21 @@ async def test_cancelled_provider_started_detaches_late_child(
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def blocked_attach(child_turn, parent_lease, provider_key):
+    async def blocked_attach(
+        child_turn,
+        parent_lease,
+        provider_key,
+        *,
+        transport_scope,
+    ):
         entered.set()
         await release.wait()
-        return await attach(child_turn, parent_lease, provider_key)
+        return await attach(
+            child_turn,
+            parent_lease,
+            provider_key,
+            transport_scope=transport_scope,
+        )
 
     monkeypatch.setattr(
         runtime._asr_admission,

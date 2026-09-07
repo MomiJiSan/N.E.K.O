@@ -18,6 +18,7 @@ from main_logic.asr_client.admission.contracts import (
     LifecycleSettled,
     PendingProviderFinal,
     ProviderFinalReceived,
+    ProviderTransportScope,
     RejectionCapability,
     RejectionCapabilityKind,
     ResolveReserved,
@@ -28,6 +29,7 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerCheckpointKind,
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
+    SpeakerLeaseRetirementOutcome,
     SpeakerLeaseState,
     SpeakerLeaseTerminalClaim,
     SpeakerLeaseTransitionOutcome,
@@ -170,7 +172,7 @@ async def test_open_turn_then_bulk_fence_then_fact_is_one_fifo():
     await opened
     bulk = await fenced
     await fact
-    assert len(bulk) == 1
+    assert len(bulk.child_results) == 1
     record = await coordinator.get_record(token)
     assert record is not None
     assert record.admission_state.value == "abandoned"
@@ -403,25 +405,110 @@ async def test_control_follower_propagates_leader_exception():
 async def test_identical_bulk_retry_has_no_effect_execution_ownership():
     coordinator = VoiceTurnAdmissionCoordinator()
     token = _token()
-    await coordinator.open_turn(token)
+    scope = ProviderTransportScope("connection-a")
+    lease = _lease()
     lane = AdmissionIngressLane(coordinator)
     await lane.start()
+    await lane.open_speaker_lease(lease, _candidate(), transport_scope=scope)
+    await lane.attach_turn_to_speaker_lease(
+        token,
+        lease,
+        ProviderUtteranceKey(0, 0, 1),
+        transport_scope=scope,
+    )
 
-    leader = lane.invalidate_all_nowait(RouteReplaced())
-    follower = lane.invalidate_all_nowait(RouteReplaced())
-    leader_results = await leader
-    follower_results = await follower
+    await coordinator._lock.acquire()
+    try:
+        leader = lane.invalidate_all_nowait(
+            RouteReplaced(),
+            transport_scope=scope,
+        )
+        follower = lane.invalidate_all_nowait(
+            RouteReplaced(),
+            transport_scope=scope,
+        )
+        await asyncio.sleep(0)
+        assert not leader.done()
+        assert not follower.done()
+    finally:
+        coordinator._lock.release()
+    leader_result = await leader
+    follower_result = await follower
 
-    assert len(leader_results) == 1
+    assert leader_result.operation_id == follower_result.operation_id
+    assert leader_result.affected_scopes == follower_result.affected_scopes == (scope,)
+    assert leader_result.turn_tokens == follower_result.turn_tokens == (token,)
+    assert leader_result.speaker_lease_tokens == follower_result.speaker_lease_tokens == (
+        lease,
+    )
+    assert leader_result.child_results == follower_result.child_results
+    assert leader_result.owns_effect_execution is True
+    assert follower_result.owns_effect_execution is False
     assert (
         sum(
             isinstance(effect, ResolveReserved)
-            for result in leader_results
+            for result in leader_result.child_results
             for effect in result.effects
         )
         == 1
     )
-    assert follower_results == ()
+
+    repeated = await lane.invalidate_all(
+        RouteReplaced(),
+        transport_scope=scope,
+    )
+    assert repeated.operation_id == leader_result.operation_id
+    assert repeated.affected_scopes == leader_result.affected_scopes
+    assert repeated.turn_tokens == leader_result.turn_tokens
+    assert repeated.speaker_lease_tokens == leader_result.speaker_lease_tokens
+    assert repeated.child_results == leader_result.child_results
+    assert repeated.owns_effect_execution is False
+    await lane.close()
+
+
+async def test_thirty_two_scoped_reconnects_return_capacity_to_baseline():
+    coordinator = VoiceTurnAdmissionCoordinator(capacity=1)
+    lane = AdmissionIngressLane(coordinator)
+    await lane.start()
+    provider_key = ProviderUtteranceKey(0, 0, 1)
+
+    for ordinal in range(1, 33):
+        scope = ProviderTransportScope(f"connection-{ordinal}")
+        token = _token(ordinal)
+        lease = SpeakerCaptureLeaseToken(1, 2, 3, 4, ordinal)
+
+        await lane.open_speaker_lease(
+            lease,
+            _candidate(),
+            transport_scope=scope,
+        )
+        await lane.attach_turn_to_speaker_lease(
+            token,
+            lease,
+            provider_key,
+            transport_scope=scope,
+        )
+        invalidated = await lane.invalidate_all(
+            RouteReplaced(),
+            transport_scope=scope,
+        )
+        resolution = next(
+            effect
+            for result in invalidated.child_results
+            for effect in result.effects
+            if isinstance(effect, ResolveReserved)
+        )
+        await lane.post(token, CoreSettled(resolution.ticket))
+        await lane.post(token, TransportSettled(resolution.ticket))
+        await lane.post(token, LifecycleSettled(resolution.ticket))
+
+        assert await lane.retire_turn(token) is True
+        parent_retirement = await lane.retire_speaker_lease_detailed(lease)
+        assert parent_retirement.outcome is SpeakerLeaseRetirementOutcome.RETIRED
+        assert await coordinator.live_turn_tokens() == ()
+        assert await coordinator.live_speaker_lease_tokens() == ()
+        assert await coordinator.live_provider_binding_keys(scope) == ()
+
     await lane.close()
 
 
@@ -445,11 +532,11 @@ async def test_bulk_route_fence_is_ordered_with_per_turn_facts():
     bulk_results = await fenced
     await after
 
-    assert len(bulk_results) == 1
+    assert len(bulk_results.child_results) == 1
     assert any(
         isinstance(effect, ResolveReserved)
         and effect.disposition is AdmissionDisposition.ABANDON
-        for effect in bulk_results[0].effects
+        for effect in bulk_results.child_results[0].effects
     )
     record = await coordinator.get_record(token)
     assert record is not None

@@ -16,7 +16,11 @@ from main_logic.voice_turn.contracts import VoiceTurnToken
 
 from .._provider_events import ProviderUtteranceKey
 from ..speaker_shadow.contracts import SpeakerShadowCandidateKey
-from ..speaker_evidence.contracts import EvidenceProof, EvidenceStatus, ProviderEvidenceBinding
+from ..speaker_evidence.contracts import (
+    EvidenceProof,
+    EvidenceStatus,
+    ProviderEvidenceBinding,
+)
 
 
 class ProviderBindingState(StrEnum):
@@ -150,6 +154,34 @@ class ExactIntervalOutcome(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderTransportScope:
+    """Stable identity for one physical Provider transport connection."""
+
+    scope_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope_id) is not str or not self.scope_id:
+            raise ValueError("scope_id must be a non-empty string")
+
+
+LEGACY_PROVIDER_TRANSPORT_SCOPE = ProviderTransportScope("legacy")
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedProviderUtteranceKey:
+    """A raw Provider utterance key qualified by its physical transport."""
+
+    transport_scope: ProviderTransportScope
+    provider_key: ProviderUtteranceKey
+
+    def __post_init__(self) -> None:
+        if type(self.transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope")
+        if type(self.provider_key) is not ProviderUtteranceKey:
+            raise TypeError("provider_key must be ProviderUtteranceKey")
+
+
+@dataclass(frozen=True, slots=True)
 class SpeakerCaptureLeaseToken:
     """Stable identity spanning every Provider text turn in one capture."""
 
@@ -179,12 +211,19 @@ class SpeakerLeaseChildBinding:
 
     provider_key: ProviderUtteranceKey
     turn_token: VoiceTurnToken
+    transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE
 
     def __post_init__(self) -> None:
         if type(self.provider_key) is not ProviderUtteranceKey:
             raise TypeError("provider_key must be ProviderUtteranceKey")
         if type(self.turn_token) is not VoiceTurnToken:
             raise TypeError("turn_token must be VoiceTurnToken")
+        if type(self.transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope")
+
+    @property
+    def scoped_provider_key(self) -> ScopedProviderUtteranceKey:
+        return ScopedProviderUtteranceKey(self.transport_scope, self.provider_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +240,7 @@ class SpeakerCaptureLeaseRecord:
     capture_through_sequence_no: int | None = None
     child_bindings: tuple[SpeakerLeaseChildBinding, ...] = ()
     terminal_event: SpeakerLeaseEvent | None = None
+    transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE
 
     def __post_init__(self) -> None:
         if type(self.lease_token) is not SpeakerCaptureLeaseToken:
@@ -209,6 +249,8 @@ class SpeakerCaptureLeaseRecord:
             raise ValueError("record_generation must be a positive integer")
         if type(self.candidate) is not SpeakerShadowCandidateKey:
             raise TypeError("candidate must be SpeakerShadowCandidateKey")
+        if type(self.transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope")
         if type(self.state) is not SpeakerLeaseState:
             raise TypeError("state must be SpeakerLeaseState")
         for name in ("logical_revision", "last_speaker_sequence_no"):
@@ -270,6 +312,11 @@ class SpeakerCaptureLeaseRecord:
         turns = tuple(binding.turn_token for binding in self.child_bindings)
         if len(set(keys)) != len(keys) or len(set(turns)) != len(turns):
             raise ValueError("speaker lease child bindings must be unique")
+        if any(
+            binding.transport_scope != self.transport_scope
+            for binding in self.child_bindings
+        ):
+            raise ValueError("speaker lease child bindings must share transport_scope")
 
     @property
     def terminal_disposition(self) -> AdmissionDisposition | None:
@@ -404,6 +451,7 @@ class ExactIntervalPromotionScope:
     boundary_proof: BoundaryProof
     target_candidate: SpeakerShadowCandidateKey
     successor_candidate: SpeakerShadowCandidateKey | None
+    transport_scope: ProviderTransportScope = LEGACY_PROVIDER_TRANSPORT_SCOPE
 
     def __post_init__(self) -> None:
         if type(self.parent_lease_token) is not SpeakerCaptureLeaseToken:
@@ -443,6 +491,12 @@ class ExactIntervalPromotionScope:
             )
         if self.successor_candidate == self.target_candidate:
             raise ValueError("successor_candidate must differ from target_candidate")
+        if type(self.transport_scope) is not ProviderTransportScope:
+            raise TypeError("transport_scope must be ProviderTransportScope")
+
+    @property
+    def scoped_provider_key(self) -> ScopedProviderUtteranceKey:
+        return ScopedProviderUtteranceKey(self.transport_scope, self.provider_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -970,7 +1024,10 @@ class EvidenceHoldRequested:
     def __post_init__(self) -> None:
         if type(self.binding) is not ProviderEvidenceBinding:
             raise TypeError("binding must be ProviderEvidenceBinding")
-        if not math.isfinite(self.first_final_received_at) or self.first_final_received_at < 0:
+        if (
+            not math.isfinite(self.first_final_received_at)
+            or self.first_final_received_at < 0
+        ):
             raise ValueError("first final receipt time must be finite and non-negative")
         if self.hard_deadline is not None and not math.isfinite(self.hard_deadline):
             raise ValueError("hard deadline must be finite")
@@ -1255,6 +1312,99 @@ class AdmissionBulkResult:
             SpeakerLeaseState.HIGH_SEEN,
         }:
             raise ValueError("speaker lease bulk result requires a terminal state")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionInvalidationResult:
+    """Immutable cleanup range captured by one atomic route invalidation."""
+
+    operation_id: int
+    affected_scopes: tuple[ProviderTransportScope, ...]
+    turn_tokens: tuple[VoiceTurnToken, ...]
+    speaker_lease_tokens: tuple[SpeakerCaptureLeaseToken, ...]
+    child_results: tuple[AdmissionBulkResult, ...]
+    owns_effect_execution: bool
+
+    def __post_init__(self) -> None:
+        if type(self.operation_id) is not int or self.operation_id < 1:
+            raise ValueError("operation_id must be a positive integer")
+        if any(
+            type(scope) is not ProviderTransportScope for scope in self.affected_scopes
+        ):
+            raise TypeError("affected_scopes must contain ProviderTransportScope")
+        if any(type(token) is not VoiceTurnToken for token in self.turn_tokens):
+            raise TypeError("turn_tokens must contain VoiceTurnToken")
+        if any(
+            type(token) is not SpeakerCaptureLeaseToken
+            for token in self.speaker_lease_tokens
+        ):
+            raise TypeError(
+                "speaker_lease_tokens must contain SpeakerCaptureLeaseToken"
+            )
+        if any(type(item) is not AdmissionBulkResult for item in self.child_results):
+            raise TypeError("child_results must contain AdmissionBulkResult")
+        if type(self.owns_effect_execution) is not bool:
+            raise TypeError("owns_effect_execution must be bool")
+        for values, name in (
+            (self.affected_scopes, "affected_scopes"),
+            (self.turn_tokens, "turn_tokens"),
+            (self.speaker_lease_tokens, "speaker_lease_tokens"),
+        ):
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name} must be unique")
+
+    def as_follower(self) -> AdmissionInvalidationResult:
+        if not self.owns_effect_execution:
+            return self
+        return AdmissionInvalidationResult(
+            operation_id=self.operation_id,
+            affected_scopes=self.affected_scopes,
+            turn_tokens=self.turn_tokens,
+            speaker_lease_tokens=self.speaker_lease_tokens,
+            child_results=self.child_results,
+            owns_effect_execution=False,
+        )
+
+    def __len__(self) -> int:
+        """Temporary sequence compatibility for legacy bulk-result readers."""
+
+        return len(self.child_results)
+
+    def __iter__(self):
+        return iter(self.child_results)
+
+    def __getitem__(self, index):
+        return self.child_results[index]
+
+
+class SpeakerLeaseRetirementOutcome(StrEnum):
+    RETIRED = "retired"
+    ALREADY_RETIRED = "already_retired"
+    NOT_FOUND = "not_found"
+    NOT_TERMINAL = "not_terminal"
+    LIVE_CHILDREN = "live_children"
+    BINDING_CONFLICT = "binding_conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerLeaseRetirementResult:
+    lease_token: SpeakerCaptureLeaseToken
+    outcome: SpeakerLeaseRetirementOutcome
+    remaining_children: tuple[VoiceTurnToken, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.lease_token) is not SpeakerCaptureLeaseToken:
+            raise TypeError("lease_token must be SpeakerCaptureLeaseToken")
+        if type(self.outcome) is not SpeakerLeaseRetirementOutcome:
+            raise TypeError("outcome must be SpeakerLeaseRetirementOutcome")
+        if any(type(token) is not VoiceTurnToken for token in self.remaining_children):
+            raise TypeError("remaining_children must contain VoiceTurnToken")
+        if len(set(self.remaining_children)) != len(self.remaining_children):
+            raise ValueError("remaining_children must be unique")
+        if (self.outcome is SpeakerLeaseRetirementOutcome.LIVE_CHILDREN) != bool(
+            self.remaining_children
+        ):
+            raise ValueError("remaining_children are required only for LIVE_CHILDREN")
 
 
 class SpeakerLeaseTransitionOutcome(StrEnum):

@@ -156,6 +156,7 @@ async def _active_real_stack(
         stream_audio=AsyncMock(),
         signal_user_activity_end=AsyncMock(),
     )
+    runtime._asr_provider_transport_scope = runtime._mint_provider_transport_scope()
     runtime._asr_session = session
     runtime._asr_provider_exact_session = session
     runtime._asr_provider = "qwen"

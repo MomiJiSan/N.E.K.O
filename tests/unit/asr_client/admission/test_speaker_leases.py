@@ -19,7 +19,9 @@ from main_logic.asr_client.admission.contracts import (
     EvidenceState,
     ExactIntervalOutcome,
     ExactIntervalPromotionScope,
+    LEGACY_PROVIDER_TRANSPORT_SCOPE,
     PendingProviderFinal,
+    ProviderTransportScope,
     ProviderBindingState,
     ProviderFinalReceived,
     ResolveReserved,
@@ -36,11 +38,13 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseState,
+    SpeakerLeaseRetirementOutcome,
     SpeakerLeaseTerminalClaim,
     SpeakerLeaseTransitionOutcome,
     SpeakerLeaseTransitionReceipt,
     SpeakerLeaseUnavailable,
     SpeakerAuthorityPending,
+    ScopedProviderUtteranceKey,
 )
 from main_logic.asr_client.admission.coordinator import (
     AdmissionIdentityError,
@@ -727,7 +731,13 @@ async def test_detach_rejects_identity_conflict_without_touching_replacement():
         provider_key,
     )
     replacement_binding = (replacement_lease, replacement_turn)
-    coordinator._provider_speaker_lease_bindings[provider_key] = replacement_binding
+    scoped_provider_key = ScopedProviderUtteranceKey(
+        LEGACY_PROVIDER_TRANSPORT_SCOPE,
+        provider_key,
+    )
+    coordinator._provider_speaker_lease_bindings[scoped_provider_key] = (
+        replacement_binding
+    )
 
     with pytest.raises(AdmissionIdentityError, match="DETACH_IDENTITY_CONFLICT"):
         await coordinator.detach_turn_from_speaker_lease(
@@ -742,7 +752,7 @@ async def test_detach_rejects_identity_conflict_without_touching_replacement():
     assert parent.child_bindings == (runtime_binding := parent.child_bindings[0],)
     assert runtime_binding.provider_key == provider_key
     assert runtime_binding.turn_token == turn
-    assert coordinator._provider_speaker_lease_bindings[provider_key] == (
+    assert coordinator._provider_speaker_lease_bindings[scoped_provider_key] == (
         replacement_binding
     )
 
@@ -787,7 +797,9 @@ async def test_detach_rejects_final_or_terminal_binding(terminal_parent: bool):
     parent = await coordinator.get_speaker_lease(lease)
     assert parent is not None
     assert parent.child_bindings[0].turn_token == turn
-    assert coordinator._provider_speaker_lease_bindings[provider_key] == (
+    assert coordinator._provider_speaker_lease_bindings[
+        ScopedProviderUtteranceKey(LEGACY_PROVIDER_TRANSPORT_SCOPE, provider_key)
+    ] == (
         lease,
         turn,
     )
@@ -917,7 +929,9 @@ async def test_detach_terminal_late_child_rejects_committed_child_state(
     assert parent is not None
     assert parent.state is SpeakerLeaseState.ALLOW
     assert parent.child_bindings[0].turn_token == turn
-    assert coordinator._provider_speaker_lease_bindings[provider_key] == (
+    assert coordinator._provider_speaker_lease_bindings[
+        ScopedProviderUtteranceKey(LEGACY_PROVIDER_TRANSPORT_SCOPE, provider_key)
+    ] == (
         lease,
         turn,
     )
@@ -943,7 +957,11 @@ async def test_detach_terminal_late_child_does_not_touch_replacement_mapping():
     )
     child = await coordinator.get_record(turn)
     replacement = (replacement_lease, replacement_turn)
-    coordinator._provider_speaker_lease_bindings[provider_key] = replacement
+    scoped_provider_key = ScopedProviderUtteranceKey(
+        LEGACY_PROVIDER_TRANSPORT_SCOPE,
+        provider_key,
+    )
+    coordinator._provider_speaker_lease_bindings[scoped_provider_key] = replacement
 
     with pytest.raises(AdmissionIdentityError, match="DETACH_IDENTITY_CONFLICT"):
         await coordinator.detach_turn_from_speaker_lease(
@@ -957,7 +975,7 @@ async def test_detach_terminal_late_child_does_not_touch_replacement_mapping():
     assert parent is not None
     assert parent.state is SpeakerLeaseState.UNAVAILABLE
     assert parent.child_bindings[0].turn_token == turn
-    assert coordinator._provider_speaker_lease_bindings[provider_key] == replacement
+    assert coordinator._provider_speaker_lease_bindings[scoped_provider_key] == replacement
 
 
 async def test_provider_key_cannot_be_attached_to_two_live_leases():
@@ -977,6 +995,136 @@ async def test_provider_key_cannot_be_attached_to_two_live_leases():
             second_lease,
             _key(1),
         )
+
+
+async def test_same_raw_provider_key_isolated_by_transport_scope():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    old_scope = ProviderTransportScope("old-connection")
+    new_scope = ProviderTransportScope("new-connection")
+    raw_key = ProviderUtteranceKey(0, 0, 1)
+    old_lease, new_lease = _lease(1), _lease(2)
+    old_turn, new_turn = _turn(1), _turn(2)
+    await coordinator.open_speaker_lease(
+        old_lease,
+        _candidate(1),
+        transport_scope=old_scope,
+    )
+    await coordinator.open_speaker_lease(
+        new_lease,
+        _candidate(2),
+        transport_scope=new_scope,
+    )
+
+    old_child = await coordinator.attach_turn_to_speaker_lease(
+        old_turn,
+        old_lease,
+        raw_key,
+        transport_scope=old_scope,
+    )
+    new_child = await coordinator.attach_turn_to_speaker_lease(
+        new_turn,
+        new_lease,
+        raw_key,
+        transport_scope=new_scope,
+    )
+
+    assert old_child.speaker_lease_token == old_lease
+    assert new_child.speaker_lease_token == new_lease
+    old_parent = await coordinator.get_speaker_lease(old_lease)
+    new_parent = await coordinator.get_speaker_lease(new_lease)
+    assert old_parent is not None and old_parent.transport_scope == old_scope
+    assert new_parent is not None and new_parent.transport_scope == new_scope
+    assert old_parent.child_bindings == (
+        SpeakerLeaseChildBinding(raw_key, old_turn, old_scope),
+    )
+    assert new_parent.child_bindings == (
+        SpeakerLeaseChildBinding(raw_key, new_turn, new_scope),
+    )
+
+
+async def test_same_scope_duplicate_provider_key_rejects_without_overwrite():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    scope = ProviderTransportScope("one-connection")
+    raw_key = ProviderUtteranceKey(0, 0, 1)
+    first_lease, second_lease = _lease(1), _lease(2)
+    first_turn, second_turn = _turn(1), _turn(2)
+    await coordinator.open_speaker_lease(
+        first_lease,
+        _candidate(1),
+        transport_scope=scope,
+    )
+    await coordinator.open_speaker_lease(
+        second_lease,
+        _candidate(2),
+        transport_scope=scope,
+    )
+    await coordinator.attach_turn_to_speaker_lease(
+        first_turn,
+        first_lease,
+        raw_key,
+        transport_scope=scope,
+    )
+
+    with pytest.raises(AdmissionIdentityError, match="KEY_ALREADY_BOUND"):
+        await coordinator.attach_turn_to_speaker_lease(
+            second_turn,
+            second_lease,
+            raw_key,
+            transport_scope=scope,
+        )
+
+    scoped_key = ScopedProviderUtteranceKey(scope, raw_key)
+    assert coordinator._provider_speaker_lease_bindings[scoped_key] == (
+        first_lease,
+        first_turn,
+    )
+    assert await coordinator.get_record(second_turn) is None
+    second_parent = await coordinator.get_speaker_lease(second_lease)
+    assert second_parent is not None and second_parent.child_bindings == ()
+
+
+async def test_scoped_detach_and_parent_retirement_release_only_exact_binding():
+    coordinator = VoiceTurnAdmissionCoordinator()
+    scope = ProviderTransportScope("detached-connection")
+    other_scope = ProviderTransportScope("replacement-connection")
+    raw_key = ProviderUtteranceKey(0, 0, 1)
+    lease, turn = _lease(), _turn(1)
+    await coordinator.open_speaker_lease(
+        lease,
+        _candidate(),
+        transport_scope=scope,
+    )
+    await coordinator.attach_turn_to_speaker_lease(
+        turn,
+        lease,
+        raw_key,
+        transport_scope=scope,
+    )
+
+    with pytest.raises(AdmissionIdentityError, match="DETACH_IDENTITY_CONFLICT"):
+        await coordinator.detach_turn_from_speaker_lease(
+            turn,
+            lease,
+            raw_key,
+            transport_scope=other_scope,
+        )
+    assert ScopedProviderUtteranceKey(scope, raw_key) in (
+        coordinator._provider_speaker_lease_bindings
+    )
+    assert await coordinator.detach_turn_from_speaker_lease(
+        turn,
+        lease,
+        raw_key,
+        transport_scope=scope,
+    )
+    await coordinator.post_speaker_lease(lease, SpeakerLeaseAbandoned())
+    retired = await coordinator.retire_speaker_lease_detailed(lease)
+
+    assert retired.outcome is SpeakerLeaseRetirementOutcome.RETIRED
+    assert await coordinator.get_speaker_lease(lease) is None
+    assert ScopedProviderUtteranceKey(scope, raw_key) not in (
+        coordinator._provider_speaker_lease_bindings
+    )
 
 
 async def test_speaker_lease_and_child_capacities_are_strictly_bounded():
@@ -1019,6 +1167,37 @@ async def test_bulk_route_invalidation_abandons_parent_and_child_atomically():
     assert (
         await coordinator.get_record(turn)
     ).admission_state is AdmissionState.ABANDONED
+
+
+async def test_scoped_invalidation_snapshots_and_retires_zero_child_parent():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    scope = ProviderTransportScope("zero-child-connection")
+    lease = _lease()
+    await coordinator.open_speaker_lease(
+        lease,
+        _candidate(),
+        transport_scope=scope,
+    )
+
+    invalidated = await coordinator.invalidate_all(
+        RouteReplaced(),
+        transport_scope=scope,
+    )
+
+    assert invalidated.affected_scopes == (scope,)
+    assert invalidated.turn_tokens == ()
+    assert invalidated.speaker_lease_tokens == (lease,)
+    assert invalidated.child_results == ()
+    assert invalidated.owns_effect_execution is True
+    parent = await coordinator.get_speaker_lease(lease)
+    assert parent is not None and parent.state is SpeakerLeaseState.ABANDONED
+
+    retired = await coordinator.retire_speaker_lease_detailed(lease)
+    replay = await coordinator.retire_speaker_lease_detailed(lease)
+
+    assert retired.outcome is SpeakerLeaseRetirementOutcome.RETIRED
+    assert replay.outcome is SpeakerLeaseRetirementOutcome.ALREADY_RETIRED
+    assert await coordinator.live_speaker_lease_tokens() == ()
 
 
 async def test_lease_facts_share_single_ingress_worker_and_reserved_capacity():
@@ -1879,6 +2058,80 @@ async def test_exact_promotion_abort_restores_parent_child_and_bindings() -> Non
     assert await coordinator.get_record(turn) is child_before
     reopened = await coordinator.open_speaker_lease(_lease(2), successor)
     assert reopened.candidate == successor
+
+
+async def test_exact_promotion_abort_restores_only_its_transport_scope_binding() -> None:
+    coordinator = VoiceTurnAdmissionCoordinator()
+    old_scope = ProviderTransportScope("old-exact-connection")
+    new_scope = ProviderTransportScope("new-exact-connection")
+    old_lease, new_lease = _lease(1), _lease(2)
+    old_turn, new_turn = _turn(1), _turn(2)
+    raw_key = ProviderUtteranceKey(0, 0, 1)
+    target, successor, replacement_candidate = (
+        _candidate(1),
+        _candidate(2),
+        _candidate(3),
+    )
+    await coordinator.open_speaker_lease(
+        old_lease,
+        target,
+        transport_scope=old_scope,
+    )
+    await coordinator.attach_turn_to_speaker_lease(
+        old_turn,
+        old_lease,
+        raw_key,
+        transport_scope=old_scope,
+    )
+    await coordinator.post_speaker_lease(
+        old_lease,
+        SpeakerLeaseHigh(target, 1),
+    )
+    old_parent = await coordinator.get_speaker_lease(old_lease)
+    old_child = await coordinator.get_record(old_turn)
+    assert old_parent is not None and old_child is not None
+    promotion_scope = replace(
+        _exact_scope(
+            old_parent,
+            old_child,
+            turn_token=old_turn,
+            provider_key=raw_key,
+            target=target,
+            successor=successor,
+        ),
+        transport_scope=old_scope,
+    )
+    promoted = await coordinator.promote_exact_interval_tail_child(
+        promotion_scope
+    )
+    assert promoted.receipt is not None
+
+    await coordinator.open_speaker_lease(
+        new_lease,
+        replacement_candidate,
+        transport_scope=new_scope,
+    )
+    await coordinator.attach_turn_to_speaker_lease(
+        new_turn,
+        new_lease,
+        raw_key,
+        transport_scope=new_scope,
+    )
+    new_binding = (new_lease, new_turn)
+    assert coordinator._provider_speaker_lease_bindings[
+        ScopedProviderUtteranceKey(new_scope, raw_key)
+    ] == new_binding
+
+    aborted = await coordinator.abort_exact_interval_promotion(promoted.receipt)
+
+    assert aborted.outcome is ExactIntervalOutcome.ABORTED
+    assert coordinator._provider_speaker_lease_bindings[
+        ScopedProviderUtteranceKey(old_scope, raw_key)
+    ] == (old_lease, old_turn)
+    assert coordinator._provider_speaker_lease_bindings[
+        ScopedProviderUtteranceKey(new_scope, raw_key)
+    ] == new_binding
+    assert await coordinator.get_record(new_turn) is not None
 
 
 async def test_exact_promotion_abort_refuses_drift_and_forged_owner() -> None:
