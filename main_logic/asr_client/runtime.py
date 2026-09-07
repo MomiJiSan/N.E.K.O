@@ -1669,6 +1669,7 @@ class IndependentAsrRuntime:
         if exact is not None:
             if exact.resolved_disposition is not None:
                 return True
+            self._schedule_speaker_fact_diagnostic(fact, exact)
             exact_fact: SpeakerLeaseEvent = (
                 SpeakerLeaseLow(candidate, fact.sequence_no, fact.checkpoint_kind)
                 if isinstance(fact, SpeakerLow)
@@ -1680,6 +1681,7 @@ class IndependentAsrRuntime:
             return True
         ledger = self._asr_provider_speaker_ledgers.get(candidate)
         if ledger is not None:
+            self._schedule_speaker_fact_diagnostic(fact, ledger)
             provisional_fact: SpeakerLeaseEvent = (
                 SpeakerLeaseLow(candidate, fact.sequence_no, fact.checkpoint_kind)
                 if isinstance(fact, SpeakerLow)
@@ -1722,6 +1724,11 @@ class IndependentAsrRuntime:
             future = self._asr_admission_ingress.post_nowait(turn_token, fact)
         except AdmissionIngressClosedError:
             return False
+        self._schedule_pipeline_event(
+            "speaker_fact_observed", turn_token.ingress, turn_id=turn_token.turn_id,
+            outcome="low" if isinstance(fact, SpeakerLow) else "high" if isinstance(fact, SpeakerHigh) else "unavailable",
+            sequence_no=fact.sequence_no,
+        )
         self._consume_admission_future(turn_token, future)
         return True
 
@@ -5890,6 +5897,10 @@ class IndependentAsrRuntime:
     ) -> None:
         if byte_count <= 0:
             return
+        self._observe_pipeline_audio(
+            "provider_audio_written", turn_token.ingress, byte_count // 2,
+            turn_id=turn_token.turn_id, transport_current=self._asr_session is session_ref,
+        )
         self._sync_provider_wire_metrics(
             session_ref,
             fallback_audio_bytes=byte_count,
@@ -8455,6 +8466,16 @@ class IndependentAsrRuntime:
                     await self._close_created_speaker_shadow(speaker_shadow)
                     raise
                 self._asr_detector = detector_ref
+                try:
+                    install_diagnostics = getattr(detector_ref, "set_pipeline_diagnostic_callback", None)
+                    if callable(install_diagnostics):
+                        install_diagnostics(
+                            lambda fields, ingress: self._observe_endpoint_diagnostic(
+                                fields, ingress, source=detector_ref, epoch=epoch,
+                            )
+                        )
+                except Exception:
+                    pass
                 # The startup detector and Provider session share a fresh
                 # physical audio timeline. Reconnects earn this capability
                 # only after reset_provider_audio_timeline() succeeds.
@@ -9168,18 +9189,21 @@ class IndependentAsrRuntime:
 
         self._ensure_asr_runtime_state()
         handoff_identity = self._capture_runtime_identity(ingress_token=ingress_token)
+        self._observe_pipeline_audio("audio_received", ingress_token, len(frame.pcm16) // 2)
+
+
         if not await self._await_pending_turn_handoff(handoff_identity):
-            return AsrSubmitResult(AsrSubmitStatus.STALE)
+            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'handoff_stale'))
         if self._asr_deny_transport_state in {
             DenyTransportState.DENY_FENCED,
             DenyTransportState.RETIRING,
             DenyTransportState.QUARANTINED,
         }:
-            return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_fenced'))
         if self._asr_lifecycle is None:
-            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'missing_lifecycle'))
         if not self._ingress_token_matches(ingress_token):
-            return AsrSubmitResult(AsrSubmitStatus.STALE)
+            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'ingress_stale'))
         previous_ingress_token = self._asr_current_ingress_token
         deny_rearm_pending = self._asr_deny_transport_state in {
             DenyTransportState.WAIT_SILENCE,
@@ -9202,7 +9226,7 @@ class IndependentAsrRuntime:
             if incoming_order <= previous_order:
                 # A late socket may share the current session/audio epochs.
                 # Reject it before its sequence can poison the new route.
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'older_route'))
         self._asr_current_ingress_token = ingress_token
         identity_valid = self._capture_frame_identity_is_new(frame)
         if ingress_identity_changed:
@@ -9218,14 +9242,14 @@ class IndependentAsrRuntime:
                 identity_valid=identity_valid,
             )
             if not rearmed:
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_wait_silence'))
             if (
                 self._asr_deny_transport_state is not DenyTransportState.OPEN
                 or self._asr_deny_cleanup_generation != deny_cleanup_generation
                 or self._asr_current_ingress_token != ingress_token
                 or not self._ingress_token_matches(ingress_token)
             ):
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_rearm_changed'))
         authority_reset_task = self._asr_provider_authority_reset_task
         if authority_reset_task is not None:
             reset_succeeded = False
@@ -9255,12 +9279,12 @@ class IndependentAsrRuntime:
                     status_code="ASR_ENDPOINTING_FAILED",
                     expected_identity=identity,
                 )
-                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'authority_reset_failed'))
             if (
                 self._asr_deny_transport_state is not DenyTransportState.OPEN
                 or self._asr_deny_cleanup_generation != deny_cleanup_generation
             ):
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
         identity = self._capture_runtime_identity(ingress_token=ingress_token)
         failure_context = self._new_audio_failure_context("submit", identity)
 
@@ -9309,9 +9333,10 @@ class IndependentAsrRuntime:
                         ),
                     )
                     if not deny_cleanup_is_current():
-                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
                     if not ingress_is_current():
-                        return AsrSubmitResult(AsrSubmitStatus.STALE)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'ingress_stale'))
+                    self._observe_detector_audio_result(submitted, ingress_token, len(pcm16) // 2)
                     lifecycle.metrics.detector_submit_latency_ms = int(
                         (time.perf_counter() - detector_submit_started_at) * 1_000
                     )
@@ -9330,14 +9355,14 @@ class IndependentAsrRuntime:
                         detector.smart_turn_coalesced_evaluation_count
                     )
                     if submitted.status is DetectorSubmitStatus.SKIPPED_QUIET:
-                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'quiet_skipped'))
                     if submitted.status is DetectorSubmitStatus.BACKPRESSURE:
                         lifecycle.metrics.detector_overflow_count += 1
                         await self._handle_audio_ingress_backpressure(
                             ingress_token,
                             observed_state=lifecycle.snapshot.state,
                         )
-                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'detector_backpressure'))
                     if (
                         submitted.status
                         in {DetectorSubmitStatus.CLOSED, DetectorSubmitStatus.FAILED}
@@ -9349,7 +9374,7 @@ class IndependentAsrRuntime:
                             status_code="ASR_ENDPOINTING_FAILED",
                             expected_identity=identity,
                         )
-                        return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'endpointing_unavailable'))
                     if not submitted.throttle_available:
                         lifecycle.enable_independent_asr_fail_open()
                         if (
@@ -9376,7 +9401,7 @@ class IndependentAsrRuntime:
                                     status_code="ASR_ENDPOINTING_FAILED",
                                     expected_identity=identity,
                                 )
-                                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'control_backpressure'))
                 else:
                     detector_result = await detector.feed(
                         pcm16,
@@ -9393,9 +9418,10 @@ class IndependentAsrRuntime:
                         ),
                     )
                     if not deny_cleanup_is_current():
-                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
                     if not ingress_is_current():
-                        return AsrSubmitResult(AsrSubmitStatus.STALE)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'ingress_stale'))
+                    self._observe_detector_audio_result(detector_result, ingress_token, len(pcm16) // 2)
                     if not detector_result.endpointing_available:
                         await self._handle_independent_asr_error(
                             identity.session_epoch,
@@ -9403,9 +9429,9 @@ class IndependentAsrRuntime:
                             status_code="ASR_ENDPOINTING_FAILED",
                             expected_identity=identity,
                         )
-                        return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'endpointing_unavailable'))
                     if detector_result.throttle_action is ThrottleAction.SKIP_IDLE_PCM:
-                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'idle_skipped'))
                     if not detector_result.throttle_available:
                         lifecycle.enable_independent_asr_fail_open()
                     provider_owns_turns = bool(
@@ -9422,7 +9448,7 @@ class IndependentAsrRuntime:
                                 or split_before_provider_audio
                             )
                             if not ingress_is_current():
-                                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'activity_stale'))
                     elif provider_owns_turns:
                         # Provider authority owns logical utterance identity.
                         # Local Silero remains an idle/throttle signal only: it
@@ -9450,7 +9476,7 @@ class IndependentAsrRuntime:
                     )
                     if continuous_provider_wake:
                         if not await self._await_pending_turn_handoff(identity):
-                            return AsrSubmitResult(AsrSubmitStatus.STALE)
+                            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'handoff_stale'))
                         if not await self._ensure_continuous_provider_wake(
                             lifecycle,
                             identity.session_epoch,
@@ -9459,10 +9485,10 @@ class IndependentAsrRuntime:
                             expected_identity=identity,
                         ):
                             if not ingress_is_current():
-                                return AsrSubmitResult(AsrSubmitStatus.STALE)
-                            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'transport_open_stale'))
+                            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'transport_open_failed'))
                         if not deny_cleanup_is_current():
-                            return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
                     elif not await self._bind_provider_detector_candidate(
                         lifecycle,
                         detector,
@@ -9471,15 +9497,15 @@ class IndependentAsrRuntime:
                         expected_identity=identity,
                         pending_speech_confirmed=pending_speech_confirmed,
                     ):
-                        return AsrSubmitResult(AsrSubmitStatus.STALE)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'turn_activation_stale'))
                     if not deny_cleanup_is_current():
-                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
             if lifecycle is not None and not ingress_is_current():
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'ingress_stale'))
             if not deny_cleanup_is_current():
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
             if not await self._await_pending_turn_handoff(identity):
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'handoff_stale'))
             decision = (
                 lifecycle.accept_audio(pcm16, sample_rate_hz=sample_rate_hz)
                 if lifecycle is not None
@@ -9491,7 +9517,7 @@ class IndependentAsrRuntime:
                         ingress_token,
                         observed_state=lifecycle.snapshot.state,
                     )
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'lifecycle_blocked'))
             if decision is not None and decision.disposition in {
                 AudioDisposition.BUFFER,
                 AudioDisposition.SUPPRESS,
@@ -9519,7 +9545,7 @@ class IndependentAsrRuntime:
                     )
                 ):
                     self._ensure_transport_restart_task()
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'lifecycle_buffered' if decision.disposition is AudioDisposition.BUFFER else 'lifecycle_suppressed'))
             if lifecycle is None or detector is None:
                 await self._handle_independent_asr_error(
                     identity.session_epoch,
@@ -9527,7 +9553,7 @@ class IndependentAsrRuntime:
                     status_code="ASR_BLOCKED_ENDPOINTING",
                     expected_identity=identity,
                 )
-                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'endpointing_blocked'))
             turn_token = self._capture_turn_token(lifecycle)
             if (
                 lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE
@@ -9539,11 +9565,11 @@ class IndependentAsrRuntime:
                     status_code="ASR_BLOCKED_ENDPOINTING",
                     expected_identity=identity,
                 )
-                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'endpointing_blocked'))
             asr_session = self._asr_session
             if asr_session is None or not getattr(asr_session, "is_ready", True):
                 self._ensure_transport_restart_task()
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'transport_restarting'))
             payload = (
                 decision.pre_roll
                 if decision is not None
@@ -9551,9 +9577,9 @@ class IndependentAsrRuntime:
                 else pcm16
             )
             if not payload:
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'empty_payload'))
             if not ingress_is_current():
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'ingress_stale'))
             if self._asr_audio_dispatcher.active_turn != turn_token:
                 if not await self._activate_asr_audio_dispatcher(
                     lifecycle,
@@ -9567,12 +9593,12 @@ class IndependentAsrRuntime:
                         failed_operation="submit",
                         failed_check="dispatcher_activation_rejected",
                     )
-                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                    return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'dispatcher_activation_failed'))
             arming = await self._arm_speaker_authority_for_provider_audio(
                 turn_token
             )
             if not deny_cleanup_is_current():
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
             if (
                 not ingress_is_current()
                 or self._asr_session is not asr_session
@@ -9580,7 +9606,7 @@ class IndependentAsrRuntime:
                 or self._asr_lifecycle is not lifecycle
                 or lifecycle.current_turn_token != turn_token
             ):
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'speaker_arming_stale'))
             if (
                 self._speaker_verifier_enforces_admission
                 and (
@@ -9590,7 +9616,7 @@ class IndependentAsrRuntime:
                 )
             ):
                 if arming.status is _SpeakerArmingStatus.STALE:
-                    return AsrSubmitResult(AsrSubmitStatus.STALE)
+                    return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'speaker_arming_stale'))
                 await self._handle_independent_asr_error(
                     identity.session_epoch,
                     identity.provider or "unknown",
@@ -9600,9 +9626,7 @@ class IndependentAsrRuntime:
                     failed_check="speaker_arming_invariant",
                     expected_identity=identity,
                 )
-                return AsrSubmitResult(
-                    AsrSubmitStatus.UNAVAILABLE
-                )
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'speaker_arming_failed'))
             if arming.status is _SpeakerArmingStatus.EVIDENCE_UNAVAILABLE:
                 self._schedule_speaker_evidence_unavailable(
                     identity,
@@ -9638,7 +9662,7 @@ class IndependentAsrRuntime:
                 ),
             ):
                 if not ingress_is_current():
-                    return AsrSubmitResult(AsrSubmitStatus.STALE)
+                    return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'observation_stale'))
                 await self._handle_independent_asr_error(
                     identity.session_epoch,
                     identity.provider or "unknown",
@@ -9646,9 +9670,9 @@ class IndependentAsrRuntime:
                     expected_identity=identity,
                     failure_context=failure_context,
                 )
-                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'audio_observation_failed'))
             if not deny_cleanup_is_current():
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
             if (
                 not ingress_is_current()
                 or self._asr_session is not asr_session
@@ -9656,10 +9680,10 @@ class IndependentAsrRuntime:
                 or self._asr_lifecycle is not lifecycle
                 or lifecycle.current_turn_token != turn_token
             ):
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'observation_stale'))
             self._asr_audio_sequence += 1
             if not deny_cleanup_is_current():
-                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'deny_cleanup_changed'))
             if not self._asr_audio_dispatcher.enqueue_audio(
                 turn_token,
                 asr_session,
@@ -9675,13 +9699,13 @@ class IndependentAsrRuntime:
                     expected_identity=identity,
                     failure_context=failure_context,
                 )
-                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'enqueue_failed'))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             failure_context.fail("submit_exception", actual=self._audio_failure_scalars(), error=exc, send_state="unknown")
             if not self._runtime_identity_matches(identity):
-                return AsrSubmitResult(AsrSubmitStatus.STALE)
+                return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.STALE, ingress_token, frame, 'exception_stale'))
             self._asr_received_audio = True
             status_code = (
                 "ASR_STREAM_BACKPRESSURE"
@@ -9700,9 +9724,9 @@ class IndependentAsrRuntime:
                 expected_identity=identity,
                 failure_context=failure_context,
             )
-            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+            return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.UNAVAILABLE, ingress_token, frame, 'submit_exception'))
 
-        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+        return AsrSubmitResult(self._pipeline_audio_receipt(AsrSubmitStatus.ACCEPTED, ingress_token, frame, 'enqueued'))
 
     def _ensure_transport_restart_task(self) -> None:
         task = self._asr_transport_task
@@ -11791,30 +11815,50 @@ class IndependentAsrRuntime:
         ledger = self._asr_provider_speaker_key_ledgers.get(key)
         lifecycle = self._asr_lifecycle
         ingress_token = self._asr_current_ingress_token
-        if (
-            turn_token is None
-            or lease_token is None
-            or evidence_lease is None
-            or ledger is None
-            or ledger.evidence_lease != evidence_lease
-            or ledger.turn_token != turn_token
-            or ledger.provider_key != key
-            or ledger.state is not _ProviderSpeakerLedgerState.ANCHORED_SCORING
-            or ledger.poisoned_reason is not None
-            or lifecycle is None
-            or ingress_token is None
-            or turn_token.ingress != ingress_token
-            or notification.boundary_quality != "exact"
-            or notification.audio_range is None
-            or ledger.anchor_start_sample_16k
-            != notification.audio_range.start_sample_16k
-            or self._asr_session is not self._asr_provider_exact_session
-            or (
-                len(self._asr_provider_exact_intervals)
-                + len(self._asr_provider_exact_pending)
+        # Keep the original guard order and short-circuit semantics. Capture
+        # the first failure before poisoning/awaits erase its original state.
+        failed_check = None
+        if turn_token is None:
+            failed_check = "missing_started_turn"
+        elif lease_token is None:
+            failed_check = "missing_admission_lease"
+        elif evidence_lease is None:
+            failed_check = "missing_evidence_lease"
+        elif ledger is None:
+            failed_check = "missing_ledger"
+        elif ledger.evidence_lease != evidence_lease:
+            failed_check = "evidence_lease_mismatch"
+        elif ledger.turn_token != turn_token:
+            failed_check = "turn_mismatch"
+        elif ledger.provider_key != key:
+            failed_check = "provider_key_mismatch"
+        elif ledger.state is not _ProviderSpeakerLedgerState.ANCHORED_SCORING:
+            failed_check = "ledger_not_anchored_scoring"
+        elif ledger.poisoned_reason is not None:
+            failed_check = "ledger_poisoned"
+        elif lifecycle is None:
+            failed_check = "missing_lifecycle"
+        elif ingress_token is None:
+            failed_check = "missing_ingress"
+        elif turn_token.ingress != ingress_token:
+            failed_check = "ingress_mismatch"
+        elif notification.boundary_quality != "exact":
+            failed_check = "boundary_not_exact"
+        elif notification.audio_range is None:
+            failed_check = "missing_audio_range"
+        elif ledger.anchor_start_sample_16k != notification.audio_range.start_sample_16k:
+            failed_check = "anchor_start_mismatch"
+        elif self._asr_session is not self._asr_provider_exact_session:
+            failed_check = "exact_session_mismatch"
+        elif (
+            len(self._asr_provider_exact_intervals) + len(self._asr_provider_exact_pending)
+        ) >= _MAX_PROVIDER_BOUNDARY_SNAPSHOTS:
+            failed_check = "boundary_capacity_exhausted"
+        if failed_check is not None:
+            self._schedule_provider_guard_diagnostic(
+                key, epoch, stage="provider_boundary_guard_failed", check=failed_check,
+                notification=notification,
             )
-            >= _MAX_PROVIDER_BOUNDARY_SNAPSHOTS
-        ):
             if ledger is not None and ledger.state not in {
                 _ProviderSpeakerLedgerState.EXACT_DRAINING,
                 _ProviderSpeakerLedgerState.RESOLVED,
@@ -12432,7 +12476,14 @@ class IndependentAsrRuntime:
             return
         correlator = self._asr_provider_correlator
         if correlator is None or correlator.is_completed(key):
+            self._schedule_provider_guard_diagnostic(
+                key, epoch, stage="provider_final_ignored",
+                check="missing_correlator" if correlator is None else "already_completed",
+            )
             return
+        self._schedule_provider_guard_diagnostic(
+            key, epoch, stage="provider_final_received", check="accepted_for_processing",
+        )
         pending_exact = self._asr_provider_exact_pending.get(key)
         if pending_exact is not None:
             if len(pending_exact.deferred) >= _MAX_PROVIDER_BOUNDARY_SNAPSHOTS:
@@ -12482,6 +12533,10 @@ class IndependentAsrRuntime:
                     deadline=final_deadline,
                 )
         if epoch != self._asr_session_epoch or self._asr_sealed_provider_key != key:
+            self._schedule_provider_guard_diagnostic(
+                key, epoch, stage="provider_final_ignored",
+                check="session_changed" if epoch != self._asr_session_epoch else "sealed_key_mismatch",
+            )
             return
         exact = self._asr_provider_exact_intervals.get(key)
         if exact is not None:
@@ -13516,7 +13571,9 @@ class IndependentAsrRuntime:
     ) -> asyncio.Event | None:
         """Publish one immutable final; admission owns every disposition."""
 
+        self._schedule_pipeline_session_event("asr_final_received", epoch, has_text=bool(text.strip()))
         if epoch != self._asr_session_epoch:
+            self._schedule_pipeline_session_event("asr_final_ignored", epoch, reason="session_stale")
             return
         if received_at is None:
             received_at = (
@@ -13527,6 +13584,7 @@ class IndependentAsrRuntime:
         if deadline is None:
             deadline = received_at + _PROVIDER_BOUNDARY_SETTLEMENT_TIMEOUT_SECONDS
         if deadline < received_at:
+            self._schedule_pipeline_session_event("asr_final_ignored", epoch, reason="invalid_deadline")
             return
         async with self._asr_final_lock:
             lifecycle = self._asr_lifecycle
@@ -13542,6 +13600,7 @@ class IndependentAsrRuntime:
                     and self._asr_sealed_provider_key != provider_key
                 )
             ):
+                self._schedule_pipeline_session_event("asr_final_ignored", epoch, reason="sealed_turn_mismatch")
                 return
             turn_token = sealed_token.turn
             admission_record = await self._asr_admission.get_record(turn_token)
@@ -13780,8 +13839,10 @@ class IndependentAsrRuntime:
         envelope: TranscriptEnvelope,
     ) -> None:
         ingress_token = envelope.turn_token.ingress
+        self._schedule_pipeline_event("transcript_callback", ingress_token, turn_id=envelope.turn_token.turn_id, outcome="started")
         degraded = False
         if not self._ingress_token_matches(ingress_token):
+            self._schedule_pipeline_event("transcript_callback", ingress_token, turn_id=envelope.turn_token.turn_id, outcome="stale")
             # The envelope was accepted before the audio generation moved on,
             # so neither on_final nor a teardown path will run for this turn.
             # Release the Core-side pause keyed to it instead of leaking the
@@ -13817,9 +13878,11 @@ class IndependentAsrRuntime:
                     )
                 )
             except asyncio.CancelledError:
+                self._schedule_pipeline_event("transcript_callback", ingress_token, turn_id=envelope.turn_token.turn_id, outcome="cancelled")
                 degraded = True
                 raise
             except Exception:
+                self._schedule_pipeline_event("transcript_callback", ingress_token, turn_id=envelope.turn_token.turn_id, outcome="failed")
                 degraded = True
                 await self._send_asr_status(
                     "ASR_INDEPENDENT_INJECTION_FAILED",
@@ -13827,6 +13890,8 @@ class IndependentAsrRuntime:
                     session_epoch=ingress_token.session_epoch,
                     expected_identity=identity,
                 )
+            else:
+                self._schedule_pipeline_event("transcript_callback", ingress_token, turn_id=envelope.turn_token.turn_id, outcome="returned")
             finally:
                 execution = self._asr_admission_resolutions.get(envelope.final_key)
                 if execution is not None and not execution.core_settled:
@@ -13909,7 +13974,17 @@ class IndependentAsrRuntime:
             exact = self._asr_provider_exact_candidates.get(candidate)
             ledger = self._asr_provider_speaker_ledgers.get(candidate)
             owner = exact if exact is not None else ledger
-            if owner is None or not self._runtime_identity_matches(owner.runtime_identity):
+            if owner is None:
+                if self._asr_lifecycle is None or not _uses_smart_turn_endpointing(self._asr_lifecycle.provider_policy):
+                    return
+                turn = self._asr_admission_candidate_turns.get(candidate)
+                if turn is not None and self._ingress_token_matches(turn.ingress):
+                    metadata = diagnostic_context(self, turn.ingress.session_epoch)
+                    metadata.update(speaker_diagnostic_scalars(event))
+                    metadata.update(turn_id=turn.turn_id, candidate_role="smart_turn")
+                    self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+                return
+            if not self._runtime_identity_matches(owner.runtime_identity):
                 # A detached/old candidate cannot borrow the current turn's key.
                 return
             key = owner.provider_key
@@ -13938,6 +14013,187 @@ class IndependentAsrRuntime:
                 ),
             )
             # Reserve space for final verdicts even during diagnostic bursts.
+            self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+        except Exception:
+            pass
+
+    def _pipeline_observer(self):
+        from .pipeline_diagnostics import PipelineDiagnostics
+
+        observer = getattr(self, "_asr_pipeline_observer", None)
+        if observer is None:
+            observer = PipelineDiagnostics(self, self._schedule_pipeline_metadata)
+            self._asr_pipeline_observer = observer
+        return observer
+
+    def _schedule_pipeline_metadata(self, metadata: dict, *, capacity: int = 32) -> None:
+        """One bounded batch writer per Runtime; leave verdict log slots intact."""
+        try:
+            pending = getattr(self, "_asr_pipeline_pending", None)
+            if pending is None:
+                pending = self._asr_pipeline_pending = deque()
+            if len(pending) >= min(capacity, 32):
+                self._asr_resolution_log_dropped = getattr(self, "_asr_resolution_log_dropped", 0) + 1
+                return
+            metadata["diagnostic_records_dropped"] = getattr(self, "_asr_resolution_log_dropped", 0)
+            self._asr_resolution_log_dropped = 0
+            pending.append(metadata)
+            running = getattr(self, "_asr_pipeline_log_task", None)
+            if running is not None and not running.done():
+                return
+
+            async def persist() -> None:
+                try:
+                    while pending:
+                        batch = tuple(pending.popleft() for _ in range(min(16, len(pending))))
+                        try:
+                            future = submit_resolution_log(batch, kind="pipeline")
+                            if future is None:
+                                self._asr_resolution_log_dropped += len(batch)
+                            else:
+                                await asyncio.wait_for(asyncio.wrap_future(future), timeout=0.2)
+                        except asyncio.CancelledError:
+                            self._asr_resolution_log_dropped += len(batch)
+                            raise
+                        except Exception:
+                            self._asr_resolution_log_dropped += len(batch)
+                finally:
+                    self._asr_resolution_log_dropped += len(pending)
+                    pending.clear()
+
+            task = asyncio.create_task(persist(), name="asr-pipeline-log")
+            self._asr_pipeline_log_task = task
+            def reap_cancelled(done) -> None:
+                # A task cancelled before its first step never enters finally.
+                if done.cancelled() and self._asr_pipeline_log_task is done:
+                    self._asr_resolution_log_dropped += len(pending)
+                    pending.clear()
+            task.add_done_callback(reap_cancelled)
+            self._track_terminal_close_tasks({task})
+        except Exception:
+            pass
+
+    def _schedule_pipeline_event(self, stage: str, ingress: VoiceIngressToken, **fields) -> None:
+        try:
+            self._schedule_pipeline_session_event(
+                stage, ingress.session_epoch, audio_generation=ingress.audio_generation,
+                route_generation=ingress.route_generation, lease_generation=ingress.lease_generation,
+                **fields,
+            )
+        except Exception:
+            pass
+
+    def _schedule_pipeline_session_event(self, stage: str, epoch: int, **fields) -> None:
+        try:
+            observer = self._pipeline_observer()
+            observer.flush()
+            observer.event(stage, epoch, **fields)
+        except Exception:
+            pass
+
+    def _schedule_pipeline_cleanup(self, metadata: dict, epoch: int) -> None:
+        try:
+            context = diagnostic_context(self, epoch)
+            self._schedule_asr_diagnostic_metadata({**context, **metadata}, kind="cleanup")
+        except Exception:
+            pass
+
+    def _observe_detector_audio_result(self, result, ingress, samples) -> None:
+        try:
+            status = getattr(result, "status", getattr(result, "throttle_action", None))
+            self._observe_pipeline_audio("detector_audio", ingress, samples, outcome=getattr(status, "value", None))
+            for activity in getattr(result, "events", ()):
+                self._schedule_pipeline_event("vad_activity", ingress, reason=activity.value)
+        except Exception:
+            pass
+
+    def _pipeline_audio_receipt(self, status: AsrSubmitStatus, ingress: VoiceIngressToken, frame: ProcessedVoiceFrame, reason: str) -> AsrSubmitStatus:
+        self._observe_pipeline_audio(
+            "audio_submit", ingress, len(frame.pcm16) // 2,
+            outcome=status.value, reason=reason,
+        )
+        return status
+
+    def _observe_pipeline_audio(self, stage: str, ingress: VoiceIngressToken, samples: int, **fields) -> None:
+        try:
+            self._pipeline_observer().audio(
+                stage, ingress.session_epoch, audio_samples=samples,
+                audio_generation=ingress.audio_generation, route_generation=ingress.route_generation,
+                lease_generation=ingress.lease_generation, **fields,
+            )
+        except Exception:
+            pass
+
+    def _observe_endpoint_diagnostic(self, fields: dict, ingress, *, source, epoch: int) -> None:
+        try:
+            if ingress is None or epoch != ingress.session_epoch:
+                return
+            # Captured ingress/semantic identity stays with a late result. Never
+            # read a replacement detector's state to decorate its predecessor.
+            if source is not self._asr_detector or epoch != self._asr_session_epoch:
+                return
+            self._schedule_pipeline_event("endpoint_diagnostic", ingress, **fields)
+        except Exception:
+            pass
+
+    def _schedule_speaker_fact_diagnostic(self, fact, owner) -> None:
+        """Observe classification before queueing, without retaining score/PCM."""
+        try:
+            if not self._runtime_identity_matches(owner.runtime_identity):
+                return
+            key = owner.provider_key
+            if key is None:
+                return
+            metadata = diagnostic_context(self, owner.runtime_identity.session_epoch)
+            metadata.update(
+                stage="speaker_fact_observed",
+                provider_generation=key.generation,
+                provider_buffer_epoch=key.buffer_epoch,
+                provider_utterance_id=key.utterance_id,
+                turn_id=owner.turn_token.turn_id if owner.turn_token is not None else None,
+                speaker_sequence_no=fact.sequence_no,
+                speaker_classification=("low" if isinstance(fact, SpeakerLow)
+                                        else "high" if isinstance(fact, SpeakerHigh)
+                                        else "unavailable"),
+                checkpoint_kind=fact.checkpoint_kind.value if isinstance(fact, SpeakerLow) else None,
+            )
+            # Observation is not proof that the coordinator accepted the fact.
+            self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
+        except Exception:
+            pass
+
+    def _schedule_provider_guard_diagnostic(
+        self, key: ProviderUtteranceKey, epoch: int, *, stage: str, check: str,
+        notification: ProviderEndpointNotification | None = None,
+    ) -> None:
+        """Snapshot technical ownership before mutation, using bounded off-loop I/O."""
+        try:
+            # A callback crossing an await must not borrow its successor's state.
+            if epoch != self._asr_session_epoch:
+                return
+            ledger = self._asr_provider_speaker_key_ledgers.get(key)
+            turn = self._asr_provider_started_turns.get(key)
+            evidence = self._asr_provider_speaker_evidence_lease
+            audio_range = notification.audio_range if notification is not None else None
+            metadata = diagnostic_context(self, epoch)
+            metadata.update(
+                stage=stage, failed_check=check,
+                provider_generation=key.generation,
+                provider_buffer_epoch=key.buffer_epoch,
+                provider_utterance_id=key.utterance_id,
+                turn_id=turn.turn_id if turn is not None else None,
+                ledger_turn_id=ledger.turn_token.turn_id if ledger is not None and ledger.turn_token is not None else None,
+                ledger_state=ledger.state.value if ledger is not None else None,
+                ledger_poisoned=ledger.poisoned_reason is not None if ledger is not None else None,
+                expected_lease_generation=evidence.lease_generation if evidence is not None else None,
+                ledger_lease_generation=ledger.evidence_lease.lease_generation if ledger is not None else None,
+                anchor_start_sample_16k=ledger.anchor_start_sample_16k if ledger is not None else None,
+                provider_start_sample_16k=audio_range.start_sample_16k if audio_range is not None else None,
+                provider_end_sample_16k=audio_range.end_sample_16k if audio_range is not None else None,
+                exact_interval_count=len(self._asr_provider_exact_intervals),
+                exact_pending_count=len(self._asr_provider_exact_pending),
+                exact_capacity=_MAX_PROVIDER_BOUNDARY_SNAPSHOTS,
+            )
             self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
         except Exception:
             pass
@@ -14100,6 +14356,10 @@ class IndependentAsrRuntime:
             ),
         }
         metadata["recorded_at"] = utc_now()
+        try:
+            metadata["diagnostic_session_ref"] = diagnostic_context(self, source_session_epoch)["diagnostic_session_ref"]
+        except Exception:
+            pass
         if failure_context is not None:
             metadata.update(failure_context.snapshot())
 
@@ -14236,7 +14496,7 @@ class IndependentAsrRuntime:
             lifecycle.stop()
         trace = CleanupTrace(
             incident_id,
-            lambda metadata: self._schedule_asr_diagnostic_metadata(metadata, kind="cleanup"),
+            lambda metadata: self._schedule_pipeline_cleanup(metadata, epoch),
         )
         for component in ("transport", "lease", "detector", "admission"):
             trace.mark(component, "not_required")
@@ -14497,6 +14757,12 @@ class IndependentAsrRuntime:
         if snapshot is not None:
             reason_code = reason_code or snapshot.reason_code
             incident_id = incident_id or snapshot.incident_id
+        self._schedule_pipeline_session_event(
+            "asr_lifecycle", session_epoch, state=state.value,
+            transport_generation=transport_generation,
+            endpoint_authority=lifecycle.provider_policy.endpoint_authority if lifecycle is not None else None,
+            speaker_enabled=self._speaker_verifier_enforces_admission,
+        )
         try:
             await self._callbacks.on_lifecycle(
                 AsrLifecycleNotification(

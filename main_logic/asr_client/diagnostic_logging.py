@@ -20,7 +20,10 @@ def _write_records() -> None:
             if not future.set_running_or_notify_cancel():
                 continue
             try:
-                if kind == "incident":
+                if kind == "pipeline":
+                    for record in metadata:
+                        logger.info("ASR resolution %s", record)
+                elif kind == "incident":
                     logger.warning("ASR incident %s", metadata)
                 elif kind == "cleanup":
                     logger.info("ASR cleanup %s", metadata)
@@ -34,15 +37,17 @@ def _write_records() -> None:
             _QUEUE.task_done()
 
 
-def submit_resolution_log(metadata: dict, *, kind: str = "resolution") -> Future | None:
+def submit_resolution_log(metadata: dict | tuple[dict, ...], *, kind: str = "resolution") -> Future | None:
     """At most one writer and 32 queued records, across resets and runtimes.
 
     A stalled filesystem may occupy this single daemon, but cannot grow the
     default executor, hold process exit, or block the audio event loop. No
     handler or alternate log file is installed here.
     """
-    if kind not in {"resolution", "incident", "cleanup"}:
+    if kind not in {"resolution", "incident", "cleanup", "pipeline"}:
         raise ValueError("unknown ASR diagnostic record kind")
+    if kind == "pipeline" and (type(metadata) is not tuple or not 1 <= len(metadata) <= 16):
+        raise ValueError("pipeline diagnostic batch must contain 1..16 records")
     global _worker
     with _START_LOCK:
         if _worker is None:

@@ -3817,6 +3817,7 @@ class AsrRuntimeMixin:
         event: VoiceTranscriptEvent,
     ) -> None:
         result = await self._voice_input_registry.dispatch_final(event)
+        self._observe_core_asr_delivery(event, stage="voice_registry_final", outcome=result.value, phase="dispatch")
         if result is VoiceInputDispatchResult.CALLBACK_FAILED:
             await self._send_core_asr_status(
                 AsrStatusEvent(
@@ -3994,6 +3995,16 @@ class AsrRuntimeMixin:
         else:
             await session_ref.create_response(text)
 
+    def _observe_core_asr_delivery(self, event, *, stage="core_voice_delivery", outcome, phase) -> None:
+        """Keep ASR/Core correlation without copying transcript or session data."""
+        try:
+            self._asr_runtime._schedule_pipeline_event(
+                stage, event.turn_token.ingress, turn_id=event.turn_token.turn_id,
+                outcome=outcome, phase=phase,
+            )
+        except Exception:
+            pass
+
     async def _dispatch_core_asr_transcript(
         self,
         event: VoiceTranscriptEvent,
@@ -4007,6 +4018,9 @@ class AsrRuntimeMixin:
             session_ref = getattr(self, "session", None)
         prepared_session_ref = session_ref
         transition_generation = self._voice_input_transition_generation
+        diagnostic_phase = "initial_route_check"
+        diagnostic_outcome = "abandoned"
+        self._observe_core_asr_delivery(event, outcome="started", phase=diagnostic_phase)
         try:
             if (
                 not self._ingress_token_matches(token)
@@ -4015,6 +4029,7 @@ class AsrRuntimeMixin:
             ):
                 return
             if not event.text.strip():
+                diagnostic_phase = "empty_final"
                 # An empty final still completed the turn provider-side (e.g.
                 # the OpenAI/Step stalled-item timeouts): Core deliberately
                 # injects no user_transcript for empty text, yet the frontend
@@ -4040,6 +4055,7 @@ class AsrRuntimeMixin:
                 # 从这里到本函数的 finally（_abandon_core_voice_turn 按 turn_id 摘
                 # 掉它）之间，这条记录是**在派发中**的，后继的 prepare 不能挤掉它。
                 turn_record.dispatch_started = True
+                diagnostic_phase = "visual_validation"
                 await self._await_independent_visual_validation_tasks(
                     external_turn_id
                 )
@@ -4064,9 +4080,13 @@ class AsrRuntimeMixin:
             transcript_kwargs["source_game_route_identity"] = (
                 source_game_route_identity
             )
+            diagnostic_phase = "transcript_acceptance"
             accepted = await self.handle_input_transcript(
                 event.text,
                 **transcript_kwargs,
+            )
+            self._observe_core_asr_delivery(
+                event, outcome="accepted" if accepted else "rejected", phase=diagnostic_phase,
             )
             def route_still_core() -> bool:
                 """The route-identity half, re-checkable across an await.
@@ -4146,6 +4166,7 @@ class AsrRuntimeMixin:
                             "[%s] Offline VLM voice transcript delivery failed",
                             self.lanlan_name,
                         )
+            diagnostic_phase = "preview_restore"
             await self._restore_core_asr_preview_after_final(
                 external_turn_id,
                 session_epoch=token.session_epoch,
@@ -4168,6 +4189,7 @@ class AsrRuntimeMixin:
             # dispatcher cannot be held forever by a stuck swap.
             session_swap_lock = self._core_voice_session_swap_lock
             handoff_target = None
+            diagnostic_phase = "session_swap_barrier"
             try:
                 await asyncio.wait_for(
                     session_swap_lock.acquire(),
@@ -4191,6 +4213,7 @@ class AsrRuntimeMixin:
                 if target_session is None:
                     return
                 if target_session is not session_ref:
+                    diagnostic_phase = "replacement_session_prepare"
                     session_ref = target_session
                     prepare = getattr(
                         session_ref,
@@ -4207,6 +4230,7 @@ class AsrRuntimeMixin:
                             return
                     if not route_still_core() or self.session is not session_ref:
                         return
+                diagnostic_phase = "response_submission"
                 if multimodal_turn is None:
                     await self._submit_core_voice_turn(
                         event.text,
@@ -4305,6 +4329,7 @@ class AsrRuntimeMixin:
                     session_ref=session_ref,
                 )
             if handoff_target is not None:
+                diagnostic_phase = "offline_handoff"
                 delivered = await self._handoff_to_offline_vlm_and_submit(
                     multimodal_turn,
                     expected_session=handoff_target,
@@ -4322,7 +4347,17 @@ class AsrRuntimeMixin:
                         "code": "ASR_MULTIMODAL_TURN_FAILED",
                         "details": {"stage": "offline_vlm_handoff"},
                     }))
+                diagnostic_outcome = "submitted" if delivered else "handoff_not_delivered"
+            else:
+                diagnostic_outcome = "submitted"
+        except asyncio.CancelledError:
+            diagnostic_outcome = "cancelled"
+            raise
+        except Exception:
+            diagnostic_outcome = "failed"
+            raise
         finally:
+            self._observe_core_asr_delivery(event, outcome=diagnostic_outcome, phase=diagnostic_phase)
             self._abandon_core_voice_turn(
                 external_turn_id,
                 session_ref=session_ref,

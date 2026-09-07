@@ -656,6 +656,7 @@ class _VoiceTurnAdapter:
             try:
                 self._vad_available = await asyncio.to_thread(self._vad.load)
             except Exception:
+                self._emit_pipeline("vad_load", item.identity, item.detector_identity, outcome="error")
                 if self._smart_turn_required:
                     self._vad_degraded = True
                     await self._process_without_vad(item)
@@ -663,6 +664,8 @@ class _VoiceTurnAdapter:
                     self._report_failure("runtime_error", "vad_load")
                 return
         if not self._vad_available:
+            if not self._vad_degraded:
+                self._emit_pipeline("vad_load", item.identity, item.detector_identity, outcome="unavailable")
             if self._smart_turn_required:
                 self._vad_degraded = True
                 await self._process_without_vad(item)
@@ -673,6 +676,7 @@ class _VoiceTurnAdapter:
         try:
             events = await asyncio.to_thread(self._gate.feed, item.pcm16)
         except Exception:
+            self._emit_pipeline("vad_feed", item.identity, item.detector_identity, outcome="error")
             if self._smart_turn_required:
                 self._vad_degraded = True
                 await self._process_without_vad(item)
@@ -680,6 +684,7 @@ class _VoiceTurnAdapter:
                 self._report_failure("runtime_error", "vad_feed")
             return
         for event in events:
+            self._emit_pipeline("vad_activity", item.identity, item.detector_identity, reason=event.value)
             if self._on_activity is not None:
                 await self._on_activity(event)
             if (
@@ -787,6 +792,7 @@ class _VoiceTurnAdapter:
             return
         coordinator_generation = int(getattr(self._coordinator, "generation", 0))
         activity_seq = int(getattr(self._coordinator, "activity_seq", 0))
+        self._emit_pipeline("evaluation_requested", identity, detector_identity, reason=reason)
         self._smart_turn_diagnostics.candidate(reason=reason)
 
         async def evaluate() -> None:
@@ -796,6 +802,7 @@ class _VoiceTurnAdapter:
             try:
                 result = await self._coordinator.evaluate_buffered()
             except asyncio.CancelledError:
+                self._emit_pipeline("evaluation_result", identity, detector_identity, reason=reason, outcome="cancelled")
                 return
             except BaseException as exc:
                 error = exc
@@ -867,6 +874,12 @@ class _VoiceTurnAdapter:
             probability=probability,
             threshold=getattr(self._coordinator, "evaluation_threshold", None),
         )
+        self._emit_pipeline(
+            "evaluation_result", item.identity, item.detector_identity,
+            reason=item.reason, outcome=diagnostic_outcome, evaluation_ms=item.evaluation_ms,
+            identity_matches=identity_matches, generation_matches=generation_matches,
+            activity_matches=activity_matches, probability=probability,
+        )
         if (
             self._closed
             or self._failed
@@ -915,6 +928,10 @@ class _VoiceTurnAdapter:
                 elif item.reason == "strict_retry":
                     confirmation_seconds = self._strict_complete_confirmation_seconds
             if confirmation_seconds > 0:
+                self._emit_pipeline(
+                    "confirmation_wait", item.identity, item.detector_identity,
+                    reason=item.reason, confirmation_ms=int(confirmation_seconds * 1000),
+                )
                 if (
                     self._closed
                     or self._failed
@@ -1034,6 +1051,7 @@ class _VoiceTurnAdapter:
             # current turn; a stale one must not roll the identity back or
             # cancel the newer turn's work.
             return
+        self._emit_pipeline("reset", self._identity, self._latest_detector_identity, outcome="retired")
         self._cancel_fallback(attribute_confirmation_tail=False)
         self._cancel_smart_turn_unload()
         # Invalidate callbacks before awaiting their cancellation. A callback
@@ -1121,6 +1139,7 @@ class _VoiceTurnAdapter:
         identity: _Identity,
         reason: _FallbackReason,
     ) -> None:
+        self._emit_pipeline("fallback_wait", identity, self._latest_detector_identity, reason=reason)
         self._cancel_fallback()
 
         async def fallback() -> None:
@@ -1269,6 +1288,7 @@ class _VoiceTurnAdapter:
         wait_for_commit: bool = False,
     ) -> None:
         self._strict_endpoint_deadline = None
+        self._emit_pipeline("completion", identity, detector_identity, reason=reason, outcome="complete")
         self._smart_turn_diagnostics.complete(reason=reason)
         self._complete_observed_candidate(detector_identity)
         active_identity = identity
@@ -1381,6 +1401,7 @@ class _VoiceTurnAdapter:
             return
         self._failed = True
         self._failure = _VoiceTurnFailure(kind, stage)
+        self._emit_pipeline(stage, self._identity, self._latest_detector_identity, outcome=kind)
         self._smart_turn_diagnostics.failure(kind=kind, stage=stage)
         self._cancel_fallback(attribute_confirmation_tail=False)
         self._cancel_smart_turn_unload()
@@ -1394,6 +1415,29 @@ class _VoiceTurnAdapter:
             self._failure_future = failure_future
         if not failure_future.done():
             failure_future.set_result(self._failure)
+
+    def _emit_pipeline(self, phase, identity, detector_identity, *, probability=None, **fields) -> None:
+        """Emit only immutable identities and model-decision metadata, never PCM."""
+        try:
+            callback = getattr(self, "_on_pipeline_diagnostic", None)
+            if callback is None or identity is None or detector_identity is None:
+                return
+            from ..pipeline_diagnostics import safe_fields
+
+            fields.update(
+                phase=phase, semantic_generation=identity[0], semantic_buffer_epoch=identity[1],
+                semantic_turn_id=identity[2], detector_epoch=detector_identity.detector_epoch,
+                sequence_no=detector_identity.sequence_no, queue_audio_ms=self.queued_audio_ms,
+                coalesced_count=self._smart_turn_coalesced_evaluation_count,
+            )
+            # SmartTurn completion probability is not a speaker similarity.
+            for name, value in (("probability_milli", probability),
+                                ("threshold_milli", getattr(self._coordinator, "evaluation_threshold", None))):
+                if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1:
+                    fields[name] = round(value * 1000)
+            callback(safe_fields(fields), detector_identity.ingress_token)
+        except Exception:
+            pass
 
     def _dispatch_commit(
         self,
@@ -2316,6 +2360,11 @@ class DetectorRuntime:
                 ),
                 smart_turn_required=True,
             )
+
+    def set_pipeline_diagnostic_callback(self, callback) -> None:
+        """Install the session-owned observer; provider endpointing needs no adapter."""
+        if self._semantic_adapter is not None:
+            self._semantic_adapter._on_pipeline_diagnostic = callback
 
     @property
     def smart_turn_readiness(self) -> SmartTurnReadiness:
