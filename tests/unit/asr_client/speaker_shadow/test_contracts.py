@@ -164,6 +164,7 @@ def test_config_is_default_off_and_caps_candidate_audio() -> None:
     assert config.completion_confirmation_scopes == ()
     assert config.pending_observation_gate_scopes == ()
     assert config.backend_prewarm_scopes == ()
+    assert config.terminal_short_evaluation_scopes == ()
     assert config.terminal_queue_capacity == 512
     assert config.completion_queue_capacity == 512
     assert MAX_SPEAKER_SHADOW_FRAME_PCM_BYTES == 128_000
@@ -185,13 +186,15 @@ def test_config_preserves_legacy_positional_argument_order() -> None:
 
     assert config.idle_unload_seconds == 60.0
     assert config.completion_confirmation_scopes == ()
-    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-6:] == (
+    assert tuple(SpeakerShadowConfig.__dataclass_fields__)[-8:] == (
         "completion_confirmation_scopes",
         "pending_observation_gate_scopes",
         "backend_prewarm_scopes",
         "terminal_queue_capacity",
         "completion_queue_capacity",
         "exact_boundary_pcm_retention_seconds",
+        "terminal_short_evaluation_scopes",
+        "terminal_short_minimum_samples",
     )
 
 
@@ -374,6 +377,88 @@ def test_observation_kind_defaults_to_checkpoint_and_accepts_confirmation() -> N
         ).observation_kind
         == "completion_confirmation"
     )
+    assert (
+        SpeakerShadowObservation(
+            candidate=candidate,
+            similarity=0.2,
+            would_block=((0.4, True),),
+            audio_ms=900,
+            observation_kind="terminal_short",
+        ).observation_kind
+        == "terminal_short"
+    )
+
+
+def test_terminal_short_scope_is_explicit_and_quality_summary_is_bounded() -> None:
+    config = SpeakerShadowConfig(
+        terminal_short_evaluation_scopes=("provider_candidate",)
+    )
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+
+    observation = SpeakerShadowObservation(
+        candidate=candidate,
+        similarity=0.2,
+        would_block=((0.4, True),),
+        audio_ms=900,
+        observation_kind="terminal_short",
+        quality_summary_available=True,
+        rms=0.1,
+        peak=0.3,
+        near_silence=0.4,
+        clipping=0.0,
+    )
+
+    assert config.terminal_short_evaluation_scopes == ("provider_candidate",)
+    assert config.terminal_short_minimum_samples == 1
+    assert observation.quality_summary_available is True
+
+
+@pytest.mark.parametrize(
+    "scopes",
+    [
+        ["provider_candidate"],
+        ("unsupported",),
+        ("provider_candidate", "provider_candidate"),
+    ],
+)
+def test_config_rejects_invalid_terminal_short_scopes(scopes: object) -> None:
+    with pytest.raises(ValueError, match="terminal_short_evaluation_scopes"):
+        SpeakerShadowConfig(
+            terminal_short_evaluation_scopes=scopes,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"quality_summary_available": 1},
+        {"rms": 0.1},
+        {
+            "quality_summary_available": True,
+            "rms": float("nan"),
+            "peak": 0.3,
+            "near_silence": 0.4,
+            "clipping": 0.0,
+        },
+        {
+            "quality_summary_available": True,
+            "rms": 0.1,
+            "peak": 1.1,
+            "near_silence": 0.4,
+            "clipping": 0.0,
+        },
+    ],
+)
+def test_observation_rejects_invalid_quality_summary(kwargs: dict[str, object]) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        SpeakerShadowObservation(
+            candidate=SpeakerShadowCandidateKey(1, 2, "provider_candidate"),
+            similarity=0.2,
+            would_block=((0.4, True),),
+            audio_ms=900,
+            observation_kind="terminal_short",
+            **kwargs,  # type: ignore[arg-type]
+        )
 
 
 def test_decision_status_is_an_optional_structural_read_only_protocol() -> None:

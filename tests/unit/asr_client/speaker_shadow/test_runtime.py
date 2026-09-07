@@ -3110,6 +3110,153 @@ async def test_provider_completion_confirmation_respects_checkpoint_boundaries(
     await runtime.close()
 
 
+async def test_terminal_short_evaluates_once_only_when_scope_is_enabled() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.8),
+        config=_config(
+            minimum_audio_ms=20,
+            maximum_audio_ms=100,
+            observation_checkpoints_ms=(20, 40),
+            terminal_short_evaluation_scopes=("provider_candidate",),
+        ),
+        on_evidence=evidence.append,
+    )
+    candidate = _candidate(24_810)
+
+    assert runtime.submit(
+        _pcm(19),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    observations = [
+        item for item in evidence if isinstance(item, SpeakerShadowObservation)
+    ]
+    completions = [
+        item for item in evidence if isinstance(item, SpeakerShadowCompletion)
+    ]
+    assert len(observations) == 1
+    assert observations[0].observation_kind == "terminal_short"
+    assert observations[0].checkpoint_ms is None
+    assert observations[0].audio_ms == 19
+    assert observations[0].sequence_no == 1
+    assert observations[0].quality_summary_available is True
+    assert len(completions) == 1
+    assert completions[0].through_sequence_no == 1
+    assert completions[0].terminal_reason == "scored"
+    await runtime.close()
+
+
+async def test_terminal_short_remains_off_without_explicit_scope() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.1),
+        config=_config(
+            minimum_audio_ms=20,
+            maximum_audio_ms=100,
+            observation_checkpoints_ms=(20, 40),
+        ),
+        on_evidence=evidence.append,
+    )
+    candidate = _candidate(24_811)
+
+    assert runtime.submit(
+        _pcm(19),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert not any(isinstance(item, SpeakerShadowObservation) for item in evidence)
+    assert [
+        item.terminal_reason
+        for item in evidence
+        if isinstance(item, SpeakerShadowCompletion)
+    ] == ["insufficient"]
+    await runtime.close()
+
+
+async def test_terminal_short_below_backend_minimum_is_explicitly_unsupported() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(score_value=0.8),
+        config=_config(
+            minimum_audio_ms=1_500,
+            maximum_audio_ms=4_000,
+            observation_checkpoints_ms=(1_500, 3_000),
+            terminal_short_evaluation_scopes=("provider_candidate",),
+            terminal_short_minimum_samples=720,
+        ),
+        on_evidence=evidence.append,
+    )
+    candidate = _candidate(24_813)
+
+    assert runtime.submit(
+        b"\x00\x00" * 719,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    observation = next(
+        item for item in evidence if isinstance(item, SpeakerShadowObservation)
+    )
+    completion = next(
+        item for item in evidence if isinstance(item, SpeakerShadowCompletion)
+    )
+    assert observation.observation_kind == "terminal_short"
+    assert observation.evidence_available is False
+    assert observation.unavailable_reason == "unsupported"
+    assert completion.terminal_reason == "insufficient"
+    assert completion.through_sequence_no == 1
+    assert runtime.snapshot()["inference_ms"] == 0
+    await runtime.close()
+
+
+async def test_reset_invalidates_in_flight_terminal_short_evaluation() -> None:
+    started = _spawn_event()
+    release = _spawn_event()
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    runtime = SpeakerShadowRuntime(
+        backend_factory=_BackendFactory(
+            score_value=0.8,
+            block_stage="score",
+            stage_started=started,
+            stage_release=release,
+        ),
+        config=_config(
+            minimum_audio_ms=20,
+            maximum_audio_ms=100,
+            observation_checkpoints_ms=(20, 40),
+            terminal_short_evaluation_scopes=("provider_candidate",),
+        ),
+        on_evidence=evidence.append,
+    )
+    candidate = _candidate(24_812)
+
+    assert runtime.submit(
+        _pcm(19),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await _wait_until(started.is_set)
+    await runtime.reset()
+    release.set()
+    await runtime.wait_idle()
+
+    assert evidence == []
+    assert runtime.snapshot()["retained_pcm_bytes"] == 0
+    await runtime.close()
+
+
 async def test_completion_confirmation_observation_precedes_single_completion() -> None:
     events: list[tuple[str, str | None, int | None]] = []
     completions: list[SpeakerShadowCompletion] = []

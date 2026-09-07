@@ -102,7 +102,12 @@ async def test_pure_lease_reducer_requires_ordered_first_then_second_low():
     for late in (
         SpeakerLeaseUnavailable(_candidate(), 3),
         SpeakerLeaseCaptureClosed(_candidate(), 2),
-        SpeakerLeaseHigh(_candidate(), 3),
+        SpeakerLeaseHigh(
+            _candidate(),
+            3,
+            SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+            2_000,
+        ),
         SpeakerLeaseAbandoned(),
     ):
         unchanged, _ = reduce_speaker_lease(record, late)
@@ -124,6 +129,57 @@ async def test_second_low_without_first_fails_open_and_capture_close_is_terminal
     )
     assert closed.state is SpeakerLeaseState.UNAVAILABLE
     assert closed.capture_through_sequence_no == 0
+
+
+async def test_terminal_short_low_is_one_formal_deny_and_high_waits_for_close():
+    record = SpeakerCaptureLeaseRecord(_lease(), 1, _candidate())
+
+    denied, diagnostics = reduce_speaker_lease(
+        record,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.TERMINAL_SHORT),
+    )
+
+    assert denied.state is SpeakerLeaseState.DENY_LATCHED
+    assert denied.terminal_sequence_no == 1
+    assert diagnostics == (CountDiagnostic("speaker_lease_terminal_short_deny_count"),)
+
+    owner, _ = reduce_speaker_lease(
+        record,
+        SpeakerLeaseHigh(
+            _candidate(),
+            1,
+            SpeakerCheckpointKind.TERMINAL_SHORT,
+            900,
+        ),
+    )
+    assert owner.state is SpeakerLeaseState.HIGH_SEEN
+    owner, _ = reduce_speaker_lease(
+        owner,
+        SpeakerLeaseCaptureClosed(_candidate(), 1),
+    )
+    assert owner.state is SpeakerLeaseState.ALLOW
+
+
+async def test_terminal_short_parent_fans_out_one_low_to_exact_child():
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease = _lease()
+    turn = _turn(1)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.attach_turn_to_speaker_lease(turn, lease, _key(1))
+    await coordinator.post(turn, ProviderFinalReceived(_final(_key(1), "short")))
+
+    receipt = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.TERMINAL_SHORT),
+    )
+
+    assert receipt.outcome is SpeakerLeaseTransitionOutcome.APPLIED
+    assert len(receipt.child_results) == 1
+    child = await coordinator.get_record(turn)
+    assert child is not None
+    assert child.evidence_state is EvidenceState.DENY_LATCHED
+    assert child.last_speaker_sequence_no == 1
+    assert child.admission_state is AdmissionState.DROPPED
 
 
 async def test_two_provider_children_share_one_sticky_deny_and_fan_out_in_order():
@@ -1139,20 +1195,11 @@ async def test_legacy_terminal_record_without_exact_event_remains_constructible(
     )
 
 
-@pytest.mark.parametrize(
-    "events",
-    (
-        (
-            SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
-            SpeakerLeaseHigh(_candidate(), 2),
-        ),
-        (
-            SpeakerLeaseHigh(_candidate(), 1),
-            SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.FIRST),
-        ),
-    ),
-)
-async def test_mixed_high_low_evidence_latches_sticky_deny(events) -> None:
+async def test_high_then_low_evidence_latches_sticky_deny() -> None:
+    events = (
+        SpeakerLeaseHigh(_candidate(), 1),
+        SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.FIRST),
+    )
     record = SpeakerCaptureLeaseRecord(_lease(), 1, _candidate())
 
     for event in events:
@@ -1166,6 +1213,146 @@ async def test_mixed_high_low_evidence_latches_sticky_deny(events) -> None:
         SpeakerLeaseUnavailable(_candidate(), 3),
     )
     assert late is record
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_kind", "audio_ms"),
+    (
+        (SpeakerCheckpointKind.SECOND, 3_000),
+        (SpeakerCheckpointKind.COMPLETION_CONFIRMATION, 2_100),
+    ),
+)
+async def test_first_low_valid_high_confirmation_waits_for_close_then_allows(
+    checkpoint_kind: SpeakerCheckpointKind,
+    audio_ms: int,
+) -> None:
+    record = SpeakerCaptureLeaseRecord(_lease(), 1, _candidate())
+    first_low, _ = reduce_speaker_lease(
+        record,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+
+    high_seen, diagnostics = reduce_speaker_lease(
+        first_low,
+        SpeakerLeaseHigh(_candidate(), 2, checkpoint_kind, audio_ms),
+    )
+    allowed, _ = reduce_speaker_lease(
+        high_seen,
+        SpeakerLeaseCaptureClosed(_candidate(), 2),
+    )
+
+    assert high_seen.state is SpeakerLeaseState.HIGH_SEEN
+    assert high_seen.terminal_disposition is None
+    assert diagnostics == (CountDiagnostic("speaker_lease_low_high_recovered_count"),)
+    assert allowed.state is SpeakerLeaseState.ALLOW
+    assert allowed.terminal_disposition is AdmissionDisposition.FORWARD
+
+
+async def test_first_low_recovered_high_then_later_low_still_rejects() -> None:
+    record = SpeakerCaptureLeaseRecord(_lease(), 1, _candidate())
+    for event in (
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+        SpeakerLeaseHigh(
+            _candidate(),
+            2,
+            SpeakerCheckpointKind.SECOND,
+            3_000,
+        ),
+        SpeakerLeaseLow(
+            _candidate(),
+            3,
+            SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+        ),
+    ):
+        record, _ = reduce_speaker_lease(record, event)
+
+    assert record.state is SpeakerLeaseState.MIXED_DENY_LATCHED
+    assert record.terminal_disposition is AdmissionDisposition.DROP
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_kind", "audio_ms"),
+    (
+        (None, None),
+        (SpeakerCheckpointKind.FIRST, 3_000),
+        (SpeakerCheckpointKind.SECOND, 1_500),
+    ),
+)
+async def test_first_low_invalid_high_confirmation_remains_pending_until_close(
+    checkpoint_kind: SpeakerCheckpointKind | None,
+    audio_ms: int | None,
+) -> None:
+    record, _ = reduce_speaker_lease(
+        SpeakerCaptureLeaseRecord(_lease(), 1, _candidate()),
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+
+    pending, diagnostics = reduce_speaker_lease(
+        record,
+        SpeakerLeaseHigh(_candidate(), 2, checkpoint_kind, audio_ms),
+    )
+    closed, _ = reduce_speaker_lease(
+        pending,
+        SpeakerLeaseCaptureClosed(_candidate(), 2),
+    )
+
+    assert pending.state is SpeakerLeaseState.FIRST_LOW
+    assert pending.last_speaker_sequence_no == 2
+    assert diagnostics == (
+        CountDiagnostic("speaker_lease_high_confirmation_invalid_count"),
+    )
+    assert closed.state is SpeakerLeaseState.UNAVAILABLE
+    assert closed.terminal_disposition is AdmissionDisposition.FORWARD
+
+
+async def test_first_low_high_close_fans_out_allow_to_every_child() -> None:
+    coordinator = VoiceTurnAdmissionCoordinator(clock=lambda: 10.0)
+    lease = _lease()
+    first, second = _turn(1), _turn(2)
+    await coordinator.open_speaker_lease(lease, _candidate())
+    await coordinator.attach_turn_to_speaker_lease(first, lease, _key(1))
+    await coordinator.attach_turn_to_speaker_lease(second, lease, _key(2))
+    await coordinator.post(first, ProviderFinalReceived(_final(_key(1), "first")))
+    await coordinator.post(second, ProviderFinalReceived(_final(_key(2), "second")))
+
+    low = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+    )
+    high = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseHigh(
+            _candidate(),
+            2,
+            SpeakerCheckpointKind.SECOND,
+            3_000,
+        ),
+    )
+    receipt = await coordinator.post_speaker_lease(
+        lease,
+        SpeakerLeaseCaptureClosed(_candidate(), 2),
+    )
+
+    assert low.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    assert high.outcome is SpeakerLeaseTransitionOutcome.NON_TERMINAL
+    assert high.child_results == ()
+    assert receipt.after_state is SpeakerLeaseState.ALLOW
+    assert tuple(result.turn_token for result in receipt.child_results) == (
+        first,
+        second,
+    )
+    assert all(
+        result.speaker_lease_terminal_state is SpeakerLeaseState.ALLOW
+        for result in receipt.child_results
+    )
+    assert all(
+        any(
+            isinstance(effect, ResolveReserved)
+            and effect.disposition is AdmissionDisposition.FORWARD
+            for effect in result.effects
+        )
+        for result in receipt.child_results
+    )
 
 
 async def test_high_seen_backend_unavailable_remains_fail_open() -> None:
@@ -1233,10 +1420,10 @@ async def test_terminal_claim_prepare_is_read_only_and_commit_is_exact_cas() -> 
     await coordinator.post(turn, ProviderFinalReceived(_final(_key(1), "pending")))
     await coordinator.post_speaker_lease(
         lease,
-        SpeakerLeaseLow(_candidate(), 1, SpeakerCheckpointKind.FIRST),
+        SpeakerLeaseHigh(_candidate(), 1),
     )
     before = await coordinator.get_speaker_lease(lease)
-    event = SpeakerLeaseHigh(_candidate(), 2)
+    event = SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.FIRST)
 
     claim = await coordinator.prepare_speaker_lease_transition(lease, event)
 
@@ -1289,7 +1476,7 @@ async def test_terminal_claim_is_stale_after_ordinary_fact_advances_revision() -
     )
     claim = await coordinator.prepare_speaker_lease_transition(
         lease,
-        SpeakerLeaseHigh(_candidate(), 2),
+        SpeakerLeaseLow(_candidate(), 2, SpeakerCheckpointKind.SECOND),
     )
     assert claim is not None
     advanced = await coordinator.post_speaker_lease(

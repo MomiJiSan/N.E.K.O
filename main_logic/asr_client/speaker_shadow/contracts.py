@@ -41,7 +41,9 @@ SpeakerShadowScope = Literal["provider_candidate", "smart_turn_turn"]
 SpeakerShadowObservationKind = Literal[
     "checkpoint",
     "completion_confirmation",
+    "terminal_short",
 ]
+SpeakerShadowUnavailableReason = Literal["unsupported", "failure"]
 SpeakerShadowTerminalReason = Literal[
     "scored",
     "insufficient",
@@ -383,6 +385,10 @@ class SpeakerShadowConfig:
     # Only Provider candidates waiting for an exact boundary retain their
     # original buffer after terminal scoring; this never retains a second copy.
     exact_boundary_pcm_retention_seconds: float = 2.0
+    # Appended to preserve every pre-existing positional field. A terminal-short
+    # score is independent of the fixed checkpoints and requires explicit opt-in.
+    terminal_short_evaluation_scopes: tuple[SpeakerShadowScope, ...] = ()
+    terminal_short_minimum_samples: int = 1
 
     def __post_init__(self) -> None:
         if (
@@ -501,6 +507,31 @@ class SpeakerShadowConfig:
                 "backend_prewarm_scopes must be a subset of "
                 "pending_observation_gate_scopes"
             )
+        terminal_short_scopes = self.terminal_short_evaluation_scopes
+        if (
+            type(terminal_short_scopes) is not tuple
+            or any(
+                scope not in ("provider_candidate", "smart_turn_turn")
+                for scope in terminal_short_scopes
+            )
+            or any(
+                scope in terminal_short_scopes[index + 1 :]
+                for index, scope in enumerate(terminal_short_scopes)
+            )
+        ):
+            raise ValueError(
+                "terminal_short_evaluation_scopes must be a tuple of unique, "
+                "supported speaker-shadow scopes"
+            )
+        if (
+            type(self.terminal_short_minimum_samples) is not int
+            or not 0 < self.terminal_short_minimum_samples
+            < self.minimum_audio_ms * SPEAKER_SHADOW_SAMPLE_RATE_HZ // 1_000
+        ):
+            raise ValueError(
+                "terminal_short_minimum_samples must be positive and below "
+                "minimum_audio_ms"
+            )
         if not math.isfinite(self.idle_unload_seconds) or self.idle_unload_seconds <= 0:
             raise ValueError("idle_unload_seconds must be positive")
         if not 0 < self.queue_capacity <= MAX_SPEAKER_SHADOW_QUEUE_CAPACITY:
@@ -607,6 +638,38 @@ class SpeakerShadowObservation:
     # False is an explicit fail-open placeholder emitted when scoring or
     # callback delivery cannot preserve the candidate's ordered evidence.
     evidence_available: bool = True
+    quality_summary_available: bool = False
+    rms: float | None = None
+    peak: float | None = None
+    near_silence: float | None = None
+    clipping: float | None = None
+    unavailable_reason: SpeakerShadowUnavailableReason | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.quality_summary_available) is not bool:
+            raise TypeError("quality_summary_available must be bool")
+        if self.unavailable_reason not in {None, "unsupported", "failure"}:
+            raise ValueError("unavailable_reason must be unsupported, failure, or None")
+        if self.evidence_available and self.unavailable_reason is not None:
+            raise ValueError(
+                "available speaker evidence cannot have an unavailable reason"
+            )
+        quality = (self.rms, self.peak, self.near_silence, self.clipping)
+        if not self.quality_summary_available:
+            if any(value is not None for value in quality):
+                raise ValueError(
+                    "unavailable quality summary cannot contain measurements"
+                )
+            return
+        if any(
+            type(value) not in {int, float}
+            or not math.isfinite(float(value))
+            or not 0.0 <= float(value) <= 1.0
+            for value in quality
+        ):
+            raise ValueError(
+                "available quality summary requires finite measurements within [0, 1]"
+            )
 
 
 ObservationCallback = Callable[

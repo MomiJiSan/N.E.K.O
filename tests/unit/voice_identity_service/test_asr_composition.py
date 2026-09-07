@@ -8,8 +8,11 @@ import pytest
 
 from main_logic.asr_client.admission.contracts import (
     CaptureClosed,
+    SpeakerCheckpointKind,
+    SpeakerHigh,
     SpeakerLow,
     SpeakerUnavailable,
+    SpeakerUnavailableReason,
 )
 from main_logic.asr_client.speaker_shadow.asset_manifest import (
     CAMPPLUS_MODEL_ID,
@@ -30,11 +33,19 @@ from main_logic.voice_identity.reference import SpeakerReference
 from main_logic.voice_identity_service.asr_composition import (
     OwnerVoiceAsrCompositionFactory,
 )
+from main_logic.voice_identity_service.calibration import (
+    CALIBRATION_MODEL_FEATURE_ORDER,
+    CalibrationPackage,
+    CalibrationProtocol,
+    RegisteredCalibration,
+    calibration_package_artifact_sha256,
+    register_calibration_package,
+)
 
 
 @dataclass
 class _EvidenceSink:
-    events: list[SpeakerLow | SpeakerUnavailable | CaptureClosed] = field(
+    events: list[SpeakerLow | SpeakerHigh | SpeakerUnavailable | CaptureClosed] = field(
         default_factory=list
     )
     degraded_generations: list[str] = field(default_factory=list)
@@ -42,7 +53,7 @@ class _EvidenceSink:
 
     def _accept_speaker_evidence_fact(
         self,
-        fact: SpeakerLow | SpeakerUnavailable,
+        fact: SpeakerLow | SpeakerHigh | SpeakerUnavailable,
         *,
         activation_generation: str,
         enforce: bool,
@@ -91,6 +102,39 @@ def _profile(identity: SpeakerModelIdentity | None = None) -> SpeakerProfile:
         return SpeakerProfile("profile-generation", reference)
     finally:
         reference.close()
+
+
+def _calibration_package(*, release_status: str) -> CalibrationPackage:
+    size = len(CALIBRATION_MODEL_FEATURE_ORDER)
+    return CalibrationPackage(
+        schema_version=1,
+        package_revision="terminal-short-test",
+        protocol=CalibrationProtocol(
+            model_id=CAMPPLUS_MODEL_ID,
+            model_revision=CAMPPLUS_MODEL_REVISION,
+            embedding_dimension=CAMPPLUS_EMBEDDING_DIM,
+            preprocessing_contract_id="desktop-pcm16-test",
+            preprocessing_revision=1,
+            noise_reduction_enabled=True,
+        ),
+        feature_order=CALIBRATION_MODEL_FEATURE_ORDER,
+        center=(0.0,) * size,
+        scale=(1.0,) * size,
+        weights=(1.0,) + (0.0,) * (size - 1),
+        intercept=0.0,
+        nonowner_boundary=-0.5,
+        owner_boundary=0.5,
+        dataset_digest="0" * 64,
+        split_group_counts=(1, 1, 1),
+        release_status=release_status,
+    )
+
+
+def _allowlisted(package: CalibrationPackage) -> RegisteredCalibration:
+    return register_calibration_package(
+        package,
+        expected_digest=calibration_package_artifact_sha256(package),
+    )
 
 
 @pytest.mark.parametrize("iteration", range(50))
@@ -229,6 +273,60 @@ def test_composition_emits_stateless_ordered_low_facts_then_close() -> None:
     factory.close()
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_ms", "audio_ms", "observation_kind", "checkpoint_kind"),
+    (
+        (3_000, 3_000, "checkpoint", SpeakerCheckpointKind.SECOND),
+        (
+            1_500,
+            2_100,
+            "completion_confirmation",
+            SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+        ),
+    ),
+)
+def test_composition_preserves_high_checkpoint_window_metadata(
+    checkpoint_ms: int,
+    audio_ms: int,
+    observation_kind: str,
+    checkpoint_kind: SpeakerCheckpointKind,
+) -> None:
+    sink = _EvidenceSink()
+    profile = _profile()
+    factory = OwnerVoiceAsrCompositionFactory(
+        sink,
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(1, 2, "provider_candidate")
+    callback = shadow._on_evidence
+    assert callback is not None
+
+    callback(
+        SpeakerShadowObservation(
+            candidate,
+            0.8,
+            ((0.4, False),),
+            audio_ms,
+            checkpoint_ms,
+            observation_kind=observation_kind,
+            sequence_no=1,
+        )
+    )
+
+    assert sink.events == [
+        SpeakerHigh(
+            candidate,
+            1,
+            checkpoint_kind,
+            audio_ms,
+        )
+    ]
+    factory.close()
+
+
 def test_incomplete_close_emits_unavailable_before_close() -> None:
     sink = _EvidenceSink()
     profile = _profile()
@@ -246,10 +344,238 @@ def test_incomplete_close_emits_unavailable_before_close() -> None:
     callback(SpeakerShadowCompletion(candidate, "failed", None, 1, False))
 
     assert sink.events == [
-        SpeakerUnavailable(candidate, 1),
+        SpeakerUnavailable(candidate, 1, SpeakerUnavailableReason.FAILURE),
         CaptureClosed(candidate, 1),
     ]
     factory.close()
+
+
+@pytest.mark.parametrize(
+    ("package", "similarity", "expected"),
+    [
+        (
+            _calibration_package(release_status="candidate"),
+            -0.8,
+            SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE,
+        ),
+        (
+            _calibration_package(release_status="registered"),
+            -0.8,
+            SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE,
+        ),
+        (
+            _calibration_package(release_status="registered"),
+            0.0,
+            SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE,
+        ),
+    ],
+    ids=["candidate-observes", "bare-registered-observes", "registered-uncertain"],
+)
+def test_terminal_short_maps_calibration_without_using_checkpoint_threshold(
+    package: CalibrationPackage,
+    similarity: float,
+    expected: SpeakerUnavailableReason | SpeakerCheckpointKind,
+) -> None:
+    sink = _EvidenceSink()
+    profile = _profile()
+    factory = OwnerVoiceAsrCompositionFactory(
+        sink,
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+        calibration_package=package,
+        runtime_calibration_protocol=package.protocol,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(1, 4, "provider_candidate")
+    callback = shadow._on_evidence
+    assert callback is not None
+
+    callback(
+        SpeakerShadowObservation(
+            candidate,
+            similarity,
+            ((0.4, similarity < 0.4),),
+            900,
+            observation_kind="terminal_short",
+            sequence_no=1,
+        )
+    )
+
+    assert shadow._config.terminal_short_evaluation_scopes == (
+        "provider_candidate",
+    )
+    assert shadow._backend_factory._allow_short_input is True
+    assert shadow._config.terminal_short_minimum_samples == 720
+    if isinstance(expected, SpeakerCheckpointKind):
+        assert sink.events == [SpeakerLow(candidate, 1, expected)]
+    else:
+        assert sink.events == [SpeakerUnavailable(candidate, 1, expected)]
+    diagnostics = factory.diagnostics_snapshot()
+    if similarity == -0.8:
+        assert diagnostics["terminal_short_recommended_nonowner_count"] == 1
+    factory.close()
+    profile.close()
+
+
+@pytest.mark.parametrize(
+    ("similarity", "expected"),
+    (
+        (0.8, SpeakerCheckpointKind.TERMINAL_SHORT),
+        (-0.8, SpeakerCheckpointKind.TERMINAL_SHORT),
+        (0.0, SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE),
+    ),
+    ids=("owner", "nonowner", "uncertain"),
+)
+def test_only_allowlisted_wrapper_enables_terminal_short_authority(
+    similarity: float,
+    expected: SpeakerUnavailableReason | SpeakerCheckpointKind,
+) -> None:
+    sink = _EvidenceSink()
+    profile = _profile()
+    package = _calibration_package(release_status="candidate")
+    factory = OwnerVoiceAsrCompositionFactory(
+        sink,
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+        calibration_package=package,
+        registered_calibration=_allowlisted(package),
+        runtime_calibration_protocol=package.protocol,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(1, 40, "provider_candidate")
+    callback = shadow._on_evidence
+    assert callback is not None
+
+    callback(
+        SpeakerShadowObservation(
+            candidate,
+            similarity,
+            ((0.4, similarity < 0.4),),
+            900,
+            observation_kind="terminal_short",
+            sequence_no=1,
+        )
+    )
+
+    if isinstance(expected, SpeakerUnavailableReason):
+        assert sink.events == [SpeakerUnavailable(candidate, 1, expected)]
+    elif similarity < 0:
+        assert sink.events == [SpeakerLow(candidate, 1, expected)]
+    else:
+        assert sink.events == [SpeakerHigh(candidate, 1, expected, 900)]
+    factory.close()
+    profile.close()
+
+
+def test_registered_wrapper_must_match_the_observed_package() -> None:
+    profile = _profile()
+    package = _calibration_package(release_status="candidate")
+    other = _calibration_package(release_status="registered")
+
+    with pytest.raises(ValueError, match="must match calibration_package"):
+        OwnerVoiceAsrCompositionFactory(
+            _EvidenceSink(),
+            profile,
+            activation_generation="activation-1",
+            enforce=True,
+            calibration_package=package,
+            registered_calibration=_allowlisted(other),
+            runtime_calibration_protocol=package.protocol,
+        )
+
+    profile.close()
+
+
+def test_terminal_short_is_disabled_without_calibration_package() -> None:
+    profile = _profile()
+    factory = OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(),
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+    )
+    shadow = factory()
+
+    assert shadow._config.terminal_short_evaluation_scopes == ()
+    assert shadow._backend_factory._allow_short_input is False
+    factory.close()
+    profile.close()
+
+
+def test_calibration_package_requires_independent_runtime_protocol() -> None:
+    profile = _profile()
+    package = _calibration_package(release_status="candidate")
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        OwnerVoiceAsrCompositionFactory(
+            _EvidenceSink(),
+            profile,
+            activation_generation="activation-1",
+            enforce=True,
+            calibration_package=package,
+        )
+
+    profile.close()
+
+
+def test_candidate_package_observes_terminal_short_when_admission_is_not_enforced() -> None:
+    profile = _profile()
+    package = _calibration_package(release_status="candidate")
+    factory = OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(),
+        profile,
+        activation_generation="activation-1",
+        enforce=False,
+        calibration_package=package,
+        runtime_calibration_protocol=package.protocol,
+    )
+    shadow = factory()
+
+    assert shadow._config.terminal_short_evaluation_scopes == (
+        "provider_candidate",
+    )
+    assert shadow._backend_factory._allow_short_input is True
+    factory.close()
+    profile.close()
+
+
+def test_terminal_short_backend_limit_maps_to_unsupported_fail_open() -> None:
+    sink = _EvidenceSink()
+    profile = _profile()
+    package = _calibration_package(release_status="registered")
+    factory = OwnerVoiceAsrCompositionFactory(
+        sink,
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+        calibration_package=package,
+        runtime_calibration_protocol=package.protocol,
+    )
+    shadow = factory()
+    candidate = SpeakerShadowCandidateKey(1, 5, "provider_candidate")
+    callback = shadow._on_evidence
+    assert callback is not None
+
+    callback(
+        SpeakerShadowObservation(
+            candidate,
+            0.0,
+            (),
+            44,
+            observation_kind="terminal_short",
+            sequence_no=1,
+            evidence_available=False,
+            unavailable_reason="unsupported",
+        )
+    )
+
+    assert sink.events == [
+        SpeakerUnavailable(candidate, 1, SpeakerUnavailableReason.UNSUPPORTED)
+    ]
+    factory.close()
+    profile.close()
 
 
 async def test_factory_close_wipes_owned_profile_and_backend_material() -> None:

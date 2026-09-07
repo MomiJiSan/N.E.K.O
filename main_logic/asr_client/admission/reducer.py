@@ -768,6 +768,12 @@ def _reduce_untracked(
         deny_latched = False
         if evidence is not EvidenceState.DENY_LATCHED:
             if (
+                event.checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT
+                and evidence is EvidenceState.NONE
+            ):
+                evidence = EvidenceState.DENY_LATCHED
+                deny_latched = True
+            elif (
                 event.checkpoint_kind is SpeakerCheckpointKind.FIRST
                 and evidence is EvidenceState.NONE
             ):
@@ -828,6 +834,7 @@ def _reduce_untracked(
                 last_speaker_sequence_no=event.sequence_no,
                 capture_state=CaptureState.UNAVAILABLE,
                 evidence_state=EvidenceState.UNAVAILABLE,
+                speaker_unavailable_reason=event.reason,
                 rejection_apply_state=RejectionApplyState.STALE,
                 rejection_capability=None,
                 rejection_operation_nonce=None,

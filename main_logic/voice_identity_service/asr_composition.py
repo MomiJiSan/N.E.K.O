@@ -19,6 +19,7 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerHigh,
     SpeakerLow,
     SpeakerUnavailable,
+    SpeakerUnavailableReason,
 )
 from main_logic.asr_client.speaker_shadow.asset_manifest import (
     CAMPPLUS_MODEL_ID,
@@ -26,6 +27,7 @@ from main_logic.asr_client.speaker_shadow.asset_manifest import (
 )
 from main_logic.asr_client.speaker_shadow.campplus import (
     CAMPPLUS_EMBEDDING_DIM,
+    CAMPPLUS_EXECUTABLE_MINIMUM_SAMPLES,
     CampPlusBackendFactory,
 )
 from main_logic.asr_client.speaker_shadow.contracts import (
@@ -44,6 +46,12 @@ from main_logic.asr_client.speaker_diagnostics import diagnostic_value_ref
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
 
+from .calibration import (
+    CalibrationOutcome,
+    CalibrationPackage,
+    CalibrationProtocol,
+    RegisteredCalibration,
+)
 from .policy import OwnerVoiceClassification, OwnerVoicePolicy
 
 
@@ -96,6 +104,9 @@ class OwnerVoiceAsrCompositionFactory:
         enforce: bool,
         authority: SpeakerVerifierAuthority | None = None,
         installation_identity: SpeakerVerifierInstallIdentity | None = None,
+        calibration_package: CalibrationPackage | None = None,
+        registered_calibration: RegisteredCalibration | None = None,
+        runtime_calibration_protocol: CalibrationProtocol | None = None,
     ) -> None:
         required_methods = (
             "_accept_speaker_evidence_fact",
@@ -111,12 +122,37 @@ class OwnerVoiceAsrCompositionFactory:
             raise ValueError("activation_generation must be a non-empty string")
         if type(enforce) is not bool:
             raise TypeError("enforce must be bool")
+        if calibration_package is not None and type(calibration_package) is not CalibrationPackage:
+            raise TypeError("calibration_package must be CalibrationPackage or None")
+        if registered_calibration is not None:
+            if type(registered_calibration) is not RegisteredCalibration:
+                raise TypeError(
+                    "registered_calibration must be RegisteredCalibration or None"
+                )
+            if (
+                calibration_package is None
+                or registered_calibration.package != calibration_package
+            ):
+                raise ValueError(
+                    "registered_calibration must match calibration_package"
+                )
+        if runtime_calibration_protocol is not None and type(runtime_calibration_protocol) is not CalibrationProtocol:
+            raise TypeError(
+                "runtime_calibration_protocol must be CalibrationProtocol or None"
+            )
+        if (calibration_package is None) != (runtime_calibration_protocol is None):
+            raise ValueError(
+                "calibration_package and runtime_calibration_protocol must be provided together"
+            )
         self._runtime = runtime
         self._profile = copy.copy(profile)
         self._activation_generation = activation_generation
         self._enforce = enforce
         self._authority = authority
         self._installation_identity = installation_identity
+        self._calibration_package = calibration_package
+        self._registered_calibration = registered_calibration
+        self._runtime_calibration_protocol = runtime_calibration_protocol
         self._lock = threading.Lock()
         self._closed = False
         self._diagnostics = {
@@ -130,6 +166,16 @@ class OwnerVoiceAsrCompositionFactory:
             "speaker_completion_before_first_checkpoint_count": 0,
             "speaker_completion_after_first_checkpoint_count": 0,
             "speaker_completion_stale_count": 0,
+            "terminal_short_observation_count": 0,
+            "terminal_short_owner_count": 0,
+            "terminal_short_nonowner_count": 0,
+            "terminal_short_insufficient_count": 0,
+            "terminal_short_unavailable_count": 0,
+            "terminal_short_recommended_owner_count": 0,
+            "terminal_short_recommended_nonowner_count": 0,
+            "terminal_short_recommended_uncertain_count": 0,
+            "terminal_short_recommended_unsupported_count": 0,
+            "terminal_short_recommended_failure_count": 0,
         }
 
     @property
@@ -175,7 +221,11 @@ class OwnerVoiceAsrCompositionFactory:
             if reference.model_identity != expected_identity:
                 raise ValueError("speaker profile model identity does not match CAM++")
             embedding = reference.copy_embedding()
-            backend_factory = CampPlusBackendFactory(embedding)
+            backend_factory = (
+                CampPlusBackendFactory(embedding)
+                if self._calibration_package is None
+                else CampPlusBackendFactory(embedding, allow_short_input=True)
+            )
         finally:
             if embedding is not None:
                 embedding.fill(0.0)
@@ -217,6 +267,7 @@ class OwnerVoiceAsrCompositionFactory:
                         SpeakerUnavailable(
                             candidate=event.candidate,
                             sequence_no=through_sequence_no,
+                            reason=SpeakerUnavailableReason.FAILURE,
                         ),
                         activation_generation=generation,
                         enforce=enforce,
@@ -240,10 +291,20 @@ class OwnerVoiceAsrCompositionFactory:
                     self._diagnostics["first_checkpoint_count"] += 1
                 elif checkpoint_kind is SpeakerCheckpointKind.SECOND:
                     self._diagnostics["second_checkpoint_count"] += 1
+                elif checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+                    self._diagnostics["terminal_short_observation_count"] += 1
 
             if not event.evidence_available:
                 fact: SpeakerLow | SpeakerHigh | SpeakerUnavailable = (
-                    SpeakerUnavailable(event.candidate, event.sequence_no)
+                    SpeakerUnavailable(
+                        event.candidate,
+                        event.sequence_no,
+                        (
+                            SpeakerUnavailableReason.UNSUPPORTED
+                            if event.unavailable_reason == "unsupported"
+                            else SpeakerUnavailableReason.FAILURE
+                        ),
+                    )
                 )
             else:
                 result = OwnerVoicePolicy.classify(
@@ -251,7 +312,29 @@ class OwnerVoiceAsrCompositionFactory:
                     similarity=event.similarity,
                     observation_kind=event.observation_kind,
                     audio_ms=event.audio_ms,
+                    calibration_package=self._calibration_package,
+                    registered_calibration=self._registered_calibration,
+                    runtime_protocol=self._runtime_calibration_protocol,
+                    rms=event.rms,
+                    peak=event.peak,
+                    near_silence=event.near_silence,
+                    clipping=event.clipping,
                 )
+                if (
+                    checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT
+                    and result.calibration_outcome is not None
+                ):
+                    outcome_key = {
+                        CalibrationOutcome.OWNER: "owner",
+                        CalibrationOutcome.NONOWNER: "nonowner",
+                        CalibrationOutcome.UNCERTAIN: "uncertain",
+                        CalibrationOutcome.UNSUPPORTED: "unsupported",
+                        CalibrationOutcome.FAILURE: "failure",
+                    }[result.calibration_outcome]
+                    with self._lock:
+                        self._diagnostics[
+                            f"terminal_short_recommended_{outcome_key}_count"
+                        ] += 1
                 if (
                     result.classification is OwnerVoiceClassification.LOW
                     and checkpoint_kind is not None
@@ -270,10 +353,49 @@ class OwnerVoiceAsrCompositionFactory:
                             SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
                         }:
                             self._diagnostics["speaker_second_low_count"] += 1
-                elif result.classification is OwnerVoiceClassification.HIGH:
-                    fact = SpeakerHigh(event.candidate, event.sequence_no)
+                        elif checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+                            self._diagnostics["terminal_short_nonowner_count"] += 1
+                elif (
+                    result.classification is OwnerVoiceClassification.HIGH
+                    and checkpoint_kind is not None
+                ):
+                    fact = SpeakerHigh(
+                        event.candidate,
+                        event.sequence_no,
+                        checkpoint_kind,
+                        event.audio_ms,
+                    )
+                    if checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+                        with self._lock:
+                            self._diagnostics["terminal_short_owner_count"] += 1
+                elif result.classification is OwnerVoiceClassification.INSUFFICIENT:
+                    fact = SpeakerUnavailable(
+                        event.candidate,
+                        event.sequence_no,
+                        SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE,
+                    )
+                    with self._lock:
+                        self._diagnostics["terminal_short_insufficient_count"] += 1
                 else:
-                    fact = SpeakerUnavailable(event.candidate, event.sequence_no)
+                    reason = (
+                        SpeakerUnavailableReason.UNSUPPORTED
+                        if result.calibration_outcome is CalibrationOutcome.UNSUPPORTED
+                        or result.reason
+                        in {
+                            "protocol_mismatch",
+                            "missing_primary_feature",
+                            "calibration_protocol_unavailable",
+                        }
+                        else SpeakerUnavailableReason.FAILURE
+                    )
+                    fact = SpeakerUnavailable(
+                        event.candidate,
+                        event.sequence_no,
+                        reason,
+                    )
+                    if checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+                        with self._lock:
+                            self._diagnostics["terminal_short_unavailable_count"] += 1
             runtime._accept_speaker_evidence_fact(
                 fact,
                 activation_generation=generation,
@@ -313,6 +435,16 @@ class OwnerVoiceAsrCompositionFactory:
                     ),
                     completion_confirmation_scopes=(
                         ("provider_candidate",) if enforce else ()
+                    ),
+                    terminal_short_evaluation_scopes=(
+                        ("provider_candidate",)
+                        if self._calibration_package is not None
+                        else ()
+                    ),
+                    terminal_short_minimum_samples=(
+                        CAMPPLUS_EXECUTABLE_MINIMUM_SAMPLES
+                        if self._calibration_package is not None
+                        else 1
                     ),
                     pending_observation_gate_scopes=(
                         ("provider_candidate",) if enforce else ()
@@ -359,6 +491,8 @@ class OwnerVoiceAsrCompositionFactory:
     ) -> SpeakerCheckpointKind | None:
         if observation.observation_kind == "completion_confirmation":
             return SpeakerCheckpointKind.COMPLETION_CONFIRMATION
+        if observation.observation_kind == "terminal_short":
+            return SpeakerCheckpointKind.TERMINAL_SHORT
         if observation.checkpoint_ms == OwnerVoicePolicy.FIRST_CHECKPOINT_MS:
             return SpeakerCheckpointKind.FIRST
         if observation.checkpoint_ms == OwnerVoicePolicy.SECOND_CHECKPOINT_MS:

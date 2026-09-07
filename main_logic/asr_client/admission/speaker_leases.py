@@ -21,6 +21,7 @@ from .contracts import (
 
 MAX_SPEAKER_LEASES = 8
 MAX_SPEAKER_LEASE_CHILDREN = 8
+_FIRST_CHECKPOINT_AUDIO_MS = 1_500
 
 _TERMINAL_STATES = {
     SpeakerLeaseState.ALLOW,
@@ -198,6 +199,14 @@ def reduce_speaker_lease(
                 terminal_sequence_no=sequence_no,
                 terminal_event=event,
             ), (CountDiagnostic("speaker_lease_mixed_deny_latched_count"),)
+        if event.checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+            return _changed(
+                record,
+                state=SpeakerLeaseState.DENY_LATCHED,
+                last_speaker_sequence_no=sequence_no,
+                terminal_sequence_no=sequence_no,
+                terminal_event=event,
+            ), (CountDiagnostic("speaker_lease_terminal_short_deny_count"),)
         if record.state is SpeakerLeaseState.FIRST_LOW and event.checkpoint_kind in {
             SpeakerCheckpointKind.SECOND,
             SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
@@ -233,13 +242,26 @@ def reduce_speaker_lease(
 
     if isinstance(event, SpeakerLeaseHigh):
         if record.state is SpeakerLeaseState.FIRST_LOW:
+            if not (
+                event.checkpoint_kind
+                in {
+                    SpeakerCheckpointKind.SECOND,
+                    SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+                }
+                and type(event.audio_ms) is int
+                and event.audio_ms > _FIRST_CHECKPOINT_AUDIO_MS
+            ):
+                return _changed(
+                    record,
+                    last_speaker_sequence_no=sequence_no,
+                ), (
+                    CountDiagnostic("speaker_lease_high_confirmation_invalid_count"),
+                )
             return _changed(
                 record,
-                state=SpeakerLeaseState.MIXED_DENY_LATCHED,
+                state=SpeakerLeaseState.HIGH_SEEN,
                 last_speaker_sequence_no=sequence_no,
-                terminal_sequence_no=sequence_no,
-                terminal_event=event,
-            ), (CountDiagnostic("speaker_lease_mixed_deny_latched_count"),)
+            ), (CountDiagnostic("speaker_lease_low_high_recovered_count"),)
         return _changed(
             record,
             state=SpeakerLeaseState.HIGH_SEEN,

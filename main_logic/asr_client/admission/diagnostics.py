@@ -44,6 +44,7 @@ def resolution_diagnostics(
         "disposition": ticket.disposition.value,
         "reason_code": "ASR_DECISION_RECORD_UNAVAILABLE",
         "evidence_state": "unknown",
+        "speaker_unavailable_reason": None,
     }
     if record is None or record.resolution_ticket != ticket:
         return result
@@ -70,6 +71,11 @@ def resolution_diagnostics(
     result.update(
         reason_code=reason,
         evidence_state=record.evidence_state.value,
+        speaker_unavailable_reason=(
+            record.speaker_unavailable_reason.value
+            if record.speaker_unavailable_reason is not None
+            else None
+        ),
         capture_state=record.capture_state.value,
         boundary_state=record.boundary_state.value,
         micro_event_state=record.micro_event_state.value,

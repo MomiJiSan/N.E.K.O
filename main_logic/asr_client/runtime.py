@@ -37,6 +37,9 @@ from .diagnostic_logging import submit_resolution_log
 from .failure_diagnostics import AudioFailureContext, CleanupTrace, utc_now
 from .speaker_diagnostics import diagnostic_context, speaker_diagnostic_scalars
 from .speaker_shadow.diagnostics import SpeakerShadowDiagnostic
+from .provider_state_diagnostics import (
+    trace_state_change, runtime_state_emitter, reset_origin, state_change,
+)
 from ._provider_events import (
     ProviderEndpointNotification,
     ProviderFinalNotification,
@@ -121,6 +124,7 @@ from .admission.contracts import (
     SpeakerLeaseUnavailable,
     SpeakerLow,
     SpeakerUnavailable,
+    SpeakerUnavailableReason,
     SpeakerAuthorityNamespacePoisonFailed,
     SpeakerAuthorityNamespacePoisoned,
     TransportSettled,
@@ -705,6 +709,7 @@ class _ProviderSpeakerProvisionalLedger:
     )
     close_event: SpeakerLeaseCaptureClosed | None = None
     poisoned_reason: str | None = None
+    unavailable_reason: SpeakerUnavailableReason = SpeakerUnavailableReason.UNAVAILABLE
     # Physical retirement does not settle the Provider text/admission owner.
     # In particular, unanchored unavailable audio still belongs to this turn.
     evidence_turn_token: VoiceTurnToken | None = None
@@ -1605,6 +1610,7 @@ class IndependentAsrRuntime:
             )
             return True
         if isinstance(event, SpeakerLeaseUnavailable):
+            ledger.unavailable_reason = event.reason
             self._poison_provider_speaker_ledger(
                 ledger,
                 "speaker_evidence_unavailable",
@@ -1739,9 +1745,16 @@ class IndependentAsrRuntime:
             exact_fact: SpeakerLeaseEvent = (
                 SpeakerLeaseLow(candidate, fact.sequence_no, fact.checkpoint_kind)
                 if isinstance(fact, SpeakerLow)
-                else SpeakerLeaseHigh(candidate, fact.sequence_no)
+                else SpeakerLeaseHigh(
+                    candidate,
+                    fact.sequence_no,
+                    fact.checkpoint_kind,
+                    fact.audio_ms,
+                )
                 if isinstance(fact, SpeakerHigh)
-                else SpeakerLeaseUnavailable(candidate, fact.sequence_no)
+                else SpeakerLeaseUnavailable(
+                    candidate, fact.sequence_no, fact.reason
+                )
             )
             self._schedule_exact_interval_event(exact, exact_fact)
             return True
@@ -1751,9 +1764,16 @@ class IndependentAsrRuntime:
             provisional_fact: SpeakerLeaseEvent = (
                 SpeakerLeaseLow(candidate, fact.sequence_no, fact.checkpoint_kind)
                 if isinstance(fact, SpeakerLow)
-                else SpeakerLeaseHigh(candidate, fact.sequence_no)
+                else SpeakerLeaseHigh(
+                    candidate,
+                    fact.sequence_no,
+                    fact.checkpoint_kind,
+                    fact.audio_ms,
+                )
                 if isinstance(fact, SpeakerHigh)
-                else SpeakerLeaseUnavailable(candidate, fact.sequence_no)
+                else SpeakerLeaseUnavailable(
+                    candidate, fact.sequence_no, fact.reason
+                )
             )
             return self._record_provider_provisional_speaker_event(
                 ledger,
@@ -1768,9 +1788,16 @@ class IndependentAsrRuntime:
                     fact.checkpoint_kind,
                 )
                 if isinstance(fact, SpeakerLow)
-                else SpeakerLeaseHigh(candidate, fact.sequence_no)
+                else SpeakerLeaseHigh(
+                    candidate,
+                    fact.sequence_no,
+                    fact.checkpoint_kind,
+                    fact.audio_ms,
+                )
                 if isinstance(fact, SpeakerHigh)
-                else SpeakerLeaseUnavailable(candidate, fact.sequence_no)
+                else SpeakerLeaseUnavailable(
+                    candidate, fact.sequence_no, fact.reason
+                )
             )
             return self._post_or_defer_provider_speaker_lease_event(
                 lease_token,
@@ -1792,7 +1819,13 @@ class IndependentAsrRuntime:
             return False
         self._schedule_pipeline_event(
             "speaker_fact_observed", turn_token.ingress, turn_id=turn_token.turn_id,
-            outcome="low" if isinstance(fact, SpeakerLow) else "high" if isinstance(fact, SpeakerHigh) else "unavailable",
+            outcome=(
+                "low"
+                if isinstance(fact, SpeakerLow)
+                else "high"
+                if isinstance(fact, SpeakerHigh)
+                else fact.reason.value
+            ),
             sequence_no=fact.sequence_no,
         )
         self._consume_admission_future(turn_token, future, speaker_fact=fact)
@@ -1882,6 +1915,7 @@ class IndependentAsrRuntime:
             in {
                 SpeakerCheckpointKind.SECOND,
                 SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+                SpeakerCheckpointKind.TERMINAL_SHORT,
             }
         )
         cleanup_owner: _SpeakerDenyCleanupOperation | None = None
@@ -2470,6 +2504,7 @@ class IndependentAsrRuntime:
             if event.checkpoint_kind in {
                 SpeakerCheckpointKind.SECOND,
                 SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+                SpeakerCheckpointKind.TERMINAL_SHORT,
             }:
                 return True
             saw_first_low = True
@@ -2497,6 +2532,8 @@ class IndependentAsrRuntime:
             if event.checkpoint_kind is SpeakerCheckpointKind.FIRST:
                 saw_first_low = True
                 continue
+            if event.checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+                return True
             if saw_first_low:
                 return True
         return False
@@ -3468,7 +3505,7 @@ class IndependentAsrRuntime:
             )
         if detector is not None:
             try:
-                await detector.reset()
+                await self._reset_detector_with_diagnostics(detector, initiator="abort", reason=reason)
             except Exception:
                 logger.warning(
                     "[%s] detector reset failed during voice abort",
@@ -5442,12 +5479,17 @@ class IndependentAsrRuntime:
         self._asr_sealed_turn_token = None
         self._asr_provider_candidate_fence = None
         self._asr_sealed_provider_key = None
-        self._asr_provider_speaker_evidence_lease = None
-        candidate = cleanup.context.candidate_key
-        self._asr_admission_candidate_leases.pop(candidate, None)
-        self._asr_admission_candidate_turns.pop(candidate, None)
-        self._asr_current_speaker_lease = None
-        self._asr_current_speaker_candidate = None
+        with state_change(
+            self, component="runtime", operation="evidence_alias_clear",
+            initiator="finish_speaker_deny_cleanup", reason="speaker_denied",
+            source_epoch=cleanup.context.session_epoch,
+        ):
+            self._asr_provider_speaker_evidence_lease = None
+            candidate = cleanup.context.candidate_key
+            self._asr_admission_candidate_leases.pop(candidate, None)
+            self._asr_admission_candidate_turns.pop(candidate, None)
+            self._asr_current_speaker_lease = None
+            self._asr_current_speaker_candidate = None
         try:
             retired = await self._asr_admission_ingress.retire_speaker_lease(
                 cleanup.lease_token
@@ -6850,6 +6892,7 @@ class IndependentAsrRuntime:
                 return ledger
         return None
 
+    @trace_state_change("evidence_alias_consume", component="runtime")
     def _consume_provider_speaker_evidence_settlement(
         self,
         settlement: ProviderSpeakerEvidenceSettlement | None,
@@ -7958,7 +8001,7 @@ class IndependentAsrRuntime:
             if final_completed_before_discard:
                 if detector is not None and detector is self._asr_detector:
                     try:
-                        await detector.reset()
+                        await self._reset_detector_with_diagnostics(detector, initiator="handle_audio_ingress_backpressure", reason="ingress_backpressure")
                     except Exception:
                         logger.warning(
                             "[%s] detector reset failed after pending overflow",
@@ -7982,7 +8025,7 @@ class IndependentAsrRuntime:
             self._asr_pending_detector_candidate = None
             if detector is not None:
                 identity = self._capture_runtime_identity(ingress_token=token)
-                await detector.reset()
+                await self._reset_detector_with_diagnostics(detector, initiator="handle_audio_ingress_backpressure", reason="ingress_backpressure")
                 if not self._runtime_identity_matches(
                     identity
                 ) or not self._asr_runtime_refs_match(
@@ -8009,7 +8052,7 @@ class IndependentAsrRuntime:
             if detector is not None:
                 identity = self._capture_runtime_identity()
                 try:
-                    await detector.reset()
+                    await self._reset_detector_with_diagnostics(detector, initiator="handle_audio_ingress_backpressure", reason="ingress_backpressure")
                 except Exception:
                     logger.warning(
                         "[%s] detector reset failed after ingress backpressure",
@@ -8053,7 +8096,7 @@ class IndependentAsrRuntime:
                 ):
                     return
                 if detector is not None:
-                    await detector.reset()
+                    await self._reset_detector_with_diagnostics(detector, initiator="handle_audio_ingress_backpressure", reason="ingress_backpressure")
                     if not self._runtime_identity_matches(
                         post_detach
                     ) or not self._asr_runtime_refs_match(
@@ -8629,6 +8672,7 @@ class IndependentAsrRuntime:
                     await self._close_created_speaker_shadow(speaker_shadow)
                     raise
                 self._asr_detector = detector_ref
+                self._install_provider_state_diagnostics(detector_ref)
                 try:
                     install_diagnostics = getattr(detector_ref, "set_pipeline_diagnostic_callback", None)
                     if callable(install_diagnostics):
@@ -8769,10 +8813,13 @@ class IndependentAsrRuntime:
         except Exception:
             return
 
+    @trace_state_change("transport_namespace_clear", component="runtime")
     def _reset_asr_provider_transport_namespace(
         self,
         *,
         retire_owned_proofs: bool = False,
+        initiator: str = "unspecified", reason: str = "transport_namespace_clear",
+        source_epoch: int | None = None,
     ) -> None:
         """Detach private state keyed to one physical Provider session.
 
@@ -8839,7 +8886,11 @@ class IndependentAsrRuntime:
         self._asr_sealed_provider_key = None
         self._asr_provider_exact_session = None
 
-    def _reset_asr_turn_state(self) -> None:
+    @trace_state_change("turn_state_clear", component="runtime")
+    def _reset_asr_turn_state(
+        self, *, initiator: str = "unspecified", reason: str = "turn_state_clear",
+        source_epoch: int | None = None,
+    ) -> None:
         """Reset per-turn bookkeeping shared by close/abort/error teardown."""
 
         # Both deadlines belong to the detached route. Keep cancelled owners
@@ -8885,7 +8936,9 @@ class IndependentAsrRuntime:
         self._asr_partial_settlements.clear()
         self._asr_sealed_turn_token = None
         self._asr_provider_candidate_fence = None
-        self._reset_asr_provider_transport_namespace()
+        self._reset_asr_provider_transport_namespace(
+            initiator=initiator, reason=reason, source_epoch=source_epoch,
+        )
         self._asr_turn_endpointed_at = None
         self._asr_turn_audio_started_at = None
         self._asr_turn_onset_at = None
@@ -8973,7 +9026,7 @@ class IndependentAsrRuntime:
         async def reset_authority() -> bool:
             try:
                 await asyncio.wait_for(
-                    detector.reset(),
+                    self._reset_detector_with_diagnostics(detector, initiator="reset_authority", reason="candidate_decision_timeout"),
                     timeout=_SPEAKER_CANDIDATE_DECISION_TIMEOUT_SECONDS,
                 )
             except asyncio.CancelledError:
@@ -9021,6 +9074,7 @@ class IndependentAsrRuntime:
             operation_generation = self._begin_asr_start_operation()
         elif not self._asr_start_operation_matches(operation_generation):
             return None
+        source_epoch = self._asr_session_epoch
         self._asr_session_epoch += 1
         self._asr_audio_generation += 1
         transcript_dispatcher = self._asr_transcript_dispatcher
@@ -9089,7 +9143,9 @@ class IndependentAsrRuntime:
             task for task in self._asr_exact_callback_tasks
             if task is not asyncio.current_task() and not task.done()
         }
-        self._reset_asr_turn_state()
+        self._reset_asr_turn_state(
+            initiator="detach_independent_asr", reason="route_detached", source_epoch=source_epoch,
+        )
         self._asr_session_factory = None
         self._asr_transport_selection = None
 
@@ -9986,7 +10042,10 @@ class IndependentAsrRuntime:
                         reset_provider_timeline
                     ):
                         try:
-                            exact_timeline_ready = bool(await reset_provider_timeline())
+                            exact_timeline_ready = bool(await self._reset_detector_with_diagnostics(
+                                detector, initiator="restart_transport",
+                                reason="transport_reconnect", timeline_only=True,
+                            ))
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -10003,7 +10062,8 @@ class IndependentAsrRuntime:
                     # adoption. Provider callbacks are accepted only after
                     # _asr_session points at this candidate.
                     self._reset_asr_provider_transport_namespace(
-                        retire_owned_proofs=True
+                        retire_owned_proofs=True, initiator="restart_transport",
+                        reason="transport_reconnect", source_epoch=identity.session_epoch,
                     )
                     self._asr_provider_exact_session = (
                         candidate
@@ -10189,7 +10249,9 @@ class IndependentAsrRuntime:
             self._asr_audio_dispatcher.abort()
             self._asr_provider_speaker_sequence = 0
             self._asr_buffered_provider_speaker_observation = None
-            self._reset_asr_turn_state()
+            self._reset_asr_turn_state(
+                initiator="abort_transport", reason=reason, source_epoch=post_detach.session_epoch,
+            )
             if lifecycle is not None:
                 lifecycle.metrics.asr_abort_discarded_command_count = (
                     self._asr_audio_dispatcher.asr_abort_discarded_command_count
@@ -12311,7 +12373,11 @@ class IndependentAsrRuntime:
                 if ledger.poisoned_reason is not None:
                     self._enqueue_exact_interval_event(
                         transaction,
-                        SpeakerLeaseUnavailable(transaction.target_candidate, 1),
+                        SpeakerLeaseUnavailable(
+                            transaction.target_candidate,
+                            1,
+                            ledger.unavailable_reason,
+                        ),
                     )
                 elif committed.score_reusable:
                     for provisional in ledger.events:
@@ -12325,6 +12391,8 @@ class IndependentAsrRuntime:
                             else SpeakerLeaseHigh(
                                 transaction.target_candidate,
                                 provisional.sequence_no,
+                                provisional.checkpoint_kind,
+                                provisional.audio_ms,
                             )
                         )
                         self._enqueue_exact_interval_event(
@@ -14427,6 +14495,26 @@ class IndependentAsrRuntime:
         except Exception:
             pass
 
+    def _install_provider_state_diagnostics(self, detector) -> None:
+        try:
+            install = getattr(detector, "set_provider_state_diagnostic_callback", None)
+            if callable(install):
+                install(runtime_state_emitter(self))
+        except Exception:
+            pass
+
+    async def _reset_detector_with_diagnostics(
+        self, detector, *, initiator: str, reason: str, timeline_only: bool = False,
+    ):
+        with reset_origin(initiator, reason), state_change(
+            detector, operation="reset_request", initiator=initiator, reason=reason,
+        ) as diagnostic:
+            result = (await detector.reset_provider_audio_timeline() if timeline_only
+                      else await detector.reset())
+            if result is False:
+                diagnostic["outcome"] = "rejected"
+            return result
+
     def _observe_endpoint_diagnostic(self, fields: dict, ingress, *, source, epoch: int) -> None:
         try:
             if ingress is None or epoch != ingress.session_epoch:
@@ -14447,6 +14535,7 @@ class IndependentAsrRuntime:
             key = owner.provider_key
             if key is None:
                 return
+            checkpoint_kind = getattr(fact, "checkpoint_kind", None)
             metadata = diagnostic_context(self, owner.runtime_identity.session_epoch)
             metadata.update(
                 stage="speaker_fact_observed",
@@ -14458,7 +14547,16 @@ class IndependentAsrRuntime:
                 speaker_classification=("low" if isinstance(fact, SpeakerLow)
                                         else "high" if isinstance(fact, SpeakerHigh)
                                         else "unavailable"),
-                checkpoint_kind=fact.checkpoint_kind.value if isinstance(fact, SpeakerLow) else None,
+                checkpoint_kind=(
+                    checkpoint_kind.value
+                    if isinstance(checkpoint_kind, SpeakerCheckpointKind)
+                    else None
+                ),
+                unavailable_reason=(
+                    fact.reason.value
+                    if isinstance(fact, SpeakerUnavailable)
+                    else None
+                ),
             )
             # Observation is not proof that the coordinator accepted the fact.
             self._schedule_asr_diagnostic_metadata(metadata, capacity=8)
@@ -14785,7 +14883,9 @@ class IndependentAsrRuntime:
         self._asr_transport_selection = None
         self._asr_provider_speaker_sequence = 0
         self._asr_buffered_provider_speaker_observation = None
-        self._reset_asr_turn_state()
+        self._reset_asr_turn_state(
+            initiator="handle_independent_asr_error", reason=effective_reason.lower(), source_epoch=epoch,
+        )
         for task_name in (
             "_asr_transport_task",
             "_asr_warm_expiry_task",

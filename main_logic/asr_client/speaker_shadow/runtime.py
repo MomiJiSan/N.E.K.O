@@ -4802,7 +4802,7 @@ class SpeakerShadowRuntime:
         checkpoint_ms: int | None,
         terminal: bool,
         observation_kind: Literal[
-            "checkpoint", "completion_confirmation"
+            "checkpoint", "completion_confirmation", "terminal_short"
         ] = "checkpoint",
     ) -> bool | None:
         self._active_evaluation = (generation, candidate)
@@ -4943,6 +4943,34 @@ class SpeakerShadowRuntime:
                 checkpoint_ms=checkpoint_ms,
                 observation_kind=observation_kind,
                 sequence_no=sequence_no,
+                quality_summary_available=bool(
+                    score_context is not None
+                    and score_context.quality.outcome == "measured"
+                ),
+                rms=(
+                    score_context.quality.rms_milli / 1_000
+                    if score_context is not None
+                    and score_context.quality.rms_milli is not None
+                    else None
+                ),
+                peak=(
+                    score_context.quality.peak_milli / 1_000
+                    if score_context is not None
+                    and score_context.quality.peak_milli is not None
+                    else None
+                ),
+                near_silence=(
+                    score_context.quality.near_silence_ratio_milli / 1_000
+                    if score_context is not None
+                    and score_context.quality.near_silence_ratio_milli is not None
+                    else None
+                ),
+                clipping=(
+                    score_context.quality.clipping_ratio_milli / 1_000
+                    if score_context is not None
+                    and score_context.quality.clipping_ratio_milli is not None
+                    else None
+                ),
             )
             if not self._publish_evidence(observation, token=token):
                 return blocked_at_any_threshold
@@ -5047,7 +5075,10 @@ class SpeakerShadowRuntime:
         token: _CandidateToken,
         audio_ms: int,
         checkpoint_ms: int | None,
-        observation_kind: Literal["checkpoint", "completion_confirmation"],
+        observation_kind: Literal[
+            "checkpoint", "completion_confirmation", "terminal_short"
+        ],
+        unavailable_reason: Literal["unsupported", "failure"] = "failure",
     ) -> None:
         """Publish one explicit ordered fail-open fact after score failure."""
 
@@ -5068,6 +5099,7 @@ class SpeakerShadowRuntime:
             observation_kind=observation_kind,
             sequence_no=sequence_no,
             evidence_available=False,
+            unavailable_reason=unavailable_reason,
         )
         self._publish_evidence(unavailable, token=token)
 
@@ -5403,9 +5435,56 @@ class SpeakerShadowRuntime:
             and buffer.audio_ms > confirmation_checkpoint_ms
             and buffer.audio_ms < explicit_checkpoints[buffer.next_checkpoint_index]
         )
-        if should_confirm:
+        terminal_short_requested = (
+            buffer is not None
+            and buffer.token is marker.token
+            and self._identity_is_current(
+                marker.generation,
+                marker.candidate,
+                marker.token,
+            )
+            and marker.candidate.scope
+            in self._config.terminal_short_evaluation_scopes
+            and buffer.next_checkpoint_index == 0
+            and 0 < buffer.audio_ms < self._config.minimum_audio_ms
+        )
+        if (
+            terminal_short_requested
+            and buffer is not None
+            and buffer.sample_count < self._config.terminal_short_minimum_samples
+        ):
+            self._publish_unavailable_observation(
+                generation=marker.generation,
+                candidate=marker.candidate,
+                token=marker.token,
+                audio_ms=buffer.audio_ms,
+                checkpoint_ms=None,
+                observation_kind="terminal_short",
+                unavailable_reason="unsupported",
+            )
+            self._buffers.pop(marker.candidate, None)
+            self._wipe_bytearray(buffer.pcm16)
+            self._finalize_candidate(
+                marker.candidate,
+                "insufficient",
+                token=marker.token,
+            )
+            self._record_token_finish(marker.token)
+            self._enqueue_completion(marker, terminal_reason="insufficient")
+            return
+        should_evaluate_terminal_short = terminal_short_requested
+        if should_confirm or should_evaluate_terminal_short:
             assert buffer is not None
-            assert confirmation_checkpoint_ms is not None
+            evaluation_kind: Literal[
+                "completion_confirmation", "terminal_short"
+            ] = (
+                "completion_confirmation" if should_confirm else "terminal_short"
+            )
+            evaluation_checkpoint_ms = (
+                confirmation_checkpoint_ms if should_confirm else None
+            )
+            if should_confirm:
+                assert evaluation_checkpoint_ms is not None
             candidate_pcm = bytearray(buffer.pcm16)
             audio_ms = buffer.audio_ms
             sample_rate_hz = buffer.sample_rate_hz
@@ -5418,9 +5497,9 @@ class SpeakerShadowRuntime:
                         pcm16=candidate_pcm,
                         sample_rate_hz=sample_rate_hz,
                         audio_ms=audio_ms,
-                        checkpoint_ms=confirmation_checkpoint_ms,
+                        checkpoint_ms=evaluation_checkpoint_ms,
                         terminal=True,
-                        observation_kind="completion_confirmation",
+                        observation_kind=evaluation_kind,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -5442,7 +5521,13 @@ class SpeakerShadowRuntime:
                     self._buffers.pop(marker.candidate, None)
                 self._wipe_bytearray(buffer.pcm16)
 
-            if marker.generation != self._generation or self._closed:
+            finalized_after_evaluation = self._finalized.get(marker.candidate)
+            if (
+                marker.generation != self._generation
+                or self._closed
+                or finalized_after_evaluation is None
+                or finalized_after_evaluation.token is not marker.token
+            ):
                 self._abandon_completion(marker.token)
                 return
             terminal_reason = marker.token.terminal_reason

@@ -24,8 +24,18 @@ from .asset_manifest import (
 
 CAMPPLUS_EMBEDDING_DIM = 192
 CAMPPLUS_MINIMUM_SAMPLES = 24_000
-_FRAME_LENGTH = 400
+CAMPPLUS_FEATURE_MINIMUM_SAMPLES = 400
+_FRAME_LENGTH = CAMPPLUS_FEATURE_MINIMUM_SAMPLES
 _FRAME_SHIFT = 160
+# The pinned graph produces non-finite output for one or two frontend frames.
+# The offline real-model probe verifies that three frames (720 raw samples) are
+# the first finite, non-zero execution point. This is a capability boundary,
+# not evidence that a 45 ms speaker embedding is identity-reliable.
+CAMPPLUS_EXECUTABLE_MINIMUM_FRAMES = 3
+CAMPPLUS_EXECUTABLE_MINIMUM_SAMPLES = (
+    _FRAME_LENGTH
+    + (CAMPPLUS_EXECUTABLE_MINIMUM_FRAMES - 1) * _FRAME_SHIFT
+)
 _PADDED_FRAME_LENGTH = 512
 _MEL_BIN_COUNT = 80
 _PREEMPHASIS_COEFFICIENT = np.float32(0.97)
@@ -301,6 +311,45 @@ class CampPlusEmbeddingModel:
         *,
         sample_rate_hz: int,
     ) -> np.ndarray:
+        """Embed production PCM under the existing 1.5 second guard."""
+
+        self._validate_pcm16(pcm16, sample_rate_hz=sample_rate_hz)
+        if len(pcm16) // 2 < CAMPPLUS_MINIMUM_SAMPLES:
+            raise ValueError("pcm_too_short")
+        return self._embedding_from_validated_pcm16(
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+        )
+
+    def probe_short_input_embedding_from_pcm16(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+    ) -> np.ndarray:
+        """Probe raw short-input model capability outside production flows.
+
+        This deliberately named entry point is absent from the speaker backend
+        protocol. It consumes the exact PCM supplied by the caller without
+        silence padding, repetition, or concatenation. A finite embedding only
+        establishes that the frontend and pinned ONNX graph can execute; it
+        says nothing about speaker-identity reliability at this duration.
+        """
+
+        self._validate_pcm16(pcm16, sample_rate_hz=sample_rate_hz)
+        if len(pcm16) // 2 < CAMPPLUS_FEATURE_MINIMUM_SAMPLES:
+            raise ValueError("pcm_below_feature_minimum")
+        return self._embedding_from_validated_pcm16(
+            pcm16,
+            sample_rate_hz=sample_rate_hz,
+        )
+
+    def _validate_pcm16(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+    ) -> None:
         with self._lifecycle_lock:
             session = self._session
             closed = self._closed
@@ -310,8 +359,18 @@ class CampPlusEmbeddingModel:
             raise ValueError("pcm_invalid")
         if sample_rate_hz != CAMPPLUS_SAMPLE_RATE_HZ:
             raise ValueError("sample_rate_mismatch")
-        if len(pcm16) // 2 < CAMPPLUS_MINIMUM_SAMPLES:
-            raise ValueError("pcm_too_short")
+
+    def _embedding_from_validated_pcm16(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+    ) -> np.ndarray:
+        with self._lifecycle_lock:
+            session = self._session
+            closed = self._closed
+        if closed or session is None:
+            raise RuntimeError("model_not_loaded")
 
         features: np.ndarray | None = None
         raw_embedding: np.ndarray | None = None
@@ -333,6 +392,14 @@ class CampPlusEmbeddingModel:
                 pcm16,
                 sample_rate_hz=sample_rate_hz,
             )
+            if (
+                features.ndim != 2
+                or features.shape[1] != _MEL_BIN_COUNT
+                or features.shape[0] < 1
+            ):
+                raise ValueError("features_shape")
+            if not np.isfinite(features).all():
+                raise ValueError("features_non_finite")
             outputs = session.run(
                 ["embedding"],
                 {"x": features[np.newaxis, :, :]},
@@ -402,10 +469,14 @@ class CampPlusSpeakerShadowBackend:
         *,
         asset_dir: Path | None = None,
         model_factory: Callable[[], Any] | None = None,
+        allow_short_input: bool = False,
     ) -> None:
+        if type(allow_short_input) is not bool:
+            raise ValueError("allow_short_input_invalid")
         self._reference = _ZeroizableEmbedding(reference_embedding)
         self._asset_dir = Path(asset_dir) if asset_dir is not None else None
         self._model_factory = model_factory
+        self._allow_short_input = allow_short_input
         self._model: Any | None = None
         self._closed = False
 
@@ -445,10 +516,18 @@ class CampPlusSpeakerShadowBackend:
         candidate: np.ndarray | None = None
         reference: np.ndarray | None = None
         try:
-            raw_candidate = model.embedding_from_pcm16(
-                pcm16,
-                sample_rate_hz=sample_rate_hz,
-            )
+            if self._allow_short_input:
+                raw_candidate = (
+                    model.probe_short_input_embedding_from_pcm16(
+                        pcm16,
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                )
+            else:
+                raw_candidate = model.embedding_from_pcm16(
+                    pcm16,
+                    sample_rate_hz=sample_rate_hz,
+                )
             candidate = np.array(raw_candidate, dtype=np.float32, copy=True)
             if candidate.shape != (CAMPPLUS_EMBEDDING_DIM,):
                 raise ValueError("embedding_shape")
@@ -489,9 +568,13 @@ class CampPlusBackendFactory:
         reference_embedding: np.ndarray,
         *,
         asset_dir: Path | None = None,
+        allow_short_input: bool = False,
     ) -> None:
+        if type(allow_short_input) is not bool:
+            raise ValueError("allow_short_input_invalid")
         self._reference = _ZeroizableEmbedding(reference_embedding)
         self._asset_dir = Path(asset_dir) if asset_dir is not None else None
+        self._allow_short_input = allow_short_input
         self._closed = False
 
     def __call__(self) -> CampPlusSpeakerShadowBackend:
@@ -502,6 +585,7 @@ class CampPlusBackendFactory:
             return CampPlusSpeakerShadowBackend(
                 reference,
                 asset_dir=self._asset_dir,
+                allow_short_input=self._allow_short_input,
             )
         finally:
             _wipe_array(reference)

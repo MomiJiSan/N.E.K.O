@@ -21,6 +21,7 @@ from main_logic.voice_turn.contracts import (
 
 from .._provider_events import ProviderAudioRange
 from ..failure_diagnostics import AudioFailureContext
+from ..provider_state_diagnostics import trace_state_change, observe_retirement_failure, state_change
 from .config import SmartTurnConfig
 from .coordinator import CoordinatorState, TurnCoordinator
 from .detector import (
@@ -2364,6 +2365,10 @@ class DetectorRuntime:
                 smart_turn_required=True,
             )
 
+    def set_provider_state_diagnostic_callback(self, callback) -> None:
+        """Observer is bound to the originating session, including detached close."""
+        self._provider_state_diagnostic_callback = callback
+
     def set_pipeline_diagnostic_callback(self, callback) -> None:
         """Install the session-owned observer; provider endpointing needs no adapter."""
         if self._semantic_adapter is not None:
@@ -2561,6 +2566,7 @@ class DetectorRuntime:
             accounting_receipt=accounting_receipt,
         )
 
+    @trace_state_change("evidence_abandon")
     def _abandon_provider_speaker_evidence_locked(
         self,
         state: _ProviderSpeakerEvidenceState,
@@ -2593,6 +2599,7 @@ class DetectorRuntime:
         ] += 1
         return retired
 
+    @trace_state_change("evidence_retirement")
     def _record_provider_speaker_evidence_retirement(
         self, state: _ProviderSpeakerEvidenceState, *, reason: str,
     ) -> ProviderSpeakerEvidenceSettlement:
@@ -3011,8 +3018,12 @@ class DetectorRuntime:
                         shadow.abandon_candidate(coverage.candidate)
                     except Exception:
                         pass
-            self._provider_speaker_evidence_state = None
-            self._record_provider_speaker_evidence_retirement(state, reason="finished")
+            with state_change(
+                self, operation="evidence_finish", initiator="finish_provider_speaker_evidence_lease",
+                reason="candidate_finished",
+            ):
+                self._provider_speaker_evidence_state = None
+                self._record_provider_speaker_evidence_retirement(state, reason="finished")
             self._speaker_rejection_prepare_diagnostics[
                 "provider_speaker_evidence_lease_finished_count"
             ] += 1
@@ -3782,9 +3793,12 @@ class DetectorRuntime:
             return
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    @trace_state_change("segment_state_clear")
     def _clear_provider_segment_state(
         self,
         *,
+        initiator: str = "unspecified",
+        reason: str = "segment_state_clear",
         preserve_ordered_mode: bool = False,
         preserve_last_sequence: bool = False,
         preserve_audio_cursor: bool = False,
@@ -4158,6 +4172,7 @@ class DetectorRuntime:
                     # A forged or cross-epoch value cannot identify a safe
                     # target. Poison only this unresolved namespace.
                     self._clear_provider_segment_state(
+                        initiator="retire_provider_speaker_boundary_unknown", reason="boundary_unknown",
                         preserve_ordered_mode=True,
                         preserve_last_sequence=True,
                         preserve_audio_cursor=True,
@@ -4200,6 +4215,7 @@ class DetectorRuntime:
                         # generation indicate an internal mapping conflict;
                         # no single entry can be trusted as the target.
                         self._clear_provider_segment_state(
+                            initiator="retire_provider_speaker_boundary_unknown", reason="boundary_unknown",
                             preserve_ordered_mode=True,
                             preserve_last_sequence=True,
                             preserve_audio_cursor=True,
@@ -4211,6 +4227,7 @@ class DetectorRuntime:
             else:
                 # A non-contract value cannot carry target identity.
                 self._clear_provider_segment_state(
+                    initiator="retire_provider_speaker_boundary_unknown", reason="boundary_unknown",
                     preserve_ordered_mode=True,
                     preserve_last_sequence=True,
                     preserve_audio_cursor=True,
@@ -4243,7 +4260,7 @@ class DetectorRuntime:
             self._sealed_provider_micro_event = None
             self._provider_speaker_sealed_through_sequence_no = None
             self._provider_discarded_through_sequence_no = None
-            self._clear_provider_segment_state()
+            self._clear_provider_segment_state(initiator="reset_provider_audio_timeline", reason="transport_timeline_reset")
             # Rotate the private owner as defense in depth: even if a stale
             # PCM-free snapshot escapes its bounded table, it cannot authorize
             # speaker suppression in the replacement Provider timeline.
@@ -5334,7 +5351,7 @@ class DetectorRuntime:
             self._sealed_provider_candidate_rejection = None
             self._provider_micro_event_aggregate = None
             self._sealed_provider_micro_event = None
-            self._clear_provider_segment_state()
+            self._clear_provider_segment_state(initiator="invalidate", reason="token_invalidated")
             self._provider_speaker_sealed_through_sequence_no = None
             self._deferred_completion_identity_advanced = False
             self._provider_discarded_through_sequence_no = None
@@ -5343,7 +5360,7 @@ class DetectorRuntime:
             # fresh epoch's first candidate.
             self._defer_turn_complete = False
             self._deferred_turn_complete = False
-            self._reset_speaker_shadow_identity()
+            self._reset_speaker_shadow_identity(initiator="invalidate", reason="token_invalidated")
             speaker_shadow = self._speaker_shadow
             adapter = self._semantic_adapter
             if adapter is not None:
@@ -5656,7 +5673,7 @@ class DetectorRuntime:
                 if not self._available:
                     self._provider_micro_event_aggregate = None
                     self._sealed_provider_micro_event = None
-                    self._clear_provider_segment_state()
+                    self._clear_provider_segment_state(initiator="feed", reason="vad_load_failed")
                     if not self._speaker_rejection_prepare_diagnostics[
                         "detector_vad_load_exception_count"
                     ]:
@@ -5691,7 +5708,7 @@ class DetectorRuntime:
                 self._available = False
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
-                self._clear_provider_segment_state()
+                self._clear_provider_segment_state(initiator="feed", reason="vad_feed_failed")
                 self._speaker_rejection_prepare_diagnostics[
                     "detector_gate_exception_count"
                 ] += 1
@@ -6001,6 +6018,7 @@ class DetectorRuntime:
             if not issued or not self.validate_provider_speaker_evidence_settlement(
                 issued[1], lease=speaker_evidence_lease,
             ):
+                observe_retirement_failure(self, speaker_evidence_lease, issued)
                 self._record_provider_audio_failure(failure_context, "accounting_retirement_unproven")
                 return None
             settlement = issued[1]
@@ -7210,6 +7228,7 @@ class DetectorRuntime:
             self._candidate_generation += 1
             self._provider_micro_event_aggregate = None
             self._clear_provider_segment_state(
+                initiator="discard_provider_successor", reason="successor_discarded",
                 preserve_ordered_mode=True,
                 preserve_last_sequence=True,
                 preserve_audio_cursor=True,
@@ -7373,7 +7392,7 @@ class DetectorRuntime:
             )
         except asyncio.QueueFull:
             self._detector_epoch += 1
-            self._reset_speaker_shadow_identity()
+            self._reset_speaker_shadow_identity(initiator="submit_audio", reason="semantic_queue_overflow")
             speaker_shadow = self._speaker_shadow
             self._candidate_generation = 0
             self._candidate_open = False
@@ -7388,7 +7407,7 @@ class DetectorRuntime:
             self._sealed_provider_candidate_rejection = None
             self._provider_micro_event_aggregate = None
             self._sealed_provider_micro_event = None
-            self._clear_provider_segment_state()
+            self._clear_provider_segment_state(initiator="submit_audio", reason="semantic_queue_overflow")
             self._provider_speaker_sealed_through_sequence_no = None
             self._provider_discarded_through_sequence_no = None
             self._defer_turn_complete = False
@@ -7492,7 +7511,7 @@ class DetectorRuntime:
                 if self._closed:
                     return
                 self._detector_epoch += 1
-                self._reset_speaker_shadow_identity()
+                self._reset_speaker_shadow_identity(initiator="reset", reason="detector_reset")
                 speaker_shadow = self._speaker_shadow
                 self._candidate_generation = 0
                 self._sequence_no = 0
@@ -7508,7 +7527,7 @@ class DetectorRuntime:
                 self._sealed_provider_candidate_rejection = None
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
-                self._clear_provider_segment_state()
+                self._clear_provider_segment_state(initiator="reset", reason="detector_reset")
                 self._provider_speaker_sealed_through_sequence_no = None
                 self._provider_discarded_through_sequence_no = None
                 self._speech_active = False
@@ -7655,6 +7674,8 @@ class DetectorRuntime:
                             ):
                                 operation.evidence_settlement = issued[1]
                     self._clear_provider_segment_state(
+                        initiator="replace_speaker_verifier",
+                        reason="speaker_verifier_replaced",
                         preserve_ordered_mode=True,
                         preserve_last_sequence=True,
                         preserve_audio_cursor=True,
@@ -7809,7 +7830,7 @@ class DetectorRuntime:
                     return
                 self._closed = True
                 self._detector_epoch += 1
-                self._reset_speaker_shadow_identity()
+                self._reset_speaker_shadow_identity(initiator="close_impl", reason="detector_closed")
                 speaker_shadow = self._speaker_shadow
                 self._candidate_generation = 0
                 self._candidate_open = False
@@ -7823,7 +7844,7 @@ class DetectorRuntime:
                 self._sealed_provider_candidate_rejection = None
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
-                self._clear_provider_segment_state()
+                self._clear_provider_segment_state(initiator="close_impl", reason="detector_closed")
                 self._provider_speaker_sealed_through_sequence_no = None
                 self._provider_discarded_through_sequence_no = None
                 watch_task, self._failure_watch_task = self._failure_watch_task, None
@@ -7972,7 +7993,10 @@ class DetectorRuntime:
         except Exception:
             return
 
-    def _reset_speaker_shadow_identity(self) -> None:
+    @trace_state_change("speaker_identity_clear")
+    def _reset_speaker_shadow_identity(
+        self, *, initiator: str = "unspecified", reason: str = "speaker_identity_clear",
+    ) -> None:
         self._speaker_shadow_generation += 1
         self._speaker_shadow_candidate = None
         self._provider_speaker_evidence_generation += 1
@@ -8029,7 +8053,7 @@ class DetectorRuntime:
                     self._available = False
                     return
                 self._detector_epoch += 1
-                self._reset_speaker_shadow_identity()
+                self._reset_speaker_shadow_identity(initiator="watch_semantic_failure", reason="semantic_failure")
                 self._candidate_generation = 0
                 self._candidate_open = False
                 self._policy_event_candidate = None
@@ -8042,7 +8066,7 @@ class DetectorRuntime:
                 self._sealed_provider_candidate_rejection = None
                 self._provider_micro_event_aggregate = None
                 self._sealed_provider_micro_event = None
-                self._clear_provider_segment_state()
+                self._clear_provider_segment_state(initiator="watch_semantic_failure", reason="semantic_failure")
                 self._provider_speaker_sealed_through_sequence_no = None
                 self._provider_discarded_through_sequence_no = None
                 self._smart_turn_readiness = SmartTurnReadiness.FAILED

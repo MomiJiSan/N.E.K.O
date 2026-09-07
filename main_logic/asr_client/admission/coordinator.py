@@ -62,6 +62,7 @@ from .contracts import (
     SpeakerHigh,
     SpeakerLow,
     SpeakerUnavailable,
+    SpeakerUnavailableReason,
     VoiceTurnAdmissionRecord,
     TurnOpened,
 )
@@ -1126,6 +1127,21 @@ class VoiceTurnAdmissionCoordinator:
                     capture_through_sequence_no=(
                         reduced.capture_through_sequence_no
                     ),
+                    speaker_unavailable_reason=(
+                        reduced.terminal_event.reason
+                        if reduced.state is SpeakerLeaseState.UNAVAILABLE
+                        and isinstance(
+                            reduced.terminal_event,
+                            SpeakerLeaseUnavailable,
+                        )
+                        else SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE
+                        if reduced.state is SpeakerLeaseState.UNAVAILABLE
+                        and isinstance(
+                            reduced.terminal_event,
+                            SpeakerLeaseCaptureClosed,
+                        )
+                        else child.speaker_unavailable_reason
+                    ),
                 )
                 exact.evidence = reduced
                 exact.child_logical_revision = updated_child.logical_revision
@@ -1495,6 +1511,7 @@ class VoiceTurnAdmissionCoordinator:
                     in {
                         SpeakerCheckpointKind.SECOND,
                         SpeakerCheckpointKind.COMPLETION_CONFIRMATION,
+                        SpeakerCheckpointKind.TERMINAL_SHORT,
                     }
                 )
                 or (
@@ -1540,7 +1557,19 @@ class VoiceTurnAdmissionCoordinator:
                 SpeakerLeaseState.MIXED_DENY_LATCHED,
             }:
                 next_sequence = child.last_speaker_sequence_no + 1
-                if child.evidence_state is EvidenceState.FIRST_LOW:
+                if (
+                    isinstance(lease.terminal_event, SpeakerLeaseLow)
+                    and lease.terminal_event.checkpoint_kind
+                    is SpeakerCheckpointKind.TERMINAL_SHORT
+                ):
+                    events = (
+                        SpeakerLow(
+                            lease.candidate,
+                            next_sequence,
+                            SpeakerCheckpointKind.TERMINAL_SHORT,
+                        ),
+                    )
+                elif child.evidence_state is EvidenceState.FIRST_LOW:
                     events = (
                         SpeakerLow(
                             lease.candidate,
@@ -1573,6 +1602,19 @@ class VoiceTurnAdmissionCoordinator:
                     SpeakerUnavailable(
                         lease.candidate,
                         child.last_speaker_sequence_no + 1,
+                        (
+                            lease.terminal_event.reason
+                            if isinstance(
+                                lease.terminal_event,
+                                SpeakerLeaseUnavailable,
+                            )
+                            else SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE
+                            if isinstance(
+                                lease.terminal_event,
+                                SpeakerLeaseCaptureClosed,
+                            )
+                            else SpeakerUnavailableReason.UNAVAILABLE
+                        ),
                     ),
                 )
             elif lease.state is SpeakerLeaseState.ABANDONED:

@@ -18,7 +18,12 @@ from main_logic.asr_client._provider_events import (
     ProviderUtteranceStartedNotification,
 )
 from main_logic.asr_client.admission.contracts import (
-    CaptureClosed, SpeakerCheckpointKind, SpeakerHigh, SpeakerLow,
+    CaptureClosed,
+    SpeakerCheckpointKind,
+    SpeakerHigh,
+    SpeakerLeaseHigh,
+    SpeakerLeaseLow,
+    SpeakerLow,
 )
 from main_logic.voice_turn.contracts import AsrSubmitStatus
 from tests.unit.asr_client.test_candidate_rejection_runtime import (
@@ -89,6 +94,66 @@ async def test_completed_score_keeps_original_range_at_short_exact_boundary(scor
         assert old_score_token.scored_sample_count >= scored
         assert detector._provider_audio_sample_cursor_16k == 25_600
         assert sum(len(c.args[0]) // 2 for c in session.stream_audio.await_args_list) == 25_600
+        session.close.assert_not_awaited()
+    finally:
+        await _close_stack(core)
+
+
+async def test_real_exact_first_low_then_second_high_forwards_final():
+    core, runtime, detector, shadow, lifecycle, session, turn = (
+        await _active_real_stack(score=0.20)
+    )
+    key = ProviderUtteranceKey(0, 0, 1)
+    try:
+        core.continuity_score_host.ready.set()
+        await _feed(runtime, turn, 1, 16)
+        assert await runtime._handle_provider_utterance_started(
+            ProviderUtteranceStartedNotification(0, 0, 1, audio_start_sample_16k=0),
+            runtime._asr_session_epoch,
+        )
+        await shadow.wait_idle()
+        ledger = runtime._asr_provider_speaker_key_ledgers[key]
+        assert tuple(type(event) for event in ledger.events) == (SpeakerLeaseLow,)
+
+        core.continuity_score_host.backend.value = 0.95
+        await _feed(runtime, turn, 17, 30)
+        await shadow.wait_idle()
+        assert tuple(type(event) for event in ledger.events) == (
+            SpeakerLeaseLow,
+            SpeakerLeaseHigh,
+        )
+        recovered = ledger.events[-1]
+        assert isinstance(recovered, SpeakerLeaseHigh)
+        assert recovered.checkpoint_kind is SpeakerCheckpointKind.SECOND
+        assert recovered.audio_ms == 3_000
+
+        await runtime._handle_provider_endpoint_notification(
+            _boundary(key, 0, 48_000),
+            runtime._asr_session_epoch,
+        )
+        await shadow.wait_idle()
+        transaction = runtime._asr_provider_exact_intervals[key]
+        await runtime._handle_provider_endpoint_notification(
+            _boundary(key, 0, 48_000, "ordered"),
+            runtime._asr_session_epoch,
+        )
+        await runtime._handle_provider_final(
+            key,
+            "synthetic recovered owner sentence",
+            runtime._asr_session_epoch,
+            "qwen",
+        )
+        await _settle(core, runtime)
+
+        assert transaction.resolved_disposition is not None
+        assert transaction.resolved_disposition.value == "forward"
+        assert core.handle_input_transcript.await_count == 1
+        assert core.handle_input_transcript.await_args.args[0] == (
+            "synthetic recovered owner sentence"
+        )
+        core.session.create_response.assert_awaited_once_with(
+            "synthetic recovered owner sentence"
+        )
         session.close.assert_not_awaited()
     finally:
         await _close_stack(core)

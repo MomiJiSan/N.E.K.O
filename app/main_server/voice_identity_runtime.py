@@ -19,6 +19,7 @@ from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierInstallReceipt,
     SpeakerVerifierSpec,
 )
+from main_logic.asr_client.provider_state_diagnostics import speaker_installation_trace
 from main_logic.asr_client.speaker_shadow.campplus import CampPlusEmbeddingModel
 from main_logic.voice_identity.profile import SpeakerProfile
 from main_logic.voice_identity_service.asr_composition import (
@@ -174,7 +175,8 @@ class OwnerVoiceRuntimeRegistry:
                     self._attach_pending.discard(manager)
                     return VoiceIdentityActivationResult.READY
                 self._detach_pending.pop(manager, None)
-                result = await self._attach_manager_bounded(manager, activation)
+                with speaker_installation_trace("registry_register", "pending_manager_attach"):
+                    result = await self._attach_manager_bounded(manager, activation)
                 if result is not VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                     self._record_attach_result(manager, result)
                     return result
@@ -213,7 +215,8 @@ class OwnerVoiceRuntimeRegistry:
                 activation = target_activation
                 if activation is not None:
                     self._detach_pending.pop(manager, None)
-                    result = await self._attach_manager_bounded(manager, activation)
+                    with speaker_installation_trace("registry_register", "new_manager_attach"):
+                        result = await self._attach_manager_bounded(manager, activation)
                     if result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                         self._attach_pending.add(manager)
                         self._ensure_attach_watchdog()
@@ -258,10 +261,11 @@ class OwnerVoiceRuntimeRegistry:
             detach_generation = str(uuid.uuid4())
             cancellation: asyncio.CancelledError | None = None
             try:
-                detached = await asyncio.wait_for(
-                    self._detach_manager(manager, detach_generation),
-                    timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
-                )
+                with speaker_installation_trace("registry_unregister", "manager_detach"):
+                    detached = await asyncio.wait_for(
+                        self._detach_manager(manager, detach_generation),
+                        timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
+                    )
             except asyncio.TimeoutError:
                 detached = False
             except asyncio.CancelledError as exc:
@@ -352,7 +356,8 @@ class OwnerVoiceRuntimeRegistry:
                 managers = tuple(self._managers)
                 for index, manager in enumerate(managers):
                     try:
-                        result = await self._detach_manager(manager, generation)
+                        with speaker_installation_trace("activation_prepare", "configuration_disable"):
+                            result = await self._detach_manager(manager, generation)
                     except asyncio.CancelledError:
                         for pending in managers[index:]:
                             self._detach_pending[pending] = generation
@@ -378,9 +383,11 @@ class OwnerVoiceRuntimeRegistry:
                 for manager in tuple(self._managers):
                     prepared.managers.append(manager)
                     if candidate is None:
-                        result = await self._detach_manager(manager, generation)
+                        with speaker_installation_trace("activation_prepare", "configuration_disable"):
+                            result = await self._detach_manager(manager, generation)
                     else:
-                        result = await self._attach_manager_bounded(manager, candidate)
+                        with speaker_installation_trace("activation_prepare", "configuration_replace"):
+                            result = await self._attach_manager_bounded(manager, candidate)
                     if result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                         self._count_installation("install_failed")
                         raise RuntimeError("speaker verifier preparation failed")
@@ -778,10 +785,11 @@ class OwnerVoiceRuntimeRegistry:
                         if call_timeout <= 0:
                             break
                         try:
-                            attached = await asyncio.wait_for(
-                                self._attach_manager(manager, activation),
-                                timeout=call_timeout,
-                            )
+                            with speaker_installation_trace("attach_watchdog", "pending_attach_retry"):
+                                attached = await asyncio.wait_for(
+                                    self._attach_manager(manager, activation),
+                                    timeout=call_timeout,
+                                )
                         except asyncio.TimeoutError:
                             continue
                         except asyncio.CancelledError:
@@ -1004,10 +1012,11 @@ class OwnerVoiceRuntimeRegistry:
                         if call_timeout <= 0:
                             break
                         try:
-                            detached = await asyncio.wait_for(
-                                self._detach_manager(manager, generation),
-                                timeout=call_timeout,
-                            )
+                            with speaker_installation_trace("detach_watchdog", "pending_detach_retry"):
+                                detached = await asyncio.wait_for(
+                                    self._detach_manager(manager, generation),
+                                    timeout=call_timeout,
+                                )
                         except asyncio.CancelledError:
                             if current is not None and current.cancelling():
                                 raise

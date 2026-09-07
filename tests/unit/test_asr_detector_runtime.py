@@ -16,6 +16,7 @@ from main_logic.asr_client.endpointing.detector_runtime import (
     DetectorRuntime,
     ProviderExactSpeakerIntervalReservation,
     ProviderSpeakerEvidenceAnchorStatus,
+    ProviderSpeakerEvidenceSettlementStatus,
     SmartTurnLease,
     SmartTurnReadiness,
     _AudioItem,
@@ -2320,6 +2321,86 @@ async def test_provider_audio_timeline_reset_abandons_stable_speaker_evidence() 
         assert not await detector.finish_provider_speaker_evidence_lease(evidence_lease)
         successor = await detector.ensure_provider_speaker_evidence_lease()
         assert successor is not None and successor != evidence_lease
+    finally:
+        await detector.close()
+
+
+async def test_verifier_replacement_retires_evidence_without_resetting_audio_timeline() -> (
+    None
+):
+    old_shadow = _StableEvidenceSpeakerShadowSpy()
+    new_shadow = _StableEvidenceSpeakerShadowSpy()
+    detector = DetectorRuntime(
+        vad=_Vad(),
+        gate=_Gate(),
+        provider_policy=_provider_endpoint_policy(),
+        speaker_shadow=old_shadow,
+    )
+    try:
+        _candidate, identity, _token = await _open_provider_candidate(
+            detector,
+            turn_id=1,
+        )
+        evidence_lease = await detector.ensure_provider_speaker_evidence_lease()
+        assert evidence_lease is not None
+        first = await detector.observe_provider_audio_ordered(
+            b"\x11\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=1,
+            split_before_audio=False,
+            speaker_evidence_lease=evidence_lease,
+        )
+        assert first is not None
+        before = (
+            detector._provider_audio_timeline_generation,
+            detector._provider_audio_sample_cursor_16k,
+            detector._provider_segment_last_sequence_no,
+        )
+
+        await detector.replace_speaker_verifier(
+            new_shadow,
+            owner_generation="owner-new",
+        )
+
+        settlement = await detector.confirm_provider_speaker_evidence_retirement(
+            evidence_lease
+        )
+        assert (
+            settlement.status
+            is ProviderSpeakerEvidenceSettlementStatus.ALREADY_RETIRED
+        )
+        assert detector.validate_provider_speaker_evidence_settlement(
+            settlement,
+            lease=evidence_lease,
+        )
+        assert old_shadow.abandoned == [evidence_lease.candidate]
+        assert (
+            detector._provider_audio_timeline_generation,
+            detector._provider_audio_sample_cursor_16k,
+            detector._provider_segment_last_sequence_no,
+        ) == before
+
+        accounted = await detector.observe_provider_audio_ordered(
+            b"\x12\x00" * 160,
+            sample_rate_hz=16_000,
+            identity=identity,
+            sequence_no=2,
+            split_before_audio=False,
+            evidence_complete=False,
+            speaker_evidence_lease=evidence_lease,
+            accounting_only=True,
+        )
+        assert accounted is not None
+        assert accounted.evidence_settlement is settlement
+        assert detector._provider_audio_sample_cursor_16k == before[1] + 160
+        assert detector._provider_segment_last_sequence_no == 2
+
+        timeline = detector._provider_audio_timeline_generation
+        assert await detector.reset_provider_audio_timeline()
+        assert detector._provider_audio_timeline_generation == timeline + 1
+        assert detector._provider_audio_sample_cursor_16k == 0
+        assert detector._provider_segment_last_sequence_no is None
     finally:
         await detector.close()
 

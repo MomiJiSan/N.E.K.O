@@ -7,6 +7,7 @@ import pytest
 
 from app.main_server.voice_identity_runtime import OwnerVoiceRuntimeRegistry
 from main_logic.asr_client import VoiceIdentityActivationResult as Result
+from main_logic.asr_client.provider_state_diagnostics import _installation_trace_fields
 from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierAuthorityState as AuthorityState,
     SpeakerVerifierInstallIdentity,
@@ -26,6 +27,7 @@ class _TypedManager:
         self.supported = True
         self.spec = None
         self.calls = []
+        self.installation_traces = []
         self.fail = False
         self.barrier = None
         self.entered = asyncio.Event()
@@ -35,6 +37,7 @@ class _TypedManager:
     async def set_speaker_verifier_spec(self, spec):
         self.spec = spec
         self.calls.append(spec)
+        self.installation_traces.append(_installation_trace_fields())
         self.entered.set()
         if self.barrier is not None:
             await self.barrier.wait()
@@ -63,6 +66,40 @@ class _TypedManager:
 
     async def set_voice_input_suppressed(self, reason, *, suppressed):
         pass
+
+
+@pytest.mark.asyncio
+async def test_registry_labels_attach_detach_and_watchdog_origins():
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=True,
+        restore_retry_interval_seconds=0.001,
+        restore_retry_timeout_seconds=0.1,
+    )
+    manager = _TypedManager()
+    first = _profile("first")
+    second = _profile("second")
+    try:
+        assert await registry.activate(first, "first") is Result.ACTIVATION_PENDING
+        assert await registry.register_manager(manager) is Result.READY
+        assert manager.installation_traces[-1]["installation_initiator"] == "registry_register"
+
+        assert await registry.activate(second, "second") is Result.READY
+        assert manager.installation_traces[-1]["installation_initiator"] == "activation_prepare"
+
+        registry._attach_pending.add(manager)
+        await registry._run_attach_watchdog()
+        assert manager.installation_traces[-1]["installation_initiator"] == "attach_watchdog"
+
+        await registry.unregister_manager(manager)
+        assert manager.installation_traces[-1]["installation_initiator"] == "registry_unregister"
+
+        registry._detach_pending[manager] = "retry"
+        await registry._run_detach_watchdog()
+        assert manager.installation_traces[-1]["installation_initiator"] == "detach_watchdog"
+    finally:
+        first.close()
+        second.close()
+        await registry.close()
 
 
 @pytest.mark.asyncio

@@ -116,6 +116,14 @@ class SpeakerCheckpointKind(StrEnum):
     FIRST = "first"
     SECOND = "second"
     COMPLETION_CONFIRMATION = "completion_confirmation"
+    TERMINAL_SHORT = "terminal_short"
+
+
+class SpeakerUnavailableReason(StrEnum):
+    UNAVAILABLE = "unavailable"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    UNSUPPORTED = "unsupported"
+    FAILURE = "failure"
 
 
 class SpeakerLeaseState(StrEnum):
@@ -285,12 +293,19 @@ class SpeakerLeaseLow:
 class SpeakerLeaseHigh:
     candidate: SpeakerShadowCandidateKey
     sequence_no: int
+    checkpoint_kind: SpeakerCheckpointKind | None = None
+    audio_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SpeakerLeaseUnavailable:
     candidate: SpeakerShadowCandidateKey
     sequence_no: int
+    reason: SpeakerUnavailableReason = SpeakerUnavailableReason.UNAVAILABLE
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not SpeakerUnavailableReason:
+            raise TypeError("reason must be SpeakerUnavailableReason")
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,12 +763,19 @@ class VoiceTurnAdmissionRecord:
     evidence_hold_enabled: bool = False
     evidence_hold: EvidenceHoldRecord | None = None
     evidence_order_blocked: bool = False
+    speaker_unavailable_reason: SpeakerUnavailableReason | None = None
 
     def __post_init__(self) -> None:
         if type(self.turn_token) is not VoiceTurnToken:
             raise TypeError("turn_token must be VoiceTurnToken")
         if type(self.evidence_hold_enabled) is not bool:
             raise TypeError("evidence_hold_enabled must be bool")
+        if self.speaker_unavailable_reason is not None and (
+            type(self.speaker_unavailable_reason) is not SpeakerUnavailableReason
+        ):
+            raise TypeError(
+                "speaker_unavailable_reason must be SpeakerUnavailableReason or None"
+            )
         if type(self.record_generation) is not int or self.record_generation < 1:
             raise ValueError("record_generation must be a positive integer")
         for name in (
@@ -860,12 +882,19 @@ class SpeakerLow:
 class SpeakerHigh:
     candidate: SpeakerShadowCandidateKey
     sequence_no: int
+    checkpoint_kind: SpeakerCheckpointKind | None = None
+    audio_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SpeakerUnavailable:
     candidate: SpeakerShadowCandidateKey
     sequence_no: int
+    reason: SpeakerUnavailableReason = SpeakerUnavailableReason.UNAVAILABLE
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not SpeakerUnavailableReason:
+            raise TypeError("reason must be SpeakerUnavailableReason")
 
 
 @dataclass(frozen=True, slots=True)

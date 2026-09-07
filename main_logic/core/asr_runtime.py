@@ -38,6 +38,11 @@ from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierInstallReceipt,
     SpeakerVerifierSpec,
 )
+from main_logic.asr_client.provider_state_diagnostics import (
+    emit_speaker_installation_event,
+    installation_revision_label,
+    trace_speaker_installation_call,
+)
 from main_logic.voice_input import (
     BuiltinVoiceInputConsumer,
     VoiceInputConsumerCapabilities,
@@ -1495,16 +1500,38 @@ class AsrRuntimeMixin:
             return replace(receipt, outcome=SpeakerVerifierInstallOutcome.FAILED)
         return receipt
 
+    @trace_speaker_installation_call("set_speaker_verifier_spec", "configuration_request")
     async def set_speaker_verifier_spec(
-        self, spec: SpeakerVerifierSpec | None,
+        self,
+        spec: SpeakerVerifierSpec | None,
+        *,
+        diagnostic_initiator: str = "set_speaker_verifier_spec",
+        diagnostic_reason: str = "configuration_request",
     ) -> SpeakerVerifierInstallReceipt:
         self._ensure_asr_runtime_state()
-        if getattr(self, "_speaker_verifier_spec", None) is not spec:
+        spec_changed = getattr(self, "_speaker_verifier_spec", None) is not spec
+        emit_speaker_installation_event(
+            self._asr_runtime,
+            phase="request",
+            reason="spec_changed" if spec_changed else "spec_reused",
+            spec_changed=spec_changed,
+            requested_enabled=bool(spec is not None and spec.requested_enabled),
+            activation_revision=installation_revision_label(
+                spec.activation_revision if spec is not None else None
+            ),
+        )
+        if spec_changed:
             self._retire_core_speaker_installation()
             self._speaker_verifier_spec = spec
         return await self.reconcile_speaker_verifier()
 
-    async def reconcile_speaker_verifier(self) -> SpeakerVerifierInstallReceipt:
+    @trace_speaker_installation_call("reconcile_speaker_verifier", "explicit_reconcile")
+    async def reconcile_speaker_verifier(
+        self,
+        *,
+        diagnostic_initiator: str = "reconcile_speaker_verifier",
+        diagnostic_reason: str = "explicit_reconcile",
+    ) -> SpeakerVerifierInstallReceipt:
         """One owner per manager, with queued callers coalescing to latest spec."""
         self._ensure_asr_runtime_state()
         lock = getattr(self, "_speaker_verifier_reconcile_lock", None)
@@ -1512,10 +1539,30 @@ class AsrRuntimeMixin:
             lock = asyncio.Lock()
             self._speaker_verifier_reconcile_lock = lock
         requested = getattr(self, "_speaker_verifier_spec", None)
+        emit_speaker_installation_event(
+            self._asr_runtime,
+            phase="entry",
+            reason="reconcile_requested",
+            requested_enabled=bool(requested is not None and requested.requested_enabled),
+            activation_revision=installation_revision_label(
+                requested.activation_revision if requested is not None else None
+            ),
+            participating=self.speaker_verifier_participating,
+            route_mode=getattr(self, "_asr_route_mode", "blocked"),
+            detector_present=getattr(self._asr_runtime, "_asr_detector", None) is not None,
+        )
         async with lock:
             spec = getattr(self, "_speaker_verifier_spec", None)
             if requested is not spec:
+                emit_speaker_installation_event(
+                    self._asr_runtime,
+                    phase="result",
+                    reason="request_superseded",
+                    decision="stale_coalesced",
+                    outcome=SpeakerVerifierInstallOutcome.STALE.value,
+                )
                 return SpeakerVerifierInstallReceipt(None, SpeakerVerifierInstallOutcome.STALE)
+            status = None
             if spec is not None and spec.requested_enabled and spec.revocable_authority.state is not SpeakerVerifierAuthorityState.REVOKED:
                 status = self.speaker_verifier_installation_status(spec.activation_revision)
                 if status.outcome in {
@@ -1523,22 +1570,97 @@ class AsrRuntimeMixin:
                     SpeakerVerifierInstallOutcome.DEFERRED_ROUTE,
                     SpeakerVerifierInstallOutcome.UNSUPPORTED_ROUTE,
                 } and (status.outcome is not SpeakerVerifierInstallOutcome.DEFERRED_ROUTE or not self.speaker_verifier_participating):
+                    decision = (
+                        "reuse_installed"
+                        if status.outcome is SpeakerVerifierInstallOutcome.INSTALLED
+                        else "defer_inactive"
+                        if status.outcome is SpeakerVerifierInstallOutcome.DEFERRED_ROUTE
+                        else "unsupported_route"
+                    )
+                    emit_speaker_installation_event(
+                        self._asr_runtime,
+                        phase="result",
+                        reason=decision,
+                        decision=decision,
+                        outcome=status.outcome.value,
+                        cleanup_pending=status.cleanup_pending,
+                    )
                     return status
             fence = self._speaker_installation_fence()
+            current_receipt = getattr(self, "_speaker_verifier_install_receipt", None)
+            decision = (
+                "revoke_requested"
+                if spec is None or not spec.requested_enabled
+                else "revoke_authority"
+                if spec.revocable_authority.state is SpeakerVerifierAuthorityState.REVOKED
+                else "install_degraded"
+                if status is not None and status.outcome is SpeakerVerifierInstallOutcome.FAILED
+                else "install_stale"
+                if status is not None and status.outcome is SpeakerVerifierInstallOutcome.STALE
+                else "install_deferred_route_ready"
+                if status is not None and status.outcome is SpeakerVerifierInstallOutcome.DEFERRED_ROUTE
+                else "install_missing"
+                if current_receipt is None
+                else "install_fence_changed"
+                if getattr(self, "_speaker_verifier_install_fence", None) != fence
+                else "install_required"
+            )
+            emit_speaker_installation_event(
+                self._asr_runtime,
+                phase="decision",
+                reason=decision,
+                decision=decision,
+                outcome="started",
+            )
             identity = self._asr_runtime.create_speaker_verifier_install_identity(
                 manager_identity=id(self),
                 route_generation=self._asr_route_operation_generation,
                 activation_revision=spec.activation_revision if spec is not None else "disabled",
             )
-            receipt = await self._asr_runtime.install_speaker_verifier(spec, identity)
+            try:
+                receipt = await self._asr_runtime.install_speaker_verifier(spec, identity)
+            except asyncio.CancelledError:
+                emit_speaker_installation_event(
+                    self._asr_runtime,
+                    phase="result",
+                    reason="install_cancelled",
+                    decision=decision,
+                    outcome="cancelled",
+                )
+                raise
+            except BaseException:
+                emit_speaker_installation_event(
+                    self._asr_runtime,
+                    phase="result",
+                    reason="install_raised",
+                    decision=decision,
+                    outcome="failed",
+                )
+                raise
             if (
                 getattr(self, "_speaker_verifier_spec", None) is not spec
                 or fence != self._speaker_installation_fence()
             ):
                 self._asr_runtime.retire_speaker_verifier_authority()
+                emit_speaker_installation_event(
+                    self._asr_runtime,
+                    phase="result",
+                    reason="post_install_fence_changed",
+                    decision=decision,
+                    outcome=SpeakerVerifierInstallOutcome.STALE.value,
+                    cleanup_pending=receipt.cleanup_pending,
+                )
                 return replace(receipt, outcome=SpeakerVerifierInstallOutcome.STALE)
             self._speaker_verifier_install_receipt = receipt
             self._speaker_verifier_install_fence = fence
+            emit_speaker_installation_event(
+                self._asr_runtime,
+                phase="result",
+                reason="install_completed",
+                decision=decision,
+                outcome=receipt.outcome.value,
+                cleanup_pending=receipt.cleanup_pending,
+            )
             return receipt
 
     async def set_speaker_verifier_factory(
@@ -1900,7 +2022,10 @@ class AsrRuntimeMixin:
         if result.status is AsrStartStatus.READY:
             self._set_microphone_route("independent")
             if getattr(self, "_speaker_verifier_spec", None) is not None:
-                await self.reconcile_speaker_verifier()
+                await self.reconcile_speaker_verifier(
+                    diagnostic_initiator="core_route_start",
+                    diagnostic_reason="route_ready",
+                )
         else:
             # Independent ASR was ENABLED and failed to start (provider connect,
             # credentials, config). Unlike a runtime failure this emits no
@@ -2265,7 +2390,10 @@ class AsrRuntimeMixin:
             # delivery policy without restarting ASR or touching PCM routing.
             self._set_microphone_route(self._asr_route_mode)
             if getattr(self, "_speaker_verifier_spec", None) is not None:
-                await self.reconcile_speaker_verifier()
+                await self.reconcile_speaker_verifier(
+                    diagnostic_initiator="core_session_change",
+                    diagnostic_reason="same_provider_runtime_replaced",
+                )
             return
         await self._start_independent_asr_if_enabled(
             str(getattr(self, "input_mode", "audio") or "audio"),

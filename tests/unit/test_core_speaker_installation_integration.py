@@ -82,6 +82,37 @@ async def test_idle_registry_bind_and_real_supported_unsupported_round_trip(iter
 
 
 @pytest.mark.asyncio
+async def test_registry_to_detector_diagnostics_share_activation_trace(monkeypatch):
+    manager = _Runtime()
+    manager.input_mode = "audio"
+    registry = OwnerVoiceRuntimeRegistry(enforce=True)
+    profile = _profile()
+    records = []
+    try:
+        _supported_route(manager)
+        runtime = manager._asr_runtime
+        monkeypatch.setattr(runtime, "_schedule_pipeline_metadata", lambda record, **_: records.append(record))
+        runtime._install_provider_state_diagnostics(runtime._asr_detector)
+        await registry.register_manager(manager)
+        assert await registry.activate(profile, "A") is PublicResult.READY
+        installation = [r for r in records if r.get("stage") == "speaker_verifier_installation"]
+        detector = [r for r in records if r.get("stage") == "provider_state_change"]
+        assert installation and detector
+        trace_ref = installation[0]["installation_trace_ref"]
+        assert all(r["installation_trace_ref"] == trace_ref for r in installation)
+        assert all(r["installation_initiator"] == "activation_prepare" for r in installation)
+        assert any(r.get("installation_trace_ref") == trace_ref for r in detector)
+        assert {r.get("operation") for r in detector} & {
+            "segment_state_clear", "speaker_identity_clear",
+        }
+    finally:
+        await registry.close()
+        profile.close()
+        manager._asr_runtime._asr_lifecycle = None
+        await manager._asr_runtime.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("register_first", [True, False])
 @pytest.mark.parametrize("iteration", range(25))
 async def test_real_core_start_reconciles_both_registration_orders_and_restart(

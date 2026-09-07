@@ -50,6 +50,7 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerHigh,
     SpeakerLow,
     SpeakerUnavailable,
+    SpeakerUnavailableReason,
     SpeakerAuthorityNamespacePoisoned,
     TransportSettled,
     VoiceTurnAdmissionRecord,
@@ -186,6 +187,42 @@ def test_exact_final_then_second_low_before_deadline_drops():
         and effect.name == "speaker_deny_final_dropped_count"
         for effect in effects
     )
+
+
+def test_terminal_short_low_is_a_single_direct_admission_deny():
+    record, _ = _record()
+    record, _ = _step(record, ProviderFinalReceived(_final(text="short")))
+
+    record, effects = _step(
+        record,
+        SpeakerLow(_candidate(), 1, SpeakerCheckpointKind.TERMINAL_SHORT),
+    )
+
+    assert record.evidence_state is EvidenceState.DENY_LATCHED
+    assert record.last_speaker_sequence_no == 1
+    assert record.admission_state is AdmissionState.DROPPED
+    assert _resolve_effects(effects)[0].disposition is AdmissionDisposition.DROP
+
+
+def test_terminal_short_insufficient_is_fail_open_but_not_verified():
+    record, _ = _record()
+    record, _ = _step(record, ProviderFinalReceived(_final(text="short")))
+
+    record, effects = _step(
+        record,
+        SpeakerUnavailable(
+            _candidate(),
+            1,
+            SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE,
+        ),
+    )
+
+    assert record.evidence_state is EvidenceState.UNAVAILABLE
+    assert record.speaker_unavailable_reason is (
+        SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE
+    )
+    assert record.admission_state is AdmissionState.FORWARDED
+    assert _resolve_effects(effects)[0].disposition is AdmissionDisposition.FORWARD
 
 
 def test_final_before_first_score_holds_then_two_lows_drop():

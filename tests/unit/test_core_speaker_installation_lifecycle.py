@@ -69,6 +69,68 @@ async def test_idle_registration_retains_goal_without_allocating_and_start_recon
 
 
 @pytest.mark.asyncio
+async def test_reconcile_diagnostics_share_trace_and_distinguish_install_from_reuse(monkeypatch):
+    manager = _manager()
+    runtime = manager._asr_runtime
+    records = []
+    monkeypatch.setattr(runtime, "_schedule_pipeline_metadata", lambda record, **_: records.append(record))
+    spec = _spec("activation")
+    try:
+        await manager.set_speaker_verifier_spec(
+            spec,
+            diagnostic_initiator="registry_register",
+            diagnostic_reason="new_manager_attach",
+        )
+        first = [r for r in records if r.get("stage") == "speaker_verifier_installation"]
+        assert {r["phase"] for r in first} == {"request", "entry", "result"}
+        assert len({r["installation_trace_ref"] for r in first}) == 1
+        assert all(r["installation_initiator"] == "registry_register" for r in first)
+        assert first[-1]["decision"] == "defer_inactive"
+
+        records.clear()
+        manager._set_microphone_route("independent")
+        installed = await manager.reconcile_speaker_verifier(
+            diagnostic_initiator="core_route_start",
+            diagnostic_reason="route_ready",
+        )
+        assert installed.outcome is Outcome.INSTALLED
+        install_events = [r for r in records if r.get("stage") == "speaker_verifier_installation"]
+        assert [r["phase"] for r in install_events] == ["entry", "decision", "result"]
+        assert len({r["installation_trace_ref"] for r in install_events}) == 1
+        assert all(r["installation_initiator"] == "core_route_start" for r in install_events)
+        assert install_events[1]["decision"] == "install_deferred_route_ready"
+        assert install_events[-1]["outcome"] == "installed"
+
+        records.clear()
+        reused = await manager.reconcile_speaker_verifier()
+        assert reused.outcome is Outcome.INSTALLED
+        reuse_events = [r for r in records if r.get("stage") == "speaker_verifier_installation"]
+        assert [r["phase"] for r in reuse_events] == ["entry", "result"]
+        assert reuse_events[-1]["decision"] == "reuse_installed"
+        runtime.install_speaker_verifier.assert_awaited_once()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_diagnostics_record_cancellation_without_changing_it(monkeypatch):
+    manager = _manager()
+    runtime = manager._asr_runtime
+    records = []
+    monkeypatch.setattr(runtime, "_schedule_pipeline_metadata", lambda record, **_: records.append(record))
+    manager._set_microphone_route("independent")
+    runtime.install_speaker_verifier.side_effect = asyncio.CancelledError()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await manager.set_speaker_verifier_spec(_spec("activation"))
+        results = [r for r in records if r.get("stage") == "speaker_verifier_installation" and r.get("phase") == "result"]
+        assert results[-1]["outcome"] == "cancelled"
+        assert manager._speaker_verifier_install_receipt is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("iteration", range(50))
 async def test_route_change_during_install_never_publishes_stale_ready(iteration):
     manager = _manager()

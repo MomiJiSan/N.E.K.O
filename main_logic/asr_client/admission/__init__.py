@@ -17,6 +17,7 @@ from .contracts import (
     SpeakerLeaseTransitionOutcome,
     SpeakerLeaseTransitionReceipt,
     SpeakerLeaseUnavailable,
+    SpeakerUnavailableReason,
     VoiceTurnAdmissionRecord,
 )
 from .coordinator import (
@@ -69,6 +70,7 @@ __all__ = [
     "SpeakerLeaseTransitionReceipt",
     "SpeakerLeaseTerminalError",
     "SpeakerLeaseUnavailable",
+    "SpeakerUnavailableReason",
     "VoiceTurnAdmissionCoordinator",
     "VoiceTurnAdmissionRecord",
     "bind_speaker_lease_child",

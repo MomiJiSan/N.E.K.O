@@ -24,6 +24,7 @@ from main_logic.asr_client.admission.contracts import (
     SpeakerLeaseHigh,
     SpeakerLeaseLow,
     SpeakerLeaseUnavailable,
+    SpeakerUnavailableReason,
 )
 from main_logic.asr_client.admission.coordinator import VoiceTurnAdmissionCoordinator
 from main_logic.asr_client.speaker_shadow.contracts import SpeakerShadowCandidateKey
@@ -64,10 +65,27 @@ async def _resolved(*, mode, exact=True):
     events = {
         "verified": [SpeakerLeaseHigh(target, 1), SpeakerLeaseCaptureClosed(target, 1)],
         "unavailable": [SpeakerLeaseUnavailable(target, 1)],
+        "unsupported": [
+            SpeakerLeaseUnavailable(
+                target,
+                1,
+                SpeakerUnavailableReason.UNSUPPORTED,
+            )
+        ],
+        "failure": [
+            SpeakerLeaseUnavailable(
+                target,
+                1,
+                SpeakerUnavailableReason.FAILURE,
+            )
+        ],
         "insufficient": [SpeakerLeaseCaptureClosed(target, 0)],
         "rejected": [
             SpeakerLeaseLow(target, 1, SpeakerCheckpointKind.FIRST),
             SpeakerLeaseLow(target, 2, SpeakerCheckpointKind.SECOND),
+        ],
+        "terminal_short_rejected": [
+            SpeakerLeaseLow(target, 1, SpeakerCheckpointKind.TERMINAL_SHORT),
         ],
     }[mode]
     earlier_effects = []
@@ -91,20 +109,55 @@ async def _resolved(*, mode, exact=True):
 
 
 @pytest.mark.parametrize("exact", [False, True])
-@pytest.mark.parametrize("mode,reason,evidence", [
-    ("verified", "ASR_SPEAKER_VERIFIED", "allow"),
-    ("unavailable", "ASR_SPEAKER_EVIDENCE_UNAVAILABLE", "unavailable"),
-    ("insufficient", "ASR_SPEAKER_EVIDENCE_UNAVAILABLE", "unavailable"),
-    ("rejected", "ASR_SPEAKER_REJECTED", "deny_latched"),
+@pytest.mark.parametrize("mode,reason,evidence,unavailable_reason", [
+    ("verified", "ASR_SPEAKER_VERIFIED", "allow", None),
+    (
+        "unavailable",
+        "ASR_SPEAKER_EVIDENCE_UNAVAILABLE",
+        "unavailable",
+        "unavailable",
+    ),
+    (
+        "insufficient",
+        "ASR_SPEAKER_EVIDENCE_UNAVAILABLE",
+        "unavailable",
+        "insufficient_evidence",
+    ),
+    (
+        "unsupported",
+        "ASR_SPEAKER_EVIDENCE_UNAVAILABLE",
+        "unavailable",
+        "unsupported",
+    ),
+    (
+        "failure",
+        "ASR_SPEAKER_EVIDENCE_UNAVAILABLE",
+        "unavailable",
+        "failure",
+    ),
+    ("rejected", "ASR_SPEAKER_REJECTED", "deny_latched", None),
+    (
+        "terminal_short_rejected",
+        "ASR_SPEAKER_REJECTED",
+        "deny_latched",
+        None,
+    ),
 ])
-async def test_authoritative_verdict_snapshot(mode, reason, evidence, exact):
+async def test_authoritative_verdict_snapshot(
+    mode, reason, evidence, unavailable_reason, exact
+):
     coordinator, effect = await _resolved(mode=mode, exact=exact)
     record = await coordinator.get_record(effect.turn_token)
     snapshot = coordinator.snapshot_resolution_diagnostics(effect.ticket)
     assert snapshot["reason_code"] == reason
     assert snapshot["evidence_state"] == evidence
+    assert snapshot["speaker_unavailable_reason"] == unavailable_reason
+    if mode == "terminal_short_rejected":
+        assert snapshot["speaker_sequence"] == 1
     assert snapshot["provider_utterance_id"] == 3
-    assert snapshot["disposition"] == ("drop" if mode == "rejected" else "forward")
+    assert snapshot["disposition"] == (
+        "drop" if mode in {"rejected", "terminal_short_rejected"} else "forward"
+    )
     assert await coordinator.get_record(effect.turn_token) is record
     assert "PRIVATE" not in json.dumps(snapshot)
     assert all(type(value) in (str, int, bool, type(None)) for value in snapshot.values())
