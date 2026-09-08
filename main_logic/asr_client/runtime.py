@@ -265,6 +265,10 @@ class IndependentAsrRuntime:
         if revoking:
             self._speaker_verifier_factory = None
             self._speaker_verifier_activation_generation = activation_generation
+            # A failed physical detach must not look idempotently complete on
+            # retry. The old callbacks are already stale, while this flag
+            # keeps the next revocation call driving detector cleanup again.
+            self._speaker_verifier_degraded = True
             if old_factory is not None:
                 self._close_speaker_verifier_factory(old_factory)
 
