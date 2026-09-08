@@ -2534,7 +2534,6 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import app.main_server.voice_identity_runtime as voice_runtime
     import main_routers.config_router.preferences as preferences
 
     service, _model, activations, _events = _service(tmp_path)
@@ -2571,20 +2570,17 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
         "aload_global_conversation_settings_snapshot",
         snapshot,
     )
-    monkeypatch.setattr(
-        voice_runtime,
-        "prepare_voice_identity_audio_contract_change",
-        prepare,
-    )
-    monkeypatch.setattr(
-        voice_runtime,
-        "reconcile_voice_identity_audio_contract_change",
-        reconcile,
-    )
     monkeypatch.setattr(preferences, "_NOISE_REDUCTION_APPLY_LOCK", asyncio.Lock())
+    preferences.configure_voice_identity_audio_contract_callbacks(
+        prepare=prepare,
+        reconcile=reconcile,
+    )
 
-    with pytest.raises(RuntimeError, match="snapshot failed"):
-        await preferences._apply_noise_reduction_if_current(False)
+    try:
+        with pytest.raises(RuntimeError, match="snapshot failed"):
+            await preferences._apply_noise_reduction_if_current(False)
+    finally:
+        preferences.configure_voice_identity_audio_contract_callbacks()
 
     assert activations[-1][0] is None
     assert not service.status().state.effective_enabled
