@@ -357,7 +357,6 @@ async def test_one_manager_failing_does_not_abandon_the_rest_of_the_toggle():
 async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild(
     monkeypatch,
 ) -> None:
-    import app.main_server.voice_identity_runtime as voice_runtime
     import main_routers.config_router.preferences as preferences
 
     events: list[str] = []
@@ -393,18 +392,14 @@ async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild
         "_apply_noise_reduction_to_active_sessions",
         apply,
     )
-    monkeypatch.setattr(
-        voice_runtime,
-        "prepare_voice_identity_audio_contract_change",
-        prepare,
+    preferences.configure_voice_identity_audio_contract_callbacks(
+        prepare=prepare,
+        reconcile=reconcile,
     )
-    monkeypatch.setattr(
-        voice_runtime,
-        "reconcile_voice_identity_audio_contract_change",
-        reconcile,
-    )
-
-    await preferences._apply_noise_reduction_if_current(False)
+    try:
+        await preferences._apply_noise_reduction_if_current(False)
+    finally:
+        preferences.configure_voice_identity_audio_contract_callbacks()
 
     assert events == ["revoke", "dsp", "reconcile"]
 
@@ -412,7 +407,6 @@ async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild
 async def test_noise_reduction_reconcile_finishes_after_caller_cancellation(
     monkeypatch,
 ) -> None:
-    import app.main_server.voice_identity_runtime as voice_runtime
     import main_routers.config_router.preferences as preferences
 
     apply_entered = asyncio.Event()
@@ -447,27 +441,25 @@ async def test_noise_reduction_reconcile_finishes_after_caller_cancellation(
         "_apply_noise_reduction_to_active_sessions",
         apply,
     )
-    monkeypatch.setattr(
-        voice_runtime,
-        "prepare_voice_identity_audio_contract_change",
-        prepare,
-    )
-    monkeypatch.setattr(
-        voice_runtime,
-        "reconcile_voice_identity_audio_contract_change",
-        reconcile,
-    )
     monkeypatch.setattr(preferences, "_NOISE_REDUCTION_APPLY_LOCK", asyncio.Lock())
-
-    operation = asyncio.create_task(
-        preferences._apply_noise_reduction_if_current(False)
+    preferences.configure_voice_identity_audio_contract_callbacks(
+        prepare=prepare,
+        reconcile=reconcile,
     )
-    await apply_entered.wait()
-    operation.cancel()
-    await asyncio.sleep(0)
-    assert not operation.done()
-    release_apply.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await operation
-    assert reconciled.is_set()
+    try:
+        operation = asyncio.create_task(
+            preferences._apply_noise_reduction_if_current(False)
+        )
+        await apply_entered.wait()
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done()
+        release_apply.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert reconciled.is_set()
+    finally:
+        release_apply.set()
+        preferences.configure_voice_identity_audio_contract_callbacks()

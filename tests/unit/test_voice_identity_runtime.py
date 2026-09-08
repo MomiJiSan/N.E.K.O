@@ -2313,6 +2313,7 @@ async def test_runtime_install_and_wrapper_lifecycle(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     installed: list[object] = []
+    callback_configurations: list[tuple[object | None, object | None]] = []
 
     class FakeProfileStore:
         def __init__(self, _path: Path) -> None:
@@ -2370,6 +2371,13 @@ async def test_runtime_install_and_wrapper_lifecycle(
         "install_voice_identity_service_for_app",
         installed.append,
     )
+    monkeypatch.setattr(
+        runtime_module,
+        "configure_voice_identity_audio_contract_callbacks",
+        lambda *, prepare=None, reconcile=None: callback_configurations.append(
+            (prepare, reconcile)
+        ),
+    )
     monkeypatch.setenv("NEKO_VOICE_IDENTITY_MODE", "invalid-mode")
     config = SimpleNamespace(local_state_dir=tmp_path)
 
@@ -2382,8 +2390,15 @@ async def test_runtime_install_and_wrapper_lifecycle(
 
     await runtime_module.initialize_voice_identity_runtime(config)
     assert service.initialized == 1
+    assert callback_configurations == [
+        (
+            runtime_module.prepare_voice_identity_audio_contract_change,
+            runtime_module.reconcile_voice_identity_audio_contract_change,
+        )
+    ]
     await runtime_module.close_voice_identity_runtime()
     assert service.closed == 1
+    assert callback_configurations[-1] == (None, None)
 
     manager = _Manager()
     assert not await runtime_module.register_voice_identity_manager(manager)

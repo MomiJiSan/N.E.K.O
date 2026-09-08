@@ -23,6 +23,7 @@ from ._shared import logger, router
 import asyncio
 import json
 import re
+from typing import Protocol
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -44,6 +45,60 @@ _CONVERSATION_SETTINGS_ASR_DECISION_HEADER = "x-conversation-settings-asr-decisi
 _CONVERSATION_SETTINGS_FULL_SNAPSHOT_HEADER = "x-conversation-settings-full-snapshot"
 _CONVERSATION_SETTINGS_ETAG_RE = re.compile(r'^(?:W/)?"conversation-settings-(\d+)"$')
 _NOISE_REDUCTION_APPLY_LOCK = asyncio.Lock()
+
+
+class _PrepareVoiceIdentityAudioContractChange(Protocol):
+    async def __call__(self, enabled: bool) -> bool: ...
+
+
+class _ReconcileVoiceIdentityAudioContractChange(Protocol):
+    async def __call__(
+        self,
+        enabled: bool,
+        *,
+        runtime_ready: bool,
+    ) -> None: ...
+
+
+async def _prepare_voice_identity_audio_contract_change_default(
+    _enabled: bool,
+) -> bool:
+    return True
+
+
+async def _reconcile_voice_identity_audio_contract_change_default(
+    _enabled: bool,
+    *,
+    runtime_ready: bool,
+) -> None:
+    del runtime_ready
+
+
+_VOICE_IDENTITY_AUDIO_CONTRACT_CALLBACKS: tuple[
+    _PrepareVoiceIdentityAudioContractChange,
+    _ReconcileVoiceIdentityAudioContractChange,
+] = (
+    _prepare_voice_identity_audio_contract_change_default,
+    _reconcile_voice_identity_audio_contract_change_default,
+)
+
+
+def configure_voice_identity_audio_contract_callbacks(
+    *,
+    prepare: _PrepareVoiceIdentityAudioContractChange | None = None,
+    reconcile: _ReconcileVoiceIdentityAudioContractChange | None = None,
+) -> None:
+    """Inject App-owned voice-identity hooks without reversing module layers."""
+
+    global _VOICE_IDENTITY_AUDIO_CONTRACT_CALLBACKS
+    _VOICE_IDENTITY_AUDIO_CONTRACT_CALLBACKS = (
+        prepare
+        if prepare is not None
+        else _prepare_voice_identity_audio_contract_change_default,
+        reconcile
+        if reconcile is not None
+        else _reconcile_voice_identity_audio_contract_change_default,
+    )
 
 
 def _conversation_settings_etag(revision: int) -> str:
@@ -124,12 +179,11 @@ async def _apply_noise_reduction_to_active_sessions(enabled: bool) -> bool:
 
 async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
     """Run one persisted noise-reduction transition to a terminal state."""
-    from app.main_server.voice_identity_runtime import (
-        prepare_voice_identity_audio_contract_change,
-        reconcile_voice_identity_audio_contract_change,
-    )
-
     async with _NOISE_REDUCTION_APPLY_LOCK:
+        (
+            prepare_voice_identity_audio_contract_change,
+            reconcile_voice_identity_audio_contract_change,
+        ) = _VOICE_IDENTITY_AUDIO_CONTRACT_CALLBACKS
         current = await aload_global_conversation_settings_snapshot()
         if current.settings.get("noiseReductionEnabled") is not enabled:
             return

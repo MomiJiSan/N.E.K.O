@@ -30,6 +30,9 @@ from main_logic.voice_identity_service.registry import (
 )
 from main_logic.voice_identity_service.service import VoiceIdentityService
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
+from main_routers.config_router.preferences import (
+    configure_voice_identity_audio_contract_callbacks,
+)
 from utils.preferences import load_global_conversation_settings
 
 
@@ -1371,7 +1374,15 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
 
 async def initialize_voice_identity_runtime(config_manager) -> None:
     service = install_voice_identity_runtime(config_manager)
-    await service.initialize()
+    try:
+        await service.initialize()
+    except BaseException:
+        configure_voice_identity_audio_contract_callbacks()
+        raise
+    configure_voice_identity_audio_contract_callbacks(
+        prepare=prepare_voice_identity_audio_contract_change,
+        reconcile=reconcile_voice_identity_audio_contract_change,
+    )
 
 
 async def prepare_voice_identity_audio_contract_change(enabled: bool) -> bool:
@@ -1403,21 +1414,24 @@ async def close_voice_identity_runtime() -> None:
     service = _service
     registry = _runtime_registry
     try:
-        if service is not None:
-            await service.close()
-    except BaseException:
         try:
-            if registry is not None:
-                await registry.close()
+            if service is not None:
+                await service.close()
         except BaseException:
-            logger.warning(
-                "Owner voice runtime registry cleanup failed after service "
-                "cleanup failure",
-                exc_info=True,
-            )
-        raise
-    if registry is not None:
-        await registry.close()
+            try:
+                if registry is not None:
+                    await registry.close()
+            except BaseException:
+                logger.warning(
+                    "Owner voice runtime registry cleanup failed after service "
+                    "cleanup failure",
+                    exc_info=True,
+                )
+            raise
+        if registry is not None:
+            await registry.close()
+    finally:
+        configure_voice_identity_audio_contract_callbacks()
 
 
 async def register_voice_identity_manager(
