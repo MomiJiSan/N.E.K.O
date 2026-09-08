@@ -248,6 +248,7 @@ class LifecycleMixin:
         except (json.JSONDecodeError, TypeError):
             _parsed = None
 
+        defer_native_idle_reconnect = False
         async with self.lock:
             is_pending = False
             if expected_session is not None:
@@ -281,10 +282,61 @@ class LifecycleMixin:
             # A pending_session failure must not misclassify the main session as closed.
             if not is_pending:
                 self.session_closed_by_server = True
+
+                # Voice-session activation deliberately keeps microphone PCM
+                # local while waiting. Some native providers retire an otherwise
+                # healthy socket during that quiet interval. Keep the Core voice
+                # lease alive for this one classified condition so the first
+                # owner-authorized output can reconnect the same client before
+                # replaying. Every other provider failure retains the ordinary
+                # fail-closed teardown below.
+                capture_activation_generation = getattr(
+                    self,
+                    "_capture_voice_session_activation_generation",
+                    None,
+                )
+                activation_runtime = getattr(
+                    self,
+                    "_voice_session_activation_runtime",
+                    None,
+                )
+                voice_input_accepts_pcm = getattr(
+                    self,
+                    "_voice_input_accepts_pcm",
+                    None,
+                )
+                defer_native_idle_reconnect = bool(
+                    isinstance(_parsed, dict)
+                    and _parsed.get("code") == "API_IDLE_TIMEOUT"
+                    and expected_session is not None
+                    and getattr(self, "_voice_session_activation_factory", None)
+                    is not None
+                    and activation_runtime is not None
+                    and getattr(self, "_asr_route_mode", "blocked") == "native"
+                    and getattr(self, "_voice_lease_owner", "none") == "core"
+                    and callable(capture_activation_generation)
+                    and activation_runtime.generation
+                    == capture_activation_generation()
+                    and callable(voice_input_accepts_pcm)
+                    and voice_input_accepts_pcm()
+                )
+                if defer_native_idle_reconnect:
+                    self._native_activation_idle_reconnect_identity = (
+                        activation_runtime.generation,
+                        getattr(expected_session, "_connection_generation", None),
+                    )
         
         if is_pending:
             logger.info("⏭️ handle_connection_error: expected_session is pending_session, delegating to pending teardown")
             await self._teardown_pending_session_from_lifecycle_callback(expected_session, message)
+            return
+
+        if defer_native_idle_reconnect:
+            logger.info(
+                "[%s] native provider idled while voice-session activation "
+                "owns the microphone; deferring reconnect until authorized output",
+                self.lanlan_name,
+            )
             return
         
         if message:

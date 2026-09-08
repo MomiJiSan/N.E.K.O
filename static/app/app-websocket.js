@@ -3385,6 +3385,61 @@
                         return;
                     }
 
+                    if (statusCode === 'VOICE_SESSION_ACTIVATION_STATE') {
+                        var activationState = (statusDetails && statusDetails.state) || '';
+                        var allowedActivationStates = [
+                            'disabled', 'preparing', 'waiting', 'verifying',
+                            'replaying', 'active', 'unavailable', 'closed'
+                        ];
+                        if (allowedActivationStates.indexOf(activationState) !== -1) {
+                            var activationIdentity = [
+                                statusDetails.session_id,
+                                statusDetails.microphone_generation,
+                                statusDetails.route_generation,
+                                statusDetails.profile_revision,
+                                statusDetails.permission_revision
+                            ].join(':');
+                            var activationRevision = Number(statusDetails.revision) || 0;
+                            if (S.voiceSessionActivationIdentity === activationIdentity
+                                && activationRevision <= (S.voiceSessionActivationRevision || 0)) {
+                                return;
+                            }
+                            var previousActivationState = S.voiceSessionActivationState || '';
+                            S.voiceSessionActivationIdentity = activationIdentity;
+                            S.voiceSessionActivationRevision = activationRevision;
+                            S.voiceSessionActivationState = activationState;
+                            document.documentElement.setAttribute(
+                                'data-voice-session-activation-state',
+                                activationState
+                            );
+                            window.dispatchEvent(new CustomEvent(
+                                'voice-session-activation-changed',
+                                { detail: statusDetails }
+                            ));
+                            if (previousActivationState !== activationState
+                                && S.isRecording === true
+                                && typeof window.showStatusToast === 'function') {
+                                if (activationState === 'waiting') {
+                                    window.showStatusToast(
+                                        window.t ? window.t('voiceIdentity.sessionWaiting') : 'Waiting for your voice to activate the conversation.',
+                                        2500
+                                    );
+                                } else if (activationState === 'active') {
+                                    window.showStatusToast(
+                                        window.t ? window.t('voiceIdentity.sessionActive') : 'Voice conversation activated.',
+                                        2500
+                                    );
+                                } else if (activationState === 'unavailable') {
+                                    window.showStatusToast(
+                                        window.t ? window.t('voiceIdentity.sessionUnavailable') : 'Voice activation is unavailable. Standby audio will not be uploaded.',
+                                        5000
+                                    );
+                                }
+                            }
+                        }
+                        return;
+                    }
+
                     if (statusCode === 'VOICE_INPUT_LEASE_RESYNC_REQUIRED') {
                         // 仅采集中的窗口重发 lease 快照；非采集窗口忽略，避免多窗口互相覆盖
                         if (S.isRecording === true
