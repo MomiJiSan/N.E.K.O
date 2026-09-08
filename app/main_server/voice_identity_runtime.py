@@ -23,6 +23,7 @@ from main_logic.asr_client.provider_state_diagnostics import speaker_installatio
 from main_logic.asr_client.speaker_shadow.campplus import CampPlusEmbeddingModel
 from main_logic.voice_identity.profile import SpeakerProfile
 from main_logic.voice_identity.pvad.assets import EcapaDownload
+from main_logic.voice_identity.tse.assets import TseAssets
 from main_logic.voice_identity_service.asr_composition import (
     OwnerVoiceAsrCompositionFactory,
 )
@@ -64,7 +65,9 @@ class _OwnerActivation:
     generation: str
     enforce: bool
     revision: str = field(default_factory=lambda: str(uuid.uuid4()))
-    authority: SpeakerVerifierAuthority = field(default_factory=SpeakerVerifierAuthority)
+    authority: SpeakerVerifierAuthority = field(
+        default_factory=SpeakerVerifierAuthority
+    )
     shared_campplus_binding: SharedCampPlusCompositionBinding | None = None
     _spec: SpeakerVerifierSpec | None = field(default=None, init=False, repr=False)
 
@@ -110,7 +113,12 @@ class _OwnerActivation:
             )
 
         self._spec = SpeakerVerifierSpec(
-            self.profile.generation, self.revision, True, self.enforce, self.authority, build,
+            self.profile.generation,
+            self.revision,
+            True,
+            self.enforce,
+            self.authority,
+            build,
         )
         return self._spec
 
@@ -196,7 +204,9 @@ class OwnerVoiceRuntimeRegistry:
                     self._attach_pending.discard(manager)
                     return VoiceIdentityActivationResult.READY
                 self._detach_pending.pop(manager, None)
-                with speaker_installation_trace("registry_register", "pending_manager_attach"):
+                with speaker_installation_trace(
+                    "registry_register", "pending_manager_attach"
+                ):
                     result = await self._attach_manager_bounded(manager, activation)
                 if result is not VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                     self._record_attach_result(manager, result)
@@ -229,14 +239,14 @@ class OwnerVoiceRuntimeRegistry:
                     ):
                         self._restore_pending.discard(manager)
                     else:
-                        self._ensure_restore_watchdog(
-                            "voice_identity_enrollment"
-                        )
+                        self._ensure_restore_watchdog("voice_identity_enrollment")
                         return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 activation = target_activation
                 if activation is not None:
                     self._detach_pending.pop(manager, None)
-                    with speaker_installation_trace("registry_register", "new_manager_attach"):
+                    with speaker_installation_trace(
+                        "registry_register", "new_manager_attach"
+                    ):
                         result = await self._attach_manager_bounded(manager, activation)
                     if result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                         self._attach_pending.add(manager)
@@ -282,7 +292,9 @@ class OwnerVoiceRuntimeRegistry:
             detach_generation = str(uuid.uuid4())
             cancellation: asyncio.CancelledError | None = None
             try:
-                with speaker_installation_trace("registry_unregister", "manager_detach"):
+                with speaker_installation_trace(
+                    "registry_unregister", "manager_detach"
+                ):
                     detached = await asyncio.wait_for(
                         self._detach_manager(manager, detach_generation),
                         timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
@@ -317,9 +329,7 @@ class OwnerVoiceRuntimeRegistry:
                     else:
                         self._restore_pending.add(manager)
                         if not self._suppressed:
-                            self._ensure_restore_watchdog(
-                                "voice_identity_enrollment"
-                            )
+                            self._ensure_restore_watchdog("voice_identity_enrollment")
             if cancellation is not None:
                 raise cancellation
 
@@ -335,20 +345,31 @@ class OwnerVoiceRuntimeRegistry:
         return self.commit_activation(prepared)
 
     async def prepare_activation(
-        self, profile: SpeakerProfile | None, generation: str,
+        self,
+        profile: SpeakerProfile | None,
+        generation: str,
     ) -> ActivationPreparation:
         if type(generation) is not str or not generation.strip():
             return ActivationPreparation(
-                None, None, VoiceIdentityActivationResult.RUNTIME_DEGRADED, settled=True,
+                None,
+                None,
+                VoiceIdentityActivationResult.RUNTIME_DEGRADED,
+                settled=True,
             )
         async with self._lock:
             if self._closed:
                 return ActivationPreparation(
-                    None, None, VoiceIdentityActivationResult.RUNTIME_DEGRADED, settled=True,
+                    None,
+                    None,
+                    VoiceIdentityActivationResult.RUNTIME_DEGRADED,
+                    settled=True,
                 )
             candidate = (
-                None if profile is None else
-                _OwnerActivation.from_borrowed(profile, generation, enforce=self._enforce)
+                None
+                if profile is None
+                else _OwnerActivation.from_borrowed(
+                    profile, generation, enforce=self._enforce
+                )
             )
             self._count_installation("install_requested")
             previous_preparation = self._prepared_activation
@@ -358,7 +379,9 @@ class OwnerVoiceRuntimeRegistry:
                 if previous_preparation.candidate is not None:
                     previous_preparation.candidate.close()
             prepared = ActivationPreparation(
-                candidate, self._activation, VoiceIdentityActivationResult.READY,
+                candidate,
+                self._activation,
+                VoiceIdentityActivationResult.READY,
             )
             self._prepared_activation = prepared
             # Disable must revoke before asynchronous teardown. A staged replacement
@@ -366,7 +389,9 @@ class OwnerVoiceRuntimeRegistry:
             # only in managers where it has not yet been replaced.
             if candidate is None and self._activation is not None:
                 self._activation.authority.revoke()
-                self._retire_activation_installations(self._activation, tuple(self._managers))
+                self._retire_activation_installations(
+                    self._activation, tuple(self._managers)
+                )
             if candidate is None:
                 deactivation_cancellation: asyncio.CancelledError | None = None
                 try:
@@ -385,7 +410,9 @@ class OwnerVoiceRuntimeRegistry:
                 managers = tuple(self._managers)
                 for index, manager in enumerate(managers):
                     try:
-                        with speaker_installation_trace("activation_prepare", "configuration_disable"):
+                        with speaker_installation_trace(
+                            "activation_prepare", "configuration_disable"
+                        ):
                             result = await self._detach_manager(manager, generation)
                     except asyncio.CancelledError:
                         for pending in managers[index:]:
@@ -422,11 +449,17 @@ class OwnerVoiceRuntimeRegistry:
                 for manager in tuple(self._managers):
                     prepared.managers.append(manager)
                     if candidate is None:
-                        with speaker_installation_trace("activation_prepare", "configuration_disable"):
+                        with speaker_installation_trace(
+                            "activation_prepare", "configuration_disable"
+                        ):
                             result = await self._detach_manager(manager, generation)
                     else:
-                        with speaker_installation_trace("activation_prepare", "configuration_replace"):
-                            result = await self._attach_manager_bounded(manager, candidate)
+                        with speaker_installation_trace(
+                            "activation_prepare", "configuration_replace"
+                        ):
+                            result = await self._attach_manager_bounded(
+                                manager, candidate
+                            )
                     if result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                         self._count_installation("install_failed")
                         raise RuntimeError("speaker verifier preparation failed")
@@ -444,7 +477,10 @@ class OwnerVoiceRuntimeRegistry:
             except BaseException as exc:
                 self.revoke_prepared_activation(prepared)
                 rollback_cancellation = await self._abort_preparation_locked(prepared)
-                if isinstance(exc, asyncio.CancelledError) and self._current_task_is_cancelling():
+                if (
+                    isinstance(exc, asyncio.CancelledError)
+                    and self._current_task_is_cancelling()
+                ):
                     raise
                 if rollback_cancellation is not None:
                     raise rollback_cancellation
@@ -484,10 +520,13 @@ class OwnerVoiceRuntimeRegistry:
             raise RuntimeError("shared CAMPPlus host profile generation mismatch")
         return binding
 
-    def commit_activation(self, prepared: ActivationPreparation) -> VoiceIdentityActivationResult:
+    def commit_activation(
+        self, prepared: ActivationPreparation
+    ) -> VoiceIdentityActivationResult:
         """No await: the only point granting staged configuration authority."""
         if (
-            self._closed or prepared.settled
+            self._closed
+            or prepared.settled
             or self._prepared_activation is not prepared
         ):
             self._count_installation("install_stale")
@@ -508,7 +547,9 @@ class OwnerVoiceRuntimeRegistry:
         for manager in self._managers:
             snapshot = getattr(manager, "speaker_verifier_installation_status", None)
             if callable(snapshot):
-                self._record_attach_result(manager, self._receipt_result(snapshot(candidate.revision)))
+                self._record_attach_result(
+                    manager, self._receipt_result(snapshot(candidate.revision))
+                )
         # Re-query live installation snapshots; routes may have changed while
         # preference/profile persistence was awaited by Service.
         snapshot_result = self.activation_status()
@@ -517,7 +558,9 @@ class OwnerVoiceRuntimeRegistry:
             and prepared.result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
             and any(
                 self._manager_participating(manager)
-                and not callable(getattr(manager, "speaker_verifier_installation_status", None))
+                and not callable(
+                    getattr(manager, "speaker_verifier_installation_status", None)
+                )
                 for manager in prepared.managers
             )
         ):
@@ -534,7 +577,9 @@ class OwnerVoiceRuntimeRegistry:
         for manager in managers:
             runtime = getattr(manager, "_asr_runtime", None)
             pending = getattr(runtime, "_speaker_installation_pending", None)
-            identity = pending or getattr(runtime, "_speaker_installation_identity", None)
+            identity = pending or getattr(
+                runtime, "_speaker_installation_identity", None
+            )
             if identity is None or identity.activation_revision != activation.revision:
                 continue
             retire = getattr(runtime, "retire_speaker_verifier_authority", None)
@@ -547,7 +592,9 @@ class OwnerVoiceRuntimeRegistry:
                     self._count_installation("authority_retirement_failed")
 
     def _count_installation(self, reason: str) -> None:
-        self._installation_diagnostics[reason] = self._installation_diagnostics.get(reason, 0) + 1
+        self._installation_diagnostics[reason] = (
+            self._installation_diagnostics.get(reason, 0) + 1
+        )
 
     def installation_diagnostics_snapshot(self) -> dict[str, int]:
         """Internal control-plane counters; no profile/session/install identity."""
@@ -595,7 +642,9 @@ class OwnerVoiceRuntimeRegistry:
             previous.close()
         return cancellation
 
-    async def abort_activation(self, prepared: ActivationPreparation) -> VoiceIdentityActivationResult:
+    async def abort_activation(
+        self, prepared: ActivationPreparation
+    ) -> VoiceIdentityActivationResult:
         self.revoke_prepared_activation(prepared)
         async with self._lock:
             cancellation = await self._abort_preparation_locked(prepared)
@@ -605,12 +654,15 @@ class OwnerVoiceRuntimeRegistry:
             return result
 
     @staticmethod
-    async def _detach_manager(manager, generation: str) -> VoiceIdentityActivationResult:
+    async def _detach_manager(
+        manager, generation: str
+    ) -> VoiceIdentityActivationResult:
         setter = getattr(manager, "set_speaker_verifier_spec", None)
         try:
             if callable(setter):
                 receipt = await asyncio.wait_for(
-                    setter(None), timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
+                    setter(None),
+                    timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
                 )
                 return (
                     VoiceIdentityActivationResult.READY
@@ -619,8 +671,10 @@ class OwnerVoiceRuntimeRegistry:
                 )
             result = await asyncio.wait_for(
                 manager.set_speaker_verifier_factory(
-                    None, activation_generation=generation,
-                ), timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
+                    None,
+                    activation_generation=generation,
+                ),
+                timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
             )
             return OwnerVoiceRuntimeRegistry._legacy_activation_result(result)
         except Exception:
@@ -632,11 +686,14 @@ class OwnerVoiceRuntimeRegistry:
         if isinstance(result, VoiceIdentityActivationResult):
             return result
         return (
-            VoiceIdentityActivationResult.READY if result is True else
-            VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            VoiceIdentityActivationResult.READY
+            if result is True
+            else VoiceIdentityActivationResult.RUNTIME_DEGRADED
         )
 
-    def _record_attach_result(self, manager, result: VoiceIdentityActivationResult) -> None:
+    def _record_attach_result(
+        self, manager, result: VoiceIdentityActivationResult
+    ) -> None:
         if result is VoiceIdentityActivationResult.READY:
             if manager in self._attach_pending:
                 self._count_installation("rollback_settled")
@@ -647,13 +704,17 @@ class OwnerVoiceRuntimeRegistry:
             # retained without an idle polling task until an installed snapshot.
             self._attach_pending.add(manager)
             self._count_installation(
-                "install_unsupported" if result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
-                else "install_deferred" if result is VoiceIdentityActivationResult.ACTIVATION_PENDING
+                "install_unsupported"
+                if result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+                else "install_deferred"
+                if result is VoiceIdentityActivationResult.ACTIVATION_PENDING
                 else "install_failed"
             )
 
     @staticmethod
-    def _receipt_result(receipt: SpeakerVerifierInstallReceipt) -> VoiceIdentityActivationResult:
+    def _receipt_result(
+        receipt: SpeakerVerifierInstallReceipt,
+    ) -> VoiceIdentityActivationResult:
         if receipt.outcome is SpeakerVerifierInstallOutcome.INSTALLED:
             return VoiceIdentityActivationResult.READY
         if receipt.outcome in (
@@ -729,9 +790,7 @@ class OwnerVoiceRuntimeRegistry:
             missing_identity = runtime_metrics.get(
                 "provider_candidate_bind_missing_identity_count"
             )
-            seal_unbound = runtime_metrics.get(
-                "rejection_seal_snapshot_unbound_count"
-            )
+            seal_unbound = runtime_metrics.get("rejection_seal_snapshot_unbound_count")
             has_missing_identity = bool(
                 type(missing_identity) is int and missing_identity > 0
             )
@@ -879,7 +938,9 @@ class OwnerVoiceRuntimeRegistry:
                         if call_timeout <= 0:
                             break
                         try:
-                            with speaker_installation_trace("attach_watchdog", "pending_attach_retry"):
+                            with speaker_installation_trace(
+                                "attach_watchdog", "pending_attach_retry"
+                            ):
                                 attached = await asyncio.wait_for(
                                     self._attach_manager(manager, activation),
                                     timeout=call_timeout,
@@ -896,15 +957,24 @@ class OwnerVoiceRuntimeRegistry:
                         elif attached in (
                             VoiceIdentityActivationResult.ACTIVATION_PENDING,
                             VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE,
-                        ) and callable(getattr(manager, "set_speaker_verifier_spec", None)):
+                        ) and callable(
+                            getattr(manager, "set_speaker_verifier_spec", None)
+                        ):
                             # Core now owns the deferred obligation and resumes on
                             # route startup. Do not poll an idle microphone.
                             continue
                     if all(
-                        callable(getattr(manager, "speaker_verifier_installation_status", None))
+                        callable(
+                            getattr(
+                                manager, "speaker_verifier_installation_status", None
+                            )
+                        )
                         and self._receipt_result(
-                            manager.speaker_verifier_installation_status(activation.revision)
-                        ) in (
+                            manager.speaker_verifier_installation_status(
+                                activation.revision
+                            )
+                        )
+                        in (
                             VoiceIdentityActivationResult.ACTIVATION_PENDING,
                             VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE,
                         )
@@ -1106,7 +1176,9 @@ class OwnerVoiceRuntimeRegistry:
                         if call_timeout <= 0:
                             break
                         try:
-                            with speaker_installation_trace("detach_watchdog", "pending_detach_retry"):
+                            with speaker_installation_trace(
+                                "detach_watchdog", "pending_detach_retry"
+                            ):
                                 detached = await asyncio.wait_for(
                                     self._detach_manager(manager, generation),
                                     timeout=call_timeout,
@@ -1140,7 +1212,9 @@ class OwnerVoiceRuntimeRegistry:
             self._closed = True
             if self._activation is not None:
                 self._activation.authority.revoke()
-                self._retire_activation_installations(self._activation, tuple(self._managers))
+                self._retire_activation_installations(
+                    self._activation, tuple(self._managers)
+                )
             prepared = self._prepared_activation
             if prepared is not None:
                 self.revoke_prepared_activation(prepared)
@@ -1152,9 +1226,7 @@ class OwnerVoiceRuntimeRegistry:
             attach_task = self._attach_retry_task
             detach_task = self._detach_retry_task
         tasks = tuple(
-            task
-            for task in (retry_task, attach_task, detach_task)
-            if task is not None
+            task for task in (retry_task, attach_task, detach_task) if task is not None
         )
         for task in tasks:
             task.cancel()
@@ -1180,9 +1252,7 @@ class OwnerVoiceRuntimeRegistry:
         detach_task: asyncio.Task[None] | None,
     ) -> None:
         tasks = tuple(
-            task
-            for task in (retry_task, attach_task, detach_task)
-            if task is not None
+            task for task in (retry_task, attach_task, detach_task) if task is not None
         )
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1356,6 +1426,10 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
         activation_transaction=registry,
         speech_validator_factory=SileroEnrollmentSpeechValidator,
         activity_models=EcapaDownload(local_state_dir / "models" / "ecapa"),
+        extraction_models=TseAssets(local_state_dir / "models" / "tse"),
+        extraction_preference_store=VoiceIdentityPreferenceStore(
+            local_state_dir / "voice_identity.tse.settings.json",
+        ),
         enrollment_noise_reduction_enabled=(
             load_global_conversation_settings().get(
                 "noiseReductionEnabled",

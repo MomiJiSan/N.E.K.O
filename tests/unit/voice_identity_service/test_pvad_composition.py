@@ -23,6 +23,12 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCompletion,
     SpeakerShadowObservation,
 )
+from main_logic.asr_client.speaker_shadow.shared_host import (
+    HostGenerationReceipt,
+    SharedSpeakerScoringHostManager,
+    SpeakerHostIdentity,
+    SpeakerScoringMode,
+)
 from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierAuthority,
     SpeakerVerifierInstallIdentity,
@@ -45,6 +51,9 @@ from main_logic.voice_identity_service.asr_composition import (
     PvadSpeakerBackend,
 )
 from main_logic.voice_identity_service.pvad_policy import PvadEvidenceKind, PvadMode
+from main_logic.voice_identity_service.shared_campplus_host import (
+    SharedCampPlusCompositionBinding,
+)
 
 
 class _Scorer:
@@ -87,6 +96,18 @@ class _UnavailablePvadFactory(_ProcessFactory):
         return PvadSpeakerBackend(_Scorer(0.7), _Scorer(available=False))
 
 
+class _SharedLeaseManager(SharedSpeakerScoringHostManager):
+    def __init__(self, generation: HostGenerationReceipt) -> None:
+        self.generation = generation
+        self.leases = []
+
+    def is_generation_current(self, generation: HostGenerationReceipt) -> bool:
+        return generation == self.generation
+
+    def lease(self, generation, **kwargs):
+        lease = object()
+        self.leases.append((generation, kwargs, lease))
+        return lease
 
 
 @dataclass
@@ -181,17 +202,17 @@ def test_shared_modes_keep_prewire_on_campplus_and_shadow_short_on_pvad():
         assert backend.score_with_mode(
             short_pcm,
             16_000,
-            mode="short_probe",
+            mode=SpeakerScoringMode.SHORT_PROBE.value,
         ) == 0.7
         assert backend.score_with_mode(
             short_pcm,
             16_000,
-            mode="standard",
+            mode=SpeakerScoringMode.STANDARD.value,
         ) == 0.8
         assert backend.score_with_mode(
             long_pcm,
             16_000,
-            mode="standard",
+            mode=SpeakerScoringMode.STANDARD.value,
         ) == 0.7
         assert camp.calls == [
             (short_pcm, 16_000, "short_probe"),
@@ -323,8 +344,103 @@ async def test_off_restores_existing_short_behavior_and_enforce_cannot_bypass_re
         factory.close()
 
 
+def test_shared_campplus_path_does_not_spawn_a_second_private_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: SpeakerProfile,
+) -> None:
+    import main_logic.voice_identity_service.asr_composition as module
+
+    constructed = []
+
+    class _Shadow:
+        def bind_score_diagnostic_configuration(self, configuration):
+            self.configuration = configuration
+
+    def construct_shadow(**kwargs):
+        constructed.append(kwargs)
+        return _Shadow()
+
+    def reject_private_backend(*_args, **_kwargs):
+        raise AssertionError("shared path must not construct a private CAM++/pVAD host")
+
+    generation = HostGenerationReceipt(
+        "manager",
+        1,
+        SpeakerHostIdentity(profile.generation, "campplus", "config"),
+    )
+    manager = _SharedLeaseManager(generation)
+    monkeypatch.setattr(module, "SpeakerShadowRuntime", construct_shadow)
+    monkeypatch.setattr(module, "CampPlusBackendFactory", reject_private_backend)
+    factory = OwnerVoiceAsrCompositionFactory(
+        _Sink(),
+        profile,
+        activation_generation="activation",
+        enforce=True,
+        shared_scoring_manager=manager,
+        shared_host_generation=generation,
+    )
+    try:
+        shadow = factory()
+        assert constructed[0]["backend_factory"] is None
+        assert constructed[0]["shared_backend_lease"] is manager.leases[0][2]
+        assert constructed[0]["config"].terminal_short_evaluation_scopes == ()
+        assert shadow.configuration is not None
+    finally:
+        factory.close()
 
 
+def test_shared_pvad_binding_enables_observation_without_private_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: SpeakerProfile,
+) -> None:
+    import main_logic.voice_identity_service.asr_composition as module
+
+    constructed = []
+
+    class _Shadow:
+        def bind_score_diagnostic_configuration(self, configuration):
+            self.configuration = configuration
+
+    def construct_shadow(**kwargs):
+        constructed.append(kwargs)
+        return _Shadow()
+
+    def reject_private_backend(*_args, **_kwargs):
+        raise AssertionError("shared path must not construct a private backend")
+
+    generation = HostGenerationReceipt(
+        "manager",
+        1,
+        SpeakerHostIdentity(profile.generation, "campplus+pvad", "config"),
+    )
+    manager = _SharedLeaseManager(generation)
+    binding = SharedCampPlusCompositionBinding(
+        manager,
+        generation,
+        pvad_observe_enabled=True,
+    )
+    monkeypatch.setattr(module, "SpeakerShadowRuntime", construct_shadow)
+    monkeypatch.setattr(module, "CampPlusBackendFactory", reject_private_backend)
+
+    factory = OwnerVoiceAsrCompositionFactory(
+        _Sink(),
+        profile,
+        activation_generation="activation",
+        enforce=True,
+        shared_host_binding=binding,
+    )
+    try:
+        factory()
+        assert constructed[0]["backend_factory"] is None
+        assert constructed[0]["shared_backend_lease"] is manager.leases[0][2]
+        assert constructed[0]["config"].terminal_short_evaluation_scopes == (
+            "provider_candidate",
+            "smart_turn_turn",
+        )
+        assert constructed[0]["config"].terminal_short_minimum_samples == 3_200
+        assert manager.leases[0][1]["mode"] is SpeakerScoringMode.STANDARD
+    finally:
+        factory.close()
 
 
 @pytest.mark.parametrize(

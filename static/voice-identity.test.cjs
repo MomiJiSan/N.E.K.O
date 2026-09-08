@@ -162,6 +162,8 @@ function createHarness({
     initialNextSegmentIndex = 1,
     initialRemainingSeconds = 45,
     initialShortSpeech = null,
+    initialTse = null,
+    tseHandler,
     downloadGate,
     downloadError,
     downloadHandler,
@@ -192,6 +194,20 @@ function createHarness({
         'voice-identity-ecapa-status',
         'voice-identity-ecapa-progress',
         'voice-identity-ecapa-download',
+        'voice-identity-tse',
+        'voice-identity-tse-model-status',
+        'voice-identity-tse-reference-status',
+        'voice-identity-tse-runtime-status',
+        'voice-identity-tse-size',
+        'voice-identity-tse-source',
+        'voice-identity-tse-progress',
+        'voice-identity-tse-error',
+        'voice-identity-tse-download',
+        'voice-identity-tse-import',
+        'voice-identity-tse-file',
+        'voice-identity-tse-enroll',
+        'voice-identity-tse-enabled',
+        'voice-identity-tse-restart',
     ];
     const elements = new Map(elementIds.map(id => [id, createElement()]));
     const stepElements = [1, 2, 3, 4].map(index => {
@@ -222,6 +238,7 @@ function createHarness({
     let statusRequestCount = 0;
     let canonicalStatusOverride = null;
     let shortSpeech = initialShortSpeech ? { ...initialShortSpeech } : null;
+    let tse = initialTse ? { ...initialTse, model: { ...initialTse.model } } : null;
     let timerId = 0;
     let nowMs = 1000;
     let enrollmentExpiresAtMs = enrollmentId
@@ -297,6 +314,7 @@ function createHarness({
         last_completed_enrollment_id: lastCompletedEnrollmentId,
         runtime_mode: 'enforce',
         ...(shortSpeech ? { short_speech: { ...shortSpeech } } : {}),
+        ...(tse ? { tse: { ...tse, model: { ...tse.model } } } : {}),
         ...(canonicalStatusOverride || {}),
         });
     };
@@ -348,6 +366,17 @@ function createHarness({
                 profile_ready: Boolean(shortSpeech?.profile_ready),
                 error_code: null,
             };
+            return jsonResponse(statusPayload());
+        }
+        if (call.url === `${API_ROOT}/tse` || call.url.startsWith(`${API_ROOT}/models/tse/`)) {
+            if (tseHandler) return tseHandler({ payload: statusPayload(), call });
+            if (call.url === `${API_ROOT}/tse`) {
+                const body = JSON.parse(call.options.body);
+                assert.equal(body.profile_id, serverProfileGeneration);
+                tse = { ...tse, enabled: body.enabled, requires_restart: true };
+            } else {
+                tse = { ...tse, model: { ...tse.model, state: 'downloading', downloaded_bytes: 0, can_download: false, can_import: false } };
+            }
             return jsonResponse(statusPayload());
         }
         if (call.url === `${API_ROOT}/enrollment/segment`) {
@@ -658,6 +687,7 @@ function createHarness({
         Uint8Array,
         Int16Array,
         ArrayBuffer,
+        AbortController,
         Promise,
         Error,
         JSON,
@@ -723,6 +753,9 @@ function createHarness({
         setShortSpeech(status) {
             shortSpeech = status ? { ...status } : null;
         },
+        setTse(status) {
+            tse = status ? { ...status, model: { ...status.model } } : null;
+        },
         setStartGate(gate) {
             currentStartGate = gate;
         },
@@ -758,6 +791,286 @@ async function flush(turns = 8) {
         await new Promise(resolve => setImmediate(resolve));
     }
 }
+
+function tseStatus(overrides = {}) {
+    return {
+        enabled: false, reference_ready: false, reference_state: 'missing',
+        runtime_state: 'disabled', requires_restart: false, reason: null,
+        ...overrides,
+        model: {
+            state: 'missing', downloaded_bytes: 0, total_bytes: 94504320,
+            error_code: null, source_configured: true, can_download: true, can_import: true,
+            ...overrides.model,
+        },
+    };
+}
+
+test('TSE has local import when public source is absent, without pretending the model is active', async () => {
+    const harness = createHarness({ initialTse: tseStatus({ model: { source_configured: false, can_download: false } }) });
+    await harness.initialize();
+    assert.equal(harness.elements.get('voice-identity-tse-source').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-tse-download').disabled, true);
+    assert.equal(harness.elements.get('voice-identity-tse-import').disabled, false);
+    assert.equal(harness.elements.get('voice-identity-tse-enabled').disabled, true);
+    assert.match(harness.elements.get('voice-identity-tse-size').textContent, /94\.50 MB/);
+    assert.doesNotMatch(harness.elements.get('voice-identity-tse-size').textContent, /94,504,320/);
+    assert.match(harness.elements.get('voice-identity-tse-runtime-status').textContent, /已关闭/);
+    await harness.emit('voice-identity-tse-download');
+    assert.equal(harness.fetchCalls.filter(call => call.url.endsWith('/tse/download')).length, 0);
+});
+
+test('TSE download distinguishes full transfer, verification, installation and missing voice reference', async () => {
+    const harness = createHarness({ manualPreparation: true, initialTse: tseStatus() });
+    await harness.initialize();
+    await harness.emit('voice-identity-tse-download');
+    const call = harness.fetchCalls.find(call => call.url.endsWith('/tse/download'));
+    assert.equal(call.options.headers.get('X-CSRF-Token'), 'csrf-token');
+    assert.equal(call.options.method, 'POST');
+    assert.equal(call.options.body, undefined);
+    assert.equal(harness.elements.get('voice-identity-start').disabled, true);
+    for (const modelState of ['downloading', 'verifying', 'installing', 'ready']) {
+        harness.setTse(tseStatus({ model: { state: modelState, downloaded_bytes: 94504320 } }));
+        harness.advanceTime(1000);
+        await flush();
+        assert.equal(harness.elements.get('voice-identity-tse-enabled').checked, false);
+        assert.equal(harness.elements.get('voice-identity-tse-enabled').disabled, true);
+        assert.equal(harness.elements.get('voice-identity-tse-progress').hidden, modelState !== 'downloading');
+        assert.equal(harness.elements.get('voice-identity-tse-enroll').hidden, modelState !== 'ready');
+        assert.equal(harness.elements.get('voice-identity-start').disabled, modelState !== 'ready');
+    }
+    assert.match(harness.elements.get('voice-identity-tse-model-status').textContent, /已安装/);
+    assert.match(harness.elements.get('voice-identity-tse-reference-status').textContent, /重新录入/);
+    assert.match(harness.elements.get('voice-identity-tse-runtime-status').textContent, /已关闭/);
+    const requests = harness.statusRequestCount;
+    harness.advanceTime(10000); await flush();
+    assert.equal(harness.statusRequestCount, requests);
+});
+
+test('TSE reuses one mutation and blocks microphone and ECAPA while starting a download', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialTse: tseStatus(), initialShortSpeech: { state: 'missing', total_bytes: 83540359 },
+        tseHandler: async ({ payload }) => { await gate.promise; return jsonResponse({ ...payload, tse: tseStatus({ model: { state: 'downloading' } }) }); }
+    });
+    await harness.initialize();
+    const pending = harness.emit('voice-identity-tse-download');
+    await flush();
+    await harness.emit('voice-identity-tse-download');
+    await harness.emit('voice-identity-start');
+    await harness.emit('voice-identity-ecapa-download');
+    assert.equal(harness.mediaRequests, 0);
+    assert.equal(harness.fetchCalls.filter(call => call.url.endsWith('/tse/download')).length, 1);
+    assert.equal(harness.fetchCalls.filter(call => call.url.endsWith('/ecapa/download')).length, 0);
+    gate.resolve(); await pending;
+});
+
+test('TSE cannot download or import during four-part enrollment', async () => {
+    const harness = createHarness({ initialTse: tseStatus(), initialEnrollment: true });
+    await harness.initialize();
+    assert.equal(harness.elements.get('voice-identity-tse-download').disabled, true);
+    assert.equal(harness.elements.get('voice-identity-tse-import').disabled, true);
+    harness.elements.get('voice-identity-tse-file').files = [{ name: 'models.zip', size: 94504320 }];
+    await harness.emit('voice-identity-tse-file', 'change');
+    await harness.emit('voice-identity-tse-download');
+    assert.equal(harness.fetchCalls.some(call => call.url.includes('/models/tse/')), false);
+});
+
+test('TSE import sends the File directly as a ZIP and rejects the wrong size before upload', async () => {
+    const harness = createHarness({ manualPreparation: true, initialTse: tseStatus({ model: { source_configured: false, can_download: false } }) });
+    await harness.initialize();
+    const input = harness.elements.get('voice-identity-tse-file');
+    input.files = [{ name: 'wrong.zip', size: 1000 }];
+    await harness.emit('voice-identity-tse-file', 'change');
+    assert.equal(harness.fetchCalls.some(call => call.url.endsWith('/tse/import')), false);
+    assert.match(harness.elements.get('voice-identity-tse-error').textContent, /完整 ZIP/);
+    const file = { name: 'models.zip', size: 94504320 };
+    input.files = [file];
+    await harness.emit('voice-identity-tse-file', 'change');
+    const call = harness.fetchCalls.find(call => call.url.endsWith('/tse/import'));
+    assert.equal(call.options.body, file);
+    assert.equal(call.options.headers.get('Content-Type'), 'application/zip');
+    assert.equal(call.options.headers.get('X-CSRF-Token'), 'csrf-token');
+    assert.equal(input.value, '');
+    assert.equal(harness.elements.get('voice-identity-tse-error').hidden, true);
+});
+
+test('TSE enable stores the explicit preference and keeps current runtime separate until restart', async () => {
+    const harness = createHarness({ initialProfile: true, initialTse: tseStatus({
+        model: { state: 'ready' }, reference_ready: true, reference_state: 'ready'
+    }) });
+    await harness.initialize();
+    const toggle = harness.elements.get('voice-identity-tse-enabled');
+    assert.equal(toggle.checked, false);
+    assert.equal(toggle.disabled, false);
+    toggle.checked = true;
+    await harness.emit('voice-identity-tse-enabled', 'change');
+    assert.deepEqual(JSON.parse(harness.fetchCalls.at(-1).options.body), { enabled: true, profile_id: 'profile-0' });
+    assert.equal(toggle.checked, true);
+    assert.equal(harness.elements.get('voice-identity-tse-restart').hidden, false);
+    assert.match(harness.elements.get('voice-identity-tse-runtime-status').textContent, /已关闭/);
+    assert.equal(harness.mediaRequests, 0);
+});
+
+test('TSE production route unavailability disables enabling without hiding installation and reference state', async () => {
+    const harness = createHarness({ initialProfile: true, initialTse: tseStatus({
+        model: { state: 'ready' }, reference_ready: true, reference_state: 'ready',
+        can_enable: false, reason: 'tse_route_unavailable'
+    }) });
+    await harness.initialize();
+    const toggle = harness.elements.get('voice-identity-tse-enabled');
+    assert.equal(toggle.checked, false);
+    assert.equal(toggle.disabled, true);
+    assert.match(harness.elements.get('voice-identity-tse-model-status').textContent, /已安装/);
+    assert.match(harness.elements.get('voice-identity-tse-reference-status').textContent, /准备好/);
+    assert.match(harness.elements.get('voice-identity-tse-runtime-status').textContent, /暂时不能开启/);
+    toggle.checked = true;
+    await harness.emit('voice-identity-tse-enabled', 'change');
+    assert.equal(toggle.checked, false);
+    assert.equal(harness.fetchCalls.some(call => call.url === `${API_ROOT}/tse`), false);
+});
+
+test('TSE can be disabled after profile deletion using explicit null profile generation', async () => {
+    const harness = createHarness({ initialProfile: true, initialTse: tseStatus({
+        model: { state: 'ready' }, enabled: true, reference_ready: true
+    }) });
+    await harness.initialize();
+    await harness.emit('voice-identity-delete');
+    const toggle = harness.elements.get('voice-identity-tse-enabled');
+    assert.equal(toggle.disabled, false);
+    toggle.checked = false;
+    await harness.emit('voice-identity-tse-enabled', 'change');
+    const call = harness.fetchCalls.find(call => call.url === `${API_ROOT}/tse`);
+    assert.deepEqual(JSON.parse(call.options.body), { enabled: false, profile_id: null });
+    assert.equal(toggle.checked, false);
+});
+
+test('TSE reference-required and unavailable-route errors use localized guidance', async () => {
+    for (const [code, message] of [['tse_reference_required', /重新录入/], ['tse_route_unavailable', /暂时不能开启/]]) {
+        const harness = createHarness({ initialProfile: true, initialTse: tseStatus({ model: { state: 'ready' }, reference_ready: true }),
+            tseHandler: async () => jsonResponse({ error_code: code }, { ok: false, status: 409 }) });
+        await harness.initialize();
+        harness.elements.get('voice-identity-tse-enabled').checked = true;
+        await harness.emit('voice-identity-tse-enabled', 'change');
+        assert.equal(harness.elements.get('voice-identity-tse-enabled').checked, false);
+        assert.match(harness.elements.get('voice-identity-tse-error').textContent, message);
+    }
+});
+
+test('TSE runtime fault can be disabled even after its model or reference becomes incompatible', async () => {
+    const harness = createHarness({ initialProfile: true, initialTse: tseStatus({ enabled: true,
+        reference_state: 'incompatible', runtime_state: 'error', reason: 'inference_failure' }) });
+    await harness.initialize();
+    assert.match(harness.elements.get('voice-identity-tse-reference-status').textContent, /需要更新/);
+    assert.match(harness.elements.get('voice-identity-tse-runtime-status').textContent, /暂停语音识别/);
+    const toggle = harness.elements.get('voice-identity-tse-enabled');
+    assert.equal(toggle.disabled, false);
+    toggle.checked = false;
+    await harness.emit('voice-identity-tse-enabled', 'change');
+    assert.equal(toggle.checked, false);
+    assert.equal(harness.elements.get('voice-identity-tse-restart').hidden, false);
+});
+
+test('TSE failed download remains retryable and a refused enable restores the canonical switch', async () => {
+    const failed = createHarness({ initialTse: tseStatus({ model: { state: 'failed', error_code: 'tse_integrity_error' } }) });
+    await failed.initialize();
+    assert.match(failed.elements.get('voice-identity-tse-download').textContent, /重试/);
+    assert.equal(failed.elements.get('voice-identity-tse-download').disabled, false);
+    assert.equal(failed.elements.get('voice-identity-tse-import').disabled, false);
+    assert.match(failed.elements.get('voice-identity-tse-error').textContent, /完整 ZIP/);
+
+    const harness = createHarness({ initialProfile: true,
+        initialTse: tseStatus({ model: { state: 'ready' }, reference_ready: true }),
+        tseHandler: async () => jsonResponse({ error_code: 'tse_reference_incompatible' }, { ok: false, status: 409 })
+    });
+    await harness.initialize();
+    const toggle = harness.elements.get('voice-identity-tse-enabled');
+    toggle.checked = true;
+    await harness.emit('voice-identity-tse-enabled', 'change');
+    assert.equal(toggle.checked, false);
+    assert.match(harness.elements.get('voice-identity-tse-error').textContent, /需要更新/);
+    assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+});
+
+test('a late failed TSE operation cannot replace the status or error of a new profile', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialProfile: true, initialTse: tseStatus(),
+        tseHandler: async () => { await gate.promise; throw new Error('tse_import_failed'); }
+    });
+    await harness.initialize();
+    const pending = harness.emit('voice-identity-tse-download');
+    await flush();
+    harness.setCanonicalStatusOverride({ profile_generation: 'new-profile' });
+    harness.setTse(tseStatus({ model: { state: 'ready' }, reference_ready: true }));
+    harness.dispatch('focus'); await flush();
+    const requestCount = harness.statusRequestCount;
+    gate.resolve(); await pending;
+    assert.equal(harness.statusRequestCount, requestCount);
+    assert.equal(harness.elements.get('voice-identity-tse-error').hidden, true);
+    assert.match(harness.elements.get('voice-identity-tse-reference-status').textContent, /准备好/);
+});
+
+test('an old TSE response cannot overwrite a profile changed in another window', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialProfile: true, initialTse: tseStatus(),
+        tseHandler: async ({ payload }) => { await gate.promise; return jsonResponse(payload); }
+    });
+    await harness.initialize();
+    const pending = harness.emit('voice-identity-tse-download');
+    await flush();
+    harness.setCanonicalStatusOverride({ profile_generation: 'new-profile' });
+    harness.setTse(tseStatus({ model: { state: 'ready' }, reference_ready: true }));
+    harness.dispatch('focus'); await flush();
+    gate.resolve(); await pending;
+    assert.match(harness.elements.get('voice-identity-tse-reference-status').textContent, /准备好/);
+    assert.equal(harness.elements.get('voice-identity-tse-download').hidden, true);
+});
+
+test('TSE polling pauses when hidden and shares one status request with ECAPA', async () => {
+    const harness = createHarness({ manualPreparation: true, initialTse: tseStatus({ model: { state: 'downloading' } }),
+        initialShortSpeech: { state: 'downloading', total_bytes: 83540359 } });
+    await harness.initialize();
+    assert.equal(harness.timeoutCount, 1);
+    harness.advanceTime(1000); await flush();
+    assert.equal(harness.statusRequestCount, 2);
+    harness.setDocumentVisibility('hidden'); harness.dispatchDocument('visibilitychange'); await flush();
+    assert.equal(harness.timeoutCount, 0);
+    harness.advanceTime(3000); await flush();
+    assert.equal(harness.statusRequestCount, 2);
+    harness.setDocumentVisibility('visible'); harness.dispatchDocument('visibilitychange'); await flush();
+    assert.equal(harness.timeoutCount, 1);
+    await harness.beforeClose();
+    assert.equal(harness.timeoutCount, 0);
+});
+
+test('closing during local TSE upload aborts upload and ignores its late success', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialTse: tseStatus(), tseHandler: async ({ payload }) => {
+        await gate.promise; return jsonResponse({ ...payload, tse: tseStatus({ model: { state: 'ready' } }) });
+    } });
+    await harness.initialize();
+    harness.elements.get('voice-identity-tse-file').files = [{ name: 'models.zip', size: 94504320 }];
+    const pending = harness.emit('voice-identity-tse-file', 'change');
+    await flush();
+    const call = harness.fetchCalls.find(call => call.url.endsWith('/tse/import'));
+    assert.equal(call.options.signal.aborted, false);
+    await harness.beforeClose();
+    assert.equal(call.options.signal.aborted, true);
+    gate.resolve(); await pending;
+    assert.doesNotMatch(harness.elements.get('voice-identity-tse-model-status').textContent, /^已安装$/);
+    assert.equal(harness.timeoutCount, 0);
+});
+
+test('all TSE interface and error messages exist in all eight locales with matching placeholders', () => {
+    const english = JSON.parse(fs.readFileSync(path.join(__dirname, 'locales/en.json'), 'utf8')).tseModels;
+    for (const locale of ['en', 'es', 'ja', 'ko', 'pt', 'ru', 'zh-CN', 'zh-TW']) {
+        const messages = JSON.parse(fs.readFileSync(path.join(__dirname, `locales/${locale}.json`), 'utf8')).tseModels;
+        assert.deepEqual(Object.keys(messages).sort(), Object.keys(english).sort(), locale);
+        for (const [key, value] of Object.entries(messages)) {
+            assert.equal(typeof value, 'string');
+            assert.ok(value.trim(), `${locale}.${key}`);
+            assert.deepEqual((value.match(/\{\{\w+\}\}/g) || []).sort(), (english[key].match(/\{\{\w+\}\}/g) || []).sort(), `${locale}.${key}`);
+        }
+    }
+});
 
 test('ECAPA card reports optional download state and reaches ready by bounded polling', async () => {
     const harness = createHarness({
@@ -821,7 +1134,7 @@ test('ECAPA card reports optional download state and reaches ready by bounded po
     assert.equal(progress.hidden, true);
     assert.match(
         harness.elements.get('voice-identity-ecapa-status').textContent,
-        /模型已就绪/,
+        /增强模型已安装/,
     );
     assert.equal(harness.timeoutCount, 0);
 });

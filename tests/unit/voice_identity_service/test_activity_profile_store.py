@@ -50,7 +50,7 @@ def dual_profile(generation: str = "dual-generation") -> SpeakerProfile:
         activity.close()
 
 
-def rewrite_authenticated_payload(path: Path, mutate, *, schema_version: int = 4) -> None:
+def rewrite_authenticated_payload(path: Path, mutate, *, schema_version: int = 5) -> None:
     envelope = json.loads(path.read_bytes())
     key = _TestKeyProtector().unprotect(base64.b64decode(envelope["wrapped_key"]))
     nonce = base64.b64decode(envelope["nonce"])
@@ -59,6 +59,8 @@ def rewrite_authenticated_payload(path: Path, mutate, *, schema_version: int = 4
         store_module._READ_AAD[envelope["schema_version"]],
     ))
     mutate(payload)
+    if schema_version < 5:
+        payload.pop("extraction_reference", None)
     envelope["schema_version"] = schema_version
     envelope["ciphertext"] = base64.b64encode(AESGCM(key).encrypt(
         nonce, json.dumps(payload).encode(), store_module._READ_AAD[schema_version],
@@ -117,7 +119,7 @@ def test_v3_load_migrates_in_memory_without_rewriting_original(tmp_path: Path) -
         assert loaded.audio_contract == AUDIO_CONTRACT
         assert store.path.read_bytes() == original
         store.save(loaded.profile, audio_contract=loaded.audio_contract)
-        assert json.loads(store.path.read_bytes())["schema_version"] == 4
+        assert json.loads(store.path.read_bytes())["schema_version"] == 5
     finally:
         loaded.close()
 

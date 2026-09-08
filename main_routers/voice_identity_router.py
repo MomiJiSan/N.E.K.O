@@ -59,6 +59,14 @@ def _service_error(exc: VoiceIdentityServiceError) -> JSONResponse:
         "stale_enrollment",
         "segment_out_of_order",
         "segment_in_progress",
+        "enrollment_active",
+        "tse_assets_busy",
+        "stale_profile",
+        "tse_reference_missing",
+        "tse_reference_required",
+        "tse_route_unavailable",
+        "tse_reference_incompatible",
+        "tse_model_missing",
     }:
         status_code = 409
     elif exc.code == "audio_too_long":
@@ -72,6 +80,9 @@ def _service_error(exc: VoiceIdentityServiceError) -> JSONResponse:
         "no_speech_detected",
         "voice_samples_inconsistent",
         "owner_verification_failed",
+        "tse_integrity_error",
+        "tse_invalid_archive",
+        "tse_model_contract_error",
     }:
         status_code = 422
     elif exc.code in {
@@ -144,6 +155,74 @@ async def download_voice_identity_ecapa(request: Request):
     except VoiceIdentityServiceError as exc:
         if exc.code == "enrollment_active":
             return JSONResponse({"error_code": exc.code}, status_code=409)
+        return _service_error(exc)
+
+
+@router.post("/models/tse/download")
+async def download_voice_identity_tse(request: Request):
+    rejected = _validate_mutation(request)
+    if rejected is not None:
+        return rejected
+    service = _service()
+    if service is None:
+        return _service_unavailable()
+    try:
+        # The service selects only the application-pinned resource. Request
+        # query/body fields cannot override the source, revision or cache path.
+        return (await service.download_tse_model()).as_dict()
+    except VoiceIdentityServiceError as exc:
+        return _service_error(exc)
+
+
+@router.post("/models/tse/import")
+async def import_voice_identity_tse(request: Request):
+    rejected = _validate_mutation(request)
+    if rejected is not None:
+        return rejected
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/zip":
+        return JSONResponse({"error_code": "tse_invalid_archive"}, status_code=415)
+    service = _service()
+    if service is None:
+        return _service_unavailable()
+    try:
+        # No Request.body(), multipart buffer or caller-provided filesystem path.
+        # TseAssets enforces the exact trusted archive byte limit as it receives.
+        return (await service.import_tse_model(request.stream())).as_dict()
+    except VoiceIdentityServiceError as exc:
+        return _service_error(exc)
+
+
+@router.post("/tse")
+async def set_voice_identity_tse(request: Request):
+    has_csrf_header = bool(request.headers.get("X-CSRF-Token"))
+    if has_csrf_header:
+        rejected = _validate_mutation(request)
+        if rejected is not None:
+            return rejected
+    body = await _read_bounded_body(request, _MAX_FILTER_JSON_BYTES)
+    if body is None:
+        return JSONResponse({"error_code": "invalid_enabled"}, status_code=413)
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        parsed = None
+    payload = parsed if type(parsed) is dict else None
+    if not has_csrf_header:
+        rejected = _validate_mutation(request, payload)
+        if rejected is not None:
+            return rejected
+    if payload is None or type(payload.get("enabled")) is not bool:
+        return JSONResponse({"error_code": "invalid_enabled"}, status_code=422)
+    profile_id = payload.get("profile_id")
+    no_profile_disable = payload["enabled"] is False and "profile_id" in payload and profile_id is None
+    if not no_profile_disable and (type(profile_id) is not str or not profile_id.strip()):
+        return JSONResponse({"error_code": "invalid_profile_id"}, status_code=400)
+    service = _service()
+    if service is None:
+        return _service_unavailable()
+    try:
+        return (await service.update_tse(payload["enabled"], profile_id)).as_dict()
+    except VoiceIdentityServiceError as exc:
         return _service_error(exc)
 
 

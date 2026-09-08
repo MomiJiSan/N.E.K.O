@@ -87,7 +87,8 @@
         message: { kind: 'text', text: '', isError: false, verification: null },
         passiveRefreshPromise: null, passiveRefreshContext: null,
         passiveRefreshQueued: false, refreshAfterCompletion: false,
-        shortSpeech: null, ecapaPending: false, ecapaTimer: null
+        shortSpeech: null, ecapaPending: false, ecapaTimer: null,
+        tse: null, tsePending: false, tseError: null, tseRequestNonce: 0, tseImportAbort: null
     };
     const elements = {};
 
@@ -103,6 +104,13 @@
         for (const [name, id] of Object.entries({
             shortSpeech: 'voice-identity-short-speech', ecapaStatus: 'voice-identity-ecapa-status',
             ecapaProgress: 'voice-identity-ecapa-progress', ecapaDownload: 'voice-identity-ecapa-download',
+            tse: 'voice-identity-tse', tseModelStatus: 'voice-identity-tse-model-status',
+            tseReferenceStatus: 'voice-identity-tse-reference-status', tseRuntimeStatus: 'voice-identity-tse-runtime-status',
+            tseSize: 'voice-identity-tse-size', tseSource: 'voice-identity-tse-source',
+            tseProgress: 'voice-identity-tse-progress', tseError: 'voice-identity-tse-error',
+            tseDownload: 'voice-identity-tse-download', tseImport: 'voice-identity-tse-import',
+            tseFile: 'voice-identity-tse-file', tseEnroll: 'voice-identity-tse-enroll',
+            tseEnabled: 'voice-identity-tse-enabled', tseRestart: 'voice-identity-tse-restart',
             statusDot: 'voice-identity-status-dot', profileStatus: 'voice-identity-profile-status',
             enrollment: 'voice-identity-enrollment', captureStatus: 'voice-identity-capture-status',
             captureLabel: 'voice-identity-capture-label', timer: 'voice-identity-timer',
@@ -198,6 +206,7 @@
 
     function applyStatus(payload) {
         applyShortSpeechStatus(payload && payload.short_speech);
+        applyTseStatus(payload && payload.tse);
         const status = payload && typeof payload === 'object' ? payload : {};
         const enrollment = status.enrollment && typeof status.enrollment === 'object' ? status.enrollment : null;
         const profile = status.profile && typeof status.profile === 'object' ? status.profile : {};
@@ -227,7 +236,8 @@
             state.remainingSeconds = null;
         }
         state.profileAvailable = valueFrom([status, profile], ['has_profile', 'profile_available', 'available'], 'boolean', state.profileAvailable);
-        state.profileRevision = valueFrom([status, profile], ['profile_generation'], 'scalar', state.profileRevision);
+        state.profileRevision = status.profile_generation === null
+            ? null : valueFrom([status, profile], ['profile_generation'], 'scalar', state.profileRevision);
         state.requestedEnabled = valueFrom([status, filter], ['requested_enabled', 'enabled'], 'boolean', state.requestedEnabled);
         state.effectiveEnabled = valueFrom([status, filter], ['effective_enabled'], 'boolean', state.requestedEnabled && state.profileAvailable);
         state.effectiveReason = valueFrom([status, filter], ['effective_reason', 'reason'], 'string', state.effectiveEnabled ? 'ready' : (state.profileAvailable ? 'disabled' : 'no_profile'));
@@ -465,7 +475,7 @@
         if (state.effectiveEnabled) elements.statusDot.classList.add('ready');
         else if (state.profileAvailable) elements.statusDot.classList.add('warning');
         elements.profileStatus.textContent = reasonMessage();
-        const pending = !state.initialized || state.busy || state.cancelPending || state.filterPending;
+        const pending = !state.initialized || state.busy || state.cancelPending || state.filterPending || modelOperationActive();
         const unavailable = ['model_unavailable', 'secure_storage_unavailable'].includes(state.effectiveReason);
         elements.start.hidden = state.busy || state.cancelPending || (state.profileAvailable && !state.enrollmentId);
         elements.start.disabled = pending || unavailable;
@@ -514,7 +524,172 @@
             else step.removeAttribute('aria-current');
         }
     }
-    function render() { renderProfile(); renderEnrollment(); renderMessage(); renderShortSpeech(); }
+    function render() { renderProfile(); renderEnrollment(); renderMessage(); renderShortSpeech(); renderTse(); }
+
+    function tseModelActive() {
+        return Boolean(state.tse && ['downloading', 'verifying', 'installing'].includes(state.tse.model?.state));
+    }
+
+    function modelOperationActive() {
+        return state.ecapaPending || state.tsePending || tseModelActive()
+            || Boolean(state.shortSpeech && ['downloading', 'verifying'].includes(state.shortSpeech.state));
+    }
+
+    function applyTseStatus(status) {
+        if (!status || typeof status !== 'object') return;
+        state.tse = status;
+        if (tseModelActive() && document.visibilityState !== 'hidden' && !state.ecapaTimer && !state.closeStarted) {
+            state.ecapaTimer = window.setTimeout(refreshEcapaDownload, 1000);
+        }
+    }
+
+    function tseText(key, fallback, options) { return translate(`tseModels.${key}`, fallback, options); }
+
+    function tseErrorMessage(code) {
+        if (!code) return '';
+        if (code === 'tse_route_unavailable') {
+            return tseText('routeUnavailable', '功能还没接入完成，暂时不能开启。');
+        }
+        if (['tse_source_unconfigured', 'source_unconfigured', 'download_source_unconfigured'].includes(code)) {
+            return tseText('sourcePending', '公开下载源尚未配置；可以导入本地模型包。');
+        }
+        if (['enrollment_active', 'download_in_progress', 'tse_busy', 'tse_assets_busy', 'model_download_in_progress'].includes(code)) {
+            return tseText('busy', '模型安装与声纹录入不能同时进行，请等待当前操作结束。');
+        }
+        if (['tse_profile_incompatible', 'tse_reference_incompatible', 'profile_incompatible'].includes(code)) {
+            return tseText('referenceIncompatible', '声纹需要更新，请重新录入。');
+        }
+        if (['tse_reference_missing', 'tse_reference_required', 'no_profile', 'tse_profile_missing'].includes(code)) {
+            return tseText('referenceMissing', '需要重新录入一次声纹。');
+        }
+        if (['invalid_tse_package', 'tse_package_invalid', 'package_size_mismatch', 'package_hash_mismatch',
+            'invalid_package', 'invalid_zip', 'tse_integrity_error', 'tse_invalid_archive', 'tse_model_contract_error'].includes(code)) {
+            return tseText('invalidPackage', '模型包损坏或版本不匹配，请选择本版本的完整 ZIP 包。');
+        }
+        return tseText('operationFailed', '操作失败，请检查连接与模型包后重试。现有声纹档案会保留。');
+    }
+
+    function renderTse() {
+        if (!elements.tse) return;
+        const status = state.tse;
+        const model = status?.model || {};
+        const ready = model.state === 'ready';
+        const active = tseModelActive();
+        const pending = !state.initialized || state.busy || state.cancelPending || state.filterPending
+            || Boolean(state.enrollmentId) || modelOperationActive();
+        const failed = ['failed', 'error'].includes(model.state);
+        const total = Number(model.total_bytes);
+        const size = Number.isFinite(total) && total > 0 ? (total / 1000000).toFixed(2) : null;
+        const downloaded = Math.max(0, Math.min(total || 0, Number(model.downloaded_bytes) || 0));
+        const modelLabels = {
+            missing: ['modelMissing', '尚未安装'], ready: ['modelReady', '已安装'],
+            verifying: ['modelVerifying', '下载完成，正在校验…'], installing: ['modelInstalling', '正在安装并检查模型…'],
+            failed: ['modelFailed', '下载或安装失败'], error: ['modelFailed', '下载或安装失败']
+        };
+        const modelLabel = modelLabels[model.state] || ['unavailable', '正在读取状态…'];
+        elements.tseModelStatus.textContent = model.state === 'downloading'
+            ? tseText('modelDownloading', `正在下载 ${(downloaded / 1000000).toFixed(2)} / ${size || '—'} MB`, { downloaded: (downloaded / 1000000).toFixed(2), size: size || '—' })
+            : tseText(...modelLabel);
+        if (state.tsePending && state.tseImportAbort) elements.tseModelStatus.textContent = tseText('importing', '正在上传本地模型包…');
+        const reference = status?.reference_state;
+        elements.tseReferenceStatus.textContent = status?.reference_ready
+            ? tseText('referenceReady', '声纹已准备好')
+            : (reference === 'incompatible'
+                ? tseText('referenceIncompatible', '声纹需要更新，请重新录入。')
+                : tseText('referenceMissing', '需要重新录入一次声纹。'));
+        const runtimeLabels = {
+            disabled: ['runtimeDisabled', '已关闭'], waiting: ['runtimeWaiting', '已开启，等待受支持的麦克风会话'],
+            preparing: ['runtimePreparing', '正在准备当前会话…'], active: ['runtimeActive', '当前会话正在使用'],
+            error: ['runtimeError', '分离出现问题，已暂停语音识别']
+        };
+        elements.tseRuntimeStatus.textContent = tseText(...(runtimeLabels[status?.runtime_state] || ['unavailable', '正在读取状态…']));
+        if (status?.can_enable === false && !['active', 'preparing', 'error'].includes(status.runtime_state)) {
+            elements.tseRuntimeStatus.textContent = tseText('routeUnavailable', '功能还没接入完成，暂时不能开启。');
+        }
+        elements.tseSize.hidden = !size;
+        elements.tseSize.textContent = size ? tseText('size', `模型大小：${size} MB`, { size, bytes: total.toLocaleString() }) : '';
+        elements.tseSource.hidden = !status || model.source_configured !== false || ready;
+        elements.tseProgress.hidden = model.state !== 'downloading';
+        elements.tseProgress.value = total > 0 ? Math.min(100, downloaded * 100 / total) : 0;
+        elements.tseDownload.hidden = ready;
+        elements.tseDownload.disabled = pending || model.can_download !== true;
+        elements.tseDownload.textContent = failed ? tseText('retry', '重试下载') : tseText('download', '下载 TSE 模型');
+        elements.tseImport.hidden = ready;
+        elements.tseImport.disabled = pending || model.can_import !== true;
+        elements.tseFile.disabled = elements.tseImport.disabled;
+        elements.tseEnroll.hidden = !ready || status?.reference_ready === true;
+        elements.tseEnroll.disabled = pending || ['model_unavailable', 'secure_storage_unavailable'].includes(state.effectiveReason);
+        elements.tseEnabled.checked = status?.enabled === true;
+        // Disabling an already enabled feature remains possible when its resource/reference is unavailable.
+        elements.tseEnabled.disabled = pending || !status || (!status.enabled && (status.can_enable === false || !ready || !status.reference_ready));
+        elements.tseRestart.hidden = status?.requires_restart !== true;
+        const error = tseErrorMessage(state.tseError || model.error_code || (status?.runtime_state === 'error' ? status.reason : null));
+        elements.tseError.hidden = !error;
+        elements.tseError.textContent = error;
+        elements.tse.setAttribute('aria-busy', String(active || state.tsePending));
+    }
+
+    async function mutateTse(path, options) {
+        if (state.closeStarted || state.busy || state.filterPending || state.enrollmentId || modelOperationActive()) return;
+        const requestNonce = ++state.tseRequestNonce;
+        ++state.operationNonce;
+        const identity = passiveRefreshIdentity();
+        const matches = () => !state.closeStarted && requestNonce === state.tseRequestNonce && passiveRefreshMatches(identity);
+        state.tsePending = true; state.tseError = null;
+        render();
+        try {
+            const payload = await apiRequest(path, options);
+            if (!matches()) return;
+            if (payload.profile_generation === state.profileRevision) applyStatus(payload);
+            else state.passiveRefreshQueued = true;
+        } catch (error) {
+            if (!matches()) return;
+            let canonical = null;
+            try { canonical = await getCanonicalStatus(); } catch (_) {}
+            if (!matches()) return;
+            if (canonical) applyStatus(canonical);
+            state.tseError = error.message;
+        } finally {
+            if (requestNonce === state.tseRequestNonce) {
+                if (passiveRefreshMatches(identity)) ++state.operationNonce;
+                state.tsePending = false;
+                state.tseImportAbort = null;
+                if (!state.closeStarted) {
+                    render();
+                    if (state.passiveRefreshQueued || state.passiveRefreshPromise) {
+                        state.passiveRefreshQueued = false;
+                        refreshStatusWhenIdle();
+                    }
+                }
+            }
+        }
+    }
+
+    async function downloadTse() {
+        if (state.tse?.model?.can_download !== true) return;
+        return mutateTse('/models/tse/download', { method: 'POST' });
+    }
+
+    async function importTse() {
+        const file = elements.tseFile.files?.[0];
+        elements.tseFile.value = '';
+        if (!file || state.tse?.model?.can_import !== true || modelOperationActive() || state.enrollmentId || state.busy || state.closeStarted) return;
+        const expected = Number(state.tse.model.total_bytes);
+        if (!file.name.toLowerCase().endsWith('.zip') || file.size <= 0 || (expected > 0 && file.size !== expected)) {
+            state.tseError = 'invalid_tse_package'; renderTse(); return;
+        }
+        const controller = new AbortController();
+        state.tseImportAbort = controller;
+        return mutateTse('/models/tse/import', { method: 'POST', body: file,
+            headers: { 'Content-Type': 'application/zip' }, signal: controller.signal });
+    }
+
+    async function updateTse() {
+        const enabled = elements.tseEnabled.checked;
+        if (!state.tse || (enabled && (state.tse.can_enable === false || state.tse.model?.state !== 'ready' || !state.tse.reference_ready))) { renderTse(); return; }
+        return mutateTse('/tse', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled, profile_id: state.profileRevision }) });
+    }
 
     function applyShortSpeechStatus(status) {
         if (!status || typeof status !== 'object') return;
@@ -536,25 +711,25 @@
         const ready = status.state === 'ready';
         const size = (Number(status.total_bytes || 0) / 1000000).toFixed(1);
         elements.ecapaDownload.hidden = ready;
-        elements.ecapaDownload.disabled = downloading || verifying || state.ecapaPending || state.busy || Boolean(state.enrollmentId);
+        elements.ecapaDownload.disabled = downloading || verifying || modelOperationActive() || state.busy || Boolean(state.enrollmentId);
         elements.ecapaDownload.textContent = status.state === 'failed'
             ? translate('voiceIdentity.ecapaRetry', '重试下载')
-            : translate('voiceIdentity.ecapaDownloadSize', `下载 ECAPA（${size} MB）`, { size });
+            : translate('voiceIdentity.ecapaDownloadSize', `下载 ECAPA 增强模型（${size} MB）`, { size });
         elements.ecapaProgress.hidden = !downloading;
         elements.ecapaProgress.value = Math.min(100, 100 * Number(status.downloaded_bytes || 0) / Number(status.total_bytes || 1));
         if (verifying) {
-            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaVerifying', '下载完成，正在校验 ECAPA 模型…');
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaVerifying', '下载完成，正在校验模型…');
         } else if (downloading) {
             const downloaded = (Number(status.downloaded_bytes || 0) / 1000000).toFixed(1);
             elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaDownloading', `正在下载 ${downloaded} / ${size} MB`, { downloaded, size });
         } else if (status.profile_ready) {
-            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaProfileReady', '短语音声纹已就绪；当前运行链路支持增强且 Owner 声纹过滤已开启时才会使用。');
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaProfileReady', '短语音声纹已就绪；开启 Owner 声纹过滤后即可使用。');
         } else if (ready) {
-            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaNeedsEnrollment', '模型已就绪，请重新录入声纹以生成配套的短语音声纹。');
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaNeedsEnrollment', '增强模型已安装。请重新录入声纹，完成最后一步设置。');
         } else if (status.state === 'failed') {
-            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaFailed', '模型下载或校验失败，请重试。现有声纹识别不受影响。');
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaFailed', '增强模型下载或检查失败，请重试。普通声纹识别仍可使用。');
         } else {
-            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaMissing', '尚未下载 ECAPA 模型。');
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaMissing', '尚未安装短语音增强模型。');
         }
     }
 
@@ -570,21 +745,22 @@
                 || payload.profile_generation !== state.profileRevision) return;
             const status = payload && payload.short_speech;
             applyShortSpeechStatus(status);
-            renderShortSpeech();
+            applyTseStatus(payload && payload.tse);
+            render();
         } catch (_) {
             // A transient status failure does not prove that the download failed.
-            if (!state.closeStarted && document.visibilityState !== 'hidden' && state.shortSpeech
-                && ['downloading', 'verifying'].includes(state.shortSpeech.state)) {
+            if (!state.closeStarted && document.visibilityState !== 'hidden' && (tseModelActive()
+                || (state.shortSpeech && ['downloading', 'verifying'].includes(state.shortSpeech.state)))) {
                 state.ecapaTimer = window.setTimeout(refreshEcapaDownload, 1000);
             }
         }
     }
 
     async function downloadEcapa() {
-        if (state.ecapaPending || state.busy || state.enrollmentId || state.closeStarted) return;
+        if (modelOperationActive() || state.busy || state.enrollmentId || state.closeStarted) return;
         const identity = passiveRefreshIdentity();
         state.ecapaPending = true;
-        renderShortSpeech();
+        render();
         try {
             const payload = await apiRequest('/models/ecapa/download', { method: 'POST' });
             // A slow download response may belong to a profile that another window replaced.
@@ -597,7 +773,7 @@
             if (!canonical) state.shortSpeech = { ...state.shortSpeech, state: 'failed' };
         } finally {
             state.ecapaPending = false;
-            if (!state.closeStarted) renderShortSpeech();
+            if (!state.closeStarted) render();
         }
     }
 
@@ -952,7 +1128,7 @@
         }
     }
     async function startEnrollment() {
-        if (state.busy || state.filterPending || state.cancelPending) return;
+        if (state.busy || state.filterPending || state.cancelPending || modelOperationActive() || state.closeStarted) return;
         const nonce = ++state.operationNonce;
         stopPreparation('preparation_replaced');
         let startSettled = null;
@@ -1037,7 +1213,7 @@
         } finally { state.busy = false; state.cancelPending = false; render(); }
     }
     async function deleteProfile() {
-        if (state.busy || state.filterPending) return;
+        if (state.busy || state.filterPending || modelOperationActive()) return;
         state.busy = true; setMessage(''); render();
         try {
             const message = translate('voiceIdentity.deleteConfirm', '删除后需要重新录入才能使用声纹过滤。');
@@ -1054,7 +1230,7 @@
         } finally { state.busy = false; render(); }
     }
     async function updateFilter() {
-        if (state.filterPending || state.busy) return;
+        if (state.filterPending || state.busy || modelOperationActive()) return;
         const desired = elements.filter.checked;
         state.filterPending = true; setMessage(''); render();
         try {
@@ -1069,6 +1245,13 @@
     }
     function bindEvents() {
         if (elements.ecapaDownload) elements.ecapaDownload.addEventListener('click', downloadEcapa);
+        if (elements.tseDownload) elements.tseDownload.addEventListener('click', downloadTse);
+        if (elements.tseImport) elements.tseImport.addEventListener('click', () => {
+            if (!elements.tseImport.disabled) elements.tseFile.click();
+        });
+        if (elements.tseFile) elements.tseFile.addEventListener('change', importTse);
+        if (elements.tseEnabled) elements.tseEnabled.addEventListener('change', updateTse);
+        if (elements.tseEnroll) elements.tseEnroll.addEventListener('click', startEnrollment);
         elements.start.addEventListener('click', startEnrollment);
         elements.reenroll.addEventListener('click', startEnrollment);
         elements.cancel.addEventListener('click', () => cancelEnrollment().catch(function () {}));
@@ -1086,6 +1269,9 @@
         });
         window.nekoBeforeWindowClose = async function () {
             state.closeStarted = true; ++state.operationNonce; state.cancelPending = true;
+            ++state.tseRequestNonce;
+            if (state.tseImportAbort) state.tseImportAbort.abort();
+            state.tseImportAbort = null; state.tsePending = false;
             if (state.ecapaTimer) window.clearTimeout(state.ecapaTimer);
             state.ecapaTimer = null;
             stopTtlClock();

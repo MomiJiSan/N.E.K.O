@@ -150,6 +150,20 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert 'id="voice-identity-timer" aria-hidden="true"' in template
     assert 'data-i18n="voiceIdentity.hintSameMicrophone"' in template
     assert 'data-i18n="voiceIdentity.hintDifferentSentence"' in template
+    enrollment_position = template.index('id="voice-identity-enrollment"')
+    short_speech_position = template.index('id="voice-identity-short-speech"')
+    tse_position = template.index('id="voice-identity-tse"')
+    assert enrollment_position < short_speech_position < tse_position
+    assert '<details class="enrollment-card tse-model-card" id="voice-identity-short-speech" hidden>' in template
+    assert 'data-i18n="voiceIdentity.shortSpeechExpand">展开</span>' in template
+    assert 'data-i18n="voiceIdentity.shortSpeechCollapse">隐藏</span>' in template
+    assert '<details class="enrollment-card tse-model-card" id="voice-identity-short-speech" hidden open>' not in template
+    assert '<details class="enrollment-card tse-model-card" id="voice-identity-tse">' in template
+    assert '<summary class="tse-model-summary">' in template
+    assert 'data-i18n="tseModels.expand">展开</span>' in template
+    assert 'data-i18n="tseModels.collapse">隐藏</span>' in template
+    assert '<details class="enrollment-card tse-model-card" id="voice-identity-tse" open>' not in template
+    assert "pVAD 判断短语音" not in template
     assert "voice-identity-record" not in template
     assert "embedding" not in template.lower()
     assert "similarity" not in template.lower()

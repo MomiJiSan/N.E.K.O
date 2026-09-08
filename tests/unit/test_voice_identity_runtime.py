@@ -14,7 +14,10 @@ from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierInstallIdentity,
 )
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
-from main_logic.voice_identity.profile import SpeakerProfile
+from main_logic.voice_identity.profile import (
+    SpeakerActivityReferenceContract,
+    SpeakerProfile,
+)
 from main_logic.voice_identity.reference import SpeakerReference
 from main_logic.voice_identity_service.audio_contract import (
     desktop_audio_contract_snapshot,
@@ -30,6 +33,8 @@ class _Factory:
     authority: object | None
     installation_identity: object | None
     shared_host_binding: object | None
+    shared_scoring_manager: object | None
+    shared_host_generation: object | None
     closed: bool = False
 
     def __init__(
@@ -42,6 +47,8 @@ class _Factory:
         authority: object | None = None,
         installation_identity: object | None = None,
         shared_host_binding: object | None = None,
+        shared_scoring_manager: object | None = None,
+        shared_host_generation: object | None = None,
     ) -> None:
         self.runtime = runtime
         self.profile = profile
@@ -50,6 +57,8 @@ class _Factory:
         self.authority = authority
         self.installation_identity = installation_identity
         self.shared_host_binding = shared_host_binding
+        self.shared_scoring_manager = shared_scoring_manager
+        self.shared_host_generation = shared_host_generation
         self.closed = False
 
     def close(self) -> None:
@@ -114,10 +123,38 @@ def _profile(generation: str) -> SpeakerProfile:
         reference.close()
 
 
+def _profile_with_activity(generation: str) -> SpeakerProfile:
+    primary = SpeakerReference(
+        SpeakerModelIdentity("model", "revision", 2),
+        [1.0, 0.0],
+    )
+    activity = SpeakerReference(
+        SpeakerModelIdentity("activity-model", "activity-revision", 2),
+        [0.0, 1.0],
+    )
+    try:
+        return SpeakerProfile(
+            generation,
+            primary,
+            activity_reference=activity,
+            activity_reference_contract=SpeakerActivityReferenceContract(
+                "resource-revision",
+                "preprocessing-revision",
+                "activity-reference",
+                16_000,
+                True,
+            ),
+        )
+    finally:
+        primary.close()
+        activity.close()
+
+
 @dataclass(slots=True)
 class _SharedBinding:
     manager: object
     generation: object
+    pvad_observe_enabled: bool = False
     current: bool = True
 
     def is_current(self) -> bool:
@@ -131,6 +168,8 @@ class _SharedCampPlusHost:
         self.binding: _SharedBinding | None = None
         self.generation_number = 0
         self.closed = 0
+        self.activate_error: BaseException | None = None
+        self.deactivate_result = True
         self.close_started: asyncio.Event | None = None
         self.close_release: asyncio.Event | None = None
 
@@ -143,6 +182,9 @@ class _SharedCampPlusHost:
     ) -> object:
         assert absolute_deadline > asyncio.get_running_loop().time()
         self.events.append(f"activate:{profile.generation}:{config_generation}")
+        if self.activate_error is not None:
+            error, self.activate_error = self.activate_error, None
+            raise error
         if self.binding is not None:
             self.binding.current = False
         self.generation_number += 1
@@ -150,7 +192,11 @@ class _SharedCampPlusHost:
             host_generation=self.generation_number,
             identity=SimpleNamespace(profile_generation=profile.generation),
         )
-        self.binding = _SharedBinding(self.manager, generation)
+        self.binding = _SharedBinding(
+            self.manager,
+            generation,
+            pvad_observe_enabled=profile.has_activity_reference,
+        )
         return generation
 
     def composition_binding(self) -> _SharedBinding:
@@ -164,7 +210,7 @@ class _SharedCampPlusHost:
         if self.binding is not None:
             self.binding.current = False
         self.binding = None
-        return True
+        return self.deactivate_result
 
     async def close(self) -> None:
         self.events.append("close")
@@ -202,10 +248,7 @@ def test_missing_registry_diagnostics_preserve_fixed_schema() -> None:
     diagnostics = runtime_module.get_voice_identity_diagnostics()
 
     assert diagnostics == {
-        **{
-            name: 0
-            for name in runtime_module._VOICE_IDENTITY_DIAGNOSTIC_COUNTERS
-        },
+        **{name: 0 for name in runtime_module._VOICE_IDENTITY_DIAGNOSTIC_COUNTERS},
         "registered_manager_count": 0,
         "diagnostic_runtime_count": 0,
     }
@@ -295,10 +338,11 @@ async def test_shared_campplus_binding_reaches_legacy_and_spec_factories() -> No
 
         activation = registry._activation  # type: ignore[attr-defined]
         assert activation is not None
+        spec = activation.spec()
         identity = SpeakerVerifierInstallIdentity(
             1, 2, 3, 4, 5, 6, activation.revision, "installation"
         )
-        built = activation.spec().factory_builder(object(), identity)  # type: ignore[misc]
+        built = spec.factory_builder(object(), identity)  # type: ignore[misc]
         assert built.shared_host_binding is binding
 
         future = OrderedManager()
@@ -313,7 +357,38 @@ async def test_shared_campplus_binding_reaches_legacy_and_spec_factories() -> No
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_failed_activation_restores_previous_shared_generation() -> None:
+async def test_activity_profile_uses_shared_pvad_composition_path() -> None:
+    shared_host = _SharedCampPlusHost()
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=True,
+        shared_campplus_host=shared_host,  # type: ignore[arg-type]
+    )
+    manager = _Manager()
+    await registry.register_manager(manager)
+    plain_profile = _profile("plain")
+    activity_profile = _profile_with_activity("activity")
+    try:
+        assert await registry.activate(plain_profile, "plain-configuration")
+        assert shared_host.binding is not None
+
+        assert await registry.activate(activity_profile, "activity-configuration")
+        factory = manager.verifier_calls[-1][0]
+        assert factory is not None
+        assert factory.shared_host_binding is shared_host.binding
+        assert factory.shared_host_binding.pvad_observe_enabled is True
+        assert factory.shared_scoring_manager is None
+        assert factory.shared_host_generation is None
+        assert shared_host.binding is not None
+        assert shared_host.events[-1] == "activate:activity:activity-configuration"
+    finally:
+        plain_profile.close()
+        activity_profile.close()
+        await registry.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_failed_shared_activation_restores_previous_physical_generation() -> None:
     shared_host = _SharedCampPlusHost()
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,
@@ -341,6 +416,13 @@ async def test_failed_activation_restores_previous_shared_generation() -> None:
         restored = shared_host.composition_binding()
         assert restored.generation is not first_generation
         assert restored.generation.identity.profile_generation == "old"
+        assert [
+            event for event in shared_host.events if event.startswith("activate:")
+        ] == [
+            "activate:old:old-configuration",
+            "activate:new:new-configuration",
+            "activate:old:old-configuration",
+        ]
         for manager in ordered:
             factory = manager.verifier_calls[-1][0]
             assert factory is not None
@@ -353,7 +435,7 @@ async def test_failed_activation_restores_previous_shared_generation() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_abort_restores_previous_shared_binding_before_reattach() -> None:
+async def test_abort_prepared_activation_restores_previous_shared_binding() -> None:
     shared_host = _SharedCampPlusHost()
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,
@@ -387,7 +469,7 @@ async def test_abort_restores_previous_shared_binding_before_reattach() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_disable_deactivates_shared_host_without_closing_owner() -> None:
+async def test_disable_deactivates_shared_host_without_terminating_owner() -> None:
     shared_host = _SharedCampPlusHost()
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,
@@ -467,8 +549,7 @@ async def test_activation_status_tracks_live_route_and_runtime_degradation() -> 
     assert registry.activation_status() is VoiceIdentityActivationResult.READY
     registry._restore_pending.add(manager)  # type: ignore[attr-defined]
     assert (
-        registry.activation_status()
-        is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        registry.activation_status() is VoiceIdentityActivationResult.RUNTIME_DEGRADED
     )
     registry._restore_pending.discard(manager)  # type: ignore[attr-defined]
     manager._asr_route_mode = "native"  # type: ignore[attr-defined]
@@ -479,15 +560,16 @@ async def test_activation_status_tracks_live_route_and_runtime_degradation() -> 
     manager._asr_route_mode = "independent"  # type: ignore[attr-defined]
     manager._asr_runtime._speaker_verifier_degraded = True
     assert (
-        registry.activation_status()
-        is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        registry.activation_status() is VoiceIdentityActivationResult.RUNTIME_DEGRADED
     )
     await registry.close()
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runtime() -> None:
+async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runtime() -> (
+    None
+):
     registry = OwnerVoiceRuntimeRegistry(enforce=True)
     runtime = SimpleNamespace(
         _speaker_verifier_diagnostics=lambda: {
@@ -529,8 +611,7 @@ async def test_diagnostics_snapshot_aggregates_only_safe_counters_once_per_runti
     assert diagnostics["diagnostic_runtime_missing_identity_count"] == 1
     assert diagnostics["diagnostic_runtime_seal_unbound_count"] == 1
     assert (
-        diagnostics["diagnostic_runtime_missing_identity_and_seal_unbound_count"]
-        == 1
+        diagnostics["diagnostic_runtime_missing_identity_and_seal_unbound_count"] == 1
     )
     assert "similarity" not in diagnostics
     assert "unexpected" not in diagnostics
@@ -644,7 +725,9 @@ async def test_reregistration_invalidates_stale_detach_before_attach_retry() -> 
     registration_calls = manager.verifier_calls[calls_before_registration:]
     assert len(registration_calls) == 2
     assert all(factory is not None for factory, _generation in registration_calls)
-    assert all(generation == "generation" for _factory, generation in registration_calls)
+    assert all(
+        generation == "generation" for _factory, generation in registration_calls
+    )
     await registry.close()
 
 
@@ -666,8 +749,7 @@ async def test_failed_activation_rolls_changed_managers_back() -> None:
 
         await _wait_until(
             lambda: all(
-                manager
-                not in registry._attach_pending  # type: ignore[attr-defined]
+                manager not in registry._attach_pending  # type: ignore[attr-defined]
                 for manager in ordered
             )
         )
@@ -682,7 +764,9 @@ async def test_failed_activation_rolls_changed_managers_back() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_failed_activation_retries_prior_verifier_when_rollback_degrades() -> None:
+async def test_failed_activation_retries_prior_verifier_when_rollback_degrades() -> (
+    None
+):
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,
         restore_retry_interval_seconds=0.01,
@@ -704,8 +788,7 @@ async def test_failed_activation_retries_prior_verifier_when_rollback_degrades()
         assert ordered[0] in registry._attach_pending  # type: ignore[attr-defined]
         assert ordered[0] not in registry._detach_pending  # type: ignore[attr-defined]
         await _wait_until(
-            lambda: ordered[0]
-            not in registry._attach_pending  # type: ignore[attr-defined]
+            lambda: ordered[0] not in registry._attach_pending  # type: ignore[attr-defined]
         )
         assert ordered[0].verifier_calls[-1][1] == "old-generation"
         assert ordered[0].verifier_calls[-1][0] is not None
@@ -905,8 +988,7 @@ async def test_failed_detach_never_restores_old_activation() -> None:
     assert await registry.register_manager(future)
     assert future.verifier_calls == []
     await _wait_until(
-        lambda: manager
-        not in registry._detach_pending  # type: ignore[attr-defined]
+        lambda: manager not in registry._detach_pending  # type: ignore[attr-defined]
     )
     assert all(
         generation != "active-generation"
@@ -953,9 +1035,7 @@ async def test_cancelled_detach_defers_current_and_remaining_managers() -> None:
         profile.close()
     ordered = tuple(registry._managers)  # type: ignore[attr-defined]
 
-    detach_task = asyncio.create_task(
-        registry.activate(None, "detach-generation")
-    )
+    detach_task = asyncio.create_task(registry.activate(None, "detach-generation"))
     await asyncio.wait_for(ordered[0].detach_started.wait(), 1.0)
     detach_task.cancel()
 
@@ -1637,8 +1717,7 @@ async def test_registration_suppression_failure_keeps_manager_for_retry() -> Non
     assert manager in registry._managers  # type: ignore[attr-defined]
     assert manager in registry._attach_pending  # type: ignore[attr-defined]
     assert (
-        registry.activation_status()
-        is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        registry.activation_status() is VoiceIdentityActivationResult.RUNTIME_DEGRADED
     )
     manager.suppress_failure = False
     await registry.restore("voice_identity_enrollment")
@@ -1694,8 +1773,7 @@ async def test_registration_suppression_timeout_keeps_manager_for_retry(
     assert manager in registry._restore_pending  # type: ignore[attr-defined]
     assert manager in registry._attach_pending  # type: ignore[attr-defined]
     assert (
-        registry.activation_status()
-        is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        registry.activation_status() is VoiceIdentityActivationResult.RUNTIME_DEGRADED
     )
     await registry.close()
 
@@ -1779,8 +1857,10 @@ async def test_cancelled_registration_keeps_attach_pending_for_retry(
         assert registry._restore_retry_task is not None  # type: ignore[attr-defined]
 
     await _wait_until(
-        lambda: manager not in registry._attach_pending  # type: ignore[attr-defined]
-        and manager not in registry._restore_pending  # type: ignore[attr-defined]
+        lambda: (
+            manager not in registry._attach_pending  # type: ignore[attr-defined]
+            and manager not in registry._restore_pending
+        )  # type: ignore[attr-defined]
     )
     assert registry.activation_status() is VoiceIdentityActivationResult.READY
     await registry.close()
@@ -2025,7 +2105,9 @@ async def test_registry_close_cancellation_during_watchdog_join_still_cleans() -
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_registry_close_detaches_before_cancellation_safe_shared_host_close() -> None:
+async def test_registry_close_detaches_before_cancellation_safe_shared_host_close() -> (
+    None
+):
     events: list[str] = []
     shared_host = _SharedCampPlusHost(events)
     shared_host.close_started = asyncio.Event()
@@ -2152,17 +2234,19 @@ async def test_runtime_install_and_wrapper_lifecycle(
             speech_validator_factory,
             enrollment_noise_reduction_enabled: bool,
             activity_models,
-            ) -> None:
+            extraction_models,
+            extraction_preference_store,
+        ) -> None:
             self.args = args
             self.runtime_mode = runtime_mode
             self.runtime_status_callback = runtime_status_callback
             self.activation_transaction = activation_transaction
             self.enrollment_ttl_seconds = enrollment_ttl_seconds
             self.speech_validator_factory = speech_validator_factory
-            self.enrollment_noise_reduction_enabled = (
-                enrollment_noise_reduction_enabled
-            )
+            self.enrollment_noise_reduction_enabled = enrollment_noise_reduction_enabled
             self.activity_models = activity_models
+            self.extraction_models = extraction_models
+            self.extraction_preference_store = extraction_preference_store
             self.initialized = 0
             self.closed = 0
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from .contracts import SpeakerModelIdentity
 from .reference import SpeakerReference
+from .extraction_reference import SpeakerExtractionReference, SpeakerExtractionReferenceContract
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,7 @@ class SpeakerProfile:
     __slots__ = (
         "_closed", "_generation", "_lock", "_reference", "_activity_reference",
         "_activity_reference_contract",
+        "_extraction_reference", "_extraction_reference_contract",
     )
 
     def __init__(
@@ -48,6 +50,8 @@ class SpeakerProfile:
         *,
         activity_reference: SpeakerReference | None = None,
         activity_reference_contract: SpeakerActivityReferenceContract | None = None,
+        extraction_reference: SpeakerExtractionReference | None = None,
+        extraction_reference_contract: SpeakerExtractionReferenceContract | None = None,
     ) -> None:
         if type(generation) is not str or not generation.strip():
             raise ValueError("generation must be a non-empty string")
@@ -63,19 +67,31 @@ class SpeakerProfile:
         ):
             raise TypeError("activity reference contract must be concrete")
 
+        if (extraction_reference is None) != (extraction_reference_contract is None):
+            raise ValueError("extraction reference and contract must be provided together")
+        if extraction_reference is not None and type(extraction_reference) is not SpeakerExtractionReference:
+            raise TypeError("invalid extraction reference")
+        if extraction_reference_contract is not None and type(extraction_reference_contract) is not SpeakerExtractionReferenceContract:
+            raise TypeError("invalid extraction reference contract")
         self._generation = generation
         self._lock = threading.Lock()
         self._closed = False
         self._activity_reference = None
         self._activity_reference_contract = activity_reference_contract
+        self._extraction_reference = None
+        self._extraction_reference_contract = extraction_reference_contract
         cloned_reference: SpeakerReference | None = None
         try:
             cloned_reference = reference.clone()
             self._reference = cloned_reference
             if activity_reference is not None:
                 self._activity_reference = activity_reference.clone()
+            if extraction_reference is not None:
+                self._extraction_reference = extraction_reference.clone()
             return
         except BaseException:
+            if self._activity_reference is not None:
+                self._activity_reference.close()
             if cloned_reference is not None:
                 cloned_reference.close()
             raise
@@ -122,6 +138,23 @@ class SpeakerProfile:
     def __copy__(self) -> SpeakerProfile:
         return self._clone()
 
+    def clone_extraction_reference(self) -> SpeakerExtractionReference | None:
+        with self._lock:
+            self._require_open()
+            return None if self._extraction_reference is None else self._extraction_reference.clone()
+
+    @property
+    def has_extraction_reference(self) -> bool:
+        with self._lock:
+            self._require_open()
+            return self._extraction_reference is not None
+
+    @property
+    def extraction_reference_contract(self) -> SpeakerExtractionReferenceContract | None:
+        with self._lock:
+            self._require_open()
+            return self._extraction_reference_contract
+
     def __deepcopy__(self, memo: dict[int, object]) -> SpeakerProfile:
         del memo
         return self._clone()
@@ -131,7 +164,7 @@ class SpeakerProfile:
             if self._closed:
                 return
             first_error: BaseException | None = None
-            for reference in (self._activity_reference, self._reference):
+            for reference in (self._extraction_reference, self._activity_reference, self._reference):
                 if reference is None or reference.closed:
                     continue
                 try:
@@ -141,6 +174,8 @@ class SpeakerProfile:
                         first_error = exc
             self._closed = self._reference.closed and (
                 self._activity_reference is None or self._activity_reference.closed
+            ) and (
+                self._extraction_reference is None or self._extraction_reference.closed
             )
             if first_error is not None:
                 raise first_error
@@ -154,6 +189,7 @@ class SpeakerProfile:
             self._closed
             or self._reference.closed
             or (self._activity_reference is not None and self._activity_reference.closed)
+            or (self._extraction_reference is not None and self._extraction_reference.closed)
         ):
             raise RuntimeError("speaker profile is closed")
 
@@ -166,14 +202,20 @@ class SpeakerProfile:
             clone._closed = False
             clone._activity_reference = None
             clone._activity_reference_contract = self._activity_reference_contract
+            clone._extraction_reference = None
+            clone._extraction_reference_contract = self._extraction_reference_contract
             cloned_reference: SpeakerReference | None = None
             try:
                 cloned_reference = self._reference.clone()
                 clone._reference = cloned_reference
                 if self._activity_reference is not None:
                     clone._activity_reference = self._activity_reference.clone()
+                if self._extraction_reference is not None:
+                    clone._extraction_reference = self._extraction_reference.clone()
                 return clone
             except BaseException:
+                if clone._activity_reference is not None:
+                    clone._activity_reference.close()
                 if cloned_reference is not None:
                     cloned_reference.close()
                 raise

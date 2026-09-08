@@ -80,6 +80,12 @@ class AsrActivateCommand:
     buffered_pcm16: bytes
     sample_rate_hz: int
 
+    @property
+    def pcm16(self) -> bytes:
+        """Expose startup audio through the shared queued-payload contract."""
+
+        return self.buffered_pcm16
+
 
 @dataclass(frozen=True, slots=True)
 class AsrAudioCommand:
@@ -99,10 +105,13 @@ class AsrSealCommand:
     after_sequence: int
 
 
-_Command: TypeAlias = AsrActivateCommand | AsrAudioCommand | AsrSealCommand
+_PayloadCommand: TypeAlias = AsrActivateCommand | AsrAudioCommand
+_Command: TypeAlias = _PayloadCommand | AsrSealCommand
 _Validator: TypeAlias = Callable[["VoiceTurnToken", Any], bool]
 _WireCallback: TypeAlias = Callable[["VoiceTurnToken", Any, int], Awaitable[None]]
-_FailureCallback: TypeAlias = Callable[["VoiceTurnToken", BaseException], Awaitable[None]]
+_FailureCallback: TypeAlias = Callable[
+    ["VoiceTurnToken", BaseException], Awaitable[None]
+]
 _CloseSessionCallback: TypeAlias = Callable[[], Awaitable[None]]
 
 
@@ -178,7 +187,7 @@ class AsrAudioDispatcher:
         self._session_ref = session_ref
         self._state = "active"
         self._last_sequence = 0
-        return self._put(
+        return self._enqueue_payload(
             AsrActivateCommand(
                 self._generation,
                 turn_token,
@@ -209,7 +218,7 @@ class AsrAudioDispatcher:
         ):
             return False
         self._last_sequence = sequence_no
-        return self._put(
+        return self._enqueue_payload(
             AsrAudioCommand(
                 self._generation,
                 turn_token,
@@ -291,9 +300,7 @@ class AsrAudioDispatcher:
 
         discarded_before = self.asr_abort_discarded_command_count
         self.abort(turn_token)
-        discarded_commands = (
-            self.asr_abort_discarded_command_count - discarded_before
-        )
+        discarded_commands = self.asr_abort_discarded_command_count - discarded_before
 
         async def join_active_writer() -> bool:
             # abort() has synchronously task_done()'d every queued command, so
@@ -333,6 +340,11 @@ class AsrAudioDispatcher:
         if worker is not None:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
+
+    def _enqueue_payload(self, command: _PayloadCommand) -> bool:
+        """Queue startup and realtime PCM through one ordered entry point."""
+
+        return self._put(command)
 
     def _put(self, command: _Command) -> bool:
         self._ensure_worker()
@@ -390,11 +402,7 @@ class AsrAudioDispatcher:
                         self._turn_token = None
                         self._session_ref = None
                     continue
-                payload = (
-                    command.buffered_pcm16
-                    if isinstance(command, AsrActivateCommand)
-                    else command.pcm16
-                )
+                payload = command.pcm16
                 max_bytes = command.sample_rate_hz * 2
                 for offset in range(0, len(payload), max_bytes):
                     if not self._command_is_current(command):

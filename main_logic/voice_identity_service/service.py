@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field, replace
 import math
 from typing import Literal, Protocol, TypeVar
@@ -23,6 +23,15 @@ from main_logic.voice_identity.profile import SpeakerActivityReferenceContract, 
 from main_logic.voice_identity.reference import SpeakerReference
 from main_logic.voice_identity.pvad.assets import EcapaDownload, EcapaModelSnapshot
 from main_logic.voice_identity.pvad.models import extract_activity_reference
+from main_logic.voice_identity.extraction_reference import (
+    SpeakerExtractionReference, SpeakerExtractionReferenceContract,
+)
+from main_logic.voice_identity.tse.assets import TseAssets, TseAssetError, TseModelSnapshot
+from main_logic.voice_identity.tse.contracts import (
+    TSE_ENCODER_IDENTITY, RESOURCE_REVISION as TSE_RESOURCE_REVISION,
+    PREPROCESSING_REVISION as TSE_PREPROCESSING_REVISION,
+    REFERENCE_METHOD as TSE_REFERENCE_METHOD,
+)
 from main_logic.voice_input.suppression import (
     VoiceInputSuppressionController,
     VoiceInputSuppressionLease,
@@ -183,6 +192,7 @@ class VoiceIdentityServiceStatus:
     last_completed_enrollment_id: str | None
     verification: EnrollmentVerificationResult | None = None
     short_speech: dict[str, object] | None = None
+    tse: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = self.state.as_dict()
@@ -196,6 +206,8 @@ class VoiceIdentityServiceStatus:
             result["verification"] = self.verification.as_dict()
         if self.short_speech is not None:
             result["short_speech"] = self.short_speech
+        if self.tse is not None:
+            result["tse"] = self.tse
         return result
 
 
@@ -212,6 +224,9 @@ class _EnrollmentSession:
     requested_enabled_snapshot: bool
     noise_reduction_enabled_snapshot: bool
     activity_model_snapshot: EcapaModelSnapshot | None = None
+    extraction_model_snapshot: TseModelSnapshot | None = None
+    extraction_pcm: list[np.ndarray] = field(default_factory=list)
+    extraction_task: asyncio.Task[SpeakerExtractionReference] | None = None
     operation_nonce: int = 0
     in_flight_segment_index: int | None = None
     operation_task: asyncio.Task[object] | None = None
@@ -228,12 +243,20 @@ class _EnrollmentSession:
 @dataclass(slots=True)
 class _SegmentComputation:
     activity_reference: SpeakerReference | None = None
+    extraction_reference: SpeakerExtractionReference | None = None
+    extraction_pcm: np.ndarray | None = None
     reference_embedding: np.ndarray | None = None
     holdout_1_5: np.ndarray | None = None
     holdout_3_0: np.ndarray | None = None
     holdout_5_0: np.ndarray | None = None
 
     def wipe(self) -> None:
+        if self.extraction_reference is not None:
+            self.extraction_reference.close()
+            self.extraction_reference = None
+        if self.extraction_pcm is not None:
+            self.extraction_pcm.fill(0)
+            self.extraction_pcm = None
         if self.activity_reference is not None:
             self.activity_reference.close()
             self.activity_reference = None
@@ -270,6 +293,10 @@ class VoiceIdentityService:
         ) = None,
         enrollment_noise_reduction_enabled: bool = True,
         activity_models: EcapaDownload | None = None,
+        extraction_models: TseAssets | None = None,
+        extraction_preference_store: VoiceIdentityPreferenceStore | None = None,
+        extraction_runtime_status: Callable[[], dict[str, object]] | None = None,
+        extraction_runtime_available: bool = False,
     ) -> None:
         if not isinstance(profile_store, VoiceIdentityProfileStore):
             raise TypeError("profile_store must be VoiceIdentityProfileStore")
@@ -347,6 +374,14 @@ class VoiceIdentityService:
         self._initialized = False
         self._closed = False
         self._activity_models = activity_models
+        self._extraction_models = extraction_models
+        self._extraction_preference_store = extraction_preference_store
+        self._extraction_runtime_status = extraction_runtime_status
+        self._extraction_runtime_available = extraction_runtime_available
+        self._extraction_enabled = False
+        self._extraction_configuration_generation = 0
+        self._extraction_import_active = False
+        self._extraction_retirement_owner = None
 
     async def initialize(self) -> VoiceIdentityServiceStatus:
         async with self._operation_lock:
@@ -355,6 +390,13 @@ class VoiceIdentityService:
                 return self.status()
             if self._activity_models is not None:
                 await self._activity_models.initialize()
+            if self._extraction_models is not None:
+                await self._extraction_models.initialize()
+            if self._extraction_preference_store is not None:
+                try:
+                    self._extraction_enabled = await self._extraction_preference_store.aload()
+                except VoiceIdentityPreferenceStoreError:
+                    self._extraction_enabled = False
             try:
                 requested_enabled = await self._preference_store.aload()
             except VoiceIdentityPreferenceStoreError:
@@ -454,6 +496,7 @@ class VoiceIdentityService:
                 **self._activity_models.status(),
                 "profile_ready": bool(self._profile is not None and self._profile.has_activity_reference),
             }),
+            tse=self._extraction_status(),
         )
 
     async def download_activity_model(self) -> VoiceIdentityServiceStatus:
@@ -462,12 +505,135 @@ class VoiceIdentityService:
             self._require_initialized()
             if self._enrollment is not None:
                 raise VoiceIdentityServiceError("enrollment_active")
+            if self._extraction_import_active or (self._extraction_models is not None and self._extraction_models.busy):
+                raise VoiceIdentityServiceError("tse_assets_busy")
             if self._activity_models is None:
                 raise VoiceIdentityServiceError("model_unavailable")
             try:
                 self._activity_models.start()
             except Exception as exc:
                 raise VoiceIdentityServiceError("model_unavailable") from exc
+            return self.status()
+
+    def _activity_download_busy(self) -> bool:
+        return bool(self._activity_models is not None and self._activity_models.status().get("state") in {
+            "downloading", "verifying", "installing",
+        })
+
+    def _extraction_reference_state(self) -> str:
+        profile = self._profile
+        if profile is None or not profile.has_extraction_reference:
+            return "missing"
+        contract = profile.extraction_reference_contract
+        reference = profile.clone_extraction_reference()
+        try:
+            compatible = bool(
+                reference is not None and reference.model_identity == TSE_ENCODER_IDENTITY
+                and contract == SpeakerExtractionReferenceContract(
+                    TSE_RESOURCE_REVISION, TSE_PREPROCESSING_REVISION,
+                    TSE_REFERENCE_METHOD, 16000, self._runtime_noise_reduction_enabled,
+                )
+            )
+            return "ready" if compatible else "incompatible"
+        finally:
+            if reference is not None:
+                reference.close()
+
+    def _extraction_status(self) -> dict[str, object] | None:
+        if self._extraction_models is None:
+            return None
+        model = self._extraction_models.status()
+        busy = self._extraction_import_active or self._extraction_models.busy
+        can_change = not self._closed and self._enrollment is None and not self._activity_download_busy()
+        reference_state = self._extraction_reference_state()
+        runtime = {
+            "runtime_state": "waiting" if self._extraction_enabled else "disabled",
+            "requires_restart": False,
+            "reason": None if self._extraction_runtime_available else "tse_route_unavailable",
+        }
+        if self._extraction_runtime_status is not None:
+            try:
+                runtime.update(self._extraction_runtime_status())
+            except Exception:
+                runtime.update(runtime_state="error", reason="tse_runtime_failed")
+        return {
+            "model": {**model,
+                "can_download": can_change and not busy and bool(model.get("source_configured")) and not self._extraction_models.ready,
+                "can_import": can_change and not busy,
+            },
+            "reference_ready": reference_state == "ready", "reference_state": reference_state,
+            "can_enable": self._extraction_runtime_available,
+            "enabled": self._extraction_enabled, **runtime,
+        }
+
+    async def download_tse_model(self) -> VoiceIdentityServiceStatus:
+        async with self._operation_lock:
+            self._require_open()
+            self._require_initialized()
+            if self._enrollment is not None:
+                raise VoiceIdentityServiceError("enrollment_active")
+            if self._extraction_import_active or self._activity_download_busy():
+                raise VoiceIdentityServiceError("tse_assets_busy")
+            if self._extraction_models is None:
+                raise VoiceIdentityServiceError("tse_model_unavailable")
+            try:
+                self._extraction_models.start()
+            except TseAssetError as exc:
+                raise VoiceIdentityServiceError(exc.code) from exc
+            return self.status()
+
+    async def import_tse_model(self, chunks: AsyncIterable[bytes]) -> VoiceIdentityServiceStatus:
+        async with self._operation_lock:
+            self._require_open()
+            self._require_initialized()
+            if self._enrollment is not None:
+                raise VoiceIdentityServiceError("enrollment_active")
+            models = self._extraction_models
+            if models is None:
+                raise VoiceIdentityServiceError("tse_model_unavailable")
+            if self._extraction_import_active or models.busy or self._activity_download_busy():
+                raise VoiceIdentityServiceError("tse_assets_busy")
+            self._extraction_import_active = True
+        try:
+            await models.import_stream(chunks)
+        except TseAssetError as exc:
+            raise VoiceIdentityServiceError(exc.code) from exc
+        finally:
+            self._extraction_import_active = False
+        return self.status()
+
+    async def update_tse(self, enabled: bool, profile_id: str | None) -> VoiceIdentityServiceStatus:
+        if type(enabled) is not bool:
+            raise VoiceIdentityServiceError("invalid_enabled")
+        async with self._operation_lock:
+            self._require_open()
+            self._require_initialized()
+            if self._enrollment is not None:
+                raise VoiceIdentityServiceError("enrollment_active")
+            current_id = None if self._profile is None else self._profile.generation
+            if profile_id != current_id:
+                raise VoiceIdentityServiceError("stale_profile")
+            if enabled:
+                if not self._extraction_runtime_available:
+                    raise VoiceIdentityServiceError("tse_route_unavailable")
+                if self._extraction_models is None or not self._extraction_models.ready:
+                    raise VoiceIdentityServiceError("tse_model_unavailable")
+                if self._extraction_reference_state() != "ready":
+                    raise VoiceIdentityServiceError("tse_reference_required")
+            cancellations: list[asyncio.CancelledError] = []
+            if self._extraction_preference_store is not None:
+                try:
+                    await _await_cancellation_safe(
+                        self._extraction_preference_store.asave(enabled),
+                        name="voice-identity-tse-preference-save", cancellations=cancellations,
+                    )
+                except VoiceIdentityPreferenceStoreError as exc:
+                    raise VoiceIdentityServiceError("runtime_degraded") from exc
+            if enabled != self._extraction_enabled:
+                self._extraction_configuration_generation += 1
+            self._extraction_enabled = enabled
+            if cancellations:
+                raise cancellations[0]
             return self.status()
 
     def _enrollment_status(self, session: _EnrollmentSession) -> EnrollmentStatus:
@@ -494,10 +660,19 @@ class VoiceIdentityService:
             self._require_initialized()
             if self._enrollment is not None:
                 return self._enrollment_status(self._enrollment)
+            if self._extraction_retirement_owner is not None:
+                raise VoiceIdentityServiceError("model_unavailable")
+            if self._extraction_import_active or self._activity_download_busy() or (
+                self._extraction_models is not None and self._extraction_models.busy
+            ):
+                raise VoiceIdentityServiceError("tse_assets_busy")
             # Freeze before the first load/suppression await. A download finishing
             # during this start request must not change this enrollment's protocol.
             activity_snapshot = (
                 None if self._activity_models is None else self._activity_models.snapshot()
+            )
+            extraction_snapshot = (
+                None if self._extraction_models is None else self._extraction_models.snapshot()
             )
             cleanup_task = self._model_load_cleanup_task
             if cleanup_task is not None:
@@ -660,6 +835,7 @@ class VoiceIdentityService:
                     self._runtime_noise_reduction_enabled
                 ),
                 activity_model_snapshot=activity_snapshot,
+                extraction_model_snapshot=extraction_snapshot,
             )
             self._enrollment_generation += 1
             if not self._effective_enabled:
@@ -844,6 +1020,12 @@ class VoiceIdentityService:
                     await self._retire_expired_session(session)
                 raise VoiceIdentityServiceError("stale_enrollment")
 
+            if segment_index <= 3 and session.extraction_model_snapshot is not None:
+                if computed.extraction_pcm is None:
+                    raise VoiceIdentityServiceError("tse_reference_required")
+                session.extraction_pcm.append(computed.extraction_pcm)
+                computed.extraction_pcm = None
+
             if segment_index in (1, 2):
                 embedding = computed.reference_embedding
                 computed.reference_embedding = None
@@ -882,6 +1064,8 @@ class VoiceIdentityService:
 
             activity_reference = computed.activity_reference
             computed.activity_reference = None
+            extraction_reference = computed.extraction_reference
+            computed.extraction_reference = None
             try:
                 centroid = session.reference_centroid
                 if centroid is None:
@@ -898,12 +1082,20 @@ class VoiceIdentityService:
                     computed.holdout_3_0,
                     computed.holdout_5_0,
                 )
+            except BaseException:
+                if activity_reference is not None:
+                    activity_reference.close()
+                if extraction_reference is not None:
+                    extraction_reference.close()
+                raise
             finally:
                 computed.wipe()
 
             if not verification.passed:
                 if activity_reference is not None:
                     activity_reference.close()
+                if extraction_reference is not None:
+                    extraction_reference.close()
                 session.holdout_failure_count += 1
                 if session.holdout_failure_count >= 2:
                     self._reset_session_references(session)
@@ -918,10 +1110,13 @@ class VoiceIdentityService:
                     operation_nonce=operation_nonce,
                     profile_id=profile_id,
                     activity_reference=activity_reference,
+                    extraction_reference=extraction_reference,
                 )
             finally:
                 if activity_reference is not None:
                     activity_reference.close()
+                if extraction_reference is not None:
+                    extraction_reference.close()
             return replace(committed, verification=verification)
         finally:
             computed.wipe()
@@ -1020,6 +1215,10 @@ class VoiceIdentityService:
                     segment_index,
                     operation_task,
                 )
+                if session.extraction_model_snapshot is not None:
+                    computation.extraction_pcm = np.frombuffer(
+                        normalized_pcm16[:reference_bytes], dtype="<i2",
+                    ).astype(np.float32) / 32768.0
                 return computation
             computation.holdout_1_5 = await self._infer_embedding(
                 session,
@@ -1088,6 +1287,40 @@ class VoiceIdentityService:
                     or computation.activity_reference.model_identity != snapshot.model_identity
                 ):
                     raise ValueError("activity_reference_model_mismatch")
+            if (
+                session.extraction_model_snapshot is not None
+                and session.reference_centroid is not None
+                and verify_enrollment_holdout(
+                    session.reference_centroid, computation.holdout_1_5,
+                    computation.holdout_3_0, computation.holdout_5_0,
+                ).passed
+            ):
+                from main_logic.voice_identity.tse.worker import extract_extraction_reference
+                snapshot = session.extraction_model_snapshot
+                if len(session.extraction_pcm) != 3:
+                    raise ValueError("extraction_reference_segments_missing")
+                timeout = min(self._model_timeout_seconds, max(
+                    0.0, session.expires_at - asyncio.get_running_loop().time(),
+                ))
+                extraction_task = asyncio.create_task(
+                    extract_extraction_reference(
+                        snapshot.directory, tuple(session.extraction_pcm), timeout=timeout,
+                    ), name="voice-identity-enrollment-extraction-reference",
+                )
+                session.extraction_task = extraction_task
+                computation.extraction_reference = await asyncio.wait_for(
+                    asyncio.shield(extraction_task), timeout=timeout,
+                )
+                if session.extraction_task is extraction_task:
+                    session.extraction_task = None
+                self._require_compute_fence(
+                    session, session_generation, operation_nonce, segment_index, operation_task,
+                )
+                if (
+                    type(computation.extraction_reference) is not SpeakerExtractionReference
+                    or computation.extraction_reference.model_identity != snapshot.model_identity
+                ):
+                    raise ValueError("extraction_reference_model_mismatch")
             return computation
         except BaseException:
             computation.wipe()
@@ -1186,6 +1419,7 @@ class VoiceIdentityService:
         operation_nonce: int,
         profile_id: str,
         activity_reference: SpeakerReference | None = None,
+        extraction_reference: SpeakerExtractionReference | None = None,
     ) -> VoiceIdentityServiceStatus:
         old_profile = self._profile
         old_audio_contract = self._profile_audio_contract
@@ -1242,10 +1476,24 @@ class VoiceIdentityService:
                     )
                 elif activity_reference is not None:
                     raise VoiceIdentityServiceError("model_unavailable")
+                extraction_snapshot = session.extraction_model_snapshot
+                extraction_contract = None
+                if extraction_snapshot is not None:
+                    if extraction_reference is None or extraction_reference.model_identity != extraction_snapshot.model_identity:
+                        raise VoiceIdentityServiceError("tse_reference_required")
+                    extraction_contract = SpeakerExtractionReferenceContract(
+                        extraction_snapshot.resource_revision, extraction_snapshot.preprocessing_revision,
+                        extraction_snapshot.reference_method, ENROLLMENT_SAMPLE_RATE_HZ,
+                        session.noise_reduction_enabled_snapshot,
+                    )
+                elif extraction_reference is not None:
+                    raise VoiceIdentityServiceError("tse_reference_required")
                 new_profile = SpeakerProfile(
                     profile_id, reference,
                     activity_reference=activity_reference,
                     activity_reference_contract=activity_contract,
+                    extraction_reference=extraction_reference,
+                    extraction_reference_contract=extraction_contract,
                 )
             finally:
                 reference.close()
@@ -1514,6 +1762,9 @@ class VoiceIdentityService:
             )
 
     def _reset_session_references(self, session: _EnrollmentSession) -> None:
+        for pcm in session.extraction_pcm:
+            pcm.fill(0)
+        session.extraction_pcm.clear()
         for embedding in session.reference_embeddings:
             wipe_enrollment_embedding(embedding)
         session.reference_embeddings.clear()
@@ -1865,6 +2116,14 @@ class VoiceIdentityService:
             self._closed = True
             cancellations: list[asyncio.CancelledError] = []
             download_close_error: Exception | None = None
+            if self._extraction_models is not None:
+                try:
+                    await _await_cancellation_safe(
+                        self._extraction_models.close(), name="voice-identity-close-tse-download",
+                        cancellations=cancellations,
+                    )
+                except Exception as exc:
+                    download_close_error = exc
             if self._activity_models is not None:
                 try:
                     await _await_cancellation_safe(
@@ -1924,6 +2183,32 @@ class VoiceIdentityService:
         if session.expiry_task is not current:
             session.expiry_task.cancel()
         ok = True
+        extraction_task = session.extraction_task
+        session.extraction_task = None
+        if extraction_task is not None:
+            if not extraction_task.done():
+                extraction_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(extraction_task), timeout=self._model_timeout_seconds)
+                except TimeoutError:
+                    self._retain_activity_cleanup(session, extraction_task)
+                    return False
+                except asyncio.CancelledError:
+                    if not extraction_task.done():
+                        self._retain_activity_cleanup(session, extraction_task)
+                        raise
+                except Exception:
+                    pass
+            from main_logic.voice_identity.tse.worker import TseEncoderRetirementError
+            try:
+                reference = extraction_task.result()
+            except TseEncoderRetirementError as exc:
+                self._retain_extraction_retirement_cleanup(session, exc)
+                return False
+            except BaseException:
+                pass
+            else:
+                reference.close()
         activity_task = session.activity_task
         session.activity_task = None
         if activity_task is not None:
@@ -2033,6 +2318,40 @@ class VoiceIdentityService:
             return
         reference.close()
 
+    def _retain_extraction_retirement_cleanup(self, session: _EnrollmentSession, error) -> None:
+        """Do not confuse a completed coroutine with a stopped native process.
+
+        The owner remains a quarantine even if the waiter is canceled or fails.
+        Only successful native retirement and session cleanup clear it.
+        """
+        owner = error.retirement_owner
+        self._extraction_retirement_owner = owner
+        self._wipe_session_embeddings(session)
+
+        async def finish() -> None:
+            await asyncio.shield(error.retirement_task)
+            if not owner.confirmed_stopped:
+                raise RuntimeError("TSE encoder retirement is not confirmed")
+            if not await self._cleanup_session(session):
+                raise RuntimeError("TSE enrollment cleanup is incomplete")
+            if self._extraction_retirement_owner is owner:
+                self._extraction_retirement_owner = None
+
+        task = asyncio.create_task(finish(), name="voice-identity-extraction-retirement")
+        self._model_inference_cleanup_task = task
+
+        def completed(result: asyncio.Task[None]) -> None:
+            # Cancellation/error retains the owner quarantine. In particular,
+            # shutdown cannot turn a canceled waiter into permission to restart.
+            try:
+                result.result()
+            except BaseException:
+                return
+            if self._model_inference_cleanup_task is result:
+                self._model_inference_cleanup_task = None
+
+        task.add_done_callback(completed)
+
     def _retain_activity_cleanup(
         self,
         session: _EnrollmentSession,
@@ -2042,8 +2361,12 @@ class VoiceIdentityService:
         self._wipe_session_embeddings(session)
 
         async def finish_cleanup() -> None:
+            from main_logic.voice_identity.tse.worker import TseEncoderRetirementError
             try:
                 await activity_task
+            except TseEncoderRetirementError as exc:
+                self._retain_extraction_retirement_cleanup(session, exc)
+                return
             except BaseException:
                 pass
             self._discard_activity_result(activity_task)
@@ -2065,6 +2388,9 @@ class VoiceIdentityService:
         cleanup_task.add_done_callback(clear_finished)
 
     def _wipe_session_embeddings(self, session: _EnrollmentSession) -> None:
+        for pcm in session.extraction_pcm:
+            pcm.fill(0)
+        session.extraction_pcm.clear()
         for embedding in session.reference_embeddings:
             wipe_enrollment_embedding(embedding)
         session.reference_embeddings.clear()

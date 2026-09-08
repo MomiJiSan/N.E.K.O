@@ -33,8 +33,7 @@ _FRAME_SHIFT = 160
 # not evidence that a 45 ms speaker embedding is identity-reliable.
 CAMPPLUS_EXECUTABLE_MINIMUM_FRAMES = 3
 CAMPPLUS_EXECUTABLE_MINIMUM_SAMPLES = (
-    _FRAME_LENGTH
-    + (CAMPPLUS_EXECUTABLE_MINIMUM_FRAMES - 1) * _FRAME_SHIFT
+    _FRAME_LENGTH + (CAMPPLUS_EXECUTABLE_MINIMUM_FRAMES - 1) * _FRAME_SHIFT
 )
 _PADDED_FRAME_LENGTH = 512
 _MEL_BIN_COUNT = 80
@@ -70,9 +69,7 @@ class _ZeroizableEmbedding:
             if not math.isfinite(norm) or norm <= 1e-12:
                 raise ValueError("reference_embedding_norm")
             embedding /= np.float32(norm)
-            self._storage = bytearray(
-                embedding.astype("<f4", copy=False).tobytes()
-            )
+            self._storage = bytearray(embedding.astype("<f4", copy=False).tobytes())
         finally:
             _wipe_array(embedding)
         self._closed = False
@@ -94,9 +91,7 @@ class _ZeroizableEmbedding:
 
 def _povey_window() -> np.ndarray:
     indices = np.arange(_FRAME_LENGTH, dtype=np.float64)
-    window = (
-        0.5 - 0.5 * np.cos(2 * np.pi * indices / (_FRAME_LENGTH - 1))
-    ) ** 0.85
+    window = (0.5 - 0.5 * np.cos(2 * np.pi * indices / (_FRAME_LENGTH - 1))) ** 0.85
     return window.astype(np.float32)
 
 
@@ -118,9 +113,7 @@ def _mel_filter_bank() -> np.ndarray:
         (_MEL_BIN_COUNT, _PADDED_FRAME_LENGTH // 2 + 1),
         dtype=np.float32,
     )
-    segments = np.floor((mel_frequencies - low_mel) / mel_delta).astype(
-        np.int32
-    )
+    segments = np.floor((mel_frequencies - low_mel) / mel_delta).astype(np.int32)
     for fft_bin, segment in enumerate(segments):
         if segment < 0 or segment > _MEL_BIN_COUNT:
             continue
@@ -177,9 +170,9 @@ def compute_campplus_features(
         frames[:, 0] *= np.float32(1.0) - _PREEMPHASIS_COEFFICIENT
         frames *= _POVEY_WINDOW
         spectrum = np.fft.rfft(frames, n=_PADDED_FRAME_LENGTH, axis=1)
-        power = (
-            spectrum.real * spectrum.real + spectrum.imag * spectrum.imag
-        ).astype(np.float32)
+        power = (spectrum.real * spectrum.real + spectrum.imag * spectrum.imag).astype(
+            np.float32
+        )
         mel_energies = power @ _MEL_FILTER_BANK.T
         np.maximum(mel_energies, _FLOAT32_EPSILON, out=mel_energies)
         features = np.log(mel_energies, dtype=np.float32)
@@ -229,9 +222,7 @@ class CampPlusEmbeddingModel:
             options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             options.intra_op_num_threads = 1
             options.inter_op_num_threads = 1
-            options.graph_optimization_level = (
-                ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            )
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             options.enable_cpu_mem_arena = False
             with self._lifecycle_lock:
                 if self._closed:
@@ -287,10 +278,7 @@ class CampPlusEmbeddingModel:
             raise ValueError("onnx_output_name")
         if outputs[0].type != "tensor(float)":
             raise ValueError("onnx_output_type")
-        if (
-            len(outputs[0].shape) != 2
-            or outputs[0].shape[1] != CAMPPLUS_EMBEDDING_DIM
-        ):
+        if len(outputs[0].shape) != 2 or outputs[0].shape[1] != CAMPPLUS_EMBEDDING_DIM:
             raise ValueError("onnx_output_shape")
         metadata = session.get_modelmeta().custom_metadata_map
         expected_metadata = {
@@ -302,8 +290,7 @@ class CampPlusEmbeddingModel:
             "normalize_samples": "1",
         }
         if any(
-            metadata.get(key) != expected
-            for key, expected in expected_metadata.items()
+            metadata.get(key) != expected for key, expected in expected_metadata.items()
         ):
             raise ValueError("onnx_metadata")
 
