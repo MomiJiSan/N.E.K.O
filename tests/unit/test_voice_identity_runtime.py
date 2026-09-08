@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -70,6 +71,17 @@ class _Manager:
             factory.close()
         return outcome
 
+    async def set_voice_session_activation_factory(
+        self,
+        factory: _Factory | None,
+        *,
+        activation_generation: str,
+    ) -> bool | VoiceIdentityActivationResult:
+        return await self.set_speaker_verifier_factory(
+            factory,
+            activation_generation=activation_generation,
+        )
+
     async def set_voice_input_suppressed(
         self,
         reason: str,
@@ -112,7 +124,7 @@ async def _wait_until(predicate, *, timeout_seconds: float = 2.0) -> None:
 def _fake_composition_factory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runtime_module,
-        "OwnerVoiceAsrCompositionFactory",
+        "OwnerVoiceSessionActivationFactory",
         _Factory,
     )
     monkeypatch.setattr(runtime_module, "_runtime_registry", None)
@@ -164,6 +176,80 @@ async def test_activation_preserves_unsupported_route_result() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_registry_prefers_session_activation_over_legacy_utterance_filter() -> None:
+    class SessionActivationManager(_Manager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.session_activation_calls: list[tuple[object | None, str]] = []
+
+        async def set_voice_session_activation_factory(
+            self,
+            factory,
+            *,
+            activation_generation: str,
+        ) -> VoiceIdentityActivationResult:
+            self.session_activation_calls.append((factory, activation_generation))
+            return VoiceIdentityActivationResult.READY
+
+    registry = OwnerVoiceRuntimeRegistry(enforce=True)
+    manager = SessionActivationManager()
+    await registry.register_manager(manager)
+    profile = _profile("profile-session")
+    try:
+        assert (
+            await registry.activate(profile, "generation-session")
+            is VoiceIdentityActivationResult.READY
+        )
+    finally:
+        profile.close()
+
+    assert len(manager.session_activation_calls) == 1
+    assert manager.session_activation_calls[0][1] == "generation-session"
+    assert manager.verifier_calls == []
+    await registry.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_legacy_manager_does_not_receive_incompatible_session_factory() -> None:
+    class LegacyManager:
+        def __init__(self) -> None:
+            self._asr_runtime = object()
+            self._asr_route_mode = "independent"
+            self.legacy_setter = AsyncMock(return_value=True)
+
+        async def set_speaker_verifier_factory(self, *args, **kwargs):
+            return await self.legacy_setter(*args, **kwargs)
+
+        async def set_voice_input_suppressed(
+            self,
+            reason: str,
+            *,
+            suppressed: bool,
+        ) -> None:
+            del reason, suppressed
+
+    registry = OwnerVoiceRuntimeRegistry(enforce=True)
+    manager = LegacyManager()
+    assert (
+        await registry.register_manager(manager)
+        is VoiceIdentityActivationResult.READY
+    )
+    profile = _profile("legacy-profile")
+    try:
+        assert (
+            await registry.activate(profile, "legacy-generation")
+            is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        )
+    finally:
+        profile.close()
+
+    manager.legacy_setter.assert_not_awaited()
+    await registry.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_late_registration_preserves_unsupported_route_result() -> None:
     registry = OwnerVoiceRuntimeRegistry(enforce=True)
     profile = _profile("profile")
@@ -206,7 +292,7 @@ async def test_activation_status_tracks_live_route_and_runtime_degradation() -> 
     manager._asr_route_mode = "native"  # type: ignore[attr-defined]
     assert (
         registry.activation_status()
-        is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+        is VoiceIdentityActivationResult.READY
     )
     manager._asr_route_mode = "independent"  # type: ignore[attr-defined]
     manager._asr_runtime._speaker_verifier_degraded = True
@@ -1771,10 +1857,14 @@ async def test_runtime_install_and_wrapper_lifecycle(
             *args,
             runtime_mode: str,
             runtime_status_callback,
+            enrollment_noise_reduction_enabled: bool,
         ) -> None:
             self.args = args
             self.runtime_mode = runtime_mode
             self.runtime_status_callback = runtime_status_callback
+            self.enrollment_noise_reduction_enabled = (
+                enrollment_noise_reduction_enabled
+            )
             self.initialized = 0
             self.closed = 0
 

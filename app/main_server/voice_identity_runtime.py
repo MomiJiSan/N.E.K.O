@@ -15,8 +15,8 @@ import weakref
 from main_logic.asr_client import VoiceIdentityActivationResult
 from main_logic.asr_client.speaker_shadow.campplus import CampPlusEmbeddingModel
 from main_logic.voice_identity.profile import SpeakerProfile
-from main_logic.voice_identity_service.asr_composition import (
-    OwnerVoiceAsrCompositionFactory,
+from main_logic.voice_identity_service.session_activation_factory import (
+    OwnerVoiceSessionActivationFactory,
 )
 from main_logic.voice_identity_service.preference_store import (
     VoiceIdentityPreferenceStore,
@@ -30,6 +30,7 @@ from main_logic.voice_identity_service.registry import (
 )
 from main_logic.voice_identity_service.service import VoiceIdentityService
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
+from utils.preferences import load_global_conversation_settings
 
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,8 @@ class _OwnerActivation:
     ) -> "_OwnerActivation":
         return cls(copy.copy(profile), generation, enforce)
 
-    def factory_for(self, manager) -> OwnerVoiceAsrCompositionFactory:
-        return OwnerVoiceAsrCompositionFactory(
+    def factory_for(self, manager) -> OwnerVoiceSessionActivationFactory:
+        return OwnerVoiceSessionActivationFactory(
             manager._asr_runtime,
             self.profile,
             activation_generation=self.generation,
@@ -206,7 +207,8 @@ class OwnerVoiceRuntimeRegistry:
             cancellation: asyncio.CancelledError | None = None
             try:
                 detached = await asyncio.wait_for(
-                    manager.set_speaker_verifier_factory(
+                    self._set_manager_activation_factory(
+                        manager,
                         None,
                         activation_generation=detach_generation,
                     ),
@@ -286,7 +288,8 @@ class OwnerVoiceRuntimeRegistry:
                 for index, manager in enumerate(managers):
                     try:
                         detached = await asyncio.wait_for(
-                            manager.set_speaker_verifier_factory(
+                            self._set_manager_activation_factory(
+                                manager,
                                 None,
                                 activation_generation=generation,
                             ),
@@ -324,7 +327,8 @@ class OwnerVoiceRuntimeRegistry:
                     changed.append(manager)
                     try:
                         updated = await asyncio.wait_for(
-                            manager.set_speaker_verifier_factory(
+                            self._set_manager_activation_factory(
+                                manager,
                                 factory,
                                 activation_generation=generation,
                             ),
@@ -398,6 +402,8 @@ class OwnerVoiceRuntimeRegistry:
     def _manager_activation_result(manager) -> VoiceIdentityActivationResult:
         if OwnerVoiceRuntimeRegistry._manager_is_inactive_blocked(manager):
             return VoiceIdentityActivationResult.READY
+        if bool(getattr(manager, "_voice_session_activation_degraded", False)):
+            return VoiceIdentityActivationResult.RUNTIME_DEGRADED
         runtime = getattr(manager, "_asr_runtime", None)
         if bool(getattr(runtime, "_speaker_verifier_degraded", False)):
             return VoiceIdentityActivationResult.RUNTIME_DEGRADED
@@ -408,9 +414,24 @@ class OwnerVoiceRuntimeRegistry:
         route_mode = getattr(manager, "_asr_route_mode", None)
         if OwnerVoiceRuntimeRegistry._manager_is_inactive_blocked(manager):
             return VoiceIdentityActivationResult.READY
-        if route_mode is not None and route_mode != "independent":
+        if route_mode is not None and route_mode not in {"native", "independent"}:
             return VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
         return VoiceIdentityActivationResult.READY
+
+    @staticmethod
+    async def _set_manager_activation_factory(
+        manager,
+        factory,
+        *,
+        activation_generation: str,
+    ):
+        setter = getattr(manager, "set_voice_session_activation_factory", None)
+        if not callable(setter):
+            raise RuntimeError("voice-session activation is unsupported by manager")
+        return await setter(
+            factory,
+            activation_generation=activation_generation,
+        )
 
     @staticmethod
     def _manager_is_inactive_blocked(manager) -> bool:
@@ -429,11 +450,12 @@ class OwnerVoiceRuntimeRegistry:
         manager,
         activation: _OwnerActivation,
     ) -> VoiceIdentityActivationResult:
-        factory: OwnerVoiceAsrCompositionFactory | None = None
+        factory: OwnerVoiceSessionActivationFactory | None = None
         try:
             factory = activation.factory_for(manager)
             updated = await asyncio.wait_for(
-                manager.set_speaker_verifier_factory(
+                OwnerVoiceRuntimeRegistry._set_manager_activation_factory(
+                    manager,
                     factory,
                     activation_generation=activation.generation,
                 ),
@@ -722,7 +744,8 @@ class OwnerVoiceRuntimeRegistry:
                             break
                         try:
                             detached = await asyncio.wait_for(
-                                manager.set_speaker_verifier_factory(
+                                self._set_manager_activation_factory(
+                                    manager,
                                     None,
                                     activation_generation=generation,
                                 ),
@@ -827,7 +850,8 @@ class OwnerVoiceRuntimeRegistry:
                         pass
                     try:
                         await asyncio.wait_for(
-                            manager.set_speaker_verifier_factory(
+                            self._set_manager_activation_factory(
+                                manager,
                                 None,
                                 activation_generation=str(uuid.uuid4()),
                             ),
@@ -901,8 +925,8 @@ class _UnavailableProfileStore(VoiceIdentityProfileStore):
     def load(self) -> SpeakerProfile | None:
         raise SecureStorageUnavailableError("secure_storage_unavailable")
 
-    def stage(self, profile: SpeakerProfile):
-        del profile
+    def stage(self, profile: SpeakerProfile, *, audio_contract=None):
+        del profile, audio_contract
         raise SecureStorageUnavailableError("secure_storage_unavailable")
 
     def delete(self) -> bool:
@@ -956,6 +980,13 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
         registry.activate,
         runtime_mode=runtime_mode,
         runtime_status_callback=registry.activation_status,
+        enrollment_noise_reduction_enabled=(
+            load_global_conversation_settings().get(
+                "noiseReductionEnabled",
+                True,
+            )
+            is not False
+        ),
     )
     install_voice_identity_service_for_app(service)
     _runtime_registry = registry
