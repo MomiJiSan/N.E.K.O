@@ -24,6 +24,14 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowCompletion,
     SpeakerShadowObservation,
 )
+from main_logic.asr_client.speaker_shadow.shared_host import (
+    HostGenerationReceipt,
+    SharedHostIdentityError,
+    SharedSpeakerScoringHostManager,
+    SpeakerHostIdentity,
+    SpeakerScoringLane,
+    SpeakerScoringMode,
+)
 from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierInstallIdentity,
 )
@@ -40,6 +48,9 @@ from main_logic.voice_identity_service.calibration import (
     RegisteredCalibration,
     calibration_package_artifact_sha256,
     register_calibration_package,
+)
+from main_logic.voice_identity_service.shared_campplus_host import (
+    SharedCampPlusCompositionBinding,
 )
 
 
@@ -91,6 +102,62 @@ class _EvidenceSink:
         self.healthy_generations.append(activation_generation)
 
 
+@dataclass(slots=True)
+class _LeaseToken:
+    generation: HostGenerationReceipt
+    lane: SpeakerScoringLane
+    mode: SpeakerScoringMode
+    timeout_seconds: float
+
+
+class _SharedManagerStub(SharedSpeakerScoringHostManager):
+    def __init__(self, current: HostGenerationReceipt) -> None:
+        self._current = current
+        self.leases: list[_LeaseToken] = []
+        self.close_count = 0
+
+    def is_generation_current(self, receipt: HostGenerationReceipt) -> bool:
+        return receipt == self._current
+
+    def lease(
+        self,
+        generation: HostGenerationReceipt,
+        *,
+        lane: SpeakerScoringLane,
+        mode: SpeakerScoringMode,
+        timeout_seconds: float,
+    ) -> _LeaseToken:
+        if not self.is_generation_current(generation):
+            raise SharedHostIdentityError("host generation stale")
+        lease = _LeaseToken(generation, lane, mode, timeout_seconds)
+        self.leases.append(lease)
+        return lease
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+
+class _ConstructedShadow:
+    def bind_score_diagnostic_configuration(self, configuration: object) -> None:
+        self.configuration = configuration
+
+
+def _shared_generation(
+    *,
+    profile_generation: str = "profile-generation",
+    host_generation: int = 7,
+) -> HostGenerationReceipt:
+    return HostGenerationReceipt(
+        "manager-1",
+        host_generation,
+        SpeakerHostIdentity(
+            profile_generation,
+            "campplus-model-generation",
+            "speaker-config-generation",
+        ),
+    )
+
+
 def _profile(identity: SpeakerModelIdentity | None = None) -> SpeakerProfile:
     identity = identity or SpeakerModelIdentity(
         CAMPPLUS_MODEL_ID, CAMPPLUS_MODEL_REVISION, CAMPPLUS_EMBEDDING_DIM
@@ -135,6 +202,144 @@ def _allowlisted(package: CalibrationPackage) -> RegisteredCalibration:
         package,
         expected_digest=calibration_package_artifact_sha256(package),
     )
+
+
+def test_shared_binding_creates_independent_shadow_leases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import main_logic.voice_identity_service.asr_composition as module
+
+    constructed: list[dict[str, object]] = []
+
+    def construct_shadow(**kwargs: object) -> _ConstructedShadow:
+        constructed.append(dict(kwargs))
+        return _ConstructedShadow()
+
+    def reject_private_backend(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("shared mode must not construct a private backend")
+
+    monkeypatch.setattr(module, "SpeakerShadowRuntime", construct_shadow)
+    monkeypatch.setattr(module, "CampPlusBackendFactory", reject_private_backend)
+    profile = _profile()
+    generation = _shared_generation()
+    manager = _SharedManagerStub(generation)
+    factory = OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(),
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+        shared_host_binding=SharedCampPlusCompositionBinding(manager, generation),
+    )
+    try:
+        first = factory()
+        second = factory()
+
+        assert first is not second
+        assert len(manager.leases) == 2
+        assert manager.leases[0] is not manager.leases[1]
+        assert all(lease.generation == generation for lease in manager.leases)
+        assert all(lease.lane is SpeakerScoringLane.SHADOW for lease in manager.leases)
+        assert all(lease.mode is SpeakerScoringMode.STANDARD for lease in manager.leases)
+        assert [item["backend_factory"] for item in constructed] == [None, None]
+        assert [item["shared_backend_lease"] for item in constructed] == manager.leases
+    finally:
+        factory.close()
+        profile.close()
+
+    assert manager.close_count == 0
+
+
+def test_shared_binding_rejects_stale_or_mismatched_generation() -> None:
+    profile = _profile()
+    generation = _shared_generation()
+    manager = _SharedManagerStub(generation)
+    try:
+        with pytest.raises(ValueError, match="does not match speaker profile"):
+            OwnerVoiceAsrCompositionFactory(
+                _EvidenceSink(),
+                profile,
+                activation_generation="activation-1",
+                enforce=True,
+                shared_host_binding=SharedCampPlusCompositionBinding(
+                    manager,
+                    _shared_generation(profile_generation="other-profile"),
+                ),
+            )
+
+        manager._current = _shared_generation(host_generation=8)
+        with pytest.raises(SharedHostIdentityError, match="not current"):
+            OwnerVoiceAsrCompositionFactory(
+                _EvidenceSink(),
+                profile,
+                activation_generation="activation-1",
+                enforce=True,
+                shared_host_binding=SharedCampPlusCompositionBinding(
+                    manager,
+                    generation,
+                ),
+            )
+    finally:
+        profile.close()
+
+
+def test_shared_binding_constructor_failure_does_not_close_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import main_logic.voice_identity_service.asr_composition as module
+
+    def broken_shadow(**_kwargs: object) -> object:
+        raise RuntimeError("injected observer construction failure")
+
+    monkeypatch.setattr(module, "SpeakerShadowRuntime", broken_shadow)
+    profile = _profile()
+    generation = _shared_generation()
+    manager = _SharedManagerStub(generation)
+    factory = OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(),
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+        shared_host_binding=SharedCampPlusCompositionBinding(manager, generation),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="injected observer"):
+            factory()
+        assert len(manager.leases) == 1
+        assert manager.close_count == 0
+    finally:
+        factory.close()
+        profile.close()
+
+    assert manager.close_count == 0
+
+
+def test_legacy_composition_still_builds_private_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import main_logic.voice_identity_service.asr_composition as module
+
+    constructed: list[dict[str, object]] = []
+
+    def construct_shadow(**kwargs: object) -> _ConstructedShadow:
+        constructed.append(dict(kwargs))
+        return _ConstructedShadow()
+
+    monkeypatch.setattr(module, "SpeakerShadowRuntime", construct_shadow)
+    profile = _profile()
+    factory = OwnerVoiceAsrCompositionFactory(
+        _EvidenceSink(),
+        profile,
+        activation_generation="activation-1",
+        enforce=True,
+    )
+    try:
+        factory()
+        assert len(constructed) == 1
+        assert "shared_backend_lease" not in constructed[0]
+        assert constructed[0]["backend_factory"] is not None
+    finally:
+        factory.close()
+        profile.close()
 
 
 @pytest.mark.parametrize("iteration", range(50))

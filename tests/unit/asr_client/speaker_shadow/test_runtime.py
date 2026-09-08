@@ -26,8 +26,10 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowTerminalCoverageRequest,
 )
 from main_logic.asr_client.speaker_shadow.runtime import (
+    BackendProcessPhysicalHostAdapter,
     SpeakerShadowRuntime,
     _AudioFrame,
+    _BackendHostTimeout,
     _BackendProcessHost,
     _CandidateActivated,
     _CandidateBatchReconciliation,
@@ -36,6 +38,12 @@ from main_logic.asr_client.speaker_shadow.runtime import (
     _CandidateFinished,
     _CandidateToken,
     _backend_host_main,
+)
+from main_logic.asr_client.speaker_shadow.shared_host import (
+    PhysicalScoreResponse,
+    SharedHostResultStatus,
+    SharedHostScoreError,
+    SpeakerScoringMode,
 )
 
 
@@ -2729,6 +2737,11 @@ async def test_ordered_finish_scores_once_and_rejects_late_pcm() -> None:
                 (0.55, True),
             ),
             audio_ms=20,
+            quality_summary_available=True,
+            rms=0.0,
+            peak=0.0,
+            near_silence=1.0,
+            clipping=0.0,
         )
     ]
     assert (
@@ -5838,3 +5851,399 @@ async def test_permanently_blocked_backend_close_is_bounded_and_leaves_no_resour
         assert runtime._backend_load_task is None
     else:
         assert metrics["shutdown_timeout_count"] + metrics["backend_timeout_count"] >= 1
+
+
+@dataclass(slots=True)
+class _SharedPhysicalState:
+    alive: bool = True
+    manager_close_calls: int = 0
+
+
+class _SharedLease:
+    def __init__(
+        self,
+        state: _SharedPhysicalState,
+        *,
+        score_value: float = 0.9,
+        stale: bool = False,
+        score_error: SharedHostScoreError | None = None,
+        score_started: asyncio.Event | None = None,
+        score_release: asyncio.Event | None = None,
+    ) -> None:
+        self._state = state
+        self._score_value = score_value
+        self._stale = stale
+        self._score_error = score_error
+        self._score_started = score_started
+        self._score_release = score_release
+        self._closed = False
+        self.close_calls = 0
+        self.score_calls = 0
+        self.cancelled_score_calls = 0
+        self.pcm_bytes_in_use = 0
+
+    @property
+    def alive(self) -> bool:
+        return self._state.alive and not self._closed and not self._stale
+
+    @property
+    def loaded(self) -> bool:
+        return self.alive
+
+    @property
+    def process_count(self) -> int:
+        return int(self.alive)
+
+    async def score(self, pcm16: bytes, *, timeout_seconds: float) -> float:
+        assert timeout_seconds > 0
+        self.score_calls += 1
+        self.pcm_bytes_in_use = len(pcm16)
+        if self._score_started is not None:
+            self._score_started.set()
+        try:
+            if self._score_release is not None:
+                await self._score_release.wait()
+            if self._score_error is not None:
+                raise self._score_error
+            return self._score_value
+        except asyncio.CancelledError:
+            self.cancelled_score_calls += 1
+            raise
+        finally:
+            self.pcm_bytes_in_use = 0
+
+    async def close(self, *, timeout_seconds: float = 1.0) -> bool:
+        assert timeout_seconds > 0
+        self.close_calls += 1
+        self._closed = True
+        return True
+
+
+class _TaggedHostConnection:
+    def __init__(
+        self,
+        messages: list[tuple[object, ...]],
+        responses: list[tuple[object, ...]] | None = None,
+    ) -> None:
+        self._messages = iter(messages)
+        self._responses = iter(responses or [])
+        self.sent: list[tuple[object, ...]] = []
+        self.closed = False
+
+    def send(self, message: tuple[object, ...]) -> None:
+        self.sent.append(message)
+
+    def recv(self) -> tuple[object, ...]:
+        try:
+            return next(self._messages)
+        except StopIteration:
+            return next(self._responses)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@dataclass(slots=True)
+class _ModeBackendFactory:
+    seen_modes: list[str]
+
+    def __call__(self) -> _ModeBackend:
+        return _ModeBackend(self)
+
+    def close(self) -> None:
+        return None
+
+
+class _ModeBackend:
+    def __init__(self, settings: _ModeBackendFactory) -> None:
+        self._settings = settings
+
+    def load(self) -> bool:
+        return True
+
+    def score(self, pcm16: bytes, sample_rate_hz: int) -> float:
+        return 0.1
+
+    def score_with_mode(
+        self,
+        pcm16: bytes,
+        sample_rate_hz: int,
+        *,
+        mode: str,
+    ) -> float:
+        self._settings.seen_modes.append(mode)
+        return 0.8 if mode == SpeakerScoringMode.SHORT_PROBE.value else 0.2
+
+    def close(self) -> None:
+        return None
+
+
+def test_tagged_host_wire_routes_mode_and_echoes_identity() -> None:
+    pcm16 = _pcm(10)
+    modes: list[str] = []
+    connection = _TaggedHostConnection(
+        [
+            ("load",),
+            (
+                "score_tagged",
+                7,
+                41,
+                SpeakerScoringMode.STANDARD.value,
+                len(pcm16),
+                SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+            ),
+            ("close",),
+        ]
+    )
+
+    _backend_host_main(  # type: ignore[arg-type]
+        _ModeBackendFactory(modes), connection, bytearray(pcm16)
+    )
+
+    assert modes == [SpeakerScoringMode.STANDARD.value]
+    assert connection.sent[1] == (True, (7, 41, 0.2))
+    assert connection.closed is True
+
+
+async def test_physical_adapter_preserves_tagged_response_and_wipes_host_pcm() -> None:
+    host = _BackendProcessHost(
+        factory=_BackendFactory(), terminate_timeout_seconds=0.1
+    )
+    parent_connection = host._connection
+    child_connection = host._child_connection
+    assert parent_connection is not None and child_connection is not None
+    parent_connection.close()
+    child_connection.close()
+    connection = _TaggedHostConnection([], [(True, (12, 88, 0.73))])
+    host._connection = connection  # type: ignore[assignment]
+    host._child_connection = None
+    host._process = _PollBlindProcess()  # type: ignore[assignment]
+    adapter = BackendProcessPhysicalHostAdapter(host)
+    pcm16 = bytearray(_pcm(10))
+
+    response = await adapter.score(
+        pcm16,
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        mode=SpeakerScoringMode.SHORT_PROBE,
+        host_generation=11,
+        request_id=87,
+        timeout_seconds=1.0,
+    )
+
+    assert response == PhysicalScoreResponse(12, 88, 0.73)
+    assert host.pcm_bytes_in_use == 0
+    assert not any(memoryview(host._pcm_buffer).cast("B")[: len(pcm16)])
+    connection.close()
+    host._connection = None
+    host._process = None
+    host._dispose_handles()
+
+
+async def test_physical_adapter_translates_process_timeout_for_manager() -> None:
+    host = _BackendProcessHost(
+        factory=_BackendFactory(), terminate_timeout_seconds=0.1
+    )
+
+    async def timed_out(
+        _pcm16: bytes | bytearray, **_kwargs: object
+    ) -> PhysicalScoreResponse:
+        raise _BackendHostTimeout("private timeout detail")
+
+    host.score_tagged = timed_out  # type: ignore[method-assign]
+    try:
+        with pytest.raises(TimeoutError, match="physical speaker score timed out"):
+            await BackendProcessPhysicalHostAdapter(host).score(
+                bytearray(_pcm(10)),
+                sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+                mode=SpeakerScoringMode.STANDARD,
+                host_generation=1,
+                request_id=1,
+                timeout_seconds=0.01,
+            )
+    finally:
+        for connection in (host._connection, host._child_connection):
+            if connection is not None:
+                connection.close()
+        host._connection = None
+        host._child_connection = None
+        host._process = None
+        host._dispose_handles()
+
+
+def test_shared_backend_lease_is_mutually_exclusive_with_legacy_factory() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SpeakerShadowRuntime(
+            backend_factory=_BackendFactory(),
+            shared_backend_lease=_SharedLease(_SharedPhysicalState()),  # type: ignore[arg-type]
+            config=_config(),
+        )
+
+
+async def test_shared_backend_lease_scores_without_owned_host() -> None:
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    state = _SharedPhysicalState()
+    lease = _SharedLease(state, score_value=0.35)
+    runtime = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20),
+        on_observation=observe,
+    )
+    assert runtime.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=_candidate(20_001),
+    )
+    await runtime.wait_idle()
+
+    assert [item.similarity for item in observations] == [pytest.approx(0.35)]
+    assert lease.score_calls == 1
+    assert runtime._backend_host is None
+    await runtime.close()
+    assert lease.close_calls == 1
+    assert state.manager_close_calls == 0
+
+
+async def test_closing_one_shared_lease_runtime_leaves_peer_operational() -> None:
+    state = _SharedPhysicalState()
+    first_lease = _SharedLease(state, score_value=0.2)
+    second_lease = _SharedLease(state, score_value=0.8)
+    observations: list[SpeakerShadowObservation] = []
+
+    async def observe(observation: SpeakerShadowObservation) -> None:
+        observations.append(observation)
+
+    first = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=first_lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20),
+    )
+    second = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=second_lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20),
+        on_observation=observe,
+    )
+    await first.close()
+    assert second.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=_candidate(20_002),
+    )
+    await second.wait_idle()
+
+    assert [item.similarity for item in observations] == [pytest.approx(0.8)]
+    assert first_lease.close_calls == 1
+    assert state.manager_close_calls == 0
+    await second.close()
+
+
+async def test_stale_shared_lease_fails_open_as_backend_unavailable() -> None:
+    lease = _SharedLease(_SharedPhysicalState(), stale=True)
+    runtime = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20),
+    )
+    candidate = _candidate(20_003)
+    assert runtime.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=candidate,
+    )
+    assert runtime.finish_candidate(candidate)
+    await runtime.wait_idle()
+
+    assert runtime.snapshot()["failed_candidate_count"] == 1
+    assert runtime.snapshot()["load_failure_count"] == 1
+    assert lease.score_calls == 0
+    await runtime.close()
+
+
+async def test_shared_host_score_error_maps_to_unavailable() -> None:
+    evidence: list[SpeakerShadowObservation | SpeakerShadowCompletion] = []
+    lease = _SharedLease(
+        _SharedPhysicalState(),
+        score_error=SharedHostScoreError(
+            SharedHostResultStatus.STALE, "private_shared_host_detail"
+        ),
+    )
+    runtime = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20),
+        on_evidence=evidence.append,
+    )
+    assert runtime.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=_candidate(20_004),
+    )
+    await runtime.wait_idle()
+
+    observations = [
+        event for event in evidence if isinstance(event, SpeakerShadowObservation)
+    ]
+    assert len(observations) == 1
+    assert observations[0].evidence_available is False
+    assert runtime.snapshot()["inference_failure_count"] == 1
+    await runtime.close()
+
+
+async def test_close_cancels_only_owned_shared_lease_request() -> None:
+    score_started = asyncio.Event()
+    state = _SharedPhysicalState()
+    lease = _SharedLease(
+        state, score_started=score_started, score_release=asyncio.Event()
+    )
+    runtime = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20, shutdown_grace_seconds=0.01),
+    )
+    assert runtime.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=_candidate(20_005),
+    )
+    await asyncio.wait_for(score_started.wait(), 1.0)
+
+    await asyncio.wait_for(runtime.close(), 1.0)
+
+    assert lease.cancelled_score_calls == 1
+    assert lease.close_calls == 1
+    assert state.manager_close_calls == 0
+
+
+async def test_reset_cancels_shared_request_without_closing_lease_or_host() -> None:
+    score_started = asyncio.Event()
+    score_release = asyncio.Event()
+    state = _SharedPhysicalState()
+    lease = _SharedLease(
+        state,
+        score_value=0.6,
+        score_started=score_started,
+        score_release=score_release,
+    )
+    runtime = SpeakerShadowRuntime(
+        backend_factory=None,
+        shared_backend_lease=lease,  # type: ignore[arg-type]
+        config=_config(minimum_audio_ms=20, shutdown_grace_seconds=0.05),
+    )
+    assert runtime.submit(
+        _pcm(20),
+        sample_rate_hz=SPEAKER_SHADOW_SAMPLE_RATE_HZ,
+        candidate=_candidate(20_006),
+    )
+    await asyncio.wait_for(score_started.wait(), 1.0)
+
+    await asyncio.wait_for(runtime.reset(), 1.0)
+
+    assert lease.cancelled_score_calls == 1
+    assert lease.close_calls == 0
+    assert state.manager_close_calls == 0
+    await runtime.close()

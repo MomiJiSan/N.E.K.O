@@ -40,6 +40,11 @@ from main_logic.asr_client.speaker_shadow.contracts import (
     SpeakerShadowObservation,
 )
 from main_logic.asr_client.speaker_shadow.runtime import SpeakerShadowRuntime
+from main_logic.asr_client.speaker_shadow.shared_host import (
+    SharedHostIdentityError,
+    SpeakerScoringLane,
+    SpeakerScoringMode,
+)
 from main_logic.asr_client.speaker_shadow.diagnostics import (
     SpeakerScoreDiagnosticConfiguration,
     SpeakerShadowDiagnostic,
@@ -70,6 +75,7 @@ from .pvad_policy import (
     PvadMode,
     classify_pvad_observation,
 )
+from .shared_campplus_host import SharedCampPlusCompositionBinding
 
 
 class _OwnerVoiceEvidenceSink(Protocol):
@@ -129,6 +135,7 @@ class OwnerVoiceAsrCompositionFactory:
         registered_calibration: RegisteredCalibration | None = None,
         runtime_calibration_protocol: CalibrationProtocol | None = None,
         pvad_mode: PvadMode = PvadMode.OBSERVE,
+        shared_host_binding: SharedCampPlusCompositionBinding | None = None,
     ) -> None:
         required_methods = (
             "_accept_speaker_evidence_fact",
@@ -172,6 +179,16 @@ class OwnerVoiceAsrCompositionFactory:
             raise ValueError(
                 "calibration_package and runtime_calibration_protocol must be provided together"
             )
+        if shared_host_binding is not None:
+            if type(shared_host_binding) is not SharedCampPlusCompositionBinding:
+                raise TypeError(
+                    "shared_host_binding must be "
+                    "SharedCampPlusCompositionBinding or None"
+                )
+            self._validate_shared_binding(
+                shared_host_binding,
+                profile_generation=profile.generation,
+            )
         self._runtime = runtime
         self._profile = copy.copy(profile)
         self._activation_generation = activation_generation
@@ -182,6 +199,7 @@ class OwnerVoiceAsrCompositionFactory:
         self._calibration_package = calibration_package
         self._registered_calibration = registered_calibration
         self._runtime_calibration_protocol = runtime_calibration_protocol
+        self._shared_host_binding = shared_host_binding
         self._lock = threading.Lock()
         self._closed = False
         self._diagnostics = {
@@ -243,45 +261,63 @@ class OwnerVoiceAsrCompositionFactory:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Owner voice composition factory is closed")
-            reference = self._profile.clone_reference()
+            shared_host_binding = self._shared_host_binding
+            reference = (
+                None
+                if shared_host_binding is not None
+                else self._profile.clone_reference()
+            )
+        backend_factory = None
         embedding = None
         backend_factory = None
-        pvad_enabled = False
+        pvad_enabled = bool(
+            shared_host_binding is not None
+            and shared_host_binding.pvad_observe_enabled
+            and self._pvad_mode is PvadMode.OBSERVE
+        )
         try:
-            expected_identity = SpeakerModelIdentity(
-                CAMPPLUS_MODEL_ID,
-                CAMPPLUS_MODEL_REVISION,
-                CAMPPLUS_EMBEDDING_DIM,
-            )
-            if reference.model_identity != expected_identity:
-                raise ValueError("speaker profile model identity does not match CAM++")
-            embedding = reference.copy_embedding()
-            backend_factory = (
-                CampPlusBackendFactory(embedding)
-                if self._calibration_package is None
-                else CampPlusBackendFactory(embedding, allow_short_input=True)
-            )
-            activity_reference = self._profile.clone_activity_reference()
-            if activity_reference is not None:
-                activity_embedding = None
-                activity_contract = self._profile.activity_reference_contract
-                try:
-                    if (
-                        self._pvad_mode is PvadMode.OBSERVE
-                        and activity_reference.model_identity == ECAPA_IDENTITY
-                        and activity_contract is not None
-                        and activity_contract.resource_revision == ECAPA_RESOURCE_REVISION
-                        and activity_contract.preprocessing_revision == ECAPA_PREPROCESSING_REVISION
-                        and activity_contract.reference_method == ECAPA_REFERENCE_METHOD
-                        and activity_contract.sample_rate_hz == 16_000
-                    ):
-                        activity_embedding = activity_reference.copy_embedding()
-                        backend_factory = PvadBackendFactory(backend_factory, activity_embedding)
-                        pvad_enabled = True
-                finally:
-                    if activity_embedding is not None:
-                        activity_embedding.fill(0)
-                    activity_reference.close()
+            if reference is not None:
+                expected_identity = SpeakerModelIdentity(
+                    CAMPPLUS_MODEL_ID,
+                    CAMPPLUS_MODEL_REVISION,
+                    CAMPPLUS_EMBEDDING_DIM,
+                )
+                if reference.model_identity != expected_identity:
+                    raise ValueError(
+                        "speaker profile model identity does not match CAM++"
+                    )
+                embedding = reference.copy_embedding()
+                backend_factory = (
+                    CampPlusBackendFactory(embedding)
+                    if self._calibration_package is None
+                    else CampPlusBackendFactory(embedding, allow_short_input=True)
+                )
+                activity_reference = self._profile.clone_activity_reference()
+                if activity_reference is not None:
+                    activity_embedding = None
+                    activity_contract = self._profile.activity_reference_contract
+                    try:
+                        if (
+                            self._pvad_mode is PvadMode.OBSERVE
+                            and activity_reference.model_identity == ECAPA_IDENTITY
+                            and activity_contract is not None
+                            and activity_contract.resource_revision
+                            == ECAPA_RESOURCE_REVISION
+                            and activity_contract.preprocessing_revision
+                            == ECAPA_PREPROCESSING_REVISION
+                            and activity_contract.reference_method
+                            == ECAPA_REFERENCE_METHOD
+                            and activity_contract.sample_rate_hz == 16_000
+                        ):
+                            activity_embedding = activity_reference.copy_embedding()
+                            backend_factory = PvadBackendFactory(
+                                backend_factory, activity_embedding
+                            )
+                            pvad_enabled = True
+                    finally:
+                        if activity_embedding is not None:
+                            activity_embedding.fill(0)
+                        activity_reference.close()
         except BaseException:
             if backend_factory is not None:
                 backend_factory.close()
@@ -289,7 +325,8 @@ class OwnerVoiceAsrCompositionFactory:
         finally:
             if embedding is not None:
                 embedding.fill(0.0)
-            reference.close()
+            if reference is not None:
+                reference.close()
 
         runtime = self._runtime
         identity = self._installation_identity
@@ -516,8 +553,27 @@ class OwnerVoiceAsrCompositionFactory:
                     SpeakerVerifierHealthEvent(identity, revision, causes)
                 )
 
+        shared_backend_lease = None
+        if shared_host_binding is not None:
+            self._validate_shared_binding(
+                shared_host_binding,
+                profile_generation=self._profile.generation,
+            )
+            shared_backend_lease = shared_host_binding.manager.lease(
+                shared_host_binding.generation,
+                lane=SpeakerScoringLane.SHADOW,
+                mode=(
+                    SpeakerScoringMode.STANDARD
+                    if pvad_enabled
+                    else SpeakerScoringMode.SHORT_PROBE
+                    if self._calibration_package is not None
+                    else SpeakerScoringMode.STANDARD
+                ),
+                timeout_seconds=2.0,
+            )
+
         try:
-            shadow = SpeakerShadowRuntime(
+            shadow_kwargs = dict(
                 backend_factory=backend_factory,
                 config=SpeakerShadowConfig(
                     enabled=True,
@@ -554,6 +610,9 @@ class OwnerVoiceAsrCompositionFactory:
                 on_backend_recovered=on_backend_recovered if identity is None else None,
                 on_health_changed=on_health_changed if identity is not None else None,
             )
+            if shared_backend_lease is not None:
+                shadow_kwargs["shared_backend_lease"] = shared_backend_lease
+            shadow = SpeakerShadowRuntime(**shadow_kwargs)
             try:
                 shadow.bind_score_diagnostic_configuration(
                     SpeakerScoreDiagnosticConfiguration(
@@ -577,8 +636,22 @@ class OwnerVoiceAsrCompositionFactory:
             source_ref = weakref.ref(shadow)
             return shadow
         except BaseException:
-            backend_factory.close()
+            if backend_factory is not None:
+                backend_factory.close()
             raise
+
+    @staticmethod
+    def _validate_shared_binding(
+        binding: SharedCampPlusCompositionBinding,
+        *,
+        profile_generation: str,
+    ) -> None:
+        if binding.generation.identity.profile_generation != profile_generation:
+            raise ValueError(
+                "shared host generation profile does not match speaker profile"
+            )
+        if not binding.is_current():
+            raise SharedHostIdentityError("shared host generation is not current")
 
     @staticmethod
     def _checkpoint_kind(

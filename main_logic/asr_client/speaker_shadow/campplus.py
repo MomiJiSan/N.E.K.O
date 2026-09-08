@@ -6,7 +6,7 @@ import math
 from collections.abc import Callable
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -40,6 +40,8 @@ _PADDED_FRAME_LENGTH = 512
 _MEL_BIN_COUNT = 80
 _PREEMPHASIS_COEFFICIENT = np.float32(0.97)
 _FLOAT32_EPSILON = np.finfo(np.float32).eps
+
+CampPlusScoreMode = Literal["standard", "short_probe"]
 
 
 def _wipe_array(value: np.ndarray | None) -> None:
@@ -506,6 +508,26 @@ class CampPlusSpeakerShadowBackend:
         return True
 
     def score(self, pcm16: bytes, sample_rate_hz: int) -> float:
+        mode: CampPlusScoreMode = (
+            "short_probe" if self._allow_short_input else "standard"
+        )
+        return self.score_with_mode(
+            pcm16,
+            sample_rate_hz,
+            mode=mode,
+        )
+
+    def score_with_mode(
+        self,
+        pcm16: bytes,
+        sample_rate_hz: int,
+        *,
+        mode: CampPlusScoreMode,
+    ) -> float:
+        """Score once with an explicit production or short-probe input contract."""
+
+        if mode not in ("standard", "short_probe"):
+            raise ValueError("score_mode_invalid")
         if self._closed:
             raise RuntimeError("backend_closed")
         model = self._model
@@ -516,12 +538,10 @@ class CampPlusSpeakerShadowBackend:
         candidate: np.ndarray | None = None
         reference: np.ndarray | None = None
         try:
-            if self._allow_short_input:
-                raw_candidate = (
-                    model.probe_short_input_embedding_from_pcm16(
-                        pcm16,
-                        sample_rate_hz=sample_rate_hz,
-                    )
+            if mode == "short_probe":
+                raw_candidate = model.probe_short_input_embedding_from_pcm16(
+                    pcm16,
+                    sample_rate_hz=sample_rate_hz,
                 )
             else:
                 raw_candidate = model.embedding_from_pcm16(

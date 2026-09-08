@@ -21,6 +21,13 @@ from .diagnostics import (
     SpeakerScoreDiagnosticConfiguration,
     SpeakerShadowDiagnostic,
 )
+from .shared_host import (
+    PhysicalScoreResponse,
+    SharedHostResultStatus,
+    SharedHostScoreError,
+    SharedSpeakerScoringLease,
+    SpeakerScoringMode,
+)
 
 from .contracts import (
     CompletionCallback,
@@ -58,7 +65,7 @@ _HOST_POLL_INTERVAL_SECONDS = 0.005
 _QUALITY_SUMMARY_VERSION = "pcm16_quality_v1"
 _NEAR_SILENCE_AMPLITUDE = 328
 _CLIPPING_AMPLITUDE = 32_760
-_HostOperation = Literal["load", "score", "close"]
+_HostOperation = Literal["load", "score", "score_tagged", "close"]
 _DegradedCause = Literal[
     "backend_unavailable",
     "terminal_overflow",
@@ -185,6 +192,34 @@ def _backend_host_main(
                         del pcm16
                     connection.send((True, similarity))
                     continue
+                if operation == "score_tagged":
+                    if backend is None:
+                        raise RuntimeError("backend is not loaded")
+                    host_generation = int(message[1])
+                    request_id = int(message[2])
+                    mode = SpeakerScoringMode(str(message[3]))
+                    pcm_length = int(message[4])
+                    sample_rate_hz = int(message[5])
+                    pcm16 = bytearray(memoryview(pcm_buffer).cast("B")[:pcm_length])
+                    try:
+                        score_with_mode = getattr(backend, "score_with_mode", None)
+                        if callable(score_with_mode):
+                            similarity = float(
+                                score_with_mode(
+                                    bytes(pcm16),
+                                    sample_rate_hz,
+                                    mode=mode.value,
+                                )
+                            )
+                        else:
+                            similarity = float(
+                                backend.score(bytes(pcm16), sample_rate_hz)
+                            )
+                    finally:
+                        pcm16[:] = b"\x00" * len(pcm16)
+                        del pcm16
+                    connection.send((True, (host_generation, request_id, similarity)))
+                    continue
                 if operation == "close":
                     error_name = close_owned_resources()
                     connection.send((error_name is None, error_name))
@@ -301,6 +336,55 @@ class _BackendProcessHost:
             pcm_view[: len(pcm16)] = b"\x00" * len(pcm16)
             self.pcm_bytes_in_use = 0
 
+    async def score_tagged(
+        self,
+        pcm16: bytes | bytearray,
+        *,
+        sample_rate_hz: int,
+        mode: SpeakerScoringMode,
+        host_generation: int,
+        request_id: int,
+        timeout_seconds: float,
+    ) -> PhysicalScoreResponse:
+        """Score one tagged request while preserving the legacy score wire."""
+        if not isinstance(mode, SpeakerScoringMode):
+            raise TypeError("mode must be SpeakerScoringMode")
+        if type(host_generation) is not int or host_generation < 1:
+            raise ValueError("host_generation must be a positive integer")
+        if type(request_id) is not int or request_id < 1:
+            raise ValueError("request_id must be a positive integer")
+        if type(sample_rate_hz) is not int or sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be positive")
+        if len(pcm16) > MAX_SPEAKER_SHADOW_CANDIDATE_PCM_BYTES:
+            raise _BackendHostError("candidate PCM exceeds host buffer")
+        if self._pcm_buffer is None:
+            raise _BackendHostError("backend host PCM buffer is closed")
+        pcm_view = memoryview(self._pcm_buffer).cast("B")
+        pcm_view[: len(pcm16)] = pcm16
+        self.pcm_bytes_in_use = len(pcm16)
+        try:
+            response = await self._request(
+                "score_tagged",
+                host_generation,
+                request_id,
+                mode.value,
+                len(pcm16),
+                sample_rate_hz,
+                timeout_seconds=timeout_seconds,
+            )
+            try:
+                response_generation, response_request_id, score = response
+                return PhysicalScoreResponse(
+                    int(response_generation),
+                    int(response_request_id),
+                    float(score),
+                )
+            except (TypeError, ValueError) as exc:
+                raise _BackendHostError("backend tagged response invalid") from exc
+        finally:
+            pcm_view[: len(pcm16)] = b"\x00" * len(pcm16)
+            self.pcm_bytes_in_use = 0
+
     async def close(self, *, timeout_seconds: float) -> bool:
         success = True
         if self.alive:
@@ -315,18 +399,28 @@ class _BackendProcessHost:
         await asyncio.to_thread(self._dispose_handles)
         return success
 
-    async def terminate(self) -> None:
+    async def terminate(self, *, timeout_seconds: float | None = None) -> None:
         process = self._process
         self.loaded = False
+        termination_timeout = self._terminate_timeout_seconds
+        if timeout_seconds is not None:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(float(timeout_seconds))
+                or timeout_seconds <= 0
+            ):
+                raise ValueError("timeout_seconds must be finite and positive")
+            termination_timeout = float(timeout_seconds)
         if process is None:
             await asyncio.to_thread(self._dispose_handles)
             return
         if process.is_alive():
             self.was_terminated = True
             process.terminate()
-            if not await self._wait_for_exit(self._terminate_timeout_seconds):
+            if not await self._wait_for_exit(termination_timeout):
                 process.kill()
-                if not await self._wait_for_exit(self._terminate_timeout_seconds):
+                if not await self._wait_for_exit(termination_timeout):
                     raise _BackendHostError("backend host could not be terminated")
         await asyncio.to_thread(self._dispose_handles)
 
@@ -433,6 +527,64 @@ class _BackendProcessHost:
             pcm_view[:] = b"\x00" * len(pcm_view)
             self._pcm_buffer = None
             self.pcm_bytes_in_use = 0
+
+
+class BackendProcessPhysicalHostAdapter:
+    """Expose the legacy killable process through the shared-host protocol."""
+
+    def __init__(self, host: _BackendProcessHost) -> None:
+        if not isinstance(host, _BackendProcessHost):
+            raise TypeError("host must be _BackendProcessHost")
+        self._host = host
+
+    @classmethod
+    async def create_started(
+        cls,
+        *,
+        factory: SpeakerShadowBackendFactory,
+        terminate_timeout_seconds: float,
+    ) -> BackendProcessPhysicalHostAdapter:
+        host = await asyncio.to_thread(
+            _BackendProcessHost.create_started,
+            factory=factory,
+            terminate_timeout_seconds=terminate_timeout_seconds,
+        )
+        return cls(host)
+
+    @property
+    def process_count(self) -> int:
+        return self._host.process_count
+
+    async def load(self, *, timeout_seconds: float) -> bool:
+        return await self._host.load(timeout_seconds=timeout_seconds)
+
+    async def score(
+        self,
+        pcm16: bytearray,
+        *,
+        sample_rate_hz: int,
+        mode: SpeakerScoringMode,
+        host_generation: int,
+        request_id: int,
+        timeout_seconds: float,
+    ) -> PhysicalScoreResponse:
+        try:
+            return await self._host.score_tagged(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+                mode=mode,
+                host_generation=host_generation,
+                request_id=request_id,
+                timeout_seconds=timeout_seconds,
+            )
+        except _BackendHostTimeout as exc:
+            raise TimeoutError("physical speaker score timed out") from exc
+
+    async def close(self, *, timeout_seconds: float) -> bool:
+        return await self._host.close(timeout_seconds=timeout_seconds)
+
+    async def terminate(self, *, timeout_seconds: float) -> None:
+        await self._host.terminate(timeout_seconds=timeout_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -753,6 +905,7 @@ class SpeakerShadowRuntime:
         self,
         *,
         backend_factory: SpeakerShadowBackendFactory | None,
+        shared_backend_lease: SharedSpeakerScoringLease | None = None,
         config: SpeakerShadowConfig | None = None,
         on_observation: ObservationCallback | None = None,
         on_completion: CompletionCallback | None = None,
@@ -762,8 +915,15 @@ class SpeakerShadowRuntime:
         on_health_changed: Callable[[int, frozenset[str]], None] | None = None,
         on_diagnostic: Callable[[SpeakerShadowDiagnostic], None] | None = None,
     ) -> None:
+        if backend_factory is not None and shared_backend_lease is not None:
+            raise ValueError(
+                "backend_factory and shared_backend_lease are mutually exclusive"
+            )
         self._config = config or SpeakerShadowConfig()
         self._backend_factory = backend_factory
+        self._shared_backend_lease = shared_backend_lease
+        self._shared_backend_attached = False
+        self._shared_lease_unavailable_recorded = False
         self._on_backend_degraded = on_backend_degraded
         self._on_backend_recovered = on_backend_recovered
         self._on_health_changed = on_health_changed
@@ -893,7 +1053,10 @@ class SpeakerShadowRuntime:
 
         return (
             self._config.enabled
-            and self._backend_factory is not None
+            and (
+                self._backend_factory is not None
+                or self._shared_backend_lease is not None
+            )
             and not self._closed
         )
 
@@ -2648,9 +2811,8 @@ class SpeakerShadowRuntime:
         buffered_audio_bytes = prepared_audio_bytes + sum(
             len(buffer.pcm16) for buffer in self._buffers.values()
         )
-        host_pcm_bytes = (
-            self._backend_host.pcm_bytes_in_use if self._backend_host is not None else 0
-        )
+        backend = self._current_backend()
+        host_pcm_bytes = backend.pcm_bytes_in_use if backend is not None else 0
         snapshot = self._metrics.snapshot()
         snapshot.update(
             buffered_candidate_count=len(self._buffers),
@@ -2694,14 +2856,10 @@ class SpeakerShadowRuntime:
                 self._host_start_task is not None and not self._host_start_task.done()
             ),
             backend_loaded_count=int(
-                self._backend_host is not None
-                and self._backend_host.alive
-                and self._backend_host.loaded
+                backend is not None and backend.alive and backend.loaded
             ),
             backend_process_count=(
-                self._backend_host.process_count
-                if self._backend_host is not None
-                else 0
+                backend.process_count if backend is not None else 0
             ),
             backend_close_failed_count=0,
         )
@@ -3442,6 +3600,21 @@ class SpeakerShadowRuntime:
         observation = self._observation_task
         try:
             await self._cancel_backend_load()
+            worker = self._worker_task
+            if (
+                self._shared_backend_lease is not None
+                and worker is not None
+                and not worker.done()
+            ):
+                # Cancellation propagates through the shared lease and abandons
+                # only this runtime's receipt; manager ownership stays external.
+                worker.cancel()
+                done, _ = await asyncio.wait(
+                    {worker},
+                    timeout=self._config.shutdown_grace_seconds,
+                )
+                if done:
+                    self._consume_worker_result(worker)
             if observation is not None and not observation.done():
                 cancelled = await self._cancel_callback_bounded(observation)
                 if not cancelled:
@@ -3532,6 +3705,7 @@ class SpeakerShadowRuntime:
             worker is not None
             or dispatcher is not None
             or self._backend_host is not None
+            or self._shared_backend_lease is not None
             or self._host_start_task is not None
             or self._observation_task is not None
             or self._completion_callback_task is not None
@@ -4586,8 +4760,8 @@ class SpeakerShadowRuntime:
         allow_frozen: bool = False,
     ) -> bool:
         """Keep bounded references, never duplicate PCM or wait on the worker."""
-        host = self._backend_host
-        if host is not None and host.alive and host.loaded:
+        backend = self._current_backend()
+        if backend is not None and backend.alive and backend.loaded:
             return False
         pending = self._pending_backend_candidates
         for key, previous in tuple(pending.items()):
@@ -4885,9 +5059,33 @@ class SpeakerShadowRuntime:
                     )
                     self._finalize_candidate(candidate, "failed", token=token)
                 return
+            except SharedHostScoreError as exc:
+                token.score_outcome = (
+                    "timeout"
+                    if exc.status is SharedHostResultStatus.TIMED_OUT
+                    else "failed"
+                )
+                if exc.status is SharedHostResultStatus.TIMED_OUT:
+                    self._metrics.backend_timeout_count += 1
+                self._metrics.inference_failure_count += 1
+                self._mark_backend_degraded()
+                if self._identity_is_current(generation, candidate, token):
+                    self._publish_unavailable_observation(
+                        generation=generation,
+                        candidate=candidate,
+                        token=token,
+                        audio_ms=audio_ms,
+                        checkpoint_ms=checkpoint_ms,
+                        observation_kind=observation_kind,
+                    )
+                    self._finalize_candidate(candidate, "failed", token=token)
+                return
             except Exception:
                 token.score_outcome = "failed"
-                if not backend_host.alive:
+                if (
+                    isinstance(backend_host, _BackendProcessHost)
+                    and not backend_host.alive
+                ):
                     self._discard_backend_host(backend_host)
                 self._metrics.inference_failure_count += 1
                 self._mark_backend_degraded()
@@ -5103,7 +5301,27 @@ class SpeakerShadowRuntime:
         )
         self._publish_evidence(unavailable, token=token)
 
-    async def _ensure_backend(self) -> _BackendProcessHost | None:
+    async def _ensure_backend(
+        self,
+    ) -> _BackendProcessHost | SharedSpeakerScoringLease | None:
+        shared_lease = self._shared_backend_lease
+        if shared_lease is not None:
+            try:
+                available = shared_lease.alive and shared_lease.loaded
+            except Exception:
+                available = False
+            if not available:
+                if not self._shared_lease_unavailable_recorded:
+                    self._shared_lease_unavailable_recorded = True
+                    self._record_load_failure()
+                return None
+            self._shared_lease_unavailable_recorded = False
+            if not self._shared_backend_attached:
+                self._shared_backend_attached = True
+                self._metrics.load_count += 1
+            self._mark_backend_recovered()
+            return shared_lease
+
         existing_host = self._backend_host
         if existing_host is not None and existing_host.alive and existing_host.loaded:
             return existing_host
@@ -5249,7 +5467,31 @@ class SpeakerShadowRuntime:
             except Exception:
                 self._metrics.callback_failure_count += 1
 
-    async def _unload_backend(self) -> bool:
+    async def _unload_backend(self, *, release_shared: bool = False) -> bool:
+        shared_lease = self._shared_backend_lease
+        if shared_lease is not None:
+            if not release_shared:
+                return True
+            try:
+                closed = bool(
+                    await shared_lease.close(
+                        timeout_seconds=self._config.backend_close_timeout_seconds
+                    )
+                )
+            except Exception:
+                closed = False
+            if self._shared_backend_lease is shared_lease:
+                self._shared_backend_lease = None
+            if closed:
+                self._metrics.unload_count += 1
+            else:
+                self._metrics.unload_failure_count += 1
+            self._shared_backend_attached = False
+            self._shared_lease_unavailable_recorded = False
+            self._load_failure_streak = 0
+            self._next_load_attempt_at = 0.0
+            return closed
+
         host = self._backend_host
         if host is None:
             return True
@@ -5341,7 +5583,7 @@ class SpeakerShadowRuntime:
             await self._cancel_detached_callbacks_bounded()
         finally:
             try:
-                await self._unload_backend()
+                await self._unload_backend(release_shared=True)
             finally:
                 self._close_parent_factory()
 
@@ -6240,9 +6482,8 @@ class SpeakerShadowRuntime:
         self._clear_degraded_cause("completion_overflow")
 
     def _retained_pcm_bytes(self) -> int:
-        host_pcm_bytes = (
-            self._backend_host.pcm_bytes_in_use if self._backend_host is not None else 0
-        )
+        backend = self._current_backend()
+        host_pcm_bytes = backend.pcm_bytes_in_use if backend is not None else 0
         return (
             self._queued_pcm_bytes
             + sum(len(buffer.pcm16) for buffer in self._buffers.values())
@@ -6257,6 +6498,14 @@ class SpeakerShadowRuntime:
             + self._active_pcm_bytes
             + host_pcm_bytes
         )
+
+    def _current_backend(
+        self,
+    ) -> _BackendProcessHost | SharedSpeakerScoringLease | None:
+        shared_lease = self._shared_backend_lease
+        if shared_lease is not None:
+            return shared_lease
+        return self._backend_host
 
     def _clear_buffers(self) -> None:
         if self._terminal_pcm_expiry_handle is not None:

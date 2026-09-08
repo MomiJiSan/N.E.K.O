@@ -43,6 +43,10 @@ from main_logic.voice_identity_service.registry import (
     install_voice_identity_service_for_app,
 )
 from main_logic.voice_identity_service.service import VoiceIdentityService
+from main_logic.voice_identity_service.shared_campplus_host import (
+    SharedCampPlusCompositionBinding,
+    SharedCampPlusScoringHost,
+)
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
 from main_routers.debug_router import set_voice_identity_diagnostics_provider
 from utils.preferences import load_global_conversation_settings
@@ -51,6 +55,9 @@ from utils.preferences import load_global_conversation_settings
 logger = logging.getLogger(__name__)
 
 _WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS = 1.0
+_SHARED_CAMPPLUS_ACTIVATION_TIMEOUT_SECONDS = 2.0
+
+
 @dataclass(slots=True)
 class _OwnerActivation:
     profile: SpeakerProfile
@@ -58,6 +65,7 @@ class _OwnerActivation:
     enforce: bool
     revision: str = field(default_factory=lambda: str(uuid.uuid4()))
     authority: SpeakerVerifierAuthority = field(default_factory=SpeakerVerifierAuthority)
+    shared_campplus_binding: SharedCampPlusCompositionBinding | None = None
     _spec: SpeakerVerifierSpec | None = field(default=None, init=False, repr=False)
 
     @classmethod
@@ -67,8 +75,14 @@ class _OwnerActivation:
         generation: str,
         *,
         enforce: bool,
+        shared_campplus_binding: SharedCampPlusCompositionBinding | None = None,
     ) -> "_OwnerActivation":
-        return cls(copy.copy(profile), generation, enforce)
+        return cls(
+            copy.copy(profile),
+            generation,
+            enforce,
+            shared_campplus_binding=shared_campplus_binding,
+        )
 
     def factory_for(self, manager) -> OwnerVoiceAsrCompositionFactory:
         return OwnerVoiceAsrCompositionFactory(
@@ -76,11 +90,14 @@ class _OwnerActivation:
             self.profile,
             activation_generation=self.generation,
             enforce=self.enforce,
+            shared_host_binding=self.shared_campplus_binding,
         )
 
     def spec(self) -> SpeakerVerifierSpec:
         if self._spec is not None:
             return self._spec
+        binding = self.shared_campplus_binding
+
         def build(runtime, identity):
             return OwnerVoiceAsrCompositionFactory(
                 runtime,
@@ -89,6 +106,7 @@ class _OwnerActivation:
                 enforce=self.enforce,
                 authority=self.authority,
                 installation_identity=identity,
+                shared_host_binding=binding,
             )
 
         self._spec = SpeakerVerifierSpec(
@@ -121,6 +139,7 @@ class OwnerVoiceRuntimeRegistry:
         enforce: bool,
         restore_retry_interval_seconds: float = 0.1,
         restore_retry_timeout_seconds: float = 10.0,
+        shared_campplus_host: SharedCampPlusScoringHost | None = None,
     ) -> None:
         if type(enforce) is not bool:
             raise TypeError("enforce must be bool")
@@ -132,6 +151,7 @@ class OwnerVoiceRuntimeRegistry:
         ):
             raise ValueError("restore retry bounds are invalid")
         self._enforce = enforce
+        self._shared_campplus_host = shared_campplus_host
         self._restore_retry_interval_seconds = float(restore_retry_interval_seconds)
         self._restore_retry_timeout_seconds = float(restore_retry_timeout_seconds)
         self._lock = asyncio.Lock()
@@ -348,6 +368,14 @@ class OwnerVoiceRuntimeRegistry:
                 self._activation.authority.revoke()
                 self._retire_activation_installations(self._activation, tuple(self._managers))
             if candidate is None:
+                deactivation_cancellation: asyncio.CancelledError | None = None
+                try:
+                    await self._prepare_shared_campplus_binding(None, generation)
+                except asyncio.CancelledError as exc:
+                    deactivation_cancellation = exc
+                    prepared.result = VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                except Exception:
+                    prepared.result = VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 previous = self._activation
                 self._activation = None
                 self._attach_pending.clear()
@@ -379,8 +407,18 @@ class OwnerVoiceRuntimeRegistry:
                 if prepared.result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                     prepared.settled = True
                     self._prepared_activation = None
+                if deactivation_cancellation is not None:
+                    raise deactivation_cancellation
                 return prepared
             try:
+                candidate.shared_campplus_binding = (
+                    await self._prepare_shared_campplus_binding(
+                        candidate.profile,
+                        candidate.generation,
+                    )
+                )
+                if self._closed or self._prepared_activation is not prepared:
+                    raise RuntimeError("speaker activation preparation became stale")
                 for manager in tuple(self._managers):
                     prepared.managers.append(manager)
                     if candidate is None:
@@ -405,11 +443,46 @@ class OwnerVoiceRuntimeRegistry:
                 return prepared
             except BaseException as exc:
                 self.revoke_prepared_activation(prepared)
-                self._abort_preparation_locked(prepared)
+                rollback_cancellation = await self._abort_preparation_locked(prepared)
                 if isinstance(exc, asyncio.CancelledError) and self._current_task_is_cancelling():
                     raise
+                if rollback_cancellation is not None:
+                    raise rollback_cancellation
                 prepared.result = VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 return prepared
+
+    async def _prepare_shared_campplus_binding(
+        self,
+        profile: SpeakerProfile | None,
+        config_generation: str,
+    ) -> SharedCampPlusCompositionBinding | None:
+        shared_host = self._shared_campplus_host
+        if shared_host is None:
+            return None
+        loop = asyncio.get_running_loop()
+        absolute_deadline = loop.time() + _SHARED_CAMPPLUS_ACTIVATION_TIMEOUT_SECONDS
+        if profile is None:
+            deactivated = await asyncio.wait_for(
+                shared_host.deactivate(absolute_deadline=absolute_deadline),
+                timeout=max(0.0, absolute_deadline - loop.time()),
+            )
+            if deactivated is not True:
+                raise RuntimeError("shared CAMPPlus host deactivation failed")
+            return None
+        generation = await asyncio.wait_for(
+            shared_host.activate(
+                profile,
+                config_generation,
+                absolute_deadline=absolute_deadline,
+            ),
+            timeout=max(0.0, absolute_deadline - loop.time()),
+        )
+        binding = shared_host.composition_binding()
+        if binding.generation != generation or not binding.is_current():
+            raise RuntimeError("shared CAMPPlus host binding became stale")
+        if binding.generation.identity.profile_generation != profile.generation:
+            raise RuntimeError("shared CAMPPlus host profile generation mismatch")
+        return binding
 
     def commit_activation(self, prepared: ActivationPreparation) -> VoiceIdentityActivationResult:
         """No await: the only point granting staged configuration authority."""
@@ -480,17 +553,33 @@ class OwnerVoiceRuntimeRegistry:
         """Internal control-plane counters; no profile/session/install identity."""
         return dict(self._installation_diagnostics)
 
-    def _abort_preparation_locked(self, prepared: ActivationPreparation) -> None:
+    async def _abort_preparation_locked(
+        self,
+        prepared: ActivationPreparation,
+    ) -> asyncio.CancelledError | None:
         if prepared.settled or self._prepared_activation is not prepared:
-            return
+            return None
         self.revoke_prepared_activation(prepared)
         previous = prepared.previous
-        restored = (
-            None if previous is None else
-            _OwnerActivation.from_borrowed(
-                previous.profile, previous.generation, enforce=previous.enforce,
+        restored: _OwnerActivation | None = None
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            restored_binding = await self._prepare_shared_campplus_binding(
+                None if previous is None else previous.profile,
+                str(uuid.uuid4()) if previous is None else previous.generation,
             )
-        )
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            pass
+        else:
+            if previous is not None:
+                restored = _OwnerActivation.from_borrowed(
+                    previous.profile,
+                    previous.generation,
+                    enforce=previous.enforce,
+                    shared_campplus_binding=restored_binding,
+                )
         if restored is not None:
             restored.authority.commit()
         self._activation = restored
@@ -504,12 +593,16 @@ class OwnerVoiceRuntimeRegistry:
             prepared.candidate.close()
         if previous is not None:
             previous.close()
+        return cancellation
 
     async def abort_activation(self, prepared: ActivationPreparation) -> VoiceIdentityActivationResult:
         self.revoke_prepared_activation(prepared)
         async with self._lock:
-            self._abort_preparation_locked(prepared)
-            return self.activation_status()
+            cancellation = await self._abort_preparation_locked(prepared)
+            result = self.activation_status()
+            if cancellation is not None:
+                raise cancellation
+            return result
 
     @staticmethod
     async def _detach_manager(manager, generation: str) -> VoiceIdentityActivationResult:
@@ -1142,6 +1235,9 @@ class OwnerVoiceRuntimeRegistry:
                 self._activation = None
                 if activation is not None:
                     activation.close()
+                shared_host = self._shared_campplus_host
+                if shared_host is not None:
+                    await shared_host.close()
 
     @staticmethod
     async def _restore_manager(manager, reason: str) -> None:
@@ -1229,7 +1325,10 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
             "filtering is disabled",
             configured_mode,
         )
-    registry = OwnerVoiceRuntimeRegistry(enforce=runtime_mode == "enforce")
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=runtime_mode == "enforce",
+        shared_campplus_host=SharedCampPlusScoringHost(),
+    )
     local_state_dir = Path(config_manager.local_state_dir)
     try:
         profile_store = VoiceIdentityProfileStore(
