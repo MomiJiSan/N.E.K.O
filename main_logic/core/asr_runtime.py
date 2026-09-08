@@ -335,6 +335,12 @@ class AsrRuntimeMixin:
         self._independent_asr_handshake_override: bool | None = None
         self._speaker_shadow_factory: SpeakerShadowFactory | None = None
         self._voice_session_activation_factory: VoiceSessionActivationFactory | None = None
+        # ``factory is None`` is intentionally not the policy bit.  It can mean
+        # either that the user disabled Owner activation or that protection was
+        # requested but its profile/runtime authority is temporarily
+        # unavailable.  Only the former may use the ordinary microphone route.
+        self._voice_session_activation_required = False
+        self._voice_session_activation_policy_revision = 0
         self._voice_session_activation_authority_generation = ""
         self._voice_session_activation_runtime: (
             VoiceSessionActivationRuntime | None
@@ -494,6 +500,10 @@ class AsrRuntimeMixin:
             self._independent_asr_handshake_override = None
         if not hasattr(self, "_speaker_shadow_factory"):
             self._speaker_shadow_factory = None
+        if not hasattr(self, "_voice_session_activation_required"):
+            self._voice_session_activation_required = False
+        if not hasattr(self, "_voice_session_activation_policy_revision"):
+            self._voice_session_activation_policy_revision = 0
         if not hasattr(self, "_voice_input_external_suppressions"):
             self._voice_input_external_suppressions = set()
         if not hasattr(
@@ -1448,20 +1458,79 @@ class AsrRuntimeMixin:
                 pass
         return False
 
+    def require_voice_session_activation(
+        self,
+        *,
+        activation_generation: str,
+    ) -> int:
+        """Synchronously close microphone output while authority is replaced.
+
+        This operation only tightens the common PCM gate.  It deliberately has
+        no await so a newer required policy can invalidate an older factory
+        replacement even while that replacement is waiting on a session lock.
+        Reopening the route remains the responsibility of the serialized async
+        setter below.
+        """
+
+        if type(activation_generation) is not str or not activation_generation.strip():
+            raise ValueError("activation_generation must be a non-empty string")
+        self._ensure_asr_runtime_state()
+        previous_factory = self._voice_session_activation_factory
+        self._voice_session_activation_degraded = True
+        self._voice_session_activation_required = True
+        self._voice_session_activation_factory = None
+        self._voice_session_activation_authority_generation = activation_generation
+        self._voice_session_activation_policy_revision += 1
+        self._voice_session_activation_profile_revision += 1
+        self._voice_session_activation_permission_revision += 1
+        self._voice_session_activation_sequence = 0
+        self._voice_session_activation_sample_cursor = 0
+        self._voice_session_activation_status = None
+        self._invalidate_voice_pcm_sync("voice_session_activation_authority_revoke")
+        if previous_factory is not None:
+            try:
+                previous_factory.close()
+            except Exception:
+                logger.warning(
+                    "[%s] revoked voice-session activation factory close failed",
+                    self.lanlan_name,
+                )
+        return self._voice_session_activation_policy_revision
+
+    def voice_session_activation_policy_token(self) -> int:
+        """Return the synchronous fence required by an async authority write."""
+
+        self._ensure_asr_runtime_state()
+        return self._voice_session_activation_policy_revision
+
     async def set_voice_session_activation_factory(
         self,
         factory: VoiceSessionActivationFactory | None,
         *,
         activation_generation: str,
+        activation_required: bool = False,
+        expected_policy_revision: int | None = None,
     ) -> VoiceIdentityActivationResult:
         """Replace the Owner activation authority for future microphone PCM."""
 
         if type(activation_generation) is not str or not activation_generation.strip():
             raise ValueError("activation_generation must be a non-empty string")
+        if type(activation_required) is not bool:
+            raise TypeError("activation_required must be bool")
+        if expected_policy_revision is not None and (
+            type(expected_policy_revision) is not int or expected_policy_revision < 0
+        ):
+            raise TypeError("expected_policy_revision must be a non-negative int or None")
         if factory is not None and (
             getattr(factory, "activation_generation", None) != activation_generation
         ):
             raise ValueError("activation factory generation does not match authority")
+        self._ensure_asr_runtime_state()
+        policy_revision = (
+            self._voice_session_activation_policy_revision
+            if expected_policy_revision is None
+            else expected_policy_revision
+        )
         session_swap_lock = self._core_voice_session_swap_lock
         try:
             await asyncio.wait_for(
@@ -1476,10 +1545,14 @@ class AsrRuntimeMixin:
             )
             return VoiceIdentityActivationResult.RUNTIME_DEGRADED
         try:
+            if policy_revision != self._voice_session_activation_policy_revision:
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
             if (
                 factory is self._voice_session_activation_factory
                 and activation_generation
                 == self._voice_session_activation_authority_generation
+                and activation_required
+                is self._voice_session_activation_required
                 and not self._voice_session_activation_degraded
             ):
                 return VoiceIdentityActivationResult.READY
@@ -1498,10 +1571,14 @@ class AsrRuntimeMixin:
                     raise
                 except Exception:
                     return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                if policy_revision != self._voice_session_activation_policy_revision:
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 if not detached:
                     return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 self._speaker_shadow_factory = None
             async with self._voice_session_activation_lock:
+                if policy_revision != self._voice_session_activation_policy_revision:
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 retired_generation = (
                     self._capture_voice_session_activation_generation()
                 )
@@ -1517,8 +1594,11 @@ class AsrRuntimeMixin:
                 previous_factory = self._voice_session_activation_factory
                 previous_runtime = self._voice_session_activation_runtime
                 self._voice_session_activation_factory = factory
+                self._voice_session_activation_required = activation_required
                 self._voice_session_activation_authority_generation = (
-                    activation_generation if factory is not None else ""
+                    activation_generation
+                    if factory is not None or activation_required
+                    else ""
                 )
                 self._voice_session_activation_runtime = None
                 self._voice_session_activation_profile_revision += 1
@@ -3158,6 +3238,11 @@ class AsrRuntimeMixin:
             return True
         factory = self._voice_session_activation_factory
         if factory is None:
+            if self._voice_session_activation_required:
+                # Requested protection without a usable authority is a
+                # deliberate fail-closed state.  Consuming the local frame here
+                # prevents both native and independent-ASR downstream sends.
+                return True
             if (
                 self._asr_route_mode == "native"
                 and getattr(self, "session_closed_by_server", False)
@@ -3192,6 +3277,22 @@ class AsrRuntimeMixin:
                 ingress_token=ingress_token,
                 captured_at=captured_at,
             )
+            return True
+
+        expected_noise_reduction = getattr(
+            factory,
+            "noise_reduction_enabled",
+            None,
+        )
+        if (
+            expected_noise_reduction is not None
+            and self._voice_input_noise_reduction_enabled
+            is not expected_noise_reduction
+        ):
+            # A factory may be installed while an inactive manager still has
+            # its construction-time pipeline.  Session start/settings owns the
+            # DSP write; until that exact contract lands, both ASR routes stay
+            # closed and no candidate/replay runtime is created.
             return True
 
         async with self._voice_session_activation_lock:

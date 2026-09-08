@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -177,6 +178,7 @@ def _service(
     async def activate(
         profile: SpeakerProfile | None,
         generation: str,
+        **_authority,
     ) -> bool:
         activations.append((profile, generation))
         return results.pop(0) if results else True
@@ -1606,6 +1608,7 @@ async def test_cancelled_reenrollment_activation_restores_previous_profile(
     async def blocking_activate(
         profile: SpeakerProfile | None,
         generation: str,
+        **_authority,
     ) -> bool:
         activations.append((profile, generation))
         if generation == "profile-b":
@@ -1684,6 +1687,7 @@ async def test_status_stays_valid_while_filter_disable_detaches(
     async def blocking_activate(
         profile: SpeakerProfile | None,
         generation: str,
+        **_authority,
     ) -> bool:
         del generation
         if profile is None:
@@ -1720,6 +1724,7 @@ async def test_status_stays_valid_while_profile_delete_detaches(
     async def blocking_activate(
         profile: SpeakerProfile | None,
         generation: str,
+        **_authority,
     ) -> bool:
         del generation
         if profile is None:
@@ -2330,6 +2335,20 @@ async def test_initialize_maps_profile_storage_failures(
     reason: str,
 ) -> None:
     service, _model, _activations, _events = _service(tmp_path)
+    await service._preference_store.asave(True)  # type: ignore[attr-defined]
+    authority_calls: list[dict[str, object]] = []
+
+    async def capture_unavailable_authority(
+        profile: SpeakerProfile | None,
+        generation: str,
+        **authority,
+    ) -> bool:
+        del generation
+        assert profile is None
+        authority_calls.append(authority)
+        return True
+
+    service._activation_callback = capture_unavailable_authority  # type: ignore[attr-defined]
 
     async def fail_load():
         raise failure
@@ -2341,6 +2360,8 @@ async def test_initialize_maps_profile_storage_failures(
     )
     status = await service.initialize()
     assert status.state.effective_reason == reason
+    assert authority_calls[-1]["activation_required"] is True
+    assert authority_calls[-1]["noise_reduction_enabled"] is True
     await service.close()
 
 
@@ -2474,6 +2495,106 @@ async def test_runtime_noise_reduction_same_value_does_not_reinstall(
     assert unchanged.state.effective_enabled
     assert unchanged.state.effective_reason == "ready"
     assert len(activations) == activation_count
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_runtime_noise_reduction_aba_reinstalls_after_stale_prepare(
+    tmp_path: Path,
+) -> None:
+    service, _model, activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+    activation_count = len(activations)
+
+    # A stale False task revoked the authority, then a newer settings write
+    # returned to the Service's original True snapshot before reconcile.
+    assert await service.prepare_runtime_audio_contract_change(False)
+    assert activations[-1][0] is None
+    assert await service.prepare_runtime_audio_contract_change(True)
+    restored = await service.update_runtime_noise_reduction_enabled(True)
+
+    assert restored.state.effective_enabled
+    assert restored.state.effective_reason == "ready"
+    assert activations[-1][0] is not None
+    assert len(activations) == activation_count + 3
+    assert not service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main_server.voice_identity_runtime as voice_runtime
+    import main_routers.config_router.preferences as preferences
+
+    service, _model, activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+    snapshot_count = 0
+
+    async def snapshot():
+        nonlocal snapshot_count
+        snapshot_count += 1
+        if snapshot_count == 1:
+            return SimpleNamespace(
+                revision=1,
+                settings={"noiseReductionEnabled": False},
+            )
+        raise RuntimeError("snapshot failed")
+
+    async def prepare(enabled: bool) -> bool:
+        return await service.prepare_runtime_audio_contract_change(enabled)
+
+    async def reconcile(enabled: bool, *, runtime_ready: bool) -> None:
+        await service.update_runtime_noise_reduction_enabled(
+            enabled,
+            runtime_ready=runtime_ready,
+        )
+
+    monkeypatch.setattr(
+        preferences,
+        "aload_global_conversation_settings_snapshot",
+        snapshot,
+    )
+    monkeypatch.setattr(
+        voice_runtime,
+        "prepare_voice_identity_audio_contract_change",
+        prepare,
+    )
+    monkeypatch.setattr(
+        voice_runtime,
+        "reconcile_voice_identity_audio_contract_change",
+        reconcile,
+    )
+    monkeypatch.setattr(preferences, "_NOISE_REDUCTION_APPLY_LOCK", asyncio.Lock())
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        await preferences._apply_noise_reduction_if_current(False)
+
+    assert activations[-1][0] is None
+    assert not service.status().state.effective_enabled
+    assert service.status().state.effective_reason == "runtime_degraded"
+    assert not service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
+
+    assert await service.prepare_runtime_audio_contract_change(True)
+    restored = await service.update_runtime_noise_reduction_enabled(True)
+    assert restored.state.effective_enabled
+    assert restored.state.effective_reason == "ready"
     await service.close()
 
 
