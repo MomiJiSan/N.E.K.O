@@ -24,6 +24,7 @@ class _Pipeline:
         tail: object = b"",
         finalize_fail: bool = False,
         finalize_block: asyncio.Event | None = None,
+        finalize_entered: asyncio.Event | None = None,
         output_trim_bytes: int = 0,
     ) -> None:
         self.rnnoise_available = rnnoise_available
@@ -32,6 +33,7 @@ class _Pipeline:
         self.tail = tail
         self.finalize_fail = finalize_fail
         self.finalize_block = finalize_block
+        self.finalize_entered = finalize_entered
         self.output_trim_bytes = output_trim_bytes
         self.chunks: list[bytes] = []
         self.closed = False
@@ -60,6 +62,8 @@ class _Pipeline:
 
     async def finalize_stream(self) -> bytes:
         self.finalize_count += 1
+        if self.finalize_entered is not None:
+            self.finalize_entered.set()
         if self.finalize_block is not None:
             await self.finalize_block.wait()
         if self.finalize_fail:
@@ -347,7 +351,11 @@ async def test_finalize_failure_and_cancellation_close_pipeline() -> None:
     assert failed_pipeline.closed
 
     release_finalize = asyncio.Event()
-    cancelled_pipeline = _Pipeline(finalize_block=release_finalize)
+    finalize_entered = asyncio.Event()
+    cancelled_pipeline = _Pipeline(
+        finalize_block=release_finalize,
+        finalize_entered=finalize_entered,
+    )
     normalizer = EnrollmentAudioNormalizer(
         nr_enabled=False,
         pipeline_factory=lambda: cancelled_pipeline,
@@ -359,9 +367,13 @@ async def test_finalize_failure_and_cancellation_close_pipeline() -> None:
             target_samples=16_000 * 3,
         )
     )
-    while cancelled_pipeline.finalize_count == 0:
-        await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await asyncio.wait_for(finalize_entered.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert cancelled_pipeline.finalize_count == 1
     assert cancelled_pipeline.closed

@@ -1,4 +1,4 @@
-"""Fail-open application controller for the single local Owner profile."""
+"""Application controller for the single local Owner profile."""
 
 from __future__ import annotations
 
@@ -87,10 +87,7 @@ class EnrollmentEmbeddingModel(Protocol):
 
 EnrollmentModelFactory = Callable[[], EnrollmentEmbeddingModel]
 EnrollmentAudioNormalizerFactory = Callable[[bool], EnrollmentAudioNormalizer]
-ActivationCallback = Callable[
-    [SpeakerProfile | None, str],
-    Awaitable[bool | VoiceIdentityActivationResult],
-]
+ActivationCallback = Callable[..., Awaitable[bool | VoiceIdentityActivationResult]]
 RuntimeStatusCallback = Callable[[], VoiceIdentityActivationResult]
 
 
@@ -237,7 +234,7 @@ class _SegmentComputation:
 
 
 class VoiceIdentityService:
-    """Own persistence, enrollment, activation, and fail-open state."""
+    """Own persistence, enrollment, activation, and effective state."""
 
     def __init__(
         self,
@@ -313,6 +310,7 @@ class VoiceIdentityService:
             or (lambda enabled: EnrollmentAudioNormalizer(nr_enabled=enabled))
         )
         self._runtime_noise_reduction_enabled = enrollment_noise_reduction_enabled
+        self._runtime_audio_contract_transition_pending = False
         self._activation_callback = activation_callback
         self._activation_transaction = activation_transaction
         self._runtime_status_callback = runtime_status_callback
@@ -350,6 +348,8 @@ class VoiceIdentityService:
                 stored_profile = await self._profile_store.aload()
             except SecureStorageUnavailableError:
                 self._requested_enabled = requested_enabled
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(
                     VoiceIdentityEffectiveReason.SECURE_STORAGE_UNAVAILABLE
                 )
@@ -357,16 +357,22 @@ class VoiceIdentityService:
                 return self.status()
             except VoiceIdentityProfileIncompatibleError:
                 self._requested_enabled = requested_enabled
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE)
                 self._initialized = True
                 return self.status()
             except VoiceIdentityProfileCorruptError:
                 self._requested_enabled = requested_enabled
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
                 self._initialized = True
                 return self.status()
             except VoiceIdentityProfileStoreError:
                 self._requested_enabled = requested_enabled
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
                 self._initialized = True
                 return self.status()
@@ -379,14 +385,20 @@ class VoiceIdentityService:
             self._profile = profile
             self._profile_audio_contract = profile_audio_contract
             if profile is None:
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(
                     VoiceIdentityEffectiveReason.NO_PROFILE
                     if requested_enabled
                     else VoiceIdentityEffectiveReason.DISABLED
                 )
             elif not self._profile_is_compatible(profile):
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE)
             elif not self._audio_contract_matches_runtime(profile_audio_contract):
+                if requested_enabled and self._runtime_mode == "enforce":
+                    await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(
                     VoiceIdentityEffectiveReason.AUDIO_CONTRACT_MISMATCH
                 )
@@ -1184,7 +1196,11 @@ class VoiceIdentityService:
                     activation_result = prepared_activation.result
                 else:
                     activation_result = await _await_cancellation_safe(
-                        self._activate(new_profile, profile_id),
+                        self._activate(
+                            new_profile,
+                            profile_id,
+                            protection_requested=desired_requested,
+                        ),
                         name="voice-identity-enrollment-activation",
                         cancellations=activation_cancellations,
                     )
@@ -1202,7 +1218,11 @@ class VoiceIdentityService:
             elif desired_requested and self._runtime_mode != "off":
                 activation_cancellations = []
                 activation_result = await _await_cancellation_safe(
-                    self._activate(None, str(uuid.uuid4())),
+                    self._activate(
+                        None,
+                        str(uuid.uuid4()),
+                        protection_requested=desired_requested,
+                    ),
                     name="voice-identity-enrollment-contract-mismatch-detach",
                     cancellations=activation_cancellations,
                 )
@@ -1333,6 +1353,7 @@ class VoiceIdentityService:
                     old_activation_restore_result = await self._activate(
                         rollback_profile,
                         rollback_generation,
+                        protection_requested=old_requested,
                     )
                     if old_activation_restore_result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                         failure_reason = VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
@@ -1520,55 +1541,87 @@ class VoiceIdentityService:
     async def update_runtime_noise_reduction_enabled(
         self,
         enabled: bool,
+        *,
+        runtime_ready: bool = True,
     ) -> VoiceIdentityServiceStatus:
         """Reconcile the active profile after the runtime DSP domain changes."""
 
         if type(enabled) is not bool:
             raise TypeError("enabled must be bool")
+        if type(runtime_ready) is not bool:
+            raise TypeError("runtime_ready must be bool")
         async with self._operation_lock:
-            self._require_initialized()
-            if enabled is self._runtime_noise_reduction_enabled:
-                return self.status()
-            self._runtime_noise_reduction_enabled = enabled
-            profile = self._profile
-            if not self._requested_enabled:
-                self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
-                return self.status()
-            if profile is None:
-                self._set_ineffective(VoiceIdentityEffectiveReason.NO_PROFILE)
-                return self.status()
-            if not self._profile_is_compatible(profile):
-                self._set_ineffective(VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE)
-                return self.status()
-            if self._runtime_mode == "off":
-                self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
-                return self.status()
+            try:
+                return await self._update_runtime_noise_reduction_enabled_locked(
+                    enabled,
+                    runtime_ready=runtime_ready,
+                )
+            finally:
+                self._runtime_audio_contract_transition_pending = False
 
-            cancellations: list[asyncio.CancelledError] = []
-            if not self._audio_contract_matches_runtime(
-                self._profile_audio_contract
-            ):
-                detached = await _await_cancellation_safe(
-                    self._activate(None, str(uuid.uuid4())),
-                    name="voice-identity-audio-contract-mismatch-detach",
-                    cancellations=cancellations,
-                )
-                self._set_ineffective(
-                    VoiceIdentityEffectiveReason.AUDIO_CONTRACT_MISMATCH
-                    if detached
-                    else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
-                )
-            else:
-                activated = await _await_cancellation_safe(
-                    self._activate(profile, profile.generation),
-                    name="voice-identity-audio-contract-restore",
-                    cancellations=cancellations,
-                )
-                self._apply_activation_result(activated)
-            status = self.status()
-            if cancellations:
-                raise cancellations[0]
-            return status
+    async def _update_runtime_noise_reduction_enabled_locked(
+        self,
+        enabled: bool,
+        *,
+        runtime_ready: bool,
+    ) -> VoiceIdentityServiceStatus:
+        self._require_initialized()
+        if (
+            enabled is self._runtime_noise_reduction_enabled
+            and not self._runtime_audio_contract_transition_pending
+        ):
+            if not runtime_ready and self._requested_enabled:
+                await self._activate(None, str(uuid.uuid4()))
+                self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+            return self.status()
+        self._runtime_noise_reduction_enabled = enabled
+        profile = self._profile
+        if not self._requested_enabled:
+            self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
+            return self.status()
+        if not runtime_ready:
+            await self._activate(None, str(uuid.uuid4()))
+            self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+            return self.status()
+        if profile is None:
+            await self._activate(None, str(uuid.uuid4()))
+            self._set_ineffective(VoiceIdentityEffectiveReason.NO_PROFILE)
+            return self.status()
+        if not self._profile_is_compatible(profile):
+            await self._activate(None, str(uuid.uuid4()))
+            self._set_ineffective(VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE)
+            return self.status()
+        if self._runtime_mode == "off":
+            self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+            return self.status()
+
+        cancellations: list[asyncio.CancelledError] = []
+        if not self._audio_contract_matches_runtime(self._profile_audio_contract):
+            detached = await _await_cancellation_safe(
+                self._activate(None, str(uuid.uuid4())),
+                name="voice-identity-audio-contract-mismatch-detach",
+                cancellations=cancellations,
+            )
+            self._set_ineffective(
+                VoiceIdentityEffectiveReason.AUDIO_CONTRACT_MISMATCH
+                if detached
+                else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+            )
+        else:
+            activated = await _await_cancellation_safe(
+                self._activate(
+                    profile,
+                    profile.generation,
+                    allow_partial=True,
+                ),
+                name="voice-identity-audio-contract-restore",
+                cancellations=cancellations,
+            )
+            self._apply_activation_result(activated)
+        status = self.status()
+        if cancellations:
+            raise cancellations[0]
+        return status
 
     async def prepare_runtime_audio_contract_change(
         self,
@@ -1580,7 +1633,10 @@ class VoiceIdentityService:
             raise TypeError("enabled must be bool or None")
         async with self._operation_lock:
             self._require_initialized()
-            if enabled is self._runtime_noise_reduction_enabled:
+            if (
+                enabled is self._runtime_noise_reduction_enabled
+                and not self._runtime_audio_contract_transition_pending
+            ):
                 return True
             if (
                 not self._requested_enabled
@@ -1597,6 +1653,7 @@ class VoiceIdentityService:
             self._set_ineffective(
                 VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
             )
+            self._runtime_audio_contract_transition_pending = True
             if cancellations:
                 raise cancellations[0]
             return bool(detached)
@@ -1632,12 +1689,30 @@ class VoiceIdentityService:
                     else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
                 )
             elif self._profile is None:
+                if self._runtime_mode == "enforce":
+                    await _await_cancellation_safe(
+                        self._activate(None, str(uuid.uuid4())),
+                        name="voice-identity-filter-no-profile",
+                        cancellations=cancellations,
+                    )
                 self._set_ineffective(VoiceIdentityEffectiveReason.NO_PROFILE)
             elif not self._profile_is_compatible(self._profile):
+                if self._runtime_mode == "enforce":
+                    await _await_cancellation_safe(
+                        self._activate(None, str(uuid.uuid4())),
+                        name="voice-identity-filter-incompatible-profile",
+                        cancellations=cancellations,
+                    )
                 self._set_ineffective(VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE)
             elif not self._audio_contract_matches_runtime(
                 self._profile_audio_contract
             ):
+                if self._runtime_mode == "enforce":
+                    await _await_cancellation_safe(
+                        self._activate(None, str(uuid.uuid4())),
+                        name="voice-identity-filter-audio-contract-mismatch",
+                        cancellations=cancellations,
+                    )
                 self._set_ineffective(
                     VoiceIdentityEffectiveReason.AUDIO_CONTRACT_MISMATCH
                 )
@@ -1992,10 +2067,28 @@ class VoiceIdentityService:
         self,
         profile: SpeakerProfile | None,
         generation: str,
+        *,
+        protection_requested: bool | None = None,
+        allow_partial: bool = False,
     ) -> VoiceIdentityActivationResult:
+        requested = (
+            self._requested_enabled
+            if protection_requested is None
+            else protection_requested
+        )
         try:
             result = await asyncio.wait_for(
-                self._activation_callback(profile, generation),
+                self._activation_callback(
+                    profile,
+                    generation,
+                    activation_required=(
+                        requested and self._runtime_mode == "enforce"
+                    ),
+                    noise_reduction_enabled=(
+                        self._runtime_noise_reduction_enabled
+                    ),
+                    allow_partial=allow_partial,
+                ),
                 timeout=self._activation_timeout_seconds,
             )
             if isinstance(result, VoiceIdentityActivationResult):
