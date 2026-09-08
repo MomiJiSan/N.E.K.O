@@ -768,3 +768,59 @@ def test_delete_profile_returns_canonical_disabled_status(
     assert response.json() == payload
     service.delete_profile.assert_awaited_once_with()
     _assert_private_values_absent(response.json())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("headers", [{}, {"Origin": "https://untrusted.example"}])
+def test_ecapa_download_requires_local_mutation_auth(monkeypatch, headers) -> None:
+    service = _fake_service()
+    service.download_activity_model = AsyncMock(return_value=_Status())
+    client = _client(monkeypatch, service, authenticated=False)
+    response = client.post(f"{API_ROOT}/models/ecapa/download", headers=headers)
+    assert response.status_code == 403
+    service.download_activity_model.assert_not_awaited()
+
+
+@pytest.mark.unit
+def test_ecapa_download_uses_fixed_service_operation_and_returns_model_state(monkeypatch) -> None:
+    payload = {
+        **SAFE_STATUS,
+        "short_speech": {
+            "state": "downloading", "downloaded_bytes": 12, "total_bytes": 123,
+            "profile_ready": False, "task_generation": 1,
+        },
+    }
+    service = _fake_service(payload)
+    service.download_activity_model = AsyncMock(return_value=_Status(payload))
+    client = _client(monkeypatch, service)
+    response = client.post(
+        f"{API_ROOT}/models/ecapa/download",
+        json={"url": "https://untrusted.example/model", "directory": "arbitrary"},
+    )
+    assert response.status_code == 200
+    assert response.json() == payload
+    service.download_activity_model.assert_awaited_once_with()
+    _assert_private_values_absent(response.json())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("error,status", [
+    ("enrollment_active", 409), ("model_unavailable", 503), ("runtime_degraded", 503),
+])
+def test_ecapa_download_maps_stable_errors_without_changing_profile_state(monkeypatch, error, status) -> None:
+    service = _fake_service()
+    service.download_activity_model = AsyncMock(side_effect=VoiceIdentityServiceError(error))
+    client = _client(monkeypatch, service)
+    response = client.post(f"{API_ROOT}/models/ecapa/download")
+    assert response.status_code == status
+    assert response.json() == {"error_code": error}
+    service.delete_profile.assert_not_awaited()
+    service.set_filter.assert_not_awaited()
+
+
+@pytest.mark.unit
+def test_ecapa_download_unavailable_registry_is_ui_safe(monkeypatch) -> None:
+    client = _client(monkeypatch, None)
+    response = client.post(f"{API_ROOT}/models/ecapa/download")
+    assert response.status_code == 503
+    assert response.json() == {"error_code": "runtime_degraded"}

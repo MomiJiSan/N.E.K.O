@@ -71,6 +71,20 @@
                     </div>
                 </section>
 
+                <section class="enrollment-card" id="voice-identity-short-speech" hidden
+                    aria-labelledby="voice-identity-short-speech-title">
+                    <h2 id="voice-identity-short-speech-title" data-i18n="voiceIdentity.shortSpeechTitle">短语音识别增强</h2>
+                    <p class="enrollment-help" data-i18n="voiceIdentity.shortSpeechHelp">
+                        下载 ECAPA，用于从你的录音中生成配套声纹，帮助判断“嗯”“好”等短语音是否由你说出。仅在本机录入时运行，完成后释放；日常识别由内置 pVAD 处理。
+                    </p>
+                    <p class="enrollment-help" data-i18n="voiceIdentity.shortSpeechOptional">可选功能。未下载时继续使用现有声纹识别；下载后需完成声纹录入。</p>
+                    <p id="voice-identity-ecapa-status" role="status" aria-live="polite" aria-atomic="true"></p>
+                    <progress id="voice-identity-ecapa-progress" max="100" value="0" hidden
+                        data-i18n-aria="voiceIdentity.ecapaProgress" aria-label="ECAPA 下载进度"></progress>
+                    <button type="button" class="secondary-button" id="voice-identity-ecapa-download"
+                        data-i18n="voiceIdentity.ecapaDownload">下载 ECAPA 模型</button>
+                </section>
+
                 <section class="enrollment-card" id="voice-identity-enrollment"
                     aria-labelledby="voice-identity-enrollment-title">
                     <div class="enrollment-copy">

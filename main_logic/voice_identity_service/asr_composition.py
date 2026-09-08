@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import threading
 import weakref
 from typing import Protocol
+
 
 from main_logic.asr_client.speaker_verifier_contracts import (
     SpeakerVerifierAuthority,
@@ -45,6 +47,12 @@ from main_logic.asr_client.speaker_shadow.diagnostics import (
 from main_logic.asr_client.speaker_diagnostics import diagnostic_value_ref
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
+from main_logic.voice_identity.pvad.assets import (
+    ECAPA_IDENTITY,
+    ECAPA_PREPROCESSING_REVISION,
+    ECAPA_REFERENCE_METHOD,
+    ECAPA_RESOURCE_REVISION,
+)
 
 from .calibration import (
     CalibrationOutcome,
@@ -53,6 +61,15 @@ from .calibration import (
     RegisteredCalibration,
 )
 from .policy import OwnerVoiceClassification, OwnerVoicePolicy
+from .pvad_backend import PvadBackendFactory, PvadSpeakerBackend
+from .pvad_policy import (
+    MINIMUM_SHORT_SAMPLES,
+    PVAD_FRAME_SAMPLES,
+    PVAD_OBSERVATION_SCOPES,
+    PvadEvidenceKind,
+    PvadMode,
+    classify_pvad_observation,
+)
 
 
 class _OwnerVoiceEvidenceSink(Protocol):
@@ -92,6 +109,10 @@ class _OwnerVoiceEvidenceSink(Protocol):
     ) -> None: ...
 
 
+
+
+
+
 class OwnerVoiceAsrCompositionFactory:
     """Create repeatable observers for one activation generation."""
 
@@ -107,6 +128,7 @@ class OwnerVoiceAsrCompositionFactory:
         calibration_package: CalibrationPackage | None = None,
         registered_calibration: RegisteredCalibration | None = None,
         runtime_calibration_protocol: CalibrationProtocol | None = None,
+        pvad_mode: PvadMode = PvadMode.OBSERVE,
     ) -> None:
         required_methods = (
             "_accept_speaker_evidence_fact",
@@ -122,6 +144,12 @@ class OwnerVoiceAsrCompositionFactory:
             raise ValueError("activation_generation must be a non-empty string")
         if type(enforce) is not bool:
             raise TypeError("enforce must be bool")
+        if type(pvad_mode) is not PvadMode:
+            raise TypeError("pvad_mode must be PvadMode")
+        if pvad_mode is PvadMode.ENFORCE:
+            # No validated negative-evidence rule or sample-exact authority
+            # transport has shipped. A profile/download never opens this gate.
+            raise ValueError("pvad_enforcement_not_validated")
         if calibration_package is not None and type(calibration_package) is not CalibrationPackage:
             raise TypeError("calibration_package must be CalibrationPackage or None")
         if registered_calibration is not None:
@@ -148,6 +176,7 @@ class OwnerVoiceAsrCompositionFactory:
         self._profile = copy.copy(profile)
         self._activation_generation = activation_generation
         self._enforce = enforce
+        self._pvad_mode = pvad_mode
         self._authority = authority
         self._installation_identity = installation_identity
         self._calibration_package = calibration_package
@@ -176,6 +205,10 @@ class OwnerVoiceAsrCompositionFactory:
             "terminal_short_recommended_uncertain_count": 0,
             "terminal_short_recommended_unsupported_count": 0,
             "terminal_short_recommended_failure_count": 0,
+            "pvad_owner_activity_observed_count": 0,
+            "pvad_negative_evidence_observed_count": 0,
+            "pvad_insufficient_observed_count": 0,
+            "pvad_unavailable_observed_count": 0,
         }
 
     @property
@@ -212,6 +245,8 @@ class OwnerVoiceAsrCompositionFactory:
                 raise RuntimeError("Owner voice composition factory is closed")
             reference = self._profile.clone_reference()
         embedding = None
+        backend_factory = None
+        pvad_enabled = False
         try:
             expected_identity = SpeakerModelIdentity(
                 CAMPPLUS_MODEL_ID,
@@ -226,6 +261,31 @@ class OwnerVoiceAsrCompositionFactory:
                 if self._calibration_package is None
                 else CampPlusBackendFactory(embedding, allow_short_input=True)
             )
+            activity_reference = self._profile.clone_activity_reference()
+            if activity_reference is not None:
+                activity_embedding = None
+                activity_contract = self._profile.activity_reference_contract
+                try:
+                    if (
+                        self._pvad_mode is PvadMode.OBSERVE
+                        and activity_reference.model_identity == ECAPA_IDENTITY
+                        and activity_contract is not None
+                        and activity_contract.resource_revision == ECAPA_RESOURCE_REVISION
+                        and activity_contract.preprocessing_revision == ECAPA_PREPROCESSING_REVISION
+                        and activity_contract.reference_method == ECAPA_REFERENCE_METHOD
+                        and activity_contract.sample_rate_hz == 16_000
+                    ):
+                        activity_embedding = activity_reference.copy_embedding()
+                        backend_factory = PvadBackendFactory(backend_factory, activity_embedding)
+                        pvad_enabled = True
+                finally:
+                    if activity_embedding is not None:
+                        activity_embedding.fill(0)
+                    activity_reference.close()
+        except BaseException:
+            if backend_factory is not None:
+                backend_factory.close()
+            raise
         finally:
             if embedding is not None:
                 embedding.fill(0.0)
@@ -238,6 +298,20 @@ class OwnerVoiceAsrCompositionFactory:
         source_ref = None
 
         def on_diagnostic(event: SpeakerShadowDiagnostic) -> None:
+            if pvad_enabled and event.score_checkpoint_kind == "terminal_short":
+                # Diagnostic coverage is not an authority channel. Preserve the
+                # real input count, but show only complete frames as evaluated.
+                covered = event.score_input_sample_count // PVAD_FRAME_SAMPLES * PVAD_FRAME_SAMPLES
+                event = replace(
+                    event,
+                    model_version="firered_pvad_v1",
+                    scoring_rule_version="pvad_activity_observe_v1",
+                    score_window_end_sample=(
+                        event.score_window_start_sample + covered
+                        if event.score_window_start_sample is not None else None
+                    ),
+                    score_duration_ms=covered * 1_000 // 16_000,
+                )
             if source_ref is not None:
                 runtime._accept_speaker_diagnostic(
                     event, activation_generation=generation, source=source_ref(),
@@ -293,6 +367,27 @@ class OwnerVoiceAsrCompositionFactory:
                     self._diagnostics["second_checkpoint_count"] += 1
                 elif checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
                     self._diagnostics["terminal_short_observation_count"] += 1
+
+            if pvad_enabled and checkpoint_kind is SpeakerCheckpointKind.TERMINAL_SHORT:
+                activity = classify_pvad_observation(event)
+                with self._lock:
+                    self._diagnostics[f"pvad_{activity.kind.value}_observed_count"] += 1
+                # Neither observed target activity nor its absence is a formal
+                # Owner/nonowner result. The existing route owns degradation,
+                # holding and settlement; no pre-wire KEEP/DROP is emitted.
+                reason = (
+                    SpeakerUnavailableReason.FAILURE
+                    if activity.kind is PvadEvidenceKind.UNAVAILABLE
+                    else SpeakerUnavailableReason.INSUFFICIENT_EVIDENCE
+                )
+                if activity.reason == "pvad_unsupported_samples":
+                    reason = SpeakerUnavailableReason.UNSUPPORTED
+                runtime._accept_speaker_evidence_fact(
+                    SpeakerUnavailable(event.candidate, event.sequence_no, reason),
+                    activation_generation=generation,
+                    enforce=enforce,
+                )
+                return
 
             if not event.evidence_available:
                 fact: SpeakerLow | SpeakerHigh | SpeakerUnavailable = (
@@ -437,13 +532,13 @@ class OwnerVoiceAsrCompositionFactory:
                         ("provider_candidate",) if enforce else ()
                     ),
                     terminal_short_evaluation_scopes=(
-                        ("provider_candidate",)
-                        if self._calibration_package is not None
+                        PVAD_OBSERVATION_SCOPES if pvad_enabled
+                        else ("provider_candidate",) if self._calibration_package is not None
                         else ()
                     ),
                     terminal_short_minimum_samples=(
-                        CAMPPLUS_EXECUTABLE_MINIMUM_SAMPLES
-                        if self._calibration_package is not None
+                        MINIMUM_SHORT_SAMPLES if pvad_enabled
+                        else CAMPPLUS_EXECUTABLE_MINIMUM_SAMPLES if self._calibration_package is not None
                         else 1
                     ),
                     pending_observation_gate_scopes=(
@@ -519,4 +614,4 @@ class OwnerVoiceAsrCompositionFactory:
             self._profile.close()
 
 
-__all__ = ["OwnerVoiceAsrCompositionFactory"]
+__all__ = ["OwnerVoiceAsrCompositionFactory", "PvadBackendFactory", "PvadSpeakerBackend"]

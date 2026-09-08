@@ -610,3 +610,11 @@ button:disabled {
         justify-content: flex-start;
     }
 }
+/* Model download status shares the enrollment card on browser and desktop. */
+#voice-identity-ecapa-progress {
+    display: block;
+    width: 100%;
+    margin: 12px 0;
+    accent-color: var(--primary-color, #37b8b4);
+}
+#voice-identity-ecapa-progress[hidden] { display: none; }

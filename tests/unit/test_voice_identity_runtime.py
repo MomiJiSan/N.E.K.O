@@ -1871,6 +1871,7 @@ async def test_runtime_install_and_wrapper_lifecycle(
             enrollment_ttl_seconds: float,
             speech_validator_factory,
             enrollment_noise_reduction_enabled: bool,
+            activity_models,
             ) -> None:
             self.args = args
             self.runtime_mode = runtime_mode
@@ -1880,6 +1881,7 @@ async def test_runtime_install_and_wrapper_lifecycle(
             self.enrollment_noise_reduction_enabled = (
                 enrollment_noise_reduction_enabled
             )
+            self.activity_models = activity_models
             self.initialized = 0
             self.closed = 0
 
@@ -1912,6 +1914,8 @@ async def test_runtime_install_and_wrapper_lifecycle(
     service = runtime_module.install_voice_identity_runtime(config)
     assert service.runtime_mode == "off"
     assert service.enrollment_noise_reduction_enabled
+    assert isinstance(service.activity_models, runtime_module.EcapaDownload)
+    assert service.activity_models.directory == tmp_path / "models" / "ecapa"
     assert "Unsupported NEKO_VOICE_IDENTITY_MODE" in caplog.text
     assert isinstance(service.args[0], runtime_module._UnavailableProfileStore)
     assert service.enrollment_ttl_seconds == 45.0

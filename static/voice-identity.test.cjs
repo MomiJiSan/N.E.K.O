@@ -161,6 +161,10 @@ function createHarness({
     initialEnrollmentProfileId = null,
     initialNextSegmentIndex = 1,
     initialRemainingSeconds = 45,
+    initialShortSpeech = null,
+    downloadGate,
+    downloadError,
+    downloadHandler,
     statusHandler,
     finalResponseTransform,
 } = {}) {
@@ -184,6 +188,10 @@ function createHarness({
         'voice-identity-reading-prompt',
         'voice-identity-reading-text',
         'voice-identity-verification-help',
+        'voice-identity-short-speech',
+        'voice-identity-ecapa-status',
+        'voice-identity-ecapa-progress',
+        'voice-identity-ecapa-download',
     ];
     const elements = new Map(elementIds.map(id => [id, createElement()]));
     const stepElements = [1, 2, 3, 4].map(index => {
@@ -213,6 +221,7 @@ function createHarness({
     let lastCompletedEnrollmentId = null;
     let statusRequestCount = 0;
     let canonicalStatusOverride = null;
+    let shortSpeech = initialShortSpeech ? { ...initialShortSpeech } : null;
     let timerId = 0;
     let nowMs = 1000;
     let enrollmentExpiresAtMs = enrollmentId
@@ -287,6 +296,7 @@ function createHarness({
         profile_generation: serverProfileGeneration,
         last_completed_enrollment_id: lastCompletedEnrollmentId,
         runtime_mode: 'enforce',
+        ...(shortSpeech ? { short_speech: { ...shortSpeech } } : {}),
         ...(canonicalStatusOverride || {}),
         });
     };
@@ -320,6 +330,24 @@ function createHarness({
             nextSegmentIndex = 1;
             enrollmentExpiresAtMs = nowMs + initialRemainingSeconds * 1000;
             if (startTransportErrorAfterCreate) throw new Error('start_response_lost');
+            return jsonResponse(statusPayload());
+        }
+        if (call.url === `${API_ROOT}/models/ecapa/download`) {
+            if (downloadHandler) return downloadHandler({ payload: statusPayload(), call });
+            if (downloadGate) await downloadGate.promise;
+            if (downloadError) {
+                return jsonResponse(
+                    { error_code: downloadError },
+                    { ok: false, status: 503 },
+                );
+            }
+            shortSpeech = {
+                state: 'downloading',
+                downloaded_bytes: 0,
+                total_bytes: shortSpeech?.total_bytes || 83540359,
+                profile_ready: Boolean(shortSpeech?.profile_ready),
+                error_code: null,
+            };
             return jsonResponse(statusPayload());
         }
         if (call.url === `${API_ROOT}/enrollment/segment`) {
@@ -692,6 +720,9 @@ function createHarness({
         setCanonicalStatusOverride(override) {
             canonicalStatusOverride = override;
         },
+        setShortSpeech(status) {
+            shortSpeech = status ? { ...status } : null;
+        },
         setStartGate(gate) {
             currentStartGate = gate;
         },
@@ -727,6 +758,299 @@ async function flush(turns = 8) {
         await new Promise(resolve => setImmediate(resolve));
     }
 }
+
+test('ECAPA card reports optional download state and reaches ready by bounded polling', async () => {
+    const harness = createHarness({
+        manualPreparation: true,
+        initialShortSpeech: {
+            state: 'missing',
+            downloaded_bytes: 0,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+    });
+    await harness.initialize();
+
+    const card = harness.elements.get('voice-identity-short-speech');
+    const button = harness.elements.get('voice-identity-ecapa-download');
+    const progress = harness.elements.get('voice-identity-ecapa-progress');
+    assert.equal(card.hidden, false);
+    assert.equal(button.hidden, false);
+    assert.match(button.textContent, /83\.5 MB/);
+    assert.equal(progress.hidden, true);
+
+    await harness.emit('voice-identity-ecapa-download');
+    const download = harness.fetchCalls.find(call => (
+        call.url === `${API_ROOT}/models/ecapa/download`
+    ));
+    assert.ok(download);
+    assert.equal(download.options.method, 'POST');
+    assert.equal(download.options.headers.get('x-csrf-token'), 'csrf-token');
+    assert.equal(button.disabled, true);
+    assert.equal(progress.hidden, false);
+    assert.equal(harness.timeoutCount, 1);
+
+    harness.setShortSpeech({
+        state: 'verifying',
+        downloaded_bytes: 83540359,
+        total_bytes: 83540359,
+        profile_ready: false,
+        error_code: null,
+    });
+    harness.advanceTime(1000);
+    await flush();
+    assert.equal(button.disabled, true);
+    assert.match(
+        harness.elements.get('voice-identity-ecapa-status').textContent,
+        /正在校验/,
+    );
+    assert.equal(harness.timeoutCount, 1);
+
+    harness.setShortSpeech({
+        state: 'ready',
+        downloaded_bytes: 83540359,
+        total_bytes: 83540359,
+        profile_ready: false,
+        error_code: null,
+    });
+    harness.advanceTime(1000);
+    await flush();
+
+    assert.equal(button.hidden, true);
+    assert.equal(progress.hidden, true);
+    assert.match(
+        harness.elements.get('voice-identity-ecapa-status').textContent,
+        /模型已就绪/,
+    );
+    assert.equal(harness.timeoutCount, 0);
+});
+
+test('ECAPA polling stops on window close and never starts during enrollment', async () => {
+    const harness = createHarness({
+        manualPreparation: true,
+        initialEnrollment: true,
+        initialShortSpeech: {
+            state: 'downloading',
+            downloaded_bytes: 1024,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+    });
+    await harness.initialize();
+
+    const button = harness.elements.get('voice-identity-ecapa-download');
+    assert.equal(button.disabled, true);
+    await harness.emit('voice-identity-ecapa-download');
+    assert.equal(
+        harness.fetchCalls.some(call => call.url === `${API_ROOT}/models/ecapa/download`),
+        false,
+    );
+    assert.equal(harness.timeoutCount >= 1, true);
+
+    await harness.beforeClose();
+    assert.equal(harness.timeoutCount, 0);
+});
+
+test('ECAPA polling pauses while hidden and resumes from canonical status when visible', async () => {
+    const harness = createHarness({
+        manualPreparation: true,
+        initialShortSpeech: {
+            state: 'downloading',
+            downloaded_bytes: 1024,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+    });
+    await harness.initialize();
+    assert.equal(harness.timeoutCount, 1);
+
+    harness.setDocumentVisibility('hidden');
+    harness.dispatchDocument('visibilitychange');
+    assert.equal(harness.timeoutCount, 0);
+
+    harness.setShortSpeech({
+        state: 'ready',
+        downloaded_bytes: 83540359,
+        total_bytes: 83540359,
+        profile_ready: false,
+        error_code: null,
+    });
+    harness.setDocumentVisibility('visible');
+    harness.dispatchDocument('visibilitychange');
+    await flush();
+
+    assert.equal(harness.elements.get('voice-identity-ecapa-download').hidden, true);
+    assert.equal(harness.timeoutCount, 0);
+});
+
+test('an ECAPA status failure that returns after hiding cannot restart polling', async () => {
+    const refreshGate = deferred();
+    const harness = createHarness({
+        manualPreparation: true,
+        initialShortSpeech: {
+            state: 'downloading',
+            downloaded_bytes: 1024,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+        statusHandler({ requestNumber, payload }) {
+            return requestNumber === 2 ? refreshGate.promise : jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+    harness.advanceTime(1000);
+    await flush(2);
+    assert.equal(harness.statusRequestCount, 2);
+
+    harness.setDocumentVisibility('hidden');
+    harness.dispatchDocument('visibilitychange');
+    assert.equal(harness.timeoutCount, 0);
+    refreshGate.reject(new Error('status_unavailable'));
+    await flush();
+    assert.equal(harness.timeoutCount, 0);
+
+    harness.advanceTime(1000);
+    await flush();
+    assert.equal(harness.statusRequestCount, 2);
+});
+
+test('an old ECAPA poll cannot overwrite a newer cross-window profile status', async () => {
+    const oldPoll = deferred();
+    let oldPayload;
+    const harness = createHarness({
+        manualPreparation: true,
+        initialShortSpeech: {
+            state: 'downloading',
+            downloaded_bytes: 1024,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+        statusHandler({ requestNumber, payload }) {
+            if (requestNumber === 2) {
+                oldPayload = payload;
+                return oldPoll.promise;
+            }
+            return jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+    harness.advanceTime(1000);
+    await flush(2);
+    assert.equal(harness.statusRequestCount, 2);
+
+    harness.setCanonicalStatusOverride({
+        has_profile: true,
+        requested_enabled: true,
+        effective_enabled: true,
+        effective_reason: 'ready',
+        profile_generation: 'profile-new',
+        short_speech: {
+            state: 'ready',
+            downloaded_bytes: 83540359,
+            total_bytes: 83540359,
+            profile_ready: true,
+            error_code: null,
+        },
+    });
+    harness.dispatch('focus');
+    await flush();
+    assert.match(
+        harness.elements.get('voice-identity-ecapa-status').textContent,
+        /短语音声纹已就绪/,
+    );
+
+    oldPoll.resolve(jsonResponse(oldPayload));
+    await flush();
+    assert.match(
+        harness.elements.get('voice-identity-ecapa-status').textContent,
+        /短语音声纹已就绪/,
+    );
+    assert.equal(harness.timeoutCount, 0);
+});
+
+test('an old ECAPA download response cannot overwrite a newer cross-window profile status', async () => {
+    const oldDownload = deferred();
+    const harness = createHarness({
+        manualPreparation: true,
+        initialShortSpeech: {
+            state: 'missing',
+            downloaded_bytes: 0,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+        downloadHandler() {
+            return oldDownload.promise;
+        },
+    });
+    await harness.initialize();
+    harness.emit('voice-identity-ecapa-download');
+    await flush(2);
+
+    harness.setCanonicalStatusOverride({
+        has_profile: true,
+        requested_enabled: true,
+        effective_enabled: true,
+        effective_reason: 'ready',
+        profile_generation: 'profile-new',
+        short_speech: {
+            state: 'ready',
+            downloaded_bytes: 83540359,
+            total_bytes: 83540359,
+            profile_ready: true,
+            error_code: null,
+        },
+    });
+    harness.dispatch('focus');
+    await flush();
+    assert.match(
+        harness.elements.get('voice-identity-ecapa-status').textContent,
+        /短语音声纹已就绪/,
+    );
+
+    oldDownload.resolve(jsonResponse({
+        profile_generation: null,
+        short_speech: {
+            state: 'downloading',
+            downloaded_bytes: 0,
+            total_bytes: 83540359,
+            profile_ready: false,
+            error_code: null,
+        },
+    }));
+    await flush();
+    assert.match(
+        harness.elements.get('voice-identity-ecapa-status').textContent,
+        /短语音声纹已就绪/,
+    );
+});
+
+test('all supported locales contain the complete ECAPA UI contract', () => {
+    const keys = [
+        'shortSpeechTitle', 'shortSpeechHelp', 'shortSpeechOptional',
+        'ecapaProgress', 'ecapaDownload', 'ecapaDownloadSize', 'ecapaRetry',
+        'ecapaDownloading', 'ecapaVerifying', 'ecapaProfileReady', 'ecapaNeedsEnrollment',
+        'ecapaFailed', 'ecapaMissing',
+    ];
+    for (const locale of ['en', 'es', 'ja', 'ko', 'pt', 'ru', 'zh-CN', 'zh-TW']) {
+        const messages = JSON.parse(fs.readFileSync(
+            path.join(__dirname, `locales/${locale}.json`),
+            'utf8',
+        ));
+        for (const key of keys) {
+            assert.equal(typeof messages.voiceIdentity[key], 'string', `${locale}:${key}`);
+            assert.notEqual(messages.voiceIdentity[key].trim(), '', `${locale}:${key}`);
+        }
+        assert.match(messages.voiceIdentity.ecapaDownloadSize, /\{\{size\}\}/, locale);
+        assert.match(messages.voiceIdentity.ecapaDownloading, /\{\{downloaded\}\}/, locale);
+        assert.match(messages.voiceIdentity.ecapaDownloading, /\{\{size\}\}/, locale);
+    }
+});
 
 test('mutation controls stay disabled until CSRF and canonical status resolve', async () => {
     const statusGate = deferred();

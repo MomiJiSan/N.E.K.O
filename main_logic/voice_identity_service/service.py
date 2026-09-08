@@ -19,8 +19,10 @@ from main_logic.asr_client.speaker_shadow.asset_manifest import (
 )
 from main_logic.asr_client.speaker_shadow.campplus import CAMPPLUS_EMBEDDING_DIM
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
-from main_logic.voice_identity.profile import SpeakerProfile
+from main_logic.voice_identity.profile import SpeakerActivityReferenceContract, SpeakerProfile
 from main_logic.voice_identity.reference import SpeakerReference
+from main_logic.voice_identity.pvad.assets import EcapaDownload, EcapaModelSnapshot
+from main_logic.voice_identity.pvad.models import extract_activity_reference
 from main_logic.voice_input.suppression import (
     VoiceInputSuppressionController,
     VoiceInputSuppressionLease,
@@ -180,6 +182,7 @@ class VoiceIdentityServiceStatus:
     runtime_mode: VoiceIdentityRuntimeMode
     last_completed_enrollment_id: str | None
     verification: EnrollmentVerificationResult | None = None
+    short_speech: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = self.state.as_dict()
@@ -191,6 +194,8 @@ class VoiceIdentityServiceStatus:
         result["last_completed_enrollment_id"] = self.last_completed_enrollment_id
         if self.verification is not None:
             result["verification"] = self.verification.as_dict()
+        if self.short_speech is not None:
+            result["short_speech"] = self.short_speech
         return result
 
 
@@ -206,6 +211,7 @@ class _EnrollmentSession:
     session_generation: int
     requested_enabled_snapshot: bool
     noise_reduction_enabled_snapshot: bool
+    activity_model_snapshot: EcapaModelSnapshot | None = None
     operation_nonce: int = 0
     in_flight_segment_index: int | None = None
     operation_task: asyncio.Task[object] | None = None
@@ -216,16 +222,21 @@ class _EnrollmentSession:
     holdout_failure_count: int = 0
     inference_task: asyncio.Task[np.ndarray] | None = None
     validation_task: asyncio.Task[object] | None = None
+    activity_task: asyncio.Task[SpeakerReference] | None = None
 
 
 @dataclass(slots=True)
 class _SegmentComputation:
+    activity_reference: SpeakerReference | None = None
     reference_embedding: np.ndarray | None = None
     holdout_1_5: np.ndarray | None = None
     holdout_3_0: np.ndarray | None = None
     holdout_5_0: np.ndarray | None = None
 
     def wipe(self) -> None:
+        if self.activity_reference is not None:
+            self.activity_reference.close()
+            self.activity_reference = None
         wipe_enrollment_embedding(self.reference_embedding)
         wipe_enrollment_embedding(self.holdout_1_5)
         wipe_enrollment_embedding(self.holdout_3_0)
@@ -258,6 +269,7 @@ class VoiceIdentityService:
             EnrollmentAudioNormalizerFactory | None
         ) = None,
         enrollment_noise_reduction_enabled: bool = True,
+        activity_models: EcapaDownload | None = None,
     ) -> None:
         if not isinstance(profile_store, VoiceIdentityProfileStore):
             raise TypeError("profile_store must be VoiceIdentityProfileStore")
@@ -334,12 +346,15 @@ class VoiceIdentityService:
         self._model_inference_cleanup_task: asyncio.Task[None] | None = None
         self._initialized = False
         self._closed = False
+        self._activity_models = activity_models
 
     async def initialize(self) -> VoiceIdentityServiceStatus:
         async with self._operation_lock:
             self._require_open()
             if self._initialized:
                 return self.status()
+            if self._activity_models is not None:
+                await self._activity_models.initialize()
             try:
                 requested_enabled = await self._preference_store.aload()
             except VoiceIdentityPreferenceStoreError:
@@ -435,7 +450,25 @@ class VoiceIdentityService:
             None if self._profile is None else self._profile.generation,
             self._runtime_mode,
             None if self._last_completed is None else self._last_completed[0],
+            short_speech=(None if self._activity_models is None else {
+                **self._activity_models.status(),
+                "profile_ready": bool(self._profile is not None and self._profile.has_activity_reference),
+            }),
         )
+
+    async def download_activity_model(self) -> VoiceIdentityServiceStatus:
+        async with self._operation_lock:
+            self._require_open()
+            self._require_initialized()
+            if self._enrollment is not None:
+                raise VoiceIdentityServiceError("enrollment_active")
+            if self._activity_models is None:
+                raise VoiceIdentityServiceError("model_unavailable")
+            try:
+                self._activity_models.start()
+            except Exception as exc:
+                raise VoiceIdentityServiceError("model_unavailable") from exc
+            return self.status()
 
     def _enrollment_status(self, session: _EnrollmentSession) -> EnrollmentStatus:
         try:
@@ -461,6 +494,11 @@ class VoiceIdentityService:
             self._require_initialized()
             if self._enrollment is not None:
                 return self._enrollment_status(self._enrollment)
+            # Freeze before the first load/suppression await. A download finishing
+            # during this start request must not change this enrollment's protocol.
+            activity_snapshot = (
+                None if self._activity_models is None else self._activity_models.snapshot()
+            )
             cleanup_task = self._model_load_cleanup_task
             if cleanup_task is not None:
                 if not cleanup_task.done():
@@ -621,6 +659,7 @@ class VoiceIdentityService:
                 noise_reduction_enabled_snapshot=(
                     self._runtime_noise_reduction_enabled
                 ),
+                activity_model_snapshot=activity_snapshot,
             )
             self._enrollment_generation += 1
             if not self._effective_enabled:
@@ -841,6 +880,8 @@ class VoiceIdentityService:
                 self._clear_segment_operation(session, preserve_phase=True)
                 return self.status()
 
+            activity_reference = computed.activity_reference
+            computed.activity_reference = None
             try:
                 centroid = session.reference_centroid
                 if centroid is None:
@@ -861,6 +902,8 @@ class VoiceIdentityService:
                 computed.wipe()
 
             if not verification.passed:
+                if activity_reference is not None:
+                    activity_reference.close()
                 session.holdout_failure_count += 1
                 if session.holdout_failure_count >= 2:
                     self._reset_session_references(session)
@@ -868,12 +911,17 @@ class VoiceIdentityService:
                 return replace(self.status(), verification=verification)
 
             session.phase = "committing"
-            committed = await self._commit_enrollment_reference(
-                session,
-                session_generation=session_generation,
-                operation_nonce=operation_nonce,
-                profile_id=profile_id,
-            )
+            try:
+                committed = await self._commit_enrollment_reference(
+                    session,
+                    session_generation=session_generation,
+                    operation_nonce=operation_nonce,
+                    profile_id=profile_id,
+                    activity_reference=activity_reference,
+                )
+            finally:
+                if activity_reference is not None:
+                    activity_reference.close()
             return replace(committed, verification=verification)
         finally:
             computed.wipe()
@@ -1006,6 +1054,40 @@ class VoiceIdentityService:
                 segment_index,
                 operation_task,
             )
+            if (
+                session.activity_model_snapshot is not None
+                and session.reference_centroid is not None
+                and verify_enrollment_holdout(
+                    session.reference_centroid, computation.holdout_1_5,
+                    computation.holdout_3_0, computation.holdout_5_0,
+                ).passed
+            ):
+                snapshot = session.activity_model_snapshot
+                timeout = min(
+                    self._model_timeout_seconds,
+                    max(0.0, session.expires_at - asyncio.get_running_loop().time()),
+                )
+                activity_task = asyncio.create_task(
+                    extract_activity_reference(
+                        snapshot.directory, normalized_pcm16[:verification_bytes],
+                        timeout=timeout,
+                    ),
+                    name="voice-identity-enrollment-activity-reference",
+                )
+                session.activity_task = activity_task
+                computation.activity_reference = await asyncio.wait_for(
+                    asyncio.shield(activity_task), timeout=timeout,
+                )
+                if session.activity_task is activity_task:
+                    session.activity_task = None
+                self._require_compute_fence(
+                    session, session_generation, operation_nonce, segment_index, operation_task,
+                )
+                if (
+                    type(computation.activity_reference) is not SpeakerReference
+                    or computation.activity_reference.model_identity != snapshot.model_identity
+                ):
+                    raise ValueError("activity_reference_model_mismatch")
             return computation
         except BaseException:
             computation.wipe()
@@ -1103,11 +1185,13 @@ class VoiceIdentityService:
         session_generation: int,
         operation_nonce: int,
         profile_id: str,
+        activity_reference: SpeakerReference | None = None,
     ) -> VoiceIdentityServiceStatus:
         old_profile = self._profile
         old_audio_contract = self._profile_audio_contract
         old_requested = self._requested_enabled
         old_effective = self._effective_enabled
+        old_effective_reason = self._effective_reason
         old_activation_requested = (
             old_requested
             and old_profile is not None
@@ -1141,7 +1225,28 @@ class VoiceIdentityService:
                 centroid,
             )
             try:
-                new_profile = SpeakerProfile(profile_id, reference)
+                snapshot = session.activity_model_snapshot
+                activity_contract = None
+                if snapshot is not None:
+                    if (
+                        activity_reference is None
+                        or activity_reference.model_identity != snapshot.model_identity
+                    ):
+                        raise VoiceIdentityServiceError("model_unavailable")
+                    activity_contract = SpeakerActivityReferenceContract(
+                        resource_revision=snapshot.resource_revision,
+                        preprocessing_revision=snapshot.preprocessing_revision,
+                        reference_method=snapshot.reference_method,
+                        sample_rate_hz=ENROLLMENT_SAMPLE_RATE_HZ,
+                        noise_reduction_enabled=session.noise_reduction_enabled_snapshot,
+                    )
+                elif activity_reference is not None:
+                    raise VoiceIdentityServiceError("model_unavailable")
+                new_profile = SpeakerProfile(
+                    profile_id, reference,
+                    activity_reference=activity_reference,
+                    activity_reference_contract=activity_contract,
+                )
             finally:
                 reference.close()
 
@@ -1349,6 +1454,19 @@ class VoiceIdentityService:
                     and old_activation_restore_result is not VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 ):
                     self._apply_activation_result(old_activation_restore_result)
+                elif (
+                    old_profile is not None
+                    and self._profile is old_profile
+                    and self._enrollment is session
+                    and not self._closed
+                    and not activation_changed
+                    and prepared_activation is None
+                    and not preference_changed
+                ):
+                    # No new runtime authority was installed. An unpublished
+                    # staging failure cannot invalidate the still-owned profile.
+                    self._effective_enabled = old_effective
+                    self._effective_reason = old_effective_reason
                 elif old_effective:
                     self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
                 else:
@@ -1746,6 +1864,15 @@ class VoiceIdentityService:
                 return
             self._closed = True
             cancellations: list[asyncio.CancelledError] = []
+            download_close_error: Exception | None = None
+            if self._activity_models is not None:
+                try:
+                    await _await_cancellation_safe(
+                        self._activity_models.close(), name="voice-identity-close-model-download",
+                        cancellations=cancellations,
+                    )
+                except Exception as exc:
+                    download_close_error = exc
             session = self._enrollment
             self._enrollment = None
             if session is not None:
@@ -1776,6 +1903,8 @@ class VoiceIdentityService:
             self._effective_reason = VoiceIdentityEffectiveReason.DISABLED
             if cancellations:
                 raise cancellations[0]
+            if download_close_error is not None:
+                raise VoiceIdentityServiceError("model_unavailable") from download_close_error
 
     async def _expire_enrollment(
         self,
@@ -1795,6 +1924,25 @@ class VoiceIdentityService:
         if session.expiry_task is not current:
             session.expiry_task.cancel()
         ok = True
+        activity_task = session.activity_task
+        session.activity_task = None
+        if activity_task is not None:
+            if not activity_task.done():
+                activity_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(activity_task), timeout=self._model_timeout_seconds,
+                    )
+                except TimeoutError:
+                    self._retain_activity_cleanup(session, activity_task)
+                    return False
+                except asyncio.CancelledError:
+                    if not activity_task.done():
+                        self._retain_activity_cleanup(session, activity_task)
+                        raise
+                except Exception:
+                    pass
+            self._discard_activity_result(activity_task)
         try:
             await session.lease.release()
         except Exception:
@@ -1876,6 +2024,45 @@ class VoiceIdentityService:
             ok = False
         await self._close_model(session.model)
         return ok
+
+    @staticmethod
+    def _discard_activity_result(task: asyncio.Task[SpeakerReference]) -> None:
+        try:
+            reference = task.result()
+        except BaseException:
+            return
+        reference.close()
+
+    def _retain_activity_cleanup(
+        self,
+        session: _EnrollmentSession,
+        activity_task: asyncio.Task[SpeakerReference],
+    ) -> None:
+        """Keep one retirement owner until the worker confirms termination."""
+        self._wipe_session_embeddings(session)
+
+        async def finish_cleanup() -> None:
+            try:
+                await activity_task
+            except BaseException:
+                pass
+            self._discard_activity_result(activity_task)
+            await self._cleanup_session(session)
+
+        cleanup_task = asyncio.create_task(
+            finish_cleanup(), name="voice-identity-activity-resource-cleanup",
+        )
+        self._model_inference_cleanup_task = cleanup_task
+
+        def clear_finished(completed: asyncio.Task[None]) -> None:
+            if self._model_inference_cleanup_task is completed:
+                self._model_inference_cleanup_task = None
+            try:
+                completed.result()
+            except BaseException:
+                pass
+
+        cleanup_task.add_done_callback(clear_finished)
 
     def _wipe_session_embeddings(self, session: _EnrollmentSession) -> None:
         for embedding in session.reference_embeddings:

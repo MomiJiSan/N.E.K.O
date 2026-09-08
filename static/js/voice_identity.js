@@ -86,7 +86,8 @@
         operationNonce: 0, ttlTimer: null, ttlSettling: false,
         message: { kind: 'text', text: '', isError: false, verification: null },
         passiveRefreshPromise: null, passiveRefreshContext: null,
-        passiveRefreshQueued: false, refreshAfterCompletion: false
+        passiveRefreshQueued: false, refreshAfterCompletion: false,
+        shortSpeech: null, ecapaPending: false, ecapaTimer: null
     };
     const elements = {};
 
@@ -100,6 +101,8 @@
 
     function cacheElements() {
         for (const [name, id] of Object.entries({
+            shortSpeech: 'voice-identity-short-speech', ecapaStatus: 'voice-identity-ecapa-status',
+            ecapaProgress: 'voice-identity-ecapa-progress', ecapaDownload: 'voice-identity-ecapa-download',
             statusDot: 'voice-identity-status-dot', profileStatus: 'voice-identity-profile-status',
             enrollment: 'voice-identity-enrollment', captureStatus: 'voice-identity-capture-status',
             captureLabel: 'voice-identity-capture-label', timer: 'voice-identity-timer',
@@ -194,6 +197,7 @@
     }
 
     function applyStatus(payload) {
+        applyShortSpeechStatus(payload && payload.short_speech);
         const status = payload && typeof payload === 'object' ? payload : {};
         const enrollment = status.enrollment && typeof status.enrollment === 'object' ? status.enrollment : null;
         const profile = status.profile && typeof status.profile === 'object' ? status.profile : {};
@@ -510,7 +514,92 @@
             else step.removeAttribute('aria-current');
         }
     }
-    function render() { renderProfile(); renderEnrollment(); renderMessage(); }
+    function render() { renderProfile(); renderEnrollment(); renderMessage(); renderShortSpeech(); }
+
+    function applyShortSpeechStatus(status) {
+        if (!status || typeof status !== 'object') return;
+        state.shortSpeech = status;
+        if (['downloading', 'verifying'].includes(status.state)
+            && document.visibilityState !== 'hidden'
+            && !state.ecapaTimer && !state.closeStarted) {
+            state.ecapaTimer = window.setTimeout(refreshEcapaDownload, 1000);
+        }
+    }
+
+    function renderShortSpeech() {
+        if (!elements.shortSpeech) return;
+        const status = state.shortSpeech;
+        elements.shortSpeech.hidden = !status;
+        if (!status) return;
+        const downloading = status.state === 'downloading';
+        const verifying = status.state === 'verifying';
+        const ready = status.state === 'ready';
+        const size = (Number(status.total_bytes || 0) / 1000000).toFixed(1);
+        elements.ecapaDownload.hidden = ready;
+        elements.ecapaDownload.disabled = downloading || verifying || state.ecapaPending || state.busy || Boolean(state.enrollmentId);
+        elements.ecapaDownload.textContent = status.state === 'failed'
+            ? translate('voiceIdentity.ecapaRetry', '重试下载')
+            : translate('voiceIdentity.ecapaDownloadSize', `下载 ECAPA（${size} MB）`, { size });
+        elements.ecapaProgress.hidden = !downloading;
+        elements.ecapaProgress.value = Math.min(100, 100 * Number(status.downloaded_bytes || 0) / Number(status.total_bytes || 1));
+        if (verifying) {
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaVerifying', '下载完成，正在校验 ECAPA 模型…');
+        } else if (downloading) {
+            const downloaded = (Number(status.downloaded_bytes || 0) / 1000000).toFixed(1);
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaDownloading', `正在下载 ${downloaded} / ${size} MB`, { downloaded, size });
+        } else if (status.profile_ready) {
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaProfileReady', '短语音声纹已就绪；当前运行链路支持增强且 Owner 声纹过滤已开启时才会使用。');
+        } else if (ready) {
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaNeedsEnrollment', '模型已就绪，请重新录入声纹以生成配套的短语音声纹。');
+        } else if (status.state === 'failed') {
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaFailed', '模型下载或校验失败，请重试。现有声纹识别不受影响。');
+        } else {
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaMissing', '尚未下载 ECAPA 模型。');
+        }
+    }
+
+    async function refreshEcapaDownload() {
+        state.ecapaTimer = null;
+        if (state.closeStarted || document.visibilityState === 'hidden') return;
+        const identity = passiveRefreshIdentity();
+        try {
+            const payload = await getCanonicalStatus();
+            if (state.closeStarted || document.visibilityState === 'hidden') return;
+            // A download refresh must never overwrite newer profile/enrollment identity.
+            if (!passiveRefreshMatches(identity)
+                || payload.profile_generation !== state.profileRevision) return;
+            const status = payload && payload.short_speech;
+            applyShortSpeechStatus(status);
+            renderShortSpeech();
+        } catch (_) {
+            // A transient status failure does not prove that the download failed.
+            if (!state.closeStarted && document.visibilityState !== 'hidden' && state.shortSpeech
+                && ['downloading', 'verifying'].includes(state.shortSpeech.state)) {
+                state.ecapaTimer = window.setTimeout(refreshEcapaDownload, 1000);
+            }
+        }
+    }
+
+    async function downloadEcapa() {
+        if (state.ecapaPending || state.busy || state.enrollmentId || state.closeStarted) return;
+        const identity = passiveRefreshIdentity();
+        state.ecapaPending = true;
+        renderShortSpeech();
+        try {
+            const payload = await apiRequest('/models/ecapa/download', { method: 'POST' });
+            // A slow download response may belong to a profile that another window replaced.
+            if (!state.closeStarted && passiveRefreshMatches(identity)
+                && payload.profile_generation === state.profileRevision) {
+                applyShortSpeechStatus(payload.short_speech);
+            }
+        } catch (_) {
+            const canonical = await reconcileStatus();
+            if (!canonical) state.shortSpeech = { ...state.shortSpeech, state: 'failed' };
+        } finally {
+            state.ecapaPending = false;
+            if (!state.closeStarted) renderShortSpeech();
+        }
+    }
 
     function passiveRefreshIdentity() {
         return Object.freeze({
@@ -979,6 +1068,7 @@
         } finally { state.filterPending = false; render(); }
     }
     function bindEvents() {
+        if (elements.ecapaDownload) elements.ecapaDownload.addEventListener('click', downloadEcapa);
         elements.start.addEventListener('click', startEnrollment);
         elements.reenroll.addEventListener('click', startEnrollment);
         elements.cancel.addEventListener('click', () => cancelEnrollment().catch(function () {}));
@@ -987,10 +1077,17 @@
         window.addEventListener('localechange', render);
         window.addEventListener('focus', function () { refreshStatusWhenIdle(); });
         document.addEventListener('visibilitychange', function () {
-            if (document.visibilityState === 'visible') refreshStatusWhenIdle();
+            if (document.visibilityState === 'visible') {
+                refreshStatusWhenIdle();
+            } else {
+                if (state.ecapaTimer) window.clearTimeout(state.ecapaTimer);
+                state.ecapaTimer = null;
+            }
         });
         window.nekoBeforeWindowClose = async function () {
             state.closeStarted = true; ++state.operationNonce; state.cancelPending = true;
+            if (state.ecapaTimer) window.clearTimeout(state.ecapaTimer);
+            state.ecapaTimer = null;
             stopTtlClock();
             stopMicrophone('capture_cancelled');
             const pendingStart = state.startSettled;

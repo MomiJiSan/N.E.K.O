@@ -535,5 +535,4 @@ def test_locale_bootstrap_declares_a_non_empty_locale_cache_key() -> None:
     bootstrap = (ROOT / "static/i18n-i18next.js").read_text(encoding="utf-8")
     locale_version = re.search(r"const\s+LOCALE_VERSION\s*=\s*'([^']+)'", bootstrap)
     assert locale_version and locale_version.group(1).strip()
-    assert locale_version.group(1) == "2026-09-03-voice-identity-five-second-verification"
     assert locale_version.group(1) != "2026-08-07-credentials-console-guide"

@@ -101,7 +101,7 @@ def test_store_round_trip_contains_no_plain_profile(tmp_path: Path) -> None:
         assert plain_bytes not in stored
         assert plain_base64 not in stored
         envelope = json.loads(stored)
-        assert envelope["schema_version"] == 3
+        assert envelope["schema_version"] == 4
         assert envelope["algorithm"] == "AES-256-GCM"
         assert envelope["key_wrapping"] == "DPAPI-CURRENT-USER"
 
@@ -272,8 +272,9 @@ def test_legacy_profile_is_explicitly_incompatible_and_not_migrated(
 
 @pytest.mark.unit
 def test_v3_uses_versioned_authenticated_data() -> None:
-    assert store_module._SCHEMA_VERSION == 3
-    assert store_module._AAD == b"N.E.K.O.voice-identity.profile\x00v3"
+    assert store_module._SCHEMA_VERSION == 4
+    assert store_module._AAD == b"N.E.K.O.voice-identity.profile\x00v4"
+    assert store_module._READ_AAD[3] == b"N.E.K.O.voice-identity.profile\x00v3"
 
 
 @pytest.mark.unit

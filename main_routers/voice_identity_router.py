@@ -131,6 +131,22 @@ async def start_voice_identity_enrollment(request: Request):
     return service.status().as_dict()
 
 
+@router.post("/models/ecapa/download")
+async def download_voice_identity_ecapa(request: Request):
+    rejected = _validate_mutation(request)
+    if rejected is not None:
+        return rejected
+    service = _service()
+    if service is None:
+        return _service_unavailable()
+    try:
+        return (await service.download_activity_model()).as_dict()
+    except VoiceIdentityServiceError as exc:
+        if exc.code == "enrollment_active":
+            return JSONResponse({"error_code": exc.code}, status_code=409)
+        return _service_error(exc)
+
+
 @router.put("/enrollment/segment")
 async def submit_voice_identity_enrollment_segment(request: Request):
     rejected = _validate_mutation(request)

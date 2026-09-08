@@ -22,6 +22,7 @@ from main_logic.asr_client.speaker_verifier_contracts import (
 from main_logic.asr_client.provider_state_diagnostics import speaker_installation_trace
 from main_logic.asr_client.speaker_shadow.campplus import CampPlusEmbeddingModel
 from main_logic.voice_identity.profile import SpeakerProfile
+from main_logic.voice_identity.pvad.assets import EcapaDownload
 from main_logic.voice_identity_service.asr_composition import (
     OwnerVoiceAsrCompositionFactory,
 )
@@ -1255,6 +1256,7 @@ def install_voice_identity_runtime(config_manager) -> VoiceIdentityService:
         runtime_status_callback=registry.activation_status,
         activation_transaction=registry,
         speech_validator_factory=SileroEnrollmentSpeechValidator,
+        activity_models=EcapaDownload(local_state_dir / "models" / "ecapa"),
         enrollment_noise_reduction_enabled=(
             load_global_conversation_settings().get(
                 "noiseReductionEnabled",
