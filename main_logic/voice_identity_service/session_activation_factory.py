@@ -26,6 +26,7 @@ class OwnerVoiceSessionActivationFactory:
         *,
         activation_generation: str,
         enforce: bool,
+        noise_reduction_enabled: bool | None = None,
         config: VoiceSessionActivationRuntimeConfig | None = None,
     ) -> None:
         del runtime_owner
@@ -35,9 +36,15 @@ class OwnerVoiceSessionActivationFactory:
             raise ValueError("activation_generation must be a non-empty string")
         if type(enforce) is not bool:
             raise TypeError("enforce must be bool")
+        if (
+            noise_reduction_enabled is not None
+            and type(noise_reduction_enabled) is not bool
+        ):
+            raise TypeError("noise_reduction_enabled must be bool or None")
         self._profile = copy.copy(profile)
         self._activation_generation = activation_generation
         self._enforce = enforce
+        self._noise_reduction_enabled = noise_reduction_enabled
         self._config = config
         self._lock = threading.Lock()
         self._scorer_generation = 0
@@ -46,6 +53,10 @@ class OwnerVoiceSessionActivationFactory:
     @property
     def activation_generation(self) -> str:
         return self._activation_generation
+
+    @property
+    def noise_reduction_enabled(self) -> bool | None:
+        return self._noise_reduction_enabled
 
     def create(
         self,

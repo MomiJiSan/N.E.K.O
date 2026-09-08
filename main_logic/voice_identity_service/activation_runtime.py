@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+import logging
 import math
 
 from main_logic.voice_input.activation import (
@@ -27,6 +28,9 @@ from .activation_scoring import (
 
 ActivationOutput = Callable[[AudioFrame], Awaitable[OutputCommit]]
 ActivationStatusCallback = Callable[[ActivationDecision], None]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,12 +83,17 @@ class VoiceSessionActivationRuntime:
         self._controller = controller or VoiceActivationController()
         self._config = config or VoiceSessionActivationRuntimeConfig()
         self._status_callback = status_callback
+        self._status_callback_failure_logged = False
         self._enabled = enabled
         self._lock = asyncio.Lock()
         self._verification_task: asyncio.Task[None] | None = None
         self._output_task: asyncio.Task[None] | None = None
         self._output_retry_requested = False
         self._idle_task: asyncio.Task[None] | None = None
+        self._close_completion: asyncio.Future[None] | None = None
+        self._close_recovery_task: asyncio.Task[None] | None = None
+        self._shutdown_tasks: tuple[asyncio.Task[None], ...] = ()
+        self._scorer_close_complete = False
         self._closed = False
         self._candidate_start_sequence: int | None = None
         self._candidate_start_sample: int | None = None
@@ -159,26 +168,75 @@ class VoiceSessionActivationRuntime:
             return self._publish(decision)
 
     async def close(self) -> None:
+        completion = self._close_completion
+        if completion is not None:
+            await asyncio.shield(completion)
+            return
+
+        completion = asyncio.get_running_loop().create_future()
+        self._close_completion = completion
+        try:
+            await self._close()
+        except asyncio.CancelledError:
+            self._close_recovery_task = asyncio.create_task(
+                self._recover_close(completion),
+                name="voice-session-activation-close-recovery",
+            )
+            raise
+        except BaseException as error:
+            completion.set_exception(error)
+            completion.exception()
+            raise
+        else:
+            completion.set_result(None)
+
+    async def _recover_close(self, completion: asyncio.Future[None]) -> None:
+        try:
+            await self._close()
+        except BaseException as error:
+            completion.set_exception(error)
+            completion.exception()
+            try:
+                logger.warning("Voice activation cleanup recovery failed")
+            except Exception:
+                pass
+        else:
+            completion.set_result(None)
+
+    async def _close(self) -> None:
         async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._publish(self._controller.close())
-            verification_task = self._verification_task
-            output_task = self._output_task
-            idle_task = self._idle_task
-        for task in (verification_task, output_task, idle_task):
-            if task is not None and not task.done():
+            if not self._closed:
+                self._closed = True
+                self._publish(self._controller.close())
+                self._shutdown_tasks = tuple(
+                    task
+                    for task in (
+                        self._verification_task,
+                        self._output_task,
+                        self._idle_task,
+                    )
+                    if task is not None
+                )
+            shutdown_tasks = self._shutdown_tasks
+        for task in shutdown_tasks:
+            if not task.done():
                 task.cancel()
-        await self._scorer.close()
+        close_error: BaseException | None = None
+        if not self._scorer_close_complete:
+            try:
+                await self._scorer.close()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                close_error = error
+            else:
+                self._scorer_close_complete = True
         await self._join_tasks(
-            tuple(
-                task
-                for task in (verification_task, output_task, idle_task)
-                if task is not None
-            ),
+            shutdown_tasks,
             timeout_seconds=self._config.shutdown_timeout_seconds,
         )
+        if close_error is not None:
+            raise close_error
 
     def _advance_candidate(
         self,
@@ -331,6 +389,8 @@ class VoiceSessionActivationRuntime:
             except Exception:
                 commit = OutputCommit.UNKNOWN
             async with self._lock:
+                if self._closed:
+                    return
                 decision = self._controller.complete_output(lease, commit)
                 self._publish(decision)
                 self._ensure_idle_task_locked()
@@ -390,7 +450,15 @@ class VoiceSessionActivationRuntime:
 
     def _publish(self, decision: ActivationDecision) -> ActivationDecision:
         if self._status_callback is not None:
-            self._status_callback(decision)
+            try:
+                self._status_callback(decision)
+            except Exception:
+                if not self._status_callback_failure_logged:
+                    self._status_callback_failure_logged = True
+                    try:
+                        logger.warning("Voice activation status callback failed")
+                    except Exception:
+                        pass
         return decision
 
     @classmethod

@@ -154,6 +154,18 @@ class _IgnoringCloseBackend(_BlockingBackend):
         self.closed = True
 
 
+class _BlockingCloseBackend(_Backend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = Event()
+        self.release_close = Event()
+
+    def close(self) -> None:
+        self.close_started.set()
+        self.release_close.wait(timeout=1.0)
+        super().close()
+
+
 class _SpawnBackend:
     def __init__(
         self,
@@ -293,6 +305,31 @@ async def test_cancelled_score_releases_backend_before_propagating() -> None:
         await task
     assert backend.closed is True
     assert scorer._active_task is None
+    await scorer.close()
+    profile.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waits_for_real_scorer_cleanup_before_propagating() -> None:
+    profile = _profile()
+    backend = _BlockingCloseBackend()
+    scorer = CampPlusActivationScorer(
+        profile,
+        scorer_generation=1,
+        backend_factory=lambda: backend,
+    )
+    closing = asyncio.create_task(scorer.close())
+    assert await asyncio.to_thread(backend.close_started.wait, 1.0)
+
+    closing.cancel()
+    backend.release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1.0)
+
+    assert scorer.closed is True
+    assert backend.closed is True
+    assert scorer._close_task is not None
+    assert scorer._close_task.done()
     await scorer.close()
     profile.close()
 
