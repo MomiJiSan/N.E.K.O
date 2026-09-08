@@ -127,6 +127,11 @@ def test_voice_identity_template_is_an_accessible_four_segment_enrollment_flow()
     assert 'data-neko-window-control="pin"' in template
     assert 'id="voice-identity-start"' in template
     assert 'data-i18n="voiceIdentity.enrollAndEnable"' in template
+    enrollment = template[
+        template.index('id="voice-identity-enrollment"') : template.index('id="voice-identity-short-speech"')
+    ]
+    assert 'id="voice-identity-reenroll"' in enrollment
+    assert 'id="voice-identity-tse-enroll"' not in template
     assert 'id="voice-identity-capture-status" hidden' in template
     assert 'id="voice-identity-profile-controls"' in template
     assert 'aria-labelledby="voice-filter-title"' in template

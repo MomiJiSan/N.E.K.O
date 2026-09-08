@@ -109,7 +109,7 @@
             tseSize: 'voice-identity-tse-size', tseSource: 'voice-identity-tse-source',
             tseProgress: 'voice-identity-tse-progress', tseError: 'voice-identity-tse-error',
             tseDownload: 'voice-identity-tse-download', tseImport: 'voice-identity-tse-import',
-            tseFile: 'voice-identity-tse-file', tseEnroll: 'voice-identity-tse-enroll',
+            tseFile: 'voice-identity-tse-file',
             tseEnabled: 'voice-identity-tse-enabled', tseRestart: 'voice-identity-tse-restart',
             statusDot: 'voice-identity-status-dot', profileStatus: 'voice-identity-profile-status',
             enrollment: 'voice-identity-enrollment', captureStatus: 'voice-identity-capture-status',
@@ -468,9 +468,9 @@
         }
     }
     function renderProfile() {
-        const enrollmentVisible = !state.profileAvailable || state.busy || state.cancelPending || Boolean(state.enrollmentId);
-        elements.enrollment.hidden = !enrollmentVisible;
-        elements.profileControls.hidden = !state.profileAvailable || enrollmentVisible;
+        const enrollmentActive = state.busy || state.cancelPending || Boolean(state.enrollmentId);
+        elements.enrollment.hidden = false;
+        elements.profileControls.hidden = !state.profileAvailable || enrollmentActive;
         elements.statusDot.className = 'status-dot';
         if (state.effectiveEnabled) elements.statusDot.classList.add('ready');
         else if (state.profileAvailable) elements.statusDot.classList.add('warning');
@@ -484,6 +484,7 @@
             : translate('voiceIdentity.enrollAndEnable', '录入并启用声纹');
         elements.cancel.hidden = !state.busy && !state.cancelPending && !state.enrollmentId;
         elements.cancel.disabled = state.cancelPending;
+        elements.reenroll.hidden = !state.profileAvailable || enrollmentActive;
         elements.reenroll.disabled = pending || unavailable;
         elements.delete.disabled = pending;
         if (!state.filterPending) elements.filter.checked = state.requestedEnabled;
@@ -611,14 +612,14 @@
         elements.tseSource.hidden = !status || model.source_configured !== false || ready;
         elements.tseProgress.hidden = model.state !== 'downloading';
         elements.tseProgress.value = total > 0 ? Math.min(100, downloaded * 100 / total) : 0;
-        elements.tseDownload.hidden = ready;
-        elements.tseDownload.disabled = pending || model.can_download !== true;
-        elements.tseDownload.textContent = failed ? tseText('retry', '重试下载') : tseText('download', '下载 TSE 模型');
+        elements.tseDownload.hidden = false;
+        elements.tseDownload.disabled = pending || ready || model.can_download !== true;
+        elements.tseDownload.textContent = ready
+            ? tseText('modelReady', '已安装')
+            : (failed ? tseText('retry', '重试下载') : tseText('download', '下载 TSE 模型'));
         elements.tseImport.hidden = ready;
         elements.tseImport.disabled = pending || model.can_import !== true;
         elements.tseFile.disabled = elements.tseImport.disabled;
-        elements.tseEnroll.hidden = !ready || status?.reference_ready === true;
-        elements.tseEnroll.disabled = pending || ['model_unavailable', 'secure_storage_unavailable'].includes(state.effectiveReason);
         elements.tseEnabled.checked = status?.enabled === true;
         // Disabling an already enabled feature remains possible when its resource/reference is unavailable.
         elements.tseEnabled.disabled = pending || !status || (!status.enabled && (status.can_enable === false || !ready || !status.reference_ready));
@@ -725,7 +726,7 @@
         } else if (status.profile_ready) {
             elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaProfileReady', '短语音声纹已就绪；开启 Owner 声纹过滤后即可使用。');
         } else if (ready) {
-            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaNeedsEnrollment', '增强模型已安装。请重新录入声纹，完成最后一步设置。');
+            elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaNeedsEnrollment', '增强模型已就绪。请重新录入声纹，完成最后一步设置。');
         } else if (status.state === 'failed') {
             elements.ecapaStatus.textContent = translate('voiceIdentity.ecapaFailed', '增强模型下载或检查失败，请重试。普通声纹识别仍可使用。');
         } else {
@@ -1251,7 +1252,6 @@
         });
         if (elements.tseFile) elements.tseFile.addEventListener('change', importTse);
         if (elements.tseEnabled) elements.tseEnabled.addEventListener('change', updateTse);
-        if (elements.tseEnroll) elements.tseEnroll.addEventListener('click', startEnrollment);
         elements.start.addEventListener('click', startEnrollment);
         elements.reenroll.addEventListener('click', startEnrollment);
         elements.cancel.addEventListener('click', () => cancelEnrollment().catch(function () {}));

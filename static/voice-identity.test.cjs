@@ -205,7 +205,6 @@ function createHarness({
         'voice-identity-tse-download',
         'voice-identity-tse-import',
         'voice-identity-tse-file',
-        'voice-identity-tse-enroll',
         'voice-identity-tse-enabled',
         'voice-identity-tse-restart',
     ];
@@ -835,7 +834,6 @@ test('TSE download distinguishes full transfer, verification, installation and m
         assert.equal(harness.elements.get('voice-identity-tse-enabled').checked, false);
         assert.equal(harness.elements.get('voice-identity-tse-enabled').disabled, true);
         assert.equal(harness.elements.get('voice-identity-tse-progress').hidden, modelState !== 'downloading');
-        assert.equal(harness.elements.get('voice-identity-tse-enroll').hidden, modelState !== 'ready');
         assert.equal(harness.elements.get('voice-identity-start').disabled, modelState !== 'ready');
     }
     assert.match(harness.elements.get('voice-identity-tse-model-status').textContent, /已安装/);
@@ -1021,7 +1019,9 @@ test('an old TSE response cannot overwrite a profile changed in another window',
     harness.dispatch('focus'); await flush();
     gate.resolve(); await pending;
     assert.match(harness.elements.get('voice-identity-tse-reference-status').textContent, /准备好/);
-    assert.equal(harness.elements.get('voice-identity-tse-download').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-tse-download').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-tse-download').disabled, true);
+    assert.match(harness.elements.get('voice-identity-tse-download').textContent, /已安装/);
 });
 
 test('TSE polling pauses when hidden and shares one status request with ECAPA', async () => {
@@ -1134,7 +1134,7 @@ test('ECAPA card reports optional download state and reaches ready by bounded po
     assert.equal(progress.hidden, true);
     assert.match(
         harness.elements.get('voice-identity-ecapa-status').textContent,
-        /增强模型已安装/,
+        /重新录入声纹/,
     );
     assert.equal(harness.timeoutCount, 0);
 });
@@ -2207,11 +2207,13 @@ test('microphone denial prevents enrollment start and reports a useful error', a
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Microphone unavailable.');
 });
 
-test('canonical has_profile reveals only switch, re-enroll, and delete controls', async () => {
+test('canonical has_profile keeps re-enrollment inside the four-part recording card', async () => {
     const harness = createHarness({ initialProfile: true, initialRequested: true });
     await harness.initialize();
 
-    assert.equal(harness.elements.get('voice-identity-enrollment').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-enrollment').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-start').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-reenroll').hidden, false);
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
     assert.equal(harness.elements.get('voice-identity-filter').checked, true);
     assert.equal(harness.elements.get('voice-identity-profile-status').textContent,
