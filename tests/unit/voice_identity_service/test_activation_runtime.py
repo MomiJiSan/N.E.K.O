@@ -216,6 +216,219 @@ async def test_close_is_bounded_when_output_swallows_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_cleans_up_when_closed_status_callback_raises(caplog) -> None:
+    sensitive_detail = "private transcript and score"
+    published: list[ActivationState] = []
+    sent: list[int] = []
+
+    class CountingScorer(_Scorer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    def status_callback(decision) -> None:
+        published.append(decision.state)
+        if decision.state is ActivationState.CLOSED:
+            raise RuntimeError(sensitive_detail)
+
+    async def output(frame: AudioFrame) -> OutputCommit:
+        sent.append(frame.sequence)
+        return OutputCommit.TRANSPORT_WRITTEN
+
+    scorer = CountingScorer()
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        scorer,  # type: ignore[arg-type]
+        output,
+        controller=VoiceActivationController(clock=lambda: 1.5),
+        status_callback=status_callback,
+    )
+    await runtime.prepare()
+    for sequence in range(15):
+        await runtime.feed(_frame(sequence), voice_activity=True)
+    await _settle(runtime)
+    idle_task = runtime._idle_task
+    assert idle_task is not None and not idle_task.done()
+
+    await runtime.close()
+    sent_at_close = list(sent)
+    await runtime.close()
+    await runtime.feed(_frame(15), voice_activity=True)
+
+    assert runtime.state is ActivationState.CLOSED
+    assert published.count(ActivationState.CLOSED) >= 1
+    assert scorer.closed is True
+    assert scorer.close_calls == 1
+    assert idle_task.done()
+    assert sent == sent_at_close
+    assert sensitive_detail not in caplog.text
+    assert caplog.text.count("Voice activation status callback failed") == 1
+
+
+@pytest.mark.asyncio
+async def test_non_close_status_callback_exception_does_not_break_runtime() -> None:
+    def status_callback(decision) -> None:
+        if decision.state is ActivationState.WAITING:
+            raise RuntimeError("status observer unavailable")
+
+    scorer = _Scorer()
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        scorer,  # type: ignore[arg-type]
+        AsyncMock(return_value=OutputCommit.TRANSPORT_WRITTEN),
+        status_callback=status_callback,
+    )
+
+    decision = await runtime.prepare()
+
+    assert decision.state is ActivationState.WAITING
+    await runtime.close()
+    assert scorer.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_caller_does_not_cancel_shared_cleanup() -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class BlockingCloseScorer(_Scorer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            close_started.set()
+            await release_close.wait()
+            self.closed = True
+
+    scorer = BlockingCloseScorer()
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        scorer,  # type: ignore[arg-type]
+        AsyncMock(return_value=OutputCommit.TRANSPORT_WRITTEN),
+    )
+    await runtime.prepare()
+
+    interrupted_caller = asyncio.create_task(runtime.close())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    interrupted_caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await interrupted_caller
+
+    assert runtime.state is ActivationState.CLOSED
+    assert scorer.closed is False
+    release_close.set()
+    await asyncio.wait_for(runtime.close(), timeout=1)
+
+    assert scorer.closed is True
+    assert scorer.close_calls == 2
+    assert runtime._close_completion is not None
+    assert runtime._close_completion.done()
+    assert runtime._close_recovery_task is not None
+    assert runtime._close_recovery_task.done()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_during_task_join_resumes_without_reclosing_scorer() -> None:
+    output_started = asyncio.Event()
+    release_output = asyncio.Event()
+    scorer_closed = asyncio.Event()
+
+    class SignallingScorer(_Scorer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+            scorer_closed.set()
+
+    async def output(_frame: AudioFrame) -> OutputCommit:
+        output_started.set()
+        while not release_output.is_set():
+            try:
+                await release_output.wait()
+            except asyncio.CancelledError:
+                continue
+        return OutputCommit.NOT_SENT
+
+    scorer = SignallingScorer()
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        scorer,  # type: ignore[arg-type]
+        output,
+        controller=VoiceActivationController(clock=lambda: 1.5),
+        config=VoiceSessionActivationRuntimeConfig(shutdown_timeout_seconds=1),
+    )
+    await runtime.prepare()
+    for sequence in range(15):
+        await runtime.feed(_frame(sequence), voice_activity=True)
+    await asyncio.wait_for(output_started.wait(), timeout=1)
+
+    interrupted_caller = asyncio.create_task(runtime.close())
+    await asyncio.wait_for(scorer_closed.wait(), timeout=1)
+    await asyncio.sleep(0)
+    interrupted_caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await interrupted_caller
+
+    release_output.set()
+    await asyncio.wait_for(runtime.close(), timeout=1)
+
+    assert scorer.closed is True
+    assert scorer.close_calls == 1
+    assert runtime._output_task is not None
+    assert runtime._output_task.done()
+
+
+@pytest.mark.asyncio
+async def test_late_cancel_ignoring_output_cannot_publish_after_close() -> None:
+    output_started = asyncio.Event()
+    release_output = asyncio.Event()
+    published: list[tuple[ActivationState, str]] = []
+
+    async def output(_frame: AudioFrame) -> OutputCommit:
+        output_started.set()
+        while not release_output.is_set():
+            try:
+                await release_output.wait()
+            except asyncio.CancelledError:
+                continue
+        return OutputCommit.NOT_SENT
+
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        _Scorer(),  # type: ignore[arg-type]
+        output,
+        controller=VoiceActivationController(clock=lambda: 1.5),
+        config=VoiceSessionActivationRuntimeConfig(shutdown_timeout_seconds=0.01),
+        status_callback=lambda decision: published.append(
+            (decision.state, decision.reason)
+        ),
+    )
+    await runtime.prepare()
+    for sequence in range(15):
+        await runtime.feed(_frame(sequence), voice_activity=True)
+    await asyncio.wait_for(output_started.wait(), timeout=1)
+
+    await asyncio.wait_for(runtime.close(), timeout=0.2)
+    published_at_close = list(published)
+    output_task = runtime._output_task
+    assert output_task is not None
+    release_output.set()
+    await asyncio.wait_for(output_task, timeout=1)
+
+    assert runtime.state is ActivationState.CLOSED
+    assert published == published_at_close
+
+
+@pytest.mark.asyncio
 async def test_short_waiting_audio_does_not_leave_the_process() -> None:
     sent: list[AudioFrame] = []
 

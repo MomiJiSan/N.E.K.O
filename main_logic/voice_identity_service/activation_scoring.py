@@ -123,6 +123,7 @@ class CampPlusActivationScorer:
         self._closed = False
         self._loaded = False
         self._cleanup_started = False
+        self._close_task: asyncio.Task[None] | None = None
         self._active_task: asyncio.Task[object] | None = None
         self._local_close_task: asyncio.Task[object] | None = None
         self._host_start_task: asyncio.Task[_BackendProcessHost] | None = None
@@ -205,10 +206,28 @@ class CampPlusActivationScorer:
     async def close(self) -> None:
         self._closed = True
         self._loaded = False
-        if self._cleanup_started:
-            await self._wait_for_background_cleanup()
-            return
-        self._cleanup_started = True
+        close_task = self._close_task
+        if close_task is None:
+            self._cleanup_started = True
+            close_task = asyncio.create_task(
+                self._finish_close_cleanup(),
+                name="voice-activation-scorer-close",
+            )
+            self._close_task = close_task
+        cancellation: asyncio.CancelledError | None = None
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as error:
+                if close_task.cancelled():
+                    raise
+                if cancellation is None:
+                    cancellation = error
+        await close_task
+        if cancellation is not None:
+            raise cancellation
+
+    async def _finish_close_cleanup(self) -> None:
         start_task = self._host_start_task
         if start_task is None:
             self._close_process_factory()
