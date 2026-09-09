@@ -813,6 +813,123 @@ async def test_startup_profile_failure_blocks_actual_core_downstream_routes(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route_mode", ["native", "independent"])
+@pytest.mark.parametrize("initial_nr", [True, False])
+async def test_failed_dsp_construction_blocks_pcm_until_successful_retry(
+    monkeypatch, route_mode: str, initial_nr: bool,
+) -> None:
+    import main_logic.core.asr_runtime as core_runtime
+    import main_routers.config_router.preferences as preferences
+    from main_logic.voice_input.activation import ActivationState
+    from tests.unit.test_core_independent_asr import _CoreActivationFactory, _Runtime
+
+    # Use real Core, Registry and settings sequencing. Only model inference and
+    # the pipeline constructor failure are injected.
+    def factory_for(_manager, _profile, *, activation_generation, enforce,
+                    noise_reduction_enabled=None):
+        factory = _CoreActivationFactory()
+        factory.activation_generation = activation_generation
+        factory.noise_reduction_enabled = noise_reduction_enabled
+        return factory
+
+    monkeypatch.setattr(runtime_module, "OwnerVoiceSessionActivationFactory", factory_for)
+    runtime = _Runtime()
+    runtime.is_active = True
+    runtime._set_microphone_route(route_mode)
+    runtime.session.stream_audio = AsyncMock()
+    runtime._asr_runtime.submit = AsyncMock(
+        return_value=AsrSubmitResult(AsrSubmitStatus.ACCEPTED),
+    )
+    await runtime.apply_voice_input_noise_reduction(initial_nr)
+    original = runtime._voice_input_audio_pipeline
+    registry = OwnerVoiceRuntimeRegistry(enforce=True)
+    await registry.register_manager(runtime)
+    profile = _profile("profile")
+    reconciled: list[VoiceIdentityActivationResult] = []
+    requested_nr = not initial_nr
+
+    async def prepare(enabled: bool) -> bool:
+        assert enabled is requested_nr
+        return bool(await registry.activate(
+            None, "dsp-transition", activation_required=True,
+        ))
+
+    async def reconcile(enabled: bool, *, runtime_ready: bool) -> None:
+        assert runtime_ready is True
+        reconciled.append(await registry.activate(
+            profile, "new-authority", activation_required=True,
+            noise_reduction_enabled=enabled, allow_partial=True,
+        ))
+
+    monkeypatch.setattr(preferences, "get_session_manager", lambda: {"test": runtime})
+    monkeypatch.setattr(
+        preferences, "aload_global_conversation_settings_snapshot",
+        AsyncMock(return_value=SimpleNamespace(
+            settings={"noiseReductionEnabled": requested_nr},
+        )),
+    )
+    preferences.configure_voice_identity_audio_contract_callbacks(
+        prepare=prepare, reconcile=reconcile,
+    )
+    try:
+        assert await registry.activate(
+            profile, "old-authority", activation_required=True,
+            noise_reduction_enabled=initial_nr,
+        )
+        with monkeypatch.context() as failing:
+            from unittest.mock import Mock
+
+            failing.setattr(
+                core_runtime, "VoiceInputAudioPipeline",
+                Mock(side_effect=RuntimeError("pipeline construction failed")),
+            )
+            await preferences._apply_noise_reduction_if_current(requested_nr)
+
+        assert reconciled == [VoiceIdentityActivationResult.RUNTIME_DEGRADED]
+        assert runtime._voice_input_audio_pipeline is original
+        assert runtime._voice_input_noise_reduction_enabled is initial_nr
+        assert runtime._voice_session_activation_required is True
+        assert runtime._voice_session_activation_factory is None
+        assert runtime in registry._attach_pending
+        # More than a full activation checkpoint must still produce no output.
+        for _ in range(20):
+            await runtime._route_microphone_audio(
+                b"\xd0\x07" * 1_600, sample_rate_hz=16_000,
+            )
+        runtime.session.stream_audio.assert_not_awaited()
+        runtime._asr_runtime.submit.assert_not_awaited()
+        assert runtime._voice_session_activation_runtime is None
+
+        # The same persisted preference can be retried; reopening starts with
+        # empty evidence rather than forwarding any PCM seen during failure.
+        await preferences._apply_noise_reduction_if_current(requested_nr)
+        assert reconciled[-1] is VoiceIdentityActivationResult.READY
+        assert runtime._voice_input_audio_pipeline.nr_enabled is requested_nr
+        assert runtime._voice_input_noise_reduction_enabled is requested_nr
+        assert runtime not in registry._attach_pending
+        with pytest.raises(RuntimeError, match="VOICE_AUDIO_PIPELINE_CLOSED"):
+            await original.process(b"\x01\x00" * 160, sample_rate_hz=16_000)
+        await runtime._route_microphone_audio(
+            bytes(320), sample_rate_hz=16_000,
+        )
+        await _wait_until(lambda: (
+            runtime._voice_session_activation_runtime is not None
+            and runtime._voice_session_activation_runtime.state is ActivationState.WAITING
+        ))
+        factory = runtime._voice_session_activation_factory
+        assert factory.scorers[0].calls == 0
+        runtime.session.stream_audio.assert_not_awaited()
+        runtime._asr_runtime.submit.assert_not_awaited()
+    finally:
+        preferences.configure_voice_identity_audio_contract_callbacks()
+        await registry.close()
+        profile.close()
+        await runtime._voice_input_audio_pipeline.close()
+        await asyncio.gather(*runtime._core_asr_cleanup_tasks, return_exceptions=True)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_dsp_reconcile_restores_ready_manager_and_keeps_mismatch_blocked() -> None:
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,

@@ -1916,12 +1916,14 @@ class AsrRuntimeMixin:
         async with self._voice_input_pipeline_transition_lock:
             if not core_start_is_current():
                 return
-            self._voice_input_noise_reduction_enabled = nr_enabled
             if self._voice_input_audio_pipeline.nr_enabled != nr_enabled:
                 pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
                     self,
                     nr_enabled=nr_enabled,
                 )
+            # Publish the DSP contract only after replacement succeeds. A
+            # constructor failure leaves both the old pipeline and its contract.
+            self._voice_input_noise_reduction_enabled = nr_enabled
         if pipeline_cleanup is not None:
             await asyncio.shield(pipeline_cleanup)
             if not core_start_is_current():
@@ -2385,8 +2387,8 @@ class AsrRuntimeMixin:
 
         async def transition() -> bool:
             async with transition_lock:
-                self._voice_input_noise_reduction_enabled = nr_enabled
                 if self._voice_input_audio_pipeline.nr_enabled == nr_enabled:
+                    self._voice_input_noise_reduction_enabled = nr_enabled
                     return False
                 pipeline_cleanup = (
                     AsrRuntimeMixin._replace_voice_input_audio_pipeline(
@@ -2394,6 +2396,9 @@ class AsrRuntimeMixin:
                         nr_enabled=nr_enabled,
                     )
                 )
+                # Registry/PCM gates read this field as the installed contract,
+                # never as intent. Keep the old value if construction fails.
+                self._voice_input_noise_reduction_enabled = nr_enabled
             await asyncio.shield(pipeline_cleanup)
             return True
 
