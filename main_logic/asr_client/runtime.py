@@ -2745,9 +2745,19 @@ class IndependentAsrRuntime:
                     and owned != preserve_prefix and lifecycle.prefix_protected
                     and lifecycle.pending_connect_bytes):
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
-            self._asr_protected_prefix = preserve_prefix
             if owned != preserve_prefix:
-                lifecycle.protect_unsent_prefix()
+                try:
+                    lifecycle.protect_unsent_prefix()
+                except RuntimeError as exc:
+                    if str(exc) != "ASR_PROTECTED_PREFIX_OVERFLOW":
+                        raise
+                    await self._handle_independent_asr_error(
+                        identity.session_epoch, identity.provider or "unknown",
+                        status_code=self._protected_delivery_failure_code(),
+                        expected_identity=identity,
+                    )
+                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+            self._asr_protected_prefix = preserve_prefix
         if lifecycle.prefix_protected and not await self._wait_for_prefix_capacity(
             lifecycle, ingress_token, len(frame.pcm16),
         ):
