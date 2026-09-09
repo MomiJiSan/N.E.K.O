@@ -17,9 +17,11 @@ from main_logic.voice_identity_service.registry import (
 )
 from main_logic.voice_identity_service.service import VoiceIdentityServiceError
 from main_routers.system_router import _validate_local_mutation_request
+from utils.logger_config import get_module_logger
 
 
 router = APIRouter(prefix="/api/voice-identity", tags=["voice-identity"])
+logger = get_module_logger(__name__)
 _ENROLLMENT_HEADER = "X-Voice-Identity-Enrollment"
 _PROFILE_HEADER = "X-Voice-Identity-Profile"
 _SEGMENT_HEADER = "X-Voice-Identity-Segment"
@@ -236,10 +238,17 @@ async def set_voice_identity_filter(request: Request):
     if service is None:
         return _service_unavailable()
     try:
+        logger.info("Voice identity filter change requested enabled=%s", enabled)
         status = await service.set_filter(enabled)
     except VoiceIdentityServiceError as exc:
+        logger.warning("Voice identity filter change failed enabled=%s", enabled)
         return _service_error(exc)
-    return status.as_dict()
+    payload = status.as_dict()
+    logger.info(
+        "Voice identity filter change completed requested=%s effective=%s",
+        payload.get("requested_enabled"), payload.get("effective_enabled"),
+    )
+    return payload
 
 
 @router.delete("/profile")

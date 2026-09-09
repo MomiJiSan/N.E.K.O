@@ -41,6 +41,7 @@ class OutputCommit(str, Enum):
     """Known delivery state after a writer attempts one output lease."""
 
     NOT_SENT = "not_sent"
+    LOCAL_ACCEPTED = "local_accepted"
     TRANSPORT_WRITTEN = "transport_written"
     PROVIDER_CONFIRMED = "provider_confirmed"
     UNKNOWN = "unknown"

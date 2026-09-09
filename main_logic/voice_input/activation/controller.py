@@ -118,6 +118,20 @@ class VoiceActivationController:
     def verification_queued(self) -> bool:
         return self._queued_candidate is not None
 
+    @property
+    def last_voice_at(self) -> float | None:
+        return self._latest_voice_at
+
+    @property
+    def idle_deadline(self) -> float | None:
+        if self._latest_voice_at is None:
+            return None
+        return self._latest_voice_at + self._config.idle_timeout_seconds
+
+    def monotonic_now(self) -> float:
+        """Use the same clock for all local qualification decisions."""
+        return self._clock()
+
     def start(
         self,
         generation: ActivationGeneration,
@@ -204,12 +218,16 @@ class VoiceActivationController:
                 return self._decision("output_backlog_overflow")
             return self._decision("bypass_frame")
 
-        if self._state is ActivationState.ACTIVE and self._idle_expired(
-            frame.captured_at
-        ):
+        if self._state in {
+            ActivationState.ACTIVE,
+            ActivationState.REPLAYING,
+        } and self._idle_expired(frame.captured_at):
             self._state = ActivationState.WAITING
             self._latest_voice_at = None
             self._replay_cutoff_sequence = None
+            # Existing output leases remain authorized. Their source frames
+            # must not become pre-roll for a later, separate activation.
+            self._buffer.clear()
 
         if self._state is ActivationState.ACTIVE:
             if voice_activity:
@@ -261,6 +279,8 @@ class VoiceActivationController:
         self,
         request: VerificationRequest,
         result: VerificationResultKind,
+        *,
+        now: float | None = None,
     ) -> ActivationDecision:
         """Commit a verifier result only if its complete authority is current."""
 
@@ -287,7 +307,7 @@ class VoiceActivationController:
                 else "verification_insufficient"
             )
 
-        now = self._clock()
+        now = self._clock() if now is None else now
         if self._latest_voice_at is None or self._idle_expired(now):
             self._state = ActivationState.WAITING
             self._queued_candidate = None
@@ -353,7 +373,7 @@ class VoiceActivationController:
     def tick(self, now: float | None = None) -> ActivationDecision:
         """Apply the 30-second inactivity rule using a monotonic timestamp."""
 
-        if self._state is not ActivationState.ACTIVE:
+        if self._state not in {ActivationState.ACTIVE, ActivationState.REPLAYING}:
             return self._decision("tick_ignored")
         current = self._clock() if now is None else float(now)
         if not self._idle_expired(current):
@@ -361,6 +381,7 @@ class VoiceActivationController:
         self._state = ActivationState.WAITING
         self._latest_voice_at = None
         self._replay_cutoff_sequence = None
+        self._buffer.clear()
         return self._decision("idle_timeout")
 
     def claim_output(self) -> OutputLease | None:
@@ -386,6 +407,8 @@ class VoiceActivationController:
         self,
         lease: OutputLease,
         commit: OutputCommit,
+        *,
+        now: float | None = None,
     ) -> ActivationDecision:
         """Advance only the exact claimed frame with a known send outcome."""
 
@@ -397,6 +420,13 @@ class VoiceActivationController:
         if commit is OutputCommit.UNKNOWN:
             self._fail_closed("output_delivery_unknown")
             return self._decision("output_delivery_unknown")
+        if commit not in {
+            OutputCommit.LOCAL_ACCEPTED,
+            OutputCommit.TRANSPORT_WRITTEN,
+            OutputCommit.PROVIDER_CONFIRMED,
+        }:
+            self._fail_closed("output_delivery_invalid")
+            return self._decision("output_delivery_invalid")
 
         queued = self._output.popleft()
         self._output_bytes -= len(queued.frame.pcm)
@@ -404,11 +434,11 @@ class VoiceActivationController:
             self._state = ActivationState.ACTIVE
             self._buffer.clear()
             self._replay_cutoff_sequence = None
-            if self._idle_expired(self._clock()):
+            if self._idle_expired(self._clock() if now is None else now):
                 self._state = ActivationState.WAITING
                 self._latest_voice_at = None
                 return self._decision("idle_timeout_after_replay")
-            return self._decision("replay_complete")
+            return self._decision("replay_handed_off")
         return self._decision("output_committed")
 
     def close(self) -> ActivationDecision:
