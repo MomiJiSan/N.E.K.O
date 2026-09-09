@@ -1674,6 +1674,68 @@ async def test_filter_toggle_delete_and_completion_retry(tmp_path: Path) -> None
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_profile", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_enrollment_completion_preserves_latest_explicit_filter_choice(
+    tmp_path: Path, has_profile: bool, enabled: bool,
+) -> None:
+    service, _model, activations, _events = _service(tmp_path)
+    await service.initialize()
+    try:
+        if has_profile:
+            first = await service.start_enrollment()
+            await service.complete_enrollment(first.enrollment_id, "old", _pcm())
+            await service.set_filter(not enabled)
+        enrollment = await service.start_enrollment()
+        for index in range(1, 4):
+            await service.submit_enrollment_segment(
+                enrollment.enrollment_id, "new", index, _pcm(),
+            )
+        # The active enrollment survives a page reload/retry. A filter request
+        # can arrive before its last segment is committed.
+        await service.set_filter(enabled)
+        status = await service.submit_enrollment_segment(
+            enrollment.enrollment_id, "new", 4, _verification_pcm(),
+        )
+        assert status.profile_generation == "new"
+        assert status.state.requested_enabled is enabled
+        assert status.state.effective_enabled is enabled
+        assert await service._preference_store.aload() is enabled
+        if enabled:
+            assert activations[-1][1] == "new"
+        else:
+            assert activations[-1][0] is None
+    finally:
+        await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_failed_filter_save_does_not_replace_enrollment_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+    try:
+        enrollment = await service.start_enrollment()
+
+        async def fail_save(_enabled):
+            raise VoiceIdentityPreferenceStoreError("cannot save")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(service._preference_store, "asave", fail_save)
+            with pytest.raises(VoiceIdentityServiceError, match="runtime_degraded"):
+                await service.set_filter(False)
+        status = await service.complete_enrollment(enrollment.enrollment_id, "new", _pcm())
+        assert status.state.requested_enabled
+        assert status.state.effective_enabled
+        assert await service._preference_store.aload()
+    finally:
+        await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_status_stays_valid_while_filter_disable_detaches(
     tmp_path: Path,
 ) -> None:

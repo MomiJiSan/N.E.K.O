@@ -63,6 +63,24 @@ def test_unconfirmed_window_keeps_existing_rolling_semantics():
     assert lifecycle.metrics.buffer_overflow_count == 1
 
 
+def test_prefix_promotion_overflow_preserves_uncommitted_state():
+    lifecycle = _lifecycle()
+    pre_roll = b"\x01\x00" * 160
+    pending = bytes(lifecycle.prefix_capacity_bytes)
+    # Inject the capacity failure at this ownership boundary without changing
+    # production budgets or mocking the promotion implementation.
+    lifecycle._pre_roll.append(pre_roll)
+    lifecycle._pending_connect.append(pending)
+
+    with pytest.raises(RuntimeError, match="^ASR_PROTECTED_PREFIX_OVERFLOW$"):
+        lifecycle.protect_unsent_prefix()
+
+    assert not lifecycle.prefix_protected
+    assert lifecycle._pre_roll.peek() == pre_roll
+    assert lifecycle._pending_connect.peek() == pending
+    assert lifecycle.metrics.buffer_overflow_count == 0
+
+
 def _cold_runtime():
     runtime = _Runtime()
     lifecycle = _lifecycle()
@@ -179,6 +197,29 @@ async def test_oversized_protected_frame_fails_without_detector_or_partial_accep
         assert result.status is AsrSubmitStatus.UNAVAILABLE
         assert detector.feed.await_count == 0
         assert lifecycle.pending_connect_bytes == 0
+        assert sessions == []
+    finally:
+        await _close(runtime)
+
+
+@pytest.mark.asyncio
+async def test_prefix_promotion_overflow_returns_failure_and_retires_input():
+    runtime, lifecycle, detector, token, prefix, _, ready, sessions = _cold_runtime()
+    lifecycle._pre_roll.append(b"\x01\x00" * 160)
+    lifecycle._pending_connect.append(bytes(lifecycle.prefix_capacity_bytes))
+    try:
+        result = await runtime._asr_runtime.submit(
+            ProcessedVoiceFrame(bytes(320), 16000, .9, True),
+            ingress_token=token, preserve_prefix=prefix,
+        )
+        assert result.status is AsrSubmitStatus.UNAVAILABLE
+        assert getattr(runtime._asr_runtime, "_asr_protected_prefix", None) is None
+        assert runtime._asr_lifecycle is None
+        assert not lifecycle.prefix_protected
+        assert lifecycle.pending_connect_bytes == lifecycle.pre_roll_bytes == 0
+        assert detector.feed.await_count == 0
+        ready.set()
+        await asyncio.sleep(0)
         assert sessions == []
     finally:
         await _close(runtime)
