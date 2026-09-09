@@ -2882,9 +2882,11 @@ async def test_hot_swap_lifecycle_guards_close_and_promote_with_voice_barrier() 
     )
 
     barrier = source.index("async with core_voice_session_lock")
-    close = source.index("await old_main_session.close()")
-    promote = source.index("self.session = new_session")
-    assert barrier < close < promote
+    close = source.index("old_main_session.close()", barrier)
+    promote = source.index("self.session = new_session", close)
+    barrier_exit = source.index("if not _promote_allowed", promote)
+    assert barrier < close < promote < barrier_exit
+    assert "asyncio.timeout_at" in source[barrier:promote]
 
 
 async def test_final_transcript_is_dropped_when_the_route_leaves_core_mid_restore() -> None:
@@ -6310,7 +6312,9 @@ async def test_adopted_restart_cancellation_fails_closed_and_propagates(
     await asyncio.wait_for(prepare_started.wait(), 1)
     assert component._asr_session is sessions[1]
 
-    restarting.cancel()
+    # Authoritative cancellation targets the shared owner, not one waiter.
+    assert component._asr_transport_task is not None
+    component._asr_transport_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await restarting
     while component._asr_close_tasks:
@@ -8323,8 +8327,7 @@ async def test_stale_connect_failure_cannot_fail_new_generation() -> None:
     candidate.connect = AsyncMock(side_effect=connect)
     runtime._asr_session_factory = MagicMock(return_value=candidate)
     runtime._asr_transport_selection = _selection("qwen")
-    old_restart = asyncio.create_task(runtime._restart_transport())
-    runtime._asr_transport_task = old_restart
+    old_restart = runtime._asr_runtime._ensure_transport_restart_task()
     await asyncio.wait_for(started.wait(), 1)
 
     new_session, new_lifecycle, new_detector = _install_replacement_runtime_generation(
@@ -10161,10 +10164,10 @@ async def test_transport_restart_task_failure_is_logged(caplog) -> None:
     runtime = _Runtime()
     component = runtime._asr_runtime
 
-    async def failing_restart() -> None:
+    async def failing_restart(_operation) -> None:
         raise RuntimeError("restart boom")
 
-    component._restart_transport = failing_restart
+    component._run_transport_connect_operation = failing_restart
     with caplog.at_level(logging.ERROR, logger="main_logic.asr_client._infra"):
         component._ensure_transport_restart_task()
         task = component._asr_transport_task

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
+import logging
 import math
 from pathlib import Path
 from typing import Protocol
@@ -19,6 +20,9 @@ from main_logic.asr_client.speaker_shadow.campplus import (
     CAMPPLUS_EMBEDDING_DIM,
     CampPlusBackendFactory,
 )
+from main_logic.asr_client.speaker_shadow.contracts import (
+    MAX_SPEAKER_BACKEND_PCM_BYTES,
+)
 from main_logic.asr_client.speaker_shadow.runtime import (
     _BackendHostError,
     _BackendHostTimeout,
@@ -26,6 +30,9 @@ from main_logic.asr_client.speaker_shadow.runtime import (
 )
 from main_logic.voice_identity.contracts import SpeakerModelIdentity
 from main_logic.voice_identity.profile import SpeakerProfile
+
+
+logger = logging.getLogger(__name__)
 
 
 class ActivationScoreStatus(StrEnum):
@@ -181,6 +188,7 @@ class CampPlusActivationScorer:
             not isinstance(pcm16, bytes)
             or not pcm16
             or len(pcm16) % 2
+            or len(pcm16) > MAX_SPEAKER_BACKEND_PCM_BYTES
             or sample_rate_hz != CAMPPLUS_SAMPLE_RATE_HZ
         ):
             return ActivationScoreResult(identity, ActivationScoreStatus.INVALID_AUDIO)
@@ -327,7 +335,31 @@ class CampPlusActivationScorer:
             return ActivationScoreStatus.CLOSED, None
         except (ValueError, TypeError):
             return ActivationScoreStatus.INVALID_AUDIO, None
-        except _BackendHostError:
+        except _BackendHostError as error:
+            # Only fixed host identities cross into logs. Backend exception
+            # messages, PCM, embeddings and similarity scores must stay private.
+            reason = {
+                "candidate PCM exceeds host buffer": "candidate_pcm_exceeds_host_buffer",
+                "backend host PCM buffer is closed": "pcm_buffer_closed",
+                "backend host is not alive": "host_not_alive",
+                "backend host command failed": "command_failed",
+                "backend host exited without a response": "host_exited",
+                "backend host response failed": "response_failed",
+            }.get(str(error), "backend_operation_failed")
+            pcm_bytes = (
+                len(args[0])
+                if operation == "score" and args and isinstance(args[0], bytes)
+                else 0
+            )
+            logger.warning(
+                "Voice activation backend failed: operation=%s reason=%s "
+                "pcm_bytes=%s limit_bytes=%s host_alive=%s",
+                operation,
+                reason,
+                pcm_bytes,
+                MAX_SPEAKER_BACKEND_PCM_BYTES,
+                host.alive,
+            )
             return ActivationScoreStatus.FAILED, None
 
     async def _ensure_process_host(
@@ -345,6 +377,7 @@ class CampPlusActivationScorer:
                 _BackendProcessHost.create_started,
                 factory=factory,
                 terminate_timeout_seconds=self._shutdown_timeout_seconds,
+                max_pcm_bytes=MAX_SPEAKER_BACKEND_PCM_BYTES,
             )
         )
         self._host_start_task = start_task
