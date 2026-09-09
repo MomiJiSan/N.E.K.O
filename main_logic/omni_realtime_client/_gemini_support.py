@@ -284,6 +284,11 @@ class _GeminiMixin:
         if self._fatal_error_occurred:
             return
         self.note_user_turn_started()
+        voice_handoff_input_sequence = getattr(
+            self,
+            "_voice_handoff_input_sequence",
+            0,
+        )
         # This commit is the turn boundary for both providers below. Read the
         # owner NOW so frames streamed while the commit is in flight cannot move
         # it, but only pin it once the boundary actually reached the provider:
@@ -306,6 +311,9 @@ class _GeminiMixin:
                     self._fatal_error_occurred = True
                 return
             self._apply_input_route_identity_commit(pending_route_identity)
+            self._note_voice_handoff_input_boundary(
+                expected_sequence=voice_handoff_input_sequence
+            )
             return
         # The committed buffer excludes the ~21ms tail soxr still holds in the
         # uplink resampler; drop it so it isn't prepended to the next turn.
@@ -327,6 +335,9 @@ class _GeminiMixin:
         )
         await ticket.sent
         self._apply_input_route_identity_commit(pending_route_identity)
+        self._note_voice_handoff_input_boundary(
+            expected_sequence=voice_handoff_input_sequence
+        )
 
     async def _gemini_send_user_turn(
         self,
@@ -901,6 +912,11 @@ class _GeminiMixin:
                     self._turn_epoch += 1
                     self._current_turn_epoch = self._turn_epoch
                     self._current_turn_host_id = self._read_host_turn_id()
+                    self._voice_handoff_response_input_sequence = getattr(
+                        self,
+                        "_voice_handoff_input_sequence",
+                        0,
+                    )
                     if _is_new_turn and _can_clear_interrupted:
                         # 新回合开始就说明旧回合已经收场：欠账作废，免得旧回合
                         # 永不终结时把下一条**合法**终结也吃掉，让 token 永远结算
@@ -1053,6 +1069,22 @@ class _GeminiMixin:
                         )
                     if not was_interrupted:
                         settle_event_outcome()
+                    if (
+                        not was_interrupted
+                        and self._turn_epoch == self._current_turn_epoch
+                        and event_owner_is_current()
+                    ):
+                        # Gemini has no speech_stopped event.  Its owned
+                        # turn_complete closes the native-input marker, while a
+                        # successor SOS/turn epoch keeps a late terminal from
+                        # clearing the new utterance.
+                        self._note_voice_handoff_input_boundary(
+                            expected_sequence=getattr(
+                                self,
+                                "_voice_handoff_response_input_sequence",
+                                0,
+                            )
+                        )
                     if self._skip_until_next_response:
                         self._skip_until_next_response = False
                         logger.info("Gemini: skipped response (prime_context priming)")
