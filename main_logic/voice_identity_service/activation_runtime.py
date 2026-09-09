@@ -89,6 +89,12 @@ class VoiceSessionActivationRuntime:
         self._verification_task: asyncio.Task[None] | None = None
         self._output_task: asyncio.Task[None] | None = None
         self._output_retry_requested = False
+        self._output_pause_owner: object | None = None
+        self._output_resumed_owner: object | None = None
+        self._output_failure_reason: str | None = None
+        self._capture_progress_provider: Callable[[], float | None] | None = None
+        self._capture_blocked_since: float | None = None
+        self._capture_progress_failure: ActivationDecision | None = None
         self._idle_task: asyncio.Task[None] | None = None
         self._close_completion: asyncio.Future[None] | None = None
         self._close_recovery_task: asyncio.Task[None] | None = None
@@ -110,6 +116,159 @@ class VoiceSessionActivationRuntime:
     def generation(self) -> ActivationGeneration:
         return self._generation
 
+    @property
+    def pending_output_bytes(self) -> int:
+        return self._controller.pending_output_bytes
+
+    @property
+    def verification_inflight(self) -> bool:
+        return self._controller.verification_inflight
+
+    @property
+    def last_voice_at(self) -> float | None:
+        return self._controller.last_voice_at
+
+    @property
+    def idle_deadline(self) -> float | None:
+        return self._controller.idle_deadline
+
+    @property
+    def output_inflight(self) -> bool:
+        return self._output_task is not None and not self._output_task.done()
+
+    @property
+    def output_paused(self) -> bool:
+        return self._output_pause_owner is not None
+
+    def set_capture_progress_provider(
+        self, callback: Callable[[], float | None]
+    ) -> None:
+        """Read the oldest input still awaiting local capture-ordered processing."""
+        if not callable(callback):
+            raise TypeError("capture progress provider must be callable")
+        self._capture_progress_provider = callback
+
+    async def pause_output(self, owner: object, *, deadline: float) -> bool:
+        """Stop new claims, then settle the existing writer outside the lock.
+
+        Cancellation/timeout leaves the barrier owned by the caller. It never
+        cancels an uncertain network write or implicitly rolls it back.
+        """
+        if owner is None or not math.isfinite(deadline):
+            raise ValueError("valid output owner and deadline required")
+        async with self._lock:
+            if self._closed or self.state in {
+                ActivationState.DISABLED,
+                ActivationState.CLOSED,
+                ActivationState.UNAVAILABLE,
+            }:
+                return False
+            if (
+                self._output_pause_owner is not None
+                and self._output_pause_owner is not owner
+            ):
+                return False
+            self._output_pause_owner = owner
+            self._output_resumed_owner = None
+            task = self._output_task
+        if task is not None and not task.done():
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if not done:
+                return False
+            self._consume_task_result(task)
+        async with self._lock:
+            return (
+                not self._closed
+                and self._output_pause_owner is owner
+                and self.state
+                not in {ActivationState.UNAVAILABLE, ActivationState.CLOSED}
+                and not self.output_inflight
+                and asyncio.get_running_loop().time() <= deadline
+            )
+
+    async def resume_output(self, owner: object) -> bool:
+        async with self._lock:
+            if (
+                owner is None
+                or self._output_pause_owner is not owner
+                or self._closed
+                or self.output_inflight
+                or self.state in {ActivationState.UNAVAILABLE, ActivationState.CLOSED}
+            ):
+                return False
+            self._output_pause_owner = None
+            self._output_resumed_owner = owner
+            self._ensure_output_task_locked()
+            return True
+
+    def complete_output_handoff(self, owner: object) -> bool:
+        """Release a successful Core ticket in the same event-loop commit step."""
+        if (
+            owner is None
+            or self._closed
+            or self._output_pause_owner is not None
+            or self._output_resumed_owner is not owner
+        ):
+            return False
+        self._output_resumed_owner = None
+        return True
+
+    async def fail_output(self, owner: object, reason: str) -> None:
+        async with self._lock:
+            if (
+                owner is None
+                or self._closed
+                or not (
+                    self._output_pause_owner is owner
+                    or (
+                        self._output_pause_owner is None
+                        and self._output_resumed_owner is owner
+                    )
+                )
+            ):
+                return
+            # Core may discover an expired/revoked ticket immediately after
+            # resume. Keep that exact owner revocable until its final commit,
+            # without granting older tickets authority over the next pause.
+            self._output_pause_owner = owner
+            self._output_resumed_owner = None
+            self._output_failure_reason = reason or "output_handoff_failed"
+            self._publish(
+                self._controller.mark_unavailable(
+                    self._generation, self._output_failure_reason
+                )
+            )
+
+    def _qualification_now_locked(self, now: float | None = None) -> float:
+        self._capture_progress_failure = None
+        current = self._controller.monotonic_now() if now is None else float(now)
+        provider = self._capture_progress_provider
+        deadline = self._controller.idle_deadline
+        if provider is None or deadline is None:
+            self._capture_blocked_since = None
+            return current
+        try:
+            pending = provider()
+            if pending is not None and not math.isfinite(pending):
+                raise ValueError("invalid capture watermark")
+        except Exception:
+            self._capture_progress_failure = self._controller.mark_unavailable(
+                self._generation, "capture_progress_invalid"
+            )
+            return current
+        if pending is None or pending >= deadline or current < deadline:
+            self._capture_blocked_since = None
+            return current
+        if self._capture_blocked_since is None:
+            self._capture_blocked_since = current
+        if current - self._capture_blocked_since >= 5.0:
+            self._capture_progress_failure = self._controller.mark_unavailable(
+                self._generation, "capture_progress_timeout"
+            )
+            return current
+        return min(current, pending)
+
     async def prepare(self) -> ActivationDecision:
         if not self._enabled:
             return self._publish(self._controller.disable())
@@ -117,6 +276,12 @@ class VoiceSessionActivationRuntime:
         async with self._lock:
             if self._closed:
                 return self._publish(self._controller.close())
+            if self._output_failure_reason is not None:
+                return self._publish(
+                    self._controller.mark_unavailable(
+                        self._generation, self._output_failure_reason
+                    )
+                )
             if status is ActivationScoreStatus.READY:
                 return self._publish(self._controller.mark_ready(self._generation))
             return self._publish(
@@ -162,7 +327,8 @@ class VoiceSessionActivationRuntime:
 
     async def tick(self, *, now: float | None = None) -> ActivationDecision:
         async with self._lock:
-            decision = self._controller.tick(now)
+            current = self._qualification_now_locked(now)
+            decision = self._capture_progress_failure or self._controller.tick(current)
             if decision.state is ActivationState.WAITING:
                 self._clear_candidate()
             return self._publish(decision)
@@ -207,6 +373,8 @@ class VoiceSessionActivationRuntime:
         async with self._lock:
             if not self._closed:
                 self._closed = True
+                self._output_pause_owner = None
+                self._output_resumed_owner = None
                 self._publish(self._controller.close())
                 self._shutdown_tasks = tuple(
                     task
@@ -333,7 +501,23 @@ class VoiceSessionActivationRuntime:
         async with self._lock:
             if self._closed:
                 return
-            decision = self._controller.apply_verification_result(request, kind)
+            current = self._qualification_now_locked()
+            decision = (
+                self._capture_progress_failure
+                or self._controller.apply_verification_result(
+                    request, kind, now=current
+                )
+            )
+            if decision.reason == "verification_failed":
+                logger.warning(
+                    "Voice activation verification failed: status=%s request=%s "
+                    "pcm_bytes=%s sample_rate=%s audio_seconds=%.3f",
+                    score.status.value,
+                    request.request_id,
+                    len(verification_input.pcm),
+                    verification_input.sample_rate,
+                    len(verification_input.pcm) / (2 * verification_input.sample_rate),
+                )
             self._publish(decision)
             next_request = decision.verification_request
             self._ensure_output_task_locked()
@@ -343,7 +527,7 @@ class VoiceSessionActivationRuntime:
                 self._ensure_verification_task_locked(next_request)
 
     def _ensure_output_task_locked(self) -> None:
-        if self._closed:
+        if self._closed or self._output_pause_owner is not None:
             return
         task = self._output_task
         if task is not None and not task.done():
@@ -368,7 +552,8 @@ class VoiceSessionActivationRuntime:
     async def _drain_output(self) -> None:
         while True:
             async with self._lock:
-                if self._closed:
+                if self._closed or self._output_pause_owner is not None:
+                    self._output_task = None
                     return
                 lease = self._controller.claim_output()
                 if lease is None:
@@ -391,7 +576,11 @@ class VoiceSessionActivationRuntime:
             async with self._lock:
                 if self._closed:
                     return
-                decision = self._controller.complete_output(lease, commit)
+                current = self._qualification_now_locked()
+                decision = (
+                    self._capture_progress_failure
+                    or self._controller.complete_output(lease, commit, now=current)
+                )
                 self._publish(decision)
                 self._ensure_idle_task_locked()
                 if commit in {OutputCommit.NOT_SENT, OutputCommit.UNKNOWN}:
@@ -399,6 +588,7 @@ class VoiceSessionActivationRuntime:
                     if (
                         commit is OutputCommit.NOT_SENT
                         and self._output_retry_requested
+                        and self._output_pause_owner is None
                     ):
                         self._output_retry_requested = False
                         self._output_task = asyncio.create_task(
@@ -428,7 +618,10 @@ class VoiceSessionActivationRuntime:
                 async with self._lock:
                     if self._closed:
                         return
-                    decision = self._controller.tick()
+                    current_time = self._qualification_now_locked()
+                    decision = self._capture_progress_failure or self._controller.tick(
+                        current_time
+                    )
                     self._publish(decision)
                     if decision.state not in {
                         ActivationState.REPLAYING,
