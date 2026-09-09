@@ -15,6 +15,49 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("route", ["native", "independent"])
+async def test_unavailable_authority_pcm_cannot_wait_for_later_reopening(
+    route,
+):
+    async with _harness(route, active=False) as h:
+        # Hold the consumer so enqueue-time authority and later processing
+        # authority differ. Routing and activation remain production methods.
+        h.manager._ensure_audio_stream_worker = lambda: None
+        h.manager.require_voice_session_activation(activation_generation="revoked")
+        await h.manager._enqueue_audio_stream_data({"data": [2800] * 160})
+        await h.manager.set_voice_session_activation_factory(
+            h.factory, activation_generation="profile",
+        )
+        h.manager._voice_input_audio_pipeline.process = AsyncMock(
+            return_value=ProcessedVoiceFrame(b"\x01\x00" * 160, 16000, .9, True)
+        )
+
+        async def drain():
+            while not h.manager._audio_stream_queue.empty():
+                frame = h.manager._audio_stream_queue.get_nowait()
+                try:
+                    await h.manager._process_microphone_stream_data(
+                        frame.message, ingress_token=frame.token,
+                        audio_stream_epoch=frame.audio_stream_epoch,
+                        ingress_sequence=frame.ingress_sequence,
+                        received_at=frame.received_at, captured_at=frame.captured_at,
+                    )
+                finally:
+                    h.manager._audio_stream_queue.task_done()
+                    h.manager._complete_hot_swap_ingress_sequence(frame.ingress_sequence)
+
+        await drain()
+        h.manager._voice_input_audio_pipeline.process.assert_not_awaited()
+        assert len(h.factory.runtimes) == 1
+        assert not h.manager._voice_activation_pending_capture
+        assert not h.pcm
+        await h.manager._enqueue_audio_stream_data({"data": [2801] * 160})
+        await drain()
+        h.manager._voice_input_audio_pipeline.process.assert_awaited_once()
+        assert len(h.factory.runtimes) == 2
+        assert h.manager._voice_session_activation_sequence == 1
+
+
+@pytest.mark.parametrize("route", ["native", "independent"])
 async def test_dsp_await_survives_a_fully_committed_authorized_handoff(route):
     async with _harness(route) as h:
         h.manager.is_active = True

@@ -3211,6 +3211,13 @@ class AsrRuntimeMixin:
     async def _enqueue_audio_stream_data(self, message: dict) -> None:
         self._ensure_asr_runtime_state()
         if (
+            self._voice_session_activation_required
+            and self._voice_session_activation_factory is None
+        ):
+            # Revoked/unavailable authority cannot collect input for a future
+            # factory (or a later explicit disable) to adopt from this queue.
+            return
+        if (
             self._voice_input_pipeline_failed
             # The same latch the ingress worker checks, one step earlier.
             # Nothing below this line closes during the failure notice on a
