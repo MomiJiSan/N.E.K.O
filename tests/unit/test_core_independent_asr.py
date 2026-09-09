@@ -5280,6 +5280,49 @@ async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() 
     runtime._asr_runtime.close.assert_awaited_once_with()
 
 
+@pytest.mark.parametrize("initial_nr", [True, False])
+async def test_start_pipeline_construction_failure_preserves_audio_contract(
+    monkeypatch, initial_nr: bool,
+) -> None:
+    runtime = _Runtime()
+    runtime.core_api_type = "gemini"
+    runtime._close_independent_asr = AsyncMock()
+    await runtime.apply_voice_input_noise_reduction(initial_nr)
+    original = runtime._voice_input_audio_pipeline
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(return_value={
+            "independentAsrEnabled": False,
+            "noiseReductionEnabled": not initial_nr,
+        }),
+    )
+    try:
+        with monkeypatch.context() as failing:
+            failing.setattr(
+                core_asr_runtime_module,
+                "VoiceInputAudioPipeline",
+                MagicMock(side_effect=RuntimeError("pipeline construction failed")),
+            )
+            with pytest.raises(RuntimeError, match="pipeline construction failed"):
+                await runtime._start_independent_asr_if_enabled("audio")
+
+        assert runtime._voice_input_audio_pipeline is original
+        assert runtime._voice_input_noise_reduction_enabled is initial_nr
+        assert runtime._asr_route_mode == "blocked"
+        frame = await original.process(b"\x01\x00" * 160, sample_rate_hz=16_000)
+        assert frame.pcm16 == b"\x01\x00" * 160
+
+        await runtime._start_independent_asr_if_enabled("audio")
+        assert runtime._voice_input_audio_pipeline.nr_enabled is not initial_nr
+        assert runtime._voice_input_noise_reduction_enabled is not initial_nr
+        with pytest.raises(RuntimeError, match="VOICE_AUDIO_PIPELINE_CLOSED"):
+            await original.process(b"\x01\x00" * 160, sample_rate_hz=16_000)
+    finally:
+        await runtime._voice_input_audio_pipeline.close()
+        await asyncio.gather(*runtime._core_asr_cleanup_tasks, return_exceptions=True)
+
+
 async def test_stale_start_waiting_for_pipeline_lock_cannot_replace_successor(
     monkeypatch,
 ) -> None:
