@@ -1676,6 +1676,10 @@ class VoiceIdentityService:
                     raise cancellations[0]
                 raise VoiceIdentityServiceError("runtime_degraded") from exc
             self._requested_enabled = enabled
+            if self._enrollment is not None:
+                # A later explicit choice supersedes enrollment's initial
+                # intent, including the first-enrollment auto-enable default.
+                self._enrollment.requested_enabled_snapshot = enabled
             if not enabled:
                 self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
                 detached = await _await_cancellation_safe(

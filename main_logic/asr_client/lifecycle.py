@@ -281,11 +281,12 @@ class VoiceInputLifecycleController:
 
     def protect_unsent_prefix(self) -> None:
         """Protect from the first authorized frame, before detector admission."""
-        self._prefix_protected = True
         payload = self._pre_roll.peek()
         if payload:
             if self.pending_connect_bytes + len(payload) > self.prefix_capacity_bytes:
                 raise RuntimeError("ASR_PROTECTED_PREFIX_OVERFLOW")
+        self._prefix_protected = True
+        if payload:
             self._pending_connect.append(payload)
             self._pre_roll.clear()
 
