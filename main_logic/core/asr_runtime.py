@@ -378,6 +378,9 @@ class AsrRuntimeMixin:
         self._voice_activation_session_anchor: int | None = None
         self._voice_activation_handoff: _VoiceActivationHandoff | None = None
         self._voice_activation_delivery_revision = 0
+        self._voice_activation_native_retirement: (
+            tuple[object, int | None, asyncio.Task[Any]] | None
+        ) = None
         self._native_activation_idle_reconnect_identity: (
             tuple[ActivationGeneration, int | None] | None
         ) = None
@@ -2001,30 +2004,9 @@ class AsrRuntimeMixin:
         ):
             return
         if self._asr_route_mode == "native":
-            source = ticket.source_session
-            self.session_closed_by_server = True
-            close = getattr(source, "close", None)
-            if callable(close):
-                # The close task owns this source object even if a successor
-                # takes over while the transport performs its close handshake.
-                close_task = AsrRuntimeMixin._schedule_core_asr_cleanup(
-                    self, close(), name="voice-activation-unsafe-native-close"
-                )
-                done, _ = await asyncio.wait({close_task}, timeout=1.0)
-                if not done:
-                    close_task.cancel()
-            recover = getattr(self, "handle_connection_error", None)
-            if callable(recover) and getattr(self, "session", None) is source:
-                # Use the existing classified recovery, not a new TTS/session
-                # teardown implementation. The callback fences expected_session.
-                AsrRuntimeMixin._schedule_core_asr_cleanup(
-                    self,
-                    recover(
-                        json.dumps({"code": "CHARACTER_DISCONNECTED"}),
-                        expected_session=source,
-                    ),
-                    name="voice-activation-unsafe-native-recovery",
-                )
+            await asyncio.shield(
+                self._retire_native_voice_activation_session(ticket.source_session)
+            )
         elif self._asr_route_mode == "independent":
             # abort() revokes the captured ASR transport before its first I/O
             # await; the blocked route also protects activation-disabled input.
@@ -2050,6 +2032,67 @@ class AsrRuntimeMixin:
             done, _ = await asyncio.wait({abort_task}, timeout=1.0)
             if not done:
                 abort_task.cancel()
+
+    def _retire_native_voice_activation_session(
+        self, source: object
+    ) -> asyncio.Task[Any]:
+        """Fence reuse synchronously, then retire only the captured connection."""
+        connection_generation = getattr(source, "_connection_generation", None)
+        retirement = self._voice_activation_native_retirement
+        if (
+            retirement is not None
+            and retirement[0] is source
+            and retirement[1] == connection_generation
+        ):
+            return retirement[2]
+        if getattr(self, "session", None) is source:
+            self.session_closed_by_server = True
+            # A failed write is never eligible for idle-timeout replay recovery.
+            self._native_activation_idle_reconnect_identity = None
+
+        async def retire() -> None:
+            if getattr(source, "_connection_generation", None) != connection_generation:
+                return
+            close = getattr(source, "close", None)
+            if callable(close):
+                async def close_captured_connection() -> None:
+                    # Scheduling close is another handoff: a reconnect may win
+                    # before this task starts running.
+                    if getattr(source, "_connection_generation", None) == connection_generation:
+                        await close()
+
+                close_task = AsrRuntimeMixin._schedule_core_asr_cleanup(
+                    self, close_captured_connection(), name="voice-activation-unsafe-native-close"
+                )
+                done, _ = await asyncio.wait({close_task}, timeout=1.0)
+                if not done:
+                    close_task.cancel()
+            recover = getattr(self, "handle_connection_error", None)
+            if (
+                callable(recover)
+                and getattr(self, "session", None) is source
+                and getattr(source, "_connection_generation", None) == connection_generation
+            ):
+                # Existing lifecycle recovery owns listener/TTS teardown. Its
+                # generation check also rejects a same-object reconnect while
+                # the callback is waiting for the manager lock.
+                AsrRuntimeMixin._schedule_core_asr_cleanup(
+                    self,
+                    recover(
+                        json.dumps({
+                            "code": "CHARACTER_DISCONNECTED",
+                            "details": {"connection_generation": connection_generation},
+                        }),
+                        expected_session=source,
+                    ),
+                    name="voice-activation-unsafe-native-recovery",
+                )
+
+        task = AsrRuntimeMixin._schedule_core_asr_cleanup(
+            self, retire(), name="voice-activation-unsafe-native-retire"
+        )
+        self._voice_activation_native_retirement = (source, connection_generation, task)
+        return task
 
     def _voice_activation_capture_watermark(self) -> float | None:
         return min(self._voice_activation_pending_capture.values(), default=None)
@@ -2093,6 +2136,11 @@ class AsrRuntimeMixin:
             )
         if decision.state is ActivationState.UNAVAILABLE:
             self._revoke_voice_activation_prefix(generation, decision.reason)
+            if self._asr_route_mode == "native" and decision.reason.startswith("output_"):
+                # Local output was dropped or its send outcome is unknown.
+                # The provider may still own an incomplete utterance; disabling
+                # activation must not reopen that same contaminated connection.
+                self._retire_native_voice_activation_session(self.session)
         status = (generation, decision.state, decision.reason)
         if status == self._voice_session_activation_status:
             return

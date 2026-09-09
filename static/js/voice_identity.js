@@ -454,9 +454,10 @@
     function renderProfile() {
         const enrollmentVisible = !state.profileAvailable || state.busy || state.cancelPending || Boolean(state.enrollmentId);
         elements.enrollment.hidden = !enrollmentVisible;
-        elements.profileControls.hidden = !state.profileAvailable;
+        elements.profileControls.hidden = !state.profileAvailable && !state.requestedEnabled;
         if (!state.profileAvailable) state.profileExpanded = false;
-        elements.profileDetails.hidden = !state.profileExpanded;
+        elements.profileDetails.hidden = state.profileAvailable && !state.profileExpanded;
+        elements.profileToggle.hidden = !state.profileAvailable;
         elements.profileToggle.setAttribute('aria-expanded', String(state.profileExpanded));
         elements.profileToggle.textContent = state.profileExpanded
             ? translate('common.collapse', '收起')
@@ -474,6 +475,8 @@
             : translate('voiceIdentity.enrollAndEnable', '录入并启用声纹');
         elements.cancel.hidden = !state.busy && !state.cancelPending && !state.enrollmentId;
         elements.cancel.disabled = state.cancelPending;
+        elements.reenroll.hidden = !state.profileAvailable;
+        elements.delete.hidden = !state.profileAvailable;
         elements.reenroll.disabled = pending || unavailable;
         elements.delete.disabled = pending;
         if (!state.filterPending) elements.filter.checked = state.requestedEnabled;
@@ -622,11 +625,17 @@
             };
         }
     }
-    async function ensureMicrophone() {
+    async function ensureMicrophone(nonce) {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('media_devices_unavailable');
+        const isCurrent = () => nonce === state.operationNonce && !state.closeStarted;
+        if (!isCurrent()) return false;
         let fallbackFromSelected = false;
         if (!state.mediaStream) {
             const opened = await openMicrophone();
+            if (!isCurrent()) {
+                opened.stream.getTracks().forEach(track => track.stop());
+                return false;
+            }
             state.mediaStream = opened.stream;
             fallbackFromSelected = opened.fallbackFromSelected;
         }
@@ -634,19 +643,27 @@
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
             if (!AudioContextClass || typeof AudioWorkletNode !== 'function') throw new Error('audio_worklet_unavailable');
             const context = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
+            // Publish before the module await so cancellation can close this
+            // operation's context. A late completion never adopts it again.
+            state.audioContext = context;
             try {
                 if (context.sampleRate !== TARGET_SAMPLE_RATE) throw new Error('unsupported_audio_sample_rate');
                 await context.audioWorklet.addModule('/static/audio-processor.js');
             }
-            catch (error) { await context.close(); throw error; }
-            state.audioContext = context;
+            catch (error) {
+                if (state.audioContext === context) state.audioContext = null;
+                if (context.state !== 'closed') await context.close();
+                throw error;
+            }
+            if (!isCurrent() || state.audioContext !== context) return false;
         }
         if (fallbackFromSelected) {
             try { window.localStorage.removeItem(SELECTED_MICROPHONE_STORAGE_KEY); } catch (_) {}
         }
+        return isCurrent();
     }
-    async function capturePcm16(recordingDurationMs) {
-        await ensureMicrophone();
+    async function capturePcm16(recordingDurationMs, nonce) {
+        if (!await ensureMicrophone(nonce)) throw new Error('capture_cancelled');
         const context = state.audioContext;
         const source = context.createMediaStreamSource(state.mediaStream);
         const processor = new AudioWorkletNode(context, 'audio-processor', {
@@ -661,17 +678,21 @@
         const targetSamples = TARGET_SAMPLE_RATE * captureDurationMs / 1000;
         let capturedSamples = 0;
         let finishCapture = null;
+        let timer = null;
         gain.gain.value = microphoneGain();
         mute.gain.value = 0;
         source.connect(gain); gain.connect(processor); processor.connect(mute); mute.connect(context.destination);
-        await context.resume();
-        const startedAt = performance.now();
-        const timer = window.setInterval(function () {
-            const elapsed = Math.min(recordingDurationMs, performance.now() - startedAt);
-            elements.timer.textContent = translate('voiceIdentity.recordingSeconds', `${(elapsed / 1000).toFixed(1)} 秒`, { seconds: (elapsed / 1000).toFixed(1) });
-            renderEnrollment();
-        }, 100);
         try {
+            await context.resume();
+            if (nonce !== state.operationNonce || state.closeStarted || state.audioContext !== context) {
+                throw new Error('capture_cancelled');
+            }
+            const startedAt = performance.now();
+            timer = window.setInterval(function () {
+                const elapsed = Math.min(recordingDurationMs, performance.now() - startedAt);
+                elements.timer.textContent = translate('voiceIdentity.recordingSeconds', `${(elapsed / 1000).toFixed(1)} 秒`, { seconds: (elapsed / 1000).toFixed(1) });
+                renderEnrollment();
+            }, 100);
             await new Promise(function (resolve, reject) {
                 let settled = false;
                 const timeoutId = window.setTimeout(function () { finishCapture(new Error('incomplete_capture')); }, captureDurationMs + CAPTURE_TIMEOUT_GRACE_MS);
@@ -702,12 +723,12 @@
             }
             return pcm.buffer;
         } finally {
-            state.captureAbort = null;
-            window.clearInterval(timer);
+            if (state.captureAbort === finishCapture) state.captureAbort = null;
+            if (timer !== null) window.clearInterval(timer);
             processor.port.onmessage = null;
             if (typeof processor.port.close === 'function') processor.port.close();
             processor.disconnect(); source.disconnect(); gain.disconnect(); mute.disconnect();
-            elements.timer.textContent = '';
+            if (nonce === state.operationNonce) elements.timer.textContent = '';
             for (const chunk of chunks) chunk.fill(0);
         }
     }
@@ -810,7 +831,7 @@
         try {
             const recordingDurationMs = index === REQUIRED_SEGMENTS
                 ? VERIFICATION_RECORDING_MS : REFERENCE_RECORDING_MS;
-            pcm = await capturePcm16(recordingDurationMs);
+            pcm = await capturePcm16(recordingDurationMs, nonce);
             if (nonce !== state.operationNonce) return 'stale';
             state.recording = false; state.saving = true;
             state.enrollmentPhase = index === 3 ? 'checking_consistency' : (index === 4 ? 'verifying' : 'collecting_reference');
@@ -863,7 +884,9 @@
             return 'continue';
         } finally {
             if (pcm) new Uint8Array(pcm).fill(0);
-            state.recording = false; state.saving = false; render();
+            if (nonce === state.operationNonce) {
+                state.recording = false; state.saving = false; render();
+            }
         }
     }
     async function startEnrollment() {
@@ -874,7 +897,7 @@
         let settleStart = null;
         state.busy = true; setMessage(''); render();
         try {
-            await ensureMicrophone();
+            if (!await ensureMicrophone(nonce)) return;
             if (nonce !== state.operationNonce || state.closeStarted) return;
             if (!state.enrollmentId) {
                 state.profileId = createProfileId();
