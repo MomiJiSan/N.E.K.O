@@ -138,6 +138,8 @@ function createHarness({
     startError,
     startTransportErrorAfterCreate = false,
     mediaGate,
+    workletGate,
+    resumeGate,
     mediaError,
     audioChunks = null,
     manualAudio = false,
@@ -425,6 +427,7 @@ function createHarness({
             this.audioWorklet = {
                 addModule: async url => {
                     workletModules.push(url);
+                    if (workletGate) await workletGate.promise;
                 },
             };
         }
@@ -445,6 +448,8 @@ function createHarness({
         }
 
         async resume() {
+            if (resumeGate) await resumeGate.promise;
+            if (this.state === 'closed') throw new Error('audio_context_closed');
             this.state = 'running';
         }
 
@@ -604,7 +609,8 @@ function createHarness({
                 async getUserMedia(constraints) {
                     mediaRequests += 1;
                     mediaRequestConstraints.push(constraints);
-                    if (mediaGate) await mediaGate.promise;
+                    const gate = typeof mediaGate === 'function' ? mediaGate(mediaRequests) : mediaGate;
+                    if (gate) await gate.promise;
                     const currentMediaError = typeof mediaError === 'function'
                         ? mediaError(mediaRequests) : mediaError;
                     if (currentMediaError) throw currentMediaError;
@@ -750,6 +756,84 @@ test('mutation controls stay disabled until CSRF and canonical status resolve', 
 
     assert.equal(harness.elements.get('voice-identity-start').disabled, false);
 });
+
+for (const reason of ['profile_incompatible', 'secure_storage_unavailable', 'no_profile']) {
+    test(`${reason} without a loaded profile still allows explicitly disabling activation`, async () => {
+        const h = createHarness({ initialRequested: true, initialEffectiveReason: reason });
+        await h.initialize();
+        assert.equal(h.elements.get('voice-identity-profile-controls').hidden, false);
+        assert.equal(h.elements.get('voice-identity-profile-details').hidden, false);
+        assert.equal(h.elements.get('voice-identity-filter').disabled, false);
+        assert.equal(h.elements.get('voice-identity-reenroll').hidden, true);
+        assert.equal(h.elements.get('voice-identity-delete').hidden, true);
+        h.elements.get('voice-identity-filter').checked = false;
+        await h.emit('voice-identity-filter', 'change');
+        const request = h.fetchCalls.find(call => call.url === `${API_ROOT}/filter`);
+        assert.deepEqual(JSON.parse(request.options.body), { enabled: false });
+        assert.equal(h.elements.get('voice-identity-filter').checked, false);
+        assert.equal(h.elements.get('voice-identity-profile-controls').hidden, true);
+    });
+}
+
+for (const closing of [false, true]) {
+    test(`late microphone permission is released after ${closing ? 'window close' : 'cancel'}`, async () => {
+        const mediaGate = deferred();
+        const h = createHarness({ mediaGate });
+        await h.initialize();
+        const starting = h.emit('voice-identity-start');
+        await flush(2);
+        if (closing) await h.beforeClose();
+        else await h.emit('voice-identity-cancel');
+        mediaGate.resolve();
+        await starting;
+        assert.equal(h.mediaStreams.length, 1);
+        assert.equal(h.mediaStreams[0].track.stopped, true);
+        assert.equal(h.getAudioContext(), null);
+        assert.equal(h.fetchCalls.some(call => call.url.endsWith('/enrollment/start')), false);
+    });
+}
+
+test('late cancelled permission cannot replace or stop a successor microphone', async () => {
+    const oldGate = deferred();
+    const h = createHarness({ mediaGate: request => request === 1 ? oldGate : null, manualPreparation: true });
+    await h.initialize();
+    const oldStart = h.emit('voice-identity-start');
+    await flush(2);
+    await h.emit('voice-identity-cancel');
+    const successor = h.emit('voice-identity-start');
+    await flush(4);
+    const successorStream = h.mediaStreams[0];
+    const successorContext = h.getAudioContext();
+    oldGate.resolve();
+    await oldStart;
+    assert.equal(h.mediaStreams[1].track.stopped, true);
+    assert.equal(successorStream.track.stopped, false);
+    assert.equal(h.getAudioContext(), successorContext);
+    assert.notEqual(successorContext.state, 'closed');
+    assert.equal(h.elements.get('voice-identity-start').hidden, true);
+    await h.emit('voice-identity-cancel');
+    await successor;
+});
+
+for (const stage of ['worklet', 'resume']) {
+    test(`cancellation while awaiting ${stage} releases owned audio resources`, async () => {
+        const gate = deferred();
+        const h = createHarness(stage === 'worklet' ? { workletGate: gate } : { resumeGate: gate });
+        await h.initialize();
+        const starting = h.emit('voice-identity-start');
+        await flush(4);
+        const context = h.getAudioContext();
+        await h.emit('voice-identity-cancel');
+        assert.equal(context.state, 'closed');
+        gate.resolve();
+        await starting;
+        assert.equal(h.mediaStreams.every(stream => stream.track.stopped), true);
+        assert.equal(h.workletNodes.every(node => node.disconnected && node.port.closed), true);
+        assert.equal(h.fetchCalls.some(call => call.url.endsWith('/enrollment/segment')), false);
+        assert.equal(h.intervalCount, 0);
+        assert.equal(h.timeoutCount, 0);
+    });
+}
 
 test('active enrollment shows deterministic reference prompts and a dedicated verification prompt', async () => {
     const prompts = [];
