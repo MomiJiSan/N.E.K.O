@@ -143,7 +143,9 @@ async def test_native_close_queued_before_reconnect_cannot_close_new_generation(
         source._connection_generation = 1
         source.close = AsyncMock()
         h.manager.handle_connection_error = AsyncMock()
-        retirement = h.manager._retire_native_voice_activation_session(source)
+        retirement = h.manager._retire_native_voice_activation_session(
+            source, connection_generation=1
+        )
         # Run the retirement until it queues close; take over before close runs.
         await asyncio.sleep(0)
         source._connection_generation = 2
