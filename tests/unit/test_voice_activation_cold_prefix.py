@@ -257,7 +257,9 @@ class _HeldGate(_Gate):
 
     def feed(self, pcm):
         self.entered.set()
-        self.release.wait(timeout=2)
+        # The harness releases this barrier before joining the detector, even
+        # on failure. A wall-clock fallback would silently lift backpressure.
+        self.release.wait()
         return super().feed(pcm)
 
 
@@ -265,15 +267,37 @@ class _HeldGate(_Gate):
 @pytest.mark.parametrize("stalled", [False, True])
 async def test_manual_detector_capacity_wait_resumes_or_fails_bounded(monkeypatch, stalled):
     gate = _HeldGate()
-    if stalled:
-        monkeypatch.setattr("main_logic.asr_client.runtime._READY_TIMEOUT_SECONDS", .03)
+    capacity_waiting, resume_wait = asyncio.Event(), asyncio.Event()
     try:
         async with _cold_harness("manual", gate=gate) as h:
+            detector = h.manager._asr_detector
+            wait_capacity = detector.wait_audio_capacity
+
+            async def controlled_wait(pcm16, *, sample_rate_hz, deadline):
+                if detector.queued_audio_ms == 1000:
+                    # The first dequeue can precede entry into the physical
+                    # gate; let that slot settle before observing saturation.
+                    await _until(gate.entered.is_set)
+                if detector.queued_audio_ms == 1000:
+                    capacity_waiting.set()
+                    await resume_wait.wait()
+                    if stalled:
+                        # Expire the real queue wait only after its full state
+                        # has been observed; CI scheduling must not erase the
+                        # detector before the precondition is asserted.
+                        deadline = asyncio.get_running_loop().time()
+                return await wait_capacity(
+                    pcm16, sample_rate_hz=sample_rate_hz, deadline=deadline,
+                )
+
+            monkeypatch.setattr(detector, "wait_audio_capacity", controlled_wait)
             frames = [await _feed(h, marker, samples=320) for marker in range(1, 76)]
             await _until(lambda: gate.entered.is_set())
             activation = h.factory.runtimes[0]
-            await _until(lambda: h.manager._asr_detector.queued_audio_ms == 1000)
+            await _until(capacity_waiting.is_set)
+            assert detector.queued_audio_ms == 1000
             assert activation.pending_output_bytes > 0
+            resume_wait.set()
             if stalled:
                 await _until(lambda: activation.state in {
                     ActivationState.UNAVAILABLE, ActivationState.CLOSED,
@@ -292,4 +316,5 @@ async def test_manual_detector_capacity_wait_resumes_or_fails_bounded(monkeypatc
                 assert h.lifecycle.metrics.detector_overflow_count == 0
             gate.release.set()
     finally:
+        resume_wait.set()
         gate.release.set()
