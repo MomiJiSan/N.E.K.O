@@ -3039,6 +3039,23 @@ class IndependentAsrRuntime:
                 return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
             asr_session = self._asr_session
             if asr_session is None or not getattr(asr_session, "is_ready", True):
+                if preserve_prefix is not None or lifecycle.prefix_protected:
+                    # ACTIVE audio was neither buffered nor enqueued. A restart
+                    # cannot acknowledge this frame, and earlier writes may be
+                    # uncertain. End protected delivery through the existing
+                    # fenced failure path instead of silently dropping its tail.
+                    failure_task = self._schedule_owned_cleanup(
+                        self._handle_independent_asr_error(
+                            identity.session_epoch, identity.provider or "unknown",
+                            status_code=self._protected_delivery_failure_code(),
+                            expected_identity=identity,
+                        ),
+                        name="asr-protected-not-ready-failure",
+                    )
+                    # The callback revokes activation and cancels this writer;
+                    # it must still finish status delivery and resource cleanup.
+                    await asyncio.shield(failure_task)
+                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
                 self._ensure_transport_restart_task()
                 return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
             protect_delivery = getattr(asr_session, "protect_audio_delivery", None)
