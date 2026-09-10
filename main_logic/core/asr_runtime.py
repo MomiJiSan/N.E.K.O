@@ -378,6 +378,9 @@ class AsrRuntimeMixin:
         self._voice_activation_session_anchor: int | None = None
         self._voice_activation_handoff: _VoiceActivationHandoff | None = None
         self._voice_activation_delivery_revision = 0
+        self._voice_activation_native_output_identity: (
+            tuple[ActivationGeneration, object, int | None] | None
+        ) = None
         self._voice_activation_native_retirement: (
             tuple[object, int | None, asyncio.Task[Any]] | None
         ) = None
@@ -2004,9 +2007,18 @@ class AsrRuntimeMixin:
         ):
             return
         if self._asr_route_mode == "native":
-            await asyncio.shield(
-                self._retire_native_voice_activation_session(ticket.source_session)
+            identity = self._voice_activation_native_output_identity
+            if (
+                identity is None
+                or identity[0] != ticket.runtime.generation
+                or identity[1] is not ticket.source_session
+            ):
+                return
+            retirement = self._retire_native_voice_activation_session(
+                identity[1], connection_generation=identity[2]
             )
+            if retirement is not None:
+                await asyncio.shield(retirement)
         elif self._asr_route_mode == "independent":
             # abort() revokes the captured ASR transport before its first I/O
             # await; the blocked route also protects activation-disabled input.
@@ -2034,10 +2046,18 @@ class AsrRuntimeMixin:
                 abort_task.cancel()
 
     def _retire_native_voice_activation_session(
-        self, source: object
-    ) -> asyncio.Task[Any]:
+        self, source: object, *, connection_generation: int | None
+    ) -> asyncio.Task[Any] | None:
         """Fence reuse synchronously, then retire only the captured connection."""
-        connection_generation = getattr(source, "_connection_generation", None)
+        def connection_is_current() -> bool:
+            return bool(
+                source is not None
+                and getattr(self, "session", None) is source
+                and getattr(source, "_connection_generation", None) == connection_generation
+            )
+
+        if not connection_is_current():
+            return None
         retirement = self._voice_activation_native_retirement
         if (
             retirement is not None
@@ -2045,20 +2065,19 @@ class AsrRuntimeMixin:
             and retirement[1] == connection_generation
         ):
             return retirement[2]
-        if getattr(self, "session", None) is source:
-            self.session_closed_by_server = True
-            # A failed write is never eligible for idle-timeout replay recovery.
-            self._native_activation_idle_reconnect_identity = None
+        self.session_closed_by_server = True
+        # A failed write is never eligible for idle-timeout replay recovery.
+        self._native_activation_idle_reconnect_identity = None
 
         async def retire() -> None:
-            if getattr(source, "_connection_generation", None) != connection_generation:
+            if not connection_is_current():
                 return
             close = getattr(source, "close", None)
             if callable(close):
                 async def close_captured_connection() -> None:
                     # Scheduling close is another handoff: a reconnect may win
                     # before this task starts running.
-                    if getattr(source, "_connection_generation", None) == connection_generation:
+                    if connection_is_current():
                         await close()
 
                 close_task = AsrRuntimeMixin._schedule_core_asr_cleanup(
@@ -2070,8 +2089,7 @@ class AsrRuntimeMixin:
             recover = getattr(self, "handle_connection_error", None)
             if (
                 callable(recover)
-                and getattr(self, "session", None) is source
-                and getattr(source, "_connection_generation", None) == connection_generation
+                and connection_is_current()
             ):
                 # Existing lifecycle recovery owns listener/TTS teardown. Its
                 # generation check also rejects a same-object reconnect while
@@ -2140,7 +2158,11 @@ class AsrRuntimeMixin:
                 # Local output was dropped or its send outcome is unknown.
                 # The provider may still own an incomplete utterance; disabling
                 # activation must not reopen that same contaminated connection.
-                self._retire_native_voice_activation_session(self.session)
+                identity = self._voice_activation_native_output_identity
+                if identity is not None and identity[0] == generation:
+                    self._retire_native_voice_activation_session(
+                        identity[1], connection_generation=identity[2]
+                    )
         status = (generation, decision.state, decision.reason)
         if status == self._voice_session_activation_status:
             return
@@ -4017,6 +4039,17 @@ class AsrRuntimeMixin:
             )
         ):
             return OutputCommit.NOT_SENT
+        if self._asr_route_mode == "native":
+            # The activation sink has one writer. Retain its actual transport
+            # identity through completion/cancellation and backlog overflow;
+            # a later status callback must never sample a successor connection.
+            # Capture after the supported idle reconnect, before the send await.
+            source = self.session
+            self._voice_activation_native_output_identity = (
+                (generation, source, getattr(source, "_connection_generation", None))
+                if source is not None
+                else None
+            )
         committed = await self._route_microphone_audio_unfiltered(
             frame.pcm,
             sample_rate_hz=frame.sample_rate,
@@ -4233,10 +4266,13 @@ class AsrRuntimeMixin:
                 return OutputCommit.NOT_SENT
             token = ingress_token or self._capture_native_ingress_token()
             session_ref = self.session
+            connection_generation = getattr(session_ref, "_connection_generation", None)
 
             def native_send_is_current() -> bool:
                 return bool(
                     self.session is session_ref
+                    and getattr(session_ref, "_connection_generation", None)
+                    == connection_generation
                     and self._asr_route_mode == "native"
                     and token == self._capture_native_ingress_token()
                     and self._voice_lease_owner == "core"
@@ -4556,6 +4592,7 @@ class AsrRuntimeMixin:
                 ticket.watchdog.cancel()
         self._voice_activation_bound_session = None
         self._voice_activation_session_anchor = None
+        self._voice_activation_native_output_identity = None
         self._voice_activation_delivery_revision += 1
         activation_runtime = self._voice_session_activation_runtime
         if activation_runtime is not None:

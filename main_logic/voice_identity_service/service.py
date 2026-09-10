@@ -1557,7 +1557,9 @@ class VoiceIdentityService:
                     runtime_ready=runtime_ready,
                 )
             finally:
-                self._runtime_audio_contract_transition_pending = False
+                # A failed DSP transition did not commit a new contract. Keep
+                # same-value reconciliation retryable after resources recover.
+                self._runtime_audio_contract_transition_pending = not runtime_ready
 
     async def _update_runtime_noise_reduction_enabled_locked(
         self,
@@ -1566,22 +1568,22 @@ class VoiceIdentityService:
         runtime_ready: bool,
     ) -> VoiceIdentityServiceStatus:
         self._require_initialized()
+        if not runtime_ready:
+            if self._requested_enabled:
+                await self._activate(None, str(uuid.uuid4()))
+                self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+            else:
+                self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
+            return self.status()
         if (
             enabled is self._runtime_noise_reduction_enabled
             and not self._runtime_audio_contract_transition_pending
         ):
-            if not runtime_ready and self._requested_enabled:
-                await self._activate(None, str(uuid.uuid4()))
-                self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
             return self.status()
         self._runtime_noise_reduction_enabled = enabled
         profile = self._profile
         if not self._requested_enabled:
             self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
-            return self.status()
-        if not runtime_ready:
-            await self._activate(None, str(uuid.uuid4()))
-            self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
             return self.status()
         if profile is None:
             await self._activate(None, str(uuid.uuid4()))
