@@ -1166,16 +1166,20 @@ class _TransportMixin:
         audio_chunk: bytes,
         *,
         captured_at: float | None = None,
-    ) -> None:
+    ) -> bool | None:
         """Stream raw audio data to the API.
 
         Supports two input modes:
         - 48kHz from PC: Apply RNNoise then downsample to 16kHz
         - 16kHz from mobile: Pass through directly (no RNNoise)
+
+        ``False`` means the provider transport definitively did not accept the
+        frame. ``None`` preserves the legacy locally-buffered result for DSP or
+        resampler frames that did not produce a provider write yet.
         """
         # 检查是否已发生致命错误，如果是则直接返回
         if self._fatal_error_occurred:
-            return
+            return False
 
         audio_timeline_at = (
             float(captured_at)
@@ -1220,7 +1224,7 @@ class _TransportMixin:
 
             # Skip if RNNoise is buffering (returns empty)
             if len(audio_chunk) == 0:
-                return
+                return None
 
         audio_processor = self._audio_processor
         use_rnnoise_path = use_rnnoise_path and audio_processor is not None
@@ -1236,7 +1240,7 @@ class _TransportMixin:
         # receive-side audio/done/error events remain continuously drainable.
         async with self._ensure_turn_admission_lock():
             if self._fatal_error_occurred:
-                return
+                return False
             admitted_at = time.time()
 
             # Unified VAD update (priority: server VAD > RNNoise > RMS).
@@ -1293,14 +1297,14 @@ class _TransportMixin:
             # Gemini uses different API (16kHz, no uplink resample needed)
             if self._is_gemini:
                 await self._stream_audio_gemini(audio_chunk)
-                return
+                return True
 
             # By this point audio_chunk is always 16kHz (RNNoise-downsampled,
             # mobile-native, or hot-swap-cache replay). Upsample to the provider
             # uplink rate as the very last step (24kHz for OpenAI; no-op others).
             audio_chunk = self._resample_uplink(audio_chunk)
             if not audio_chunk:
-                return  # resampler still buffering — nothing to send this frame
+                return None  # resampler still buffering — nothing to send this frame
 
             audio_b64 = base64.b64encode(audio_chunk).decode()
 
@@ -1308,7 +1312,7 @@ class _TransportMixin:
                 "type": "input_audio_buffer.append",
                 "audio": audio_b64
             }
-            await self.send_event(
+            return await self.send_event(
                 append_event,
                 pre_send=lambda _event: self._note_voice_handoff_audio_append(
                     samples=len(audio_chunk) // 2,

@@ -327,6 +327,7 @@ class VoiceIdentityService:
         self._enrollment: _EnrollmentSession | None = None
         self._last_completed: tuple[str, str] | None = None
         self._enrollment_generation = 0
+        self._enrollment_audio_cleanup_task: asyncio.Task[None] | None = None
         self._model_load_cleanup_task: asyncio.Task[None] | None = None
         self._speech_validator_load_cleanup_task: asyncio.Task[None] | None = None
         self._model_inference_cleanup_task: asyncio.Task[None] | None = None
@@ -473,6 +474,12 @@ class VoiceIdentityService:
             self._require_initialized()
             if self._enrollment is not None:
                 return self._enrollment_status(self._enrollment)
+            cleanup_task = self._enrollment_audio_cleanup_task
+            if cleanup_task is not None:
+                if not cleanup_task.done():
+                    self._record_failure(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+                    raise VoiceIdentityServiceError("audio_processing_unavailable")
+                self._enrollment_audio_cleanup_task = None
             cleanup_task = self._model_load_cleanup_task
             if cleanup_task is not None:
                 if not cleanup_task.done():
@@ -908,17 +915,28 @@ class VoiceIdentityService:
         normalizer = self._enrollment_audio_normalizer_factory(
             session.noise_reduction_enabled_snapshot
         )
+        normalization_task = asyncio.create_task(
+            normalizer.normalize(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+                target_samples=target_samples,
+            ),
+            name="voice-identity-enrollment-audio-normalize",
+        )
         try:
-            async with asyncio.timeout(self._model_timeout_seconds):
-                normalized_pcm16 = await normalizer.normalize(
-                    pcm16,
-                    sample_rate_hz=sample_rate_hz,
-                    target_samples=target_samples,
-                )
+            normalized_pcm16 = await asyncio.wait_for(
+                asyncio.shield(normalization_task),
+                timeout=self._model_timeout_seconds,
+            )
         except TimeoutError as exc:
+            self._retain_timed_out_audio_normalization(normalization_task)
             raise EnrollmentAudioNormalizationError(
                 "audio_processing_unavailable"
             ) from exc
+        except asyncio.CancelledError:
+            if not normalization_task.done():
+                self._retain_timed_out_audio_normalization(normalization_task)
+            raise
         except EnrollmentAudioNormalizationError as exc:
             if exc.code in {"invalid_pcm", "speech_too_short"}:
                 raise EnrollmentAudioError(exc.code) from exc
@@ -2004,6 +2022,28 @@ class VoiceIdentityService:
         def clear_finished(task: asyncio.Task[None]) -> None:
             if self._model_load_cleanup_task is task:
                 self._model_load_cleanup_task = None
+
+        cleanup_task.add_done_callback(clear_finished)
+
+    def _retain_timed_out_audio_normalization(
+        self,
+        normalization_task: asyncio.Task[bytes],
+    ) -> None:
+        async def finish() -> None:
+            try:
+                await normalization_task
+            except BaseException:
+                pass
+
+        cleanup_task = asyncio.create_task(
+            finish(),
+            name="voice-identity-enrollment-audio-cleanup",
+        )
+        self._enrollment_audio_cleanup_task = cleanup_task
+
+        def clear_finished(task: asyncio.Task[None]) -> None:
+            if self._enrollment_audio_cleanup_task is task:
+                self._enrollment_audio_cleanup_task = None
 
         cleanup_task.add_done_callback(clear_finished)
 

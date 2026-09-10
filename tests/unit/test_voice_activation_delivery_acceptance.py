@@ -118,6 +118,30 @@ async def test_gemini_activation_uses_actual_send_outcome(outcome):
             assert not sent
 
 
+@pytest.mark.parametrize("receipt", [True, False], ids=["written", "not-written"])
+async def test_non_gemini_activation_uses_actual_send_receipt(receipt):
+    async with _harness("native") as h:
+        client = _make_client("openai", "gpt-4o-realtime")
+        client._audio_processor = None
+        client._connection_generation = 1
+        client.send_event = AsyncMock(return_value=receipt)
+        client.close = AsyncMock()
+        h.manager.handle_connection_error = AsyncMock()
+        h.manager.session = client
+        h.manager.session_closed_by_server = False
+
+        for index in range(15):
+            h.clock.value += 0.1
+            await h.feed(3_000 + index)
+
+        runtime = h.manager._voice_session_activation_runtime
+        expected = ActivationState.ACTIVE if receipt else ActivationState.UNAVAILABLE
+        await _until(lambda: runtime.state is expected)
+        assert client.send_event.await_count == (15 if receipt else 2)
+        if not receipt:
+            await _until(lambda: client.close.await_count == 1)
+
+
 @pytest.mark.parametrize("outcome", ["success", "closed"])
 async def test_gemini_old_send_cannot_mutate_successor_connection(outcome):
     client = _make_client("gemini", "gemini-test")

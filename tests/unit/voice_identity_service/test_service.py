@@ -324,6 +324,65 @@ async def test_segment_progress_is_server_owned_idempotent_and_profile_bound(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_enrollment_audio_timeout_detaches_cancellation_swallowing_normalizer(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _StuckAudioNormalizer:
+        def __init__(self, nr_enabled: bool) -> None:
+            self.nr_enabled = nr_enabled
+
+        async def normalize(self, *_args, **_kwargs) -> bytes:
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return _pcm()
+
+    service, _model, _activations, _events = _service(
+        tmp_path,
+        model_timeout_seconds=0.1,
+        audio_normalizer_factory=_StuckAudioNormalizer,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    submit = asyncio.create_task(
+        service.submit_enrollment_segment(
+            enrollment.enrollment_id,
+            "profile-a",
+            1,
+            _pcm(),
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        with pytest.raises(
+            VoiceIdentityServiceError,
+            match="audio_processing_unavailable",
+        ):
+            await asyncio.wait_for(asyncio.shield(submit), timeout=0.5)
+        cleanup = getattr(service, "_enrollment_audio_cleanup_task", None)
+        assert cleanup is not None and not cleanup.done()
+        with pytest.raises(
+            VoiceIdentityServiceError,
+            match="audio_processing_unavailable",
+        ):
+            await service.start_enrollment()
+    finally:
+        release.set()
+        await asyncio.gather(submit, return_exceptions=True)
+        await _wait_until(
+            lambda: getattr(service, "_enrollment_audio_cleanup_task", None) is None
+        )
+        await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_segment_requires_explicit_desktop_contract_before_normalization(
     tmp_path: Path,
 ) -> None:
