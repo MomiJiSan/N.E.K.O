@@ -771,6 +771,10 @@ class _GeminiMixin:
             connection_generation = self._connection_generation
         if not self._still_owns_connection(connection_generation):
             return
+        handoff_turn_epoch = self._current_turn_epoch
+        handoff_input_sequence = getattr(
+            self, "_voice_handoff_response_input_sequence", 0,
+        )
         external_outcome_token = getattr(
             self,
             "_gemini_external_outcome_token",
@@ -924,12 +928,15 @@ class _GeminiMixin:
                     self._turn_epoch += 1
                     self._current_turn_epoch = self._turn_epoch
                     self._current_turn_host_id = self._read_host_turn_id()
-                    self._voice_handoff_response_input_sequence = getattr(
-                        self,
-                        "_voice_handoff_input_sequence",
-                        0,
-                    )
                     if _is_new_turn and _can_clear_interrupted:
+                        # Only a recognized new response may claim this input.
+                        # Canceled/late content still advances the legacy epoch,
+                        # but must not borrow a successor's handoff marker.
+                        handoff_turn_epoch = self._current_turn_epoch
+                        handoff_input_sequence = getattr(
+                            self, "_voice_handoff_input_sequence", 0,
+                        )
+                        self._voice_handoff_response_input_sequence = handoff_input_sequence
                         # 新回合开始就说明旧回合已经收场：欠账作废，免得旧回合
                         # 永不终结时把下一条**合法**终结也吃掉，让 token 永远结算
                         # 不掉、会话被钉成「忙」而主动搭话彻底哑掉。
@@ -1083,19 +1090,16 @@ class _GeminiMixin:
                         settle_event_outcome()
                     if (
                         not was_interrupted
-                        and self._turn_epoch == self._current_turn_epoch
+                        and not _owed_to_cancelled
+                        and not self._interrupted
+                        and handoff_turn_epoch == self._turn_epoch == self._current_turn_epoch
                         and event_owner_is_current()
                     ):
-                        # Gemini has no speech_stopped event.  Its owned
-                        # turn_complete closes the native-input marker, while a
-                        # successor SOS/turn epoch keeps a late terminal from
-                        # clearing the new utterance.
+                        # Gemini has no per-event turn ID. Use the existing
+                        # turn/cancellation classification and this event's
+                        # snapshot, never a marker replaced across callbacks.
                         self._note_voice_handoff_input_boundary(
-                            expected_sequence=getattr(
-                                self,
-                                "_voice_handoff_response_input_sequence",
-                                0,
-                            )
+                            expected_sequence=handoff_input_sequence,
                         )
                     if self._skip_until_next_response:
                         self._skip_until_next_response = False
