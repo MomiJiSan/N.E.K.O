@@ -3903,8 +3903,36 @@ class AsrRuntimeMixin:
             # closed and no candidate/replay runtime is created.
             return True
 
+        if expected_noise_reduction is True and rnnoise_available is not True:
+            # The configured flag alone cannot prove that native RNNoise ran.
+            # Revoke even an active/in-flight verifier before accepting fallback
+            # PCM into a profile enrolled in the denoised domain. Explicit
+            # retry/factory replacement owns recovery from this degraded state.
+            self._voice_session_activation_degraded = True
+            self._invalidate_voice_pcm_sync("audio_processing_unavailable")
+            generation = self._capture_voice_session_activation_generation()
+            decision = ActivationDecision(
+                ActivationState.UNAVAILABLE, "audio_processing_unavailable",
+            )
+            self._voice_session_activation_status = (
+                generation, decision.state, decision.reason,
+            )
+            self._voice_session_activation_status_revision += 1
+            AsrRuntimeMixin._schedule_core_asr_cleanup(
+                self,
+                self._send_voice_session_activation_status(
+                    generation, decision,
+                    self._voice_session_activation_status_revision,
+                ),
+                name="voice-session-activation-dsp-unavailable",
+            )
+            return True
+
         async with self._voice_session_activation_lock:
-            if factory is not self._voice_session_activation_factory:
+            if (
+                self._voice_session_activation_degraded
+                or factory is not self._voice_session_activation_factory
+            ):
                 return True
             generation = self._capture_voice_session_activation_generation()
             runtime = self._voice_session_activation_runtime
