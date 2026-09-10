@@ -2860,6 +2860,17 @@ class IndependentAsrRuntime:
                         return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
                     if submitted.status is DetectorSubmitStatus.BACKPRESSURE:
                         lifecycle.metrics.detector_overflow_count += 1
+                        if preserve_prefix is not None or lifecycle.prefix_protected:
+                            failed_prefix = getattr(self, "_asr_protected_prefix", None)
+                            await self._handle_independent_asr_error(
+                                identity.session_epoch,
+                                identity.provider or "unknown",
+                                status_code=self._protected_delivery_failure_code(),
+                                expected_identity=identity,
+                            )
+                            if getattr(self, "_asr_protected_prefix", None) is failed_prefix:
+                                self._asr_protected_prefix = None
+                            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
                         await self._handle_audio_ingress_backpressure(
                             ingress_token,
                             observed_state=lifecycle.snapshot.state,

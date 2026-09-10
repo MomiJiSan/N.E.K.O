@@ -7,6 +7,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from main_logic.asr_client.endpointing.detector import (
+    DetectorSubmitResult,
+    DetectorSubmitStatus,
+)
 from main_logic.asr_client.lifecycle import (
     AudioDisposition, VoiceInputLifecycleController, VoiceLifecycleEvent, VoiceRouteMode,
 )
@@ -16,7 +20,12 @@ from main_logic.voice_turn.contracts import (
     AsrDeliveryStage, AsrSubmitResult, AsrSubmitStatus, PreserveUnsentPrefix,
 )
 from tests.unit.test_core_independent_asr import (
-    _Runtime, _ReadyDetector, _selection, DetectorFeedResult, SpeechActivityEvent,
+    _QueuedSmartTurnDetector,
+    _Runtime,
+    _ReadyDetector,
+    _selection,
+    DetectorFeedResult,
+    SpeechActivityEvent,
 )
 
 
@@ -199,6 +208,44 @@ async def test_oversized_protected_frame_fails_without_detector_or_partial_accep
         assert lifecycle.pending_connect_bytes == 0
         assert sessions == []
     finally:
+        await _close(runtime)
+
+
+@pytest.mark.asyncio
+async def test_protected_smart_turn_backpressure_is_not_acknowledged():
+    runtime, _, _, _, _, _, ready, _ = _cold_runtime()
+    policy = resolve_provider_policy("glm", "manual")
+    lifecycle = VoiceInputLifecycleController(provider_policy=policy, shadow_mode=False)
+    lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    detector = _QueuedSmartTurnDetector()
+    detector.wait_audio_capacity = AsyncMock(return_value=True)
+    detector.submit_audio = AsyncMock(
+        return_value=DetectorSubmitResult(
+            status=DetectorSubmitStatus.BACKPRESSURE,
+            throttle_available=False,
+            endpointing_available=True,
+            identity=None,
+        )
+    )
+    runtime._asr_provider = "glm"
+    runtime._asr_transport_selection = _selection("glm", "manual")
+    runtime._asr_lifecycle = lifecycle
+    runtime._asr_detector = detector
+    token = runtime._capture_ingress_token()
+    prefix = PreserveUnsentPrefix(token, "activation", 0)
+    try:
+        result = await runtime._asr_runtime.submit(
+            ProcessedVoiceFrame(bytes(3200), 16000, 0.9, True),
+            ingress_token=token,
+            preserve_prefix=prefix,
+        )
+        assert result.status is AsrSubmitStatus.UNAVAILABLE
+        detector.wait_audio_capacity.assert_awaited_once()
+        detector.submit_audio.assert_awaited_once()
+        assert runtime._asr_lifecycle is None
+        assert getattr(runtime._asr_runtime, "_asr_protected_prefix", None) is None
+    finally:
+        ready.set()
         await _close(runtime)
 
 
