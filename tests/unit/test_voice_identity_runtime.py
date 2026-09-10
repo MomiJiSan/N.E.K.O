@@ -909,8 +909,11 @@ async def test_failed_dsp_construction_blocks_pcm_until_successful_retry(
         assert runtime not in registry._attach_pending
         with pytest.raises(RuntimeError, match="VOICE_AUDIO_PIPELINE_CLOSED"):
             await original.process(b"\x01\x00" * 160, sample_rate_hz=16_000)
+        # This direct post-DSP input models a successful retry, including the
+        # actual native capability evidence when the new contract requires it.
         await runtime._route_microphone_audio(
             bytes(320), sample_rate_hz=16_000,
+            rnnoise_available=requested_nr,
         )
         await _wait_until(lambda: (
             runtime._voice_session_activation_runtime is not None
