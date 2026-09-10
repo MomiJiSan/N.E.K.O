@@ -146,6 +146,66 @@ async def test_new_input_retries_once_after_inflight_output_was_not_sent() -> No
 
 
 @pytest.mark.asyncio
+async def test_not_sent_retries_once_without_waiting_for_new_input() -> None:
+    delivered: list[int] = []
+    attempts = 0
+
+    async def output(frame: AudioFrame) -> OutputCommit:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return OutputCommit.NOT_SENT
+        delivered.append(frame.sequence)
+        return OutputCommit.TRANSPORT_WRITTEN
+
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        _Scorer(),  # type: ignore[arg-type]
+        output,
+        controller=VoiceActivationController(clock=lambda: 1.5),
+    )
+    await runtime.prepare()
+    for sequence in range(15):
+        await runtime.feed(_frame(sequence), voice_activity=True)
+    async with asyncio.timeout(1.0):
+        while runtime.state is not ActivationState.ACTIVE:
+            await asyncio.sleep(0.01)
+
+    assert runtime.state is ActivationState.ACTIVE
+    assert delivered == list(range(15))
+    assert attempts == 16
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_not_sent_fails_closed_after_one_automatic_retry() -> None:
+    attempts = 0
+
+    async def output(_frame: AudioFrame) -> OutputCommit:
+        nonlocal attempts
+        attempts += 1
+        return OutputCommit.NOT_SENT
+
+    runtime = VoiceSessionActivationRuntime(
+        _generation(),
+        _Scorer(),  # type: ignore[arg-type]
+        output,
+        controller=VoiceActivationController(clock=lambda: 1.5),
+    )
+    await runtime.prepare()
+    for sequence in range(15):
+        await runtime.feed(_frame(sequence), voice_activity=True)
+    async with asyncio.timeout(1.0):
+        while runtime.state is not ActivationState.UNAVAILABLE:
+            await asyncio.sleep(0.01)
+
+    assert runtime.state is ActivationState.UNAVAILABLE
+    assert runtime.pending_output_bytes == 0
+    assert attempts == 2
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_new_input_never_retries_an_unknown_output_commit() -> None:
     first_attempt_started = asyncio.Event()
     release_first_attempt = asyncio.Event()

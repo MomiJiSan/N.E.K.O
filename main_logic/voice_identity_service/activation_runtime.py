@@ -32,6 +32,8 @@ ActivationStatusCallback = Callable[[ActivationDecision], None]
 
 logger = logging.getLogger(__name__)
 
+_OUTPUT_RETRY_DELAY_SECONDS = 0.25
+
 
 @dataclass(frozen=True, slots=True)
 class VoiceSessionActivationRuntimeConfig:
@@ -88,7 +90,9 @@ class VoiceSessionActivationRuntime:
         self._lock = asyncio.Lock()
         self._verification_task: asyncio.Task[None] | None = None
         self._output_task: asyncio.Task[None] | None = None
+        self._output_retry_task: asyncio.Task[None] | None = None
         self._output_retry_requested = False
+        self._output_retry_attempted = False
         self._output_pause_owner: object | None = None
         self._output_resumed_owner: object | None = None
         self._output_failure_reason: str | None = None
@@ -381,6 +385,7 @@ class VoiceSessionActivationRuntime:
                     for task in (
                         self._verification_task,
                         self._output_task,
+                        self._output_retry_task,
                         self._idle_task,
                     )
                     if task is not None
@@ -531,19 +536,22 @@ class VoiceSessionActivationRuntime:
             return
         task = self._output_task
         if task is not None and not task.done():
-            # A frame arrived while the sole writer was awaiting downstream.
-            # If that attempt proves NOT_SENT, consume this edge exactly once
-            # so the newly arrived input can trigger a safe retry after the
-            # old writer releases its lease.
+            # Preserve the existing edge-triggered retry contract: input that
+            # arrives during an uncertain attempt may resume the retained
+            # lease immediately once that attempt reports NOT_SENT.
             self._output_retry_requested = True
             return
+        retry_task = self._output_retry_task
+        if retry_task is not None:
+            self._output_retry_task = None
+            if retry_task is not asyncio.current_task() and not retry_task.done():
+                retry_task.cancel()
         lease = self._controller.claim_output()
         if lease is None:
             return
         # claim_output is exclusive. Release this speculative lease as NOT_SENT
         # so the actual writer task can claim it after this synchronous check.
         self._controller.complete_output(lease, OutputCommit.NOT_SENT)
-        self._output_retry_requested = False
         self._output_task = asyncio.create_task(
             self._drain_output(),
             name="voice-session-activation-output",
@@ -583,19 +591,57 @@ class VoiceSessionActivationRuntime:
                 )
                 self._publish(decision)
                 self._ensure_idle_task_locked()
-                if commit in {OutputCommit.NOT_SENT, OutputCommit.UNKNOWN}:
+                if commit is OutputCommit.NOT_SENT:
                     self._output_task = None
-                    if (
-                        commit is OutputCommit.NOT_SENT
-                        and self._output_retry_requested
-                        and self._output_pause_owner is None
-                    ):
+                    if self._output_retry_attempted:
                         self._output_retry_requested = False
-                        self._output_task = asyncio.create_task(
-                            self._drain_output(),
-                            name="voice-session-activation-output",
+                        self._publish(
+                            self._controller.mark_unavailable(
+                                self._generation,
+                                "output_not_sent",
+                            )
                         )
+                    else:
+                        self._output_retry_attempted = True
+                    if self.state is ActivationState.UNAVAILABLE:
+                        return
+                    if self._output_pause_owner is not None:
+                        self._output_retry_requested = True
+                    elif self._output_retry_requested:
+                        self._output_retry_requested = False
+                        self._ensure_output_task_locked()
+                    else:
+                        self._schedule_output_retry_locked()
                     return
+                elif commit is OutputCommit.UNKNOWN:
+                    self._output_task = None
+                    return
+                else:
+                    self._output_retry_requested = False
+                    self._output_retry_attempted = False
+
+    def _schedule_output_retry_locked(self) -> None:
+        task = self._output_retry_task
+        if task is None or task.done():
+            self._output_retry_task = asyncio.create_task(
+                self._retry_output_once(),
+                name="voice-session-activation-output-retry",
+            )
+
+    async def _retry_output_once(self) -> None:
+        current = asyncio.current_task()
+        try:
+            await asyncio.sleep(_OUTPUT_RETRY_DELAY_SECONDS)
+            async with self._lock:
+                if self._output_retry_task is not current:
+                    return
+                self._output_retry_task = None
+                if self._closed or self._output_pause_owner is not None:
+                    return
+                self._ensure_output_task_locked()
+        finally:
+            if self._output_retry_task is current:
+                self._output_retry_task = None
 
     def _ensure_idle_task_locked(self) -> None:
         if self._closed or self._controller.state not in {
