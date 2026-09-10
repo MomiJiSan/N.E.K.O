@@ -246,19 +246,31 @@ class _GeminiMixin:
 
     async def _stream_audio_gemini(self, audio_chunk: bytes) -> None:
         """Send audio data to Gemini Live API."""
-        if not self._gemini_session:
-            return
+        session = self._gemini_session
+        if session is None:
+            raise ConnectionError("Gemini audio session is not connected")
+        connection_generation = self._connection_generation
+
+        def send_is_current() -> bool:
+            return (
+                self._gemini_session is session
+                and self._connection_generation == connection_generation
+            )
 
         try:
             # 发送实时音频输入
-            await self._gemini_session.send_realtime_input(
+            await session.send_realtime_input(
                 audio={"data": audio_chunk, "mime_type": "audio/pcm"}
             )
-            self._last_speech_time = time.time()
+            if send_is_current():
+                self._last_speech_time = time.time()
         except Exception as e:
             logger.error(f"Error sending audio to Gemini: {e}")
-            if "closed" in str(e).lower():
+            if send_is_current() and "closed" in str(e).lower():
                 self._fatal_error_occurred = True
+            # Returning normally is the native boundary's write receipt.
+            # Preserve the original error so Core can retire uncertain output.
+            raise
 
     async def signal_user_activity_end(self) -> None:
         """Explicitly signal end-of-turn in MANUAL VAD mode.
