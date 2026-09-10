@@ -2,7 +2,7 @@
 
 These tests use the real Core routing mixin and activation controller/runtime.
 Only provider I/O and speaker inference are replaced; no provider models or
-physical microphone are required. See design section 15 for the contract.
+physical microphone are required.
 """
 
 from __future__ import annotations
