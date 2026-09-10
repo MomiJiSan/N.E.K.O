@@ -93,7 +93,8 @@ class CampPlusActivationScorer:
 
     Production CAM++ runs in the killable spawn-process host already used by
     speaker shadow. ``backend_factory`` remains an in-process unit-test seam.
-    A timeout permanently retires either kind of scorer.
+    ``timeout_seconds`` bounds hot scoring; process start and model loading
+    each use ``load_timeout_seconds``. A timeout permanently retires the scorer.
     """
 
     def __init__(
@@ -102,6 +103,7 @@ class CampPlusActivationScorer:
         *,
         scorer_generation: int,
         timeout_seconds: float = 2.0,
+        load_timeout_seconds: float = 15.0,
         shutdown_timeout_seconds: float = 0.25,
         asset_dir: Path | None = None,
         backend_factory: ActivationBackendFactory | None = None,
@@ -112,6 +114,8 @@ class CampPlusActivationScorer:
             raise ValueError("scorer_generation must be positive")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if not math.isfinite(load_timeout_seconds) or load_timeout_seconds <= 0:
+            raise ValueError("load_timeout_seconds must be positive")
         if not math.isfinite(shutdown_timeout_seconds) or shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
         expected = SpeakerModelIdentity(
@@ -125,6 +129,7 @@ class CampPlusActivationScorer:
         self._profile_generation = profile.generation
         self._scorer_generation = scorer_generation
         self._timeout_seconds = float(timeout_seconds)
+        self._load_timeout_seconds = float(load_timeout_seconds)
         self._shutdown_timeout_seconds = float(shutdown_timeout_seconds)
         self._lock = asyncio.Lock()
         self._closed = False
@@ -290,7 +295,13 @@ class CampPlusActivationScorer:
             return ActivationScoreStatus.CLOSED, None
         if self._backend is not None:
             method = getattr(self._backend, operation)
-            return await self._run_local_backend(method, *args)
+            return await self._run_local_backend(
+                method, *args,
+                timeout_seconds=(
+                    self._load_timeout_seconds if operation == "load"
+                    else self._timeout_seconds
+                ),
+            )
         return await self._run_process_backend(operation, *args)
 
     async def _run_process_backend(
@@ -304,7 +315,7 @@ class CampPlusActivationScorer:
         try:
             if operation == "load":
                 operation_task = asyncio.create_task(
-                    host.load(timeout_seconds=self._timeout_seconds)
+                    host.load(timeout_seconds=self._load_timeout_seconds)
                 )
             else:
                 pcm16, sample_rate_hz = args
@@ -382,7 +393,7 @@ class CampPlusActivationScorer:
         )
         self._host_start_task = start_task
         try:
-            done, _ = await asyncio.wait({start_task}, timeout=self._timeout_seconds)
+            done, _ = await asyncio.wait({start_task}, timeout=self._load_timeout_seconds)
         except asyncio.CancelledError:
             self._mark_terminal()
             self._retire_late_host(start_task)
@@ -406,12 +417,13 @@ class CampPlusActivationScorer:
         self,
         operation: Callable[..., object],
         *args: object,
+        timeout_seconds: float,
     ) -> tuple[ActivationScoreStatus, object | None]:
         task = asyncio.create_task(asyncio.to_thread(operation, *args))
         self._active_task = task
         task.add_done_callback(self._retire_active_task)
         try:
-            done, _ = await asyncio.wait({task}, timeout=self._timeout_seconds)
+            done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
             if not done:
                 self._mark_terminal()
                 close_task = self._ensure_local_close_task()

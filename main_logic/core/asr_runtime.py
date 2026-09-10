@@ -3909,6 +3909,21 @@ class AsrRuntimeMixin:
             # PCM into a profile enrolled in the denoised domain. Explicit
             # retry/factory replacement owns recovery from this degraded state.
             self._voice_session_activation_degraded = True
+            runtime = self._voice_session_activation_runtime
+            identity = self._voice_activation_native_output_identity
+            if (
+                self._asr_route_mode == "native"
+                and runtime is not None
+                and runtime.output_inflight
+                and identity is not None
+                and identity[0] == self._capture_voice_session_activation_generation()
+            ):
+                # Invalidation cancels the writer and clears its identity. Fence
+                # the captured connection first: disabling activation must not
+                # append ordinary PCM to an unsettled native utterance.
+                self._retire_native_voice_activation_session(
+                    identity[1], connection_generation=identity[2],
+                )
             self._invalidate_voice_pcm_sync("audio_processing_unavailable")
             generation = self._capture_voice_session_activation_generation()
             decision = ActivationDecision(
