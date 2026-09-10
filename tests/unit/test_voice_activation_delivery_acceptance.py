@@ -3,7 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -140,6 +140,27 @@ async def test_non_gemini_activation_uses_actual_send_receipt(receipt):
         assert client.send_event.await_count == (15 if receipt else 2)
         if not receipt:
             await _until(lambda: client.close.await_count == 1)
+
+
+async def test_non_gemini_local_buffer_is_not_reported_as_transport_write():
+    async with _harness("native") as h:
+        client = _make_client("openai", "gpt-4o-realtime")
+        client._audio_processor = None
+        client._connection_generation = 1
+        client._resample_uplink = MagicMock(return_value=b"")
+        client.send_event = AsyncMock()
+        h.manager.session = client
+        h.manager.session_closed_by_server = False
+        transport_written_bytes = h.manager._omni_mic_audio_bytes
+
+        for index in range(15):
+            h.clock.value += 0.1
+            await h.feed(4_000 + index)
+
+        runtime = h.manager._voice_session_activation_runtime
+        await _until(lambda: runtime.state is ActivationState.ACTIVE)
+        client.send_event.assert_not_awaited()
+        assert h.manager._omni_mic_audio_bytes == transport_written_bytes
 
 
 @pytest.mark.parametrize("outcome", ["success", "closed"])

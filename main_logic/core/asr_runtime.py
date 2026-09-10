@@ -4351,6 +4351,11 @@ class AsrRuntimeMixin:
                     return OutputCommit.NOT_SENT
                 if not native_send_is_current():
                     return OutputCommit.UNKNOWN
+                if (
+                    isinstance(session_ref, _core_facade.OmniRealtimeClient)
+                    and written is None
+                ):
+                    return OutputCommit.LOCAL_ACCEPTED
                 self._record_omni_microphone_audio(len(pcm16))
                 return OutputCommit.TRANSPORT_WRITTEN
             except asyncio.CancelledError:
