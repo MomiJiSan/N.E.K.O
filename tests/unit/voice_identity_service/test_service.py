@@ -2647,7 +2647,9 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
     assert activations[-1][0] is None
     assert not service.status().state.effective_enabled
     assert service.status().state.effective_reason == "runtime_degraded"
-    assert not service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
+    # Failure keeps coordination pending, including a retry of the old value.
+    assert service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
+    assert service._runtime_noise_reduction_enabled is True  # type: ignore[attr-defined]
 
     assert await service.prepare_runtime_audio_contract_change(True)
     restored = await service.update_runtime_noise_reduction_enabled(True)
