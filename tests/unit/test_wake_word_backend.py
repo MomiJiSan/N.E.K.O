@@ -59,6 +59,8 @@ class FakeSpotter:
 
 def streaming():
     worker = backend._StreamingSpotter.__new__(backend._StreamingSpotter)
+    worker.runtime_version = backend.SUPPORTED_RUNTIME_VERSION
+    worker.native_version = backend.SUPPORTED_RUNTIME_VERSION
     worker.spotter = FakeSpotter()
     worker.keywords = "test @name"
     worker.labels = {"name"}
@@ -108,8 +110,16 @@ def test_invalid_decoder_timestamps_never_become_evidence(times):
         worker.feed(frame(), 1)
 
 
+def ready_info(config):
+    return dict(runtime_version="1.13.8+neko.kws2", native_version="1.13.8+neko.kws2",
+                max_active_paths=config.max_active_paths,
+                keyword_threshold=config.keyword_threshold, keyword_score=config.keyword_score,
+                num_threads=config.num_threads, num_trailing_blanks=1,
+                sample_rate=16000, provider="cpu")
+
+
 def responsive_worker(connection, config):
-    connection.send((True, None))
+    connection.send((True, ready_info(config)))
     try:
         while True:
             received, epoch = connection.recv()
@@ -120,7 +130,7 @@ def responsive_worker(connection, config):
 
 
 def stuck_worker(connection, config):
-    connection.send((True, None))
+    connection.send((True, ready_info(config)))
     connection.recv()
     time.sleep(120)
 
@@ -255,7 +265,8 @@ def test_model_initialization_checks_paths_tokens_and_temporary_keyword_lifecycl
         return FakeSpotter()
 
     monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(
-        KeywordSpotter=constructor, __version__="1.13.8+neko.kws1",
+        KeywordSpotter=constructor, __version__=backend.SUPPORTED_RUNTIME_VERSION,
+        version=backend.SUPPORTED_RUNTIME_VERSION,
     ))
     config = backend.SherpaWakeWordConfig(str(tmp_path), ("x @name",))
     with pytest.raises(backend.WakeWordBackendError, match="MODEL_MISSING"):
@@ -266,6 +277,8 @@ def test_model_initialization_checks_paths_tokens_and_temporary_keyword_lifecycl
         backend._StreamingSpotter(config)
     Path(backend.model_files(str(tmp_path))["tokens"]).write_text("x 0\n", encoding="utf-8")
     worker = backend._StreamingSpotter(config)
+    assert worker.runtime_version == "1.13.8+neko.kws2"
+    assert worker.native_version == "1.13.8+neko.kws2"
     assert worker.labels == {"name"}
     assert len(configured) == 1
     assert not Path(configured[0]["keywords_file"]).exists()
@@ -304,7 +317,8 @@ def test_search_budget_reaches_native_constructor(tmp_path, monkeypatch, value):
         return FakeSpotter()
 
     monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(
-        KeywordSpotter=constructor, __version__="1.13.8+neko.kws1",
+        KeywordSpotter=constructor, __version__=backend.SUPPORTED_RUNTIME_VERSION,
+        version=backend.SUPPORTED_RUNTIME_VERSION,
     ))
     for path in backend.model_files(str(tmp_path)).values():
         Path(path).write_text("x 0\n", encoding="utf-8")
@@ -320,10 +334,17 @@ def test_search_budget_reaches_native_constructor(tmp_path, monkeypatch, value):
 def test_worker_ready_diagnostic_reports_search_configuration(monkeypatch, capsys):
     monkeypatch.setenv("NEKO_WAKE_WORD_DIAGNOSTICS", "1")
     worker = streaming()
+    # Distinguish the worker observation from a hardcoded expected-version log.
+    worker.runtime_version = "version-observed-in-worker"
+    worker.native_version = "core-version-observed-in-worker"
     monkeypatch.setattr(backend, "_StreamingSpotter", lambda config: worker)
     connection = WorkerConnection()
     backend._worker(connection, backend.SherpaWakeWordConfig("unused", ("x @name",)))
     output = capsys.readouterr().out
+    assert "runtime_version=version-observed-in-worker" in output
+    assert connection.responses[0][1]["runtime_version"] == worker.runtime_version
+    assert "native_version=core-version-observed-in-worker" in output
+    assert connection.responses[0][1]["native_version"] == worker.native_version
     assert "max_active_paths=8" in output
     assert "keyword_threshold=0.25" in output
     assert "keyword_score=1.0" in output
@@ -346,4 +367,81 @@ def test_worker_dispatches_and_reports_failure_without_audio_or_exception_detail
     if failure:
         assert connection.responses == [(False, "WAKE_WORD_WORKER_FAILED")]
     else:
-        assert connection.responses == [(True, None), (True, None)]
+        assert connection.responses == [
+            (True, ready_info(backend.SherpaWakeWordConfig("unused", ("x @name",)))),
+            (True, None),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_worker_metadata_is_received_read_only_and_cleared_on_close(monkeypatch):
+    monkeypatch.setattr(backend, "_worker", responsive_worker)
+    config = backend.SherpaWakeWordConfig("unused", ("x @name",), max_active_paths=4)
+    detector = backend.SherpaWakeWordDetector(config)
+    assert detector.runtime_info is None
+    try:
+        await detector.prepare()
+        assert dict(detector.runtime_info) == ready_info(config)
+        with pytest.raises(TypeError):
+            detector.runtime_info["runtime_version"] = "unverified"
+        assert await detector.prepare() is None
+        assert await detector.feed(frame(), 1) is None
+    finally:
+        await detector.close()
+    assert detector.runtime_info is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", [None, {}, {"runtime_version": "1.13.8+neko.kws1"},
+                                  {**ready_info(backend.SherpaWakeWordConfig("unused", ("x @name",))),
+                                   "max_active_paths": 16}])
+async def test_unverified_ready_payload_never_marks_detector_ready(monkeypatch, reply):
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig("unused", ("x @name",)))
+    monkeypatch.setattr(detector, "_launch", lambda: None)
+    monkeypatch.setattr(detector, "_exchange", lambda request, timeout: reply)
+    with pytest.raises(backend.WakeWordBackendError, match="RUNTIME_INFO_INVALID"):
+        await detector.prepare()
+    assert detector.runtime_info is None
+    assert detector._closed.is_set() and not detector._ready
+
+
+@pytest.mark.parametrize("version", [None, "1.13.8", "1.13.8+neko.kws1"])
+def test_worker_rejects_old_runtime_without_ready_event(monkeypatch, capsys, version):
+    monkeypatch.setenv("NEKO_WAKE_WORD_DIAGNOSTICS", "1")
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(__version__=version))
+    connection = WorkerConnection()
+    backend._worker(connection, backend.SherpaWakeWordConfig("unused", ("x @name",)))
+    assert connection.responses == [(False, "WAKE_WORD_WORKER_FAILED")]
+    assert connection.closed
+    assert "event=ready" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("native_version", [None, "1.13.8", "1.13.8+neko.kws1"])
+def test_supported_package_with_old_native_core_never_reports_ready(monkeypatch, capsys, native_version):
+    monkeypatch.setenv("NEKO_WAKE_WORD_DIAGNOSTICS", "1")
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(
+        __version__=backend.SUPPORTED_RUNTIME_VERSION, version=native_version))
+    config = backend.SherpaWakeWordConfig("unused", ("x @name",))
+    with pytest.raises(backend.WakeWordBackendError, match="RUNTIME_FIX_REQUIRED"):
+        backend._StreamingSpotter(config)
+    connection = WorkerConnection()
+    backend._worker(connection, config)
+    assert connection.responses == [(False, "WAKE_WORD_WORKER_FAILED")]
+    assert connection.closed
+    assert "event=ready" not in capsys.readouterr().out
+
+
+def test_native_result_is_consumed_once_with_its_timestamps(monkeypatch):
+    worker = streaming()
+    calls = []
+
+    def consume(stream):
+        calls.append(stream)
+        assert len(calls) == 1, "Native result retrieval consumes the pending result"
+        return SimpleNamespace(keyword="name", timestamps=[0.02, 0.08])
+
+    monkeypatch.setattr(worker.spotter, "get_result", consume)
+    worker.spotter.ready = True
+    result = worker.feed(frame(), 1)
+    assert len(calls) == 1
+    assert (result.sample_start, result.sample_end) == (16320, 17920)

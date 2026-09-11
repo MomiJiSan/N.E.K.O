@@ -14,10 +14,11 @@ from main_logic.voice_input.activation import (
 from main_logic.voice_input.wake_word import sherpa_backend as backend
 
 
-@pytest.mark.parametrize("version", [None, "1.13.8", "1.13.9"])
+@pytest.mark.parametrize("version", [None, "1.13.8", "1.13.9", "1.13.8+neko.kws1"])
 def test_unverified_runtime_cannot_report_detector_ready(monkeypatch, version):
-    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(__version__=version))
-    with pytest.raises(backend.WakeWordBackendError, match="TIMESTAMP_FIX_REQUIRED"):
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(
+        __version__=version, version=backend.SUPPORTED_RUNTIME_VERSION))
+    with pytest.raises(backend.WakeWordBackendError, match="RUNTIME_FIX_REQUIRED"):
         backend._StreamingSpotter(backend.SherpaWakeWordConfig(
             "unused", DEFAULT_WAKE_WORD_KEYWORDS,
         ))

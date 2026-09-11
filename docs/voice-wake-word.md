@@ -14,9 +14,11 @@ uv run scripts/provision_wake_word_model.py --model-dir C:\NEKO-models\wake-word
 $env:NEKO_WAKE_WORD_MODEL_DIR = 'C:\NEKO-models\wake-word'
 ```
 
-当前还必须使用带时间戳修复的 `sherpa-onnx==1.13.8+neko.kws1`；上面的
+当前必须使用带时间戳及解码修复的 `sherpa-onnx==1.13.8+neko.kws2`；上面的
 extra 只安装上游基础依赖，不包含修复。准备阶段会拒绝未验证的运行库版本。
-Windows 安装 VS 2022 C++ Build Tools、CMake、Git 后，可构建本地 wheel：
+旧 kws1 也会被拒绝；Python 包版本与原生库导出的版本必须同时匹配。
+Windows 安装 VS 2022 C++ Build Tools、Windows SDK、Git 后，可构建本地 wheel
+（构建命令通过 uv 提供固定版本 CMake）：
 
 ```powershell
 ./scripts/build_wake_word_runtime.ps1 -Python '<项目 Python 路径>' -OutputDirectory C:\NEKO-build\wake-word
@@ -25,10 +27,21 @@ uv run --no-sync --with $wakeRuntimeWheel python launcher.py
 ```
 
 脚本固定上游提交 `11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf`，应用仓库内
-`scripts/patches/sherpa-onnx-kws-timestamps.patch` 后构建。输出目录须为新目录。
+`scripts/patches/sherpa-onnx-kws-timestamps.patch` 与
+`scripts/patches/sherpa-onnx-kws-decoder.patch` 后构建。输出目录须不存在或为空。
+构建会执行 `neko-kws-decoder-test`，并从源码目录外导入产出的 wheel。
+输出根目录中的 `build-manifest.json` 记录补丁、wheel 哈希和实际原生版本。
+构建时不得设置 `SHERPA_ONNX_SPLIT_PYTHON_PACKAGE` 或 `SHERPA_ONNX_IS_FOR_PYPI`，
+避免误生成依赖未修复核心库的分包。Windows CI 的 `Wake word runtime` 工作流
+运行同一构建脚本并保存 wheel 与清单。
 Windows 应使用示例中的短输出路径，避免 MSBuild FileTracker 的路径长度限制。
 后续启动、离线评估和模型回归也应携带同一 `--with $wakeRuntimeWheel`；
 直接从 PyPI 安装原版或仅执行 `uv sync` 不足以复现此修复。
+
+离线对照可在不同空目录分别传 `-Variant baseline`、`merge`、`candidates` 或
+`combined`。前三种生成不同的 `1.13.8.dev0+neko.kws2.<variant>` 实验版本，
+应用会拒绝它们；只用于隔离的原生/直接库评估，不能通过放宽应用版本检查上线。
+默认 `combined` 是两项改动合用。回退必须配套恢复旧源码与旧 wheel 并重启 worker。
 
 从设置了该环境变量的终端启动后端。需要已有声纹档案并打开语音激活。
 新 worktree 还需准备 CAM++ 权重；已有档案不等于本地模型文件已存在。
@@ -62,6 +75,12 @@ int8 encoder/joiner 与 fp32 decoder。脚本只提取这三个 ONNX 文件及
 解码候选数。关键词阈值保持 0.25、关键词加分保持 1.0，不修改声纹阈值 0.40。
 候选数 8 是待真人验收的改进，不是识别率保证，也没有加入第二阶段复核模型。
 
+kws2 在 KWS 内保存独立的完整路径分数，合并同样音节时成套保留代表路径的
+概率、时间与词尾等待信息；候选排名仍使用合并总分。它检查当前候选中最高
+总分且通过完整匹配、音节评分及词尾等待条件的一项。共享 ASR 合并代码保持
+原样。完整路径分数和音节均值不同，两项修改都需要正负例回归；阈值数字不变
+不代表误触发风险不变。认可近音继续计正例，不固定为只检查前两名。
+
 ## 验证本地录音
 
 准备 PCM16、16 kHz、单声道 WAV，以及以下 JSON 清单。`wav` 相对于
@@ -70,8 +89,14 @@ int8 encoder/joiner 与 fp32 decoder。脚本只提取这三个 ONNX 文件及
 
 ```json
 [
-  {"id": "name-alone", "expected": "wake", "keyword_end_seconds": 0.8},
-  {"id": "name-and-command", "expected": "wake", "keyword_end_seconds": 0.7},
+  {"id": "name-alone", "expected": "wake", "wake_intervals": [
+    {"start_seconds": 0.3, "end_seconds": 0.8,
+     "detection_window_seconds": [0.3, 1.2], "keywords": ["悠宜", "yui"]}
+  ]},
+  {"id": "name-and-command", "expected": "wake", "wake_intervals": [
+    {"start_seconds": 0.2, "end_seconds": 0.7,
+     "detection_window_seconds": [0.2, 1.1]}
+  ]},
   {"id": "ordinary-conversation", "expected": "none"}
 ]
 ```
@@ -82,11 +107,27 @@ uv run --no-sync --with $wakeRuntimeWheel python scripts/evaluate_wake_word.py -
 
 合成语音必须加 `--synthetic`。脚本实际调用隔离推理进程，包含 WAV 中
 真实静音，不自动补静音；结果包含命中、原始采样位置、送入多少音频时
-命中、进程 CPU、采样 RSS 和每帧调用耗时。未标注词尾就不推算“说完后
-延迟”。离线快速送帧不是实时麦克风延迟，也不测试 ASR/native 网络交付。
+命中、进程 CPU、采样 RSS 和每帧调用耗时，以及 worker 实际加载的包/原生
+版本、传入配置、PCM 与清单哈希。离线快速送帧不是实时麦克风延迟，
+也不测试 ASR/native 网络交付。
+
+示例时间仅演示格式，须按实际 WAV 标注。所有区间使用 WAV 内绝对秒数，
+名字区间有序且不重叠；检测窗口可以重叠，但必须在 WAV 内且结束不早于词尾。
+`keywords` 可省略，填写时使用检测器输出别名；每次认可近音也必须标注。
+返回的采样区间须落在名字标注范围内，检测时刻须落在对应窗口内，事件与呼叫
+一一匹配。时间戳近似误差可通过显式 `--timestamp-tolerance-seconds` 统一设置，
+默认 0；该容差只扩张名字区间，不扩张检测窗口，必须在保留集验收前固定。
+
+报告 `schema_version=2`：`matched_occurrences` / `missed_occurrences` 计呼叫次数，
+`verified_positive_hits` 计所有标注呼叫均找到的录音数；该数字不能证明没有额外
+触发，还须查看 `duplicate_hits` 与 `out_of_window_hits`。旧格式仅有
+`keyword_end_seconds` 或没有完整区间的正例标记 `unverified`，不计已核验成功。
+`false_hits_per_hour` 仅以标为 `none` 的 WAV 时长为分母；正例窗口外的事件单列。
 负样本应覆盖足够长的真实普通对话；几秒内零误触发不能证明小时误触发率低。
 
-## 当前验证边界（2026-09-11）
+## 既有版本验证记录（2026-09-11）
+
+以下记录来自 kws2 之前的运行库，不能作为新 wheel 或真人效果的验收结果。
 
 - 7 个本地 Windows TTS 合成样本：5 个正例中命中 3 个，8.755 秒负例
   中 0 次命中。Huihui 的单喊名字及带停顿指令、Kangkang 单喊名字命中；

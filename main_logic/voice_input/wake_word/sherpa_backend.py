@@ -8,12 +8,17 @@ import multiprocessing
 import threading
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
+from types import MappingProxyType
 
 from main_logic.voice_input.activation.contracts import AudioFrame, WakeWordDetection
 from .diagnostics import WakeWordDiagnostics
+
+
+SUPPORTED_RUNTIME_VERSION = "1.13.8+neko.kws2"
 
 
 class WakeWordBackendError(RuntimeError):
@@ -73,8 +78,11 @@ class _StreamingSpotter:
     def __init__(self, config: SherpaWakeWordConfig) -> None:
         import sherpa_onnx
 
-        if getattr(sherpa_onnx, "__version__", None) != "1.13.8+neko.kws1":
-            raise WakeWordBackendError("WAKE_WORD_RUNTIME_TIMESTAMP_FIX_REQUIRED")
+        self.runtime_version = getattr(sherpa_onnx, "__version__", None)
+        self.native_version = getattr(sherpa_onnx, "version", None)
+        if (self.runtime_version != SUPPORTED_RUNTIME_VERSION
+                or self.native_version != SUPPORTED_RUNTIME_VERSION):
+            raise WakeWordBackendError("WAKE_WORD_RUNTIME_FIX_REQUIRED")
         paths = model_files(config.model_dir)
         if not all(Path(path).is_file() for path in paths.values()):
             raise WakeWordBackendError("WAKE_WORD_MODEL_MISSING")
@@ -142,16 +150,23 @@ class _StreamingSpotter:
         return None
 
 
+def _runtime_details(config: SherpaWakeWordConfig, version: str, native_version: str) -> dict:
+    """Configuration supplied to the native constructor, plus its loaded version."""
+    return dict(runtime_version=version, native_version=native_version,
+                max_active_paths=config.max_active_paths,
+                keyword_threshold=config.keyword_threshold, keyword_score=config.keyword_score,
+                num_threads=config.num_threads, num_trailing_blanks=1,
+                sample_rate=16000, provider="cpu")
+
+
 def _worker(connection: Connection, config: SherpaWakeWordConfig) -> None:
     """No raw audio/text logging; native crashes stay inside this process."""
     diagnostics = WakeWordDiagnostics()
     try:
         spotter = _StreamingSpotter(config)
-        diagnostics.emit("ready", runtime="1.13.8+neko.kws1",
-                         max_active_paths=config.max_active_paths,
-                         keyword_threshold=config.keyword_threshold,
-                         keyword_score=config.keyword_score, num_threads=config.num_threads)
-        connection.send((True, None))
+        runtime_info = _runtime_details(config, spotter.runtime_version, spotter.native_version)
+        diagnostics.emit("ready", **runtime_info)
+        connection.send((True, runtime_info))
         while True:
             frame, epoch = connection.recv()
             previous_stream = spotter.stream
@@ -184,6 +199,12 @@ class SherpaWakeWordDetector:
         self._connection = None
         self._busy = False
         self._ready = False
+        self._runtime_info = None
+
+    @property
+    def runtime_info(self) -> Mapping | None:
+        """Verified worker metadata while ready; unavailable before prepare/after close."""
+        return self._runtime_info
 
     def _launch(self) -> None:
         context = multiprocessing.get_context("spawn")
@@ -246,10 +267,15 @@ class SherpaWakeWordDetector:
             deadline = asyncio.get_running_loop().time() + self.config.prepare_timeout
             await asyncio.wait_for(asyncio.to_thread(self._launch), self.config.prepare_timeout)
             remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-            await asyncio.wait_for(asyncio.to_thread(self._exchange, None,
-                                   remaining), remaining)
+            runtime_info = await asyncio.wait_for(asyncio.to_thread(self._exchange, None,
+                                                  remaining), remaining)
             if self._closed.is_set():
                 raise WakeWordBackendError("WAKE_WORD_CLOSED")
+            if (not isinstance(runtime_info, dict)
+                    or runtime_info != _runtime_details(
+                        self.config, SUPPORTED_RUNTIME_VERSION, SUPPORTED_RUNTIME_VERSION)):
+                raise WakeWordBackendError("WAKE_WORD_RUNTIME_INFO_INVALID")
+            self._runtime_info = MappingProxyType(dict(runtime_info))
             self._ready = True
         except BaseException:
             await self.close()
@@ -280,4 +306,5 @@ class SherpaWakeWordDetector:
     async def close(self) -> None:
         self._closed.set()
         self._ready = False
+        self._runtime_info = None
         await asyncio.to_thread(self._stop)

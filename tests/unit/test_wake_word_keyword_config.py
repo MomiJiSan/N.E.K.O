@@ -23,7 +23,8 @@ def test_default_pronunciations_reach_model_with_shared_chinese_label(tmp_path, 
         return SimpleNamespace()
 
     monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(
-        KeywordSpotter=constructor, __version__="1.13.8+neko.kws1",
+        KeywordSpotter=constructor, __version__=backend.SUPPORTED_RUNTIME_VERSION,
+        version=backend.SUPPORTED_RUNTIME_VERSION,
     ))
     paths = backend.model_files(str(tmp_path))
     for value in paths.values():

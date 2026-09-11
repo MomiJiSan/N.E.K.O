@@ -55,6 +55,12 @@ async def test_real_model_activates_without_vad_or_speaker_and_delivers_original
         status_callback=decisions.append, wake_detector=detector)
     try:
         assert (await runtime.prepare()).state is ActivationState.WAITING
+        assert detector.runtime_info is not None
+        assert detector.runtime_info["runtime_version"] == "1.13.8+neko.kws2"
+        assert detector.runtime_info["native_version"] == "1.13.8+neko.kws2"
+        assert detector.runtime_info["keyword_threshold"] == 0.25
+        assert detector.runtime_info["max_active_paths"] == 8
+        assert detector.runtime_info["keyword_score"] == 1.0
         for offset in range(0, len(pcm), 640):
             chunk = pcm[offset:offset + 640]
             frame = AudioFrame(offset // 640, offset // 2, (offset + len(chunk)) // 2,
