@@ -27,7 +27,8 @@ concurrency:
 jobs:
   windows-wheel:
     name: Windows KWS native tests and wheel
-    runs-on: windows-latest
+    # Match the pinned CMake 3.x / Visual Studio 2022 generator.
+    runs-on: windows-2022
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
