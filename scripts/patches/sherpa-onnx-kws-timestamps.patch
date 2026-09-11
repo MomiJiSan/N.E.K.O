@@ -30,3 +30,15 @@ index c8cb18d..171dca3 100644
  
    void DecodeStreams(OnlineStream **ss, int32_t n) const override {
      for (int32_t i = 0; i < n; ++i) {
+diff --git a/sherpa-onnx/csrc/version.cc b/sherpa-onnx/csrc/version.cc
+--- a/sherpa-onnx/csrc/version.cc
++++ b/sherpa-onnx/csrc/version.cc
+@@ -20,7 +20,7 @@ const char *GetGitSha1() {
+ }
+ 
+ const char *GetVersionStr() {
+-  static const char *version = "1.13.8";
++  static const char *version = "1.13.8+neko.kws2";
+   return version;
+ }
+ 
