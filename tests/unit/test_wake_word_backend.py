@@ -408,9 +408,15 @@ async def test_unverified_ready_payload_never_marks_detector_ready(monkeypatch, 
 @pytest.mark.parametrize("version", [None, "1.13.8", "1.13.8+neko.kws1"])
 def test_worker_rejects_old_runtime_without_ready_event(monkeypatch, capsys, version):
     monkeypatch.setenv("NEKO_WAKE_WORD_DIAGNOSTICS", "1")
-    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(__version__=version))
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(
+        __version__=version, version=backend.SUPPORTED_RUNTIME_VERSION))
+    config = backend.SherpaWakeWordConfig("unused", ("x @name",))
+    # Reject specifically at the package-version gate, before unrelated missing
+    # assets could produce the same generic worker-failure response.
+    with pytest.raises(backend.WakeWordBackendError, match="RUNTIME_FIX_REQUIRED"):
+        backend._StreamingSpotter(config)
     connection = WorkerConnection()
-    backend._worker(connection, backend.SherpaWakeWordConfig("unused", ("x @name",)))
+    backend._worker(connection, config)
     assert connection.responses == [(False, "WAKE_WORD_WORKER_FAILED")]
     assert connection.closed
     assert "event=ready" not in capsys.readouterr().out
