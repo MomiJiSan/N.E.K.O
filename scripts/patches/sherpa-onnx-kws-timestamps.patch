@@ -7,7 +7,7 @@ index 03ed01e..27851fc 100644
  # ./CHANGELOG.md
  # ./new-release.sh
 -set(SHERPA_ONNX_VERSION "1.13.8")
-+set(SHERPA_ONNX_VERSION "1.13.8+neko.kws1")
++set(SHERPA_ONNX_VERSION "1.13.8+neko.kws2")
  
  # Disable warning about
  #
