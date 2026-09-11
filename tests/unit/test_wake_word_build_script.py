@@ -92,19 +92,33 @@ def test_clean_preflight_reaches_only_the_blocked_clone(preflight, tmp_path):
 
 @pytest.mark.parametrize("shell", POWERSHELLS or [None], ids=lambda path: Path(path).stem if path else "no-powershell")
 @pytest.mark.parametrize("build_relative", ["b/Release", "b/platform-specific/Release"])
-def test_native_test_build_uses_exact_source_cache(tmp_path, shell, build_relative):
+@pytest.mark.parametrize("variant,expected_version,merge,candidates", [
+    ("combined", "1.13.8+neko.kws2", "ON", "ON"),
+    ("baseline", "1.13.8.dev0+neko.kws2.baseline", "OFF", "OFF"),
+    ("merge", "1.13.8.dev0+neko.kws2.merge", "ON", "OFF"),
+    ("candidates", "1.13.8.dev0+neko.kws2.candidates", "OFF", "ON"),
+])
+def test_native_test_build_uses_exact_source_cache(
+    tmp_path, shell, build_relative, variant, expected_version, merge, candidates,
+):
     if shell is None:
         pytest.skip("PowerShell is required to execute Windows build flow")
     output = tmp_path / "build output"
     observed = tmp_path / "native-build.json"
     wrapper = tmp_path / "mock-build.ps1"
     wrapper.write_text(r'''
-param([string]$BuildScript, [string]$OutputPath, [string]$PythonPath)
+param([string]$BuildScript, [string]$OutputPath, [string]$PythonPath, [string]$Variant)
 $ErrorActionPreference = 'Stop'
 function global:git {
     $global:LASTEXITCODE = 0
     if ($args[0] -eq 'clone') {
-        New-Item -ItemType Directory -Path $args[-1] | Out-Null
+        $mockSource = $args[-1]
+        New-Item -ItemType Directory -Path (Join-Path $mockSource 'sherpa-onnx/csrc') -Force | Out-Null
+        # Model the post-patch combined source; git apply is a no-op below.
+        [IO.File]::WriteAllText((Join-Path $mockSource 'CMakeLists.txt'),
+            'set(SHERPA_ONNX_VERSION "1.13.8+neko.kws2")')
+        [IO.File]::WriteAllText((Join-Path $mockSource 'sherpa-onnx/csrc/version.cc'),
+            'const char *GetVersionStr() { static const char *version = "1.13.8+neko.kws2"; return version; }')
     } elseif ($args -contains 'rev-parse') {
         Write-Output '11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf'
     } elseif (-not ($args -contains 'apply')) {
@@ -114,6 +128,26 @@ function global:git {
 function global:uv {
     $global:LASTEXITCODE = 0
     if (($args -contains 'setup.py') -and ($args -contains 'build')) {
+        $expectedVersion = $env:NEKO_TEST_EXPECTED_VERSION
+        $cmakeVersion = [IO.File]::ReadAllText((Join-Path (Get-Location).Path 'CMakeLists.txt'))
+        $nativeVersion = [IO.File]::ReadAllText((Join-Path (Get-Location).Path 'sherpa-onnx/csrc/version.cc'))
+        if (-not $cmakeVersion.Contains('set(SHERPA_ONNX_VERSION "' + $expectedVersion + '")')) {
+            throw 'Package version not synchronized before setup build'
+        }
+        if (-not $nativeVersion.Contains('static const char *version = "' + $expectedVersion + '";')) {
+            throw 'Native version not synchronized before setup build'
+        }
+        foreach ($expectedSwitch in @(
+            ('-DSHERPA_ONNX_NEKO_KWS_MERGE=' + $env:NEKO_TEST_EXPECTED_MERGE),
+            ('-DSHERPA_ONNX_NEKO_KWS_CANDIDATES=' + $env:NEKO_TEST_EXPECTED_CANDIDATES))) {
+            if (-not $env:SHERPA_ONNX_CMAKE_ARGS.Contains($expectedSwitch)) {
+                throw "Incorrect variant switch: $expectedSwitch"
+            }
+        }
+        $hasAblation = $env:SHERPA_ONNX_CMAKE_ARGS.Contains('-DSHERPA_ONNX_NEKO_KWS_ABLATION=ON')
+        if ($hasAblation -ne ($env:NEKO_TEST_VARIANT -ne 'combined')) {
+            throw 'Incorrect ablation release guard'
+        }
         $source = (Get-Location).Path.Replace([char]92, [char]47)
         $build = Join-Path (Get-Location).Path $env:NEKO_TEST_BUILD_RELATIVE
         $dependency = Join-Path $build '_deps/vendor-subbuild'
@@ -133,14 +167,17 @@ function global:uv {
     }
 }
 try {
-    & $BuildScript -Python $PythonPath -OutputDirectory $OutputPath
+    & $BuildScript -Python $PythonPath -OutputDirectory $OutputPath -Variant $Variant
 } catch { Write-Output $_.Exception.Message; exit 91 }
 ''', encoding="utf-8")
     env = {key: value for key, value in os.environ.items() if key not in PACKAGING_FLAGS}
     env.update(NEKO_TEST_BUILD_RELATIVE=build_relative, NEKO_TEST_BUILD_OBSERVED=str(observed))
+    env.update(NEKO_TEST_EXPECTED_VERSION=expected_version, NEKO_TEST_EXPECTED_MERGE=merge,
+               NEKO_TEST_EXPECTED_CANDIDATES=candidates, NEKO_TEST_VARIANT=variant)
     result = subprocess.run(
         [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(wrapper),
-         "-BuildScript", str(BUILD_SCRIPT), "-OutputPath", str(output), "-PythonPath", sys.executable],
+         "-BuildScript", str(BUILD_SCRIPT), "-OutputPath", str(output), "-PythonPath", sys.executable,
+         "-Variant", variant],
         env=env, capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 91
