@@ -44,7 +44,7 @@ if ($Variant -ne 'combined') {
 }
 $wakeSavedCmake = $env:SHERPA_ONNX_CMAKE_ARGS
 try {
-    $env:SHERPA_ONNX_CMAKE_ARGS = '-DCMAKE_BUILD_TYPE=Release -DSHERPA_ONNX_ENABLE_BINARY=OFF -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF -DSHERPA_ONNX_ENABLE_TTS=ON -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=ON -DSHERPA_ONNX_NEKO_KWS_TESTS=ON'
+    $env:SHERPA_ONNX_CMAKE_ARGS = '-G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DSHERPA_ONNX_ENABLE_BINARY=OFF -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF -DSHERPA_ONNX_ENABLE_TTS=ON -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=ON -DSHERPA_ONNX_NEKO_KWS_TESTS=ON'
     $wakeMerge = if ($Variant -in @('combined', 'merge')) { 'ON' } else { 'OFF' }
     $wakeCandidates = if ($Variant -in @('combined', 'candidates')) { 'ON' } else { 'OFF' }
     $env:SHERPA_ONNX_CMAKE_ARGS += " -DSHERPA_ONNX_NEKO_KWS_MERGE=$wakeMerge -DSHERPA_ONNX_NEKO_KWS_CANDIDATES=$wakeCandidates"
@@ -56,7 +56,15 @@ try {
         New-Item -ItemType Directory -Force -Path 'build/sherpa_onnx/bin' | Out-Null
         uv run --no-project --python $Python --with cmake==3.31.10 --with setuptools==83.0.0 --with wheel==0.48.0 python setup.py build --build-temp b
         if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
-        uv run --no-project --python $Python --with cmake==3.31.10 cmake --build b --config Release --target neko-kws-decoder-test neko-kws-lifecycle-test --parallel 2
+        # setuptools can append Release to --build-temp. Locate the source's
+        # cache, excluding dependency/subbuild caches, instead of assuming b.
+        $wakeNormalizedSource = $wakeSource.Replace([char]92, [char]47)
+        $wakeRootCaches = @(Get-ChildItem -LiteralPath 'b' -Recurse -Filter 'CMakeCache.txt' | Where-Object {
+            Select-String -LiteralPath $_.FullName -Quiet -Pattern ('^CMAKE_HOME_DIRECTORY:INTERNAL=' + [regex]::Escape($wakeNormalizedSource) + '$')
+        })
+        if ($wakeRootCaches.Count -ne 1) { throw 'Expected exactly one source CMake cache' }
+        $wakeBuildDirectory = $wakeRootCaches[0].DirectoryName
+        uv run --no-project --python $Python --with cmake==3.31.10 cmake --build $wakeBuildDirectory --config Release --target neko-kws-decoder-test neko-kws-lifecycle-test --parallel 2
         if ($LASTEXITCODE -ne 0) { throw 'Native test build failed' }
         $wakeNativeTests = @(Get-ChildItem -LiteralPath 'b' -Recurse -Filter 'neko-kws-decoder-test.exe')
         if ($wakeNativeTests.Count -ne 1) { throw 'Expected exactly one native KWS test executable' }
@@ -74,7 +82,7 @@ try {
             $wakeImport = $wakeImportJson | ConvertFrom-Json
             if ($wakeImport.package_version -ne $wakeVersion -or $wakeImport.native_version -ne $wakeVersion) { throw 'Built wheel package/native version check failed' }
         } finally { Pop-Location }
-        $wakeCache = Get-Content -LiteralPath 'b/CMakeCache.txt' | Where-Object {
+        $wakeCache = Get-Content -LiteralPath $wakeRootCaches[0].FullName | Where-Object {
             $_ -match '^(CMAKE_(CXX_COMPILER|C_COMPILER|GENERATOR|BUILD_TYPE)|SHERPA_ONNX_NEKO_KWS_[A-Z_]+):'
         }
         $wakeManifest = [ordered]@{
@@ -91,6 +99,11 @@ try {
             patches = @($wakePatches | ForEach-Object { @{ file = [IO.Path]::GetFileName($_); sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash } })
             wheel = @{ file = $wakeWheels[0].Name; sha256 = (Get-FileHash -LiteralPath $wakeWheels[0].FullName -Algorithm SHA256).Hash }
         }
+        $wakeNativeOutput = Join-Path $wakeOutput 'native'
+        New-Item -ItemType Directory -Path $wakeNativeOutput | Out-Null
+        Get-ChildItem -LiteralPath $wakeNativeTests[0].DirectoryName -File | Where-Object {
+            $_.Name -like 'neko-kws-*.exe' -or $_.Name -like 'onnxruntime*.dll'
+        } | Copy-Item -Destination $wakeNativeOutput
         $wakeManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $wakeOutput 'build-manifest.json') -Encoding utf8
         $wakeWheels | Get-FileHash -Algorithm SHA256
     } finally { Pop-Location }
