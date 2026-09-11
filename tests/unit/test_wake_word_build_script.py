@@ -1,6 +1,7 @@
 """Execute build preflight guards without permitting cloning or compilation."""
 
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -87,3 +88,69 @@ def test_clean_preflight_reaches_only_the_blocked_clone(preflight, tmp_path):
     assert "EXTERNAL_COMMAND_BLOCKED" in result.stdout
     assert marker.read_text() == "git"
     assert list(output.iterdir()) == []
+
+
+@pytest.mark.parametrize("shell", POWERSHELLS or [None], ids=lambda path: Path(path).stem if path else "no-powershell")
+@pytest.mark.parametrize("build_relative", ["b/Release", "b/platform-specific/Release"])
+def test_native_test_build_uses_exact_source_cache(tmp_path, shell, build_relative):
+    if shell is None:
+        pytest.skip("PowerShell is required to execute Windows build flow")
+    output = tmp_path / "build output"
+    observed = tmp_path / "native-build.json"
+    wrapper = tmp_path / "mock-build.ps1"
+    wrapper.write_text(r'''
+param([string]$BuildScript, [string]$OutputPath, [string]$PythonPath)
+$ErrorActionPreference = 'Stop'
+function global:git {
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'clone') {
+        New-Item -ItemType Directory -Path $args[-1] | Out-Null
+    } elseif ($args -contains 'rev-parse') {
+        Write-Output '11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf'
+    } elseif (-not ($args -contains 'apply')) {
+        throw 'Unexpected git operation'
+    }
+}
+function global:uv {
+    $global:LASTEXITCODE = 0
+    if (($args -contains 'setup.py') -and ($args -contains 'build')) {
+        $source = (Get-Location).Path.Replace([char]92, [char]47)
+        $build = Join-Path (Get-Location).Path $env:NEKO_TEST_BUILD_RELATIVE
+        $dependency = Join-Path $build '_deps/vendor-subbuild'
+        New-Item -ItemType Directory -Path $dependency -Force | Out-Null
+        # The dependency's home starts with the complete source path. A substring
+        # match incorrectly treats this as a second root cache.
+        [IO.File]::WriteAllText((Join-Path $dependency 'CMakeCache.txt'),
+            "CMAKE_HOME_DIRECTORY:INTERNAL=$source/third_party/vendor`n")
+        [IO.File]::WriteAllText((Join-Path $build 'CMakeCache.txt'),
+            "CMAKE_HOME_DIRECTORY:INTERNAL=$source`nCMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022`n")
+    } elseif (($args -contains 'cmake') -and ($args -contains '--build')) {
+        $record = @{ arguments = @($args); configuration = $env:SHERPA_ONNX_CMAKE_ARGS }
+        [IO.File]::WriteAllText($env:NEKO_TEST_BUILD_OBSERVED, ($record | ConvertTo-Json -Depth 4))
+        throw 'NATIVE_BUILD_REACHED'
+    } else {
+        throw 'Unexpected uv operation'
+    }
+}
+try {
+    & $BuildScript -Python $PythonPath -OutputDirectory $OutputPath
+} catch { Write-Output $_.Exception.Message; exit 91 }
+''', encoding="utf-8")
+    env = {key: value for key, value in os.environ.items() if key not in PACKAGING_FLAGS}
+    env.update(NEKO_TEST_BUILD_RELATIVE=build_relative, NEKO_TEST_BUILD_OBSERVED=str(observed))
+    result = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(wrapper),
+         "-BuildScript", str(BUILD_SCRIPT), "-OutputPath", str(output), "-PythonPath", sys.executable],
+        env=env, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 91
+    assert "NATIVE_BUILD_REACHED" in result.stdout, result.stdout + result.stderr
+    record = json.loads(observed.read_text(encoding="utf-8"))
+    args = record["arguments"]
+    assert Path(args[args.index("--build") + 1]) == output / "sherpa-onnx" / build_relative
+    assert args[args.index("--config") + 1] == "Release"
+    assert args[args.index("--target") + 1:args.index("--parallel")] == [
+        "neko-kws-decoder-test", "neko-kws-lifecycle-test",
+    ]
+    assert '-G "Visual Studio 17 2022" -A x64' in record["configuration"]
+    assert not (output / "build-manifest.json").exists()

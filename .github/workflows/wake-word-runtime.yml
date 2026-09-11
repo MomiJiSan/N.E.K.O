@@ -47,7 +47,6 @@ jobs:
           path: |
             C:\kw\sherpa-onnx\dist\*.whl
             C:\kw\build-manifest.json
-            C:\kw\sherpa-onnx\b\bin\Release\neko-kws-*.exe
-            C:\kw\sherpa-onnx\b\bin\Release\onnxruntime*.dll
+            C:\kw\native\*
           if-no-files-found: error
           retention-days: 14
