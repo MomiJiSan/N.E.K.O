@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
 import math
+import os
 
 from main_logic.voice_input.activation import (
     ActivationDecision,
@@ -17,6 +19,7 @@ from main_logic.voice_input.activation import (
     VerificationRequest,
     VerificationResultKind,
     VoiceActivationController,
+    WakeWordDetector,
 )
 
 from .activation_scoring import (
@@ -42,6 +45,7 @@ class VoiceSessionActivationRuntimeConfig:
     second_checkpoint_seconds: float = 3.0
     candidate_silence_seconds: float = 0.5
     shutdown_timeout_seconds: float = 1.0
+    wake_queue_bytes: int = 256_000
 
     def __post_init__(self) -> None:
         if (
@@ -57,6 +61,8 @@ class VoiceSessionActivationRuntimeConfig:
             raise ValueError("candidate_silence_seconds must be positive")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
+        if type(self.wake_queue_bytes) is not int or self.wake_queue_bytes <= 0:
+            raise ValueError("wake_queue_bytes must be a positive integer")
 
 
 class VoiceSessionActivationRuntime:
@@ -72,6 +78,7 @@ class VoiceSessionActivationRuntime:
         config: VoiceSessionActivationRuntimeConfig | None = None,
         status_callback: ActivationStatusCallback | None = None,
         enabled: bool = True,
+        wake_detector: WakeWordDetector | None = None,
     ) -> None:
         if not callable(output):
             raise TypeError("output must be callable")
@@ -89,6 +96,15 @@ class VoiceSessionActivationRuntime:
         self._enabled = enabled
         self._lock = asyncio.Lock()
         self._verification_task: asyncio.Task[None] | None = None
+        self._pending_verification_request: VerificationRequest | None = None
+        self._wake_detector = wake_detector
+        self._wake_ready = False
+        self._wake_close_complete = False
+        self._wake_task: asyncio.Task[None] | None = None
+        self._wake_queue: deque[tuple[AudioFrame, int]] = deque()
+        self._wake_queue_bytes = 0
+        self._wake_inflight_bytes = 0
+        self._wake_epoch: int | None = None
         self._output_task: asyncio.Task[None] | None = None
         self._output_retry_task: asyncio.Task[None] | None = None
         self._output_retry_requested = False
@@ -277,6 +293,17 @@ class VoiceSessionActivationRuntime:
         if not self._enabled:
             return self._publish(self._controller.disable())
         status = await self._scorer.prepare()
+        wake_error = False
+        if status is ActivationScoreStatus.READY and self._wake_detector is not None:
+            async with self._lock:
+                if self._closed:
+                    return self._publish(self._controller.close())
+            try:
+                await self._wake_detector.prepare()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                wake_error = True
         async with self._lock:
             if self._closed:
                 return self._publish(self._controller.close())
@@ -287,6 +314,15 @@ class VoiceSessionActivationRuntime:
                     )
                 )
             if status is ActivationScoreStatus.READY:
+                if wake_error:
+                    self._wake_ready = False
+                    return self._publish(
+                        self._controller.mark_unavailable(
+                            self._generation,
+                            "wake_word_prepare_failed",
+                        )
+                    )
+                self._wake_ready = self._wake_detector is not None
                 return self._publish(self._controller.mark_ready(self._generation))
             return self._publish(
                 self._controller.mark_unavailable(
@@ -319,6 +355,13 @@ class VoiceSessionActivationRuntime:
                 ActivationState.WAITING,
                 ActivationState.VERIFYING,
             }:
+                if not self._enqueue_wake_locked(frame):
+                    return self._publish(
+                        self._controller.mark_unavailable(
+                            self._generation,
+                            "wake_word_queue_overflow",
+                        )
+                    )
                 request = self._advance_candidate(frame, voice_activity=voice_activity)
             elif decision.state in {ActivationState.ACTIVE, ActivationState.REPLAYING}:
                 self._clear_candidate()
@@ -387,14 +430,26 @@ class VoiceSessionActivationRuntime:
                         self._output_task,
                         self._output_retry_task,
                         self._idle_task,
+                        self._wake_task,
                     )
                     if task is not None
                 )
             shutdown_tasks = self._shutdown_tasks
+            self._clear_wake_queue_locked()
+            self._pending_verification_request = None
         for task in shutdown_tasks:
             if not task.done():
                 task.cancel()
         close_error: BaseException | None = None
+        if self._wake_detector is not None and not self._wake_close_complete:
+            try:
+                await self._wake_detector.close()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                close_error = error
+            else:
+                self._wake_close_complete = True
         if not self._scorer_close_complete:
             try:
                 await self._scorer.close()
@@ -468,15 +523,34 @@ class VoiceSessionActivationRuntime:
         return decision.verification_request
 
     def _ensure_verification_task_locked(self, request: VerificationRequest) -> None:
+        if not self._controller.verification_is_current(request):
+            return
         task = self._verification_task
         if task is not None and not task.done():
+            # The old backend call may still hold the scorer's lock. Keep just
+            # one current request, not an unbounded collection of waiters.
+            self._pending_verification_request = request
             return
+        self._pending_verification_request = None
         self._verification_task = asyncio.create_task(
             self._verify(request),
             name="voice-session-activation-verify",
         )
 
     async def _verify(self, request: VerificationRequest) -> None:
+        current_task = asyncio.current_task()
+        try:
+            await self._score_and_apply(request)
+        finally:
+            async with self._lock:
+                if self._verification_task is current_task:
+                    self._verification_task = None
+                    pending = self._pending_verification_request
+                    self._pending_verification_request = None
+                    if pending is not None and not self._closed:
+                        self._ensure_verification_task_locked(pending)
+
+    async def _score_and_apply(self, request: VerificationRequest) -> None:
         async with self._lock:
             verification_input = self._controller.claim_verification_input(request)
         if verification_input is None:
@@ -486,25 +560,31 @@ class VoiceSessionActivationRuntime:
             self._scorer.scorer_generation,
             request.request_id,
         )
-        score = await self._scorer.score(
-            score_identity,
-            verification_input.pcm,
-            sample_rate_hz=verification_input.sample_rate,
-        )
-        if score.status is ActivationScoreStatus.READY:
+        try:
+            score = await self._scorer.score(
+                score_identity,
+                verification_input.pcm,
+                sample_rate_hz=verification_input.sample_rate,
+            )
+            score_status = score.status
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            score_status = ActivationScoreStatus.FAILED
+        if score_status is ActivationScoreStatus.READY:
             kind = (
                 VerificationResultKind.OWNER
                 if float(score.similarity) >= self._config.owner_similarity_threshold
                 else VerificationResultKind.NOT_OWNER
             )
-        elif score.status is ActivationScoreStatus.INVALID_AUDIO:
+        elif score_status is ActivationScoreStatus.INVALID_AUDIO:
             kind = VerificationResultKind.INSUFFICIENT
         else:
             kind = VerificationResultKind.FAILED
 
         next_request: VerificationRequest | None = None
         async with self._lock:
-            if self._closed:
+            if self._closed or not self._controller.verification_is_current(request):
                 return
             current = self._qualification_now_locked()
             decision = (
@@ -517,7 +597,7 @@ class VoiceSessionActivationRuntime:
                 logger.warning(
                     "Voice activation verification failed: status=%s request=%s "
                     "pcm_bytes=%s sample_rate=%s audio_seconds=%.3f",
-                    score.status.value,
+                    score_status.value,
                     request.request_id,
                     len(verification_input.pcm),
                     verification_input.sample_rate,
@@ -527,9 +607,127 @@ class VoiceSessionActivationRuntime:
             next_request = decision.verification_request
             self._ensure_output_task_locked()
             self._ensure_idle_task_locked()
-            self._verification_task = None
             if next_request is not None:
                 self._ensure_verification_task_locked(next_request)
+
+    def _clear_wake_queue_locked(self) -> None:
+        self._wake_queue.clear()
+        self._wake_queue_bytes = 0
+
+    def _enqueue_wake_locked(self, frame: AudioFrame) -> bool:
+        if self._wake_detector is None or not self._wake_ready:
+            return True
+        epoch = self._controller.standby_epoch
+        if self._wake_epoch != epoch:
+            self._clear_wake_queue_locked()
+            self._wake_epoch = epoch
+        if (
+            self._wake_queue_bytes + self._wake_inflight_bytes + len(frame.pcm)
+            > self._config.wake_queue_bytes
+        ):
+            self._clear_wake_queue_locked()
+            return False
+        self._wake_queue.append((frame, epoch))
+        self._wake_queue_bytes += len(frame.pcm)
+        self._ensure_wake_task_locked()
+        return True
+
+    def _ensure_wake_task_locked(self) -> None:
+        if self._closed or not self._wake_queue:
+            return
+        if self._wake_task is None or self._wake_task.done():
+            self._wake_task = asyncio.create_task(
+                self._run_wake_detector(), name="voice-wake-word"
+            )
+
+    async def _run_wake_detector(self) -> None:
+        current_task = asyncio.current_task()
+        diagnostics = os.getenv("NEKO_WAKE_WORD_DIAGNOSTICS") == "1"
+        try:
+            while True:
+                async with self._lock:
+                    if self._closed or self.state not in {
+                        ActivationState.WAITING,
+                        ActivationState.VERIFYING,
+                    }:
+                        self._clear_wake_queue_locked()
+                        return
+                    if not self._wake_queue:
+                        return
+                    frame, epoch = self._wake_queue.popleft()
+                    self._wake_queue_bytes -= len(frame.pcm)
+                    if epoch != self._controller.standby_epoch:
+                        continue
+                    self._wake_inflight_bytes = len(frame.pcm)
+                failed = False
+                try:
+                    detection = await self._wake_detector.feed(frame, epoch)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failed = True
+                    detection = None
+                async with self._lock:
+                    self._wake_inflight_bytes = 0
+                    if (
+                        self._closed
+                        or epoch != self._controller.standby_epoch
+                        or self.state
+                        not in {ActivationState.WAITING, ActivationState.VERIFYING}
+                    ):
+                        if diagnostics and detection is not None:
+                            self._log_wake_diagnostic("stale_request", epoch)
+                        continue
+                    if failed:
+                        self._wake_ready = False
+                        self._clear_wake_queue_locked()
+                        self._publish(
+                            self._controller.mark_unavailable(
+                                self._generation,
+                                "wake_word_runtime_failed",
+                            )
+                        )
+                        return
+                    if detection is not None:
+                        # Check evidence identity before capture-progress checks,
+                        # which can themselves fail the current input closed.
+                        if (
+                            detection.generation != self._generation
+                            or detection.epoch != epoch
+                        ):
+                            if diagnostics:
+                                self._log_wake_diagnostic("stale_evidence", epoch)
+                            continue
+                        self._qualification_now_locked()
+                        decision = (
+                            self._capture_progress_failure
+                            or self._controller.apply_wake_word(
+                                detection,
+                                now=self._controller.monotonic_now(),
+                            )
+                        )
+                        self._publish(decision)
+                        if diagnostics:
+                            self._log_wake_diagnostic(decision.reason, epoch)
+                        if decision.reason == "wake_word_detected":
+                            self._pending_verification_request = None
+                            self._clear_candidate()
+                            self._clear_wake_queue_locked()
+                            self._ensure_output_task_locked()
+                            self._ensure_idle_task_locked()
+        finally:
+            async with self._lock:
+                if self._wake_task is current_task:
+                    self._wake_inflight_bytes = 0
+                    self._wake_task = None
+                    self._ensure_wake_task_locked()
+
+    def _log_wake_diagnostic(self, reason: str, epoch: int) -> None:
+        try:
+            logger.info("Wake word decision reason=%s state=%s epoch=%s queued_bytes=%s",
+                        reason, self.state.value, epoch, self._wake_queue_bytes)
+        except Exception:
+            pass
 
     def _ensure_output_task_locked(self) -> None:
         if self._closed or self._output_pause_owner is not None:

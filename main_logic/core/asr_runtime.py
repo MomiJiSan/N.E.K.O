@@ -2148,7 +2148,7 @@ class AsrRuntimeMixin:
         self._voice_session_activation_degraded = (
             decision.state is ActivationState.UNAVAILABLE
         )
-        if decision.reason == "owner_confirmed":
+        if decision.reason in {"owner_confirmed", "wake_word_detected"}:
             self._voice_activation_delivery_batch = (
                 getattr(self, "_voice_activation_delivery_batch", 0) + 1
             )
