@@ -41,6 +41,12 @@ if ($Variant -ne 'combined') {
     $wakeVersionLine = 'set(SHERPA_ONNX_VERSION "1.13.8+neko.kws2")'
     if (-not $wakeCmakeText.Contains($wakeVersionLine)) { throw 'Patched runtime version missing' }
     [IO.File]::WriteAllText($wakeCmakeFile, $wakeCmakeText.Replace($wakeVersionLine, "set(SHERPA_ONNX_VERSION `"$wakeVersion`")"))
+    # Upstream exports a separately hard-coded native version.
+    $wakeNativeVersionFile = Join-Path $wakeSource 'sherpa-onnx/csrc/version.cc'
+    $wakeNativeVersionText = [IO.File]::ReadAllText($wakeNativeVersionFile)
+    $wakeNativeVersionLine = 'static const char *version = "1.13.8+neko.kws2";'
+    if (-not $wakeNativeVersionText.Contains($wakeNativeVersionLine)) { throw 'Patched native runtime version missing' }
+    [IO.File]::WriteAllText($wakeNativeVersionFile, $wakeNativeVersionText.Replace($wakeNativeVersionLine, "static const char *version = `"$wakeVersion`";"))
 }
 $wakeSavedCmake = $env:SHERPA_ONNX_CMAKE_ARGS
 try {
@@ -80,7 +86,9 @@ try {
             $wakeImportJson = uv run --no-project --python $Python --with $wakeWheels[0].FullName python -c 'import json,sys,sherpa_onnx as s; print(json.dumps(dict(package_version=s.__version__,native_version=s.version,onnxruntime_version=s.onnxruntime_version,git_sha1=s.git_sha1,python=sys.version)))'
             if ($LASTEXITCODE -ne 0) { throw 'Built wheel import failed' }
             $wakeImport = $wakeImportJson | ConvertFrom-Json
-            if ($wakeImport.package_version -ne $wakeVersion -or $wakeImport.native_version -ne $wakeVersion) { throw 'Built wheel package/native version check failed' }
+            if ($wakeImport.package_version -ne $wakeVersion -or $wakeImport.native_version -ne $wakeVersion) {
+                throw "Built wheel package/native version check failed: package=$($wakeImport.package_version), native=$($wakeImport.native_version), expected=$wakeVersion"
+            }
         } finally { Pop-Location }
         $wakeCache = Get-Content -LiteralPath $wakeRootCaches[0].FullName | Where-Object {
             $_ -match '^(CMAKE_(CXX_COMPILER|C_COMPILER|GENERATOR|BUILD_TYPE)|SHERPA_ONNX_NEKO_KWS_[A-Z_]+):'
