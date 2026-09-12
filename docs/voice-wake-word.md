@@ -17,6 +17,10 @@ $env:NEKO_WAKE_WORD_MODEL_DIR = 'C:\NEKO-models\wake-word'
 当前必须使用带时间戳及解码修复的 `sherpa-onnx==1.13.8+neko.kws2`；上面的
 extra 只安装上游基础依赖，不包含修复。准备阶段会拒绝未验证的运行库版本。
 旧 kws1 也会被拒绝；Python 包版本与原生库导出的版本必须同时匹配。
+已验证的 Windows x64 / Python 3.11 产物见
+[构建记录](https://github.com/MomiJiSan/N.E.K.O/actions/runs/34623583302)，
+wheel SHA256 为 `7f435cd0ff26372be1478665ca58fd8c6df014bc3c0c9dacf5ac3411098406c2`。
+下载已有产物后可直接按下方 `--with $wakeRuntimeWheel` 方式启动。
 Windows 安装 VS 2022 C++ Build Tools、Windows SDK、Git 后，可构建本地 wheel
 （构建命令通过 uv 提供固定版本 CMake）：
 
@@ -156,7 +160,7 @@ uv run --no-sync --with $wakeRuntimeWheel python scripts/evaluate_wake_word.py -
 
 ```powershell
 $env:NEKO_WAKE_WORD_TEST_WAV = 'C:\NEKO-tests\name-and-command.wav'
-uv run --no-sync --with $wakeRuntimeWheel pytest tests/unit/test_wake_word_reset_timing.py tests/unit/test_wake_word_model_smoke.py -q
+uv run --no-sync --with $wakeRuntimeWheel pytest tests/unit/test_wake_word_reset_timing.py tests/unit/test_wake_word_model_smoke.py -q --run-manual
 ```
 
 用例在 WAV 前添加 12 / 45 秒真实静音，要求真实模型命中位置位于名字输入后、
