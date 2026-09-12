@@ -1588,6 +1588,75 @@ test('TTL expiry while awaiting a retry stops media resources and clears its int
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment expired.');
 });
 
+test('TTL reconciliation preserves a committed enrollment while its upload response is pending', async () => {
+    const responseGate = deferred();
+    let committedPayload;
+    const harness = createHarness({
+        finalResponseTransform(payload) {
+            committedPayload = payload;
+            return responseGate.promise;
+        },
+    });
+    await harness.initialize();
+    const enrolling = harness.emit('voice-identity-start');
+    await flush();
+    assert.ok(committedPayload);
+    harness.advanceTime(45000);
+    await flush();
+    const message = harness.elements.get('voice-identity-message').textContent;
+    assert.notEqual(message, 'Enrollment expired.');
+    assert.equal(message, 'Enrollment complete.');
+    assert.doesNotMatch(message, /72%/);
+    assert.equal(harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/cancel`), false);
+    assert.equal(harness.intervalCount, 0);
+    assert.equal(harness.mediaStreams[0].track.stopped, true);
+    responseGate.resolve(committedPayload);
+    await enrolling;
+    assert.equal(harness.elements.get('voice-identity-message').textContent, message);
+});
+
+for (const mismatch of ['enrollment', 'profile']) {
+    test(`TTL reconciliation cannot claim completion for a different ${mismatch}`, async () => {
+        const harness = createHarness({
+            initialEnrollment: true,
+            initialEnrollmentProfileId: 'bound-profile',
+            initialRemainingSeconds: 1,
+        });
+        await harness.initialize();
+        harness.setCanonicalStatusOverride({
+            enrollment: null,
+            has_profile: true,
+            profile_generation: mismatch === 'profile' ? 'other-profile' : 'bound-profile',
+            last_completed_enrollment_id: mismatch === 'enrollment' ? 'other-enrollment' : 'enrollment-1',
+        });
+        harness.advanceTime(1500);
+        await flush();
+        assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment expired.');
+    });
+}
+
+test('late TTL reconciliation cannot replace a cancelled enrollment with stale completion', async () => {
+    const statusGate = deferred();
+    const harness = createHarness({
+        initialEnrollment: true, initialEnrollmentProfileId: 'bound-profile',
+        initialRemainingSeconds: 1,
+        statusHandler({requestNumber, payload}) {
+            return requestNumber === 2 ? statusGate.promise : jsonResponse(payload);
+        },
+    });
+    await harness.initialize();
+    harness.advanceTime(1500);
+    await flush();
+    await harness.emit('voice-identity-cancel');
+    statusGate.resolve(jsonResponse({
+        enrollment: null, has_profile: true, profile_generation: 'bound-profile',
+        last_completed_enrollment_id: 'enrollment-1',
+    }));
+    await flush();
+    assert.equal(harness.elements.get('voice-identity-message').textContent, '');
+    assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, true);
+});
+
 test('canonical enrollment audio errors show localized messages', async () => {
     const invalid = createHarness({ profileError: 'invalid_pcm' });
     await invalid.initialize();
