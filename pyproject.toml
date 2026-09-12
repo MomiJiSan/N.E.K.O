@@ -105,7 +105,7 @@ dependencies = [
 [project.optional-dependencies]
 # Optional local wake-word inference; model weights are provisioned separately.
 # Base dependency; use the locally built 1.13.8+neko.kws2 wheel at runtime.
-# Upstream 1.13.8 loses keyword timestamp offsets after silence (see docs/voice-wake-word.md).
+# Upstream 1.13.8 loses keyword timestamp offsets after silence; use scripts/build_wake_word_runtime.ps1.
 wake-word = ["sherpa-onnx==1.13.8"]
 
 [tool.hatch.version]
