@@ -3845,8 +3845,10 @@ class AsrRuntimeMixin:
         if self._voice_session_activation_degraded:
             return True
         factory = self._voice_session_activation_factory
-        if factory is None:
-            if self._voice_session_activation_required:
+        if factory is None or getattr(factory, "enforce", True) is False:
+            # Shadow is observational: use ordinary delivery without creating
+            # an activation writer, protected prefix, or replay retry policy.
+            if factory is None and self._voice_session_activation_required:
                 # Requested protection without a usable authority is a
                 # deliberate fail-closed state.  Consuming the local frame here
                 # prevents both native and independent-ASR downstream sends.
@@ -3871,7 +3873,7 @@ class AsrRuntimeMixin:
                     )
                     if (
                         not reconnected
-                        or self._voice_session_activation_factory is not None
+                        or self._voice_session_activation_factory is not factory
                         or self._capture_voice_session_activation_generation()
                         != generation
                     ):

@@ -55,6 +55,11 @@ class OwnerVoiceSessionActivationFactory:
         return self._activation_generation
 
     @property
+    def enforce(self) -> bool:
+        """Whether microphone delivery requires owner activation."""
+        return self._enforce
+
+    @property
     def noise_reduction_enabled(self) -> bool | None:
         return self._noise_reduction_enabled
 
