@@ -3988,6 +3988,25 @@ class AsrRuntimeMixin:
                         "[%s] voice-session activation runtime creation failed",
                         self.lanlan_name,
                     )
+                    decision = ActivationDecision(
+                        ActivationState.UNAVAILABLE,
+                        "runtime_creation_failed",
+                    )
+                    self._voice_session_activation_status = (
+                        generation,
+                        decision.state,
+                        decision.reason,
+                    )
+                    self._voice_session_activation_status_revision += 1
+                    AsrRuntimeMixin._schedule_core_asr_cleanup(
+                        self,
+                        self._send_voice_session_activation_status(
+                            generation,
+                            decision,
+                            self._voice_session_activation_status_revision,
+                        ),
+                        name="voice-session-activation-runtime-unavailable",
+                    )
                     return True
                 self._voice_session_activation_runtime = runtime
                 set_progress = getattr(runtime, "set_capture_progress_provider", None)
