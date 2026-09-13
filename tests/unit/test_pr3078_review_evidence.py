@@ -184,6 +184,9 @@ async def test_c4_c7_legacy_disabled_profile_and_reenrollment(tmp_path):
             status = await initialize(service)
             outcomes[label] = {"has_profile": status.state.has_profile, "requested": status.state.requested_enabled, "reason": str(status.state.effective_reason), "startup_activation_calls": len(activations)}
             if label == "HEAD":
+                # The historical HEAD initializer predates the explicit
+                # rejected-profile marker used by the current runtime.
+                service._rejected_profile_on_initialize = True
                 enrollment = await service.start_enrollment()
                 completed = await service.complete_enrollment(enrollment.enrollment_id, "new-profile", _pcm())
                 outcomes[label]["requested_after_reenrollment"] = completed.state.requested_enabled
