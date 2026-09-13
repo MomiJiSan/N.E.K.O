@@ -136,6 +136,8 @@ class VoiceInputAudioPipeline:
                     getattr(self._processor, "_denoiser", None) is not None,
                 )
             )
+            if getattr(self._processor, "rnnoise_processing_failed", False):
+                rnnoise_available = False
             raw_frame_count = getattr(
                 self._processor,
                 "rnnoise_frame_count",

@@ -441,6 +441,7 @@ class AudioProcessor:
             Denoised int16 numpy array
         """
         self._rnnoise_frame_count = 0
+        self._rnnoise_processing_failed = False
         self._rnnoise_peak = None
         self._rnnoise_mean = None
         self._rnnoise_last = None
@@ -485,6 +486,7 @@ class AudioProcessor:
                 output[output_offset : output_offset + self.RNNOISE_FRAME_SIZE] = denoised
             except Exception as e:
                 logger.error(f"❌ RNNoise processing error: {e}")
+                self._rnnoise_processing_failed = True
                 output[output_offset : output_offset + self.RNNOISE_FRAME_SIZE] = frame
             output_offset += self.RNNOISE_FRAME_SIZE
 
