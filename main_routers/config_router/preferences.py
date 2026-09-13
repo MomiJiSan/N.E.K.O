@@ -184,14 +184,14 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
             prepare_voice_identity_audio_contract_change,
             reconcile_voice_identity_audio_contract_change,
         ) = _VOICE_IDENTITY_AUDIO_CONTRACT_CALLBACKS
-        current = await aload_global_conversation_settings_snapshot()
+        current = await aload_global_conversation_settings_snapshot(strict=True)
         if current.settings.get("noiseReductionEnabled") is not enabled:
             return
         prepare_started = False
         try:
             prepare_started = True
             prepared = await prepare_voice_identity_audio_contract_change(enabled)
-            current = await aload_global_conversation_settings_snapshot()
+            current = await aload_global_conversation_settings_snapshot(strict=True)
             if current.settings.get("noiseReductionEnabled") is not enabled:
                 return
             if not prepared:
@@ -201,7 +201,7 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
                 )
                 return
             await _apply_noise_reduction_to_active_sessions(enabled)
-            current = await aload_global_conversation_settings_snapshot()
+            current = await aload_global_conversation_settings_snapshot(strict=True)
             if current.settings.get("noiseReductionEnabled") is not enabled:
                 return
             await reconcile_voice_identity_audio_contract_change(
