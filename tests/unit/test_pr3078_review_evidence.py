@@ -182,7 +182,21 @@ async def test_c4_c7_legacy_disabled_profile_and_reenrollment(tmp_path):
     assert outcomes["BASE"]["has_profile"] is True
     assert outcomes["HEAD"]["has_profile"] is False
     assert outcomes["HEAD"]["startup_activation_calls"] == 0
-    assert outcomes["HEAD"]["requested_after_reenrollment"] is True
+    assert outcomes["HEAD"]["requested_after_reenrollment"] is False
+
+
+@pytest.mark.asyncio
+async def test_first_enrollment_preserves_disabled_preference(tmp_path):
+    service, _, _, _ = _service(tmp_path)
+    await service._preference_store.asave(False)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    completed = await service.complete_enrollment(
+        enrollment.enrollment_id, "new-profile", _pcm()
+    )
+    assert completed.state.requested_enabled is False
+    assert str(completed.state.effective_reason) == "disabled"
+    await service.close()
 
 
 @pytest.mark.asyncio
