@@ -634,9 +634,10 @@ class VoiceIdentityService:
                 lease=lease,
                 expiry_task=expiry_task,
                 session_generation=self._enrollment_generation + 1,
-                requested_enabled_snapshot=(
-                    True if self._profile is None else self._requested_enabled
-                ),
+                # Preserve the user's explicit preference across enrollment.
+                # A first enrollment must not implicitly enable voice identity
+                # when the feature was disabled before recording started.
+                requested_enabled_snapshot=self._requested_enabled,
                 noise_reduction_enabled_snapshot=(
                     self._runtime_noise_reduction_enabled
                 ),
