@@ -30,7 +30,12 @@ HEAD = "299c0b4b8c14eb386c645ad180241c6756e0b5c1"
 
 
 def revision_method(revision, path, class_name, method_name, namespace):
-    source = subprocess.check_output(["git", "show", f"{revision}:{path}"], encoding="utf-8")
+    try:
+        source = subprocess.check_output(
+            ["git", "show", f"{revision}:{path}"], encoding="utf-8"
+        )
+    except subprocess.CalledProcessError:
+        pytest.skip(f"historical revision {revision} is unavailable in this checkout")
     tree = ast.parse(source)
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
     method = next(n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == method_name)
@@ -144,7 +149,13 @@ async def test_original_head_pipeline_with_nr_off_already_uses_energy(sample):
 
 
 def write_legacy_profile(path):
-    source = subprocess.check_output(["git", "show", f"{BASE}:main_logic/voice_identity_service/profile_store.py"], encoding="utf-8")
+    try:
+        source = subprocess.check_output(
+            ["git", "show", f"{BASE}:main_logic/voice_identity_service/profile_store.py"],
+            encoding="utf-8",
+        )
+    except subprocess.CalledProcessError:
+        pytest.skip(f"historical revision {BASE} is unavailable in this checkout")
     module = ModuleType("audit_base_profile_store")
     exec(compile(source, "base_profile_store.py", "exec"), vars(module))
     store = module.VoiceIdentityProfileStore(path, key_protector=_TestKeyProtector())
