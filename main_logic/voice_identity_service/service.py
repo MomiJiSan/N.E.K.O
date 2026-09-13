@@ -320,6 +320,7 @@ class VoiceIdentityService:
         self._activation_timeout_seconds = float(activation_timeout_seconds)
         self._operation_lock = asyncio.Lock()
         self._profile: SpeakerProfile | None = None
+        self._rejected_profile_on_initialize = False
         self._profile_audio_contract: VoiceIdentityAudioContractSnapshot | None = None
         self._requested_enabled = False
         self._effective_enabled = False
@@ -357,6 +358,7 @@ class VoiceIdentityService:
                 self._initialized = True
                 return self.status()
             except VoiceIdentityProfileIncompatibleError:
+                self._rejected_profile_on_initialize = True
                 self._requested_enabled = requested_enabled
                 if requested_enabled and self._runtime_mode == "enforce":
                     await self._activate(None, str(uuid.uuid4()))
@@ -394,6 +396,7 @@ class VoiceIdentityService:
                     else VoiceIdentityEffectiveReason.DISABLED
                 )
             elif not self._profile_is_compatible(profile):
+                self._rejected_profile_on_initialize = True
                 if requested_enabled and self._runtime_mode == "enforce":
                     await self._activate(None, str(uuid.uuid4()))
                 self._set_ineffective(VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE)
@@ -634,10 +637,14 @@ class VoiceIdentityService:
                 lease=lease,
                 expiry_task=expiry_task,
                 session_generation=self._enrollment_generation + 1,
-                # Preserve the user's explicit preference across enrollment.
-                # A first enrollment must not implicitly enable voice identity
-                # when the feature was disabled before recording started.
-                requested_enabled_snapshot=self._requested_enabled,
+                # Preserve the historical first-enrollment onboarding behavior,
+                # while keeping an explicitly disabled preference after a
+                # rejected incompatible legacy profile.
+                requested_enabled_snapshot=(
+                    self._requested_enabled
+                    if self._rejected_profile_on_initialize
+                    else (True if self._profile is None else self._requested_enabled)
+                ),
                 noise_reduction_enabled_snapshot=(
                     self._runtime_noise_reduction_enabled
                 ),
