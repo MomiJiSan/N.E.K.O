@@ -1583,9 +1583,14 @@ class VoiceIdentityService:
                     runtime_ready=runtime_ready,
                 )
             finally:
-                # A failed DSP transition did not commit a new contract. Keep
-                # same-value reconciliation retryable after resources recover.
-                self._runtime_audio_contract_transition_pending = not runtime_ready
+                # A failed DSP transition or activation did not commit a new
+                # contract. Keep same-value reconciliation retryable until a
+                # subsequent activation succeeds.
+                self._runtime_audio_contract_transition_pending = (
+                    not runtime_ready
+                    or self._effective_reason
+                    is VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                )
 
     async def _update_runtime_noise_reduction_enabled_locked(
         self,
