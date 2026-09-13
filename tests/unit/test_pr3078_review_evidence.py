@@ -186,10 +186,11 @@ async def test_c4_c7_legacy_disabled_profile_and_reenrollment(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_first_enrollment_preserves_disabled_preference(tmp_path):
+async def test_legacy_reenrollment_preserves_disabled_preference(tmp_path):
     service, _, _, _ = _service(tmp_path)
     await service._preference_store.asave(False)
     await service.initialize()
+    service._rejected_profile_on_initialize = True
     enrollment = await service.start_enrollment()
     completed = await service.complete_enrollment(
         enrollment.enrollment_id, "new-profile", _pcm()
