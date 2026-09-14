@@ -11,7 +11,6 @@ from main_logic.asr_client.provider_policy import resolve_provider_policy
 from main_logic.voice_input.activation import ActivationState
 from main_logic.voice_turn.contracts import SpeechActivityEvent
 from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState
-from tests.support.activation_harness import _Clock, _Factory
 async def _cold_harness(endpointing="provider", gate=None):
     manager, clock = _Runtime(), _Clock()
     release, started = asyncio.Event(), asyncio.Event()
@@ -85,3 +84,68 @@ async def _feed(h, marker, samples=1600):
     h.clock.value += samples / 16000
     await asyncio.sleep(0)
     return pcm
+class _Clock:
+    value = 100.0
+
+    def __call__(self) -> float:
+        return self.value
+
+class _Factory:
+    activation_generation = "profile"
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.runtimes: list[VoiceSessionActivationRuntime] = []
+        self.scorers: list[_CoreActivationScorer] = []
+
+    def create(self, generation, output, *, status_callback=None):
+        scorer = _CoreActivationScorer()
+        runtime = VoiceSessionActivationRuntime(
+            generation,
+            scorer,
+            output,
+            controller=VoiceActivationController(clock=self.clock),
+            status_callback=status_callback,
+        )
+        self.scorers.append(scorer)
+        self.runtimes.append(runtime)
+        return runtime
+
+    def close(self) -> None:
+        pass
+async def _until(predicate) -> None:
+    async with asyncio.timeout(2.0):
+        while not predicate():
+            await asyncio.sleep(0)
+
+async def _harness(route: str, *, active: bool = True):
+    manager = _Runtime()
+    clock = _Clock()
+    factory = _Factory(clock)
+    harness = _Harness(manager, clock, factory, route)
+    manager.is_active = True
+    manager.core_api_type = "qwen"
+    manager._independent_asr_route_key = "qwen"
+    manager.session = harness.session("source")
+    manager._set_microphone_route(route)
+    manager._asr_runtime.submit = AsyncMock(side_effect=harness.submit)
+    await manager.set_voice_session_activation_factory(
+        factory, activation_generation="profile"
+    )
+    try:
+        for index in range(15 if active else 1):
+            clock.value = 100.0 + index / 10
+            await harness.feed(2_000 + index)
+        expected_state = ActivationState.ACTIVE if active else ActivationState.WAITING
+        await _until(lambda: harness.activation.state is expected_state)
+        if active:
+            await _until(lambda: len(harness.deliveries) == 15)
+        yield harness
+    finally:
+        await manager.set_voice_session_activation_factory(
+            None, activation_generation="test-finished"
+        )
+        pending = tuple(manager._core_asr_cleanup_tasks)
+        if pending:
+            async with asyncio.timeout(2.0):
+                await asyncio.gather(*pending, return_exceptions=True)
