@@ -2372,7 +2372,7 @@ Live2DManager.prototype.setupWheelZoom = function (model) {
 
     const onWheelScroll = (event) => {
         if (!this.currentModel) return;
-        if (this.isLive2DEffectiveLocked() || this.isLive2DPeekActive()) {
+        if ((typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked()) || this.isLive2DPeekActive()) {
             if (this.isLive2DPeekActive()) {
                 if (isWheelPointOnCurrentModel(event)) event.preventDefault();
                 return; // edge peek ignores wheel zoom
@@ -2424,7 +2424,7 @@ Live2DManager.prototype.setupTouchZoom = function (model) {
 
     const onTouchStart = (event) => {
         if (!this.currentModel) return;
-        if (this.isLive2DEffectiveLocked() || this.isLive2DPeekActive()) {
+        if ((typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked()) || this.isLive2DPeekActive()) {
             if (this.isLive2DPeekActive()) {
                 if (event.touches && event.touches.length === 2) event.preventDefault();
                 isTouchZooming = false;
@@ -2444,7 +2444,7 @@ Live2DManager.prototype.setupTouchZoom = function (model) {
 
     const onTouchMove = (event) => {
         if (!this.currentModel || !isTouchZooming) return;
-        if (this.isLive2DEffectiveLocked() || this.isLive2DPeekActive()) {
+        if ((typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked()) || this.isLive2DPeekActive()) {
             if (this.isLive2DPeekActive()) {
                 if (event.touches && event.touches.length === 2) event.preventDefault();
                 isTouchZooming = false;
