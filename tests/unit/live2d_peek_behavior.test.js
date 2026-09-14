@@ -3282,3 +3282,91 @@ test('core model bounds are null while an anchor is hiding or hidden', () => {
     manager._live2DPeekState.phase = 'hiding';
     assert.equal(manager.getModelScreenBounds(), null);
 });
+
+// Edge-peek lock contract tests. These exercise the Live2D-specific effective lock
+// boundary without changing the ordinary manager.isLocked state.
+test('effective Live2D lock follows ordinary lock or peeking edge-lock matrix', () => {
+    const harness = createHarness();
+    const manager = new harness.Live2DManager();
+    manager.isLocked = false;
+    const phases = ['unanchored', 'revealing', 'peeking', 'hiding', 'hidden'];
+    for (const phase of phases) {
+        manager._live2DPeekState = { active: true, phase };
+        harness.window.edgePeekLockEnabled = true;
+        assert.equal(
+            manager.isLive2DEffectiveLocked(),
+            phase === 'peeking',
+            `edge lock phase ${phase}`
+        );
+    }
+    manager._live2DPeekState = { active: true, phase: 'peeking' };
+    harness.window.edgePeekLockEnabled = false;
+    assert.equal(manager.isLive2DEffectiveLocked(), false);
+    manager.isLocked = true;
+    assert.equal(manager.isLive2DEffectiveLocked(), true);
+});
+
+test('effective Live2D lock requires an active peeking state', () => {
+    const harness = createHarness();
+    const manager = new harness.Live2DManager();
+    manager.isLocked = false;
+    harness.window.edgePeekLockEnabled = true;
+    for (const state of [null, {}, { active: false, phase: 'peeking' }, { active: true, phase: 'hidden' }]) {
+        manager._live2DPeekState = state;
+        assert.equal(manager.isLive2DEffectiveLocked(), false);
+    }
+});
+
+test('edge-peek input lock snapshots and restores canvas styles without changing ordinary lock', () => {
+    const canvas = {
+        style: createInlineStyle({ 'pointer-events': 'auto', cursor: 'grab' })
+    };
+    const harness = createHarness({ controls: { 'live2d-canvas': canvas } });
+    const manager = new harness.Live2DManager();
+    manager.isLocked = false;
+    manager._live2DPeekState = { active: true, phase: 'peeking' };
+    harness.window.edgePeekLockEnabled = true;
+
+    manager.syncLive2DEffectiveInputLock();
+    assert.equal(canvas.style.pointerEvents, 'none');
+    assert.equal(canvas.style.cursor, 'default');
+    assert.equal(manager.isLocked, false);
+
+    harness.window.edgePeekLockEnabled = false;
+    manager.syncLive2DEffectiveInputLock();
+    assert.equal(canvas.style.pointerEvents, 'auto');
+    assert.equal(canvas.style.cursor, 'grab');
+    assert.equal(manager.isLocked, false);
+});
+
+test('edge-peek input lock does not restore over an ordinary lock', () => {
+    const canvas = {
+        style: createInlineStyle({ 'pointer-events': 'auto', cursor: 'grab' })
+    };
+    const harness = createHarness({ controls: { 'live2d-canvas': canvas } });
+    const manager = new harness.Live2DManager();
+    manager.isLocked = false;
+    manager._live2DPeekState = { active: true, phase: 'peeking' };
+    harness.window.edgePeekLockEnabled = true;
+    manager.syncLive2DEffectiveInputLock();
+
+    manager.isLocked = true;
+    harness.window.edgePeekLockEnabled = false;
+    manager.syncLive2DEffectiveInputLock();
+    assert.equal(canvas.style.pointerEvents, 'none');
+    assert.equal(canvas.style.cursor, 'default');
+});
+
+test('clearing a peeking state removes the locked hover fade class', () => {
+    const containerClasses = new Set(['locked-hover-fade']);
+    const container = { classList: { toggle: (name, enabled) => enabled ? containerClasses.add(name) : containerClasses.delete(name), contains: (name) => containerClasses.has(name) } };
+    const harness = createHarness({ controls: { 'live2d-container': container } });
+    const manager = new harness.Live2DManager();
+    manager.isLocked = false;
+    manager._live2DPeekState = { active: true, phase: 'peeking' };
+    harness.window.edgePeekLockEnabled = true;
+
+    manager._live2DPeekState = { active: false, phase: 'hidden' };
+    manager.syncLive2DEffectiveInputLock();
+    assert.equal(containerClasses.has('locked-hover-fade'), false);
+});
