@@ -379,7 +379,7 @@ async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild
 
     async def reconcile(enabled: bool, *, runtime_ready: bool) -> None:
         assert enabled is False
-        assert runtime_ready is True
+        assert runtime_ready is False
         events.append("reconcile")
 
     monkeypatch.setattr(
