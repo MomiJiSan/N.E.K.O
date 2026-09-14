@@ -1,16 +1,19 @@
 import asyncio
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 from main_logic.asr_client.endpointing.detector_runtime import DetectorRuntime
 from main_logic.asr_client.endpointing.detector import CoreDetectorEventEnvelope
 from main_logic.asr_client.lifecycle import VoiceInputLifecycleController, VoiceRouteMode
 from main_logic.asr_client.provider_policy import resolve_provider_policy
 from main_logic.voice_input.activation import ActivationState
-from main_logic.voice_turn.contracts import SpeechActivityEvent
+from main_logic.voice_identity_service.activation_runtime import VoiceSessionActivationRuntime
+from main_logic.voice_turn.contracts import SpeechActivityEvent, AsrSubmitResult, AsrSubmitStatus
 from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState
+from main_logic.voice_turn.contracts import VoiceTurnToken
 async def _cold_harness(endpointing="provider", gate=None):
     manager, clock = _Runtime(), _Clock()
     release, started = asyncio.Event(), asyncio.Event()
@@ -118,6 +121,63 @@ async def _until(predicate) -> None:
         while not predicate():
             await asyncio.sleep(0)
 
+class _Session:
+    def __init__(self, name: str, deliveries: list[tuple[str, bytes]]) -> None:
+        self.name = name
+        self.can_handoff_voice_input = MagicMock(return_value=True)
+        self.stream_audio = AsyncMock(side_effect=self._stream)
+        self._deliveries = deliveries
+
+    async def _stream(self, pcm: bytes) -> None:
+        self._deliveries.append((self.name, pcm))
+
+
+@dataclass
+class _Harness:
+    manager: _Runtime
+    clock: _Clock
+    factory: _Factory
+    route: str
+    deliveries: list[tuple[str, bytes]] = field(default_factory=list)
+
+    @property
+    def activation(self) -> VoiceSessionActivationRuntime:
+        return self.factory.runtimes[0]
+
+    @property
+    def pcm(self) -> list[bytes]:
+        return [pcm for _, pcm in self.deliveries]
+
+    def session(self, name: str) -> _Session:
+        return _Session(name, self.deliveries)
+
+    async def submit(self, frame, **_kwargs) -> AsrSubmitResult:
+        self.deliveries.append(("independent", frame.pcm16))
+        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+
+    async def feed(self, marker: int, *, voice: bool = True) -> bytes:
+        pcm = marker.to_bytes(2, "little", signed=True) * 1_600
+        await self.manager._route_microphone_audio(
+            pcm,
+            sample_rate_hz=16_000,
+            speech_probability=0.9 if voice else 0.0,
+            received_at=self.clock.value,
+            captured_at=self.clock.value,
+        )
+        await asyncio.sleep(0)
+        return pcm
+
+    async def promote(self, ticket, target: _Session) -> None:
+        assert self.manager._voice_activation_handoff_is_current(ticket)
+        assert self.manager._mark_voice_activation_handoff_irreversible(ticket)
+        self.manager.session = target
+        await self.manager._reconcile_independent_asr_after_core_change()
+        assert self.manager._voice_activation_handoff_is_current(
+            ticket, allow_promoted=True
+        )
+        assert await self.manager._commit_voice_activation_handoff(ticket)
+
+@asynccontextmanager
 async def _harness(route: str, *, active: bool = True):
     manager = _Runtime()
     clock = _Clock()
