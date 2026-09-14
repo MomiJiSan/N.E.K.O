@@ -2599,3 +2599,5 @@ async def test_registry_close_cancels_watchdog_and_detaches_managers() -> None:
     assert not registry._managers  # type: ignore[attr-defined]
     assert registry._activation is None  # type: ignore[attr-defined]
     assert manager.verifier_calls[-1][0] is None
+
+pytestmark = pytest.mark.runtime

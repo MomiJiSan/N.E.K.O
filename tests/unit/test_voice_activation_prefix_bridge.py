@@ -92,3 +92,5 @@ async def test_core_marks_first_replay_frame_and_keeps_batch_on_live_tail() -> N
         await manager.set_voice_session_activation_factory(
             None, activation_generation="disabled"
         )
+
+pytestmark = pytest.mark.runtime

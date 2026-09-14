@@ -15,7 +15,7 @@ from tests.support.activation_harness import _cold_harness, _feed, _until
 from tests.support.activation_harness import _harness
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 @pytest.mark.parametrize("endpointing", ["provider", "manual"], ids=["provider-endpoint", "manual-endpoint"])

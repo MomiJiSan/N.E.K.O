@@ -12,7 +12,7 @@ from tests.support.asr_fakes import (
     _selection,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 def _connecting_runtime():

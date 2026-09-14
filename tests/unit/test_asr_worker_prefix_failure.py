@@ -98,3 +98,5 @@ async def test_worker_callback_classifies_once_after_real_socket_write(
     finally:
         await session.close()
         await _close(manager)
+
+pytestmark = pytest.mark.integration_serial

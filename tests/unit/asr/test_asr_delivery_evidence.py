@@ -76,3 +76,5 @@ async def test_qwen_delivery_evidence_waits_for_actual_send(outcome, caplog):
             outcome == "success"
         )
         assert delivery_evidence(asyncio.Queue()).attempted is False
+
+pytestmark = pytest.mark.unit_fast

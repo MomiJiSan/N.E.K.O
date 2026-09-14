@@ -469,3 +469,5 @@ async def test_close_cancels_and_joins_owned_rejection_task() -> None:
     assert tasks and all(task.done() for task in tasks)
     assert runtime._asr_rejection_tasks == set()
     detector.close.assert_awaited_once_with()
+
+pytestmark = pytest.mark.runtime

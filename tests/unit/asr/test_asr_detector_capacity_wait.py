@@ -80,3 +80,5 @@ async def test_runtime_capacity_bridge_rechecks_detector_ownership(change):
         runtime._closed = True
     queue.get_nowait()
     assert await asyncio.wait_for(waiter, 0.2) is (change == "none")
+
+pytestmark = pytest.mark.unit_fast

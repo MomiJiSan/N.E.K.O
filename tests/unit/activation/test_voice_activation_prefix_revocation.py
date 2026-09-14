@@ -10,7 +10,7 @@ import pytest
 from main_logic.voice_turn.contracts import PreserveUnsentPrefix
 from tests.support.asr_fakes import _Runtime, _install_ready_lifecycle
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 def _source(*, write_attempted=False):

@@ -511,3 +511,5 @@ async def test_audio_close_failure_does_not_escape_cleanup() -> None:
 
     assert await client._close_audio_processor() is None
     assert client._audio_processor is None
+
+pytestmark = pytest.mark.runtime

@@ -110,7 +110,10 @@ jobs:
         # tests/unit/conftest.py still sees the same within-file sequence.
         # Cross-file order dependencies are what random-order-tests.yml hunts;
         # they were never something this job's fixed order guaranteed.
-        run: uv run pytest tests/unit -q -n auto --dist loadfile
+        # PR #3078 tests run in the dedicated shards below. Keeping them out of
+        # this xdist gate prevents socket/process tests from being scheduled on
+        # workers while preserving coverage of the remaining unit suite.
+        run: uv run pytest tests/unit -q -n auto --dist loadfile -m "not unit_fast and not runtime and not integration_serial and not frontend_contract"
 
   plugin-manager-vitest:
     name: Plugin manager vitest

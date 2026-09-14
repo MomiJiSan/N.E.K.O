@@ -46,3 +46,5 @@ async def test_failed_audio_contract_reconcile_retries_same_setting(
         assert len(activations) == count
     finally:
         await service.close()
+
+pytestmark = pytest.mark.runtime

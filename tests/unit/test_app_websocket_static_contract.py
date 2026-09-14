@@ -2533,3 +2533,5 @@ def _run_settings_node_harness(script: str) -> subprocess.CompletedProcess[str]:
         check=False,
         timeout=60,
     )
+
+pytestmark = pytest.mark.frontend_contract

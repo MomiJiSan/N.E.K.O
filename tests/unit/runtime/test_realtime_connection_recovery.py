@@ -18,9 +18,7 @@ from main_logic.omni_realtime_client._transport import _classify_peer_close
 from main_logic.provider_failure_signals import CODES_REQUIRING_MSG_DETAIL
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("arbiter_logs_reach_caplog")]
-
-
+pytestmark = [pytest.mark.integration_serial, pytest.mark.usefixtures("arbiter_logs_reach_caplog")]
 
 
 _END = object()

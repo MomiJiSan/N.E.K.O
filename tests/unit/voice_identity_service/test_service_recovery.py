@@ -777,3 +777,5 @@ async def test_cancelled_close_retains_cleanup_to_completion(
     assert not status.state.has_profile
     assert not status.state.effective_enabled
     assert status.state.effective_reason == "disabled"
+
+pytestmark = pytest.mark.runtime

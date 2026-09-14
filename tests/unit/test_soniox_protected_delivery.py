@@ -84,3 +84,5 @@ async def test_soniox_protected_prefix_blocks_replay_but_preserves_ordinary_poli
     finally:
         await session.close()
         await _close(manager)
+
+pytestmark = pytest.mark.integration_serial

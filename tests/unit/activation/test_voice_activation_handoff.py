@@ -25,7 +25,7 @@ from main_logic.voice_turn.contracts import VoiceTurnToken
 from tests.support.asr_fakes import _CoreActivationScorer, _Runtime
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 class _Clock:

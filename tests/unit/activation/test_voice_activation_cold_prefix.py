@@ -318,3 +318,5 @@ async def test_manual_detector_capacity_wait_resumes_or_fails_bounded(monkeypatc
     finally:
         resume_wait.set()
         gate.release.set()
+
+pytestmark = pytest.mark.runtime

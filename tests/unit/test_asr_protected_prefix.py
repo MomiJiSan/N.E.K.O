@@ -408,3 +408,5 @@ async def test_same_batch_live_frames_do_not_reprotect_unconfirmed_idle_silence(
         assert lifecycle.pending_connect_bytes == 0
     finally:
         await _close(runtime)
+
+pytestmark = pytest.mark.runtime

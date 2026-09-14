@@ -10,7 +10,7 @@ from main_logic.voice_input.activation import ActivationState
 from tests.support.activation_harness import _harness, _until
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 @pytest.mark.parametrize("outcome", ["written", "unknown", "attribute", "closed_ok", "closed_error", "cancelled"])

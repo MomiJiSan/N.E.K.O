@@ -768,3 +768,5 @@ def test_delete_profile_returns_canonical_disabled_status(
     assert response.json() == payload
     service.delete_profile.assert_awaited_once_with()
     _assert_private_values_absent(response.json())
+
+pytestmark = pytest.mark.unit_fast

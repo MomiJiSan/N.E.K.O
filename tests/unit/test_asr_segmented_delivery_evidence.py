@@ -84,3 +84,5 @@ async def test_segmented_dispatch_records_attempt_before_await(provider, outcome
         release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+pytestmark = pytest.mark.runtime

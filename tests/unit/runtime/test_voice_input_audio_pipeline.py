@@ -463,3 +463,5 @@ async def test_noise_reduction_reconcile_finishes_after_caller_cancellation(
     finally:
         release_apply.set()
         preferences.configure_voice_identity_audio_contract_callbacks()
+
+pytestmark = pytest.mark.runtime

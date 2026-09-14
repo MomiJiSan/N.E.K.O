@@ -377,3 +377,5 @@ async def test_finalize_failure_and_cancellation_close_pipeline() -> None:
         await asyncio.gather(task, return_exceptions=True)
     assert cancelled_pipeline.finalize_count == 1
     assert cancelled_pipeline.closed
+
+pytestmark = pytest.mark.unit_fast

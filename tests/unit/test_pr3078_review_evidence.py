@@ -320,3 +320,5 @@ async def test_current_head_c9_close_failure_still_resets_swap():
     assert mgr._cleanup_pending_session_resources.await_count == 1
     assert mgr._reset_preparation_state.await_count == 1
     assert mgr.is_hot_swap_imminent is False
+
+pytestmark = pytest.mark.unit_fast
