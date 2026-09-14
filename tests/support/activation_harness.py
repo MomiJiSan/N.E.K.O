@@ -108,6 +108,7 @@ class _Factory:
             generation,
             scorer,
             output,
+            controller=VoiceActivationController(clock=self.clock),
             status_callback=status_callback,
         )
         self.scorers.append(scorer)
