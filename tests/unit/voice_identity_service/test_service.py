@@ -2667,7 +2667,7 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
     )
     snapshot_count = 0
 
-    async def snapshot():
+    async def snapshot(*, strict: bool = False):
         nonlocal snapshot_count
         snapshot_count += 1
         if snapshot_count == 1:
