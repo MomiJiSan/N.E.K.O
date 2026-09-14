@@ -361,7 +361,7 @@ async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild
 
     events: list[str] = []
 
-    async def snapshot():
+    async def snapshot(*, strict: bool = False):
         return SimpleNamespace(
             revision=1,
             settings={"noiseReductionEnabled": False},
@@ -413,7 +413,7 @@ async def test_noise_reduction_reconcile_finishes_after_caller_cancellation(
     release_apply = asyncio.Event()
     reconciled = asyncio.Event()
 
-    async def snapshot():
+    async def snapshot(*, strict: bool = False):
         return SimpleNamespace(
             revision=1,
             settings={"noiseReductionEnabled": False},
