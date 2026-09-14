@@ -3679,3 +3679,5 @@ async def test_silence_timeout_reaches_the_recorder_with_no_display_at_all():
 
     assert [json.loads(x)["type"] for x in recorder.sent] == ["auto_close_mic"]
     mgr.end_session.assert_awaited_once()
+
+pytestmark = pytest.mark.runtime

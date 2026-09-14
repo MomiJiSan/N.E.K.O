@@ -45,6 +45,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "static" / "i18n-i18next.js"
 LOCALES_DIR = ROOT / "static" / "locales"
@@ -267,3 +269,5 @@ def test_bump_instructions_name_every_step_of_the_fix() -> None:
     assert "LOCALE_VERSION" in _BUMP_INSTRUCTIONS
     assert "RETIRED_LOCALE_VERSIONS" in _BUMP_INSTRUCTIONS
     assert "LOCALE_KEY_SIGNATURE" in _BUMP_INSTRUCTIONS
+
+pytestmark = pytest.mark.frontend_contract

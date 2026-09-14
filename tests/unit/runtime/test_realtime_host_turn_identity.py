@@ -1083,3 +1083,5 @@ async def test_a_failed_manual_commit_leaves_ownership_unfrozen(monkeypatch):
     assert delivered == [
         ("spoken under B", ("example-game", "session-b", "route-b")),
     ]
+
+pytestmark = pytest.mark.runtime

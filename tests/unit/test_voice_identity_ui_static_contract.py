@@ -593,3 +593,5 @@ def test_locale_bootstrap_declares_a_non_empty_locale_cache_key() -> None:
     locale_version = re.search(r"const\s+LOCALE_VERSION\s*=\s*'([^']+)'", bootstrap)
     assert locale_version and locale_version.group(1).strip()
     assert locale_version.group(1) != "2026-08-07-credentials-console-guide"
+
+pytestmark = pytest.mark.frontend_contract

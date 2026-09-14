@@ -8,7 +8,7 @@ import pytest
 from tests.support.activation_harness import _harness, _until
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 @pytest.mark.parametrize("replacement", ["none", "object", "connection"])

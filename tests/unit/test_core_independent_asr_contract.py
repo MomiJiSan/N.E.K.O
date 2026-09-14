@@ -83,7 +83,7 @@ import main_logic.voice_turn.audio_input as audio_input_module
 from utils import preferences
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit_fast]
 
 
 class _Runtime(AsrRuntimeMixin):

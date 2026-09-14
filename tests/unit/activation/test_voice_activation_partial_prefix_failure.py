@@ -62,3 +62,5 @@ async def test_partial_prefix_send_failure_stops_tail_and_reports_uncertainty(
                 continue
             codes.append(payload.get("code"))
         assert expected_code in codes, codes
+
+pytestmark = pytest.mark.runtime

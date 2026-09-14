@@ -9,7 +9,7 @@ import pytest
 
 from tests.support.asr_fakes import _Runtime, _install_ready_lifecycle
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 @pytest.mark.parametrize("owner", ["core", "game"])

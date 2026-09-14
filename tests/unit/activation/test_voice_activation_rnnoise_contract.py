@@ -11,7 +11,7 @@ from tests.support.activation_harness import _Factory, _harness, _until
 from utils import audio_processor
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 @pytest.mark.parametrize("route", ["native", "independent"])

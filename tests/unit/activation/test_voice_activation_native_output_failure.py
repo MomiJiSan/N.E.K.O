@@ -9,7 +9,7 @@ from main_logic.voice_input.activation import ActivationState
 from tests.support.activation_harness import _harness, _until
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 async def test_native_partial_output_overflow_blocks_bypass_until_connection_replaced():

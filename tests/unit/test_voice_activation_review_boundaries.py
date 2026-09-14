@@ -86,3 +86,5 @@ async def test_shadow_uses_ordinary_delivery_after_transient_rejection(route):
         assert not manager._voice_session_activation_degraded
     finally:
         await manager.set_voice_session_activation_factory(None, activation_generation="disabled")
+
+pytestmark = pytest.mark.runtime

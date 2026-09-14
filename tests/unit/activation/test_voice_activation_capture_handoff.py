@@ -11,7 +11,7 @@ from main_logic.voice_input.activation import ActivationState
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from tests.support.activation_harness import _harness, _until
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
 @pytest.mark.parametrize("route", ["native", "independent"])

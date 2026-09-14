@@ -629,3 +629,5 @@ async def test_runtime_noise_reduction_aba_reinstalls_after_stale_prepare(
     assert len(activations) == activation_count + 3
     assert not service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
     await service.close()
+
+pytestmark = pytest.mark.unit_fast

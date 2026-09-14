@@ -152,3 +152,5 @@ async def test_disabling_during_activation_replay_does_not_end_session_or_tts(tm
         await asyncio.to_thread(thread.join, 2)
         await service.close()
         await registry.close()
+
+pytestmark = pytest.mark.integration_serial
