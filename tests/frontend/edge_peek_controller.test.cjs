@@ -151,3 +151,53 @@ test('native edge placements register the controller and hide clears both native
     I.hideReturnBallContainer(h.container);
     assert.equal(h.controller.isAnyLocked(), false, 'the shared hide path also clears renderer drag-edge entries');
 });
+
+for (const reason of ['disabled', 'switch-container', 'presentation-takeover']) {
+test(`native drag cleanup releases only its edge-peek state: ${reason}`, () => {
+    const h = harness();
+    const art = h.container.querySelector();
+    art.style = { removeProperty() {} };
+    h.button.querySelector = () => art;
+    h.container.querySelector = selector => selector === '.neko-idle-return-btn' ? h.button : art;
+    h.container.style.removeProperty = function () {};
+    h.container.removeEventListener = () => {};
+    h.container.removeAttribute = () => {};
+    h.container.setAttribute = () => {};
+    h.container.addEventListener = () => {};
+    h.window.removeEventListener = () => {};
+    h.window.__NEKO_MULTI_WINDOW__ = true;
+    h.window.nekoPetDrag = {};
+    const document = { body: { dataset: {} }, documentElement: {}, addEventListener() {}, removeEventListener() {} };
+    const context = vm.createContext({ window: h.window, document });
+    for (const file of ['return-transitions.js', 'return-window-drag.js']) {
+        vm.runInContext(fs.readFileSync(path.join(__dirname, '../../static/app/app-ui', file), 'utf8'), context);
+    }
+    const I = h.window.__appUiParts;
+    I.ensureMultiWindowReturnBallDrag(h.container);
+    const oldState = I.multiWindowReturnBallDragState;
+    I.applyNekoIdleCat1EdgePeek(h.container, { edge: 'left', left: -20, top: 30 });
+    const takenOver = reason === 'presentation-takeover';
+    if (takenOver) {
+        h.controller.begin({ button: h.button, container: h.container, mode: 'desktop-window', phase: 'peeking' });
+    }
+    h.emit('mousemove', { clientX: 10, clientY: 10 });
+    assert.equal(h.timers.size, 1);
+    assert.equal(h.controller.isAnyLocked(), true);
+    const nextContainer = { isConnected: true, addEventListener() {} };
+    if (reason !== 'switch-container') h.window.__NEKO_DISABLE_NATIVE_RETURN_BALL_DRAG__ = true;
+    I.ensureMultiWindowReturnBallDrag(reason === 'switch-container' ? nextContainer : h.container);
+    assert.equal(h.container.isConnected, true, 'the old DOM remains connected');
+    assert.notEqual(I.multiWindowReturnBallDragState, oldState);
+    assert.equal(oldState.dragSessionToken, 1);
+    assert.equal(h.controller.isAnyLocked(), takenOver);
+    assert.equal(h.controller.shouldBlockReturnBallDrag(h.button, h.container), takenOver);
+    assert.equal(h.timers.size, takenOver ? 1 : 0);
+    assert.equal(h.button.classList.contains('is-cat1-edge-peek-left'), takenOver);
+    assert.equal(h.observing, takenOver);
+    assert.equal(h.container.style.cursor, takenOver ? 'default' : 'grab');
+    if (reason === 'switch-container') assert.equal(I.multiWindowReturnBallDragState.container, nextContainer);
+    else assert.equal(I.multiWindowReturnBallDragState, null);
+    h.fireTimers();
+    assert.equal(h.artClasses.size, takenOver ? 1 : 0);
+});
+}

@@ -1785,6 +1785,12 @@
         }
 
         if (state.container) {
+            const edgeButton = getNekoIdleCat1EdgePeekButton(state.container);
+            const edgeMode = window.NekoEdgePeekController && window.NekoEdgePeekController.getActiveMode(edgeButton);
+            // A desktop presentation may have taken over the same button.
+            if (!edgeMode || edgeMode === 'drag-edge') {
+                I.clearNekoIdleCat1EdgePeek(state.container);
+            }
             I.restoreSavedReturnBallStyle(state.container, state);
             resetReturnBallTemporaryStyle(state.container);
             state.container.setAttribute('data-dragging', 'false');
