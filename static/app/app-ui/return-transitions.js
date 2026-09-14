@@ -1598,10 +1598,10 @@
             : null;
     }
 
-    I.clearNekoIdleCat1EdgePeek = function clearNekoIdleCat1EdgePeek(container) {
+    I.clearNekoIdleCat1EdgePeek = function clearNekoIdleCat1EdgePeek(container, options = {}) {
         const button = getNekoIdleCat1EdgePeekButton(container);
         if (!button) return;
-        if (window.NekoEdgePeekController) window.NekoEdgePeekController.clear(button);
+        if (!options.preserveController && window.NekoEdgePeekController) window.NekoEdgePeekController.clear(button);
         NEKO_IDLE_CAT1_EDGE_PEEK_CLASSES.forEach((className) => {
             button.classList.remove(className);
         });
@@ -1790,6 +1790,8 @@
             // A desktop presentation may have taken over the same button.
             if (!edgeMode || edgeMode === 'drag-edge') {
                 I.clearNekoIdleCat1EdgePeek(state.container);
+            } else {
+                I.clearNekoIdleCat1EdgePeek(state.container, { preserveController: true });
             }
             I.restoreSavedReturnBallStyle(state.container, state);
             resetReturnBallTemporaryStyle(state.container);

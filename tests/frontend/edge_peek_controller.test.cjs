@@ -192,7 +192,8 @@ test(`native drag cleanup releases only its edge-peek state: ${reason}`, () => {
     assert.equal(h.controller.isAnyLocked(), takenOver);
     assert.equal(h.controller.shouldBlockReturnBallDrag(h.button, h.container), takenOver);
     assert.equal(h.timers.size, takenOver ? 1 : 0);
-    assert.equal(h.button.classList.contains('is-cat1-edge-peek-left'), takenOver);
+    assert.equal(h.button.classList.contains('is-cat1-edge-peek-left'), false);
+    assert.equal(h.button.querySelector('.neko-idle-return-art').style.removeProperty !== undefined, true);
     assert.equal(h.observing, takenOver);
     assert.equal(h.container.style.cursor, takenOver ? 'default' : 'grab');
     if (reason === 'switch-container') assert.equal(I.multiWindowReturnBallDragState.container, nextContainer);
