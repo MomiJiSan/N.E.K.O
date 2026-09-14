@@ -1,25 +1,123 @@
 import json
+
 import re
+
 import shutil
+
 import subprocess
+
 import textwrap
+
 from pathlib import Path
 
 import pytest
 
 from tests.node_harness import run_node_script
 
-
 APP_WEBSOCKET_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-websocket.js"
+
 APP_STATE_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-state.js"
+
 APP_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-settings.js"
+
 APP_AUDIO_CAPTURE_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-audio-capture.js"
+
 APP_BUTTONS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-buttons.js"
+
 TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
+
 APP_GAME_VOICE_CONTROL_PATH = (
     Path(__file__).resolve().parents[2] / "static" / "app" / "app-game-voice-control.js"
 )
 
+def _block_after(js: str, opener: str) -> str:
+    """Return the brace-balanced body that follows ``opener``.
+
+    CodeRabbit: ``split("}", 1)[0]`` truncates at the FIRST closing brace in the
+    body -- a nested ``if {...}``, an object literal, even a ``}`` inside a
+    string -- so the slice can shrink to a line or two and the assertions then
+    pass by accident, or miss a real regression. Count braces instead, skipping
+    those inside string literals and line comments.
+
+    Two opener shapes are supported: one ending in ``{`` (scope = that block),
+    and a plain statement (scope = the rest of its enclosing block). Both leave
+    ``depth`` at 1. A TRUNCATED opener is neither -- ``"function foo("`` stops
+    before the body brace, so the body's own ``{`` pushes depth to 2 and the
+    scan runs past the function into everything that follows it (CodeRabbit
+    caught two of these scoped to 1131 lines instead of 29, where the
+    assertions could match an unrelated function). An opener with unbalanced
+    parentheses is exactly that mistake, so reject it here rather than let a
+    later reader rediscover it.
+    """
+
+    if opener.count("(") != opener.count(")"):
+        raise AssertionError(
+            f"opener has unbalanced parentheses, so it stops mid-signature "
+            f"and the scan would overrun the block: {opener!r}"
+        )
+    rest = js.split(opener, 1)[1]
+    depth = 1
+    out = []
+    quote = None
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
+        if quote:
+            if ch == "\\":
+                out.append(rest[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "/" and rest[i : i + 2] == "//":
+            end = rest.find("\n", i)
+            end = len(rest) if end == -1 else end
+            out.append(rest[i:end])
+            i = end
+            continue
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(out)
+        out.append(ch)
+        i += 1
+    raise AssertionError(f"unbalanced block after {opener!r}")
+
+def _code_only(js: str) -> str:
+    """Strip // line comments so 'does not do X' assertions test code, not prose.
+
+    Several pins in this file assert that a block does NOT call something; a
+    comment explaining why it must not would otherwise trip them.
+    """
+
+    return "\n".join(line.split("//", 1)[0] for line in js.splitlines())
+
+LOCALES_PATH = Path(__file__).resolve().parents[2] / "static" / "locales"
+
+WEBSOCKET_ROUTER_PATH = Path(__file__).resolve().parents[2] / "main_routers" / "websocket_router.py"
+
+ASR_REGISTRY_META_PATH = Path(__file__).resolve().parents[2] / "main_logic" / "asr_client" / "_registry_meta.py"
+
+def _run_settings_node_harness(script: str) -> subprocess.CompletedProcess[str]:
+    node_path = shutil.which("node")
+    if not node_path:
+        pytest.skip("node is not installed; skipping app-settings harness test")
+    # run_node_script writes the script to a temp file: node -e would put the
+    # whole harness on the command line, which Windows refuses past 32767
+    # characters and which encodes under the locale codec rather than UTF-8.
+    return run_node_script(
+        node_path,
+        script,
+        cwd=str(Path(__file__).resolve().parents[2]),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
 
 def test_game_route_close_events_require_matching_generation_when_one_is_active():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -37,7 +135,6 @@ def test_game_route_close_events_require_matching_generation_when_one_is_active(
         source,
     )
 
-
 def test_game_route_speech_cancel_is_scoped_to_the_sdk_correlation_id():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     block = _block_after(
@@ -48,7 +145,6 @@ def test_game_route_speech_cancel_is_scoped_to_the_sdk_correlation_id():
     assert "response.sdk_speech_correlation_id" in block
     assert "cancelledCorrelationId === S.currentPlayingSpeechCorrelationId" in block
     assert "applyUserActivityCancel(" in block
-
 
 def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -132,8 +228,6 @@ def test_rejected_close_events_still_tombstone_their_own_identity():
                 f"a rejected close event ({marker}) tombstoned the live route via "
                 f"{live_identity}"
             )
-
-
 
 def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -249,78 +343,6 @@ def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
         "S.gameRouteActive = false;"
     )
 
-
-def _block_after(js: str, opener: str) -> str:
-    """Return the brace-balanced body that follows ``opener``.
-
-    CodeRabbit: ``split("}", 1)[0]`` truncates at the FIRST closing brace in the
-    body -- a nested ``if {...}``, an object literal, even a ``}`` inside a
-    string -- so the slice can shrink to a line or two and the assertions then
-    pass by accident, or miss a real regression. Count braces instead, skipping
-    those inside string literals and line comments.
-
-    Two opener shapes are supported: one ending in ``{`` (scope = that block),
-    and a plain statement (scope = the rest of its enclosing block). Both leave
-    ``depth`` at 1. A TRUNCATED opener is neither -- ``"function foo("`` stops
-    before the body brace, so the body's own ``{`` pushes depth to 2 and the
-    scan runs past the function into everything that follows it (CodeRabbit
-    caught two of these scoped to 1131 lines instead of 29, where the
-    assertions could match an unrelated function). An opener with unbalanced
-    parentheses is exactly that mistake, so reject it here rather than let a
-    later reader rediscover it.
-    """
-
-    if opener.count("(") != opener.count(")"):
-        raise AssertionError(
-            f"opener has unbalanced parentheses, so it stops mid-signature "
-            f"and the scan would overrun the block: {opener!r}"
-        )
-    rest = js.split(opener, 1)[1]
-    depth = 1
-    out = []
-    quote = None
-    i = 0
-    while i < len(rest):
-        ch = rest[i]
-        if quote:
-            if ch == "\\":
-                out.append(rest[i : i + 2])
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-        elif ch in "\"'`":
-            quote = ch
-        elif ch == "/" and rest[i : i + 2] == "//":
-            end = rest.find("\n", i)
-            end = len(rest) if end == -1 else end
-            out.append(rest[i:end])
-            i = end
-            continue
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return "".join(out)
-        out.append(ch)
-        i += 1
-    raise AssertionError(f"unbalanced block after {opener!r}")
-
-
-def _code_only(js: str) -> str:
-    """Strip // line comments so 'does not do X' assertions test code, not prose.
-
-    Several pins in this file assert that a block does NOT call something; a
-    comment explaining why it must not would otherwise trip them.
-    """
-
-    return "\n".join(line.split("//", 1)[0] for line in js.splitlines())
-LOCALES_PATH = Path(__file__).resolve().parents[2] / "static" / "locales"
-WEBSOCKET_ROUTER_PATH = Path(__file__).resolve().parents[2] / "main_routers" / "websocket_router.py"
-ASR_REGISTRY_META_PATH = Path(__file__).resolve().parents[2] / "main_logic" / "asr_client" / "_registry_meta.py"
-
-
 def test_independent_asr_injection_failure_does_not_show_fallback_toast():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -335,7 +357,6 @@ def test_independent_asr_injection_failure_does_not_show_fallback_toast():
 
     assert "return;" in injection_branch
     assert "independentAsrFallback" not in injection_branch
-
 
 def test_disabled_independent_asr_is_a_normal_native_status_without_failure_toast():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -352,7 +373,6 @@ def test_disabled_independent_asr_is_a_normal_native_status_without_failure_toas
     assert "S.independentAsrActive = false;" in disabled_branch
     assert "return;" in disabled_branch
     assert "independentAsrFallback" not in disabled_branch
-
 
 def test_independent_asr_terminal_status_clears_partial_preview():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -379,13 +399,11 @@ def test_independent_asr_terminal_status_clears_partial_preview():
     assert "removeExternalAsrPreview();" in teardown_fn
     assert "S.independentAsrActive = false;" in teardown_fn
 
-
 def test_independent_asr_terminal_status_reports_stopped_voice_input():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
     assert "Independent ASR unavailable; using Omni native recognition" not in source
     assert "Voice input has stopped for this session" in source
-
 
 def test_provider_unavailable_status_names_provider_and_denies_silent_switch():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -395,7 +413,6 @@ def test_provider_unavailable_status_names_provider_and_denies_silent_switch():
     assert "{ providerKey: asrProvider || 'unknown' }" in source
     assert "It did not switch to another speech recognition service" in source
 
-
 def test_voice_lifecycle_status_is_validated_and_exposed_to_ui():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -403,7 +420,6 @@ def test_voice_lifecycle_status_is_validated_and_exposed_to_ui():
     assert "voiceInputLifecycleState" in source
     assert "voice-input-lifecycle-changed" in source
     assert "data-voice-input-state" in source
-
 
 def test_voice_session_activation_status_is_validated_and_exposed_to_ui():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -416,7 +432,6 @@ def test_voice_session_activation_status_is_validated_and_exposed_to_ui():
     assert "voiceIdentity.sessionWaiting" in source
     assert "voiceIdentity.sessionActive" in source
     assert "voiceIdentity.sessionUnavailable" in source
-
 
 def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
     # runtime.py _handle_independent_asr_error always broadcasts lifecycle
@@ -469,7 +484,6 @@ def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
     assert "microphone.independentAsrProviderUnavailable" in prefix_block
     assert "microphone.independentAsrFallback" in prefix_block
 
-
 def test_lease_resync_status_resends_snapshot_only_from_capturing_window():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     capture_source = APP_AUDIO_CAPTURE_PATH.read_text(encoding="utf-8")
@@ -488,7 +502,6 @@ def test_lease_resync_status_resends_snapshot_only_from_capturing_window():
     assert "setInterval" not in resync_branch
     assert "setTimeout" not in resync_branch
     assert "mod.sendVoiceInputControlState = sendVoiceInputControlState;" in capture_source
-
 
 def test_independent_asr_provider_copy_resolves_via_provider_names():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -518,7 +531,6 @@ def test_independent_asr_provider_copy_resolves_via_provider_names():
     )[1].split("var voicePanelId", 1)[0]
     assert "updateVoiceRecognitionUi();" in change_handler
 
-
 def test_provider_names_cover_asr_registry_keys_in_all_locales():
     registry_source = ASR_REGISTRY_META_PATH.read_text(encoding="utf-8")
     registry_keys = set(re.findall(r'provider_key="([a-z0-9_]+)"', registry_source))
@@ -544,7 +556,6 @@ def test_provider_names_cover_asr_registry_keys_in_all_locales():
         assert key_sets[locale_name] == key_sets[reference_locale], (
             f"providerNames key set of {locale_name} diverges from {reference_locale}"
         )
-
 
 def test_independent_asr_failure_copy_matches_hard_route_in_all_locales():
     expected = {
@@ -597,7 +608,6 @@ def test_independent_asr_failure_copy_matches_hard_route_in_all_locales():
         assert microphone["independentAsrNextSession"] == copy[1]
         assert microphone["independentAsrProviderUnavailable"] == copy[2]
 
-
 def test_response_discarded_visible_in_react_chat():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -622,7 +632,6 @@ def test_response_discarded_visible_in_react_chat():
     assert "document.createElement('div')" not in response_discarded_block
     assert "appendChild(messageDiv)" not in response_discarded_block
 
-
 def test_websocket_has_no_widget_mode_capability_or_lifecycle_protocol():
     frontend_source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     router_source = WEBSOCKET_ROUTER_PATH.read_text(encoding="utf-8")
@@ -632,12 +641,10 @@ def test_websocket_has_no_widget_mode_capability_or_lifecycle_protocol():
     assert "response.type.startsWith('widget_mode_')" not in frontend_source
     assert "neko:widget-mode-message" not in frontend_source
 
-
 def test_external_asr_preview_message_is_declared_app_state_field():
     app_state = APP_STATE_PATH.read_text(encoding="utf-8")
 
     assert "externalAsrPreviewMessage: null," in app_state
-
 
 def test_external_asr_preview_uses_owned_react_message_id():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -662,7 +669,6 @@ def test_external_asr_preview_uses_owned_react_message_id():
     assert "window.appendMessage" not in event_block
     assert "host.removeMessage(messageId)" in remove_helper
     assert "removeExternalAsrPreview();" in final_block
-
 
 def test_external_asr_preview_clears_only_on_current_session_terminals():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -689,7 +695,6 @@ def test_external_asr_preview_clears_only_on_current_session_terminals():
     assert "removeExternalAsrPreview();" not in stale_guard
     assert "removeExternalAsrPreview();" in current_close
     assert "removeExternalAsrPreview();" not in onerror_block
-
 
 def test_empty_preview_message_clears_streaming_preview_bubble():
     # Codex P2: a turn that ends with an EMPTY final (OpenAI/Step stalled-item
@@ -721,7 +726,6 @@ def test_empty_preview_message_clears_streaming_preview_bubble():
     )
     assert "removeExternalAsrPreview" not in else_branch
     assert event_block.count("upsertExternalAsrPreview(") == 1
-
 
 def test_independent_asr_toggle_awaits_server_sync_before_next_session():
     # Session start reads the SERVER-persisted independentAsrEnabled value
@@ -764,7 +768,6 @@ def test_independent_asr_toggle_awaits_server_sync_before_next_session():
     assert "return ensureWebSocketOpenNow(timeoutMs);" in gate_block
     assert "var SETTINGS_SYNC_GATE_TIMEOUT_MS = 3000;" in websocket_source
 
-
 def test_noise_reduction_toggle_uses_conversation_settings_cas_client():
     capture_source = APP_AUDIO_CAPTURE_PATH.read_text(encoding="utf-8")
     save_block = capture_source.split(
@@ -777,7 +780,6 @@ def test_noise_reduction_toggle_uses_conversation_settings_cas_client():
     assert "fetch('/api/config/conversation-settings'" not in save_block
     assert "'noiseReductionEnabled'," in settings_source
     assert "noiseReductionEnabled: S.noiseReductionEnabled" in settings_source
-
 
 def test_every_start_session_send_sits_behind_the_ensure_websocket_gate():
     # The settings-sync gate lives in ensureWebSocketOpen(), so it only closes
@@ -799,7 +801,6 @@ def test_every_start_session_send_sits_behind_the_ensure_websocket_gate():
             )
             checked += 1
     assert checked >= 4
-
 
 def test_start_session_payload_carries_independent_asr_handshake():
     # The bounded settings-sync gate is best-effort: when the settings POST
@@ -829,7 +830,6 @@ def test_start_session_payload_carries_independent_asr_handshake():
     creation_index = websocket_source.index("S.socket = new WebSocket(wsUrl);")
     attach_index = websocket_source.index("attachStartSessionHandshake(S.socket);")
     assert 0 < attach_index - creation_index < 200
-
 
 def test_stale_unsupported_capability_does_not_override_paid_core_preference_harness():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -862,7 +862,6 @@ def test_stale_unsupported_capability_does_not_override_paid_core_preference_har
     result = _run_settings_node_harness(harness)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
-
 
 def test_core_capability_refresh_failures_fail_open_and_coalesce_requests_harness():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -960,7 +959,6 @@ def test_core_capability_refresh_failures_fail_open_and_coalesce_requests_harnes
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
 
-
 def test_start_session_payload_carries_resource_optimization_handshake():
     websocket_source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     state_source = APP_STATE_PATH.read_text(encoding="utf-8")
@@ -981,7 +979,6 @@ def test_start_session_payload_carries_resource_optimization_handshake():
         in settings_source
     )
     assert "S.voiceInputResourceOptimizationAuthoritative = true;" in settings_source
-
 
 def test_start_session_handshake_omitted_until_settings_hydrated():
     # On a fresh browser profile — or while the async conversation-settings
@@ -1018,7 +1015,6 @@ def test_start_session_handshake_omitted_until_settings_hydrated():
     # Both flags start false so a pre-hydration start_session omits the field.
     assert "settingsHydrated: false," in state_source
     assert "independentAsrAuthoritative: false," in state_source
-
 
 def test_settings_hydration_marked_on_server_merge_and_user_change():
     # S.settingsHydrated must flip true on authoritative settings evidence:
@@ -1106,7 +1102,6 @@ def test_settings_hydration_marked_on_server_merge_and_user_change():
         < sync_load_body.index("S.settingsHydrated = true;")
     )
 
-
 def test_periodic_sync_skips_post_and_never_marks_hydration_while_unhydrated():
     # Persistent GET failure: loadSettingsFromServer resolves null (or the
     # whole chain throws), yet BOTH failure paths still start the periodic
@@ -1151,7 +1146,6 @@ def test_periodic_sync_skips_post_and_never_marks_hydration_while_unhydrated():
     # test_settings_hydration_marked_on_server_merge_and_user_change).
     assert "userInitiated" not in tick_body
 
-
 def test_user_toggle_during_get_failure_marks_hydration_posts_and_stamps():
     # Round-10 semantics must survive the userInitiated split: an explicit
     # user change is an authoritative hydration source even while the settings
@@ -1192,7 +1186,6 @@ def test_user_toggle_during_get_failure_marks_hydration_posts_and_stamps():
     )[1].split("function connectWebSocket()", 1)[0]
     assert "msg.action === 'start_session' && S.settingsHydrated === true" in wrapper
     assert "msg.independent_asr_enabled = S.independentAsrEnabled === true;" in wrapper
-
 
 def test_user_dirty_keys_survive_boot_get_merge_field_level():
     # Codex P2 (field-level authority): the conversation-settings GET may read
@@ -1286,7 +1279,6 @@ def test_user_dirty_keys_survive_boot_get_merge_field_level():
     assert "_pendingSettingsKeys.delete(key);" in clear_fn
     assert "_clearAcknowledgedPendingSettings(payload);" in sync_fn
 
-
 def test_settings_post_snapshot_waits_bounded_for_boot_get_merge():
     # Codex P2 (merge-before-post): a POST issued while the boot GET is still
     # pending used to snapshot pure local state, so unchanged fields carried
@@ -1333,7 +1325,6 @@ def test_settings_post_snapshot_waits_bounded_for_boot_get_merge():
         "const runSync = async () =>"
     )
 
-
 def test_settings_posts_serialize_so_a_stale_body_cannot_win_persistence():
     # Codex P2 (round 13): flipping the ASR toggle twice before the first POST
     # completed used to start two independent syncSettingsToServer calls with
@@ -1378,7 +1369,6 @@ def test_settings_posts_serialize_so_a_stale_body_cannot_win_persistence():
     assert sync_fn.index("S.settingsHydrated = true;") < run_sync_index
     assert sync_fn.index("_markUserDirtySettings();") < run_sync_index
 
-
 def test_cross_window_settings_posts_use_cas_and_persist_asr_decision_order():
     settings_source = APP_SETTINGS_PATH.read_text(encoding="utf-8")
     sync_fn = _block_after(
@@ -1420,7 +1410,6 @@ def test_cross_window_settings_posts_use_cas_and_persist_asr_decision_order():
     assert retry_loop.index("const requestDecision = (") < retry_loop.index(
         "await _fetchConversationSettingsJsonWithTimeout("
     )
-
 
 def test_cross_window_asr_flip_marks_hydration_and_asr_dirty():
     # Codex P2: a cross-window independent-ASR toggle arrives via the
@@ -1494,25 +1483,6 @@ def test_cross_window_asr_flip_marks_hydration_and_asr_dirty():
     assert "settingsHydrated" not in apply_fn
     assert "_dirtySettingsKeys" not in apply_fn
     assert "_markUserDirtySettings" not in apply_fn
-
-
-def _run_settings_node_harness(script: str) -> subprocess.CompletedProcess[str]:
-    node_path = shutil.which("node")
-    if not node_path:
-        pytest.skip("node is not installed; skipping app-settings harness test")
-    # run_node_script writes the script to a temp file: node -e would put the
-    # whole harness on the command line, which Windows refuses past 32767
-    # characters and which encodes under the locale codec rather than UTF-8.
-    return run_node_script(
-        node_path,
-        script,
-        cwd=str(Path(__file__).resolve().parents[2]),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-
 
 def test_rapid_asr_toggle_double_flip_persists_final_state_harness():
     # Behavioral pin for the Codex P2 fix: drive the real syncSettingsToServer
@@ -1750,7 +1720,6 @@ def test_rapid_asr_toggle_double_flip_persists_final_state_harness():
         f"stderr:\n{result.stderr}"
     )
     assert "HARNESS_OK" in result.stdout
-
 
 def test_settings_cas_conflict_rebuilds_body_from_winning_asr_decision_harness():
     harness = textwrap.dedent(
@@ -3200,7 +3169,6 @@ def test_settings_cas_conflict_rebuilds_body_from_winning_asr_decision_harness()
     )
     assert "CAS_HARNESS_OK" in result.stdout
 
-
 def test_cross_window_asr_flip_authoritative_over_pending_get_harness():
     # Behavioral pin for the cross-window Codex P2 fix: drive the real module
     # in a vm sandbox, deliver a 'storage' event carrying another window's
@@ -3360,7 +3328,6 @@ def test_cross_window_asr_flip_authoritative_over_pending_get_harness():
         f"stderr:\n{result.stderr}"
     )
     assert "HARNESS_OK" in result.stdout
-
 
 def test_boot_get_converges_on_a_peer_asr_flip_it_did_not_witness_harness():
     # Issue #2540 (residual 2 of #2345): window A's boot GET merged the stale
@@ -3599,7 +3566,6 @@ def test_boot_get_converges_on_a_peer_asr_flip_it_did_not_witness_harness():
     )
     assert "HARNESS_OK" in result.stdout
 
-
 def test_boot_merge_orders_asr_on_the_decision_tuple_not_only_the_dirty_mark():
     # Structural half of the #2540 pin. The behavioural harness above can only
     # observe the outcome; this asserts the boot path actually keeps the two
@@ -3629,7 +3595,6 @@ def test_boot_merge_orders_asr_on_the_decision_tuple_not_only_the_dirty_mark():
     # the local decision must win rather than the absence counting as newer.
     assert "!serverAsrDecision" in preserve
     assert "_dirtySettingsKeys" not in preserve
-
 
 def test_shared_settings_writes_carry_explicit_change_metadata():
     # Codex P2 (follow-up): saveSettings() writes independentAsrEnabled into
@@ -3750,7 +3715,6 @@ def test_shared_settings_writes_carry_explicit_change_metadata():
     # applied — and only that key, so other shared keys keep syncing.
     assert "delete incoming.independentAsrEnabled;" in listener_block
     assert "applySharedRuntimeSettings(incoming)" in listener_block
-
 
 def test_unrelated_save_from_unhydrated_window_is_not_an_asr_toggle_harness():
     # Behavioral pin for the Codex P2 follow-up, driven end-to-end across two
@@ -4406,7 +4370,6 @@ def test_unrelated_save_from_unhydrated_window_is_not_an_asr_toggle_harness():
     )
     assert "HARNESS_OK" in result.stdout
 
-
 def test_unrelated_change_during_pending_get_preserves_server_asr_harness():
     # Behavioral pin for the field-level authority fix (Codex P2): with the
     # old whole-merge-drop, changing ANY unrelated preference while the boot
@@ -4572,7 +4535,6 @@ def test_unrelated_change_during_pending_get_preserves_server_asr_harness():
     )
     assert "HARNESS_OK" in result.stdout
 
-
 def test_settings_get_gate_timeout_downgrades_post_to_dirty_keys_only():
     # Codex P2 (round 15): the bounded gate preserves liveness, but on timeout
     # it used to release a FULL boot snapshot — overwriting every preference
@@ -4653,7 +4615,6 @@ def test_settings_get_gate_timeout_downgrades_post_to_dirty_keys_only():
     assert "partial[key] = settings[key];" in pick_fn
     assert "Object.keys(settings)" not in pick_fn
     assert "Object.assign" not in pick_fn
-
 
 def test_never_settling_get_posts_only_dirty_keys_harness():
     # Behavioral pin for the round-15 fix, driving the real module with a
@@ -4873,7 +4834,6 @@ def test_never_settling_get_posts_only_dirty_keys_harness():
     )
     assert "HARNESS_OK" in result.stdout
 
-
 def test_unsynced_optimization_decision_survives_reload_until_posted_harness():
     """A persisted explicit choice stays authoritative until its POST succeeds."""
     harness = textwrap.dedent(
@@ -5063,7 +5023,6 @@ def test_unsynced_optimization_decision_survives_reload_until_posted_harness():
         f"stderr:\n{result.stderr}"
     )
     assert "HARNESS_OK" in result.stdout
-
 
 def test_failed_boot_get_keeps_posts_dirty_only_harness():
     # Codex P2 (round 16): the round-15 flag was released in the merge chain's
@@ -5599,7 +5558,6 @@ def test_failed_boot_get_keeps_posts_dirty_only_harness():
     )
     assert "HARNESS_OK" in result.stdout
 
-
 def test_normal_teardown_paths_reset_independent_asr_route_flags():
     # ASR_INDEPENDENT_READY sets S.independentAsrActive; ordinary user stop,
     # server-side session end, and socket close must reset it (and the
@@ -5646,7 +5604,6 @@ def test_normal_teardown_paths_reset_independent_asr_route_flags():
         "if (S.isRecording || window.isMicStarting)"
     )
 
-
 def test_failure_paths_keep_status_provided_asr_provider():
     # Negative counterpart to the teardown reset: failure paths receive the
     # provider from the status event and must keep it for the toasts/hint,
@@ -5666,7 +5623,6 @@ def test_failure_paths_keep_status_provided_asr_provider():
     )[1].split("if (statusCode === 'TTS_CONNECTION_FAILED')", 1)[0]
     assert "S.independentAsrProvider = asrProvider;" in prefix_block
     assert "S.independentAsrProvider = ''" not in prefix_block
-
 
 def test_startup_greeting_release_event_replaces_home_tutorial_block_state():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -5707,7 +5663,6 @@ def test_startup_greeting_release_event_replaces_home_tutorial_block_state():
     assert "universal-manager.js" in producer_block
     assert "isStartupGreetingHomePage" not in producer_block
 
-
 def test_blocked_greeting_check_retries_without_home_tutorial_state():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -5717,7 +5672,6 @@ def test_blocked_greeting_check_retries_without_home_tutorial_state():
     )[0]
     assert "sendHomeTutorialState(" not in blocked_branch
     assert "_scheduleGreetingCheckRetry();" in blocked_branch
-
 
 def test_greeting_check_defers_until_new_user_icebreaker_ends():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -5787,7 +5741,6 @@ def test_greeting_check_defers_until_new_user_icebreaker_ends():
     assert "function _isTutorialBlockingGreeting()" not in source
     assert "function isHomeTutorialLockedForGreeting()" not in source
 
-
 def test_new_user_icebreaker_mirror_turn_end_skips_regular_subtitle_finalize():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -5810,7 +5763,6 @@ def test_new_user_icebreaker_mirror_turn_end_skips_regular_subtitle_finalize():
     assert "if (!isNewUserIcebreakerMirrorTurnEnd(response)) {" in turn_end_block
     assert "finalizeAssistantTurn(assistantTurnId);" in turn_end_block
 
-
 def test_goodbye_blocks_stale_audio_session_started():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -5824,7 +5776,6 @@ def test_goodbye_blocks_stale_audio_session_started():
     assert "window.cancelPendingSessionStart('Voice start cancelled by goodbye');" in stale_audio_guard
     assert "S.socket.send(JSON.stringify({ action: 'end_session' }));" in stale_audio_guard
     assert "return;" in stale_audio_guard
-
 
 def test_session_ended_by_server_stops_assistant_text_output():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -5921,7 +5872,6 @@ def test_session_ended_by_server_stops_assistant_text_output():
         "clearPendingAssistantTurnStart();"
     )
 
-
 def test_ws_open_resyncs_goodbye_state_and_defers_regular_greeting_until_release():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
@@ -5947,7 +5897,6 @@ def test_ws_open_resyncs_goodbye_state_and_defers_regular_greeting_until_release
     assert "_sendGreetingCheckIfReady();" in onopen_greeting_block
     assert "S._startupGreetingReleaseGateUsed = true;" in onopen_greeting_block
     assert "sendStartupGreetingReleaseRequest('ws-open')" in onopen_greeting_block
-
 
 def test_asr_authority_is_per_key_not_granted_by_unrelated_setting_change():
     # Codex P2. syncSettingsToServer({userInitiated:true}) marks the GLOBAL
@@ -5996,7 +5945,6 @@ def test_asr_authority_is_per_key_not_granted_by_unrelated_setting_change():
     # conditional local-user gate plus the three authoritative sources above).
     assert settings_source.count("S.independentAsrAuthoritative = true;") == 4
 
-
 def test_text_session_start_stops_an_active_microphone():
     # PR #2345 removed streaming.py's audio-branch session rebuild, so a
     # microphone left running into a text session has every frame accepted at
@@ -6037,7 +5985,6 @@ def test_text_session_start_stops_an_active_microphone():
     # Match the CALL form: the comment above deliberately names the function.
     assert "window.stopMicCapture(" not in started
 
-
 def test_blocked_lifecycle_stops_microphone_capture():
     # Codex P2. _handle_core_asr_failure pins the microphone route to "blocked"
     # and nothing re-arms it inside the session, but the frontend only cleared
@@ -6077,7 +6024,6 @@ def test_blocked_lifecycle_stops_microphone_capture():
     can_upload = _block_after(capture_source, "function canUploadOrdinaryMicFrame() {")
     assert "refreshMicLease() !== MIC_LEASE.CORE" in can_upload
 
-
 def test_blocked_route_latch_blocks_game_exit_microphone_resume():
     # The teardown above is skipped while the game STT gate holds the
     # microphone, and BLOCKED is never re-sent, so the game-exit resume path
@@ -6108,7 +6054,6 @@ def test_blocked_route_latch_blocks_game_exit_microphone_resume():
         "S.isTextSessionActive = response.input_mode === 'text';", 1
     )[1].split("var _tiaStarted", 1)[0]
     assert "S.voiceInputRouteBlocked = false;" not in started_handler
-
 
 def test_every_start_session_send_carries_a_request_id():
     # #2539 / Codex P2. The ack names the start it answers, and the receiver
@@ -6143,7 +6088,6 @@ def test_every_start_session_send_carries_a_request_id():
     assert "window.sessionStartRequestId = function (owner) {" in state_source
     assert "startRequestIdByOwner.get(owner)" in state_source
 
-
 def test_pending_request_id_is_claimed_and_released_with_the_slot():
     # The id lives and dies with the shared start slot. Left behind after a
     # release, it would make the NEXT anonymous-or-foreign ack look mismatched
@@ -6164,7 +6108,6 @@ def test_pending_request_id_is_claimed_and_released_with_the_slot():
         assert source.count("S._pendingSessionStartRequestId = null;") == source.count(
             "S._pendingSessionStartMode = null;"
         )
-
 
 def test_session_started_only_settles_the_start_it_answers():
     # Codex P2. The cross-mode guard cannot catch a SAME-mode ack meant for
@@ -6215,7 +6158,6 @@ def test_session_started_only_settles_the_start_it_answers():
     )
     assert "_ackAnswersThisWindow" not in session_facts
 
-
 def test_session_started_ack_latches_a_blocked_microphone_route():
     # The one clear of the latch that is NOT tied to a route verdict is user
     # intent (app-buttons.js, next to _pendingSessionStartMode = 'audio'). What
@@ -6252,7 +6194,6 @@ def test_session_started_ack_latches_a_blocked_microphone_route():
     # keeps its current behaviour rather than refusing every microphone.
     assert "response.microphone_route !== 'blocked'" not in started_handler
 
-
 def test_shared_write_metadata_carries_per_key_asr_authority():
     # Codex P2. meta.hydrated is the GLOBAL hydration bit, which any unrelated
     # user edit flips -- so a window whose boot GET never merged could stamp its
@@ -6282,7 +6223,6 @@ def test_shared_write_metadata_carries_per_key_asr_authority():
         in settings_source
     )
 
-
 def test_cross_window_adopted_values_roll_the_dirty_baseline():
     # Without rolling the baseline, a value this window merely RECEIVED looks
     # like a local user edit on the next unrelated save: the key gets marked
@@ -6301,7 +6241,6 @@ def test_cross_window_adopted_values_roll_the_dirty_baseline():
     assert apply_index < roll_index, "the baseline roll must observe the applied values"
     # Keys this window really did touch keep their authority.
     assert "if (_dirtySettingsKeys.has(key)) continue;" in listener_block
-
 
 def test_equal_write_ids_are_broken_by_explicit_asr_intent():
     # Codex P2 follow-up. The applied-id floor in _nextSharedWriteId only rises
@@ -6328,7 +6267,6 @@ def test_equal_write_ids_are_broken_by_explicit_asr_intent():
     # consume the id and both tied writes stay eligible.
     assert "if (meta && meta.writeId > _lastAppliedSharedWriteId) {" in listener_block
 
-
 def test_write_id_doc_does_not_claim_global_uniqueness():
     # The previous round's comments claimed the applied-id floor cured
     # same-millisecond minting across windows. It does not -- that is this
@@ -6341,7 +6279,6 @@ def test_write_id_doc_does_not_claim_global_uniqueness():
     assert "already OBSERVED" in id_fn
     assert "cannot be broken at mint" in id_fn
     assert "the listener resolves it on explicit intent" in id_fn
-
 
 def test_cross_mode_session_started_still_stops_the_microphone():
     # The cross-mode ack guard returns early when this window has its own start
@@ -6361,7 +6298,6 @@ def test_cross_mode_session_started_still_stops_the_microphone():
     # end the text session that this very ack just announced.
     assert "window.stopRecording({ notifyServer: false });" in guard
 
-
 def test_status_fanout_comment_states_the_real_delivery_contract():
     # An earlier round shipped a comment claiming status "fans out to every
     # window". It does not: send_status targets the manager's current socket,
@@ -6372,7 +6308,6 @@ def test_status_fanout_comment_states_the_real_delivery_contract():
     websocket_source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     assert "fans out to every window" not in websocket_source
     assert "_send_to_voice_owner" in websocket_source
-
 
 def test_concurrent_asr_toggles_are_totally_ordered_not_swapped():
     # Codex P2. The intent tie-break added last round did not fix the real
@@ -6437,7 +6372,6 @@ def test_concurrent_asr_toggles_are_totally_ordered_not_swapped():
     )[1].split("});", 1)[0]
     assert "!asrOutranksLocalChoice" in listener_block.split("asrValueIsStale", 1)[1]
 
-
 def test_startup_failure_runs_the_same_teardown_as_a_runtime_failure():
     # Codex P2. A startup failure (provider connect, credentials, config)
     # leaves the route blocked but can NEVER emit a BLOCKED lifecycle event --
@@ -6461,7 +6395,6 @@ def test_startup_failure_runs_the_same_teardown_as_a_runtime_failure():
     ].split("if (statusCode === 'VOICE_INPUT_LEASE_RESYNC_REQUIRED')", 1)[0]
     assert "tearDownBlockedVoiceRoute();" in lifecycle_block
     assert source.count("function tearDownBlockedVoiceRoute()") == 1
-
 
 def test_blocked_route_refuses_to_open_the_microphone():
     # THE guard that closes the cold-start hole. On a cold voice start the mic
@@ -6494,7 +6427,6 @@ def test_blocked_route_refuses_to_open_the_microphone():
 
     buttons_source = APP_BUTTONS_PATH.read_text(encoding="utf-8")
     assert "window.abortVoiceStartForBlockedRoute();" in buttons_source
-
 
 def test_asr_decision_tuple_survives_unrelated_saves():
     # Codex P2. _dirtySettingsKeys is monotone, so once a window has toggled ASR
@@ -6535,7 +6467,6 @@ def test_asr_decision_tuple_survives_unrelated_saves():
     assert "const bootDecision = bootMeta.asrDecision || bootMeta;" in settings_source
     assert "const adopted = meta.asrDecision || meta;" in settings_source
 
-
 def test_audio_preprocessing_failure_tears_down_the_voice_route():
     # Codex P2. ASR_AUDIO_PREPROCESSING_FAILED rides neither the BLOCKED
     # lifecycle channel nor the ASR_INDEPENDENT_ prefix, so it was the one
@@ -6552,7 +6483,6 @@ def test_audio_preprocessing_failure_tears_down_the_voice_route():
     assert websocket_source.index(
         "if (statusCode === 'ASR_AUDIO_PREPROCESSING_FAILED') {"
     ) < websocket_source.index("if (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0) {")
-
 
 def test_server_side_teardowns_do_not_send_pause_session():
     # A pause_session from a SUPERSEDED recorder socket is not a voice-path
@@ -6577,7 +6507,6 @@ def test_server_side_teardowns_do_not_send_pause_session():
         "await window.stopMicCapture();"
     )
 
-
 def test_auto_restart_does_not_claim_success_on_a_blocked_route():
     # The rebuilt session can come back fail-closed; startMicCapture then
     # refuses silently, and the handler would still light the floating mic,
@@ -6594,7 +6523,6 @@ def test_auto_restart_does_not_claim_success_on_a_blocked_route():
         "startMicCapture"
     )
     assert "resetSessionButton(); if (_rsB) _rsB.disabled = false;" in restart
-
 
 def test_auto_restart_unwinds_a_cancelled_microphone_start():
     # startMicCapture returns false for an ownership cancellation. The restart's
@@ -6624,7 +6552,6 @@ def test_auto_restart_unwinds_a_cancelled_microphone_start():
     assert "if (!isMicrophoneStartCancelled" in catch_code
     assert "S.socket.send(JSON.stringify({ action: 'end_session' }));" in catch_code
     assert "window.syncFloatingMicButtonState(false)" in catch_code
-
 
 def test_microphone_switch_requires_a_live_committed_replacement():
     capture_source = APP_AUDIO_CAPTURE_PATH.read_text(encoding="utf-8")
@@ -6675,7 +6602,6 @@ def test_microphone_switch_requires_a_live_committed_replacement():
     assert "pendingMicStartUiOwnerToken !== micStartToken" in finish_cancelled
     assert "S.isRecording = false;" in finish_cancelled
     assert "window.isRecording = false;" in finish_cancelled
-
 
 def test_in_flight_microphone_start_is_cancellable():
     # Codex P2. S.isRecording only flips at the END of startAudioWorklet, after
@@ -6784,7 +6710,6 @@ def test_in_flight_microphone_start_is_cancellable():
     abort_fn = _block_after(capture_source, "function abortVoiceStartForBlockedRoute() {")
     assert "invalidatePendingMicStart();" in abort_fn
 
-
 def test_text_takeover_cancels_a_pending_microphone_start():
     # Both text-session branches stop an ALREADY-recording mic; neither could
     # reach a start still inside its await window.
@@ -6808,7 +6733,6 @@ def test_text_takeover_cancels_a_pending_microphone_start():
 
     capture_source = APP_AUDIO_CAPTURE_PATH.read_text(encoding="utf-8")
     assert "window.invalidatePendingMicStart = invalidatePendingMicStart;" in capture_source
-
 
 def test_deferred_session_start_resolve_is_pinned_to_the_ack_it_belongs_to():
     # Codex P2, twice. A matching session_started clears the start timeout
@@ -6868,7 +6792,6 @@ def test_deferred_session_start_resolve_is_pinned_to_the_ack_it_belongs_to():
         "that still points at an already-settled start"
     )
 
-
 def test_reconnect_reconciliation_repairs_appstate_not_only_the_dom_event():
     """chat.html has no listener that writes S.gameRoute*, so the shared
     reconnect path must repair appState itself.
@@ -6919,7 +6842,6 @@ def test_reconnect_reconciliation_repairs_appstate_not_only_the_dom_event():
             "voice bridge keeps its ordering"
         )
 
-
 def test_reconnect_reconciliation_tombstones_the_route_the_server_finalized():
     """The reconnect snapshot is the compensation path for a missed ``closed``.
 
@@ -6965,8 +6887,6 @@ def test_reconnect_reconciliation_tombstones_the_route_the_server_finalized():
         "the reconnect tombstone must read the identity the server finalized"
     )
 
-
-@pytest.mark.parametrize("template_name", ["index.html", "chat.html"])
 def test_bootstrap_route_snapshot_is_rejected_when_it_lands_late(template_name):
     """The init-time /route/active read must not re-open a route that just closed.
 
@@ -6999,7 +6919,6 @@ def test_bootstrap_route_snapshot_is_rejected_when_it_lands_late(template_name):
     assert "return" in handler, (
         f"{template_name} bootstrap compares the revision but never bails out"
     )
-
 
 def test_game_voice_command_commits_its_teardown_before_it_can_yield():
     """The microphone teardown must be issued while the admitting check still holds.

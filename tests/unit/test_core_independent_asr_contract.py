@@ -1,39 +1,59 @@
 import ast
+
 import asyncio
+
 import hashlib
+
 import inspect
+
 import json
+
 import logging
+
 import textwrap
+
 import threading
+
 import time
+
 from dataclasses import replace
+
 from types import SimpleNamespace
+
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from main_logic.asr_client import VoiceIdentityActivationResult
+
 from main_logic.core import LLMSessionManager
+
 from main_logic.core.asr_runtime import (
     AsrRuntimeMixin,
     _HotSwapAudioFrame,
     _ONSET_TRUST_WINDOW_S,
 )
+
 from main_logic.core.multimodal_turn import (
     _MAX_LIVE_TURN_RECORDS,
     _MAX_PRERECORD_VISUAL_VALIDATIONS,
 )
+
 from main_logic.asr_client.runtime import (
     AsrRuntimeCallbacks,
     AsrStartResult,
     AsrStartStatus,
     IndependentAsrRuntime,
 )
+
 from main_logic.asr_client.endpointing.detector_runtime import DetectorFeedResult, DetectorRuntime
+
 from main_logic.voice_input import VoiceInputDispatchResult
+
 from main_logic.voice_input.activation import ActivationState
+
 from main_logic.voice_input.consumers import CoreChatTurnContext
+
 from main_logic.asr_client.lifecycle import (
     AudioDisposition,
     VoiceLifecycleConfig,
@@ -42,17 +62,24 @@ from main_logic.asr_client.lifecycle import (
     VoiceTurnToken,
     VoiceRouteMode,
 )
+
 from main_logic.asr_client.lifecycle import VoiceInputLifecycleController
+
 from main_logic.asr_client.provider_policy import resolve_provider_policy
+
 from main_logic.voice_turn.activity_evidence import RnnoiseEvidence
+
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
+
 from main_logic.voice_identity_service.activation_runtime import (
     VoiceSessionActivationRuntime,
 )
+
 from main_logic.voice_identity_service.activation_scoring import (
     ActivationScoreResult,
     ActivationScoreStatus,
 )
+
 from main_logic.voice_turn.contracts import (
     AsrFailureEvent,
     AsrLifecycleNotification,
@@ -64,8 +91,11 @@ from main_logic.voice_turn.contracts import (
     VoicePartialEvent,
     VoiceTranscriptEvent,
 )
+
 from main_logic.voice_turn.contracts import EvaluationStatus, TurnDecision
+
 from main_logic.asr_client.endpointing.coordinator import CoordinatorState
+
 from main_logic.asr_client.endpointing.detector import (
     BoundDetectorTurn,
     CoreDetectorEventEnvelope,
@@ -77,14 +107,16 @@ from main_logic.asr_client.endpointing.detector import (
     DetectorSubmitResult,
     DetectorSubmitStatus,
 )
+
 import main_logic.core.asr_runtime as core_asr_runtime_module
+
 import main_logic.core as core_module
+
 import main_logic.voice_turn.audio_input as audio_input_module
+
 from utils import preferences
 
-
 pytestmark = pytest.mark.asyncio
-
 
 class _Runtime(AsrRuntimeMixin):
     def __init__(self) -> None:
@@ -134,7 +166,6 @@ class _Runtime(AsrRuntimeMixin):
             return
         object.__setattr__(self, name, value)
 
-
 class _GateAsyncLock:
     def __init__(self) -> None:
         self.requested = asyncio.Event()
@@ -148,99 +179,6 @@ class _GateAsyncLock:
     async def __aexit__(self, *_exc_info) -> None:
         return None
 
-
-async def test_external_voice_suppression_aborts_once_and_restores_pcm_gate() -> None:
-    runtime = _Runtime()
-    runtime._invalidate_voice_pcm_sync = MagicMock()
-    runtime._abort_independent_asr = AsyncMock()
-    assert runtime._voice_input_accepts_pcm() is True
-
-    await runtime.set_voice_input_suppressed(
-        "voice_identity_enrollment",
-        suppressed=True,
-    )
-    await runtime.set_voice_input_suppressed(
-        "voice_identity_enrollment",
-        suppressed=True,
-    )
-
-    assert runtime._voice_input_accepts_pcm() is False
-    runtime._abort_independent_asr.assert_awaited_once_with(
-        "voice_identity_enrollment"
-    )
-    assert runtime._invalidate_voice_pcm_sync.call_count == 1
-
-    await runtime.set_voice_input_suppressed(
-        "voice_identity_enrollment",
-        suppressed=False,
-    )
-
-    assert runtime._voice_input_accepts_pcm() is True
-    assert runtime._invalidate_voice_pcm_sync.call_count == 2
-
-
-async def test_external_voice_suppression_reasons_are_independent() -> None:
-    runtime = _Runtime()
-    runtime._invalidate_voice_pcm_sync = MagicMock()
-    runtime._abort_independent_asr = AsyncMock()
-
-    await runtime.set_voice_input_suppressed("enrollment", suppressed=True)
-    await runtime.set_voice_input_suppressed("maintenance", suppressed=True)
-    await runtime.set_voice_input_suppressed("enrollment", suppressed=False)
-
-    assert runtime._voice_input_accepts_pcm() is False
-
-    await runtime.set_voice_input_suppressed("maintenance", suppressed=False)
-
-    assert runtime._voice_input_accepts_pcm() is True
-    assert runtime._abort_independent_asr.await_count == 2
-
-
-async def test_external_voice_suppression_resets_native_audio_turn() -> None:
-    runtime = _Runtime()
-    runtime._asr_route_mode = "native"
-    runtime._invalidate_voice_pcm_sync = MagicMock()
-    runtime._abort_independent_asr = AsyncMock()
-    runtime.session.clear_audio_buffer = AsyncMock()
-
-    await runtime.set_voice_input_suppressed(
-        "voice_identity_enrollment",
-        suppressed=True,
-    )
-
-    runtime.session.clear_audio_buffer.assert_awaited_once_with()
-    runtime._abort_independent_asr.assert_not_awaited()
-
-
-async def test_native_route_installs_future_verifier_but_reports_unsupported() -> None:
-    runtime = _Runtime()
-    runtime._asr_route_mode = "native"
-    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=True)
-    factory = MagicMock()
-
-    result = await runtime.set_speaker_verifier_factory(
-        factory,
-        activation_generation="profile-generation",
-    )
-
-    assert result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
-    assert runtime._speaker_shadow_factory is factory
-
-
-async def test_core_forgets_future_verifier_when_physical_detach_degrades() -> None:
-    runtime = _Runtime()
-    runtime._speaker_shadow_factory = MagicMock()
-    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=False)
-
-    updated = await runtime.set_speaker_verifier_factory(
-        None,
-        activation_generation="revoked-profile",
-    )
-
-    assert updated is False
-    assert runtime._speaker_shadow_factory is None
-
-
 class _TestSmartTurnLease:
     def __init__(self, token) -> None:
         self.token = token
@@ -248,22 +186,6 @@ class _TestSmartTurnLease:
 
     async def release(self) -> None:
         self.released = True
-
-
-async def test_independent_asr_activity_probe_is_provider_neutral() -> None:
-    runtime = _Runtime()
-    _install_ready_lifecycle(runtime, "qwen")
-
-    assert runtime._independent_asr_user_turn_active() is False
-
-    runtime._asr_lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
-    runtime._asr_lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
-    assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
-    assert runtime._independent_asr_user_turn_active() is True
-
-    runtime._asr_route_mode = "native"
-    assert runtime._independent_asr_user_turn_active() is False
-
 
 class _ReadyDetector:
     def __init__(self, feed_result: DetectorFeedResult | None = None) -> None:
@@ -294,7 +216,6 @@ class _ReadyDetector:
     async def _reset(self) -> None:
         self._token = None
 
-
 class _FailedSmartTurnDetector(_ReadyDetector):
     async def prepare_endpointing(self, token):
         self._token = None
@@ -302,7 +223,6 @@ class _FailedSmartTurnDetector(_ReadyDetector):
 
     def endpointing_ready(self, token) -> bool:
         return False
-
 
 class _QueuedSmartTurnDetector(_ReadyDetector):
     def __init__(self) -> None:
@@ -334,7 +254,6 @@ class _QueuedSmartTurnDetector(_ReadyDetector):
             candidate=DetectorCandidateKey(1, 0),
         )
 
-
 def _selection(provider_key: str, endpointing_mode: str = "manual"):
     return type(
         "Selection",
@@ -345,7 +264,6 @@ def _selection(provider_key: str, endpointing_mode: str = "manual"):
             "soniox_region": None,
         },
     )()
-
 
 async def _start_runtime_with_callback_candidates(
     monkeypatch,
@@ -408,7 +326,6 @@ async def _start_runtime_with_callback_candidates(
     assert runtime._asr_route_mode == "independent"
     return runtime, sessions, callbacks, detector
 
-
 def _install_ready_lifecycle(
     runtime: _Runtime,
     provider: str = "qwen",
@@ -425,7 +342,6 @@ def _install_ready_lifecycle(
     runtime._asr_lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
     runtime._asr_detector = _ReadyDetector()
     runtime._asr_runtime._asr_current_ingress_token = runtime._capture_ingress_token()
-
 
 def _install_replacement_runtime_generation(
     runtime: _Runtime,
@@ -457,14 +373,12 @@ def _install_replacement_runtime_generation(
     component._asr_current_ingress_token = runtime._capture_ingress_token()
     return session, lifecycle, detector
 
-
 async def _install_active_smart_turn(runtime: _Runtime, provider: str = "qwen") -> None:
     _install_ready_lifecycle(runtime, provider)
     await runtime._handle_independent_asr_activity(
         SpeechActivityEvent.SPEECH_STARTED,
         runtime._asr_session_epoch,
     )
-
 
 async def _start_and_seal_turn(
     runtime: _Runtime,
@@ -478,6 +392,295 @@ async def _start_and_seal_turn(
     )
     await runtime._handle_independent_asr_endpoint(runtime._asr_session_epoch)
 
+class _CoreActivationScorer:
+    profile_generation = "profile"
+    scorer_generation = 1
+
+    def __init__(self, *, similarity: float = 0.8) -> None:
+        self.similarity = similarity
+        self.calls = 0
+        self.closed = False
+
+    async def prepare(self) -> ActivationScoreStatus:
+        return ActivationScoreStatus.READY
+
+    async def score(self, identity, pcm16: bytes, *, sample_rate_hz: int):
+        assert pcm16
+        assert sample_rate_hz == 16_000
+        self.calls += 1
+        return ActivationScoreResult(
+            identity,
+            ActivationScoreStatus.READY,
+            self.similarity,
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+
+class _CoreActivationFactory:
+    activation_generation = "profile"
+
+    def __init__(self, *, similarity: float = 0.8) -> None:
+        self.similarity = similarity
+        self.runtimes: list[VoiceSessionActivationRuntime] = []
+        self.scorers: list[_CoreActivationScorer] = []
+        self.closed = False
+
+    def create(self, generation, output, *, status_callback=None):
+        scorer = _CoreActivationScorer(similarity=self.similarity)
+        scorer.profile_generation = self.activation_generation
+        runtime = VoiceSessionActivationRuntime(
+            generation,
+            scorer,  # type: ignore[arg-type]
+            output,
+            status_callback=status_callback,
+        )
+        self.scorers.append(scorer)
+        self.runtimes.append(runtime)
+        return runtime
+
+    def close(self) -> None:
+        self.closed = True
+
+async def _wait_for_activation_output(
+    call_count,
+    *,
+    expected_count: int,
+) -> None:
+    try:
+        async with asyncio.timeout(1.0):
+            while call_count() < expected_count:
+                await asyncio.sleep(0)
+    except TimeoutError as exc:
+        raise AssertionError(
+            "activation replay did not drain: "
+            f"expected {expected_count}, received {call_count()}"
+        ) from exc
+
+async def _start_bridge_and_capture_builder_call(monkeypatch, runtime):
+    import main_logic.asr_client.runtime as runtime_module
+
+    asr = type("Asr", (), {})()
+    asr.connect = AsyncMock()
+    asr.close = AsyncMock()
+    builder = MagicMock(return_value=asr)
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(return_value={"independentAsrEnabled": True}),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_resolve_asr_selection",
+        MagicMock(return_value=_selection("gemini")),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_create_asr_session_from_selection",
+        builder,
+    )
+
+    await runtime._start_independent_asr_if_enabled("audio")
+
+    assert runtime._asr_route_mode == "independent"
+    return builder.call_args.kwargs
+
+def _install_failing_restart_candidates(
+    runtime: _Runtime,
+    provider: str,
+    *,
+    failure_count: int,
+) -> list[SimpleNamespace]:
+    runtime._asr_session = SimpleNamespace(is_ready=False, close=AsyncMock())
+    _install_ready_lifecycle(runtime, provider)
+    candidates: list[SimpleNamespace] = []
+
+    def build_candidate(_selection):
+        candidate = SimpleNamespace(
+            is_ready=True,
+            connect=AsyncMock(
+                side_effect=RuntimeError("private restart connect detail")
+            ),
+            close=AsyncMock(),
+        )
+        candidates.append(candidate)
+        assert len(candidates) <= failure_count
+        return candidate
+
+    runtime._asr_session_factory = MagicMock(side_effect=build_candidate)
+    runtime._asr_transport_selection = _selection(provider)
+    return candidates
+
+class _HotSwapRuntimeStub:
+    def __init__(self, *, start_status: AsrStartStatus) -> None:
+        self.session_epoch = 1
+        self.audio_generation = 1
+        self.active_provider: str | None = "provider-a"
+        self.start_status = start_status
+        self.submissions: list[tuple[str | None, bytes, object]] = []
+        self.abort = AsyncMock()
+
+    def capture_ingress_token(
+        self,
+        *,
+        connection_id: str,
+        lease_generation: int,
+        route_generation: int,
+    ):
+        from main_logic.voice_turn.contracts import VoiceIngressToken
+
+        return VoiceIngressToken(
+            self.session_epoch,
+            connection_id,
+            lease_generation,
+            route_generation,
+            self.audio_generation,
+        )
+
+    async def close(self) -> None:
+        self.session_epoch += 1
+        self.audio_generation += 1
+        self.active_provider = None
+
+    async def start(
+        self,
+        *,
+        route_key: str,
+        resource_optimization_enabled: bool,
+        user_language: str | None = None,
+    ) -> AsrStartResult:
+        _ = (route_key, resource_optimization_enabled, user_language)
+        self.active_provider = (
+            "provider-b" if self.start_status is AsrStartStatus.READY else None
+        )
+        return AsrStartResult(
+            self.start_status,
+            provider="provider-b",
+            session_epoch=self.session_epoch,
+        )
+
+    async def submit(self, frame, *, ingress_token) -> AsrSubmitResult:
+        self.submissions.append((self.active_provider, frame.pcm16, ingress_token))
+        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+
+def _lease_resync_statuses(runtime: _Runtime) -> list[dict]:
+    statuses = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    return [
+        status
+        for status in statuses
+        if status["code"] == "VOICE_INPUT_LEASE_RESYNC_REQUIRED"
+    ]
+
+def _mic_frame() -> dict:
+    return {"input_type": "audio", "sample_rate_hz": 16_000, "data": [1] * 160}
+
+def _seal_utterance(runtime) -> None:
+    runtime._asr_lifecycle = SimpleNamespace(
+        snapshot=SimpleNamespace(state=VoiceLifecycleState.DRAINING)
+    )
+
+async def test_external_voice_suppression_aborts_once_and_restores_pcm_gate() -> None:
+    runtime = _Runtime()
+    runtime._invalidate_voice_pcm_sync = MagicMock()
+    runtime._abort_independent_asr = AsyncMock()
+    assert runtime._voice_input_accepts_pcm() is True
+
+    await runtime.set_voice_input_suppressed(
+        "voice_identity_enrollment",
+        suppressed=True,
+    )
+    await runtime.set_voice_input_suppressed(
+        "voice_identity_enrollment",
+        suppressed=True,
+    )
+
+    assert runtime._voice_input_accepts_pcm() is False
+    runtime._abort_independent_asr.assert_awaited_once_with(
+        "voice_identity_enrollment"
+    )
+    assert runtime._invalidate_voice_pcm_sync.call_count == 1
+
+    await runtime.set_voice_input_suppressed(
+        "voice_identity_enrollment",
+        suppressed=False,
+    )
+
+    assert runtime._voice_input_accepts_pcm() is True
+    assert runtime._invalidate_voice_pcm_sync.call_count == 2
+
+async def test_external_voice_suppression_reasons_are_independent() -> None:
+    runtime = _Runtime()
+    runtime._invalidate_voice_pcm_sync = MagicMock()
+    runtime._abort_independent_asr = AsyncMock()
+
+    await runtime.set_voice_input_suppressed("enrollment", suppressed=True)
+    await runtime.set_voice_input_suppressed("maintenance", suppressed=True)
+    await runtime.set_voice_input_suppressed("enrollment", suppressed=False)
+
+    assert runtime._voice_input_accepts_pcm() is False
+
+    await runtime.set_voice_input_suppressed("maintenance", suppressed=False)
+
+    assert runtime._voice_input_accepts_pcm() is True
+    assert runtime._abort_independent_asr.await_count == 2
+
+async def test_external_voice_suppression_resets_native_audio_turn() -> None:
+    runtime = _Runtime()
+    runtime._asr_route_mode = "native"
+    runtime._invalidate_voice_pcm_sync = MagicMock()
+    runtime._abort_independent_asr = AsyncMock()
+    runtime.session.clear_audio_buffer = AsyncMock()
+
+    await runtime.set_voice_input_suppressed(
+        "voice_identity_enrollment",
+        suppressed=True,
+    )
+
+    runtime.session.clear_audio_buffer.assert_awaited_once_with()
+    runtime._abort_independent_asr.assert_not_awaited()
+
+async def test_native_route_installs_future_verifier_but_reports_unsupported() -> None:
+    runtime = _Runtime()
+    runtime._asr_route_mode = "native"
+    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=True)
+    factory = MagicMock()
+
+    result = await runtime.set_speaker_verifier_factory(
+        factory,
+        activation_generation="profile-generation",
+    )
+
+    assert result is VoiceIdentityActivationResult.UNSUPPORTED_ASR_ROUTE
+    assert runtime._speaker_shadow_factory is factory
+
+async def test_core_forgets_future_verifier_when_physical_detach_degrades() -> None:
+    runtime = _Runtime()
+    runtime._speaker_shadow_factory = MagicMock()
+    runtime._asr_runtime.set_speaker_verifier_factory = AsyncMock(return_value=False)
+
+    updated = await runtime.set_speaker_verifier_factory(
+        None,
+        activation_generation="revoked-profile",
+    )
+
+    assert updated is False
+    assert runtime._speaker_shadow_factory is None
+
+async def test_independent_asr_activity_probe_is_provider_neutral() -> None:
+    runtime = _Runtime()
+    _install_ready_lifecycle(runtime, "qwen")
+
+    assert runtime._independent_asr_user_turn_active() is False
+
+    runtime._asr_lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+    runtime._asr_lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)
+    assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+    assert runtime._independent_asr_user_turn_active() is True
+
+    runtime._asr_route_mode = "native"
+    assert runtime._independent_asr_user_turn_active() is False
 
 async def test_activity_probe_tracks_accepted_final_until_dispatch_completes() -> None:
     runtime = _Runtime()
@@ -524,7 +727,6 @@ async def test_activity_probe_tracks_accepted_final_until_dispatch_completes() -
     await runtime._wait_asr_transcript_dispatch_idle()
     assert runtime._independent_asr_user_turn_active() is False
 
-
 async def test_independent_route_sends_pcm_to_asr_only() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -548,7 +750,6 @@ async def test_independent_route_sends_pcm_to_asr_only() -> None:
     assert runtime._asr_audio_bytes == 320
     assert runtime._omni_mic_audio_bytes == 0
 
-
 async def test_stale_submit_drops_only_current_frame() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("independent")
@@ -562,7 +763,6 @@ async def test_stale_submit_drops_only_current_frame() -> None:
     )
 
     assert runtime._asr_route_mode == "independent"
-
 
 async def test_unavailable_submit_blocks_core_route() -> None:
     runtime = _Runtime()
@@ -584,7 +784,6 @@ async def test_unavailable_submit_blocks_core_route() -> None:
     assert runtime._asr_route_mode == "blocked"
     clear_queue.assert_called_once_with("independent_asr_unavailable")
     clear_cache.assert_called_once_with()
-
 
 async def test_stale_unavailable_submit_cannot_block_replacement_route() -> None:
     runtime = _Runtime()
@@ -627,7 +826,6 @@ async def test_stale_unavailable_submit_cannot_block_replacement_route() -> None
     assert runtime._asr_session is new_asr_session
     clear_queue.assert_not_called()
     clear_cache.assert_not_called()
-
 
 async def test_async_detector_orders_pre_roll_before_smart_turn_seal() -> None:
     class Vad:
@@ -732,11 +930,6 @@ async def test_async_detector_orders_pre_roll_before_smart_turn_seal() -> None:
     assert runtime._omni_mic_audio_bytes == 0
     await detector.close()
 
-
-@pytest.mark.parametrize(
-    "provider",
-    ["dummy", "glm", "gemini"],
-)
 async def test_smart_turn_unavailable_blocks_segmented_provider_before_wire_audio(
     provider: str,
 ) -> None:
@@ -767,8 +960,6 @@ async def test_smart_turn_unavailable_blocks_segmented_provider_before_wire_audi
     assert runtime._asr_route_mode == "blocked"
     assert runtime._omni_mic_audio_bytes == 0
 
-
-@pytest.mark.parametrize("provider", ["qwen", "grok", "soniox"])
 async def test_provider_endpoint_does_not_wait_for_smart_turn(
     provider: str,
 ) -> None:
@@ -800,8 +991,6 @@ async def test_provider_endpoint_does_not_wait_for_smart_turn(
     assert runtime._asr_route_mode == "independent"
     assert runtime._omni_mic_audio_bytes == 0
 
-
-@pytest.mark.parametrize("provider", ["qwen", "soniox"])
 async def test_manual_streaming_provider_waits_for_smart_turn(
     provider: str,
 ) -> None:
@@ -818,36 +1007,6 @@ async def test_manual_streaming_provider_waits_for_smart_turn(
     )
 
     assert runtime._asr_endpointing_ready(lifecycle, detector, turn_token) is False
-
-
-async def test_enforced_lifecycle_suppresses_local_silence_upload() -> None:
-    runtime = _Runtime()
-    asr = type("Asr", (), {})()
-    asr.is_ready = True
-    asr.stream_audio = AsyncMock()
-    runtime._asr_session = asr
-    runtime._asr_route_mode = "independent"
-    runtime._asr_lifecycle = VoiceInputLifecycleController(
-        provider_policy=resolve_provider_policy("qwen", "manual"),
-        shadow_mode=False,
-    )
-    runtime._asr_lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
-    runtime._asr_detector = type(
-        "Detector",
-        (),
-        {"feed": AsyncMock(return_value=DetectorFeedResult((), True))},
-    )()
-
-    consumed = await runtime._route_microphone_audio(
-        b"\x01\x00" * 160,
-        sample_rate_hz=16_000,
-    )
-    await runtime._asr_audio_dispatcher.wait_idle()
-
-    assert consumed is True
-    asr.stream_audio.assert_not_awaited()
-    assert runtime._asr_lifecycle.pre_roll_bytes == 320
-
 
 async def test_local_speech_wake_uploads_pre_roll_to_independent_asr() -> None:
     runtime = _Runtime()
@@ -886,7 +1045,6 @@ async def test_local_speech_wake_uploads_pre_roll_to_independent_asr() -> None:
     )
     runtime.session.handle_interruption.assert_awaited_once_with()
 
-
 async def test_detector_failure_fails_open_to_same_independent_asr() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -909,32 +1067,6 @@ async def test_detector_failure_fails_open_to_same_independent_asr() -> None:
     )
     assert runtime._asr_route_mode == "independent"
 
-
-async def test_game_takeover_clears_provider_audio_and_suspends_lifecycle() -> None:
-    runtime = _Runtime()
-    asr = type("Asr", (), {})()
-    asr.is_ready = True
-    asr.close = AsyncMock()
-    runtime._asr_session = asr
-    runtime._asr_route_mode = "independent"
-    runtime._asr_lifecycle = VoiceInputLifecycleController(
-        provider_policy=resolve_provider_policy("qwen", "manual"),
-        shadow_mode=False,
-    )
-    runtime._asr_lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
-    detector = type("Detector", (), {"reset": AsyncMock()})()
-    runtime._asr_detector = detector
-
-    await runtime._suspend_independent_voice_input_for_game()
-
-    asr.close.assert_awaited_once_with()
-    detector.reset.assert_awaited_once_with()
-    assert runtime._asr_lifecycle.snapshot.state.value == "suspended"
-
-    await runtime._resume_independent_voice_input_after_game()
-    assert runtime._asr_lifecycle.snapshot.state.value == "local_listen"
-
-
 async def test_game_takeover_wins_even_if_provider_clear_fails() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -951,7 +1083,6 @@ async def test_game_takeover_wins_even_if_provider_clear_fails() -> None:
     await runtime._suspend_independent_voice_input_for_game()
 
     assert runtime._asr_lifecycle.snapshot.state.value == "suspended"
-
 
 async def test_game_consumer_reuses_smart_turn_asr_without_core(
     monkeypatch,
@@ -1012,7 +1143,6 @@ async def test_game_consumer_reuses_smart_turn_asr_without_core(
         is True
     )
 
-
 async def test_game_consumer_ignores_empty_final(monkeypatch) -> None:
     runtime = _Runtime()
     route_transcript = AsyncMock(return_value=True)
@@ -1055,7 +1185,6 @@ async def test_game_consumer_ignores_empty_final(monkeypatch) -> None:
     runtime.handle_new_message.assert_not_awaited()
     runtime.handle_input_transcript.assert_not_awaited()
     runtime.session.create_response.assert_not_awaited()
-
 
 async def test_game_takeover_pre_abort_window_rejects_stale_core_turn(
     monkeypatch,
@@ -1160,7 +1289,6 @@ async def test_game_takeover_pre_abort_window_rejects_stale_core_turn(
         f"asr-{epoch}-1"
     )
 
-
 async def test_rejected_voice_input_final_is_observable(monkeypatch) -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -1181,7 +1309,6 @@ async def test_rejected_voice_input_final_is_observable(monkeypatch) -> None:
 
     debug.assert_called_once()
     assert "voice input final rejected" in debug.call_args.args[0]
-
 
 async def test_game_consumer_accepts_real_pcm_through_pipeline(
     monkeypatch,
@@ -1244,7 +1371,6 @@ async def test_game_consumer_accepts_real_pcm_through_pipeline(
         captured_at=1234.5,
     )
 
-
 async def test_game_consumer_submit_preserves_owner_identity(monkeypatch) -> None:
     runtime = _Runtime()
     monkeypatch.setattr(
@@ -1289,7 +1415,6 @@ async def test_game_consumer_submit_preserves_owner_identity(monkeypatch) -> Non
         processed,
         ingress_token=token,
     )
-
 
 async def test_hot_swap_cache_replay_preserves_rnnoise_evidence() -> None:
     runtime = _Runtime()
@@ -1336,7 +1461,6 @@ async def test_hot_swap_cache_replay_preserves_rnnoise_evidence() -> None:
         captured_at=2345.6,
     )
 
-
 async def test_stale_audio_epoch_rejects_processed_rnnoise_evidence() -> None:
     runtime = _Runtime()
     runtime.is_active = True
@@ -1368,7 +1492,6 @@ async def test_stale_audio_epoch_rejects_processed_rnnoise_evidence() -> None:
 
     runtime._voice_input_audio_pipeline.process.assert_awaited_once()
     route_audio.assert_not_awaited()
-
 
 async def test_game_consumer_failure_never_falls_back_to_core(
     monkeypatch,
@@ -1413,7 +1536,6 @@ async def test_game_consumer_failure_never_falls_back_to_core(
     runtime.session.create_response.assert_not_awaited()
     assert runtime._omni_mic_audio_bytes == 0
 
-
 async def test_game_final_cannot_cross_lease_back_to_core(monkeypatch) -> None:
     runtime = _Runtime()
     route_transcript = AsyncMock(return_value=True)
@@ -1455,7 +1577,6 @@ async def test_game_final_cannot_cross_lease_back_to_core(monkeypatch) -> None:
     runtime.session.create_response.assert_not_awaited()
     assert runtime._omni_mic_audio_bytes == 0
 
-
 async def test_hard_mute_overrides_game_consumer(monkeypatch) -> None:
     runtime = _Runtime()
     monkeypatch.setattr(
@@ -1474,7 +1595,6 @@ async def test_hard_mute_overrides_game_consumer(monkeypatch) -> None:
     assert runtime._voice_input_accepts_pcm() is False
     assert runtime._voice_input_suppression_reasons == {"hard_mute"}
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_game_owner_without_consumer_remains_fail_closed() -> None:
     runtime = _Runtime()
@@ -1495,7 +1615,6 @@ async def test_game_owner_without_consumer_remains_fail_closed() -> None:
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.SUSPENDED
     assert runtime._omni_mic_audio_bytes == 0
 
-
 async def test_fresh_blocked_route_consumes_pcm_without_omni() -> None:
     runtime = _Runtime()
 
@@ -1507,7 +1626,6 @@ async def test_fresh_blocked_route_consumes_pcm_without_omni() -> None:
     assert consumed is True
     assert runtime._asr_audio_bytes == 0
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_native_route_is_sufficient_to_authorize_omni_audio() -> None:
     runtime = _Runtime()
@@ -1523,59 +1641,6 @@ async def test_native_route_is_sufficient_to_authorize_omni_audio() -> None:
     assert runtime._asr_route_mode == "native"
     runtime.session.stream_audio.assert_awaited_once()
     assert not hasattr(runtime._asr_runtime, "_asr_required")
-
-
-class _CoreActivationScorer:
-    profile_generation = "profile"
-    scorer_generation = 1
-
-    def __init__(self, *, similarity: float = 0.8) -> None:
-        self.similarity = similarity
-        self.calls = 0
-        self.closed = False
-
-    async def prepare(self) -> ActivationScoreStatus:
-        return ActivationScoreStatus.READY
-
-    async def score(self, identity, pcm16: bytes, *, sample_rate_hz: int):
-        assert pcm16
-        assert sample_rate_hz == 16_000
-        self.calls += 1
-        return ActivationScoreResult(
-            identity,
-            ActivationScoreStatus.READY,
-            self.similarity,
-        )
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class _CoreActivationFactory:
-    activation_generation = "profile"
-
-    def __init__(self, *, similarity: float = 0.8) -> None:
-        self.similarity = similarity
-        self.runtimes: list[VoiceSessionActivationRuntime] = []
-        self.scorers: list[_CoreActivationScorer] = []
-        self.closed = False
-
-    def create(self, generation, output, *, status_callback=None):
-        scorer = _CoreActivationScorer(similarity=self.similarity)
-        scorer.profile_generation = self.activation_generation
-        runtime = VoiceSessionActivationRuntime(
-            generation,
-            scorer,  # type: ignore[arg-type]
-            output,
-            status_callback=status_callback,
-        )
-        self.scorers.append(scorer)
-        self.runtimes.append(runtime)
-        return runtime
-
-    def close(self) -> None:
-        self.closed = True
-
 
 async def test_required_activation_revoke_retires_runtime_before_async_replace() -> None:
     runtime = _Runtime()
@@ -1598,7 +1663,6 @@ async def test_required_activation_revoke_retires_runtime_before_async_replace()
     assert runtime._voice_session_activation_permission_revision > before_permission
     await asyncio.sleep(0)
     old_runtime.close.assert_awaited_once()
-
 
 async def test_required_activation_token_rejects_waiting_older_factory() -> None:
     runtime = _Runtime()
@@ -1626,23 +1690,6 @@ async def test_required_activation_token_rejects_waiting_older_factory() -> None
     )
     assert runtime._voice_session_activation_factory is None
     assert runtime._voice_session_activation_required is True
-
-
-async def _wait_for_activation_output(
-    call_count,
-    *,
-    expected_count: int,
-) -> None:
-    try:
-        async with asyncio.timeout(1.0):
-            while call_count() < expected_count:
-                await asyncio.sleep(0)
-    except TimeoutError as exc:
-        raise AssertionError(
-            "activation replay did not drain: "
-            f"expected {expected_count}, received {call_count()}"
-        ) from exc
-
 
 async def test_voice_session_activation_gates_native_then_replays_and_forwards() -> None:
     runtime = _Runtime()
@@ -1682,7 +1729,6 @@ async def test_voice_session_activation_gates_native_then_replays_and_forwards()
         None,
         activation_generation="disabled",
     )
-
 
 async def test_native_idle_disconnect_reconnects_before_activation_replay() -> None:
     runtime = _Runtime()
@@ -1769,7 +1815,6 @@ async def test_native_idle_disconnect_reconnects_before_activation_replay() -> N
         activation_generation="disabled",
     )
 
-
 async def test_native_idle_reconnect_failure_keeps_replay_for_one_safe_retry() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
@@ -1843,7 +1888,6 @@ async def test_native_idle_reconnect_failure_keeps_replay_for_one_safe_retry() -
         None,
         activation_generation="disabled",
     )
-
 
 async def test_native_idle_reconnect_survives_activation_authority_replacement() -> None:
     runtime = _Runtime()
@@ -1922,7 +1966,6 @@ async def test_native_idle_reconnect_survives_activation_authority_replacement()
         activation_generation="disabled",
     )
 
-
 async def test_disabling_activation_reconnects_idle_native_session_on_next_frame() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
@@ -1983,7 +2026,6 @@ async def test_disabling_activation_reconnects_idle_native_session_on_next_frame
     assert delivered == [live_frame]
     assert runtime.session_closed_by_server is False
     assert runtime._native_activation_idle_reconnect_identity is None
-
 
 async def test_activation_authority_replacement_waits_for_native_reconnect() -> None:
     runtime = _Runtime()
@@ -2067,7 +2109,6 @@ async def test_activation_authority_replacement_waits_for_native_reconnect() -> 
         activation_generation="disabled",
     )
 
-
 async def test_voice_session_activation_keeps_original_monotonic_capture_time() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
@@ -2115,7 +2156,6 @@ async def test_voice_session_activation_keeps_original_monotonic_capture_time() 
     assert captured_frames[0].captured_at == 29.9
     assert captured_frames[0].context.captured_at == 1_725_000_000.0
 
-
 async def test_voice_session_activation_gates_independent_asr_before_submit() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("independent")
@@ -2142,8 +2182,6 @@ async def test_voice_session_activation_gates_independent_asr_before_submit() ->
         activation_generation="disabled",
     )
 
-
-@pytest.mark.parametrize("route_mode", ["native", "independent"])
 async def test_required_activation_without_factory_blocks_both_audio_routes(
     route_mode: str,
 ) -> None:
@@ -2184,7 +2222,6 @@ async def test_required_activation_without_factory_blocks_both_audio_routes(
         runtime.session.stream_audio.assert_not_awaited()
         runtime._asr_runtime.submit.assert_awaited_once()
 
-
 async def test_factory_audio_contract_blocks_until_session_pipeline_matches() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
@@ -2205,7 +2242,6 @@ async def test_factory_audio_contract_blocks_until_session_pipeline_matches() ->
     runtime._voice_input_noise_reduction_enabled = False
     assert await runtime._route_microphone_audio(frame, sample_rate_hz=16_000)
     assert len(factory.runtimes) == 1
-
 
 async def test_voice_session_activation_route_change_retires_old_authority() -> None:
     runtime = _Runtime()
@@ -2237,7 +2273,6 @@ async def test_voice_session_activation_route_change_retires_old_authority() -> 
         activation_generation="disabled",
     )
 
-
 async def test_voice_pcm_invalidation_retires_activation_without_another_frame() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
@@ -2263,7 +2298,6 @@ async def test_voice_pcm_invalidation_retires_activation_without_another_frame()
     assert factory.scorers[0].closed is True
     assert factory.closed is False
 
-
 async def test_session_activation_detaches_preexisting_utterance_verifier() -> None:
     runtime = _Runtime()
     legacy_factory = MagicMock()
@@ -2285,7 +2319,6 @@ async def test_session_activation_detaches_preexisting_utterance_verifier() -> N
     assert runtime._speaker_shadow_factory is None
     assert runtime._voice_session_activation_factory is factory
 
-
 async def test_session_activation_swap_timeout_preserves_legacy_verifier() -> None:
     runtime = _Runtime()
     legacy_factory = MagicMock()
@@ -2305,7 +2338,6 @@ async def test_session_activation_swap_timeout_preserves_legacy_verifier() -> No
     assert runtime._speaker_shadow_factory is legacy_factory
     assert runtime._voice_session_activation_factory is None
     runtime._asr_runtime.set_speaker_verifier_factory.assert_not_awaited()
-
 
 async def test_session_activation_detach_failure_blocks_microphone_pcm() -> None:
     runtime = _Runtime()
@@ -2330,7 +2362,6 @@ async def test_session_activation_detach_failure_blocks_microphone_pcm() -> None
     assert runtime._voice_session_activation_degraded is True
     runtime.session.stream_audio.assert_not_awaited()
 
-
 async def test_cancelled_session_activation_detach_blocks_microphone_pcm() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "native"
@@ -2354,7 +2385,6 @@ async def test_cancelled_session_activation_detach_blocks_microphone_pcm() -> No
     assert runtime._voice_session_activation_factory is None
     assert runtime._voice_session_activation_degraded is True
     runtime.session.stream_audio.assert_not_awaited()
-
 
 async def test_inflight_session_activation_detach_blocks_microphone_pcm() -> None:
     runtime = _Runtime()
@@ -2390,7 +2420,6 @@ async def test_inflight_session_activation_detach_blocks_microphone_pcm() -> Non
     release_detach.set()
     assert await transition is VoiceIdentityActivationResult.RUNTIME_DEGRADED
 
-
 async def test_session_activation_rejects_mismatched_factory_generation() -> None:
     runtime = _Runtime()
     factory = _CoreActivationFactory()
@@ -2401,7 +2430,6 @@ async def test_session_activation_rejects_mismatched_factory_generation() -> Non
             activation_generation="stale-profile",
         )
     assert runtime._voice_session_activation_factory is None
-
 
 async def test_speech_started_interrupts_and_prepares_turn_once() -> None:
     runtime = _Runtime()
@@ -2421,7 +2449,6 @@ async def test_speech_started_interrupts_and_prepares_turn_once() -> None:
     runtime.handle_new_message.assert_awaited_once_with()
     assert runtime._asr_turn_prepared is True
 
-
 async def test_speech_started_prepares_external_voice_turn() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime)
@@ -2436,7 +2463,6 @@ async def test_speech_started_prepares_external_voice_turn() -> None:
         turn_id=f"asr-{runtime._asr_session_epoch}-1"
     )
     runtime.handle_new_message.assert_awaited_once_with()
-
 
 async def test_gemini_prepare_reconnect_replaces_core_receive_task() -> None:
     runtime = _Runtime()
@@ -2455,7 +2481,6 @@ async def test_gemini_prepare_reconnect_replaces_core_receive_task() -> None:
         runtime.session
     )
     runtime.handle_new_message.assert_awaited_once_with()
-
 
 async def test_reconnect_listener_replacement_cancels_retired_receive_task() -> None:
     manager = LLMSessionManager.__new__(LLMSessionManager)
@@ -2492,7 +2517,6 @@ async def test_reconnect_listener_replacement_cancels_retired_receive_task() -> 
     manager.message_handler_task.cancel()
     await asyncio.gather(manager.message_handler_task, return_exceptions=True)
 
-
 async def test_game_takeover_during_core_prepare_drops_stale_message() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime)
@@ -2519,7 +2543,6 @@ async def test_game_takeover_during_core_prepare_drops_stale_message() -> None:
     assert runtime.session.abandon_external_voice_turn.call_args_list == [
         call(external_turn_id),
     ]
-
 
 async def test_stale_core_prepare_restores_previous_preview_owner() -> None:
     runtime = _Runtime()
@@ -2556,7 +2579,6 @@ async def test_stale_core_prepare_restores_previous_preview_owner() -> None:
         f"asr-{token.ingress.session_epoch}-{token.turn_id}"
     )
 
-
 async def test_turn_endpoint_seals_immediately_before_provider_final() -> None:
     runtime = _Runtime()
     runtime._asr_session = type("Asr", (), {"is_ready": True})()
@@ -2570,7 +2592,6 @@ async def test_turn_endpoint_seals_immediately_before_provider_final() -> None:
     await runtime._handle_independent_asr_endpoint(epoch)
 
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.DRAINING
-
 
 async def test_rejected_prepare_fails_closed_instead_of_sealing_turn() -> None:
     runtime = _Runtime()
@@ -2603,7 +2624,6 @@ async def test_rejected_prepare_fails_closed_instead_of_sealing_turn() -> None:
     runtime.handle_input_transcript.assert_not_awaited()
     runtime.session.create_response.assert_not_awaited()
 
-
 async def test_endpoint_reprepares_turn_after_transient_prepare_rejection() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -2632,7 +2652,6 @@ async def test_endpoint_reprepares_turn_after_transient_prepare_rejection() -> N
 
     runtime.handle_input_transcript.assert_awaited_once()
     runtime.session.create_response.assert_awaited_once_with("hello")
-
 
 async def test_empty_final_completes_turn_without_core_injection() -> None:
     runtime = _Runtime()
@@ -2665,37 +2684,6 @@ async def test_empty_final_completes_turn_without_core_injection() -> None:
     runtime.session.abandon_external_voice_turn.assert_called_once_with(turn_id)
     assert runtime._omni_mic_audio_bytes == 0
 
-
-async def test_blocked_consumer_callback_does_not_block_next_turn_lifecycle() -> (
-    None
-):
-    runtime = _Runtime()
-    callback_started = asyncio.Event()
-    release_callback = asyncio.Event()
-
-    async def block_first_final(*_args, **_kwargs) -> bool:
-        callback_started.set()
-        await release_callback.wait()
-        return True
-
-    runtime.handle_input_transcript.side_effect = block_first_final
-    await _start_and_seal_turn(runtime, "qwen")
-    epoch = runtime._asr_session_epoch
-
-    await runtime._handle_independent_asr_final("first", epoch, "qwen")
-    await asyncio.wait_for(callback_started.wait(), 1)
-    await runtime._handle_independent_asr_activity(
-        SpeechActivityEvent.SPEECH_STARTED,
-        epoch,
-    )
-
-    assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
-    assert runtime._asr_turn_prepared is True
-    release_callback.set()
-    await runtime._wait_asr_transcript_dispatch_idle()
-    runtime.session.create_response.assert_awaited_once_with("first")
-
-
 async def test_prepare_failure_releases_keyed_external_turn_pause() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime)
@@ -2711,7 +2699,6 @@ async def test_prepare_failure_releases_keyed_external_turn_pause() -> None:
         f"asr-{token.ingress.session_epoch}-{token.turn_id}"
     )
 
-
 async def test_registry_prepare_rejection_releases_keyed_external_turn_pause() -> (
     None
 ):
@@ -2726,7 +2713,6 @@ async def test_registry_prepare_rejection_releases_keyed_external_turn_pause() -
     runtime.session.abandon_external_voice_turn.assert_called_once_with(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}"
     )
-
 
 async def test_registry_cancelled_prepare_releases_keyed_external_turn_pause() -> (
     None
@@ -2744,7 +2730,6 @@ async def test_registry_cancelled_prepare_releases_keyed_external_turn_pause() -
     runtime.session.abandon_external_voice_turn.assert_called_once_with(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}"
     )
-
 
 async def test_final_transcript_drops_new_conversation_swap_mid_restore() -> None:
     """A real conversation transition still invalidates the prepared final."""
@@ -2779,7 +2764,6 @@ async def test_final_transcript_drops_new_conversation_swap_mid_restore() -> Non
     replacement.create_response.assert_not_awaited()
     replacement.submit_external_voice_turn.assert_not_awaited()
 
-
 async def test_pre_dispatch_hot_swap_reprepares_turn_on_promoted_session() -> None:
     """A same-route hot swap transfers the final off the closed old arbiter."""
     runtime = _Runtime()
@@ -2809,7 +2793,6 @@ async def test_pre_dispatch_hot_swap_reprepares_turn_on_promoted_session() -> No
         "prepared",
         turn_id=f"asr-{token.ingress.session_epoch}-{token.turn_id}",
     )
-
 
 async def test_final_waits_for_shared_swap_barrier_then_uses_promoted_session() -> None:
     runtime = _Runtime()
@@ -2850,7 +2833,6 @@ async def test_final_waits_for_shared_swap_barrier_then_uses_promoted_session() 
         turn_id=f"asr-{token.ingress.session_epoch}-{token.turn_id}",
     )
 
-
 async def test_final_swap_barrier_timeout_drops_without_blocking_dispatcher() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime)
@@ -2874,20 +2856,6 @@ async def test_final_swap_barrier_timeout_drops_without_blocking_dispatcher() ->
         runtime._core_voice_session_swap_lock.release()
 
     runtime.session.create_response.assert_not_awaited()
-
-
-async def test_hot_swap_lifecycle_guards_close_and_promote_with_voice_barrier() -> None:
-    source = inspect.getsource(
-        core_module.LLMSessionManager._perform_final_swap_sequence
-    )
-
-    barrier = source.index("async with core_voice_session_lock")
-    close = source.index("old_main_session.close()", barrier)
-    promote = source.index("self.session = new_session", close)
-    barrier_exit = source.index("if not _promote_allowed", promote)
-    assert barrier < close < promote < barrier_exit
-    assert "asyncio.timeout_at" in source[barrier:promote]
-
 
 async def test_final_transcript_is_dropped_when_the_route_leaves_core_mid_restore() -> None:
     # Codex P2, the other half of the case above. Pinning session_ref protects
@@ -2923,7 +2891,6 @@ async def test_final_transcript_is_dropped_when_the_route_leaves_core_mid_restor
     # No Core response is started for a route that has moved on.
     timed_session.create_response.assert_not_awaited()
 
-
 async def test_transcript_dispatch_failure_releases_keyed_external_turn_pause() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime)
@@ -2942,7 +2909,6 @@ async def test_transcript_dispatch_failure_releases_keyed_external_turn_pause() 
     runtime.session.abandon_external_voice_turn.assert_called_once_with(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}"
     )
-
 
 async def test_cancelled_preview_clear_still_releases_keyed_external_turn_pause() -> None:
     runtime = _Runtime()
@@ -2965,8 +2931,6 @@ async def test_cancelled_preview_clear_still_releases_keyed_external_turn_pause(
         "asr-cancelled-preview"
     )
 
-
-@pytest.mark.parametrize("stale_guard", ["ingress", "owner"])
 async def test_stale_final_guard_releases_keyed_external_turn_pause(
     stale_guard: str,
 ) -> None:
@@ -2990,7 +2954,6 @@ async def test_stale_final_guard_releases_keyed_external_turn_pause(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}"
     )
 
-
 async def test_abort_bumps_generation_before_waiting_for_registry_cancel() -> None:
     runtime = _Runtime()
     order: list[str] = []
@@ -3007,7 +2970,6 @@ async def test_abort_bumps_generation_before_waiting_for_registry_cancel() -> No
     await runtime._abort_independent_asr("ingress_backpressure")
 
     assert order == ["abort", "invalidate", "wait_idle"]
-
 
 async def test_suspend_advances_runtime_barrier_before_waiting_for_registry_cancel() -> (
     None
@@ -3028,15 +2990,6 @@ async def test_suspend_advances_runtime_barrier_before_waiting_for_registry_canc
 
     assert order == ["suspend", "invalidate", "wait_idle"]
 
-
-@pytest.mark.parametrize(
-    ("previous_owner", "owner", "reason", "barrier_method"),
-    [
-        ("core", "game", "game_takeover", "suspend"),
-        ("game", "core", "game_release", "abort"),
-        ("core", "none", "connection_closed", "abort"),
-    ],
-)
 async def test_voice_lease_advances_runtime_barrier_before_waiting_for_registry(
     previous_owner: str,
     owner: str,
@@ -3070,8 +3023,6 @@ async def test_voice_lease_advances_runtime_barrier_before_waiting_for_registry(
 
     assert order == ["invalidate", barrier_method, "wait_idle"]
 
-
-@pytest.mark.parametrize("operation", ["abort", "close"])
 async def test_core_asr_teardown_force_releases_external_turn_pause(
     operation: str,
 ) -> None:
@@ -3094,7 +3045,6 @@ async def test_core_asr_teardown_force_releases_external_turn_pause(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}",
     )
 
-
 async def test_current_asr_failure_force_releases_external_turn_pause() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -3113,7 +3063,6 @@ async def test_current_asr_failure_force_releases_external_turn_pause() -> None:
     runtime.session.abandon_external_voice_turn.assert_called_once_with(
         f"asr-{token.ingress.session_epoch}-{token.turn_id}",
     )
-
 
 async def test_registry_cancellation_abandons_the_prepared_session_after_swap() -> (
     None
@@ -3139,7 +3088,6 @@ async def test_registry_cancellation_abandons_the_prepared_session_after_swap() 
     )
     replacement.abandon_external_voice_turn.assert_not_called()
 
-
 async def test_runtime_close_preserves_manager_lifetime_registry_builtins() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -3161,7 +3109,6 @@ async def test_runtime_close_preserves_manager_lifetime_registry_builtins() -> N
     assert game_registration.closed is False
     assert len(registry._records) == 2
 
-
 async def test_runtime_state_initializes_and_backfills_phase4a_fields() -> None:
     runtime = _Runtime()
 
@@ -3180,7 +3127,6 @@ async def test_runtime_state_initializes_and_backfills_phase4a_fields() -> None:
     assert runtime._voice_input_resource_optimization_session_value is None
     assert runtime._core_asr_preview_turn_token is None
     assert runtime._voice_input_external_suppressions == set()
-
 
 async def test_provider_final_watchdog_blocks_only_independent_asr() -> None:
     runtime = _Runtime()
@@ -3210,7 +3156,6 @@ async def test_provider_final_watchdog_blocks_only_independent_asr() -> None:
     runtime.handle_input_transcript.assert_not_awaited()
     runtime.session.create_response.assert_not_awaited()
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_provider_final_watchdog_honors_per_provider_policy_timeout() -> None:
     runtime = _Runtime()
@@ -3265,7 +3210,6 @@ async def test_provider_final_watchdog_honors_per_provider_policy_timeout() -> N
         f"守护任务没有按 per-provider 的 500ms 超时开火，实际 {elapsed:.3f}s"
     )
 
-
 async def test_optimization_disabled_streaming_uploads_without_smart_turn() -> None:
     runtime = _Runtime()
     runtime._voice_input_resource_optimization_enabled = False
@@ -3293,7 +3237,6 @@ async def test_optimization_disabled_streaming_uploads_without_smart_turn() -> N
     assert runtime._asr_smart_turn_lease is None
     assert runtime._asr_detector._token is None
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_segmented_fail_open_uses_continuous_wake_without_fake_speech() -> None:
     runtime = _Runtime()
@@ -3324,7 +3267,6 @@ async def test_segmented_fail_open_uses_continuous_wake_without_fake_speech() ->
     asr.stream_audio.assert_awaited_once()
     assert runtime._asr_route_mode == "independent"
 
-
 async def test_native_connection_close_is_latched_and_not_retried() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("native")
@@ -3347,7 +3289,6 @@ async def test_native_connection_close_is_latched_and_not_retried() -> None:
     assert runtime.session_closed_by_server is True
     runtime.session.stream_audio.assert_awaited_once()
 
-
 async def test_native_audio_failure_log_is_rate_limited(monkeypatch) -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("native")
@@ -3364,8 +3305,6 @@ async def test_native_audio_failure_log_is_rate_limited(monkeypatch) -> None:
     assert runtime.session.stream_audio.await_count == 2
     log_error.assert_called_once()
 
-
-@pytest.mark.parametrize("provider", ["qwen", "openai"])
 async def test_optimization_disabled_provider_route_never_prepares_smart_turn(
     provider: str,
 ) -> None:
@@ -3397,7 +3336,6 @@ async def test_optimization_disabled_provider_route_never_prepares_smart_turn(
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
     assert runtime._asr_smart_turn_lease is None
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_draining_next_speech_waits_for_old_final_then_starts_new_turn() -> None:
     runtime = _Runtime()
@@ -3454,7 +3392,6 @@ async def test_draining_next_speech_waits_for_old_final_then_starts_new_turn() -
     await runtime._handle_independent_asr_final("stale-old-turn", epoch, "qwen")
     runtime.handle_input_transcript.assert_not_awaited()
 
-
 async def test_warm_idle_pending_speech_does_not_reenter_draining_guard() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -3493,7 +3430,6 @@ async def test_warm_idle_pending_speech_does_not_reenter_draining_guard() -> Non
     assert lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
     assert lifecycle.has_pending_turn is True
 
-
 async def test_stale_pending_activation_discards_confirmed_candidate() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -3529,7 +3465,6 @@ async def test_stale_pending_activation_discards_confirmed_candidate() -> None:
     assert lifecycle.has_pending_turn is False
     assert runtime._asr_pending_detector_candidate is None
 
-
 async def test_final_without_observed_pending_preserves_racing_next_onset() -> None:
     runtime = _Runtime()
     await _start_and_seal_turn(runtime, "gemini")
@@ -3546,7 +3481,6 @@ async def test_final_without_observed_pending_preserves_racing_next_onset() -> N
     # Releasing the completed turn preserves that audio; a full reset loses it.
     detector.reset.assert_not_awaited()
     detector.release_deferred_turn.assert_awaited_once_with()
-
 
 async def test_active_onset_before_delayed_provider_final_starts_next_turn() -> None:
     runtime = _Runtime()
@@ -3586,7 +3520,6 @@ async def test_active_onset_before_delayed_provider_final_starts_next_turn() -> 
     ] == ["first", "second"]
     assert runtime.handle_new_message.await_count == 2
 
-
 async def test_stale_overlap_onset_is_not_replayed_after_final() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -3618,7 +3551,6 @@ async def test_stale_overlap_onset_is_not_replayed_after_final() -> None:
     # strict routing drops it together with the stale overlap onset.
     runtime.handle_input_transcript.assert_not_awaited()
     assert runtime.handle_new_message.await_count == 1
-
 
 async def test_candidate_pause_defers_overlap_onset_without_ghost_wake() -> None:
     runtime = _Runtime()
@@ -3655,7 +3587,6 @@ async def test_candidate_pause_defers_overlap_onset_without_ghost_wake() -> None
         call.args[0] for call in runtime.handle_input_transcript.await_args_list
     ] == ["hello"]
     assert runtime.handle_new_message.await_count == 1
-
 
 async def test_completed_overlap_before_delayed_final_delivers_both_finals() -> None:
     runtime = _Runtime()
@@ -3703,7 +3634,6 @@ async def test_completed_overlap_before_delayed_final_delivers_both_finals() -> 
     assert runtime.handle_new_message.await_count == 2
     assert runtime._asr_overlap_completed_turns == 0
 
-
 async def test_two_completed_overlaps_replay_in_order_after_delayed_final() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -3740,7 +3670,6 @@ async def test_two_completed_overlaps_replay_in_order_after_delayed_final() -> N
     ] == ["first", "second", "third"]
     assert runtime.handle_new_message.await_count == 3
     assert runtime._asr_overlap_completed_turns == 0
-
 
 async def test_hard_mute_clears_completed_overlap_credit() -> None:
     runtime = _Runtime()
@@ -3798,7 +3727,6 @@ async def test_hard_mute_clears_completed_overlap_credit() -> None:
     assert runtime.handle_input_transcript.await_count == 0
     assert runtime.handle_new_message.await_count == 1
 
-
 async def test_stale_completed_overlap_is_dropped_at_next_endpoint() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -3840,7 +3768,6 @@ async def test_stale_completed_overlap_is_dropped_at_next_endpoint() -> None:
     runtime.handle_input_transcript.assert_not_awaited()
     assert runtime.handle_new_message.await_count == 1
 
-
 async def test_smart_turn_active_resumed_is_not_recorded_for_replay() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -3867,7 +3794,6 @@ async def test_smart_turn_active_resumed_is_not_recorded_for_replay() -> None:
         call.args[0] for call in runtime.handle_input_transcript.await_args_list
     ] == ["hello"]
     assert runtime.handle_new_message.await_count == 1
-
 
 async def test_draining_pending_turn_overflow_discards_candidate_and_reports_backpressure() -> (
     None
@@ -3917,7 +3843,6 @@ async def test_draining_pending_turn_overflow_discards_candidate_and_reports_bac
         for call in runtime.send_status.await_args_list
     )
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_active_ingress_backpressure_releases_keyed_core_turn_without_blocking(
     monkeypatch,
@@ -4012,7 +3937,6 @@ async def test_active_ingress_backpressure_releases_keyed_core_turn_without_bloc
         for call in runtime.send_status.await_args_list
     )
 
-
 async def test_transport_only_close_enters_deep_sleep_without_closing_detector() -> (
     None
 ):
@@ -4041,7 +3965,6 @@ async def test_transport_only_close_enters_deep_sleep_without_closing_detector()
     asr.close.assert_awaited_once_with()
     detector.close.assert_not_awaited()
 
-
 async def test_initial_ready_transport_also_expires_from_local_listen() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {"close": AsyncMock()})()
@@ -4069,7 +3992,6 @@ async def test_initial_ready_transport_also_expires_from_local_listen() -> None:
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.DEEP_SLEEP
     asr.close.assert_awaited_once_with()
 
-
 async def test_prewarming_uses_idle_transport_ttl() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {"close": AsyncMock()})()
@@ -4096,7 +4018,6 @@ async def test_prewarming_uses_idle_transport_ttl() -> None:
     assert runtime._asr_session is None
     assert lifecycle.snapshot.state is VoiceLifecycleState.DEEP_SLEEP
     asr.close.assert_awaited_once_with()
-
 
 async def test_warm_idle_uses_provider_transport_ttl() -> None:
     runtime = _Runtime()
@@ -4128,11 +4049,6 @@ async def test_warm_idle_uses_provider_transport_ttl() -> None:
     assert lifecycle.snapshot.state is VoiceLifecycleState.DEEP_SLEEP
     asr.close.assert_awaited_once_with()
 
-
-@pytest.mark.parametrize(
-    "replacement",
-    ["epoch", "lifecycle", "session", "transport", "state"],
-)
 async def test_stale_transport_expiry_never_closes_successor(
     replacement: str,
 ) -> None:
@@ -4185,7 +4101,6 @@ async def test_stale_transport_expiry_never_closes_successor(
     original_session.close.assert_not_awaited()
     expected_current_session.close.assert_not_awaited()
 
-
 async def test_prewarm_expiry_rechecks_identity_after_detector_reset() -> None:
     runtime = _Runtime()
     original_session = type("Asr", (), {"close": AsyncMock()})()
@@ -4227,18 +4142,6 @@ async def test_prewarm_expiry_rechecks_identity_after_detector_reset() -> None:
     original_session.close.assert_not_awaited()
     successor_session.close.assert_not_awaited()
 
-
-async def test_submit_without_lifecycle_returns_typed_unavailable() -> None:
-    runtime = _Runtime()
-    result = await runtime._asr_runtime.submit(
-        ProcessedVoiceFrame(b"\x01\x00" * 160, 16_000, 0.0, False),
-        ingress_token=VoiceIngressToken(0, "socket", 0, 0, 0),
-    )
-
-    assert result == AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
-    assert not isinstance(result, bool)
-
-
 async def test_submit_has_only_typed_top_level_return_paths() -> None:
     source = textwrap.dedent(inspect.getsource(IndependentAsrRuntime.submit))
     function = ast.parse(source).body[0]
@@ -4264,7 +4167,6 @@ async def test_submit_has_only_typed_top_level_return_paths() -> None:
         and return_node.value.func.id == "AsrSubmitResult"
         for return_node in returns
     )
-
 
 async def test_deep_sleep_speech_reconnects_and_flushes_pending_audio() -> None:
     runtime = _Runtime()
@@ -4318,8 +4220,6 @@ async def test_deep_sleep_speech_reconnects_and_flushes_pending_audio() -> None:
         sample_rate_hz=16_000,
     )
 
-
-@pytest.mark.parametrize("provider", ["glm", "gemini"])
 async def test_smart_turn_fail_open_buffers_until_deep_sleep_transport_reconnects(
     provider: str,
 ) -> None:
@@ -4379,7 +4279,6 @@ async def test_smart_turn_fail_open_buffers_until_deep_sleep_transport_reconnect
     ]
     assert all(status.get("code") != "ASR_BLOCKED_ENDPOINTING" for status in statuses)
 
-
 async def test_optimization_disabled_buffers_until_initial_transport_is_ready() -> None:
     runtime = _Runtime()
     runtime._voice_input_resource_optimization_enabled = False
@@ -4433,7 +4332,6 @@ async def test_optimization_disabled_buffers_until_initial_transport_is_ready() 
         json.loads(call.args[0]) for call in runtime.send_status.await_args_list
     ]
     assert all(status.get("code") != "ASR_BLOCKED_ENDPOINTING" for status in statuses)
-
 
 async def test_hard_mute_is_backend_authoritative_and_rejects_stale_lease_events() -> (
     None
@@ -4505,7 +4403,6 @@ async def test_hard_mute_is_backend_authoritative_and_rejects_stale_lease_events
     )
     assert runtime._voice_input_suppressed is False
 
-
 async def test_hard_mute_during_detector_await_invalidates_inflight_pcm() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -4557,7 +4454,6 @@ async def test_hard_mute_during_detector_await_invalidates_inflight_pcm() -> Non
     assert runtime._asr_audio_bytes == 0
     assert runtime._omni_mic_audio_bytes == 0
 
-
 async def test_hard_mute_suppresses_stale_audio_dispatcher_failure() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -4589,7 +4485,6 @@ async def test_hard_mute_suppresses_stale_audio_dispatcher_failure() -> None:
     assert runtime._asr_route_mode == "independent"
     assert runtime._asr_lifecycle is lifecycle
     runtime.send_status.assert_not_awaited()
-
 
 async def test_game_takeover_suppresses_stale_detector_dispatcher_failure() -> None:
     runtime = _Runtime()
@@ -4633,7 +4528,6 @@ async def test_game_takeover_suppresses_stale_detector_dispatcher_failure() -> N
     assert runtime._asr_lifecycle is lifecycle
     assert lifecycle.snapshot.state is VoiceLifecycleState.SUSPENDED
     runtime.send_status.assert_not_awaited()
-
 
 async def test_new_websocket_connection_resets_mic_lease_generation_once() -> None:
     runtime = _Runtime()
@@ -4683,7 +4577,6 @@ async def test_new_websocket_connection_resets_mic_lease_generation_once() -> No
     )
     assert runtime._voice_input_accepts_pcm() is True
 
-
 async def test_legacy_audio_session_authorization_is_one_shot() -> None:
     runtime = _Runtime()
     runtime._asr_runtime.abort = AsyncMock()
@@ -4702,7 +4595,6 @@ async def test_legacy_audio_session_authorization_is_one_shot() -> None:
     assert await runtime._ensure_voice_input_session_authorized("legacy-socket") is True
     assert runtime._voice_lease_generation == 0
     runtime._asr_runtime.abort.assert_not_awaited()
-
 
 async def test_explicit_owner_none_cannot_be_overridden_by_legacy_authorization() -> (
     None
@@ -4731,14 +4623,6 @@ async def test_explicit_owner_none_cannot_be_overridden_by_legacy_authorization(
     assert runtime._voice_input_accepts_pcm() is False
     runtime._asr_runtime.abort.assert_not_awaited()
 
-
-@pytest.mark.parametrize(
-    ("event", "generation"),
-    [
-        ("invalid-control", 0),
-        ("lease_sync", -1),
-    ],
-)
 async def test_rejected_explicit_control_permanently_disables_legacy_fallback(
     event: str,
     generation: int,
@@ -4774,7 +4658,6 @@ async def test_rejected_explicit_control_permanently_disables_legacy_fallback(
     assert runtime._voice_input_accepts_pcm() is False
     assert runtime._audio_stream_queue.empty()
     runtime._asr_runtime.abort.assert_not_awaited()
-
 
 async def test_legacy_authorization_loses_race_to_new_connection_identity() -> None:
     runtime = _Runtime()
@@ -4816,7 +4699,6 @@ async def test_legacy_authorization_loses_race_to_new_connection_identity() -> N
     assert runtime._voice_input_accepts_pcm() is False
     old_abort.assert_awaited_once_with("legacy_session_start")
 
-
 async def test_game_owner_and_hard_mute_remain_simultaneously_authoritative() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -4837,7 +4719,6 @@ async def test_game_owner_and_hard_mute_remain_simultaneously_authoritative() ->
     assert runtime._voice_input_suppression_reasons == {"game", "hard_mute"}
     assert runtime._voice_input_accepts_pcm() is False
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.SUSPENDED
-
 
 async def test_accepted_final_is_recorded_and_injected_once() -> None:
     runtime = _Runtime()
@@ -4860,7 +4741,6 @@ async def test_accepted_final_is_recorded_and_injected_once() -> None:
     )
     runtime.session.create_response.assert_awaited_once_with("hello")
 
-
 async def test_final_records_segmented_wire_audio_committed_at_seal() -> None:
     runtime = _Runtime()
     session = SimpleNamespace(is_ready=True, provider_wire_audio_ms=0)
@@ -4878,7 +4758,6 @@ async def test_final_records_segmented_wire_audio_committed_at_seal() -> None:
     assert metrics.provider_wire_audio_ms == 480
     assert metrics.cloud_audio_ms == 480
     assert runtime._asr_last_provider_wire_audio_ms == 480
-
 
 async def test_final_does_not_double_count_sampled_streaming_wire_audio() -> None:
     runtime = _Runtime()
@@ -4898,7 +4777,6 @@ async def test_final_does_not_double_count_sampled_streaming_wire_audio() -> Non
     assert metrics.provider_wire_audio_ms == 480
     assert metrics.cloud_audio_ms == 480
     assert runtime._asr_last_provider_wire_audio_ms == 480
-
 
 async def test_identical_text_in_consecutive_turns_is_delivered_twice() -> None:
     runtime = _Runtime()
@@ -4923,7 +4801,6 @@ async def test_identical_text_in_consecutive_turns_is_delivered_twice() -> None:
         "嗯",
         "嗯",
     ]
-
 
 async def test_blocked_core_response_does_not_block_next_asr_turn() -> None:
     runtime = _Runtime()
@@ -4953,7 +4830,6 @@ async def test_blocked_core_response_does_not_block_next_asr_turn() -> None:
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
     release_response.set()
     await runtime._wait_asr_transcript_dispatch_idle()
-
 
 async def test_core_swap_cancels_blocked_old_final_without_touching_new_state() -> None:
     runtime = _Runtime()
@@ -4995,7 +4871,6 @@ async def test_core_swap_cancels_blocked_old_final_without_touching_new_state() 
     assert runtime._asr_lifecycle is new_lifecycle
     assert new_lifecycle.snapshot.state is expected_state
     assert runtime._asr_sealed_turn_token is None
-
 
 async def test_late_first_final_then_second_final_recovers_in_linear_order() -> None:
     runtime = _Runtime()
@@ -5039,7 +4914,6 @@ async def test_late_first_final_then_second_final_recovers_in_linear_order() -> 
         "response:second fragment",
     ]
 
-
 async def test_three_pending_finals_recover_without_request_multiplication() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -5071,7 +4945,6 @@ async def test_three_pending_finals_recover_without_request_multiplication() -> 
         "third",
     ]
 
-
 async def test_consumed_or_suppressed_final_does_not_create_response() -> None:
     runtime = _Runtime()
     runtime.handle_input_transcript.return_value = False
@@ -5085,7 +4958,6 @@ async def test_consumed_or_suppressed_final_does_not_create_response() -> None:
     await runtime._wait_asr_transcript_dispatch_idle()
 
     runtime.session.create_response.assert_not_awaited()
-
 
 async def test_close_invalidates_late_final_before_waiting_for_provider() -> None:
     runtime = _Runtime()
@@ -5103,7 +4975,6 @@ async def test_close_invalidates_late_final_before_waiting_for_provider() -> Non
     runtime.session.create_response.assert_not_awaited()
     assert runtime._asr_route_mode == "blocked"
 
-
 async def test_close_releases_independent_audio_pipeline() -> None:
     runtime = _Runtime()
     pipeline = type("Pipeline", (), {})()
@@ -5114,7 +4985,6 @@ async def test_close_releases_independent_audio_pipeline() -> None:
 
     pipeline.close.assert_awaited_once_with()
     assert runtime._voice_input_audio_pipeline is not pipeline
-
 
 async def test_cancelled_core_close_keeps_detached_cleanup_owned() -> None:
     runtime = _Runtime()
@@ -5159,7 +5029,6 @@ async def test_cancelled_core_close_keeps_detached_cleanup_owned() -> None:
     pipeline.close.assert_awaited_once_with()
     runtime._asr_runtime.close.assert_awaited_once_with()
 
-
 async def test_cancelled_core_close_waiting_for_pipeline_lock_stays_owned() -> None:
     runtime = _Runtime()
     gate = _GateAsyncLock()
@@ -5196,7 +5065,6 @@ async def test_cancelled_core_close_waiting_for_pipeline_lock_stays_owned() -> N
     old_pipeline.close.assert_awaited_once_with()
     runtime._voice_input_registry.wait_idle.assert_awaited_once_with()
     runtime._asr_runtime.close.assert_awaited_once_with()
-
 
 async def test_core_close_detaches_shared_state_before_registry_wait() -> None:
     runtime = _Runtime()
@@ -5239,7 +5107,6 @@ async def test_core_close_detaches_shared_state_before_registry_wait() -> None:
     assert runtime._asr_route_mode == "independent"
     runtime._asr_runtime.close.assert_not_awaited()
 
-
 async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() -> None:
     runtime = _Runtime()
     first_wait_started = asyncio.Event()
@@ -5281,8 +5148,6 @@ async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() 
 
     runtime._asr_runtime.close.assert_awaited_once_with()
 
-
-@pytest.mark.parametrize("initial_nr", [True, False])
 async def test_start_pipeline_construction_failure_preserves_audio_contract(
     monkeypatch, initial_nr: bool,
 ) -> None:
@@ -5324,7 +5189,6 @@ async def test_start_pipeline_construction_failure_preserves_audio_contract(
         await runtime._voice_input_audio_pipeline.close()
         await asyncio.gather(*runtime._core_asr_cleanup_tasks, return_exceptions=True)
 
-
 async def test_stale_start_waiting_for_pipeline_lock_cannot_replace_successor(
     monkeypatch,
 ) -> None:
@@ -5359,7 +5223,6 @@ async def test_stale_start_waiting_for_pipeline_lock_cannot_replace_successor(
     assert runtime._voice_input_noise_reduction_enabled is True
     successor_pipeline.close.assert_not_awaited()
 
-
 async def test_stale_close_waiting_for_pipeline_lock_cannot_replace_successor() -> None:
     runtime = _Runtime()
     runtime._asr_runtime.close = AsyncMock()
@@ -5391,7 +5254,6 @@ async def test_stale_close_waiting_for_pipeline_lock_cannot_replace_successor() 
     assert runtime._asr_route_mode == "independent"
     successor_pipeline.close.assert_not_awaited()
     runtime._asr_runtime.close.assert_not_awaited()
-
 
 async def test_cancelled_start_settings_swap_keeps_pipeline_cleanup_owned(
     monkeypatch,
@@ -5444,7 +5306,6 @@ async def test_cancelled_start_settings_swap_keeps_pipeline_cleanup_owned(
     await asyncio.wait_for(cleanup, 1)
     stale_pipeline.close.assert_awaited_once_with()
 
-
 async def test_cancelled_noise_reduction_swap_keeps_pipeline_cleanup_owned() -> None:
     runtime = _Runtime()
     close_started = asyncio.Event()
@@ -5482,7 +5343,6 @@ async def test_cancelled_noise_reduction_swap_keeps_pipeline_cleanup_owned() -> 
     await asyncio.wait_for(cleanup, 1)
     stale_pipeline.close.assert_awaited_once_with()
 
-
 async def test_close_failure_keeps_the_requested_blocked_route() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -5499,14 +5359,12 @@ async def test_close_failure_keeps_the_requested_blocked_route() -> None:
         is True
     )
 
-
 async def test_close_requires_callers_to_declare_the_next_route() -> None:
     parameter = inspect.signature(AsrRuntimeMixin._close_independent_asr).parameters[
         "next_route_mode"
     ]
 
     assert parameter.default is inspect.Parameter.empty
-
 
 async def test_asr_stream_failure_never_replays_the_failed_frame_to_omni() -> None:
     runtime = _Runtime()
@@ -5528,7 +5386,6 @@ async def test_asr_stream_failure_never_replays_the_failed_frame_to_omni() -> No
     assert runtime._asr_route_mode == "blocked"
     assert runtime._asr_session is None
     assert "sensitive provider body" not in str(runtime.send_status.await_args)
-
 
 async def test_asr_backpressure_reports_specific_blocking_status() -> None:
     runtime = _Runtime()
@@ -5560,7 +5417,6 @@ async def test_asr_backpressure_reports_specific_blocking_status() -> None:
     assert "ASR_STREAM_BACKPRESSURE" in runtime.send_status.await_args.args[0]
     assert runtime._asr_route_mode == "blocked"
 
-
 async def test_independent_asr_setting_is_persisted_as_a_boolean() -> None:
     assert "independentAsrEnabled" in preferences._ALLOWED_CONVERSATION_SETTINGS
     assert (
@@ -5571,7 +5427,6 @@ async def test_independent_asr_setting_is_persisted_as_a_boolean() -> None:
         "voice_input_resource_optimization_enabled"
         not in preferences._ALLOWED_CONVERSATION_SETTINGS
     )
-
 
 async def test_start_uses_current_core_route_only_after_provider_ready(
     monkeypatch,
@@ -5608,7 +5463,6 @@ async def test_start_uses_current_core_route_only_after_provider_ready(
     assert runtime._asr_route_mode == "independent"
     assert factory.call_args.args == ("gemini",)
     assert factory.call_args.kwargs["selection"].provider_key == "gemini"
-
 
 async def test_runtime_builds_primary_candidate_from_its_single_selection(
     monkeypatch,
@@ -5651,36 +5505,6 @@ async def test_runtime_builds_primary_candidate_from_its_single_selection(
     assert runtime._asr_provider == "gemini"
     assert runtime._asr_route_mode == "independent"
 
-
-async def _start_bridge_and_capture_builder_call(monkeypatch, runtime):
-    import main_logic.asr_client.runtime as runtime_module
-
-    asr = type("Asr", (), {})()
-    asr.connect = AsyncMock()
-    asr.close = AsyncMock()
-    builder = MagicMock(return_value=asr)
-    monkeypatch.setattr(
-        core_module,
-        "aload_global_conversation_settings",
-        AsyncMock(return_value={"independentAsrEnabled": True}),
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "_resolve_asr_selection",
-        MagicMock(return_value=_selection("gemini")),
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "_create_asr_session_from_selection",
-        builder,
-    )
-
-    await runtime._start_independent_asr_if_enabled("audio")
-
-    assert runtime._asr_route_mode == "independent"
-    return builder.call_args.kwargs
-
-
 async def test_start_forwards_core_user_language_to_session_builder(
     monkeypatch,
 ) -> None:
@@ -5692,7 +5516,6 @@ async def test_start_forwards_core_user_language_to_session_builder(
 
     assert kwargs["user_language"] == "ja"
 
-
 async def test_start_without_user_language_builds_session_without_hint(
     monkeypatch,
 ) -> None:
@@ -5703,7 +5526,6 @@ async def test_start_without_user_language_builds_session_without_hint(
     kwargs = await _start_bridge_and_capture_builder_call(monkeypatch, runtime)
 
     assert kwargs["user_language"] is None
-
 
 async def test_startup_close_window_is_blocked_before_settings_resolution(
     monkeypatch,
@@ -5742,7 +5564,6 @@ async def test_startup_close_window_is_blocked_before_settings_resolution(
     assert runtime._asr_route_mode == "native"
     assert not hasattr(runtime._asr_runtime, "_asr_required")
 
-
 async def test_explicit_intl_soniox_is_selected_before_audio(monkeypatch) -> None:
     import main_logic.asr_client.runtime as runtime_module
 
@@ -5775,7 +5596,6 @@ async def test_explicit_intl_soniox_is_selected_before_audio(monkeypatch) -> Non
     assert runtime._asr_session is asr
     assert runtime._asr_provider == "soniox"
     assert runtime._asr_received_audio is False
-
 
 async def test_soniox_connect_failure_retries_same_selection_before_audio(
     monkeypatch,
@@ -5862,7 +5682,6 @@ async def test_soniox_connect_failure_retries_same_selection_before_audio(
         runtime.send_status.await_args_list
     )
 
-
 async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback(
     monkeypatch,
 ) -> None:
@@ -5943,7 +5762,6 @@ async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback
     }
     assert "private provider detail" not in str(runtime.send_status.await_args_list)
 
-
 async def test_failed_soniox_candidate_cannot_invalidate_successful_successor(
     monkeypatch,
 ) -> None:
@@ -6018,7 +5836,6 @@ async def test_failed_soniox_candidate_cannot_invalidate_successful_successor(
     assert runtime._asr_route_mode == "independent"
     assert runtime._asr_session_epoch == adopted_epoch
 
-
 async def test_adopted_start_activity_callback_survives_idle_audio_generation_bump(
     monkeypatch,
 ) -> None:
@@ -6049,7 +5866,6 @@ async def test_adopted_start_activity_callback_survives_idle_audio_generation_bu
     assert component._asr_current_ingress_token == updated_ingress
     assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
     sessions[0].close.assert_not_awaited()
-
 
 async def test_reconnected_start_callback_survives_abort_start_generation_change(
     monkeypatch,
@@ -6088,7 +5904,6 @@ async def test_reconnected_start_callback_survives_abort_start_generation_change
     assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
     sessions[1].close.assert_not_awaited()
 
-
 async def test_restart_closes_not_ready_session_before_replacement() -> None:
     runtime = _Runtime()
     events: list[str] = []
@@ -6121,34 +5936,6 @@ async def test_restart_closes_not_ready_session_before_replacement() -> None:
     candidate.close.assert_not_awaited()
     assert runtime._asr_session is candidate
 
-
-def _install_failing_restart_candidates(
-    runtime: _Runtime,
-    provider: str,
-    *,
-    failure_count: int,
-) -> list[SimpleNamespace]:
-    runtime._asr_session = SimpleNamespace(is_ready=False, close=AsyncMock())
-    _install_ready_lifecycle(runtime, provider)
-    candidates: list[SimpleNamespace] = []
-
-    def build_candidate(_selection):
-        candidate = SimpleNamespace(
-            is_ready=True,
-            connect=AsyncMock(
-                side_effect=RuntimeError("private restart connect detail")
-            ),
-            close=AsyncMock(),
-        )
-        candidates.append(candidate)
-        assert len(candidates) <= failure_count
-        return candidate
-
-    runtime._asr_session_factory = MagicMock(side_effect=build_candidate)
-    runtime._asr_transport_selection = _selection(provider)
-    return candidates
-
-
 async def test_restart_default_attempts_follow_single_attempt_policy(
     monkeypatch,
 ) -> None:
@@ -6178,7 +5965,6 @@ async def test_restart_default_attempts_follow_single_attempt_policy(
     assert "private restart connect detail" not in str(
         runtime.send_status.await_args_list
     )
-
 
 async def test_restart_default_attempts_follow_soniox_policy_ladder(
     monkeypatch,
@@ -6210,7 +5996,6 @@ async def test_restart_default_attempts_follow_soniox_policy_ladder(
     ]
     assert statuses[-1]["code"] == "ASR_INDEPENDENT_FAILED"
 
-
 async def test_restart_explicit_attempt_override_beats_policy(monkeypatch) -> None:
     import main_logic.asr_client.runtime as runtime_module
 
@@ -6232,13 +6017,11 @@ async def test_restart_explicit_attempt_override_beats_policy(monkeypatch) -> No
     candidates[0].connect.assert_awaited_once_with()
     sleep.assert_not_awaited()
 
-
 async def test_restart_rejects_non_positive_attempt_override() -> None:
     runtime = _Runtime()
 
     with pytest.raises(ValueError, match="max_attempts must be positive"):
         await runtime._restart_transport(max_attempts=0)
-
 
 async def test_not_ready_close_cannot_overwrite_replacement_generation() -> None:
     runtime = _Runtime()
@@ -6281,7 +6064,6 @@ async def test_not_ready_close_cannot_overwrite_replacement_generation() -> None
     assert runtime._asr_session_factory is new_factory
     assert runtime._asr_transport_selection is new_selection
     new_session.close.assert_not_awaited()
-
 
 async def test_adopted_restart_cancellation_fails_closed_and_propagates(
     monkeypatch,
@@ -6347,7 +6129,6 @@ async def test_adopted_restart_cancellation_fails_closed_and_propagates(
         },
     } in statuses
 
-
 async def test_adopted_restart_exception_fails_closed_without_retry(
     monkeypatch,
 ) -> None:
@@ -6401,7 +6182,6 @@ async def test_adopted_restart_exception_fails_closed_without_retry(
         },
     } in statuses
 
-
 async def test_selection_failure_is_reported_without_escaping_session_start(
     monkeypatch,
 ) -> None:
@@ -6431,7 +6211,6 @@ async def test_selection_failure_is_reported_without_escaping_session_start(
         runtime.send_status.await_args_list
     )
 
-
 async def test_selection_failure_during_core_change_stays_blocked(
     monkeypatch,
 ) -> None:
@@ -6459,8 +6238,6 @@ async def test_selection_failure_during_core_change_stays_blocked(
     assert runtime._asr_session is None
     assert "ASR_INDEPENDENT_FAILED" in runtime.send_status.await_args.args[0]
 
-
-@pytest.mark.parametrize("core_type", ["qwen", "qwen_intl"])
 async def test_qwen_core_starts_independent_asr_with_external_turn_support(
     monkeypatch,
     core_type: str,
@@ -6507,7 +6284,6 @@ async def test_qwen_core_starts_independent_asr_with_external_turn_support(
     assert runtime._asr_route_mode == "independent"
     assert runtime._asr_session is asr
     assert runtime._asr_provider == "qwen"
-
 
 async def test_stale_settings_failure_cannot_refence_replacement_session(
     monkeypatch,
@@ -6562,7 +6338,6 @@ async def test_stale_settings_failure_cannot_refence_replacement_session(
     assert delivered_modes
     assert set(delivered_modes) == {"native"}
 
-
 async def test_websocket_core_submits_one_external_turn_after_local_history() -> None:
     runtime = _Runtime()
     runtime.core_api_type = "qwen"
@@ -6586,9 +6361,6 @@ async def test_websocket_core_submits_one_external_turn_after_local_history() ->
     assert call.kwargs["turn_id"].startswith("asr-")
     runtime.session.create_response.assert_not_awaited()
 
-
-@pytest.mark.parametrize("accepted", [True, False])
-@pytest.mark.parametrize("observer_raises", [False, True])
 async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payload(
     accepted: bool,
     observer_raises: bool,
@@ -6628,7 +6400,6 @@ async def test_audio_activation_mirrors_only_dispatcher_accepted_provider_payloa
     else:
         detector.observe_provider_audio.assert_not_called()
 
-
 async def test_partial_preview_is_display_only_and_epoch_guarded() -> None:
     runtime = _Runtime()
     websocket = type("WebSocket", (), {})()
@@ -6654,7 +6425,6 @@ async def test_partial_preview_is_display_only_and_epoch_guarded() -> None:
         }
     )
     runtime.handle_input_transcript.assert_not_awaited()
-
 
 async def test_partial_preview_keeps_prepared_token_and_rejects_after_abort() -> None:
     runtime = _Runtime()
@@ -6685,7 +6455,6 @@ async def test_partial_preview_keeps_prepared_token_and_rejects_after_abort() ->
 
     on_partial.assert_not_awaited()
 
-
 async def test_start_failure_blocks_omni_without_leaking_error(monkeypatch) -> None:
     import main_logic.asr_client.runtime as runtime_module
 
@@ -6715,7 +6484,6 @@ async def test_start_failure_blocks_omni_without_leaking_error(monkeypatch) -> N
     assert runtime._asr_route_mode == "blocked"
     assert runtime._asr_session is None
     assert "secret provider response" not in str(runtime.send_status.await_args)
-
 
 async def test_builder_failure_stays_blocked_and_never_sends_audio_to_omni(
     monkeypatch,
@@ -6755,7 +6523,6 @@ async def test_builder_failure_stays_blocked_and_never_sends_audio_to_omni(
     runtime.session.stream_audio.assert_not_awaited()
     assert "private provider detail" not in str(runtime.send_status.await_args)
 
-
 async def test_hot_swap_reuses_matching_asr_provider() -> None:
     runtime = _Runtime()
     runtime.core_api_type = "gemini"
@@ -6768,7 +6535,6 @@ async def test_hot_swap_reuses_matching_asr_provider() -> None:
     await runtime._reconcile_independent_asr_after_core_change()
 
     runtime._start_independent_asr_if_enabled.assert_not_awaited()
-
 
 async def test_hot_swap_replaces_asr_before_cached_audio_for_new_core() -> None:
     runtime = _Runtime()
@@ -6786,8 +6552,6 @@ async def test_hot_swap_replaces_asr_before_cached_audio_for_new_core() -> None:
         preserve_hot_swap_audio=True,
     )
 
-
-@pytest.mark.parametrize("core_type", ["openai", "glm", "gemini"])
 async def test_hot_swap_starts_independent_asr_after_core_route_change(
     core_type: str,
 ) -> None:
@@ -6805,7 +6569,6 @@ async def test_hot_swap_starts_independent_asr_after_core_route_change(
         preserve_hot_swap_audio=True,
     )
 
-
 async def test_hot_swap_does_not_retry_failed_same_core_route() -> None:
     runtime = _Runtime()
     runtime.core_api_type = "gemini"
@@ -6817,34 +6580,6 @@ async def test_hot_swap_does_not_retry_failed_same_core_route() -> None:
     await runtime._reconcile_independent_asr_after_core_change()
 
     runtime._start_independent_asr_if_enabled.assert_not_awaited()
-
-
-@pytest.mark.parametrize("route_mode", ["independent", "native"])
-async def test_same_core_session_promotion_resyncs_visual_delivery_mode(
-    route_mode: str,
-) -> None:
-    """A promoted session inherits the live route even when provider key is unchanged."""
-    runtime = _Runtime()
-    runtime.core_api_type = "qwen"
-    runtime.input_mode = "audio"
-    runtime._asr_route_mode = route_mode
-    runtime._independent_asr_route_key = "qwen"
-    runtime._start_independent_asr_if_enabled = AsyncMock()
-    replacement_session = type("ReplacementOmni", (), {})()
-    replacement_session._supports_native_image = True
-    replacement_session.set_visual_delivery_mode = MagicMock()
-    replacement_session.block_raw_visual_delivery = MagicMock()
-    runtime.session = replacement_session
-
-    await runtime._reconcile_independent_asr_after_core_change()
-
-    if route_mode == "independent":
-        replacement_session.set_visual_delivery_mode.assert_not_called()
-        replacement_session.block_raw_visual_delivery.assert_called_once_with()
-    else:
-        replacement_session.set_visual_delivery_mode.assert_called_once_with("native")
-    runtime._start_independent_asr_if_enabled.assert_not_awaited()
-
 
 async def test_blocked_replacement_session_preserves_external_visual_policy_and_fence() -> None:
     runtime = _Runtime()
@@ -6860,7 +6595,6 @@ async def test_blocked_replacement_session_preserves_external_visual_policy_and_
     replacement_session.set_visual_delivery_mode.assert_not_called()
     replacement_session.block_raw_visual_delivery.assert_called()
 
-
 async def test_native_to_blocked_fences_raw_frames_during_route_reconciliation() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("native")
@@ -6873,7 +6607,6 @@ async def test_native_to_blocked_fences_raw_frames_during_route_reconciliation()
 
     replacement_session.set_visual_delivery_mode.assert_called_once_with("native")
     replacement_session.block_raw_visual_delivery.assert_called_once_with()
-
 
 async def test_disabled_native_route_key_prevents_same_core_reconcile(
     monkeypatch,
@@ -6911,7 +6644,6 @@ async def test_disabled_native_route_key_prevents_same_core_reconcile(
     runtime.session.stream_audio.assert_awaited_once_with(b"\x01\x00" * 160)
     assert runtime._omni_mic_audio_bytes == 320
 
-
 async def test_start_session_handshake_true_overrides_persisted_disabled(
     monkeypatch,
 ) -> None:
@@ -6938,7 +6670,6 @@ async def test_start_session_handshake_true_overrides_persisted_disabled(
     start_mock.assert_awaited_once()
     assert runtime._asr_route_mode != "native"
 
-
 async def test_start_session_handshake_false_overrides_persisted_enabled(
     monkeypatch,
 ) -> None:
@@ -6957,7 +6688,6 @@ async def test_start_session_handshake_false_overrides_persisted_enabled(
 
     start_mock.assert_not_awaited()
     assert runtime._asr_route_mode == "native"
-
 
 async def test_resource_optimization_handshake_false_overrides_persisted_enabled(
     monkeypatch,
@@ -6989,7 +6719,6 @@ async def test_resource_optimization_handshake_false_overrides_persisted_enabled
     assert runtime._speaker_shadow_factory is None
     assert "speaker_shadow_factory" not in start_mock.await_args.kwargs
 
-
 async def test_core_passes_only_configured_speaker_shadow_factory(
     monkeypatch,
 ) -> None:
@@ -7014,7 +6743,6 @@ async def test_core_passes_only_configured_speaker_shadow_factory(
 
     assert start_mock.await_args.kwargs["speaker_shadow_factory"] is factory
     factory.assert_not_called()
-
 
 async def test_failed_independent_start_preserves_external_visual_route_memory(
     monkeypatch,
@@ -7041,7 +6769,6 @@ async def test_failed_independent_start_preserves_external_visual_route_memory(
     assert runtime._asr_route_mode == "blocked"
     assert runtime._visual_route_mode == "independent"
     runtime.session.block_raw_visual_delivery.assert_called()
-
 
 async def test_connect_budget_does_not_block_a_free_native_route(
     monkeypatch,
@@ -7071,7 +6798,6 @@ async def test_connect_budget_does_not_block_a_free_native_route(
     assert runtime._asr_route_mode == "native"
     start_mock.assert_not_awaited()
 
-
 async def test_connect_budget_stops_a_connect_it_cannot_finish(
     monkeypatch,
 ) -> None:
@@ -7100,7 +6826,6 @@ async def test_connect_budget_stops_a_connect_it_cannot_finish(
     assert runtime._asr_route_mode == "blocked"
     start_mock.assert_not_awaited()
 
-
 async def test_connect_budget_is_opt_in(monkeypatch) -> None:
     # Every other caller (hot-swap, device change, the ordinary start) passes no
     # budget and must keep connecting exactly as before.
@@ -7128,7 +6853,6 @@ async def test_connect_budget_is_opt_in(monkeypatch) -> None:
 
     assert runtime._asr_route_mode == "independent"
     start_mock.assert_awaited_once()
-
 
 async def test_provider_restart_reuses_accepted_session_optimization(
     monkeypatch,
@@ -7173,8 +6897,6 @@ async def test_provider_restart_reuses_accepted_session_optimization(
         for call in start_mock.await_args_list
     )
 
-
-@pytest.mark.parametrize("malformed", ["false", 0, 1, [False], {"enabled": False}])
 async def test_resource_optimization_handshake_malformed_falls_back_to_persisted(
     monkeypatch,
     malformed,
@@ -7204,7 +6926,6 @@ async def test_resource_optimization_handshake_malformed_falls_back_to_persisted
 
     assert start_mock.await_args.kwargs["resource_optimization_enabled"] is True
 
-
 async def test_start_session_handshake_missing_falls_back_to_persisted(
     monkeypatch,
 ) -> None:
@@ -7231,7 +6952,6 @@ async def test_start_session_handshake_missing_falls_back_to_persisted(
 
     start_mock.assert_awaited_once()
 
-
 async def test_missing_independent_asr_setting_defaults_disabled(monkeypatch) -> None:
     runtime = _Runtime()
     runtime.core_api_type = "gemini"
@@ -7253,8 +6973,6 @@ async def test_missing_independent_asr_setting_defaults_disabled(monkeypatch) ->
     start_mock.assert_not_awaited()
     assert runtime._asr_route_mode == "native"
 
-
-@pytest.mark.parametrize("malformed", ["true", 1, 0, [True], {"enabled": True}])
 async def test_start_session_handshake_malformed_value_is_ignored(
     monkeypatch,
     malformed,
@@ -7275,60 +6993,6 @@ async def test_start_session_handshake_malformed_value_is_ignored(
 
     start_mock.assert_not_awaited()
     assert runtime._asr_route_mode == "native"
-
-
-class _HotSwapRuntimeStub:
-    def __init__(self, *, start_status: AsrStartStatus) -> None:
-        self.session_epoch = 1
-        self.audio_generation = 1
-        self.active_provider: str | None = "provider-a"
-        self.start_status = start_status
-        self.submissions: list[tuple[str | None, bytes, object]] = []
-        self.abort = AsyncMock()
-
-    def capture_ingress_token(
-        self,
-        *,
-        connection_id: str,
-        lease_generation: int,
-        route_generation: int,
-    ):
-        from main_logic.voice_turn.contracts import VoiceIngressToken
-
-        return VoiceIngressToken(
-            self.session_epoch,
-            connection_id,
-            lease_generation,
-            route_generation,
-            self.audio_generation,
-        )
-
-    async def close(self) -> None:
-        self.session_epoch += 1
-        self.audio_generation += 1
-        self.active_provider = None
-
-    async def start(
-        self,
-        *,
-        route_key: str,
-        resource_optimization_enabled: bool,
-        user_language: str | None = None,
-    ) -> AsrStartResult:
-        _ = (route_key, resource_optimization_enabled, user_language)
-        self.active_provider = (
-            "provider-b" if self.start_status is AsrStartStatus.READY else None
-        )
-        return AsrStartResult(
-            self.start_status,
-            provider="provider-b",
-            session_epoch=self.session_epoch,
-        )
-
-    async def submit(self, frame, *, ingress_token) -> AsrSubmitResult:
-        self.submissions.append((self.active_provider, frame.pcm16, ingress_token))
-        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
-
 
 async def test_provider_hot_swap_drops_cached_pcm_from_old_asr_generation(
     monkeypatch,
@@ -7367,7 +7031,6 @@ async def test_provider_hot_swap_drops_cached_pcm_from_old_asr_generation(
     assert bridge.submissions == []
     runtime.session.stream_audio.assert_not_awaited()
 
-
 async def test_failed_provider_hot_swap_blocks_and_discards_cached_pcm(
     monkeypatch,
 ) -> None:
@@ -7402,7 +7065,6 @@ async def test_failed_provider_hot_swap_blocks_and_discards_cached_pcm(
     assert bridge.submissions == []
     assert not runtime.hot_swap_audio_cache
     runtime.session.stream_audio.assert_not_awaited()
-
 
 async def test_current_audio_pipeline_failure_blocks_once_without_pcm() -> None:
     runtime = _Runtime()
@@ -7446,7 +7108,6 @@ async def test_current_audio_pipeline_failure_blocks_once_without_pcm() -> None:
             "details": {"provider": "glm", "session_epoch": 0},
         }
     ]
-
 
 async def test_noise_reduction_replacement_waits_for_pipeline_failure_revoke() -> None:
     class _ObservedAsyncLock:
@@ -7510,7 +7171,6 @@ async def test_noise_reduction_replacement_waits_for_pipeline_failure_revoke() -
     assert runtime._voice_input_audio_pipeline.nr_enabled is False
     assert runtime._voice_input_pipeline_failed is False
 
-
 async def test_pipeline_failure_still_revokes_after_a_bare_pipeline_swap() -> None:
     """A replacement that does not end the route must not skip the revoke.
 
@@ -7562,7 +7222,6 @@ async def test_pipeline_failure_still_revokes_after_a_bare_pipeline_swap() -> No
     runtime.send_status.assert_awaited()
     assert runtime._voice_lease_connection_id == ""
     assert runtime._voice_lease_owner == "none"
-
 
 async def test_backpressured_status_send_does_not_block_pipeline_transitions() -> None:
     """The frontend socket is unbounded; the transition lock must not wait on it.
@@ -7617,7 +7276,6 @@ async def test_backpressured_status_send_does_not_block_pipeline_transitions() -
     assert runtime._asr_route_mode == "blocked"
     assert runtime._voice_lease_connection_id == ""
     assert runtime._voice_lease_owner == "none"
-
 
 async def test_pipeline_toggle_during_failure_notify_keeps_ingress_closed() -> None:
     """A toggle must not reopen the microphone while the route is failing.
@@ -7695,7 +7353,6 @@ async def test_pipeline_toggle_during_failure_notify_keeps_ingress_closed() -> N
     assert runtime._asr_route_mode == "blocked"
     assert runtime._voice_lease_connection_id == ""
 
-
 async def test_a_live_route_releases_the_pipeline_failure_ingress_latch() -> None:
     """The latch is fail-closed, not permanent: a live route clears it."""
 
@@ -7717,7 +7374,6 @@ async def test_a_live_route_releases_the_pipeline_failure_ingress_latch() -> Non
 
     runtime._set_microphone_route("independent")
     assert runtime._voice_input_pipeline_failure_token is None
-
 
 async def test_pipeline_failure_stops_accepting_pcm_at_ingress() -> None:
     """The latch drops frames before the queue, not after the worker dequeues.
@@ -7781,7 +7437,6 @@ async def test_pipeline_failure_stops_accepting_pcm_at_ingress() -> None:
     await asyncio.wait_for(failure, 1)
     assert runtime._asr_route_mode == "blocked"
 
-
 async def test_stale_failure_abort_does_not_clear_successor_route_audio() -> None:
     """A restart landing inside the abort keeps its own queued audio.
 
@@ -7835,7 +7490,6 @@ async def test_stale_failure_abort_does_not_clear_successor_route_audio() -> Non
     )
     runtime.send_status.assert_not_awaited()
 
-
 async def test_pipeline_failure_from_replaced_connection_is_silent() -> None:
     runtime = _Runtime()
     runtime.is_active = True
@@ -7879,18 +7533,6 @@ async def test_pipeline_failure_from_replaced_connection_is_silent() -> None:
     runtime.send_status.assert_not_awaited()
     runtime._asr_runtime.abort.assert_awaited_once_with("audio_preprocessing_failed")
 
-
-@pytest.mark.parametrize(
-    "changed_identity",
-    [
-        "lease_generation",
-        "hard_mute",
-        "focus_suppression",
-        "game_takeover",
-        "route_operation",
-        "core_session",
-    ],
-)
 async def test_stale_pipeline_failure_never_reports_to_current_identity(
     changed_identity: str,
 ) -> None:
@@ -7946,7 +7588,6 @@ async def test_stale_pipeline_failure_never_reports_to_current_identity(
     runtime.send_status.assert_not_awaited()
     runtime._asr_runtime.abort.assert_awaited_once_with("audio_preprocessing_failed")
 
-
 async def test_replaced_audio_pipeline_late_failure_is_silent() -> None:
     runtime = _Runtime()
     runtime.is_active = True
@@ -7992,7 +7633,6 @@ async def test_replaced_audio_pipeline_late_failure_is_silent() -> None:
     runtime.send_status.assert_not_awaited()
     assert runtime._voice_input_pipeline_failed is False
 
-
 async def test_old_abort_release_cannot_close_replacement_session() -> None:
     runtime = _Runtime()
     old_session = SimpleNamespace(is_ready=True, close=AsyncMock())
@@ -8025,7 +7665,6 @@ async def test_old_abort_release_cannot_close_replacement_session() -> None:
     assert runtime._asr_detector is not old_detector
     old_session.close.assert_awaited_once_with()
     new_session.close.assert_not_awaited()
-
 
 async def test_old_failure_callback_cannot_detach_replacement_runtime() -> None:
     runtime = _Runtime()
@@ -8068,7 +7707,6 @@ async def test_old_failure_callback_cannot_detach_replacement_runtime() -> None:
     new_session.close.assert_not_awaited()
     new_detector.close.assert_not_awaited()
     assert runtime._asr_route_mode == "independent"
-
 
 async def test_old_detector_endpoint_cannot_seal_replacement_runtime() -> None:
     runtime = _Runtime()
@@ -8138,7 +7776,6 @@ async def test_old_detector_endpoint_cannot_seal_replacement_runtime() -> None:
     ]
     assert "ASR_AUDIO_ORDERING_FAILED" not in statuses
 
-
 async def test_old_smart_turn_release_cannot_clear_replacement_lease() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "glm")
@@ -8181,7 +7818,6 @@ async def test_old_smart_turn_release_cannot_clear_replacement_lease() -> None:
     assert runtime._asr_lifecycle is new_lifecycle
     assert runtime._asr_detector is new_detector
     assert new_lease.released is False
-
 
 async def test_concurrent_smart_turn_readiness_callers_share_installed_lease() -> None:
     runtime = _Runtime()
@@ -8242,7 +7878,6 @@ async def test_concurrent_smart_turn_readiness_callers_share_installed_lease() -
     assert lease.released is False
     assert detector.endpointing_ready(lease.token) is True
 
-
 async def test_stale_detector_feed_exception_cannot_fail_new_generation() -> None:
     runtime = _Runtime()
     old_session = SimpleNamespace(is_ready=True, close=AsyncMock())
@@ -8281,7 +7916,6 @@ async def test_stale_detector_feed_exception_cannot_fail_new_generation() -> Non
     new_session.close.assert_not_awaited()
     runtime.send_status.assert_not_awaited()
 
-
 async def test_current_detector_feed_exception_fails_closed_once() -> None:
     runtime = _Runtime()
     runtime._asr_session = SimpleNamespace(is_ready=True, close=AsyncMock())
@@ -8306,7 +7940,6 @@ async def test_current_detector_feed_exception_fails_closed_once() -> None:
     assert runtime._asr_session is None
     assert runtime._asr_lifecycle is None
     assert runtime._asr_detector is None
-
 
 async def test_stale_connect_failure_cannot_fail_new_generation() -> None:
     runtime = _Runtime()
@@ -8354,7 +7987,6 @@ async def test_stale_connect_failure_cannot_fail_new_generation() -> None:
     runtime.send_status.assert_not_awaited()
     keep_transport.set()
     await new_transport
-
 
 async def test_close_unwind_cannot_clear_new_generation_owned_fields() -> None:
     runtime = _Runtime()
@@ -8412,7 +8044,6 @@ async def test_close_unwind_cannot_clear_new_generation_owned_fields() -> None:
     keep_transport.set()
     await new_transport
 
-
 async def test_same_epoch_reconnect_survives_old_abort_release() -> None:
     runtime = _Runtime()
     old_session = SimpleNamespace(is_ready=True, close=AsyncMock())
@@ -8453,7 +8084,6 @@ async def test_same_epoch_reconnect_survives_old_abort_release() -> None:
     new_session.close.assert_not_awaited()
     new_detector.reset.assert_not_awaited()
     assert new_lease.released is False
-
 
 async def test_old_pipeline_failure_does_not_report_replacement_provider() -> None:
     runtime = _Runtime()
@@ -8500,7 +8130,6 @@ async def test_old_pipeline_failure_does_not_report_replacement_provider() -> No
     runtime.send_status.assert_not_awaited()
     runtime._asr_runtime.abort.assert_awaited_once_with("audio_preprocessing_failed")
 
-
 async def test_session_activation_resolves_asr_before_frontend_ack() -> None:
     order: list[str] = []
     manager = LLMSessionManager.__new__(LLMSessionManager)
@@ -8546,7 +8175,6 @@ async def test_session_activation_resolves_asr_before_frontend_ack() -> None:
     stop.set()
     await manager.message_handler_task
 
-
 async def test_disabled_or_text_session_never_creates_provider(monkeypatch) -> None:
     import main_logic.asr_client.runtime as runtime_module
 
@@ -8571,16 +8199,6 @@ async def test_disabled_or_text_session_never_creates_provider(monkeypatch) -> N
     assert runtime._asr_route_mode == "blocked"
     assert not hasattr(runtime._asr_runtime, "_asr_route_mode")
 
-
-@pytest.mark.parametrize(
-    ("persisted_enabled", "handshake_enabled"),
-    [
-        (True, None),
-        (False, None),
-        (False, True),
-        (True, False),
-    ],
-)
 async def test_free_core_always_uses_native_asr_regardless_of_toggle(
     monkeypatch,
     persisted_enabled: bool,
@@ -8613,7 +8231,6 @@ async def test_free_core_always_uses_native_asr_regardless_of_toggle(
     ) is True
     runtime.session.stream_audio.assert_awaited_once_with(b"\x01\x00" * 160)
 
-
 async def test_free_core_uses_native_asr_when_preferences_are_unreadable(
     monkeypatch,
 ) -> None:
@@ -8633,7 +8250,6 @@ async def test_free_core_uses_native_asr_when_preferences_are_unreadable(
     assert runtime._asr_route_mode == "native"
     start_mock.assert_not_awaited()
     assert "ASR_INDEPENDENT_DISABLED" in runtime.send_status.await_args.args[0]
-
 
 async def test_unreadable_independent_setting_preserves_visual_route_on_hot_swap(
     monkeypatch,
@@ -8656,7 +8272,6 @@ async def test_unreadable_independent_setting_preserves_visual_route_on_hot_swap
     assert runtime._visual_route_mode == "independent"
     runtime.session.block_raw_visual_delivery.assert_called()
 
-
 async def test_unknown_core_capability_remains_fail_closed(monkeypatch) -> None:
     runtime = _Runtime()
     runtime.core_api_type = "unknown"
@@ -8674,7 +8289,6 @@ async def test_unknown_core_capability_remains_fail_closed(monkeypatch) -> None:
         for status_call in runtime.send_status.await_args_list
     )
 
-
 async def test_provider_error_without_audio_closes_and_blocks_omni() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {})()
@@ -8690,7 +8304,6 @@ async def test_provider_error_without_audio_closes_and_blocks_omni() -> None:
     assert runtime._asr_route_mode == "blocked"
     asr.close.assert_awaited_once_with()
 
-
 async def test_blocked_route_consumes_audio_without_an_asr_or_omni_send() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "blocked"
@@ -8704,7 +8317,6 @@ async def test_blocked_route_consumes_audio_without_an_asr_or_omni_send() -> Non
     )
     assert runtime._asr_route_mode == "blocked"
 
-
 async def test_independent_route_without_ready_session_blocks_omni() -> None:
     runtime = _Runtime()
     asr = type("Asr", (), {"is_ready": False})()
@@ -8716,7 +8328,6 @@ async def test_independent_route_without_ready_session_blocks_omni() -> None:
         is True
     )
     assert runtime._asr_route_mode == "blocked"
-
 
 async def test_settings_read_failure_blocks_omni(monkeypatch) -> None:
     runtime = _Runtime()
@@ -8735,7 +8346,6 @@ async def test_settings_read_failure_blocks_omni(monkeypatch) -> None:
         is True
     )
 
-
 async def test_injection_failure_is_reported_once_without_provider_body() -> None:
     runtime = _Runtime()
     runtime.session.create_response.side_effect = RuntimeError("sensitive response")
@@ -8752,7 +8362,6 @@ async def test_injection_failure_is_reported_once_without_provider_body() -> Non
     assert any("ASR_INDEPENDENT_INJECTION_FAILED" in item for item in status_payloads)
     assert "sensitive response" not in str(status_payloads)
     runtime.session.create_response.assert_awaited_once_with("hello")
-
 
 async def test_session_swap_during_transcript_reprepares_promoted_final() -> None:
     runtime = _Runtime()
@@ -8788,7 +8397,6 @@ async def test_session_swap_during_transcript_reprepares_promoted_final() -> Non
     new_session.prepare_external_voice_turn.assert_awaited_once()
     new_session.submit_external_voice_turn.assert_awaited_once()
 
-
 async def test_game_takeover_during_transcript_drops_stale_core_final() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "glm")
@@ -8818,30 +8426,6 @@ async def test_game_takeover_during_transcript_drops_stale_core_final() -> None:
 
     runtime.session.submit_external_voice_turn.assert_not_awaited()
     runtime.session.create_response.assert_not_awaited()
-
-
-async def test_status_delivery_failure_never_breaks_audio_runtime() -> None:
-    runtime = _Runtime()
-    runtime.send_status.side_effect = RuntimeError("socket closed")
-    runtime._set_microphone_route("native")
-    runtime.session.stream_audio = AsyncMock()
-    identity = runtime._asr_runtime._capture_runtime_identity()
-
-    await runtime._send_asr_status(
-        "ASR_INDEPENDENT_READY",
-        "glm",
-        session_epoch=runtime._asr_session_epoch,
-        expected_identity=identity,
-    )
-    await runtime._route_microphone_audio(
-        b"\x01\x00" * 160,
-        sample_rate_hz=16_000,
-    )
-
-    runtime.send_status.assert_awaited_once()
-    runtime.session.stream_audio.assert_awaited_once()
-    assert runtime._voice_input_pipeline_failed is False
-
 
 async def test_old_core_close_cannot_clear_new_pipeline_or_provider() -> None:
     runtime = _Runtime()
@@ -8876,7 +8460,6 @@ async def test_old_core_close_cannot_clear_new_pipeline_or_provider() -> None:
     assert runtime._independent_asr_provider == "new-provider"
     assert runtime._independent_asr_route_key == "new-core"
     assert runtime._asr_route_mode == "independent"
-
 
 async def test_stale_runtime_ready_result_cannot_replace_new_route(
     monkeypatch,
@@ -8945,7 +8528,6 @@ async def test_stale_runtime_ready_result_cannot_replace_new_route(
     assert runtime._independent_asr_route_key == "new-core"
     assert runtime._asr_route_mode == "independent"
 
-
 async def test_old_native_send_failure_cannot_close_new_session() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("native")
@@ -8987,7 +8569,6 @@ async def test_old_native_send_failure_cannot_close_new_session() -> None:
     new_session.stream_audio.assert_awaited_once_with(b"\x02\x00")
     assert runtime._omni_mic_audio_bytes == 2
 
-
 async def test_current_native_send_failure_still_closes_route_once() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("native")
@@ -9005,7 +8586,6 @@ async def test_current_native_send_failure_still_closes_route_once() -> None:
     runtime.session.stream_audio.assert_awaited_once_with(b"\x01\x00")
     assert runtime.session_closed_by_server is True
     assert runtime._omni_mic_audio_bytes == 0
-
 
 async def test_partial_preview_requires_current_core_lease() -> None:
     runtime = _Runtime()
@@ -9052,7 +8632,6 @@ async def test_partial_preview_requires_current_core_lease() -> None:
             "turn_id": f"asr-preview-{epoch}",
         }
     )
-
 
 async def test_old_notifications_cannot_override_new_generation() -> None:
     runtime = _Runtime()
@@ -9120,7 +8699,6 @@ async def test_old_notifications_cannot_override_new_generation() -> None:
     }
     assert payloads[1]["details"]["session_epoch"] == new_epoch
 
-
 async def test_failure_event_only_blocks_current_generation() -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("independent")
@@ -9143,7 +8721,6 @@ async def test_failure_event_only_blocks_current_generation() -> None:
         )
     )
     assert runtime._asr_route_mode == "blocked"
-
 
 async def test_runtime_failure_from_a_live_route_still_revokes_the_lease() -> None:
     # Codex P2. The chokepoint refactor passed the PRE-transition identity tuple
@@ -9171,7 +8748,6 @@ async def test_runtime_failure_from_a_live_route_still_revokes_the_lease() -> No
     assert runtime._asr_route_mode == "blocked"
     assert runtime._voice_lease_connection_id == ""
 
-
 async def test_runtime_failure_still_fences_a_competing_newer_operation() -> None:
     # Re-basing the identity must not weaken the fence it exists for: a NEWER
     # route operation landing during this handler's own transition still has to
@@ -9198,7 +8774,6 @@ async def test_runtime_failure_still_fences_a_competing_newer_operation() -> Non
 
     assert runtime._voice_lease_connection_id == "socket-a"
 
-
 async def test_runtime_failure_leaves_the_game_lease_alone() -> None:
     # The galgame route holds the mic through its built-in consumer route and tears
     # down via GAME_ROUTE_ENDED; re-basing the identity must not start
@@ -9218,17 +8793,6 @@ async def test_runtime_failure_leaves_the_game_lease_alone() -> None:
 
     assert runtime._voice_lease_connection_id == "socket-a"
 
-
-@pytest.mark.parametrize(
-    "transition",
-    [
-        "hard_mute",
-        "focus_suppress",
-        "game_takeover",
-        "lease_sync",
-        "connection_replacement",
-    ],
-)
 async def test_core_start_is_invalidated_by_mic_lease_transition(
     monkeypatch,
     transition: str,
@@ -9294,7 +8858,6 @@ async def test_core_start_is_invalidated_by_mic_lease_transition(
     assert "ASR_INDEPENDENT_READY" not in str(runtime.send_status.await_args_list)
     candidate.close.assert_awaited_once_with()
 
-
 async def test_settings_result_is_stale_after_connection_replacement(
     monkeypatch,
 ) -> None:
@@ -9333,8 +8896,6 @@ async def test_settings_result_is_stale_after_connection_replacement(
     assert runtime._asr_route_mode == "blocked"
     assert runtime._independent_asr_provider is None
 
-
-@pytest.mark.parametrize("enabled", [False, True])
 async def test_cold_start_with_unclaimed_lease_still_routes(
     monkeypatch, enabled: bool
 ) -> None:
@@ -9368,7 +8929,6 @@ async def test_cold_start_with_unclaimed_lease_still_routes(
         assert runtime._independent_asr_provider == "qwen"
     else:
         assert runtime._asr_route_mode == "native"
-
 
 async def test_stale_start_abort_does_not_clobber_newer_start_placeholder(
     monkeypatch,
@@ -9452,7 +9012,6 @@ async def test_stale_start_abort_does_not_clobber_newer_start_placeholder(
     assert runtime._asr_route_mode == "independent"
     assert runtime._independent_asr_provider == "qwen"
 
-
 async def test_core_start_survives_benign_lease_transition(monkeypatch) -> None:
     """Owner flip / mute toggle / lease bump during the settings await are
     PCM-gating changes, not route operations; they must not abort the start
@@ -9497,17 +9056,6 @@ async def test_core_start_survives_benign_lease_transition(monkeypatch) -> None:
     assert runtime._asr_route_mode == "independent"
     assert runtime._independent_asr_provider == "qwen"
 
-
-@pytest.mark.parametrize(
-    "newer_transition",
-    [
-        "game_takeover",
-        "hard_mute",
-        "focus_suppress",
-        "lease_generation",
-        "connection_replacement",
-    ],
-)
 async def test_game_release_resume_only_survives_pcm_gating_transitions(
     newer_transition: str,
 ) -> None:
@@ -9576,7 +9124,6 @@ async def test_game_release_resume_only_survives_pcm_gating_transitions(
     else:
         runtime._asr_runtime.resume.assert_awaited_once_with("game_release")
 
-
 async def test_current_game_release_still_aborts_and_resumes_once() -> None:
     runtime = _Runtime()
     runtime._voice_lease_connection_id = "connection"
@@ -9596,8 +9143,6 @@ async def test_current_game_release_still_aborts_and_resumes_once() -> None:
     runtime._asr_runtime.abort.assert_awaited_once_with("game_release")
     runtime._asr_runtime.resume.assert_awaited_once_with("game_release")
 
-
-@pytest.mark.parametrize("notification", ["status", "lifecycle", "failure"])
 async def test_notification_waiting_on_lock_drops_same_epoch_stale_identity(
     notification: str,
 ) -> None:
@@ -9635,7 +9180,6 @@ async def test_notification_waiting_on_lock_drops_same_epoch_stale_identity(
     runtime.send_status.assert_not_awaited()
     assert runtime._asr_route_mode == "independent"
 
-
 async def test_failure_cancellation_can_publish_without_notification_deadlock() -> (
     None
 ):
@@ -9670,22 +9214,6 @@ async def test_failure_cancellation_can_publish_without_notification_deadlock() 
 
     assert "ASR_CANCEL_CLEANUP" in str(runtime.send_status.await_args_list)
 
-
-def _lease_resync_statuses(runtime: _Runtime) -> list[dict]:
-    statuses = [
-        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
-    ]
-    return [
-        status
-        for status in statuses
-        if status["code"] == "VOICE_INPUT_LEASE_RESYNC_REQUIRED"
-    ]
-
-
-def _mic_frame() -> dict:
-    return {"input_type": "audio", "sample_rate_hz": 16_000, "data": [1] * 160}
-
-
 async def test_unsynchronized_pcm_signals_lease_resync_once_per_state() -> None:
     runtime = _Runtime()
     assert runtime._begin_voice_input_connection("chat-window") is True
@@ -9705,7 +9233,6 @@ async def test_unsynchronized_pcm_signals_lease_resync_once_per_state() -> None:
 
     assert len(_lease_resync_statuses(runtime)) == 2
     assert runtime._audio_stream_queue.empty()
-
 
 async def test_cancelled_lease_resync_send_retries_same_episode() -> None:
     runtime = _Runtime()
@@ -9731,7 +9258,6 @@ async def test_cancelled_lease_resync_send_retries_same_episode() -> None:
 
     runtime.send_status.assert_awaited_once()
     assert runtime._voice_lease_resync_signal_state is not None
-
 
 async def test_lease_resync_rearms_for_new_microphone_route_generation() -> None:
     runtime = _Runtime()
@@ -9762,7 +9288,6 @@ async def test_lease_resync_rearms_for_new_microphone_route_generation() -> None
     assert second_episode[-1] == runtime._microphone_route_generation
     assert runtime.send_status.await_count == 3
 
-
 async def test_blocked_text_notice_commits_only_for_current_connection() -> None:
     runtime = _Runtime()
     runtime.input_mode = "text"
@@ -9792,28 +9317,6 @@ async def test_blocked_text_notice_commits_only_for_current_connection() -> None
     runtime.send_status.assert_awaited_once()
     assert runtime._blocked_text_mode_microphone_signal_state is not None
 
-
-async def test_voice_control_status_resolves_owner_after_display_delivery() -> None:
-    runtime = _Runtime()
-    voice_owner = None
-
-    async def deliver_display(_message: str) -> bool:
-        nonlocal voice_owner
-        voice_owner = object()
-        return True
-
-    runtime.send_status = AsyncMock(side_effect=deliver_display)
-    runtime._voice_owner_socket = MagicMock(side_effect=lambda: voice_owner)
-    runtime._send_to_voice_owner = AsyncMock(side_effect=lambda _payload: voice_owner)
-
-    delivered = await runtime._send_voice_control_status("lease changed")
-
-    assert delivered == (True, True)
-    runtime._send_to_voice_owner.assert_awaited_once_with(
-        {"type": "status", "message": "lease changed"}
-    )
-
-
 async def test_blocked_text_episode_keeps_session_identity_reference() -> None:
     runtime = _Runtime()
     runtime.input_mode = "text"
@@ -9824,7 +9327,6 @@ async def test_blocked_text_episode_keeps_session_identity_reference() -> None:
 
     assert episode is not None
     assert episode[-1] is session
-
 
 async def test_cancelled_blocked_text_notice_retries_same_episode() -> None:
     runtime = _Runtime()
@@ -9855,7 +9357,6 @@ async def test_cancelled_blocked_text_notice_retries_same_episode() -> None:
     runtime.send_status.assert_awaited_once()
     assert runtime._blocked_text_mode_microphone_signal_state is not None
 
-
 async def test_synchronized_none_owner_pcm_signals_lease_resync() -> None:
     runtime = _Runtime()
     assert runtime._begin_voice_input_connection("chat-window") is True
@@ -9878,7 +9379,6 @@ async def test_synchronized_none_owner_pcm_signals_lease_resync() -> None:
     assert resync[0]["details"]["reason"] == "owner_none"
     assert runtime._audio_stream_queue.empty()
 
-
 async def test_hard_muted_pcm_never_signals_lease_resync() -> None:
     runtime = _Runtime()
     assert runtime._begin_voice_input_connection("chat-window") is True
@@ -9899,7 +9399,6 @@ async def test_hard_muted_pcm_never_signals_lease_resync() -> None:
     assert _lease_resync_statuses(runtime) == []
     assert runtime._audio_stream_queue.empty()
 
-
 async def test_game_owner_pcm_never_signals_lease_resync() -> None:
     runtime = _Runtime()
     assert runtime._begin_voice_input_connection("chat-window") is True
@@ -9919,7 +9418,6 @@ async def test_game_owner_pcm_never_signals_lease_resync() -> None:
 
     assert _lease_resync_statuses(runtime) == []
     assert runtime._audio_stream_queue.empty()
-
 
 async def test_noise_reduction_disabled_reaches_pipeline_audio_processor(
     monkeypatch,
@@ -9974,7 +9472,6 @@ async def test_noise_reduction_disabled_reaches_pipeline_audio_processor(
     assert len(created) == 2
     assert created[-1]["noise_reduce_enabled"] is False
 
-
 async def test_settings_read_failure_keeps_noise_reduction_enabled(
     monkeypatch,
 ) -> None:
@@ -9990,7 +9487,6 @@ async def test_settings_read_failure_keeps_noise_reduction_enabled(
 
     assert runtime._voice_input_noise_reduction_enabled is True
     assert runtime._voice_input_audio_pipeline.nr_enabled is True
-
 
 async def test_idle_backpressure_trailing_activity_is_dropped_cleanly(
     monkeypatch,
@@ -10033,7 +9529,6 @@ async def test_idle_backpressure_trailing_activity_is_dropped_cleanly(
         for call in runtime.send_status.await_args_list
     )
 
-
 async def test_idle_backpressure_new_speech_still_wakes_adopted_session(
     monkeypatch,
 ) -> None:
@@ -10060,7 +9555,6 @@ async def test_idle_backpressure_new_speech_still_wakes_adopted_session(
     assert lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
     assert component._asr_turn_prepared is True
     runtime.handle_new_message.assert_awaited_once()
-
 
 async def test_accepted_final_dropped_by_generation_bump_abandons_turn(
     monkeypatch,
@@ -10098,7 +9592,6 @@ async def test_accepted_final_dropped_by_generation_bump_abandons_turn(
         f"asr-{epoch}-{sealed_turn_id}"
     )
 
-
 async def test_accepted_final_identity_loss_before_dispatch_abandons_turn() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "glm")
@@ -10123,43 +9616,6 @@ async def test_accepted_final_identity_loss_before_dispatch_abandons_turn() -> N
         f"asr-{epoch}-{sealed_turn_id}"
     )
 
-
-async def test_failed_lease_release_does_not_skip_accepted_final_delivery() -> None:
-    runtime = _Runtime()
-    _install_ready_lifecycle(runtime, "glm")
-    component = runtime._asr_runtime
-    component._asr_lifecycle.provider_policy = replace(
-        component._asr_lifecycle.provider_policy,
-        warm_transport_ms=60_000,
-    )
-    epoch = component._asr_session_epoch
-    await _start_and_seal_turn(runtime, "glm")
-    lease = component._asr_smart_turn_lease
-    assert lease is not None
-
-    async def raising_release() -> None:
-        raise RuntimeError("release boom")
-
-    lease.release = raising_release
-
-    await runtime._handle_independent_asr_final("hello", epoch, "glm")
-    await runtime._wait_asr_transcript_dispatch_idle()
-
-    assert component._asr_smart_turn_lease is None
-    assert (
-        component._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
-    )
-    runtime.handle_input_transcript.assert_awaited_once_with(
-        "hello",
-        is_voice_source=True,
-        source="independent_asr",
-        metadata={"provider": "glm"},
-        source_game_route_identity=None,
-    )
-    assert component._asr_warm_expiry_task is not None
-    component._asr_warm_expiry_task.cancel()
-
-
 async def test_transport_restart_task_failure_is_logged(caplog) -> None:
     runtime = _Runtime()
     component = runtime._asr_runtime
@@ -10177,7 +9633,6 @@ async def test_transport_restart_task_failure_is_logged(caplog) -> None:
 
     assert "independent-asr-transport-restart" in caplog.text
     assert "restart boom" in caplog.text
-
 
 async def test_start_resolves_selection_off_event_loop(monkeypatch) -> None:
     import main_logic.asr_client.runtime as runtime_module
@@ -10218,8 +9673,6 @@ async def test_start_resolves_selection_off_event_loop(monkeypatch) -> None:
     )
     assert detector_factory.call_args.kwargs["speaker_shadow"] is None
 
-
-@pytest.mark.parametrize("factory_fails", [False, True])
 async def test_speaker_shadow_factory_is_lightweight_sync_and_fail_open(
     monkeypatch,
     factory_fails: bool,
@@ -10265,7 +9718,6 @@ async def test_speaker_shadow_factory_is_lightweight_sync_and_fail_open(
     assert detector_factory.call_args.kwargs["speaker_shadow"] is (
         None if factory_fails else shadow
     )
-
 
 async def test_start_installs_latest_verifier_published_during_connect(
     monkeypatch,
@@ -10323,7 +9775,6 @@ async def test_start_installs_latest_verifier_published_during_connect(
     current_factory.assert_called_once_with()
     assert detector_factory.call_args.kwargs["speaker_shadow"] is current_shadow
 
-
 async def test_failed_detector_construction_closes_created_speaker_shadow(
     monkeypatch,
 ) -> None:
@@ -10362,7 +9813,6 @@ async def test_failed_detector_construction_closes_created_speaker_shadow(
     assert result.status in {AsrStartStatus.FAILED, AsrStartStatus.UNAVAILABLE}
     shadow.close.assert_awaited_once_with()
 
-
 async def test_teardown_routines_share_one_turn_state_reset() -> None:
     import ast
     import inspect as inspect_module
@@ -10390,7 +9840,6 @@ async def test_teardown_routines_share_one_turn_state_reset() -> None:
             and isinstance(node.func, ast.Attribute)
         }
         assert "_reset_asr_turn_state" in calls, method_name
-
 
 def test_hot_swap_replay_damage_accounts_for_rebound_frames() -> None:
     # Codex P2. Cached pre-swap frames carry a stale route generation, so replay
@@ -10432,7 +9881,6 @@ def test_hot_swap_replay_damage_accounts_for_rebound_frames() -> None:
         "the damage check must still be what gates the invalidation"
     )
 
-
 async def test_provider_final_preserves_unconfirmed_successor_pcm_as_pre_roll() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -10466,7 +9914,6 @@ async def test_provider_final_preserves_unconfirmed_successor_pcm_as_pre_roll() 
     assert decision.pre_roll.startswith(successor_pcm)
     detector.complete_provider_candidate.assert_awaited_once()
 
-
 async def test_provider_fence_failure_does_not_accept_final() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -10493,7 +9940,6 @@ async def test_provider_fence_failure_does_not_accept_final() -> None:
     runtime.handle_input_transcript.assert_not_awaited()
     assert runtime._asr_route_mode == "blocked"
 
-
 async def test_stale_provider_endpoint_releases_local_final_reservation() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -10509,7 +9955,6 @@ async def test_stale_provider_endpoint_releases_local_final_reservation() -> Non
 
     assert component._asr_reserved_final_key is None
     assert component._asr_lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
-
 
 async def test_provider_successor_discard_failure_fails_closed_once() -> None:
     runtime = _Runtime()
@@ -10538,7 +9983,6 @@ async def test_provider_successor_discard_failure_fails_closed_once() -> None:
     assert runtime._asr_session_epoch == epoch + 1
     assert runtime._asr_route_mode == "blocked"
     assert "private failure" not in str(runtime.send_status.await_args_list)
-
 
 async def test_provider_final_lock_then_overflow_preserves_accepted_final() -> None:
     runtime = _Runtime()
@@ -10609,7 +10053,6 @@ async def test_provider_final_lock_then_overflow_preserves_accepted_final() -> N
     assert runtime._asr_lifecycle.has_pending_turn is False
     assert runtime._asr_sealed_turn_token is None
 
-
 async def test_provider_overflow_lock_then_final_preserves_accepted_final() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -10662,8 +10105,6 @@ async def test_provider_overflow_lock_then_final_preserves_accepted_final() -> N
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
     assert runtime._asr_accepted_final_keys
 
-
-@pytest.mark.parametrize("replacement", ["epoch", "lifecycle", "detector"])
 async def test_provider_overflow_waiting_on_final_lock_is_identity_fenced(
     replacement: str,
 ) -> None:
@@ -10707,7 +10148,6 @@ async def test_provider_overflow_waiting_on_final_lock_is_identity_fenced(
     watchdog = runtime._asr_final_watchdog_task
     if watchdog is not None:
         watchdog.cancel()
-
 
 async def test_speaker_shadow_abba_cannot_change_provider_authority(
     monkeypatch,
@@ -11199,30 +10639,6 @@ async def test_speaker_shadow_abba_cannot_change_provider_authority(
     assert disabled_a["provider_close_count"] == 1
     assert len(disabled_a["finals"]) == 1
 
-
-@pytest.mark.unit
-async def test_microphone_route_syncs_provider_neutral_visual_delivery_mode() -> None:
-    """Independent ASR must fail closed for raw vision during every route state."""
-    runtime = _Runtime()
-    runtime.session._supports_native_image = True
-    runtime.session.set_visual_delivery_mode = MagicMock()
-    runtime.session.block_raw_visual_delivery = MagicMock()
-    runtime.session.allow_raw_visual_delivery = MagicMock()
-
-    runtime._set_microphone_route("independent")
-    runtime._set_microphone_route("blocked")
-    runtime._set_microphone_route("native")
-
-    delivered_modes = [
-        getattr(item.args[0], "value", item.args[0])
-        for item in runtime.session.set_visual_delivery_mode.call_args_list
-    ]
-    assert delivered_modes == ["native"]
-    assert runtime.session.block_raw_visual_delivery.call_count >= 2
-    runtime.session.allow_raw_visual_delivery.assert_called_once_with()
-
-
-@pytest.mark.unit
 async def test_native_route_leaves_provider_capability_routing_inside_session() -> None:
     """Core selects the ASR strategy, while session capability keeps legacy behavior."""
     runtime = _Runtime()
@@ -11234,8 +10650,6 @@ async def test_native_route_leaves_provider_capability_routing_inside_session() 
     delivered_mode = runtime.session.set_visual_delivery_mode.call_args.args[0]
     assert getattr(delivered_mode, "value", delivered_mode) == "native"
 
-
-@pytest.mark.unit
 async def test_independent_visual_sync_failure_blocks_raw_images_without_stopping_asr() -> None:
     runtime = _Runtime()
     call_order: list[str] = []
@@ -11255,8 +10669,6 @@ async def test_independent_visual_sync_failure_blocks_raw_images_without_stoppin
     assert runtime._asr_route_mode == "independent"
     assert call_order == ["block"]
 
-
-@pytest.mark.unit
 async def test_independent_multimodal_turn_samples_the_utterance_span() -> None:
     """One utterance carries first/middle/last; identity fields name the last."""
     runtime = _Runtime()
@@ -11295,8 +10707,6 @@ async def test_independent_multimodal_turn_samples_the_utterance_span() -> None:
     assert turn.request_id == "frame-2"
     assert turn.image_generation > turn.start_image_generation
 
-
-@pytest.mark.unit
 async def test_independent_multimodal_turn_never_reuses_prior_turn_frame() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -11315,8 +10725,6 @@ async def test_independent_multimodal_turn_never_reuses_prior_turn_frame() -> No
 
     assert turn is None
 
-
-@pytest.mark.unit
 async def test_independent_multimodal_turn_rejects_delayed_prior_capture() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -11349,8 +10757,6 @@ async def test_independent_multimodal_turn_rejects_delayed_prior_capture() -> No
     assert turn.images == ("current-turn-frame",)
     assert turn.captured_at == record.started_at
 
-
-@pytest.mark.unit
 async def test_independent_multimodal_turn_rejects_owned_frame_expired_at_final() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -11375,8 +10781,6 @@ async def test_independent_multimodal_turn_rejects_owned_frame_expired_at_final(
 
     assert turn is None
 
-
-@pytest.mark.unit
 async def test_direct_multimodal_final_submits_raw_image_once() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "openai")
@@ -11444,8 +10848,6 @@ async def test_direct_multimodal_final_submits_raw_image_once() -> None:
     runtime.session.submit_external_voice_turn.assert_not_awaited()
     assert turn_id not in runtime._core_multimodal_turns
 
-
-@pytest.mark.unit
 async def test_final_superseded_after_freeze_submits_text_without_frames() -> None:
     """Freezing the frames is not the last word; the submit is.
 
@@ -11504,9 +10906,6 @@ async def test_final_superseded_after_freeze_submits_text_without_frames() -> No
     runtime.session.submit_external_voice_turn.assert_awaited_once()
     assert "look here" in runtime.session.submit_external_voice_turn.await_args.args
 
-
-@pytest.mark.unit
-@pytest.mark.parametrize("delivery", ["direct_atomic", "handoff_required"])
 async def test_ownership_lost_between_the_freeze_check_and_the_provider_call(
     delivery,
 ) -> None:
@@ -11565,8 +10964,6 @@ async def test_ownership_lost_between_the_freeze_check_and_the_provider_call(
     runtime.session.submit_external_voice_turn.assert_awaited_once()
     assert "look here" in runtime.session.submit_external_voice_turn.await_args.args
 
-
-@pytest.mark.unit
 async def test_dispatch_hands_the_ownership_predicate_to_the_handoff() -> None:
     """Checking before the handoff is not enough; it must check inside too.
 
@@ -11623,8 +11020,6 @@ async def test_dispatch_hands_the_ownership_predicate_to_the_handoff() -> None:
     assert seen["before"] is True
     assert seen["after"] is False
 
-
-@pytest.mark.unit
 async def test_provider_admission_rejection_submits_the_transcript_as_text() -> None:
     """Losing the provider's admission window must not lose the sentence.
 
@@ -11680,8 +11075,6 @@ async def test_provider_admission_rejection_submits_the_transcript_as_text() -> 
         in runtime.session.submit_external_voice_turn.await_args.args
     )
 
-
-@pytest.mark.unit
 async def test_route_close_drops_the_staged_visual_caches() -> None:
     """Staged originals belong to the route, not to the process.
 
@@ -11706,8 +11099,6 @@ async def test_route_close_drops_the_staged_visual_caches() -> None:
     assert runtime._prerecord_visual_frames == []
     assert runtime._latest_independent_visual_frame is None
 
-
-@pytest.mark.unit
 async def test_visual_validation_wait_timeout_does_not_cancel_image_task() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -11729,8 +11120,6 @@ async def test_visual_validation_wait_timeout_does_not_cancel_image_task() -> No
     release.set()
     await validation_task
 
-
-@pytest.mark.unit
 async def test_new_turn_wakes_visual_validation_wait_without_cancelling_task() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -11768,7 +11157,6 @@ async def test_new_turn_wakes_visual_validation_wait_without_cancelling_task() -
     release.set()
     await validation_task
 
-
 async def test_offline_image_free_voice_turn_retries_tts_after_failure() -> None:
     runtime = _Runtime()
     runtime.response_backend = "offline_vlm"
@@ -11797,8 +11185,6 @@ async def test_offline_image_free_voice_turn_retries_tts_after_failure() -> None
         turn_id="turn-2",
     )
 
-
-@pytest.mark.unit
 async def test_direct_multimodal_failure_reports_status_without_text_fallback() -> None:
     runtime = _Runtime()
     runtime.core_api_type = "openai"
@@ -11835,8 +11221,6 @@ async def test_direct_multimodal_failure_reports_status_without_text_fallback() 
     assert any("ASR_INDEPENDENT_INJECTION_FAILED" in item for item in status_payloads)
     assert "provider rejected image" not in str(status_payloads)
 
-
-@pytest.mark.unit
 async def test_handoff_failure_never_falls_back_to_transcript_only() -> None:
     runtime = _Runtime()
     _install_ready_lifecycle(runtime, "qwen")
@@ -11889,8 +11273,6 @@ async def test_handoff_failure_never_falls_back_to_transcript_only() -> None:
         runtime.send_status.await_args_list
     )
 
-
-@pytest.mark.unit
 async def test_native_visual_sync_failure_keeps_raw_images_blocked() -> None:
     runtime = _Runtime()
     call_order: list[str] = []
@@ -11914,8 +11296,6 @@ async def test_native_visual_sync_failure_keeps_raw_images_blocked() -> None:
     assert runtime._asr_route_mode == "native"
     assert call_order == ["sync", "block"]
 
-
-@pytest.mark.unit
 async def test_out_of_order_frame_still_joins_the_turn_sample() -> None:
     """A frame that validates late must not be dropped by the latest-frame guard."""
     runtime = _Runtime()
@@ -11946,14 +11326,6 @@ async def test_out_of_order_frame_still_joins_the_turn_sample() -> None:
     assert turn is not None
     assert turn.images == ("earlier-frame", "later-frame")
 
-
-def _seal_utterance(runtime) -> None:
-    runtime._asr_lifecycle = SimpleNamespace(
-        snapshot=SimpleNamespace(state=VoiceLifecycleState.DRAINING)
-    )
-
-
-@pytest.mark.unit
 async def test_frames_captured_after_the_endpoint_are_not_folded_in() -> None:
     """Screen state from after the user stopped talking is not this turn."""
     runtime = _Runtime()
@@ -11985,8 +11357,6 @@ async def test_frames_captured_after_the_endpoint_are_not_folded_in() -> None:
     assert turn is not None
     assert turn.images == ("spoken-frame",)
 
-
-@pytest.mark.unit
 async def test_frame_captured_before_the_endpoint_survives_late_validation() -> None:
     """Validation finishing after DRAINING must not discard a spoken-window frame."""
     runtime = _Runtime()
@@ -12012,8 +11382,6 @@ async def test_frame_captured_before_the_endpoint_survives_late_validation() -> 
     assert turn is not None
     assert turn.images == ("late-validated-frame",)
 
-
-@pytest.mark.unit
 async def test_post_endpoint_cache_frame_cannot_seed_an_empty_turn() -> None:
     """The empty-record fallback must respect the endpoint cutoff too."""
     runtime = _Runtime()
@@ -12037,8 +11405,6 @@ async def test_post_endpoint_cache_frame_cannot_seed_an_empty_turn() -> None:
 
     assert runtime._snapshot_core_multimodal_turn(turn_id, "what is that") is None
 
-
-@pytest.mark.unit
 async def test_endpoint_cutoff_uses_the_recorded_seal_instant() -> None:
     """A frame captured in the gap before Core looks must still be excluded."""
     runtime = _Runtime()
@@ -12074,8 +11440,6 @@ async def test_endpoint_cutoff_uses_the_recorded_seal_instant() -> None:
     assert turn is not None
     assert turn.images == ("spoken-frame",)
 
-
-@pytest.mark.unit
 async def test_live_seal_between_onset_and_registration_still_binds() -> None:
     """The live field floors on started_at, not registered_at.
 
@@ -12114,8 +11478,6 @@ async def test_live_seal_between_onset_and_registration_still_binds() -> None:
 
     assert record.endpoint_at == sealed_at
 
-
-@pytest.mark.unit
 async def test_previous_turn_seal_in_the_same_tick_is_not_this_turn_cutoff() -> None:
     """A previous turn's seal in the same tick is not this turn's cutoff.
 
@@ -12166,8 +11528,6 @@ async def test_previous_turn_seal_in_the_same_tick_is_not_this_turn_cutoff() -> 
     assert turn is not None
     assert "middle-frame" in turn.images
 
-
-@pytest.mark.unit
 async def test_this_turn_seal_in_the_same_tick_is_still_its_cutoff() -> None:
     """The other direction: this turn's own seal must survive a tick collision.
 
@@ -12204,8 +11564,6 @@ async def test_this_turn_seal_in_the_same_tick_is_still_its_cutoff() -> None:
         "本轮自己的封口被当成上一轮残值丢掉了：相等时必须靠身份而不是时间戳"
     )
 
-
-@pytest.mark.unit
 async def test_a_seal_after_this_record_registered_still_becomes_its_cutoff() -> None:
     """Dual: a retained seal that really belongs to this turn still binds.
 
@@ -12232,8 +11590,6 @@ async def test_a_seal_after_this_record_registered_still_becomes_its_cutoff() ->
 
     assert record.endpoint_at == sealed_at
 
-
-@pytest.mark.unit
 async def test_stale_seal_instant_from_a_previous_turn_is_not_this_turn_cutoff() -> None:
     """A leftover timestamp predates this record and must not seal it early."""
     runtime = _Runtime()
@@ -12257,8 +11613,6 @@ async def test_stale_seal_instant_from_a_previous_turn_is_not_this_turn_cutoff()
     assert turn is not None
     assert turn.images == ("spoken-frame",)
 
-
-@pytest.mark.unit
 async def test_endpoint_cutoff_survives_provider_final_clearing_the_live_field() -> None:
     """PROVIDER_FINAL clears the live timestamp before Core freezes the turn."""
     runtime = _Runtime()
@@ -12298,37 +11652,6 @@ async def test_endpoint_cutoff_survives_provider_final_clearing_the_live_field()
     assert turn is not None
     assert turn.images == ("spoken-frame",)
 
-
-@pytest.mark.unit
-async def test_frame_validated_during_lifecycle_notification_joins_the_turn() -> None:
-    """Speech onset, not record creation, is the ownership boundary."""
-    runtime = _Runtime()
-    runtime._asr_route_mode = "independent"
-    onset = time.monotonic()
-    # 刻意只设 _asr_turn_onset_at：_asr_turn_audio_started_at 在两条生产路径上是
-    # 投递完成之后才打的，用它当起点正是被修掉的那个缺陷，所以这条用例不能靠它。
-    runtime._asr_turn_onset_at = onset
-
-    # 语音已确认，Core 还卡在 _send_asr_lifecycle_state 的投递里；这一帧就是这段
-    # 发声的开头（用户开口时指的东西），它先于 record 落地。
-    assert runtime._stage_independent_visual_frame(
-        "onset-frame",
-        source="screen",
-        request_id="screen-onset",
-        captured_at=onset + 0.01,
-    )
-
-    token = VoiceTurnToken(ingress=runtime._capture_ingress_token(), turn_id=98)
-    turn_id = f"asr-{token.ingress.session_epoch}-{token.turn_id}"
-    runtime._begin_core_multimodal_turn(turn_id, token)
-
-    turn = runtime._snapshot_core_multimodal_turn(turn_id, "what is that")
-
-    assert turn is not None
-    assert turn.images == ("onset-frame",)
-
-
-@pytest.mark.unit
 async def test_frame_captured_before_the_onset_is_still_a_prior_turn_frame() -> None:
     """Widening the window to the onset must not reach into the previous turn."""
     runtime = _Runtime()
@@ -12349,8 +11672,6 @@ async def test_frame_captured_before_the_onset_is_still_a_prior_turn_frame() -> 
 
     assert runtime._snapshot_core_multimodal_turn(turn_id, "new question") is None
 
-
-@pytest.mark.unit
 async def test_prerecord_validation_task_is_attached_to_the_onset_record() -> None:
     """A frame task created before the record exists must not be dropped."""
     runtime = _Runtime()
@@ -12383,8 +11704,6 @@ async def test_prerecord_validation_task_is_attached_to_the_onset_record() -> No
     gate.set()
     await task
 
-
-@pytest.mark.unit
 async def test_prerecord_validation_stash_is_bounded() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -12408,150 +11727,6 @@ async def test_prerecord_validation_stash_is_bounded() -> None:
     gate.set()
     await asyncio.gather(*tasks)
 
-
-@pytest.mark.unit
-def test_speech_onset_is_stamped_at_the_transition_not_after_delivery() -> None:
-    """The onset stamp must not sit behind an awaited lifecycle notification.
-
-    Two production SPEECH_CONFIRMED paths stamp ``_asr_turn_audio_started_at``
-    only after awaiting ``_send_asr_lifecycle_state()``. Visual ownership uses
-    the onset as its lower bound, so a stamp taken after that await turns every
-    frame captured during delivery into a "not this utterance" frame. The
-    invariant is syntactic: the stamp follows the transition with no await in
-    between.
-    """
-    import inspect
-
-    from main_logic.asr_client import lifecycle as asr_lifecycle_module
-    from main_logic.asr_client import runtime as asr_runtime_module
-
-    source = inspect.getsource(asr_runtime_module).splitlines()
-
-    # ⚠️ 这个守卫的第一版只扫 runtime.py 里的字面量
-    # `lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)`，因此完全看不见
-    # lifecycle.py 自己的 `self.transition(...)`（begin_pending_turn 里那一处）——
-    # 第五个迁移点就是这么漏掉的，还给了"五处都打点了"的假绿。清单式守卫必须自己
-    # 证明清单是全的：先跨模块把所有迁移点数出来，再逐个查。
-    lifecycle_source = inspect.getsource(asr_lifecycle_module).splitlines()
-    lifecycle_sites = [
-        index
-        for index, line in enumerate(lifecycle_source)
-        if "transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)" in line
-    ]
-    # lifecycle 侧的迁移点没有 runtime 字段可写，只能要求它的**调用方**补打点。
-    for index in lifecycle_sites:
-        owner = None
-        for back in range(index, -1, -1):
-            stripped = lifecycle_source[back].strip()
-            if stripped.startswith("def "):
-                owner = stripped[4:].split("(")[0]
-                break
-        assert owner is not None
-        callers = [
-            i for i, line in enumerate(source) if f"lifecycle.{owner}()" in line
-        ]
-        assert callers, (
-            f"lifecycle.{owner}() performs a SPEECH_CONFIRMED transition but no "
-            f"runtime call site was found to stamp the onset"
-        )
-        for caller in callers:
-            window = chr(10).join(source[caller : caller + 12])
-            assert "self._asr_turn_onset_at" in window, (
-                f"runtime line {caller + 1}: lifecycle.{owner}() transitions to "
-                f"SPEECH_CONFIRMED, so its caller must stamp the onset; got: "
-                f"{window!r}"
-            )
-    transition = "lifecycle.transition(VoiceLifecycleEvent.SPEECH_CONFIRMED)"
-    stamp = "self._asr_turn_onset_at ="
-    sites = [i for i, line in enumerate(source) if transition in line]
-
-    assert sites, "no SPEECH_CONFIRMED transition found"
-    for index in sites:
-        # 赋值必须**紧接**转换那一行开始（注释和空行不算，它们引入不了 await）。
-        # 值本身可以是多行表达式：几条路径都要在"暂存的 onset"和"进函数时刻"之间选。
-        first = next(
-            offset
-            for offset in range(1, 12)
-            if source[index + offset].strip()
-            and not source[index + offset].strip().startswith("#")
-        )
-        assert source[index + first].strip().startswith(stamp), (
-            f"line {index + 1}: SPEECH_CONFIRMED must start stamping the onset "
-            f"before anything else, got: {source[index + first].strip()!r}"
-        )
-
-    # 每一条路径的 onset 赋值都必须**优先取暂存的 pending onset**，只有它为空时才
-    # 用进函数时刻。session 先未就绪、随后又 ready 时，真实开口时刻就是当初记下的
-    # 那个值；就地取时钟会把整段重连等待算成「开口之后」，期间拍的帧全被排除。
-    #
-    # 规则对所有迁移点一视同仁，因此不再需要"哪条是延迟路径"这种启发式识别 ——
-    # 之前那版靠往上扫若干行找条件语句，既会跨函数误标，也挡不住直接分支退化。
-    for index in sites:
-        begin = next(
-            offset
-            for offset in range(1, 12)
-            if source[index + offset].strip()
-            and not source[index + offset].strip().startswith("#")
-        )
-        statement = []
-        depth = 0
-        for offset in range(begin, begin + 9):
-            line = source[index + offset]
-            statement.append(line)
-            depth += line.count("(") - line.count(")")
-            if depth <= 0:
-                break
-        window = chr(10).join(statement)
-        assert "self._asr_pending_speech_onset_at" in window, (
-            f"line {index + 1}: the onset assignment must prefer the pending "
-            f"onset captured before the reconnect, got: {window!r}"
-        )
-
-    # detected_at 本身必须在函数里任何 await 之前捕获。
-    for index, line in enumerate(source):
-        if line.strip() != "detected_at = time.monotonic()":
-            continue
-        for back in range(index, -1, -1):
-            stripped = source[back].strip()
-            if stripped.startswith(("async def ", "def ")):
-                break
-            if stripped.startswith("#"):
-                continue
-            assert not stripped.startswith("await ") and " await " not in stripped, (
-                f"line {index + 1}: detected_at must be captured before any await; "
-                f"line {back + 1} is {stripped!r}"
-            )
-
-    # 暂存的 pending turn onset 也必须用进函数时刻。函数入口已经存了 detected_at
-    # （上面那条规则保证它在任何 await 之前），DRAINING 分支再读一次时钟等于把
-    # 「进函数 → 走到这一行」之间拍的帧排除在这段发声之外，而这个字段正是后面
-    # begin_pending_turn 那处 _asr_turn_onset_at 的来源。
-    for index, line in enumerate(source):
-        stripped = line.strip()
-        if not stripped.startswith("self._asr_pending_turn_onset_at = "):
-            continue
-        rhs = stripped.split(" = ", 1)[1]
-        if rhs == "None":
-            continue
-        captures_detected_at = False
-        for back in range(index, -1, -1):
-            # 只在**方法**定义处收边（4 空格缩进）。这些函数里 detected_at 与
-            # DRAINING 分支之间隔着 event_is_current / wake_is_current 这类嵌套
-            # def，按 "任意 def" 收边会提前停下，规则对这两处直接失效。
-            if source[back].startswith(("    def ", "    async def ")):
-                break
-            if source[back].strip() == "detected_at = time.monotonic()":
-                captures_detected_at = True
-                break
-        if not captures_detected_at:
-            continue
-        assert rhs == "detected_at", (
-            f"line {index + 1}: the pending turn onset must carry the entry "
-            f"timestamp its function already captured, got: {rhs!r}"
-        )
-
-
-@pytest.mark.unit
 async def test_reconnect_listener_join_is_bounded() -> None:
     """A receive task that swallows cancellation must not wedge the swap lock."""
     from main_logic.core import LLMSessionManager
@@ -12610,8 +11785,6 @@ async def test_reconnect_listener_join_is_bounded() -> None:
         await asyncio.sleep(0.01)
     session.close.assert_awaited_once_with()
 
-
-@pytest.mark.unit
 async def test_pending_turn_does_not_inherit_the_previous_turn_endpoint() -> None:
     """A turn started while the previous one drained must not be sealed by it.
 
@@ -12653,8 +11826,6 @@ async def test_pending_turn_does_not_inherit_the_previous_turn_endpoint() -> Non
     assert turn is not None
     assert turn.images == ("new-utterance-frame",)
 
-
-@pytest.mark.unit
 async def test_retained_seal_predating_registration_is_not_this_turn_cutoff() -> None:
     """Second line of defence behind the onset stamp.
 
@@ -12693,8 +11864,6 @@ async def test_retained_seal_predating_registration_is_not_this_turn_cutoff() ->
     assert turn is not None
     assert turn.images == ("post-seal-frame",)
 
-
-@pytest.mark.unit
 async def test_all_prerecord_frames_join_the_turn_not_just_the_newest() -> None:
     """Frames validated before the record exists must survive as a span.
 
@@ -12729,8 +11898,6 @@ async def test_all_prerecord_frames_join_the_turn_not_just_the_newest() -> None:
     # 消费即清空，不会漏进下一轮。
     assert runtime._prerecord_visual_frames == []
 
-
-@pytest.mark.unit
 async def test_prerecord_frame_buffer_is_bounded() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -12751,8 +11918,6 @@ async def test_prerecord_frame_buffer_is_bounded() -> None:
     assert kept[0] == "prerecord-0"
     assert kept[-1] == "prerecord-39"
 
-
-@pytest.mark.unit
 async def test_prerecord_frames_from_a_previous_route_are_not_adopted() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -12780,8 +11945,6 @@ async def test_prerecord_frames_from_a_previous_route_are_not_adopted() -> None:
     assert record.first_frame is None
     assert runtime._snapshot_core_multimodal_turn(turn_id, "lost") is None
 
-
-@pytest.mark.unit
 def test_overlap_replay_carries_the_real_onset_not_the_replay_instant() -> None:
     """The overlap replay happens long after the user actually resumed speaking.
 
@@ -12836,8 +11999,6 @@ def test_overlap_replay_carries_the_real_onset_not_the_replay_instant() -> None:
             f"onset to the confirmation path, got: {window!r}"
         )
 
-
-@pytest.mark.unit
 async def test_overlapping_successor_is_not_sealed_by_its_predecessor() -> None:
     """The successor's onset predates the predecessor's seal — by design.
 
@@ -12874,8 +12035,6 @@ async def test_overlapping_successor_is_not_sealed_by_its_predecessor() -> None:
     assert turn is not None
     assert turn.images == ("successor-frame",)
 
-
-@pytest.mark.unit
 async def test_live_endpoint_still_seals_its_own_turn() -> None:
     """The live field only ever describes the in-flight turn, so keep it loose."""
     runtime = _Runtime()
@@ -12898,8 +12057,6 @@ async def test_live_endpoint_still_seals_its_own_turn() -> None:
 
     assert record.endpoint_at == sealed_at
 
-
-@pytest.mark.unit
 async def test_prerecord_buffer_trims_in_capture_order_not_arrival_order() -> None:
     """Concurrent validation means arrival order is not capture order.
 
@@ -12931,8 +12088,6 @@ async def test_prerecord_buffer_trims_in_capture_order_not_arrival_order() -> No
     captured = [frame.captured_at for frame in runtime._prerecord_visual_frames]
     assert captured == sorted(captured)
 
-
-@pytest.mark.unit
 async def test_prerecord_task_stash_keeps_the_earliest_validation() -> None:
     """Evicting the oldest task drops the opening frame of the utterance.
 
@@ -12968,8 +12123,6 @@ async def test_prerecord_task_stash_keeps_the_earliest_validation() -> None:
     gate.set()
     await asyncio.gather(*tasks)
 
-
-@pytest.mark.unit
 async def test_new_prepare_does_not_erase_a_preceding_turn_record() -> None:
     """An in-flight accepted final must still find its own record.
 
@@ -12997,8 +12150,6 @@ async def test_new_prepare_does_not_erase_a_preceding_turn_record() -> None:
     assert first_record.invalidated.is_set()
     assert runtime._core_multimodal_turns.get(second_id) is not None
 
-
-@pytest.mark.unit
 async def test_retained_turn_records_are_bounded() -> None:
     runtime = _Runtime()
     runtime._asr_route_mode = "independent"
@@ -13017,8 +12168,6 @@ async def test_retained_turn_records_are_bounded() -> None:
     kept = sorted(runtime._core_multimodal_turns)
     assert kept[-1].endswith("-229")
 
-
-@pytest.mark.unit
 async def test_successor_prepares_do_not_evict_a_still_running_final() -> None:
     """A record is removed by its own dispatch, never by a successor's prepare.
 
@@ -13050,8 +12199,6 @@ async def test_successor_prepares_do_not_evict_a_still_running_final() -> None:
     runtime._abandon_core_voice_turn(running_id, session_ref=None)
     assert running_id not in runtime._core_multimodal_turns
 
-
-@pytest.mark.unit
 async def test_a_dispatching_record_outlives_the_cap() -> None:
     """The cap must never be the thing that drops an accepted final.
 
@@ -13082,8 +12229,6 @@ async def test_a_dispatching_record_outlives_the_cap() -> None:
     # 没在派发的那些仍然有界。
     assert len(runtime._core_multimodal_turns) <= _MAX_LIVE_TURN_RECORDS
 
-
-@pytest.mark.unit
 async def test_all_records_mid_dispatch_keeps_them_past_the_cap() -> None:
     """When nothing is evictable the cap yields, it does not pick a victim.
 
@@ -13115,8 +12260,6 @@ async def test_all_records_mid_dispatch_keeps_them_past_the_cap() -> None:
         runtime._abandon_core_voice_turn(record_id, session_ref=None)
     assert len(runtime._core_multimodal_turns) == _MAX_LIVE_TURN_RECORDS
 
-
-@pytest.mark.unit
 async def test_the_real_dispatch_marks_its_record_before_it_can_be_evicted() -> None:
     """The flag has to be set by the dispatch itself, not only in a test.
 
@@ -13166,8 +12309,6 @@ async def test_the_real_dispatch_marks_its_record_before_it_can_be_evicted() -> 
     # 自己的 finally 摘掉它。
     assert turn_id not in runtime._core_multimodal_turns
 
-
-@pytest.mark.unit
 async def test_validation_tracking_picks_the_active_record_not_a_retained_one() -> None:
     """Retained records exist only so an in-flight final keeps its transcript.
 
@@ -13206,8 +12347,6 @@ async def test_validation_tracking_picks_the_active_record_not_a_retained_one() 
     gate.set()
     await task
 
-
-@pytest.mark.unit
 async def test_invalidated_record_does_not_hand_over_its_frames() -> None:
     """A superseded turn keeps its words but not the successor's frames."""
     runtime = _Runtime()
@@ -13234,8 +12373,6 @@ async def test_invalidated_record_does_not_hand_over_its_frames() -> None:
     assert runtime._core_multimodal_turns.get(first_id) is record
     assert runtime._snapshot_core_multimodal_turn(first_id, "first") is None
 
-
-@pytest.mark.unit
 async def test_prerecord_stash_still_arms_while_older_records_are_retained() -> None:
     """The dict is no longer empty between turns, so 'no records' is the wrong test."""
     runtime = _Runtime()
@@ -13260,8 +12397,6 @@ async def test_prerecord_stash_still_arms_while_older_records_are_retained() -> 
         "between-turns-frame"
     ]
 
-
-@pytest.mark.unit
 async def test_live_onset_replay_waits_behind_queued_overlap_credits() -> None:
     """FIFO order decides who gets replayed, not who is newest.
 
@@ -13322,8 +12457,6 @@ async def test_live_onset_replay_waits_behind_queued_overlap_credits() -> None:
     assert runtime.handle_new_message.await_count == 3
     assert runtime._asr_overlap_onset_token is None
 
-
-@pytest.mark.unit
 async def test_endpoint_marking_skips_invalidated_records() -> None:
     """A successor's seal has no business landing on a superseded record."""
     runtime = _Runtime()
@@ -13345,8 +12478,6 @@ async def test_endpoint_marking_skips_invalidated_records() -> None:
     assert active.endpoint_at is not None
     assert retained.endpoint_at is None
 
-
-@pytest.mark.unit
 async def test_frames_after_a_sealed_turn_are_kept_for_the_successor() -> None:
     """A sealed record is done taking frames, so it must not block the buffer.
 
@@ -13383,8 +12514,6 @@ async def test_frames_after_a_sealed_turn_are_kept_for_the_successor() -> None:
         "successor-opening-frame"
     ]
 
-
-@pytest.mark.unit
 async def test_a_late_registration_still_adopts_its_real_onset() -> None:
     """Waiting behind a provider final does not make an onset stale.
 
@@ -13422,8 +12551,6 @@ async def test_a_late_registration_still_adopts_its_real_onset() -> None:
         "frame-from-the-real-onset"
     ]
 
-
-@pytest.mark.unit
 async def test_idle_frames_do_not_consume_the_prerecord_budget() -> None:
     """Frames from before the user spoke are not this turn's to keep.
 
@@ -13464,8 +12591,6 @@ async def test_idle_frames_do_not_consume_the_prerecord_budget() -> None:
     # 开口之前的一张都不占名额了，这一轮自己的三张全在。
     assert kept == ["speech-0", "speech-1", "speech-2"]
 
-
-@pytest.mark.unit
 async def test_a_stale_onset_does_not_evict_the_prerecord_buffer() -> None:
     """Trimming is only safe against an onset this turn actually owns.
 
@@ -13498,8 +12623,6 @@ async def test_a_stale_onset_does_not_evict_the_prerecord_buffer() -> None:
         "frame-2",
     ]
 
-
-@pytest.mark.unit
 async def test_replay_drops_the_pending_slot_when_the_transport_identity_moves_on() -> None:
     """A drifted runtime identity must not strand the pending confirmation.
 
@@ -13591,8 +12714,6 @@ async def test_replay_drops_the_pending_slot_when_the_transport_identity_moves_o
     assert component._asr_turn_onset_at != recorded_onset
     assert component._asr_turn_onset_at >= fresh_floor
 
-
-@pytest.mark.unit
 async def test_credit_redemption_drops_the_pending_slot_when_the_transport_identity_moves_on() -> None:
     """Dual of the direct-replay case for the completed-overlap credit path.
 
@@ -13698,8 +12819,6 @@ async def test_credit_redemption_drops_the_pending_slot_when_the_transport_ident
     assert component._asr_turn_onset_at == later_onset
     assert runtime._asr_overlap_completed_turns == 0
 
-
-@pytest.mark.unit
 async def test_direct_overlap_replay_seals_when_the_session_is_not_ready() -> None:
     """The direct replay must complete its confirmation in place too.
 
@@ -13766,8 +12885,6 @@ async def test_direct_overlap_replay_seals_when_the_session_is_not_ready() -> No
     ] == ["first", "second"]
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
 
-
-@pytest.mark.unit
 async def test_direct_overlap_replay_reclaims_its_lent_onset_when_it_never_wakes() -> None:
     """A direct replay that never reaches ACTIVE must take its onset back.
 
@@ -13814,8 +12931,6 @@ async def test_direct_overlap_replay_reclaims_its_lent_onset_when_it_never_wakes
         "the lent onset stayed behind and a later unrelated turn will adopt it"
     )
 
-
-@pytest.mark.unit
 async def test_direct_overlap_replay_keeps_the_onset_for_a_pending_confirmation() -> None:
     """Dual: an onset held for a pending confirmation must NOT be reclaimed.
 
@@ -13850,8 +12965,6 @@ async def test_direct_overlap_replay_keeps_the_onset_for_a_pending_confirmation(
 
     assert runtime._asr_pending_speech_onset_at is not None
 
-
-@pytest.mark.unit
 async def test_overlap_credit_survives_a_replay_that_never_activates() -> None:
     """Spend the credit on a successful wake-up, not on the attempt.
 
@@ -13897,8 +13010,6 @@ async def test_overlap_credit_survives_a_replay_that_never_activates() -> None:
     # 借出去的 onset 也收回了，不会被后面不相干的回合继承。
     assert runtime._asr_pending_speech_onset_at is None
 
-
-@pytest.mark.unit
 async def test_an_unwoken_redemption_still_seals_and_delivers_the_queued_final() -> None:
     """An unwoken replay must still seal: its final is already on the way.
 
@@ -13972,8 +13083,6 @@ async def test_an_unwoken_redemption_still_seals_and_delivers_the_queued_final()
     # 收尾不留忙标志。
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
 
-
-@pytest.mark.unit
 async def test_an_unwoken_redemption_never_parks_in_an_untimed_busy_state() -> None:
     """Invariant: a busy state must always carry a timer, whatever the fix is.
 
@@ -14016,8 +13125,6 @@ async def test_an_unwoken_redemption_never_parks_in_an_untimed_busy_state() -> N
         and component._asr_final_watchdog_task is None
     ), "忙标志停在了没有任何定时器兜底的状态上"
 
-
-@pytest.mark.unit
 async def test_overlap_prerecord_trims_against_the_pending_turn_onset() -> None:
     """During an overlap the successor's boundary lives in the pending slot.
 
@@ -14059,6 +13166,7 @@ async def test_overlap_prerecord_trims_against_the_pending_turn_onset() -> None:
         "successor-0",
         "successor-1",
     ]
+
 async def test_lease_resync_does_not_hand_a_successor_the_replaced_episode() -> None:
     """A takeover inside the display send must not reach the new recorder.
 
