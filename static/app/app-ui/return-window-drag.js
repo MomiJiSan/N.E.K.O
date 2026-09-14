@@ -833,6 +833,12 @@
         };
         state.handleTouchStart = (event) => {
             if (isThoughtBubbleEventTarget(event)) return;
+            const edgeButton = (container.classList && container.classList.contains('neko-idle-return-btn'))
+                ? container : (container.querySelector && container.querySelector('.neko-idle-return-btn'));
+            if (window.NekoEdgePeekController && window.NekoEdgePeekController.shouldBlockReturnBallDrag(edgeButton, container)) {
+                event.stopImmediatePropagation();
+                return;
+            }
             const point = getTouchScreenPoint(event.touches[0]);
             if (!point) return;
             event.preventDefault();

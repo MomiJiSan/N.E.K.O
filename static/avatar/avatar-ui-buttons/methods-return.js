@@ -1012,7 +1012,7 @@ Object.assign(AvatarButtonMixin.methods, {
                 const button = _getNekoIdleReturnButtonFromContainer(container);
                 if (_isNekoIdleCat1PlaygroundEntryOrDropActive(button)) return;
                 if (isEdgePeekLockedForDrag(button)) {
-                    e.preventDefault();
+                    if (e.pointerType !== 'touch') e.preventDefault();
                     e.stopImmediatePropagation();
                 }
             }, true);
@@ -1168,7 +1168,6 @@ Object.assign(AvatarButtonMixin.methods, {
                 if (container.getAttribute('data-edge-peek-locked') === 'true'
                     || (window.edgePeekLockEnabled === true
                         && (edgeVisual || edgeContainerVisual || legacyEdgePeekVisual))) {
-                    e.preventDefault();
                     e.stopImmediatePropagation();
                     return;
                 }

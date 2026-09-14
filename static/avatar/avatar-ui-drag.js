@@ -110,7 +110,7 @@ Live2DManager.prototype.setupReturnButtonContainerDrag = function (returnButtonC
 
     returnButtonContainer.addEventListener('pointerdown', (e) => {
         if (isEdgePeekLocked()) {
-            e.preventDefault();
+            if (e.pointerType !== 'touch') e.preventDefault();
             e.stopImmediatePropagation();
         }
     }, true);
@@ -190,7 +190,6 @@ Live2DManager.prototype.setupReturnButtonContainerDrag = function (returnButtonC
     // 触摸事件支持
     returnButtonContainer.addEventListener('touchstart', (e) => {
         if (isEdgePeekLocked()) {
-            e.preventDefault();
             e.stopImmediatePropagation();
             return;
         }
