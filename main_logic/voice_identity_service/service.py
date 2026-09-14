@@ -1601,8 +1601,25 @@ class VoiceIdentityService:
         self._require_initialized()
         if not runtime_ready:
             if self._requested_enabled:
-                await self._activate(None, str(uuid.uuid4()))
-                self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+                profile = self._profile
+                if profile is not None and self._profile_is_compatible(profile):
+                    # Reconcile each manager through the partial activation
+                    # path.  A single DSP failure must not detach managers
+                    # whose pipelines settled successfully.
+                    activated = await self._activate(
+                        profile,
+                        profile.generation,
+                        allow_partial=True,
+                    )
+                    self._apply_activation_result(activated)
+                    if activated is not VoiceIdentityActivationResult.READY:
+                        self._set_ineffective(
+                            VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                        )
+                else:
+                    self._set_ineffective(
+                        VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
             else:
                 self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
             return self.status()

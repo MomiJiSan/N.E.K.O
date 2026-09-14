@@ -638,6 +638,11 @@ class AudioProcessor:
         return self._rnnoise_frame_count
 
     @property
+    def rnnoise_processing_failed(self) -> bool:
+        """Whether any RNNoise frame fell back to the original PCM."""
+        return bool(self._rnnoise_processing_failed)
+
+    @property
     def rnnoise_available(self) -> bool:
         """Whether this processor can currently produce RNNoise evidence."""
 
