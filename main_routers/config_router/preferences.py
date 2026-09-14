@@ -200,7 +200,7 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
                     runtime_ready=False,
                 )
                 return
-            await _apply_noise_reduction_to_active_sessions(enabled)
+            runtime_ready = await _apply_noise_reduction_to_active_sessions(enabled)
             current = await aload_global_conversation_settings_snapshot(strict=True)
             if current.settings.get("noiseReductionEnabled") is not enabled:
                 return
@@ -209,7 +209,7 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
                 # Registry compares each manager with this settled snapshot.  A
                 # failed manager stays required+pending while managers that did
                 # settle receive independent fresh WAITING runtimes.
-                runtime_ready=True,
+                runtime_ready=runtime_ready,
             )
         except Exception:
             if prepare_started:
