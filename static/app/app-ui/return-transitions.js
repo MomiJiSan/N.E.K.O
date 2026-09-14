@@ -1180,6 +1180,10 @@
 
     I.hideReturnBallContainer = function hideReturnBallContainer(container, reason = 'return-ball-hide') {
         if (!container) return;
+        const button = container.querySelector && container.querySelector('.neko-idle-return-btn');
+        [window.NekoDesktopWindowEdgePeek, window.NekoDesktopWindowTopEdgePerch].forEach((runner) => {
+            if (runner && typeof runner.cancel === 'function') runner.cancel(button, { reason: reason || 'return-ball-hide' });
+        });
         I.clearNekoIdleCat1EdgePeek(container);
         cancelReturnBallReveal(container);
         I.restoreSavedReturnBallStyle(container);
@@ -1204,6 +1208,8 @@
 
     function clearLive2DPeekReturnBallEdgeAnchor(container) {
         if (!container) return;
+        const button = getNekoIdleCat1EdgePeekButton(container);
+        if (button && window.NekoEdgePeekController) window.NekoEdgePeekController.clear(button);
         container.removeAttribute('data-neko-live2d-peek-anchor');
         container.__nekoLive2DPeekEdgeAnchor = null;
     }
@@ -1231,6 +1237,10 @@
 
         container.setAttribute('data-neko-live2d-peek-anchor', edge);
         container.__nekoLive2DPeekEdgeAnchor = Object.assign({}, edgeAnchor, { edge });
+        const button = getNekoIdleCat1EdgePeekButton(container);
+        if (button && window.NekoEdgePeekController) {
+            window.NekoEdgePeekController.begin({ button, container, mode: 'live2d-edge-peek', edge, phase: 'peeking' });
+        }
         container.style.left = `${left}px`;
         container.style.top = `${top}px`;
         container.style.right = '';

@@ -544,7 +544,7 @@
             scheduleReturnBallDragRecoveryCheck();
 
             if (event) {
-                event.preventDefault();
+                if (event.pointerType !== 'touch') event.preventDefault();
                 event.stopImmediatePropagation();
             }
         }

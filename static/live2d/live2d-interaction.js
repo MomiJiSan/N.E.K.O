@@ -1090,8 +1090,11 @@ Live2DManager.prototype.syncLive2DEffectiveInputLock = function () {
         };
         window.addEventListener('neko-edge-peek-lock-changed', this._edgePeekLockChangedListener);
     }
-    const canvas = document.getElementById('live2d-canvas');
-    const container = document.getElementById('live2d-container');
+    const rendererView = this.pixi_app && this.pixi_app.renderer && this.pixi_app.renderer.view;
+    const canvas = rendererView || document.getElementById('live2d-canvas');
+    const container = (canvas && canvas.closest && canvas.closest('#live2d-container'))
+        || (canvas && canvas.parentElement)
+        || document.getElementById('live2d-container');
     if (!canvas || !canvas.style) {
         if (!this.isLive2DEffectiveLocked() && container && container.classList) {
             typeof container.classList.toggle === 'function' ? container.classList.toggle('locked-hover-fade', false) : container.classList.remove('locked-hover-fade');
