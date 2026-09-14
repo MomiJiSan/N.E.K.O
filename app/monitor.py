@@ -243,8 +243,10 @@ def get_emotion_mapping(model_name: str):
 @app.get("/{lanlan_name}", response_class=HTMLResponse)
 async def get_index(request: Request, lanlan_name: str):
     # lanlan_name 将从 URL 中提取，前端会通过 API 获取配置
+    from main_routers.pages_router import _static_assets_ctx
     return templates.TemplateResponse("templates/viewer.html", {
-        "request": request
+        "request": request,
+        **_static_assets_ctx(),
     })
 
 
