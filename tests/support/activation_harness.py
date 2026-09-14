@@ -9,7 +9,7 @@ from main_logic.asr_client.endpointing.detector_runtime import DetectorRuntime
 from main_logic.asr_client.endpointing.detector import CoreDetectorEventEnvelope
 from main_logic.asr_client.lifecycle import VoiceInputLifecycleController, VoiceRouteMode
 from main_logic.asr_client.provider_policy import resolve_provider_policy
-from main_logic.voice_input.activation import ActivationState
+from main_logic.voice_input.activation import ActivationState, VoiceActivationController
 from main_logic.voice_identity_service.activation_runtime import VoiceSessionActivationRuntime
 from main_logic.voice_turn.contracts import SpeechActivityEvent, AsrSubmitResult, AsrSubmitStatus
 from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState, _CoreActivationScorer
