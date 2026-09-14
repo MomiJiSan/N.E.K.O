@@ -1601,6 +1601,9 @@ class VoiceIdentityService:
         self._require_initialized()
         if not runtime_ready:
             if self._requested_enabled:
+                # Reconciliation must build partial runtimes against the
+                # newly committed DSP contract, even when one manager failed.
+                self._runtime_noise_reduction_enabled = enabled
                 profile = self._profile
                 if profile is not None and self._profile_is_compatible(profile):
                     # Reconcile each manager through the partial activation
