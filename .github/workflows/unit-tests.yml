@@ -110,7 +110,7 @@ jobs:
         # tests/unit/conftest.py still sees the same within-file sequence.
         # Cross-file order dependencies are what random-order-tests.yml hunts;
         # they were never something this job's fixed order guaranteed.
-        run: uv run pytest tests/unit -q -n auto --dist loadfile
+        run: uv run pytest tests/unit -q -n auto --dist loadfile --basetemp=.pytest-tmp
 
   plugin-manager-vitest:
     name: Plugin manager vitest
