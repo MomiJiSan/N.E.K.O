@@ -2114,7 +2114,7 @@ Live2DManager.prototype.setupDragAndDrop = function (model) {
             : (edgeContainer && edgeContainer.querySelector
                 ? edgeContainer.querySelector('.neko-idle-return-btn')
                 : null);
-        if (window.NekoEdgePeekController
+        if (window.NekoEdgePeekController && edgeContainer
             && (window.NekoEdgePeekController.shouldBlockReturnBallDrag(edgeButton, edgeContainer)
                 || (this === window.live2dManager && window.NekoEdgePeekController.isAnyLocked()))) return;
         if (isYuiGuideDragLocked()) return;
