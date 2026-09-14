@@ -1073,7 +1073,9 @@ Live2DManager.prototype.isLive2DPeekActive = function () {
 Live2DManager.prototype.isLive2DEffectiveLocked = function () {
     const state = this._live2DPeekState;
     const edgeLocked = window.edgePeekLockEnabled === true
-        && !!state && state.active === true && state.phase === 'peeking';
+        && !!state && state.active === true && state.phase === 'peeking'
+        && (!state.model || (state.model === this.currentModel
+            && !state.model.destroyed && state.model.visible !== false));
     return this.isLocked === true || edgeLocked;
 };
 
@@ -2114,7 +2116,7 @@ Live2DManager.prototype.setupDragAndDrop = function (model) {
                 : null);
         if (window.NekoEdgePeekController
             && (window.NekoEdgePeekController.shouldBlockReturnBallDrag(edgeButton, edgeContainer)
-                || window.NekoEdgePeekController.isAnyLocked())) return;
+                || (this === window.live2dManager && window.NekoEdgePeekController.isAnyLocked()))) return;
         if (isYuiGuideDragLocked()) return;
 
         // 检测是否为触摸事件，且是多点触摸（双指缩放）
