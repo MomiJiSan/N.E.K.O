@@ -19,7 +19,7 @@ from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from main_logic.voice_turn.contracts import (
     AsrDeliveryStage, AsrSubmitResult, AsrSubmitStatus, PreserveUnsentPrefix,
 )
-from tests.unit.test_core_independent_asr import (
+from tests.support.asr_fakes import (
     _QueuedSmartTurnDetector,
     _Runtime,
     _ReadyDetector,

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tests.unit.test_core_independent_asr import (
+from tests.support.asr_fakes import (
     _Runtime,
     _install_ready_lifecycle,
     _selection,

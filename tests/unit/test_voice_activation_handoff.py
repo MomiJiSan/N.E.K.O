@@ -22,7 +22,7 @@ from main_logic.voice_input.activation import ActivationState, VoiceActivationCo
 from main_logic.voice_turn.contracts import AsrSubmitResult, AsrSubmitStatus
 from main_logic.asr_client.endpointing.detector_runtime import SmartTurnLease
 from main_logic.voice_turn.contracts import VoiceTurnToken
-from tests.unit.test_core_independent_asr import _CoreActivationScorer, _Runtime
+from tests.support.asr_fakes import _CoreActivationScorer, _Runtime
 
 
 pytestmark = pytest.mark.asyncio

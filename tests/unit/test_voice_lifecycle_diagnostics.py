@@ -92,8 +92,8 @@ def test_server_records_control_sites_but_never_audio_messages(monkeypatch):
 @pytest.mark.asyncio
 async def test_disabling_during_activation_replay_does_not_end_session_or_tts(tmp_path):
     from app.main_server.voice_identity_runtime import OwnerVoiceRuntimeRegistry
-    from tests.unit.test_core_independent_asr import _CoreActivationFactory, _Runtime
-    from tests.unit.voice_identity_service.test_service import _service
+    from tests.support.asr_fakes import _CoreActivationFactory, _Runtime
+    from tests.support.voice_identity_fakes import _service
 
     service, _, _, _ = _service(tmp_path)
     registry = OwnerVoiceRuntimeRegistry(enforce=True)

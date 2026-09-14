@@ -11,7 +11,7 @@ from main_logic.voice_input.activation import (
     VerificationResultKind,
 )
 from main_logic.voice_turn.contracts import AsrSubmitResult, AsrSubmitStatus
-from tests.unit.test_core_independent_asr import _CoreActivationFactory, _Runtime
+from tests.support.asr_fakes import _CoreActivationFactory, _Runtime
 from tests.unit.test_voice_session_activation import _frame, _generation, _waiting_controller
 
 

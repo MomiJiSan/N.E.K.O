@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.unit.test_core_independent_asr import _Runtime, _install_ready_lifecycle
+from tests.support.asr_fakes import _Runtime, _install_ready_lifecycle
 
 pytestmark = pytest.mark.asyncio
 

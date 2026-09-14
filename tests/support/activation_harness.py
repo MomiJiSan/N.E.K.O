@@ -1,4 +1,87 @@
-"""Shared activation test harness exports for PR #3078."""
-from tests.unit.test_voice_activation_handoff import _Clock, _Factory, _harness, _until
-from tests.unit.test_voice_activation_cold_prefix import _cold_harness, _feed
-__all__ = ["_Clock", "_Factory", "_harness", "_until", "_cold_harness", "_feed"]
+import asyncio
+import threading
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+import pytest
+from main_logic.asr_client.endpointing.detector_runtime import DetectorRuntime
+from main_logic.asr_client.endpointing.detector import CoreDetectorEventEnvelope
+from main_logic.asr_client.lifecycle import VoiceInputLifecycleController, VoiceRouteMode
+from main_logic.asr_client.provider_policy import resolve_provider_policy
+from main_logic.voice_input.activation import ActivationState
+from main_logic.voice_turn.contracts import SpeechActivityEvent
+from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState
+from tests.support.activation_harness import _Clock, _Factory
+async def _cold_harness(endpointing="provider", gate=None):
+    manager, clock = _Runtime(), _Clock()
+    release, started = asyncio.Event(), asyncio.Event()
+    deliveries, sessions = [], []
+
+    def create_session(selection):
+        session = SimpleNamespace(is_ready=False, transport_write_attempted=False)
+        sessions.append(session)
+
+        async def connect():
+            started.set()
+            await release.wait()
+            session.is_ready = True
+
+        async def close():
+            session.is_ready = False
+
+        async def stream(pcm, **kwargs):
+            session.transport_write_attempted = True
+            deliveries.append(pcm)
+
+        session.connect = connect
+        session.close = AsyncMock(side_effect=close)
+        session.stream_audio = stream
+        session.signal_user_activity_end = AsyncMock()
+        return session
+
+    manager._asr_route_mode = "independent"
+    provider = "qwen" if endpointing == "provider" else "glm"
+    manager._asr_provider = provider
+    manager._asr_transport_selection = _selection(provider, endpointing)
+    manager._asr_session_factory = create_session
+    policy = resolve_provider_policy(provider, endpointing)
+    lifecycle = VoiceInputLifecycleController(provider_policy=policy, shadow_mode=False)
+    lifecycle.open(route_mode=VoiceRouteMode.INDEPENDENT)
+    manager._asr_lifecycle = lifecycle
+
+    async def on_event(event):
+        assert manager._asr_detector_dispatcher.submit_nowait(
+            CoreDetectorEventEnvelope(
+                event=event, detector_ref=detector, lifecycle_ref=lifecycle,
+                session_epoch=manager._asr_session_epoch,
+            )
+        )
+
+    detector = DetectorRuntime(vad=_Vad(), gate=gate or _Gate(), provider_policy=policy,
+                               on_event=on_event, coordinator=_Coordinator())
+    manager._asr_detector = detector
+    factory = _Factory(clock)
+    await manager.set_voice_session_activation_factory(factory, activation_generation="profile")
+    h = SimpleNamespace(manager=manager, clock=clock, factory=factory, lifecycle=lifecycle,
+                        release=release, started=started, deliveries=deliveries, sessions=sessions)
+    try:
+        yield h
+    finally:
+        # Release the test's physical-thread barrier before joining detector
+        # cleanup; it is not a production resource that can stay blocked.
+        if gate is not None and hasattr(gate, "release"):
+            gate.release.set()
+        await manager.set_voice_session_activation_factory(None, activation_generation="disabled")
+        await manager._asr_runtime.abort("test_end")
+        await detector.close()
+        await manager._asr_audio_dispatcher.close()
+        await manager._asr_detector_dispatcher.close()
+async def _feed(h, marker, samples=1600):
+    pcm = marker.to_bytes(2, "little") * samples
+    await h.manager._route_microphone_audio(
+        pcm, sample_rate_hz=16000, speech_probability=.9 if marker else 0,
+        rnnoise_available=True, received_at=h.clock.value, captured_at=h.clock.value,
+    )
+    h.clock.value += samples / 16000
+    await asyncio.sleep(0)
+    return pcm

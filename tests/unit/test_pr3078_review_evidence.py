@@ -16,8 +16,8 @@ import main_logic.omni_realtime_client._gemini_support as gemini_module
 import main_logic.voice_turn.audio_input as pipeline_module
 import main_logic.voice_identity_service.service as service_module
 from app.main_server.voice_identity_runtime import OwnerVoiceRuntimeRegistry
-from tests.unit.test_core_independent_asr import _Runtime
-from tests.unit.voice_identity_service.test_service import _service, _pcm, _embedding
+from tests.support.asr_fakes import _Runtime
+from tests.support.voice_identity_fakes import _service, _pcm, _embedding
 from main_logic.voice_turn.contracts import AsrSubmitResult, AsrSubmitStatus
 from tests.unit.voice_identity_service.test_profile_store import _TestKeyProtector
 from main_logic.voice_identity.contracts import SpeakerModelIdentity

@@ -740,7 +740,7 @@ async def test_startup_profile_failure_blocks_actual_core_downstream_routes(
     failure_type,
     route_mode: str,
 ) -> None:
-    from tests.unit.test_core_independent_asr import _Runtime
+    from tests.support.asr_fakes import _Runtime
     from tests.unit.voice_identity_service.test_profile_store import (
         _TestKeyProtector,
     )
@@ -821,7 +821,7 @@ async def test_failed_dsp_construction_blocks_pcm_until_successful_retry(
     import main_logic.core.asr_runtime as core_runtime
     import main_routers.config_router.preferences as preferences
     from main_logic.voice_input.activation import ActivationState
-    from tests.unit.test_core_independent_asr import _CoreActivationFactory, _Runtime
+    from tests.support.asr_fakes import _CoreActivationFactory, _Runtime
 
     # Use real Core, Registry and settings sequencing. Only model inference and
     # the pipeline constructor failure are injected.

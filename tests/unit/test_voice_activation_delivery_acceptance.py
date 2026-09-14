@@ -11,8 +11,8 @@ from main_logic.voice_input.activation import ActivationState
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from main_logic.voice_turn.contracts import AsrSubmitStatus
 from tests.unit.test_external_visual_delivery import _make_client
-from tests.unit.test_voice_activation_cold_prefix import _cold_harness, _feed, _until
-from tests.unit.test_voice_activation_handoff import _harness
+from tests.support.activation_harness import _cold_harness, _feed, _until
+from tests.support.activation_harness import _harness
 
 
 pytestmark = pytest.mark.asyncio
