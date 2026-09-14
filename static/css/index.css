@@ -4600,4 +4600,6 @@ body.chat-export-modal-open {
 }
 
 /* Edge Peek lock fades only the visual art layer. */
-.neko-idle-return-btn > .neko-idle-return-art.is-cat1-edge-peek-locked-hover-fade { opacity: 0.12; transition: opacity 160ms ease; }
+.is-cat1-edge-peek-locked .neko-idle-return-btn > .neko-idle-return-art,
+.neko-idle-return-btn.is-cat1-edge-peek-locked > .neko-idle-return-art { transition: opacity 160ms ease; }
+.neko-idle-return-btn > .neko-idle-return-art.is-cat1-edge-peek-locked-hover-fade { opacity: 0.12; }

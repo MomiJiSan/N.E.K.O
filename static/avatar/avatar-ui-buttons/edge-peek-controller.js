@@ -3,6 +3,7 @@
     if (!global || global.NekoEdgePeekController) return;
     const states = new WeakMap();
     const active = new Set();
+    let removalObserver = null;
     const diagnostics = [];
     function trace(stage, detail) {
         diagnostics.push({ time: Date.now(), stage, detail: detail || {} });
@@ -17,6 +18,10 @@
         if (previous && previous !== info) clear(button);
         const state = Object.assign({ mode: 'desktop-window', phase: 'idle', edge: null, locked: global.edgePeekLockEnabled === true, fadeTimer: 0, fadeActive: false, sourceRunner: null }, info);
         states.set(button, state); active.add(button); sync(state);
+        if (!removalObserver && global.MutationObserver && global.document && global.document.documentElement) {
+            removalObserver = new global.MutationObserver(pruneDetached);
+            removalObserver.observe(global.document.documentElement, { childList: true, subtree: true });
+        }
         trace('begin', { phase: state.phase, locked: state.locked, mode: state.mode, hasContainer: !!state.container });
         return state;
     }
@@ -36,9 +41,25 @@
     function setPhase(button, phase) { const s=states.get(key(button)); if (!s) return false; s.phase=phase; if (phase !== 'peeking') clearFade(s); sync(s); return true; }
     function applyLock(button, value) { const s=states.get(key(button)); if (!s) return false; s.locked=!!value; if (!s.locked) clearFade(s); sync(s); return true; }
     function clearFade(s) { if (s.fadeTimer) { clearTimeout(s.fadeTimer); s.fadeTimer=0; } s.fadeActive=false; if (s.container) { const art=s.container.querySelector('.neko-idle-return-art'); if (art) art.classList.remove(FADE_CLASS); } }
-    function clear(button) { const s=states.get(key(button)); if (!s) return false; clearFade(s); s.locked=false; s.phase='idle'; sync(s); states.delete(key(button)); active.delete(key(button)); return true; }
+    function clear(button) {
+        const s = states.get(key(button));
+        if (!s) return false;
+        clearFade(s); s.locked = false; s.phase = 'idle'; sync(s);
+        states.delete(key(button)); active.delete(key(button));
+        if (!active.size && removalObserver) {
+            removalObserver.disconnect(); removalObserver = null;
+        }
+        return true;
+    }
+    function pruneDetached() {
+        for (const button of active) {
+            const state = states.get(button);
+            if (button.isConnected === false || (state && state.container && state.container.isConnected === false)) clear(button);
+        }
+    }
     function cancel(button, options) { return clear(button, options); }
     function find(button) {
+        pruneDetached();
         const exact = states.get(key(button));
         if (exact) return exact;
         if (!button) return null;
@@ -51,9 +72,10 @@
         }
         return null;
     }
-    function isActive(button) { if (button) return !!find(button) && find(button).phase !== 'idle'; return active.size > 0; }
+    function isActive(button) { pruneDetached(); if (button) return !!find(button) && find(button).phase !== 'idle'; return active.size > 0; }
     function isLocked(button) { const s=find(button); return !!s && s.phase === 'peeking' && s.locked === true; }
     function isAnyLocked() {
+        pruneDetached();
         for (const button of active) {
             if (isLocked(button)) return true;
         }
@@ -66,7 +88,7 @@
         });
     }
     function shouldBlockReturnBallDrag(button, container) {
-        if (isModelInputLocked()) return true;
+        if (isModelEdgePeekLocked()) return true;
         if (button && isLocked(button)) return true;
         if (container && isLocked(container)) return true;
         if (container && container.getAttribute && container.getAttribute('data-edge-peek-locked') === 'true') return true;
@@ -80,6 +102,14 @@
             if (nodes.some(node => node.classList && edgeClasses.some(name => node.classList.contains(name)))) return true;
         }
         return false;
+    }
+    function isModelEdgePeekLocked() {
+        const manager = global.live2dManager;
+        const state = manager && manager._live2DPeekState;
+        return global.edgePeekLockEnabled === true && !!state
+            && state.active === true && state.phase === 'peeking'
+            && !!state.model && state.model === manager.currentModel
+            && !state.model.destroyed && state.model.visible !== false;
     }
     function getActiveMode(button) { const s=find(button); return s && s.phase !== 'idle' ? s.mode : null; }
     function getActiveEdge(button) { const s=find(button); return s && s.phase !== 'idle' ? s.edge : null; }
@@ -95,6 +125,7 @@
         state.fadeTimer = setTimeout(function () { state.fadeTimer = 0; if (global.lockedHoverFadeEnabled === false || state.phase !== 'peeking' || !state.locked) return; const art=state.container && state.container.querySelector('.neko-idle-return-art'); if (art) { art.classList.add(FADE_CLASS); state.fadeActive=true; } }, 1000);
     }
     function onMouseMove(event) {
+        pruneDetached();
         active.forEach(function (button) { const state=states.get(button); if (!state || state.phase !== 'peeking' || !state.locked) return; if (nearArt(state,event)) scheduleFade(state); else clearFade(state); });
     }
     function onLockChanged() { const enabled=global.edgePeekLockEnabled === true; active.forEach(b=>applyLock(b, enabled)); }
@@ -107,6 +138,10 @@
         }
     }
     function getDiagnostics() { return diagnostics.slice(); }
+    function resetHoverFade() {
+        pruneDetached();
+        active.forEach(button => clearFade(states.get(button)));
+    }
     // Last-resort capture guard: every renderer drag implementation ultimately
     // starts from a pointer press on the return-ball surface. Keeping this at
     // the controller level closes entry points that do not share one handler.
@@ -119,8 +154,12 @@
         }
     }
     global.addEventListener('mousemove', onMouseMove);
+    global.addEventListener('blur', resetHoverFade);
+    global.addEventListener('mouseleave', resetHoverFade);
     global.addEventListener('neko-locked-hover-fade-changed', onLockedHoverFadeChanged);
     if (global.document) {
+        global.document.addEventListener('mouseleave', resetHoverFade);
+        global.document.addEventListener('visibilitychange', resetHoverFade);
         global.document.addEventListener('pointerdown', onPointerDown, true);
         global.document.addEventListener('mousedown', onPointerDown, true);
         global.document.addEventListener('touchstart', onPointerDown, { capture: true, passive: false });
@@ -128,4 +167,3 @@
     global.NekoEdgePeekController = Object.freeze({ begin, setPhase, applyLock, isActive, isLocked, isAnyLocked, isModelInputLocked, shouldBlockReturnBallDrag, getActiveMode, getActiveEdge, getDiagnostics, record: trace, cancel, clear });
     global.addEventListener('neko-edge-peek-lock-changed', onLockChanged);
 })(typeof window !== 'undefined' ? window : null);
-

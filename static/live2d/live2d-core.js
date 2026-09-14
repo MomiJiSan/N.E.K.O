@@ -5454,11 +5454,10 @@ class Live2DManager {
 
         // 3. 更新 canvas 的 pointerEvents
         const container = document.getElementById('live2d-canvas');
-        if (container) {
-            container.style.pointerEvents = locked ? 'none' : 'auto';
-        }
         if (typeof this.syncLive2DEffectiveInputLock === 'function') {
             this.syncLive2DEffectiveInputLock();
+        } else if (container) {
+            container.style.pointerEvents = locked ? 'none' : 'auto';
         }
 
         if (!locked && !(typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked())) {

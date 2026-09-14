@@ -1257,7 +1257,10 @@ Live2DManager.prototype._setLive2DPeekVisibility = async function (visible, reas
     state.transitionId = transitionId;
     state.phase = shouldReveal ? 'revealing' : 'hiding';
     this.syncLive2DEffectiveInputLock();
-    model.interactive = shouldReveal ? state.baseInteractive : false;
+    // The reveal animation owns the transform until it settles. Keep input
+    // disabled during that transition when Edge Peek lock is enabled.
+    model.interactive = shouldReveal && window.edgePeekLockEnabled !== true
+        ? state.baseInteractive : false;
 
     const target = shouldReveal
         ? {
@@ -2372,7 +2375,7 @@ Live2DManager.prototype.setupWheelZoom = function (model) {
 
     const onWheelScroll = (event) => {
         if (!this.currentModel) return;
-        if ((typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked()) || this.isLive2DPeekActive()) {
+        if ((typeof this.isLive2DEffectiveLocked === 'function' ? this.isLive2DEffectiveLocked() : this.isLocked === true) || this.isLive2DPeekActive()) {
             if (this.isLive2DPeekActive()) {
                 if (isWheelPointOnCurrentModel(event)) event.preventDefault();
                 return; // edge peek ignores wheel zoom
@@ -2424,7 +2427,7 @@ Live2DManager.prototype.setupTouchZoom = function (model) {
 
     const onTouchStart = (event) => {
         if (!this.currentModel) return;
-        if ((typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked()) || this.isLive2DPeekActive()) {
+        if ((typeof this.isLive2DEffectiveLocked === 'function' ? this.isLive2DEffectiveLocked() : this.isLocked === true) || this.isLive2DPeekActive()) {
             if (this.isLive2DPeekActive()) {
                 if (event.touches && event.touches.length === 2) event.preventDefault();
                 isTouchZooming = false;
@@ -2444,7 +2447,7 @@ Live2DManager.prototype.setupTouchZoom = function (model) {
 
     const onTouchMove = (event) => {
         if (!this.currentModel || !isTouchZooming) return;
-        if ((typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked()) || this.isLive2DPeekActive()) {
+        if ((typeof this.isLive2DEffectiveLocked === 'function' ? this.isLive2DEffectiveLocked() : this.isLocked === true) || this.isLive2DPeekActive()) {
             if (this.isLive2DPeekActive()) {
                 if (event.touches && event.touches.length === 2) event.preventDefault();
                 isTouchZooming = false;

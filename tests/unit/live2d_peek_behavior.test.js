@@ -3285,6 +3285,51 @@ test('core model bounds are null while an anchor is hiding or hidden', () => {
 
 // Edge-peek lock contract tests. These exercise the Live2D-specific effective lock
 // boundary without changing the ordinary manager.isLocked state.
+test('ordinary lock followed by edge lock restores the original canvas style in either unlock order', () => {
+    for (const edgeFirst of [false, true]) {
+        const canvas = { style: createInlineStyle({ 'pointer-events': 'auto', cursor: 'grab' }) };
+        const elements = { 'live2d-canvas': canvas };
+        const harness = createHarness({ controls: elements });
+        const core = createCoreHarness({ elementsById: elements });
+        const manager = new harness.Live2DManager();
+        manager.setLocked = core.Live2DManager.prototype.setLocked;
+        manager.setLocked(true);
+        harness.window.edgePeekLockEnabled = true;
+        manager._live2DPeekState = { active: true, phase: 'peeking' };
+        manager.syncLive2DEffectiveInputLock();
+        if (edgeFirst) {
+            manager.clearLive2DPeek();
+            assert.equal(canvas.style.pointerEvents, 'none');
+            manager.setLocked(false);
+        } else {
+            manager.setLocked(false);
+            assert.equal(canvas.style.pointerEvents, 'none');
+            manager.clearLive2DPeek();
+        }
+        assert.equal(canvas.style.pointerEvents, 'auto');
+        assert.equal(canvas.style.cursor, 'grab');
+    }
+});
+
+test('locked reveal stays non-interactive until the animation settles', async () => {
+    const harness = createHarness();
+    const manager = new harness.Live2DManager();
+    const model = createModel();
+    manager.currentModel = model;
+    harness.window.edgePeekLockEnabled = true;
+    manager._live2DPeekState = {
+        active: true, model, phase: 'hidden', baseInteractive: true,
+        peekX: 20, peekY: 30, peekRotation: 0, peekScaleX: 1,
+    };
+    const work = manager._setLive2DPeekVisibility(true);
+    assert.equal(manager._live2DPeekState.phase, 'revealing');
+    assert.equal(model.interactive, false);
+    flushNextFrame(harness);
+    await work;
+    assert.equal(manager._live2DPeekState.phase, 'peeking');
+    assert.equal(manager.isLive2DEffectiveLocked(), true);
+});
+
 test('effective Live2D lock follows ordinary lock or peeking edge-lock matrix', () => {
     const harness = createHarness();
     const manager = new harness.Live2DManager();
