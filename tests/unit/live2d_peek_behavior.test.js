@@ -3330,6 +3330,29 @@ test('locked reveal stays non-interactive until the animation settles', async ()
     assert.equal(manager.isLive2DEffectiveLocked(), true);
 });
 
+test('toggling edge lock during reveal updates interaction without changing the peeking-only lock contract', async () => {
+    const harness = createHarness();
+    const manager = new harness.Live2DManager();
+    const model = createModel();
+    manager.currentModel = model;
+    manager._live2DPeekState = {
+        active: true, model, phase: 'hidden', baseInteractive: true,
+        peekX: 20, peekY: 30, peekRotation: 0, peekScaleX: 1,
+    };
+    const work = manager._setLive2DPeekVisibility(true);
+    assert.equal(model.interactive, true);
+    for (const enabled of [true, false, true]) {
+        harness.window.edgePeekLockEnabled = enabled;
+        harness.window.dispatchEvent({ type: 'neko-edge-peek-lock-changed' });
+        assert.equal(model.interactive, !enabled);
+        assert.equal(manager.isLive2DEffectiveLocked(), false);
+    }
+    flushNextFrame(harness);
+    await work;
+    assert.equal(manager._live2DPeekState.phase, 'peeking');
+    assert.equal(manager.isLive2DEffectiveLocked(), true);
+});
+
 test('effective Live2D lock follows ordinary lock or peeking edge-lock matrix', () => {
     const harness = createHarness();
     const manager = new harness.Live2DManager();

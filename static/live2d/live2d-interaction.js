@@ -1079,7 +1079,15 @@ Live2DManager.prototype.isLive2DEffectiveLocked = function () {
 
 Live2DManager.prototype.syncLive2DEffectiveInputLock = function () {
     if (!this._edgePeekLockChangedListener) {
-        this._edgePeekLockChangedListener = () => this.syncLive2DEffectiveInputLock();
+        this._edgePeekLockChangedListener = () => {
+            const state = this._live2DPeekState;
+            if (state && state.active && state.phase === 'revealing'
+                && state.model && state.model === this.currentModel && !state.model.destroyed) {
+                state.model.interactive = window.edgePeekLockEnabled !== true
+                    ? state.baseInteractive : false;
+            }
+            this.syncLive2DEffectiveInputLock();
+        };
         window.addEventListener('neko-edge-peek-lock-changed', this._edgePeekLockChangedListener);
     }
     const canvas = document.getElementById('live2d-canvas');

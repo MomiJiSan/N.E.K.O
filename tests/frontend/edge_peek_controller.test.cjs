@@ -102,7 +102,52 @@ test('a same-turn detached ball cannot block input before the observer runs', ()
     const h = harness();
     h.controller.begin({ button: h.button, container: h.container, phase: 'peeking' });
     h.container.isConnected = false;
-    assert.equal(h.controller.isAnyLocked(), false);
     assert.equal(h.controller.shouldBlockReturnBallDrag(h.button, h.container), false);
+    assert.equal(h.controller.isAnyLocked(), false);
     assert.equal(h.observing, false);
+});
+
+for (const [type, pointerType] of [['touchstart', undefined], ['pointerdown', 'touch'], ['mousedown', undefined]]) {
+    test(`locked ${type}/${pointerType || 'mouse'} blocks dragging without cancelling touch activation`, () => {
+        const h = harness();
+        h.controller.begin({ button: h.button, container: h.container, phase: 'peeking' });
+        let prevented = false, stopped = false;
+        h.emit(type, {
+            type, pointerType, target: { closest: () => h.button },
+            preventDefault() { prevented = true; },
+            stopImmediatePropagation() { stopped = true; },
+        });
+        assert.equal(stopped, true);
+        assert.equal(prevented, type === 'mousedown');
+    });
+}
+
+test('native edge placements register the controller and hide clears both native and drag-edge locks', () => {
+    const h = harness();
+    const art = h.container.querySelector();
+    art.style = { removeProperty() {} };
+    h.button.querySelector = () => art;
+    h.container.querySelector = selector => selector === '.neko-idle-return-btn' ? h.button : art;
+    h.container.style.removeProperty = function (name) { delete this[name]; };
+    h.container.removeAttribute = () => {};
+    h.container.setAttribute = () => {};
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../static/app/app-ui/return-transitions.js'), 'utf8'), { window: h.window });
+    const I = h.window.__appUiParts;
+    I.scheduleIdleReturnBallDesktopBridge = () => {};
+    assert.equal(I.applyNekoIdleCat1EdgePeek(h.container, { edge: 'left', left: -20, top: 30 }), true);
+    assert.equal(h.controller.isLocked(h.button), true);
+    assert.equal(h.controller.getActiveEdge(h.button), 'left');
+    h.emit('mousemove', { clientX: 10, clientY: 10 });
+    assert.equal(h.timers.size, 1);
+    I.hideReturnBallContainer(h.container);
+    assert.equal(h.container.isConnected, true);
+    assert.equal(h.container.style.display, 'none');
+    assert.equal(h.controller.isAnyLocked(), false);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.button.classList.contains('is-cat1-edge-peek-left'), false);
+    assert.equal(h.observing, false);
+    h.container.style.display = 'block';
+    h.controller.begin({ button: h.button, container: h.container, mode: 'drag-edge', phase: 'peeking' });
+    I.hideReturnBallContainer(h.container);
+    assert.equal(h.controller.isAnyLocked(), false, 'the shared hide path also clears renderer drag-edge entries');
 });

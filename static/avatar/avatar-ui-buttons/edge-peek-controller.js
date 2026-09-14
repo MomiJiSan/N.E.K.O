@@ -149,7 +149,9 @@
         const target = event && event.target;
         const button = target && target.closest ? target.closest('.neko-idle-return-btn') : null;
         if (button && isLocked(button)) {
-            event.preventDefault();
+            // Preserve the browser's synthesized click for a stationary touch.
+            // Stopping propagation is sufficient to keep drag handlers idle.
+            if (event.type !== 'touchstart' && event.pointerType !== 'touch') event.preventDefault();
             event.stopImmediatePropagation();
         }
     }

@@ -1180,6 +1180,7 @@
 
     I.hideReturnBallContainer = function hideReturnBallContainer(container, reason = 'return-ball-hide') {
         if (!container) return;
+        I.clearNekoIdleCat1EdgePeek(container);
         cancelReturnBallReveal(container);
         I.restoreSavedReturnBallStyle(container);
         resetReturnBallTemporaryStyle(container);
@@ -1600,6 +1601,7 @@
     I.clearNekoIdleCat1EdgePeek = function clearNekoIdleCat1EdgePeek(container) {
         const button = getNekoIdleCat1EdgePeekButton(container);
         if (!button) return;
+        if (window.NekoEdgePeekController) window.NekoEdgePeekController.clear(button);
         NEKO_IDLE_CAT1_EDGE_PEEK_CLASSES.forEach((className) => {
             button.classList.remove(className);
         });
@@ -1682,6 +1684,9 @@
         container.style.right = '';
         container.style.bottom = '';
         container.style.transform = 'none';
+        if (window.NekoEdgePeekController) {
+            window.NekoEdgePeekController.begin({ button, container, mode: 'drag-edge', phase: 'peeking', edge: placement.edge });
+        }
         return true;
     }
 
