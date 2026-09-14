@@ -41,8 +41,9 @@ jobs:
     # parallelised run takes 14m32s (4m33s of it before the first test, while
     # each worker imports the app and collects all 24621 tests), against 19m11s
     # serial. A 15-minute cap killed it one second before the summary printed.
-    # 25 stays until the shard-per-job change lands.
-    timeout-minutes: 25
+    # Keep enough headroom for slow Windows-hosted runners while the suite is
+    # still collected and executed as one job. Sharding can reduce this later.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
