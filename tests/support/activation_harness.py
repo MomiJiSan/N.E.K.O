@@ -103,11 +103,11 @@ class _Factory:
 
     def create(self, generation, output, *, status_callback=None):
         scorer = _CoreActivationScorer()
+        scorer.profile_generation = self.activation_generation
         runtime = VoiceSessionActivationRuntime(
             generation,
             scorer,
             output,
-            controller=VoiceActivationController(clock=self.clock),
             status_callback=status_callback,
         )
         self.scorers.append(scorer)
