@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from main_logic.voice_turn.contracts import PreserveUnsentPrefix
-from tests.unit.test_core_independent_asr import _Runtime, _install_ready_lifecycle
+from tests.support.asr_fakes import _Runtime, _install_ready_lifecycle
 
 pytestmark = pytest.mark.asyncio
 
@@ -79,8 +79,8 @@ async def test_old_abort_cleanup_cannot_notify_or_close_successor():
 
 @pytest.mark.parametrize("revoke_kind", ["permission", "microphone", "microphone_without_factory"])
 async def test_permission_revoke_then_new_authority_reopens_only_for_new_phrase(revoke_kind):
-    from tests.unit.test_voice_activation_cold_prefix import _cold_harness, _feed, _until
-    from tests.unit.test_voice_activation_handoff import _Factory
+    from tests.support.activation_harness import _cold_harness, _feed, _until
+    from tests.support.activation_harness import _Factory
     from main_logic.asr_client import VoiceIdentityActivationResult
 
     async with _cold_harness() as h:
@@ -111,8 +111,8 @@ async def test_permission_revoke_then_new_authority_reopens_only_for_new_phrase(
 
 
 async def test_setter_does_not_ignore_external_audio_generation_after_cleanup():
-    from tests.unit.test_voice_activation_cold_prefix import _cold_harness, _feed, _until
-    from tests.unit.test_voice_activation_handoff import _Factory
+    from tests.support.activation_harness import _cold_harness, _feed, _until
+    from tests.support.activation_harness import _Factory
     from main_logic.asr_client import VoiceIdentityActivationResult
 
     async with _cold_harness() as h:

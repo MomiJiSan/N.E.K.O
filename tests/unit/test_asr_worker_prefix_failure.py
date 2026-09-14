@@ -8,7 +8,7 @@ import pytest
 from main_logic.asr_client._infra import AsrSessionConfig, _RealtimeAsrSessionImpl
 from main_logic.asr_client.workers import qwen
 from tests.unit.test_asr_protected_prefix import _close, _cold_runtime
-from tests.unit.test_asr_workers import _FakeConnector, _FakeWebSocket, _wait_until
+from tests.support.realtime_harness import _FakeConnector, _FakeWebSocket, _wait_until
 
 
 @pytest.mark.asyncio

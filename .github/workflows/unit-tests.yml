@@ -96,7 +96,7 @@ jobs:
         # rebuilds and verifies that artifact on every run, which is the right
         # place for it — a stale local bundle would only produce a false green.
         #
-    # `-n auto --dist loadfile`: 24000+ tests in one process took 19m11s
+        # `-n auto --dist loadfile`: 24000+ tests in one process took 19m11s
         # here, against a 25-minute job ceiling — close enough that a slow runner
         # turned the gate red for reasons that had nothing to do with the PR.
         # Parallel brings that to 14m32s. Less than the 3.6x a 20-core dev box
@@ -110,7 +110,7 @@ jobs:
         # tests/unit/conftest.py still sees the same within-file sequence.
         # Cross-file order dependencies are what random-order-tests.yml hunts;
         # they were never something this job's fixed order guaranteed.
-        run: uv run pytest tests/unit -q -m unit-fast -n auto --dist loadfile
+        run: uv run pytest tests/unit -q -n auto --dist loadfile --basetemp=.pytest-tmp
 
   plugin-manager-vitest:
     name: Plugin manager vitest

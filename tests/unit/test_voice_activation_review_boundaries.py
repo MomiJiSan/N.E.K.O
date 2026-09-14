@@ -9,7 +9,7 @@ from main_logic.voice_identity_service.activation_runtime import VoiceSessionAct
 from main_logic.voice_identity_service.session_activation_factory import OwnerVoiceSessionActivationFactory
 from main_logic.voice_input.activation import ActivationState, OutputCommit, VoiceActivationController
 from main_logic.voice_turn.contracts import AsrSubmitResult, AsrSubmitStatus
-from tests.unit.test_core_independent_asr import _Runtime
+from tests.support.asr_fakes import _Runtime
 from tests.unit.voice_identity_service.test_activation_runtime import _Scorer, _frame, _generation
 from tests.unit.voice_identity_service.test_session_activation_factory import _profile
 

@@ -14,8 +14,8 @@ from main_logic.asr_client.lifecycle import VoiceInputLifecycleController, Voice
 from main_logic.asr_client.provider_policy import resolve_provider_policy
 from main_logic.voice_input.activation import ActivationState
 from main_logic.voice_turn.contracts import SpeechActivityEvent
-from tests.unit.test_core_independent_asr import _Runtime, _selection, CoordinatorState
-from tests.unit.test_voice_activation_handoff import _Clock, _Factory
+from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState
+from tests.support.activation_harness import _Clock, _Factory
 
 
 async def _until(predicate):

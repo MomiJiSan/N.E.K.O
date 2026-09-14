@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from tests.unit.test_voice_activation_cold_prefix import _cold_harness, _feed, _until
+from tests.support.activation_harness import _cold_harness, _feed, _until
 
 
 @pytest.mark.asyncio

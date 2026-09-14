@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from main_logic.voice_input.activation import ActivationState
-from tests.unit.test_voice_activation_handoff import _harness, _until
+from tests.support.activation_harness import _harness, _until
 
 
 pytestmark = pytest.mark.asyncio

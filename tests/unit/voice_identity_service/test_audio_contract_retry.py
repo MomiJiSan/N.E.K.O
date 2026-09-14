@@ -2,7 +2,7 @@
 
 import pytest
 
-from tests.unit.voice_identity_service.test_service import _pcm, _service
+from tests.support.voice_identity_fakes import _pcm, _service
 
 
 @pytest.mark.asyncio
