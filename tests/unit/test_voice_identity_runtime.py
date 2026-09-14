@@ -855,7 +855,7 @@ async def test_failed_dsp_construction_blocks_pcm_until_successful_retry(
         ))
 
     async def reconcile(enabled: bool, *, runtime_ready: bool) -> None:
-        assert runtime_ready is True
+        assert runtime_ready is (len(reconciled) > 0)
         reconciled.append(await registry.activate(
             profile, "new-authority", activation_required=True,
             noise_reduction_enabled=enabled, allow_partial=True,
