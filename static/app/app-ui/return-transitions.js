@@ -1758,6 +1758,7 @@
         I.clearReturnBallDragRecoveryTimer(state);
         I.clearMultiWindowReturnBallDeferredWork(state);
         if (state.container) {
+            if (state.handlePointerDown) state.container.removeEventListener('pointerdown', state.handlePointerDown, true);
             state.container.removeEventListener('mousedown', state.handleMouseDown, true);
             state.container.removeEventListener('touchstart', state.handleTouchStart, true);
             state.container.removeEventListener('click', state.handleClick, true);

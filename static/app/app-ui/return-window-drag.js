@@ -438,6 +438,9 @@
 
         function beginDrag(screenX, screenY, event) {
             if (I.isIdleCat1PlaygroundActiveForReturnBallDesktopBridge()) return;
+            const edgeButton = (container.classList && container.classList.contains('neko-idle-return-btn'))
+                ? container : (container.querySelector && container.querySelector('.neko-idle-return-btn'));
+            if (window.NekoEdgePeekController && window.NekoEdgePeekController.shouldBlockReturnBallDrag(edgeButton, container)) return;
             I.clearMultiWindowReturnBallDeferredWork(state);
             state.dragSessionToken += 1;
             const dragToken = state.dragSessionToken;
@@ -801,6 +804,14 @@
             if (isThoughtBubbleEventTarget(event)) return;
             beginDrag(event.screenX, event.screenY, event);
         };
+        state.handlePointerDown = (event) => {
+            const edgeButton = (container.classList && container.classList.contains('neko-idle-return-btn'))
+                ? container : (container.querySelector && container.querySelector('.neko-idle-return-btn'));
+            if (window.NekoEdgePeekController && window.NekoEdgePeekController.shouldBlockReturnBallDrag(edgeButton, container)) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        };
         state.handleMouseMove = (event) => {
             if (finishDragIfMouseButtonReleased(event, 'mousemove-buttons-released')) return;
             updateDrag(event.screenX, event.screenY, event);
@@ -868,6 +879,7 @@
             }
         };
 
+        container.addEventListener('pointerdown', state.handlePointerDown, true);
         container.addEventListener('mousedown', state.handleMouseDown, true);
         container.addEventListener('touchstart', state.handleTouchStart, true);
         container.addEventListener('click', state.handleClick, true);
