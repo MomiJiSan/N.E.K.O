@@ -5457,8 +5457,11 @@ class Live2DManager {
         if (container) {
             container.style.pointerEvents = locked ? 'none' : 'auto';
         }
+        if (typeof this.syncLive2DEffectiveInputLock === 'function') {
+            this.syncLive2DEffectiveInputLock();
+        }
 
-        if (!locked) {
+        if (!locked && !(typeof this.isLive2DEffectiveLocked === 'function' && this.isLive2DEffectiveLocked())) {
             const live2dContainer = document.getElementById('live2d-container');
             if (live2dContainer) {
                 live2dContainer.classList.remove('locked-hover-fade');
