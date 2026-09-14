@@ -12,7 +12,7 @@ from main_logic.asr_client.provider_policy import resolve_provider_policy
 from main_logic.voice_input.activation import ActivationState
 from main_logic.voice_identity_service.activation_runtime import VoiceSessionActivationRuntime
 from main_logic.voice_turn.contracts import SpeechActivityEvent, AsrSubmitResult, AsrSubmitStatus
-from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState
+from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState, _CoreActivationScorer
 from main_logic.voice_turn.contracts import VoiceTurnToken
 async def _cold_harness(endpointing="provider", gate=None):
     manager, clock = _Runtime(), _Clock()
