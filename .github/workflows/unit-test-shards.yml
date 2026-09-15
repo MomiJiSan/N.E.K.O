@@ -1,4 +1,4 @@
-name: PR3078 Test Shards
+name: Unit Test Shards
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr3078-test-shards-${{ github.ref }}
+  group: unit-test-shards-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
