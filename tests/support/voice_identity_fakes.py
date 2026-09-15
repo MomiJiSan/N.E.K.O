@@ -36,6 +36,27 @@ from main_logic.voice_identity_service.service import (
 )
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
 from tests.unit.voice_identity_service.test_profile_store import _TestKeyProtector
+
+
+class _SpeechValidator:
+    """Deterministic enrollment speech validator for service tests."""
+
+    def __init__(self, *, loads: bool = True) -> None:
+        self.loads = loads
+        self.closed = False
+
+    async def load(self) -> bool:
+        return self.loads
+
+    async def validate_pcm16(self, pcm16: bytes, *, sample_rate_hz: int = 16_000) -> EnrollmentSpeechResult:
+        assert pcm16
+        assert sample_rate_hz == 16_000
+        return EnrollmentSpeechResult(window_count=96, active_window_count=96)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _pcm() -> bytes:
     samples = np.full(48_000, 4_000, dtype="<i2")
     return samples.tobytes()
@@ -159,3 +180,17 @@ def _embedding(axis: int = 0) -> np.ndarray:
     result = np.zeros(CAMPPLUS_EMBEDDING_DIM, dtype=np.float32)
     result[axis] = 1.0
     return result
+
+class _Model:
+    model_id='3d-speaker-campplus-zh-en'; model_revision='2025-06-16-sherpa-onnx-campplus'
+    def __init__(self, *, loads=True, embeddings=None): self.loads=loads; self.closed=False; self.embeddings=list(embeddings or []); self.inference_count=0
+    def load(self): return self.loads
+    def cancel_load(self): pass
+    def embedding_from_pcm16(self, pcm16, *, sample_rate_hz):
+        self.inference_count += 1
+        if self.embeddings: return self.embeddings.pop(0)
+        r=np.zeros(CAMPPLUS_EMBEDDING_DIM,dtype=np.float32); r[0]=1.; return r
+    def cancel_inference(self): pass
+    def close(self): self.closed=True
+
+from tests.support.voice_identity_audio import _AudioNormalizer

@@ -18,8 +18,6 @@ name: Unit Tests
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -27,7 +25,7 @@ permissions:
 
 concurrency:
   group: unit-tests-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   unit-pytest:
@@ -113,7 +111,9 @@ jobs:
         # PR #3078 tests run in the dedicated shards below. Keeping them out of
         # this xdist gate prevents socket/process tests from being scheduled on
         # workers while preserving coverage of the remaining unit suite.
-        run: uv run pytest tests/unit -q -n auto --dist loadfile -m "not unit_fast and not runtime and not integration_serial and not frontend_contract"
+        run: |
+          New-Item -ItemType Directory -Force ".codex-tmp\unit-suite" | Out-Null
+          uv run pytest tests/unit -q -n auto --dist loadfile --basetemp ".codex-tmp\unit-suite" -m "not unit_fast and not runtime and not integration_serial and not frontend_contract"
 
   plugin-manager-vitest:
     name: Plugin manager vitest

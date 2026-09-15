@@ -723,7 +723,9 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
     finally:
         preferences.configure_voice_identity_audio_contract_callbacks()
 
-    assert activations[-1][0] is None
+    # Snapshot failure degrades runtime readiness but does not discard the
+    # compatible profile; recovery retries activation with that profile.
+    assert activations[-1][0] is not None
     assert not service.status().state.effective_enabled
     assert service.status().state.effective_reason == "runtime_degraded"
     # Failure keeps coordination pending, including a retry of the old value.

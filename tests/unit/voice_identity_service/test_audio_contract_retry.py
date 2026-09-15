@@ -28,7 +28,9 @@ async def test_failed_audio_contract_reconcile_retries_same_setting(
         )
         assert failed.state.effective_reason == "runtime_degraded"
         assert not failed.state.effective_enabled
-        assert activations[-1][0] is None
+        # A degraded DSP runtime keeps the compatible profile resident so a
+        # same-value reconciliation can reactivate it after recovery.
+        assert activations[-1][0] is not None
         assert service._runtime_noise_reduction_enabled is previous
         assert service._runtime_audio_contract_transition_pending
 
