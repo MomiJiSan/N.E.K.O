@@ -273,6 +273,9 @@ Live2DManager.prototype.removeModel = async function(options = {}) {
     } catch (_) {}
 
     this.currentModel = null;
+    if (typeof this.syncLive2DEffectiveInputLock === 'function') {
+        this.syncLive2DEffectiveInputLock();
+    }
     this._lastLoadedModelPath = null;
     if (typeof this._resetDerivedModelMetadata === 'function') {
         this._resetDerivedModelMetadata();

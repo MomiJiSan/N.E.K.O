@@ -2621,10 +2621,16 @@ Live2DManager.prototype.enableMouseTracking = function (model, options = {}) {
         }, delay);
     };
 
-    const live2dContainer = document.getElementById('live2d-container');
+    const getLive2DContainer = () => {
+        const view = this.pixi_app && this.pixi_app.renderer && this.pixi_app.renderer.view;
+        return (view && view.closest && view.closest('#live2d-container'))
+            || (view && view.parentElement)
+            || document.getElementById('live2d-container');
+    };
     let ctrlFadeActive = false;      // Ctrl 按住淡化
     let stationaryFadeActive = false; // 静止1秒淡化
     const applyFade = () => {
+        const live2dContainer = getLive2DContainer();
         if (!live2dContainer) return;
         const shouldFade = (ctrlFadeActive || stationaryFadeActive) && window.lockedHoverFadeEnabled !== false;
         live2dContainer.classList.toggle('locked-hover-fade', shouldFade);
