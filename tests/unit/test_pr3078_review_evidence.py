@@ -102,8 +102,11 @@ async def test_c1_closed_gemini_then_real_swap_differential():
         finally:
             await _drain_task(mgr.message_handler_task)
     print("C1", json.dumps(outcomes))
+    # Ordinary clients must retain the BASE successor-session delivery
+    # contract even when the retired Gemini connection closes normally.
     assert outcomes["BASE"]["successor_bytes"] == 320
-    assert outcomes["HEAD"]["successor_bytes"] == 0
+    assert outcomes["HEAD"]["successor_bytes"] == 320
+    assert outcomes["HEAD"]["latched_before_swap"] is False
 
 
 @pytest.mark.asyncio
