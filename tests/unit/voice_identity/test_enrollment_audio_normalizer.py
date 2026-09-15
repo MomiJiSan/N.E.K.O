@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
+from main_logic.voice_turn.activity_evidence import RnnoiseEvidence
 from main_logic.voice_identity_service.enrollment_audio import (
     OWNER_CAMPPLUS_RUNTIME_CHUNK_BYTES,
     EnrollmentAudioNormalizationError,
@@ -58,6 +59,10 @@ class _Pipeline:
             16_000,
             0.9 if self.rnnoise_available else None,
             self.rnnoise_available,
+            RnnoiseEvidence.from_legacy_probability(
+                0.9 if self.rnnoise_available else None,
+                available=self.rnnoise_available,
+            ),
         )
 
     async def finalize_stream(self) -> bytes:
