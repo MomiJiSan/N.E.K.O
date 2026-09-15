@@ -3475,15 +3475,6 @@
                         return;
                     }
 
-                    if (statusCode === 'VOICE_INPUT_READY') {
-                        window.dispatchEvent(new CustomEvent('voice-input-recovery-ready', { detail: statusDetails || {} }));
-                        return;
-                    }
-                    if (statusCode === 'VOICE_INPUT_RECOVERY_FAILED') {
-                        window.dispatchEvent(new CustomEvent('voice-input-recovery-failed', { detail: statusDetails || {} }));
-                        return;
-                    }
-
                     if (statusCode === 'VOICE_SESSION_ACTIVATION_STATE') {
                         var activationState = (statusDetails && statusDetails.state) || '';
                         var allowedActivationStates = [
@@ -3539,6 +3530,14 @@
                         return;
                     }
 
+                    if (statusCode === 'VOICE_INPUT_READY') {
+                        window.dispatchEvent(new CustomEvent('voice-input-recovery-ready', { detail: statusDetails || {} }));
+                        return;
+                    }
+                    if (statusCode === 'VOICE_INPUT_RECOVERY_FAILED') {
+                        window.dispatchEvent(new CustomEvent('voice-input-recovery-failed', { detail: statusDetails || {} }));
+                        return;
+                    }
                     if (statusCode === 'VOICE_INPUT_LEASE_RESYNC_REQUIRED') {
                         // 仅采集中的窗口重发 lease 快照；非采集窗口忽略，避免多窗口互相覆盖
                         if (S.isRecording === true
@@ -4893,14 +4892,6 @@
                             && (response.microphone_route === 'native'
                                 || response.microphone_route === 'independent')) {
                         S.independentAsrActive = response.microphone_route === 'independent';
-                        if (response.microphone_route === 'native') {
-                            ++S.voiceInputRecoveryGeneration;
-                            if (S.voiceInputRecoveryTimer) clearTimeout(S.voiceInputRecoveryTimer);
-                            S.voiceInputRecoveryTimer = null;
-                            S.voiceInputRecoveryState = 'idle';
-                            S.voiceInputRecoverySessionEpoch = null;
-                            S.voiceInputRecoveryLeaseGeneration = null;
-                        }
                     }
                     if (_ackAnswersThisWindow) S.voiceStartPending = false;
                     // NOTE: the fail-closed latch is deliberately NOT cleared

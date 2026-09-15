@@ -6009,14 +6009,7 @@ class AsrRuntimeMixin:
                 )
             elif event.code in {"ASR_INDEPENDENT_FAILED", "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE"}:
                 logger.info("[voice-recovery] failure session_epoch=%s code=%s", event.session_epoch, event.code)
-                # Same fence as the status above: a lease/route turnover
-                # during that send must not hand this failure to a new owner.
-                if not self._core_asr_operation_identity_matches(source_identity):
-                    return
-                await self._send_voice_control_status(
-                    json.dumps({"code": "VOICE_INPUT_RECOVERY_FAILED", "details": {"session_epoch": event.session_epoch, "lease_generation": self._voice_lease_generation, "reason": "ASR_INDEPENDENT_FAILED"}}),
-                    still_current=lambda: self._core_asr_operation_identity_matches(source_identity),
-                )
+                await self._send_voice_control_status(json.dumps({"code": "VOICE_INPUT_RECOVERY_FAILED", "details": {"session_epoch": event.session_epoch, "reason": "ASR_INDEPENDENT_FAILED"}}))
 
     async def _send_core_asr_lifecycle(
         self,
