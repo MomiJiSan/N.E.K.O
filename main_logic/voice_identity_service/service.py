@@ -1603,7 +1603,6 @@ class VoiceIdentityService:
             if self._requested_enabled:
                 # Reconciliation must build partial runtimes against the
                 # newly committed DSP contract, even when one manager failed.
-                self._runtime_noise_reduction_enabled = enabled
                 profile = self._profile
                 if profile is not None and self._profile_is_compatible(profile):
                     # Reconcile each manager through the partial activation
@@ -1615,10 +1614,13 @@ class VoiceIdentityService:
                         allow_partial=True,
                     )
                     self._apply_activation_result(activated)
-                    if activated is not VoiceIdentityActivationResult.READY:
-                        self._set_ineffective(
-                            VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
-                        )
+                    # A runtime that has not settled its DSP contract cannot
+                    # report ready, even when profile activation itself
+                    # succeeds. Keep the degraded fence until a later
+                    # runtime_ready=True reconciliation.
+                    self._set_ineffective(
+                        VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
                 else:
                     self._set_ineffective(
                         VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
