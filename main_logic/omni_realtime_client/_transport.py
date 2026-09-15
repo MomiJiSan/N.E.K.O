@@ -172,6 +172,7 @@ class _TransportMixin:
             < expected_sequence
         ):
             self._voice_handoff_input_open = False
+            self._voice_handoff_input_sequence = max(0, expected_sequence - 1)
 
     def _ensure_voice_handoff_audio_timeline(self) -> None:
         generation = self._connection_generation

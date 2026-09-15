@@ -2139,8 +2139,12 @@ class AsrRuntimeMixin:
                     and self._capture_voice_session_activation_generation()
                     == generation
                 ):
-                    await runtime.close()
+                    # Detach before close so CLOSED cannot supersede the
+                    # terminal UNAVAILABLE decision or trigger an immediate
+                    # retry on the next microphone frame.
                     self._voice_session_activation_runtime = None
+                    self._voice_session_activation_degraded = True
+                    await runtime.close()
                 else:
                     await runtime.close()
             return
