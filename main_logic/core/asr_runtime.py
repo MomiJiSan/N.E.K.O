@@ -4382,7 +4382,15 @@ class AsrRuntimeMixin:
             except asyncio.CancelledError:
                 raise
             except web_exceptions.ConnectionClosedOK:
-                if native_send_is_current():
+                # A normal provider close is expected during ordinary client
+                # handoff. Only the voice-identity takeover path latches the
+                # server-close guard; ordinary clients keep BASE delivery
+                # semantics on the successor session.
+                if (
+                    native_send_is_current()
+                    and getattr(self, "_voice_session_activation_factory", None)
+                    is not None
+                ):
                     self.session_closed_by_server = True
                 return OutputCommit.UNKNOWN
             except (web_exceptions.ConnectionClosed, AttributeError) as exc:
