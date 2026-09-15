@@ -11,6 +11,7 @@ import asyncio
 import bisect
 import json
 import math
+import os
 import struct
 import time
 from dataclasses import dataclass, replace
@@ -325,6 +326,7 @@ class AsrRuntimeMixin:
         self._hot_swap_sequence_progress = asyncio.Event()
         self._hot_swap_sequence_progress.set()
         self._omni_mic_audio_bytes = 0
+        self._voice_regression_trace_frames = 0
         self._asr_route_mode = "blocked"
         self._visual_route_mode: Literal["native", "independent"] = "native"
         self._microphone_route_generation = 0
@@ -3842,6 +3844,23 @@ class AsrRuntimeMixin:
         received_at: float | None = None,
         captured_at: float | None = None,
     ) -> bool:
+        if os.environ.get("NEKO_VOICE_REGRESSION_TRACE") == "1":
+            self._voice_regression_trace_frames = (
+                getattr(self, "_voice_regression_trace_frames", 0) + 1
+            )
+            if self._voice_regression_trace_frames % 100 == 0:
+                logger.info(
+                    "[%s] voice-regression-trace frames=%d route=%s "
+                    "voice_factory=%s voice_required=%s independent=%s "
+                    "session_closed=%s",
+                    self.lanlan_name,
+                    self._voice_regression_trace_frames,
+                    self._asr_route_mode,
+                    self._voice_session_activation_factory is not None,
+                    self._voice_session_activation_required,
+                    bool(getattr(self, "_independent_asr_enabled", False)),
+                    bool(getattr(self, "session_closed_by_server", False)),
+                )
         if self._voice_session_activation_degraded:
             return True
         factory = self._voice_session_activation_factory
