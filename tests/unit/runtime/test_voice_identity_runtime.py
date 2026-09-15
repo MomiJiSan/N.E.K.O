@@ -1130,6 +1130,76 @@ async def test_new_required_intent_fences_older_factory_commit() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("successor", [False, True])
+async def test_cancelled_activation_lock_wait_restores_only_owned_intent(successor):
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=True,
+        restore_retry_interval_seconds=0.01,
+        restore_retry_timeout_seconds=1.0,
+    )
+    manager = _Manager()
+    await registry.register_manager(manager)
+    old_profile, new_profile = _profile("old"), _profile("new")
+    try:
+        assert await registry.activate(old_profile, "old", activation_required=True)
+        async with registry._lock:
+            task = asyncio.create_task(
+                registry.activate(new_profile, "cancelled", activation_required=True)
+            )
+            await asyncio.sleep(0)
+            assert manager.activation_degraded
+            if successor:
+                next_task = asyncio.create_task(
+                    registry.activate(new_profile, "successor", activation_required=True)
+                )
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            if successor:
+                assert registry._required_intent_generation == "successor"
+            else:
+                assert registry._required_intent_revision is None
+                assert manager in registry._attach_pending
+        if successor:
+            assert await next_task is VoiceIdentityActivationResult.READY
+        await _wait_until(lambda: not manager.activation_degraded)
+        assert manager.verifier_calls[-1][1] == ("successor" if successor else "old")
+        assert registry._required_intent_revision is None
+    finally:
+        await registry.close()
+        old_profile.close()
+        new_profile.close()
+
+
+@pytest.mark.unit
+async def test_failed_required_activation_restores_unreached_managers():
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=True,
+        restore_retry_interval_seconds=0.01,
+        restore_retry_timeout_seconds=1.0,
+    )
+    managers = [_Manager(), _Manager(), _Manager()]
+    for manager in managers:
+        await registry.register_manager(manager)
+    old_profile, new_profile = _profile("old"), _profile("new")
+    try:
+        assert await registry.activate(old_profile, "old", activation_required=True)
+        ordered = tuple(registry._managers)
+        ordered[0].verifier_outcomes.append(False)
+        assert await registry.activate(
+            new_profile, "new", activation_required=True
+        ) is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        assert set(managers) <= registry._attach_pending
+        await _wait_until(lambda: all(not m.activation_degraded for m in managers))
+        assert all(m.verifier_calls[-1][1] == "old" for m in managers)
+    finally:
+        await registry.close()
+        old_profile.close()
+        new_profile.close()
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attach_watchdog_cannot_restore_old_factory_over_new_intent() -> None:
     registry = OwnerVoiceRuntimeRegistry(
