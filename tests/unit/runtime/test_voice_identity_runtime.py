@@ -1173,6 +1173,59 @@ async def test_cancelled_activation_lock_wait_restores_only_owned_intent(success
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("successor", [False, True])
+async def test_cancelled_optional_request_settles_inherited_required_intent(successor):
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=True,
+        restore_retry_interval_seconds=0.01,
+        restore_retry_timeout_seconds=1.0,
+    )
+    manager = _Manager()
+    await registry.register_manager(manager)
+    profile = _profile("old")
+    tasks = []
+    try:
+        assert await registry.activate(profile, "old", activation_required=True)
+        async with registry._lock:
+            required = asyncio.create_task(
+                registry.activate(profile, "required", activation_required=True)
+            )
+            tasks.append(required)
+            await asyncio.sleep(0)
+            optional = asyncio.create_task(registry.activate(None, "optional"))
+            tasks.append(optional)
+            await asyncio.sleep(0)
+            assert registry._required_intent_generation == "required"
+            if successor:
+                latest = asyncio.create_task(
+                    registry.activate(profile, "latest", activation_required=True)
+                )
+                tasks.append(latest)
+                await asyncio.sleep(0)
+            optional.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await optional
+            if successor:
+                assert registry._required_intent_generation == "latest"
+            else:
+                assert registry._required_intent_revision is None
+                assert manager in registry._attach_pending
+        assert await required is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        if successor:
+            assert await latest is VoiceIdentityActivationResult.READY
+        await _wait_until(lambda: not manager.activation_degraded)
+        assert manager.verifier_calls[-1][1] == ("latest" if successor else "old")
+        assert registry._required_intent_revision is None
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await registry.close()
+        profile.close()
+
+
+@pytest.mark.unit
 async def test_failed_required_activation_restores_unreached_managers():
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,
