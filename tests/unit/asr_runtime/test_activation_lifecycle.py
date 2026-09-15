@@ -23,6 +23,28 @@ from tests.support.asr_fakes import (
 pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
 
 
+async def test_activation_prepare_failure_publishes_unavailable_and_retires_runtime() -> None:
+    manager = _Runtime()
+
+    class FailingRuntime:
+        async def prepare(self):
+            raise RuntimeError("scorer setup failed")
+
+        mark_unavailable = AsyncMock()
+        close = AsyncMock()
+
+    failing = FailingRuntime()
+    generation = "prepare-failure"
+    manager._voice_session_activation_runtime = failing
+    manager._capture_voice_session_activation_generation = lambda: generation
+
+    await manager._prepare_voice_session_activation_runtime(failing, generation)
+
+    failing.mark_unavailable.assert_awaited_once_with("prepare_failed")
+    failing.close.assert_awaited_once()
+    assert manager._voice_session_activation_runtime is None
+
+
 async def test_required_activation_revoke_retires_runtime_before_async_replace() -> None:
     runtime = _Runtime()
     factory = _CoreActivationFactory()

@@ -2131,6 +2131,19 @@ class AsrRuntimeMixin:
                 "[%s] voice-session activation preparation failed",
                 self.lanlan_name,
             )
+            try:
+                await runtime.mark_unavailable("prepare_failed")
+            finally:
+                if (
+                    self._voice_session_activation_runtime is runtime
+                    and self._capture_voice_session_activation_generation()
+                    == generation
+                ):
+                    await runtime.close()
+                    self._voice_session_activation_runtime = None
+                else:
+                    await runtime.close()
+            return
         if (
             self._voice_session_activation_runtime is not runtime
             or self._capture_voice_session_activation_generation() != generation

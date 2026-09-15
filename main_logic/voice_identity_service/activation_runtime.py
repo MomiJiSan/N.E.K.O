@@ -295,6 +295,15 @@ class VoiceSessionActivationRuntime:
                 )
             )
 
+    async def mark_unavailable(self, reason: str) -> ActivationDecision:
+        """Publish a terminal preparation failure before retiring the runtime."""
+        async with self._lock:
+            if self._closed:
+                return self._publish(self._controller.close())
+            return self._publish(
+                self._controller.mark_unavailable(self._generation, reason)
+            )
+
     async def feed(
         self,
         frame: AudioFrame,
