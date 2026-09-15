@@ -426,6 +426,7 @@ class VoiceIdentityService:
             and self._requested_enabled
             and self._profile is not None
             and self._runtime_mode != "off"
+            and not self._runtime_audio_contract_transition_pending
             and self._effective_reason
             in {
                 VoiceIdentityEffectiveReason.READY,

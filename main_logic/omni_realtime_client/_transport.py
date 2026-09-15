@@ -1329,13 +1329,15 @@ class _TransportMixin:
                 "type": "input_audio_buffer.append",
                 "audio": audio_b64
             }
-            return await self.send_event(
+            sent = await self.send_event(
                 append_event,
-                pre_send=lambda _event: self._note_voice_handoff_audio_append(
+            )
+            if sent:
+                self._note_voice_handoff_audio_append(
                     samples=len(audio_chunk) // 2,
                     input_sequence=handoff_input_sequence,
-                ),
-            )
+                )
+            return sent
 
     async def _analyze_image_with_vision_model(
         self,
