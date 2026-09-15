@@ -724,8 +724,10 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
         preferences.configure_voice_identity_audio_contract_callbacks()
 
     # Snapshot failure degrades runtime readiness but does not discard the
-    # compatible profile; recovery retries activation with that profile.
-    assert activations[-1][0] is not None
+    # profile.  Its old DSP contract is incompatible with the pending target,
+    # so partial recovery remains detached until the committed contract is
+    # restored.
+    assert activations[-1][0] is None
     assert not service.status().state.effective_enabled
     assert service.status().state.effective_reason == "runtime_degraded"
     # Failure keeps coordination pending, including a retry of the old value.
@@ -736,6 +738,71 @@ async def test_post_prepare_snapshot_failure_clears_pending_fail_closed(
     restored = await service.update_runtime_noise_reduction_enabled(True)
     assert restored.state.effective_enabled
     assert restored.state.effective_reason == "ready"
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_partial_dsp_recovery_uses_target_contract_without_committing_it(
+    tmp_path: Path,
+) -> None:
+    service, _model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+
+    # Model a profile already enrolled in the target DSP domain while the
+    # service still retains the previously committed runtime value.
+    service._profile_audio_contract = desktop_audio_contract_snapshot(  # type: ignore[attr-defined]
+        noise_reduction_enabled=False,
+    )
+    captured: dict[str, object] = {}
+    original_activate = service._activation_callback  # type: ignore[attr-defined]
+
+    async def capture_activation(profile, generation, **authority):
+        captured.update(authority)
+        return await original_activate(profile, generation, **authority)
+
+    service._activation_callback = capture_activation  # type: ignore[attr-defined]
+    status = await service.update_runtime_noise_reduction_enabled(
+        False,
+        runtime_ready=False,
+    )
+
+    assert captured["noise_reduction_enabled"] is False
+    assert service._runtime_noise_reduction_enabled is True  # type: ignore[attr-defined]
+    assert status.state.effective_reason == "runtime_degraded"
+    assert service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_partial_dsp_recovery_rejects_incompatible_profile_contract(
+    tmp_path: Path,
+) -> None:
+    service, _model, activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(
+        enrollment.enrollment_id,
+        "profile-a",
+        _pcm(),
+    )
+    activation_count = len(activations)
+
+    status = await service.update_runtime_noise_reduction_enabled(
+        False,
+        runtime_ready=False,
+    )
+
+    assert len(activations) == activation_count
+    assert status.state.effective_reason == "runtime_degraded"
+    assert service._runtime_noise_reduction_enabled is True  # type: ignore[attr-defined]
     await service.close()
 
 @pytest.mark.unit
