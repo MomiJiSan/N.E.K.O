@@ -19,6 +19,7 @@ from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from main_logic.voice_turn.contracts import (
     AsrDeliveryStage, AsrSubmitResult, AsrSubmitStatus, PreserveUnsentPrefix,
 )
+from tests.support.asr_delivery_fakes import _cold_runtime, _close
 from tests.support.asr_fakes import (
     _QueuedSmartTurnDetector,
     _Runtime,
@@ -88,50 +89,6 @@ def test_prefix_promotion_overflow_preserves_uncommitted_state():
     assert lifecycle._pre_roll.peek() == pre_roll
     assert lifecycle._pending_connect.peek() == pending
     assert lifecycle.metrics.buffer_overflow_count == 0
-
-
-def _cold_runtime():
-    runtime = _Runtime()
-    lifecycle = _lifecycle()
-    runtime._asr_lifecycle = lifecycle
-    runtime._asr_route_mode = "independent"
-    runtime._asr_provider = "qwen"
-    runtime._asr_transport_selection = _selection("qwen")
-    entered, ready = asyncio.Event(), asyncio.Event()
-    sessions = []
-
-    def factory(_selection):
-        session = SimpleNamespace(is_ready=False)
-        async def connect():
-            entered.set()
-            await ready.wait()
-            session.is_ready = True
-        session.connect = connect
-        session.close = AsyncMock()
-        session.stream_audio = AsyncMock()
-        session.signal_user_activity_end = AsyncMock()
-        sessions.append(session)
-        return session
-
-    runtime._asr_session_factory = factory
-    detector = _ReadyDetector()
-    calls = 0
-    async def feed(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        return DetectorFeedResult((SpeechActivityEvent.SPEECH_STARTED,) if calls == 1 else (), True)
-    detector.feed = AsyncMock(side_effect=feed)
-    runtime._asr_detector = detector
-    token = runtime._capture_ingress_token()
-    prefix = PreserveUnsentPrefix(token, "first", 0)
-    return runtime, lifecycle, detector, token, prefix, entered, ready, sessions
-
-
-async def _close(runtime):
-    await runtime._asr_runtime.abort("test_complete")
-    await runtime._asr_audio_dispatcher.close()
-    await runtime._asr_detector_dispatcher.close()
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protected", [True, False])

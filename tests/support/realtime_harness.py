@@ -6,6 +6,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 import pytest
+_END = object()
+_TIMEOUT = object()
 import main_logic.asr_client._infra as asr_infra
 from main_logic.asr_client._infra import (
     AsrSessionConfig,

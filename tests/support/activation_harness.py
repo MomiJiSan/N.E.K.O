@@ -14,6 +14,53 @@ from main_logic.voice_identity_service.activation_runtime import VoiceSessionAct
 from main_logic.voice_turn.contracts import SpeechActivityEvent, AsrSubmitResult, AsrSubmitStatus
 from tests.support.asr_fakes import _Runtime, _selection, CoordinatorState, _CoreActivationScorer
 from main_logic.voice_turn.contracts import VoiceTurnToken
+
+
+class _Vad:
+    """Synchronous VAD stub accepted by DetectorRuntime test harnesses."""
+
+    def load(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        return None
+
+
+class _Gate:
+    def __init__(self) -> None:
+        self.count = 0
+
+    def feed(self, pcm):
+        self.count += 1
+        return (SpeechActivityEvent.SPEECH_STARTED,) if self.count == 3 else ()
+
+    def reset(self) -> None:
+        self.count = 0
+
+
+class _Coordinator:
+    state = CoordinatorState.IDLE
+
+    def push_audio(self, pcm) -> None:
+        return None
+
+    async def on_activity_event(self, event) -> None:
+        self.state = CoordinatorState.SPEECH_ACTIVE
+
+    async def prepare_predictor(self) -> bool:
+        return True
+
+    async def reset(self) -> None:
+        self.state = CoordinatorState.IDLE
+
+    async def close(self) -> None:
+        self.state = CoordinatorState.CLOSED
+
+    async def unload_predictor(self) -> None:
+        return None
+
+
+@asynccontextmanager
 async def _cold_harness(endpointing="provider", gate=None):
     manager, clock = _Runtime(), _Clock()
     release, started = asyncio.Event(), asyncio.Event()

@@ -191,3 +191,11 @@ Important:
 
 ---
 *(Note: Reports are gitignored and will not be committed to the repository)*
+
+## PR #3078 test shards
+
+Pull requests run the four behavior markers in `pr3078-test-shards.yml`:
+`unit_fast`, `runtime`, `integration_serial`, and `frontend_contract`, plus the
+Node frontend contract test. Each Python shard performs a non-empty collection
+check before execution. The full `tests/unit` gate runs on pushes to `main` and
+manual dispatch, avoiding duplicate 45-minute execution on pull requests.

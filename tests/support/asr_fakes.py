@@ -79,6 +79,19 @@ import main_logic.core.asr_runtime as core_asr_runtime_module
 import main_logic.core as core_module
 import main_logic.voice_turn.audio_input as audio_input_module
 from utils import preferences
+
+
+class _TestSmartTurnLease:
+    """Minimal endpointing lease used by fake detectors in runtime tests."""
+
+    def __init__(self, token) -> None:
+        self.token = token
+        self.released = False
+
+    async def release(self) -> None:
+        self.released = True
+
+
 class _Runtime(AsrRuntimeMixin):
     def __init__(self) -> None:
         self._init_asr_runtime_state()
