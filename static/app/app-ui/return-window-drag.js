@@ -808,7 +808,7 @@
             const edgeButton = (container.classList && container.classList.contains('neko-idle-return-btn'))
                 ? container : (container.querySelector && container.querySelector('.neko-idle-return-btn'));
             if (window.NekoEdgePeekController && window.NekoEdgePeekController.shouldBlockReturnBallDrag(edgeButton, container)) {
-                event.preventDefault();
+                if (!event || event.pointerType !== 'touch') event.preventDefault();
                 event.stopImmediatePropagation();
             }
         };

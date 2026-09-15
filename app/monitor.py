@@ -71,6 +71,26 @@ def get_resource_path(relative_path):
 
 templates = Jinja2Templates(directory=get_resource_path(""))
 
+_STATIC_ASSET_VERSION_CACHE = (0.0, "0")
+
+def _viewer_static_assets_ctx():
+    """Build viewer cache version without importing the full main router graph."""
+    global _STATIC_ASSET_VERSION_CACHE
+    now = asyncio.get_running_loop().time()
+    cached_at, cached_version = _STATIC_ASSET_VERSION_CACHE
+    if now - cached_at < 30.0:
+        return {"static_asset_version": cached_version}
+    from config import APP_VERSION
+    latest_mtime = 0
+    for relative_path in ("static/css/index.css", "static/css/edge-peek.css"):
+        try:
+            latest_mtime = max(latest_mtime, int(os.path.getmtime(get_resource_path(relative_path))))
+        except OSError:
+            continue
+    version = f"{APP_VERSION}-{latest_mtime or 0}"
+    _STATIC_ASSET_VERSION_CACHE = (now, version)
+    return {"static_asset_version": version}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -243,10 +263,9 @@ def get_emotion_mapping(model_name: str):
 @app.get("/{lanlan_name}", response_class=HTMLResponse)
 async def get_index(request: Request, lanlan_name: str):
     # lanlan_name 将从 URL 中提取，前端会通过 API 获取配置
-    from main_routers.pages_router import _static_assets_ctx
     return templates.TemplateResponse("templates/viewer.html", {
         "request": request,
-        **_static_assets_ctx(),
+        **_viewer_static_assets_ctx(),
     })
 
 
