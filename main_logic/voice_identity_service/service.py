@@ -395,6 +395,11 @@ class VoiceIdentityService:
                     if requested_enabled
                     else VoiceIdentityEffectiveReason.DISABLED
                 )
+            elif not requested_enabled:
+                # A disabled client keeps its legacy profile as inert state.
+                # Compatibility checks and activation fencing apply only after
+                # the user explicitly enables voice identity.
+                self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
             elif not self._profile_is_compatible(profile):
                 self._rejected_profile_on_initialize = True
                 if requested_enabled and self._runtime_mode == "enforce":
@@ -406,8 +411,6 @@ class VoiceIdentityService:
                 self._set_ineffective(
                     VoiceIdentityEffectiveReason.AUDIO_CONTRACT_MISMATCH
                 )
-            elif not requested_enabled:
-                self._set_ineffective(VoiceIdentityEffectiveReason.DISABLED)
             elif self._runtime_mode == "off":
                 self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
             else:
