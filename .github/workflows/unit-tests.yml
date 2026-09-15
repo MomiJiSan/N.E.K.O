@@ -14,8 +14,10 @@ name: Unit Tests
 # No paths filter on purpose. tests/unit reads Python packages, static/,
 # templates/ and frontend sources, so any useful filter would approximate
 # "everything"; an over-narrow one reintroduces exactly the failure mode above
-# — the one PR that needed the gate is the one that does not trigger it.
+# — the PR gate runs the unmarked remainder while dedicated shards cover classified tests.
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
@@ -113,7 +115,7 @@ jobs:
         # workers while preserving coverage of the remaining unit suite.
         run: |
           New-Item -ItemType Directory -Force ".codex-tmp\unit-suite" | Out-Null
-          uv run pytest tests/unit -q -n auto --dist loadfile --basetemp ".codex-tmp\unit-suite" -m "not unit_fast and not runtime and not integration_serial and not frontend_contract"
+          uv run pytest tests/unit -q -n auto --dist loadfile --basetemp ".codex-tmp\\unit-suite" -m "not unit_fast and not runtime and not integration_serial and not frontend_contract"
 
   plugin-manager-vitest:
     name: Plugin manager vitest
