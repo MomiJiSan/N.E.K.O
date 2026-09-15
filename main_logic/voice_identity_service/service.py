@@ -1607,7 +1607,14 @@ class VoiceIdentityService:
                 # Reconciliation must build partial runtimes against the
                 # newly committed DSP contract, even when one manager failed.
                 profile = self._profile
-                if profile is not None and self._profile_is_compatible(profile):
+                if (
+                    profile is not None
+                    and self._profile_is_compatible(profile)
+                    and self._profile_audio_contract is not None
+                    and self._profile_audio_contract.matches_runtime(
+                        noise_reduction_enabled=enabled,
+                    )
+                ):
                     # Reconcile each manager through the partial activation
                     # path.  A single DSP failure must not detach managers
                     # whose pipelines settled successfully.
@@ -1615,6 +1622,7 @@ class VoiceIdentityService:
                         profile,
                         profile.generation,
                         allow_partial=True,
+                        noise_reduction_enabled=enabled,
                     )
                     self._apply_activation_result(activated)
                     # A runtime that has not settled its DSP contract cannot
@@ -2154,11 +2162,17 @@ class VoiceIdentityService:
         *,
         protection_requested: bool | None = None,
         allow_partial: bool = False,
+        noise_reduction_enabled: bool | None = None,
     ) -> VoiceIdentityActivationResult:
         requested = (
             self._requested_enabled
             if protection_requested is None
             else protection_requested
+        )
+        activation_noise_reduction_enabled = (
+            self._runtime_noise_reduction_enabled
+            if noise_reduction_enabled is None
+            else noise_reduction_enabled
         )
         try:
             result = await asyncio.wait_for(
@@ -2168,9 +2182,7 @@ class VoiceIdentityService:
                     activation_required=(
                         requested and self._runtime_mode == "enforce"
                     ),
-                    noise_reduction_enabled=(
-                        self._runtime_noise_reduction_enabled
-                    ),
+                    noise_reduction_enabled=activation_noise_reduction_enabled,
                     allow_partial=allow_partial,
                 ),
                 timeout=self._activation_timeout_seconds,
