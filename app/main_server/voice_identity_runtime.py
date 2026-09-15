@@ -714,10 +714,11 @@ class OwnerVoiceRuntimeRegistry:
             acquired = True
             yield
         finally:
-            # Cancellation during acquire never enters activate's body. Only
-            # this request may settle its intent; a successor owns its own gate.
+            # Cancellation during acquire never enters activate's body. The
+            # latest authority must settle even an inherited required intent:
+            # an optional request supersedes authority without replacing it.
             if (
-                self._required_intent_revision == request_revision
+                self._required_intent_revision is not None
                 and self._authority_request_revision == request_revision
             ):
                 self._settle_required_intent(request_revision)
