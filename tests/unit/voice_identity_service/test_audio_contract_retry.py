@@ -2,6 +2,7 @@
 
 import pytest
 
+from main_logic.voice_identity_service.service import VoiceIdentityServiceError
 from tests.support.voice_identity_fakes import _pcm, _service
 
 
@@ -33,6 +34,9 @@ async def test_failed_audio_contract_reconcile_retries_same_setting(
         assert activations[-1][0] is not None
         assert service._runtime_noise_reduction_enabled is previous
         assert service._runtime_audio_contract_transition_pending
+
+        with pytest.raises(VoiceIdentityServiceError, match="runtime_degraded"):
+            await service.start_enrollment()
 
         assert await service.prepare_runtime_audio_contract_change(enabled)
         restored = await service.update_runtime_noise_reduction_enabled(

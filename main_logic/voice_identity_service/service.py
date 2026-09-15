@@ -478,6 +478,9 @@ class VoiceIdentityService:
     async def start_enrollment(self) -> EnrollmentStatus:
         async with self._operation_lock:
             self._require_initialized()
+            if self._runtime_audio_contract_transition_pending:
+                self._record_failure(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+                raise VoiceIdentityServiceError("runtime_degraded")
             if self._enrollment is not None:
                 return self._enrollment_status(self._enrollment)
             cleanup_task = self._enrollment_audio_cleanup_task
