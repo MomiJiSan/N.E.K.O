@@ -1270,6 +1270,30 @@ class VoiceIdentityService:
                     raise activation_cancellations[0]
                 if activation_result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
                     raise VoiceIdentityServiceError("runtime_degraded")
+            elif not desired_requested and old_requested and self._runtime_mode != "off":
+                # Disabling enrollment must retire the currently installed
+                # runtime authority before publishing the disabled state.
+                activation_cancellations = []
+                activation_result = await _await_cancellation_safe(
+                    self._activate(
+                        None,
+                        str(uuid.uuid4()),
+                        protection_requested=False,
+                    ),
+                    name="voice-identity-enrollment-disable-detach",
+                    cancellations=activation_cancellations,
+                )
+                activation_changed = True
+                self._require_commit_fence(
+                    session,
+                    session_generation,
+                    operation_nonce,
+                    profile_id,
+                )
+                if activation_cancellations:
+                    raise activation_cancellations[0]
+                if activation_result is VoiceIdentityActivationResult.RUNTIME_DEGRADED:
+                    raise VoiceIdentityServiceError("runtime_degraded")
 
             if desired_requested != old_requested:
                 preference_cancellations: list[asyncio.CancelledError] = []
