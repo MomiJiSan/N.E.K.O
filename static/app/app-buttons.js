@@ -1232,6 +1232,8 @@
             })
         })
     });
+    var LOCAL_AVATAR_TOOL_ID_PATTERN = /^local-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    var LOCAL_AVATAR_TOOL_REVISION_PATTERN = /^[0-9]+-[0-9]+$/;
     // The backend sends the final ack only after prompt_ephemeral has completed
     // the visible assistant turn. Keep separate fail-safes for no reply signal
     // and a started turn whose end event is lost, then allow a short grace period
@@ -1599,6 +1601,15 @@
         var toolId = String(payload.tool_id || payload.toolId || '').trim().toLowerCase();
         var actionId = String(payload.action_id || payload.actionId || '').trim().toLowerCase();
         var toolContract = AVATAR_INTERACTION_CONTRACT.tools[toolId];
+        var localTool = LOCAL_AVATAR_TOOL_ID_PATTERN.test(toolId);
+        if (!toolContract && localTool) {
+            toolContract = {
+                actions: { interact: ['normal', 'rapid'] },
+                acceptsTouchZone: true,
+                booleanField: { input: 'specialTriggered', output: 'special_triggered' },
+                roundChoice: false
+            };
+        }
         if (!toolContract) {
             console.warn('[AvatarInteraction] ignored unsupported tool:', toolId);
             return null;
@@ -1629,6 +1640,23 @@
             target: 'avatar',
             timestamp: timestamp
         };
+
+        if (localTool) {
+            var allowedLocalFields = [
+                'action', 'interaction_id', 'interactionId', 'tool_id', 'toolId',
+                'action_id', 'actionId', 'target', 'pointer', 'timestamp',
+                'text_context', 'textContext', 'intensity', 'touch_zone', 'touchZone',
+                'change_index', 'changeIndex',
+                'tool_revision', 'toolRevision',
+                'special_triggered', 'specialTriggered'
+            ];
+            if (Object.keys(payload).some(function (field) {
+                return allowedLocalFields.indexOf(field) === -1;
+            })) {
+                console.warn('[AvatarInteraction] ignored undeclared local tool facts');
+                return null;
+            }
+        }
 
         if (payload.pointer && typeof payload.pointer === 'object') {
             var rawClientX = getAvatarInteractionPayloadValue(
@@ -1716,6 +1744,25 @@
         }
         normalized.intensity = intensity;
 
+        if (localTool) {
+            var toolRevision = String(getAvatarInteractionPayloadValue(
+                payload, 'tool_revision', 'toolRevision', ''
+            ) || '').trim();
+            if (toolRevision.length > 128 || !LOCAL_AVATAR_TOOL_REVISION_PATTERN.test(toolRevision)) {
+                console.warn('[AvatarInteraction] ignored invalid local tool revision');
+                return null;
+            }
+            var rawChangeIndex = getAvatarInteractionPayloadValue(
+                payload, 'change_index', 'changeIndex', null
+            );
+            if (!Number.isSafeInteger(rawChangeIndex) || rawChangeIndex < 0) {
+                console.warn('[AvatarInteraction] ignored invalid local change index');
+                return null;
+            }
+            normalized.tool_revision = toolRevision;
+            normalized.change_index = rawChangeIndex;
+        }
+
         var textContext = sanitizeAvatarInteractionTextContext(getAvatarInteractionPayloadValue(
             payload, 'text_context', 'textContext', ''
         ));
@@ -1735,8 +1782,8 @@
                     console.warn('[AvatarInteraction] ignored invalid boolean field:', booleanField.output);
                     return null;
                 }
-                if (parsedBoolean) {
-                    normalized[booleanField.output] = true;
+                if (parsedBoolean || localTool) {
+                    normalized[booleanField.output] = parsedBoolean;
                 }
             }
         }
@@ -1831,7 +1878,8 @@
         host.setOnComposerSubmit(function (detail) {
             return mod.sendTextPayload(detail && detail.text, {
                 source: 'react-chat-window',
-                requestId: detail && detail.requestId
+                requestId: detail && detail.requestId,
+                submitMethod: detail && detail.submitMethod
             });
         });
         if (typeof host.setOnCompactHistoryDrop === 'function') {
@@ -2894,6 +2942,22 @@
             }
         }
 
+        function requestChatAutoCollapseAfterAcceptedEnter(options, requestId) {
+            if (
+                !options
+                || options.submitMethod !== 'enter'
+                || !window.nekoChatWindow
+                || typeof window.nekoChatWindow.requestAutoCollapseAfterEnter !== 'function'
+            ) return false;
+            try {
+                window.nekoChatWindow.requestAutoCollapseAfterEnter({ requestId: requestId });
+                return true;
+            } catch (error) {
+                console.warn('[Chat] 请求回车发送后自动收起失败:', error);
+                return false;
+            }
+        }
+
         async function sendTextPayloadInternal(rawText, options) {
             options = options || {};
             var text = String(typeof rawText === 'string' ? rawText : '').trim();
@@ -2982,6 +3046,12 @@
                     text: displayText,
                     imageUrls: optimisticImageUrls
                 });
+            }
+
+            // Enter 已通过空内容、教程锁和附件预处理校验，即视为发送请求已被聊天逻辑接受。
+            // 必须在首轮 start_session 的异步等待前收起，否则第一次聊天会等初始化完成才响应。
+            if (options.autoCollapseAfterEnterRequested !== true) {
+                requestChatAutoCollapseAfterAcceptedEnter(options, requestId);
             }
 
             function shouldAppendLegacyUserMessage() {
@@ -3262,7 +3332,8 @@
                             detail: {
                                 requestId: requestId,
                                 text: text,
-                                source: messageSource || 'text'
+                                source: messageSource || 'text',
+                                submitMethod: options.submitMethod === 'enter' ? 'enter' : 'button'
                             }
                         }));
                         // 标记"WS 已发、还没收到首 chunk"窗口，给 isAssistantTextResponseInFlight 用。
@@ -3317,7 +3388,12 @@
                     && !hasScreenshots
                     && !hasExtraImages
                     && hasPendingAvatarInteractionContinuation()) {
-                queueDeferredTextSubmission(text, options);
+                var deferredOptions = Object.assign({}, options);
+                if (deferredOptions.autoCollapseAfterEnterRequested !== true
+                        && requestChatAutoCollapseAfterAcceptedEnter(deferredOptions, deferredOptions.requestId)) {
+                    deferredOptions.autoCollapseAfterEnterRequested = true;
+                }
+                queueDeferredTextSubmission(text, deferredOptions);
                 textInputBox.value = '';
                 textInputComposing = false;
                 lastTextCompositionEndAt = 0;

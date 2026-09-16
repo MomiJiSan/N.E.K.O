@@ -48,6 +48,8 @@ from typing import Optional, Callable, Dict, Any, Awaitable, List  # noqa: F401
 
 from enum import Enum
 
+from dataclasses import dataclass
+
 from main_logic.tool_calling import (  # noqa: F401
     OnToolCallCallback,
     ToolCall,
@@ -89,6 +91,29 @@ class TurnDetectionMode(Enum):
     MANUAL = "manual"
 
 
+class VisualDeliveryMode(str, Enum):
+    """How ambient images are delivered to the active realtime session."""
+
+    NATIVE = "native"
+    EXTERNAL_DESCRIPTION = "external_description"
+
+
+@dataclass(frozen=True, slots=True)
+class ImageStageResult:
+    """Observable result of staging or delivering one image."""
+
+    accepted: bool
+    mode: str
+    generation: int | None = None
+    description: str | None = None
+    rejection_reason: str | None = None
+    # 成功送出后仍然注册着的拒绝回调的 event_id。拒绝可能晚于 send 返回才到，所以
+    # stream_image 不能自己摘掉它；但一旦调用方拿到「provider 已处理」的更强证据
+    # （例如 session.updated 屏障），这个 handler 就无关了，而它的闭包扣着整条
+    # callback（可能有数张 ~13MB 的 base64）。把 id 交出去，让那个证据点去摘。
+    rejection_event_id: str | None = None
+
+
 # Opt-in escape hatch for the response arbiter's escalation policy (issue
 # #2583). When a response lifecycle cannot reach a terminal state the arbiter
 # tears the realtime WebSocket down by default — safe, but a provider-side
@@ -124,6 +149,21 @@ _REALTIME_DIALECT_ALIASES = {
     "gpt": "gpt",
     "qwen_intl": "qwen",
 }
+
+
+# 取消欠账的存活上限。被取消的那一轮欠一条终结事件，而 Gemini 没有
+# response.cancel —— 它是被**后继内容送达**叫停的，所以计时从那一刻起算
+# （_gemini_send_user_turn），不是从 handle_interruption 决定取消那一刻。
+# 取值方向不对称：取小了最多多一次早结算，会话读作空闲，下一轮自愈；取大了会让
+# 陈旧欠账吃掉一条**合法**终结，那一轮的 external token 没人结算，
+# is_active_response() 恒真、主动搭话彻底哑。所以宁可短。
+GEMINI_CANCELLED_TERMINAL_TTL_SECONDS = 3.0
+
+# The mime a Gemini user turn's frames are sent under. One definition, because
+# it is read twice: once by the sender and once by the frame-bus publisher that
+# labels the very same bytes. Two literals would let a changed format mislabel
+# every record on the bus without anything going red.
+GEMINI_TURN_IMAGE_MIME = "image/jpeg"
 
 
 def canonical_realtime_dialect(api_type: object) -> str:

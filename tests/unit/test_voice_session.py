@@ -61,13 +61,18 @@ async def test_gemini_create_response_propagates_send_failure(monkeypatch):
     client._is_gemini = True
     client._gemini_session = object()
 
-    async def fail_send_user_turn(_text):
+    observed_turn_starts: list[bool] = []
+
+    async def fail_send_user_turn(_text, *, starts_user_turn=True):
+        observed_turn_starts.append(starts_user_turn)
         raise RuntimeError("gemini send failed")
 
     monkeypatch.setattr(client, "_gemini_send_user_turn", fail_send_user_turn)
 
     with pytest.raises(RuntimeError, match="gemini send failed"):
         await OmniRealtimeClient.create_response(client, "postgame context")
+
+    assert observed_turn_starts == [True]
 
 
 @pytest.mark.unit
@@ -78,7 +83,10 @@ async def test_gemini_create_response_skipped_failure_restores_skip_state(monkey
     client._gemini_session = object()
     client._skip_until_next_response = False
 
-    async def fail_send_user_turn(_text):
+    observed_turn_starts: list[bool] = []
+
+    async def fail_send_user_turn(_text, *, starts_user_turn=True):
+        observed_turn_starts.append(starts_user_turn)
         raise RuntimeError("gemini send failed")
 
     monkeypatch.setattr(client, "_gemini_send_user_turn", fail_send_user_turn)
@@ -87,6 +95,7 @@ async def test_gemini_create_response_skipped_failure_restores_skip_state(monkey
         await OmniRealtimeClient.create_response(client, "postgame context", skipped=True)
 
     assert client._skip_until_next_response is False
+    assert observed_turn_starts == [True]
 
 
 @pytest.mark.unit
@@ -97,7 +106,10 @@ async def test_gemini_prime_context_skipped_failure_restores_skip_state(monkeypa
     client._gemini_session = object()
     client._skip_until_next_response = False
 
-    async def fail_send_user_turn(_text):
+    observed_turn_starts: list[bool] = []
+
+    async def fail_send_user_turn(_text, *, starts_user_turn=True):
+        observed_turn_starts.append(starts_user_turn)
         raise RuntimeError("gemini send failed")
 
     monkeypatch.setattr(client, "_gemini_send_user_turn", fail_send_user_turn)
@@ -106,6 +118,8 @@ async def test_gemini_prime_context_skipped_failure_restores_skip_state(monkeypa
         await OmniRealtimeClient.prime_context(client, "assistant: context", skipped=True)
 
     assert client._skip_until_next_response is False
+    # A task-result report is not the user's turn -- it must not retire tools.
+    assert observed_turn_starts == [False]
 
 
 @pytest.mark.unit
@@ -948,6 +962,26 @@ async def test_connect_qwen_server_vad_preserves_payload():
     assert isinstance(td, dict)
     assert td.get("type") in ("server_vad", "semantic_vad")
     assert "threshold" in td
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The silence timeout is gated on the INFERRED api_type: an empty
+# api_type on a lanlan free route still resolves to 'free', and the auto
+# mic-off has to follow that inference like the rest of the class does.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_silence_timeout_uses_inferred_free_api_type():
+    client = OmniRealtimeClient(
+        base_url="wss://www.lanlan.tech/tts",
+        api_key="sk-test",
+        model="free-realtime",
+    )
+
+    assert client._api_type == ""
+    assert client._is_free_provider is True
+    assert client._enable_silence_timeout is True
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import {
   readPluginPackageErrorCode,
   resolvePluginPackageErrorMessage,
 } from '@/utils/pluginPackageError'
+import { resolvePluginInstallErrorKey } from '@/utils/pluginInstallError'
 
 export type InstallPackagePathOptions = {
   pluginsRoot?: string
@@ -88,6 +89,10 @@ export function usePluginPackageInstaller() {
           ? 'package.install.blockedBundleConflict'
           : plan.reason === 'legacy_plugin_present'
             ? 'package.install.blockedLegacyPlugin'
+            : plan.reason === 'install_source_ownership_unknown'
+              ? 'package.install.blockedOwnershipUnknown'
+              : plan.reason === 'install_source_read_only'
+                ? 'package.install.blockedInstallSourceReadOnly'
             : 'package.install.blockedDirectoryConflict'
         ElMessage.error(
           plan.reason === 'legacy_plugin_present'
@@ -96,6 +101,12 @@ export function usePluginPackageInstaller() {
               })
             : t(blockedKey),
         )
+        return null
+      }
+      if (plan.action === 'override_builtin') {
+        // Builtin source switching is intentionally Market-only because the
+        // backend must bind the transaction to a Market-verified SHA256.
+        ElMessage.error(t('market.autoUpgradeBlocked'))
         return null
       }
 
@@ -107,7 +118,9 @@ export function usePluginPackageInstaller() {
         install_source: options.installSource,
       }
       if (plan.action === 'upgrade' || plan.action === 'reinstall' || plan.action === 'downgrade') {
-        const messagePrefix = plan.action
+        const messagePrefix = plan.reason === 'manual_takeover'
+          ? 'manualTakeover'
+          : plan.action
         try {
           await ElMessageBox.confirm(
             t(`package.install.${messagePrefix}Body`, {
@@ -135,11 +148,18 @@ export function usePluginPackageInstaller() {
       return await installPluginPackage(request)
     } catch (error) {
       installFailureConfirmed = installRequested && isConfirmedSafeInstallFailure(error)
-      ElMessage.error(resolvePluginPackageErrorMessage(
-        error,
-        t,
-        installPlan.value ? 'install' : 'plan',
-      ))
+      const errorCode = readPluginPackageErrorCode(error)
+      const isPackageFailure = errorCode === 'PLUGIN_UPGRADE_ROLLED_BACK'
+        || errorCode.startsWith('PLUGIN_PACKAGE_')
+      if (installPlan.value && errorCode && !isPackageFailure) {
+        ElMessage.error(t(resolvePluginInstallErrorKey(errorCode)))
+      } else {
+        ElMessage.error(resolvePluginPackageErrorMessage(
+          error,
+          t,
+          installPlan.value ? 'install' : 'plan',
+        ))
+      }
       return null
     } finally {
       if (options.discardOnFailure && (!installRequested || installFailureConfirmed)) {

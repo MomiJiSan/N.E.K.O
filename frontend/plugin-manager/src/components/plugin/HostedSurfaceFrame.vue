@@ -11,6 +11,7 @@
       @close="runtimeError = ''"
     />
 
+    <!-- Preserve standard alert/confirm/prompt behavior authored by static plugins. -->
     <iframe
       v-if="surface.mode === 'static' && surfaceUrl"
       ref="iframeRef"
@@ -18,7 +19,7 @@
       :src="surfaceUrl"
       :title="surfaceTitle"
       class="hosted-surface-frame__iframe"
-      sandbox="allow-scripts allow-forms allow-popups allow-same-origin"
+      sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-modals"
       @load="handleLoad"
       @error="handleError"
     />
@@ -545,7 +546,7 @@ function handleMessage(event: MessageEvent) {
   }
   if (data && typeof data === 'object' && data.type === 'neko-hosted-surface-open-path') {
     const path = typeof data.payload?.path === 'string' ? data.payload.path : ''
-    if (path) openLocalPath(path)
+    if (path) openLocalPath(path).catch(() => {}) // 宿主插件发起的打开请求，失败时静默处理
     return
   }
   if (data && typeof data === 'object' && data.type === 'neko-hosted-surface-cancel') {

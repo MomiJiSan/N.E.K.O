@@ -77,6 +77,18 @@ const routes: RouteRecordRaw[] = [
         meta: {
           titleKey: 'nav.adapterUI'
         }
+      },
+      {
+        path: 'development',
+        name: 'Development',
+        component: () => import('@/views/Development.vue'),
+        meta: {
+          titleKey: 'development.title'
+        }
+      },
+      {
+        path: ':pathMatch(.*)*',
+        redirect: '/'
       }
     ]
   }
@@ -100,4 +112,3 @@ router.beforeEach((to, from, next) => {
 })
 
 export default router
-

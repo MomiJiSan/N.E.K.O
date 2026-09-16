@@ -237,6 +237,7 @@
           </WorkbenchToolbar>
         </template>
 
+
         <LoadingSpinner
           v-if="loading && rawPlugins.length === 0"
           :loading="true"
@@ -474,11 +475,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import type { AxiosError } from 'axios'
 import { Refresh, DataAnalysis, RefreshRight, Box, Connection, Finished, Sort, CircleClose, Close, VideoPlay, VideoPause, Delete, Upload, Download, ShoppingCart, ArrowRight, ArrowLeft, InfoFilled, User } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { usePluginStore } from '@/stores/plugin'
 import { useMetricsStore } from '@/stores/metrics'
-import { useMarketVersionsStore } from '@/stores/marketVersions'
+import { useMarketVersionsStore, type MarketVersionTarget } from '@/stores/marketVersions'
 import PluginGridSection from '@/components/plugin/PluginGridSection.vue'
 import PluginContextMenu from '@/components/plugin/PluginContextMenu.vue'
 import PluginDangerConfirmDialog from '@/components/plugin/PluginDangerConfirmDialog.vue'
@@ -504,14 +506,18 @@ import { usePluginListContextActions, type ResolvedPluginListAction } from '@/co
 import { usePluginWorkbench } from '@/composables/usePluginWorkbench'
 import { useMarketAuth } from '@/composables/useMarketAuth'
 import { METRICS_REFRESH_INTERVAL } from '@/utils/constants'
-import { formatHttpError } from '@/utils/request'
+import { formatHttpError, isRequestTimeout } from '@/utils/request'
 import { resolvePluginPackageErrorMessage } from '@/utils/pluginPackageError'
 import { resolveLocalizedText } from '@/utils/i18nLabel'
-import { findDuplicatePluginDisplayNameIds } from '@/utils/pluginDisplay'
+import { findDuplicatePluginDisplayNameIds, isOrdinaryPlugin } from '@/utils/pluginDisplay'
 import { openExternalUrl } from '@/utils/openExternal'
 import { isOpenUiNavigationAction } from '@/utils/pluginListActions'
 import { useI18n } from 'vue-i18n'
-import type { PluginListAction, PluginMeta } from '@/types/api'
+import type {
+  PluginInstallSourceDetailMarket,
+  PluginListAction,
+  PluginMeta,
+} from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -596,8 +602,8 @@ const dangerDialogMessage = computed(() => {
   )
 })
 
-const rawPlugins = computed(() => pluginStore.pluginsWithStatus)
-const rawNormalPlugins = computed(() => pluginStore.normalPlugins)
+const rawPlugins = computed(() => pluginStore.pluginsWithStatus.filter(isOrdinaryPlugin))
+const rawNormalPlugins = computed(() => pluginStore.normalPlugins.filter(isOrdinaryPlugin))
 const duplicateDisplayNamePluginIds = computed(() => [
   ...findDuplicatePluginDisplayNameIds(rawPlugins.value, locale.value),
 ])
@@ -632,16 +638,49 @@ let metricsRefreshTimer: number | null = null
 const showSourceDetail = ref(false)
 const marketVersionsStore = useMarketVersionsStore()
 
+function installedMarketVersionTargets(): MarketVersionTarget[] {
+  const targets: MarketVersionTarget[] = []
+  for (const plugin of pluginStore.pluginsWithStatus) {
+    const installSource = plugin.install_source
+    if (installSource?.source !== 'market') continue
+    const detail = installSource.source_detail as PluginInstallSourceDetailMarket | null
+    const pluginId = String(detail?.plugin_market_id || '').trim()
+    if (!/^\d+$/.test(pluginId)) continue
+    targets.push({
+      pluginId,
+      channel: detail?.channel === 'beta' ? 'beta' : 'stable',
+    })
+  }
+  return targets
+}
+
+function refreshInstalledMarketVersions(): void {
+  // Fire-and-forget; if Market is unreachable the badge simply won't appear.
+  // ``ensureFresh`` compares the target signature, so status-only updates do
+  // not cause a network request while a newly installed Market plugin does.
+  marketVersionsStore.ensureFresh(installedMarketVersionTargets()).catch((err) => {
+    console.warn('Failed to refresh market versions:', err)
+  })
+}
+
 async function toggleSourceDetail() {
   showSourceDetail.value = !showSourceDetail.value
   if (showSourceDetail.value) {
-    // Fire-and-forget; if Market is unreachable the badge simply won't
-    // appear, which is a fine degraded state.
-    marketVersionsStore.ensureFresh().catch((err) => {
-      console.warn('Failed to refresh market versions:', err)
-    })
+    refreshInstalledMarketVersions()
   }
 }
+
+// The initial plugin fetch and a Market install can both finish after source
+// details become visible. Recompute the target set on either change so update
+// badges are not held to the empty/stale snapshot from the original toggle.
+watch(
+  () => pluginStore.plugins,
+  () => {
+    if (showSourceDetail.value) refreshInstalledMarketVersions()
+  },
+  { deep: true },
+)
+
 const pluginSections = computed(() => [
   {
     key: 'plugin',
@@ -938,6 +977,9 @@ function resolveActionErrorMessage(error: any): string {
 }
 
 function shouldShowLocalError(error: any): boolean {
+  if (isRequestTimeout(error)) {
+    return false
+  }
   const status = error?.response?.status
   if (status === 401 || status === 403 || status === 404) {
     return true
@@ -1274,13 +1316,26 @@ async function handleBatchDelete() {
 
   batchBusy.value = true
   let ok = 0; let fail = 0
+  const restartWarnings: string[] = []
   for (const p of plugins) {
-    try { await deletePlugin(p.id); ok++ } catch { fail++ }
+    try {
+      const result = await deletePlugin(p.id)
+      ok++
+      if (result.restored_builtin_restart_error) {
+        restartWarnings.push(t('messages.pluginDeletedBuiltinRestartFailed', {
+          plugin: p.name,
+          error: result.restored_builtin_restart_error.message,
+        }))
+      }
+    } catch { fail++ }
   }
   batchBusy.value = false
   clearSelection()
-  if (fail === 0) ElMessage.success(t('plugins.batchDeleteSuccess', { count: ok }))
-  else ElMessage.warning(t('plugins.batchPartial', { success: ok, fail }))
+  if (restartWarnings.length > 0) ElMessage.warning(restartWarnings.join('; '))
+  if (fail > 0) ElMessage.warning(t('plugins.batchPartial', { success: ok, fail }))
+  else if (restartWarnings.length === 0) {
+    ElMessage.success(t('plugins.batchDeleteSuccess', { count: ok }))
+  }
   await refreshAfterPluginChange()
 }
 
@@ -1320,7 +1375,9 @@ async function handleReloadAll() {
     }
   } catch (error) {
     console.error('Failed to reload all plugins:', error)
-    ElMessage.error(t('messages.reloadFailed'))
+    if (!isRequestTimeout(error as AxiosError)) {
+      ElMessage.error(t('messages.reloadFailed'))
+    }
   } finally {
     reloadingAll.value = false
   }

@@ -166,6 +166,10 @@ const LIVE2D_PEEK_VISIBLE_RATIO = 0.22;
 const LIVE2D_PEEK_VISIBLE_MIN_PX = 96;
 const LIVE2D_PEEK_VISIBLE_MAX_PX = 180;
 const LIVE2D_PEEK_SIDE_ROTATION_DEGREES = 60;
+const LIVE2D_PEEK_SIDE_ROTATION_MAX_DEGREES = 55;
+const LIVE2D_PEEK_SIDE_ROTATION_MIN_DEGREES = 28;
+const LIVE2D_PEEK_SIDE_ROTATION_RATIO_START = 0.20;
+const LIVE2D_PEEK_SIDE_ROTATION_RATIO_END = 0.80;
 const LIVE2D_PEEK_CORNER_ROTATION_DEGREES = 45;
 // live2d-core.js performs its final cross-display renderer resize after 120ms.
 // Restore the semantic edge anchor only after that pass can no longer clear it.
@@ -632,12 +636,34 @@ function settleLive2DBaseAtEdgeContact(model, contact) {
     return true;
 }
 
-function getLive2DPeekRotationDegrees(anchor) {
+function getLive2DPeekSideRotationMagnitude(headAnchorRatio) {
+    if (headAnchorRatio === null || headAnchorRatio === undefined || headAnchorRatio === '') {
+        return LIVE2D_PEEK_SIDE_ROTATION_DEGREES;
+    }
+    const ratio = Number(headAnchorRatio);
+    if (!Number.isFinite(ratio)) return LIVE2D_PEEK_SIDE_ROTATION_DEGREES;
+    const progress = clampLive2DPeekCoordinate(
+        (ratio - LIVE2D_PEEK_SIDE_ROTATION_RATIO_START) /
+            (LIVE2D_PEEK_SIDE_ROTATION_RATIO_END - LIVE2D_PEEK_SIDE_ROTATION_RATIO_START),
+        0,
+        1
+    );
+    const smoothProgress = progress * progress * (3 - 2 * progress);
+    return LIVE2D_PEEK_SIDE_ROTATION_MAX_DEGREES +
+        (LIVE2D_PEEK_SIDE_ROTATION_MIN_DEGREES - LIVE2D_PEEK_SIDE_ROTATION_MAX_DEGREES) *
+            smoothProgress;
+}
+
+function getLive2DPeekRotationDegrees(anchor, headAnchorRatio = undefined) {
     if (!anchor || !anchor.side) return 0;
     if (!anchor.verticalEdge) {
+        const sideHeadAnchorRatio = headAnchorRatio === undefined
+            ? anchor.headAnchorRatio
+            : headAnchorRatio;
+        const rotationMagnitude = getLive2DPeekSideRotationMagnitude(sideHeadAnchorRatio);
         return anchor.side === 'left'
-            ? LIVE2D_PEEK_SIDE_ROTATION_DEGREES
-            : -LIVE2D_PEEK_SIDE_ROTATION_DEGREES;
+            ? rotationMagnitude
+            : -rotationMagnitude;
     }
     if (anchor.verticalEdge === 'top') {
         return anchor.side === 'left'
@@ -663,6 +689,25 @@ function getLive2DPeekHeadAnchor(manager) {
     if (!manager || typeof manager.getHeadScreenAnchor !== 'function') return null;
     try {
         const anchor = manager.getHeadScreenAnchor();
+        if (!anchor) return null;
+        const x = Number(anchor && anchor.x);
+        const y = Number(anchor && anchor.y);
+        return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function getLive2DPeekReliableHeadAnchor(manager) {
+    if (!manager || typeof manager.getHeadDetectionGeometryInfo !== 'function') return null;
+    try {
+        const info = manager.getHeadDetectionGeometryInfo();
+        if (!info || !info.reliableHeadRect) return null;
+        let anchor = info.headAnchor || info.rawHeadAnchor;
+        if (!anchor && typeof manager.getHeadScreenAnchor === 'function') {
+            anchor = manager.getHeadScreenAnchor();
+        }
+        if (!anchor) return null;
         const x = Number(anchor && anchor.x);
         const y = Number(anchor && anchor.y);
         return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
@@ -743,19 +788,43 @@ function getLive2DPeekPlacement(model, bounds, manager = null, anchor = null) {
     const baseY = Number(model.y) || 0;
     const baseRotation = Number.isFinite(Number(model.rotation)) ? Number(model.rotation) : 0;
     const baseScaleX = model.scale && Number.isFinite(Number(model.scale.x)) ? Number(model.scale.x) : 1;
-    const targetRotationDegrees = getLive2DPeekRotationDegrees(anchor);
-    const targetRotation = targetRotationDegrees * Math.PI / 180;
     let targetScaleX = getLive2DPeekInwardScaleX(model, side);
     if (side === 'right') {
         targetScaleX = Math.abs(targetScaleX);
     }
     const baseHeadAnchor = getLive2DPeekHeadAnchor(manager);
+    const baseReliableHeadAnchor = getLive2DPeekReliableHeadAnchor(manager);
     const fallbackHeadLocalPoint = baseHeadAnchor
         ? null
         : getLive2DPeekFallbackHeadLocalPoint(model, bounds);
     const fallbackBaseHeadAnchor = getLive2DPeekGlobalPoint(model, fallbackHeadLocalPoint);
     const effectiveBaseHeadAnchor = baseHeadAnchor || fallbackBaseHeadAnchor;
     const baseBodyRect = getLive2DPeekBodyRect(manager);
+    const baseRevealWidth = getLive2DPeekRevealWidth(bounds);
+    const sideHeadInsetY = clampLive2DPeekCoordinate(baseRevealWidth * 0.32, 36, 64);
+    const restoredHeadAnchorRatio = anchor.headAnchorRatio !== null &&
+            anchor.headAnchorRatio !== undefined &&
+            anchor.headAnchorRatio !== '' &&
+            Number.isFinite(Number(anchor.headAnchorRatio))
+        ? clampLive2DPeekCoordinate(Number(anchor.headAnchorRatio), 0, 1)
+        : null;
+    const rawSideHeadAnchorRatio = !verticalEdge && baseReliableHeadAnchor && viewport.height > 0
+        ? (restoredHeadAnchorRatio !== null
+            ? restoredHeadAnchorRatio
+            : clampLive2DPeekCoordinate((baseReliableHeadAnchor.y - viewport.top) / viewport.height, 0, 1))
+        : null;
+    const desiredSideHeadY = rawSideHeadAnchorRatio !== null
+        ? clampLive2DPeekCoordinate(
+            viewport.top + viewport.height * rawSideHeadAnchorRatio,
+            viewport.top + sideHeadInsetY,
+            viewport.bottom - sideHeadInsetY
+        )
+        : null;
+    const headAnchorRatio = desiredSideHeadY !== null && viewport.height > 0
+        ? clampLive2DPeekCoordinate((desiredSideHeadY - viewport.top) / viewport.height, 0, 1)
+        : null;
+    const targetRotationDegrees = getLive2DPeekRotationDegrees(anchor, headAnchorRatio);
+    const targetRotation = targetRotationDegrees * Math.PI / 180;
     const baseHeadY = effectiveBaseHeadAnchor
         ? effectiveBaseHeadAnchor.y
         : bounds.top + bounds.height * LIVE2D_PEEK_HEAD_Y_RATIO;
@@ -767,6 +836,7 @@ function getLive2DPeekPlacement(model, bounds, manager = null, anchor = null) {
 
     let transformedBounds = null;
     let transformedHeadAnchor = null;
+    let transformedReliableHeadAnchor = null;
     let transformedHeadAnchorSource = '';
     let transformedBodyRect = null;
     try {
@@ -776,6 +846,7 @@ function getLive2DPeekPlacement(model, bounds, manager = null, anchor = null) {
         if (model.scale) model.scale.x = targetScaleX;
         transformedBounds = getLive2DPeekBounds(model);
         transformedHeadAnchor = getLive2DPeekHeadAnchor(manager);
+        transformedReliableHeadAnchor = getLive2DPeekReliableHeadAnchor(manager);
         if (transformedHeadAnchor) {
             transformedHeadAnchorSource = 'manager';
         } else {
@@ -798,29 +869,50 @@ function getLive2DPeekPlacement(model, bounds, manager = null, anchor = null) {
     const desiredHeadX = side === 'left'
         ? viewport.left + headInset
         : viewport.right - headInset;
-    const useHeadAnchor = !!verticalEdge && !!transformedHeadAnchor;
-    const useWaistAnchor = !verticalEdge && !!(baseBodyRect && transformedBodyRect);
+    const useCornerHeadAnchor = !!verticalEdge && !!transformedHeadAnchor;
+    const useSideHeadAnchor = !verticalEdge &&
+        !!transformedReliableHeadAnchor &&
+        headAnchorRatio !== null;
+    const useWaistFallback = !verticalEdge &&
+        !useSideHeadAnchor &&
+        !!(baseBodyRect && transformedBodyRect);
     const desiredWaistX = side === 'left' ? viewport.left - 8 : viewport.right + 8;
-    let offsetX = useHeadAnchor
-        ? desiredHeadX - transformedHeadAnchor.x
-        : (useWaistAnchor
+    const placementHeadAnchor = useSideHeadAnchor
+        ? transformedReliableHeadAnchor
+        : transformedHeadAnchor;
+    let offsetX = useCornerHeadAnchor || useSideHeadAnchor
+        ? desiredHeadX - placementHeadAnchor.x
+        : (useWaistFallback
         ? desiredWaistX - transformedBodyRect.centerX
         : (transformedHeadAnchor
             ? desiredHeadX - transformedHeadAnchor.x
             : (side === 'left'
             ? viewport.left + revealWidth - transformedBounds.right
             : viewport.right - revealWidth - transformedBounds.left)));
+    if (useSideHeadAnchor && transformedBodyRect) {
+        const waistOffsetX = desiredWaistX - transformedBodyRect.centerX;
+        const minimumHeadInset = 36;
+        if (side === 'left') {
+            const minimumHeadOffsetX = viewport.left + minimumHeadInset - placementHeadAnchor.x;
+            offsetX = Math.max(Math.min(offsetX, waistOffsetX), minimumHeadOffsetX);
+        } else {
+            const maximumHeadOffsetX = viewport.right - minimumHeadInset - placementHeadAnchor.x;
+            offsetX = Math.min(Math.max(offsetX, waistOffsetX), maximumHeadOffsetX);
+        }
+    }
     const targetHeadY = transformedHeadAnchor
         ? transformedHeadAnchor.y
         : transformedBounds.top + transformedBounds.height * LIVE2D_PEEK_HEAD_Y_RATIO;
     let offsetY;
-    if (useHeadAnchor) {
+    if (useCornerHeadAnchor) {
         const desiredHeadInsetY = clampLive2DPeekCoordinate(revealWidth * 0.32, 36, 64);
         const desiredHeadYAtEdge = verticalEdge === 'bottom'
             ? viewport.bottom - desiredHeadInsetY
             : viewport.top + desiredHeadInsetY;
         offsetY = desiredHeadYAtEdge - transformedHeadAnchor.y;
-    } else if (useWaistAnchor) {
+    } else if (useSideHeadAnchor) {
+        offsetY = desiredSideHeadY - placementHeadAnchor.y;
+    } else if (useWaistFallback) {
         offsetY = baseBodyRect.bottom - transformedBodyRect.bottom;
     } else if (verticalEdge === 'top') {
         offsetY = viewport.top + revealWidth - transformedBounds.bottom;
@@ -869,6 +961,13 @@ function getLive2DPeekPlacement(model, bounds, manager = null, anchor = null) {
         0,
         1
     );
+    const resolvedHeadAnchorRatio = useSideHeadAnchor && viewport.height > 0
+        ? clampLive2DPeekCoordinate(
+            (placementHeadAnchor.y + offsetY - viewport.top) / viewport.height,
+            0,
+            1
+        )
+        : null;
     const hiddenOffsetX = side === 'left'
         ? viewport.left - targetBounds.right - LIVE2D_PEEK_HIDDEN_MARGIN_PX
         : viewport.right - targetBounds.left + LIVE2D_PEEK_HIDDEN_MARGIN_PX;
@@ -881,11 +980,12 @@ function getLive2DPeekPlacement(model, bounds, manager = null, anchor = null) {
         rotation: targetRotation,
         rotationDegrees: targetRotationDegrees,
         scaleX: targetScaleX,
-        headAnchored: useHeadAnchor || !!transformedHeadAnchor,
-        headAnchorSource: transformedHeadAnchorSource,
-        waistAnchored: useWaistAnchor,
+        headAnchored: useCornerHeadAnchor || useSideHeadAnchor,
+        headAnchorSource: useSideHeadAnchor ? 'manager' : transformedHeadAnchorSource,
+        waistAnchored: useWaistFallback,
         revealWidth,
         edgeAnchorRatio,
+        headAnchorRatio: resolvedHeadAnchorRatio,
         visibleBounds,
         hiddenX: baseX + offsetX + hiddenOffsetX,
         hiddenY: baseY + offsetY
@@ -1209,6 +1309,7 @@ Live2DManager.prototype._tryApplyLive2DPeek = async function (model, edgeContact
         headAnchorSource: target.headAnchorSource,
         waistAnchored: target.waistAnchored,
         edgeAnchorRatio: target.edgeAnchorRatio,
+        headAnchorRatio: target.headAnchorRatio,
         visibleBounds: target.visibleBounds
     };
     if (document.body) {
@@ -1292,7 +1393,7 @@ function captureLive2DPeekRestoreAnchor() {
     const visibleBounds = state.visibleBounds || getLive2DPeekViewportIntersection(bounds, viewport);
     if (!viewport || !visibleBounds || viewport.height <= 0) return null;
     const storedEdgeAnchorRatio = Number(state.edgeAnchorRatio);
-    return {
+    const restoreAnchor = {
         kind: 'live2d-edge-peek',
         edge,
         side: state.side,
@@ -1311,6 +1412,15 @@ function captureLive2DPeekRestoreAnchor() {
             scaleFactor: Number(window.devicePixelRatio) || 1
         }
     };
+    const storedHeadAnchorRatio = state.headAnchorRatio !== null &&
+            state.headAnchorRatio !== undefined &&
+            state.headAnchorRatio !== ''
+        ? Number(state.headAnchorRatio)
+        : NaN;
+    if ((edge === 'left' || edge === 'right') && Number.isFinite(storedHeadAnchorRatio)) {
+        restoreAnchor.headAnchorRatio = clampLive2DPeekCoordinate(storedHeadAnchorRatio, 0, 1);
+    }
+    return restoreAnchor;
 }
 
 async function restoreLive2DPeekAnchor(anchor) {
@@ -1349,10 +1459,18 @@ async function restoreLive2DPeekAnchor(anchor) {
     const verticalEdge = edge.startsWith('top-')
         ? 'top'
         : (edge.startsWith('bottom-') ? 'bottom' : '');
+    const restoredHeadAnchorRatio = !verticalEdge &&
+            anchor.headAnchorRatio !== null &&
+            anchor.headAnchorRatio !== undefined &&
+            anchor.headAnchorRatio !== '' &&
+            Number.isFinite(Number(anchor.headAnchorRatio))
+        ? clampLive2DPeekCoordinate(Number(anchor.headAnchorRatio), 0, 1)
+        : null;
     return await manager._tryApplyLive2DPeek(model, {
         edge,
         side,
         verticalEdge,
+        headAnchorRatio: restoredHeadAnchorRatio,
         geometry: getLive2DModelGeometryBounds(manager, model),
         workArea: viewport
     });
@@ -1555,6 +1673,17 @@ Live2DManager.prototype._checkSnapRequired = async function (model, options = {}
     }
 };
 
+// 排一帧吸附动画：Electron Pet 里渲染后端切到定时器驱动时走同周期定时器
+// （frame-pacing.requestPacedFrame），否则 rAF；裸 rAF 会在动画期间把 Blink 主帧顶回刷新率
+function scheduleLive2DSnapFrame(callback) {
+    const pacing = window.nekoFramePacing;
+    if (pacing && typeof pacing.requestPacedFrame === 'function') {
+        return pacing.requestPacedFrame(callback);
+    }
+    const id = requestAnimationFrame(callback);
+    return () => cancelAnimationFrame(id);
+}
+
 /**
  * 执行平滑吸附动画
  * @param {PIXI.DisplayObject} model - Live2D 模型对象
@@ -1607,7 +1736,7 @@ Live2DManager.prototype._performSnapAnimation = function (model, snapInfo, optio
             model.y = startY + (targetY - startY) * easedProgress;
 
             if (progress < 1) {
-                requestAnimationFrame(animate);
+                scheduleLive2DSnapFrame(animate);
             } else {
                 // 确保最终位置精确
                 model.x = targetX;
@@ -1619,7 +1748,7 @@ Live2DManager.prototype._performSnapAnimation = function (model, snapInfo, optio
         };
 
         console.debug('[Live2D] 开始吸附动画:', { from: { x: startX, y: startY }, to: { x: targetX, y: targetY } });
-        requestAnimationFrame(animate);
+        scheduleLive2DSnapFrame(animate);
     });
 };
 
@@ -2540,6 +2669,12 @@ Live2DManager.prototype.enableMouseTracking = function (model, options = {}) {
         const pointerCoords = getLive2DNiriPetPointerCoordinates(event);
         const pointer = pointerCoords.virtual;
         const localPointer = pointerCoords.local;
+        // 只有坐标真的变了才算「交互活动」去升帧。Electron Pet 的 preload 轮询会在光标
+        // 静止时也周期性派发合成 pointermove，不加这道闸它会把升帧的 hold 窗口无限续命，
+        // 空闲低频 tick 永远进不去。其余悬停/淡化状态逻辑照常执行，不受影响。
+        const pointerMoved = pointer.x !== this._lastMouseX || pointer.y !== this._lastMouseY;
+        // 供 live2d-core 的活动判定：isFocusing 只在光标最近真的动过时才算活动
+        if (pointerMoved) this._lastPointerMoveAt = performance.now();
         this._lastMouseX = pointer.x;
         this._lastMouseY = pointer.y;
         this._lastMouseLocalX = localPointer.x;
@@ -2695,7 +2830,7 @@ Live2DManager.prototype.enableMouseTracking = function (model, options = {}) {
             };
 
             if (distance < threshold) {
-                if (typeof this.boostLinuxX11InteractiveFPS === 'function') {
+                if (pointerMoved && typeof this.boostLinuxX11InteractiveFPS === 'function') {
                     this.boostLinuxX11InteractiveFPS();
                 }
                 showButtons();
@@ -2724,7 +2859,7 @@ Live2DManager.prototype.enableMouseTracking = function (model, options = {}) {
                     }
                 }
             } else if (isFullscreenTracking) {
-                if (typeof this.boostLinuxX11InteractiveFPS === 'function') {
+                if (pointerMoved && typeof this.boostLinuxX11InteractiveFPS === 'function') {
                     this.boostLinuxX11InteractiveFPS();
                 }
                 if (canvasEl && !this.isLocked && !(model.interactive && model.dragging)) {
@@ -3704,6 +3839,10 @@ Live2DManager.prototype.cleanupEventListeners = function () {
     this._clickEffectAction = null;
     this._currentClickEffectId = null;
 
+    if (typeof this._cancelTouchSetExpressionRestore === 'function') {
+        this._cancelTouchSetExpressionRestore();
+    }
+
     // 清理页面卸载监听器（如果存在）
     if (this._unloadListener) {
         window.removeEventListener('beforeunload', this._unloadListener);
@@ -4264,6 +4403,26 @@ Live2DManager.prototype.setupHitAreaInteraction = function(model) {
     console.log(`[HitArea] HitArea 交互已设置 : ${window.live2dManager.modelName}`);
 };
 
+Live2DManager.prototype._cancelTouchSetExpressionRestore = function() {
+    this._touchSetExpressionRestoreGeneration = (this._touchSetExpressionRestoreGeneration || 0) + 1;
+    const restoreState = this._touchSetExpressionRestoreState;
+    if (restoreState?.timer) {
+        clearTimeout(restoreState.timer);
+    }
+    this._touchSetExpressionRestoreState = null;
+    return this._touchSetExpressionRestoreGeneration;
+};
+
+Live2DManager.prototype._isTouchSetExpressionRestoreCurrent = function() {
+    const restoreState = this._touchSetExpressionRestoreState;
+    return !!(
+        restoreState
+        && restoreState.generation === this._touchSetExpressionRestoreGeneration
+        && restoreState.model === this.currentModel
+        && restoreState.expressionGeneration === this._transientExpressionGeneration
+    );
+};
+
 /**
  * 根据 touchSet 配置播放 HitArea 对应的动画
  * @param {string} hitAreaId - HitArea ID
@@ -4483,7 +4642,10 @@ Live2DManager.prototype._playTouchSetAnimation = async function(hitAreaId, optio
             } else {
                 console.log(`[TouchSet] 尝试播放表情: ${faceInfo.File}`);
                 try {
-                    const expressionResult = await this.playExpression(randomExpressionName, faceInfo.File);
+                    const touchExpressionModel = this.currentModel;
+                    const expressionTask = this.playExpression(randomExpressionName, faceInfo.File);
+                    const touchExpressionGeneration = this._transientExpressionGeneration;
+                    const expressionResult = await expressionTask;
                     if (expressionResult !== false) {
                         triggerLog.expressions.push({
                             name: randomExpressionName,
@@ -4501,16 +4663,38 @@ Live2DManager.prototype._playTouchSetAnimation = async function(hitAreaId, optio
                         console.warn(`[TouchSet] 表情播放返回失败: ${randomExpressionName}`);
                     }
 
-                    clearTimeout(this.expressionTimer);
-                    const holdingTime = Number.isFinite(faceHoldingTime) && faceHoldingTime > 0 ? faceHoldingTime : 3000;
-                    this.expressionTimer = setTimeout(async () => {
-                        if (typeof this.clearExpression === 'function') {
-                            try {
-                                await this.clearExpression();
-                                console.log(`[TouchSet] 临时表情清除，准备恢复常驻状态`);
-                            } catch (_) {}
-                        }
-                    }, holdingTime);
+                    if (
+                        expressionResult !== false
+                        && this.currentModel === touchExpressionModel
+                        && this._transientExpressionGeneration === touchExpressionGeneration
+                    ) {
+                        const holdingTime = Number.isFinite(faceHoldingTime) && faceHoldingTime > 0 ? faceHoldingTime : 3000;
+                        const restoreGeneration = this._cancelTouchSetExpressionRestore();
+                        const restoreState = {
+                            generation: restoreGeneration,
+                            model: touchExpressionModel,
+                            expressionGeneration: touchExpressionGeneration,
+                            timer: null
+                        };
+                        this._touchSetExpressionRestoreState = restoreState;
+                        restoreState.timer = setTimeout(async () => {
+                            if (this._touchSetExpressionRestoreState !== restoreState) {
+                                return;
+                            }
+                            const shouldRestore = this._isTouchSetExpressionRestoreCurrent();
+                            this._touchSetExpressionRestoreState = null;
+                            if (!shouldRestore) {
+                                console.log('[TouchSet] 临时表情已被新的表情接管，跳过恢复');
+                                return;
+                            }
+                            if (typeof this.clearExpression === 'function') {
+                                try {
+                                    await this.clearExpression();
+                                    console.log(`[TouchSet] 临时表情清除，准备恢复常驻状态`);
+                                } catch (_) {}
+                            }
+                        }, holdingTime);
+                    }
                 } catch (e) {
                     triggerLog.failedExpressions.push({
                         name: randomExpressionName,

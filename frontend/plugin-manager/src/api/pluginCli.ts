@@ -7,7 +7,13 @@ import { API_BASE_URL } from '@/utils/constants'
 
 export type PluginCliConflictStrategy = 'fail'
 export type PluginCliBuildMode = 'selected' | 'single' | 'bundle' | 'all'
-export type PluginCliInstallAction = 'install' | 'upgrade' | 'reinstall' | 'downgrade' | 'blocked'
+export type PluginCliInstallAction =
+  | 'install'
+  | 'upgrade'
+  | 'reinstall'
+  | 'downgrade'
+  | 'override_builtin'
+  | 'blocked'
 
 export interface PluginCliPluginRef {
   root_id: 'builtin' | 'user'
@@ -18,6 +24,8 @@ export interface PluginCliPluginRef {
 
 export interface PluginCliBuildRequest {
   mode: PluginCliBuildMode
+  development_ref?: { registration_id: string; revision: number }
+  development_refs?: Array<{ registration_id: string; revision: number }>
   plugin?: string
   plugins?: string[]
   plugin_ref?: PluginCliPluginRef
@@ -117,6 +125,8 @@ export interface PluginCliInstallPlanResponse {
   confirmation_token: string
   reason: string
   legacy_plugin_ids: string[]
+  current_source?: string
+  target_source?: string
 }
 
 export interface PluginCliInstalledPlugin {
@@ -140,7 +150,7 @@ export interface PluginCliInstallResponse {
   payload_hash_verified: boolean | null
   conflict_strategy: PluginCliConflictStrategy
   installed_plugin_count: number
-  operation: 'install' | 'upgrade' | 'reinstall' | 'downgrade'
+  operation: 'install' | 'upgrade' | 'reinstall' | 'downgrade' | 'override_builtin'
   restarted: boolean
   rollback_status: 'not_needed' | 'completed' | 'incomplete'
   install_source_warning?: string | null
@@ -214,8 +224,12 @@ export function getPluginCliPackages(): Promise<PluginCliLocalPackagesResponse> 
 /**
  * 构建一个或多个插件
  */
-export function buildPluginCli(payload: PluginCliBuildRequest): Promise<PluginCliBuildResponse> {
-  return post('/plugin-cli/build', payload)
+export function buildPluginCli(payload: PluginCliBuildRequest, config?: Pick<AxiosRequestConfig, 'timeout'>): Promise<PluginCliBuildResponse> {
+  if (payload.development_ref || payload.development_refs?.length || payload.mode === 'all') {
+    // Staging, metadata probing and archive validation can outlast a normal API request.
+    return post('/plugin-cli/build', payload, { timeout: 300_000, headers: { 'X-Neko-Development': '1' } })
+  }
+  return config ? post('/plugin-cli/build', payload, config) : post('/plugin-cli/build', payload)
 }
 
 /**

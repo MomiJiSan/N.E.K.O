@@ -644,12 +644,17 @@ export function usePackageManager(options: UsePackageManagerOptions = {}) {
 
       if (buildMode.value === 'all') {
         let response: PluginCliBuildResponse
+        // This workbench lists managed sources; implicit API "all" also builds
+        // development archives, which belong to the protected development page.
+        const refs = targetRefs(targets)
         try {
           response = await buildPluginCli({
-            mode: 'all',
+            mode: 'selected',
+            plugin_refs: refs.length > 0 ? refs : undefined,
+            plugins: refs.length > 0 ? undefined : targets,
             target_dir: buildForm.value.target_dir || undefined,
             keep_staging: !!buildForm.value.keep_staging,
-          })
+          }, { timeout: 300_000 })
         } catch (error) {
           response = failedBuildResponse('all', error)
           setResult('build', response)
@@ -761,9 +766,13 @@ export function usePackageManager(options: UsePackageManagerOptions = {}) {
       response.operation === 'upgrade'
       || response.operation === 'reinstall'
       || response.operation === 'downgrade'
+      || response.operation === 'override_builtin'
     ) {
       const plan = installPlan.value
-      ElMessage.success(t(`package.install.${response.operation}Succeeded`, {
+      const successOperation = plan?.reason === 'manual_takeover'
+        ? 'manualTakeover'
+        : response.operation
+      ElMessage.success(t(`package.install.${successOperation}Succeeded`, {
         plugin: plan?.plugin_id || plan?.directory_name || '',
       }))
     } else {

@@ -9,6 +9,14 @@ vi.mock('@/api', () => ({
 }))
 
 describe('plugin hosted UI API', () => {
+  it('marks aggregate refreshes as local development actions and preserves caller options', async () => {
+    const { refreshPluginsRegistry } = await import('./plugins')
+    await refreshPluginsRegistry({ timeout: 1234, preserveMessagesOn404: true, headers: { 'X-Other': 'value' } })
+    expect(postMock).toHaveBeenCalledWith('/plugins/refresh', undefined, {
+      timeout: 1234, preserveMessagesOn404: true,
+      headers: { 'X-Other': 'value', 'X-Neko-Development': '1' },
+    })
+  })
   beforeEach(() => {
     postMock.mockReset()
     getMock.mockReset()
@@ -25,6 +33,33 @@ describe('plugin hosted UI API', () => {
     expect(getMock).toHaveBeenCalledWith('/plugins', {
       params: { source: 'local', locale: 'zh-CN' },
       timeout: 1000,
+    })
+  })
+
+  it.each([
+    ['startPlugin', '/plugin/demo%20plugin/start'],
+    ['reloadPlugin', '/plugin/demo%20plugin/reload'],
+  ] as const)('gives %s a dedicated lifecycle timeout and message', async (functionName, url) => {
+    postMock.mockResolvedValue({ success: true })
+    const pluginApi = await import('./plugins')
+
+    await pluginApi[functionName]('demo plugin')
+
+    expect(postMock).toHaveBeenCalledWith(url, undefined, {
+      timeout: 45000,
+      timeoutErrorMessageKey: 'messages.pluginLifecycleTimeout',
+    })
+  })
+
+  it('does not let Axios truncate an aggregate reload', async () => {
+    postMock.mockResolvedValue({ success: true })
+    const { reloadAllPlugins } = await import('./plugins')
+
+    await reloadAllPlugins()
+
+    expect(postMock).toHaveBeenCalledWith('/plugins/reload', undefined, {
+      timeout: 0,
+      headers: { 'X-Neko-Development': '1' },
     })
   })
 

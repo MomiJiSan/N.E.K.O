@@ -25,6 +25,7 @@ from ._shared import (
     Optional,
     ToolDefinition,
     TurnDetectionMode,
+    VisualDeliveryMode,
     _IMAGE_ANALYSIS_PENDING_DESCRIPTION,
     asyncio,
     response_arbiter_fail_open_enabled,
@@ -106,6 +107,8 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         on_new_message: Optional[Callable[[], Awaitable[None]]] = None,
         on_sid_rotate: Optional[Callable[[], Awaitable[None]]] = None,
         on_input_transcript: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_input_transcript_with_route: Optional[Callable[..., Awaitable[None]]] = None,
+        get_input_route_identity: Optional[Callable[[], "tuple[str, str, str] | None"]] = None,
         on_output_transcript: Optional[Callable[[str, bool], Awaitable[None]]] = None,
         on_connection_error: Optional[Callable[[str], Awaitable[None]]] = None,
         on_response_done: Optional[Callable[[], Awaitable[None]]] = None,
@@ -113,12 +116,17 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         on_status_message: Optional[Callable[[str], Awaitable[None]]] = None,
         on_repetition_detected: Optional[Callable[[], Awaitable[None]]] = None,
         get_host_turn_id: Optional[Callable[[], "str | None"]] = None,
+        # Which character this session belongs to. Optional because the field
+        # is only used to attribute frame copies -- a caller that does not pass
+        # it gets the previous behaviour (unattributed) rather than a crash.
+        lanlan_name: Optional[str] = None,
         extra_event_handlers: Optional[Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]]] = None,
         api_type: Optional[str] = None,
         on_tool_call: Optional[OnToolCallCallback] = None,
         tool_definitions: Optional[List[ToolDefinition]] = None,
         livestream_mode: bool = False,
         noise_reduction_enabled: bool = True,
+        turn_admission_lock: Optional[asyncio.Lock] = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -146,6 +154,18 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self.on_new_message = on_new_message
         self.on_sid_rotate = on_sid_rotate
         self.on_input_transcript = on_input_transcript
+        self.on_input_transcript_with_route = on_input_transcript_with_route
+        self.get_input_route_identity = get_input_route_identity
+        # One client-side utterance slot plus at most eight server item ids.
+        # Provider finals consume their entry; reconnect/close clears all.
+        self._input_route_identity_captured = False
+        self._input_route_identity = None
+        self._input_route_identity_by_item: dict[str, tuple[str, str, str] | None] = {}
+        # Route owning the most recent audio frame seen before an onset, used
+        # when the local onset gate never armed a snapshot. Last-write-wins, so
+        # it cannot carry a stale owner into a later utterance.
+        self._input_route_identity_stream_armed = False
+        self._input_route_identity_stream_owner = None
         self.on_output_transcript = on_output_transcript
         self.turn_detection_mode = turn_detection_mode
         self.on_connection_error = on_connection_error
@@ -154,8 +174,35 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self.on_status_message = on_status_message
         self.on_repetition_detected = on_repetition_detected
         self.get_host_turn_id = get_host_turn_id
+        self.lanlan_name = lanlan_name
         self.extra_event_handlers = extra_event_handlers or {}
         self._bg_tasks: set = set()  # 防止 fire-and-forget 任务被 GC 回收
+        # Tool handlers have narrower ownership than generic background work:
+        # their results belong to one connection and one user-turn scope.
+        self._tool_scope_generation = 0
+        # Some OpenAI-compatible proxies omit speech_started/stopped and only
+        # report the completed input transcript. Track whether server VAD has
+        # already advanced this input's tool scope so the transcript can fill
+        # that gap without advancing a normal provider's turn twice.
+        #
+        # Two markers, because the providers this covers are inconsistent.
+        # ``_raw_speech_started_scoped_item_ids`` is the real one: the
+        # utterance ids a ``speech_started`` already scoped, so a transcript
+        # is matched against ITS OWN utterance rather than against "some
+        # utterance was scoped at some point". The bool is the fallback for a
+        # proxy that sends neither event an ``item_id``; it is all the
+        # pre-identity shape ever had, and on its own it survives an utterance
+        # whose transcript never arrives -- the next turn's transcript then
+        # reads as already scoped and a stale tool result can cross into it.
+        self._raw_speech_started_scope_pending_transcript = False
+        self._raw_speech_started_scoped_item_ids: List[str] = []
+        self._tool_tasks: set[asyncio.Task] = set()
+        # Tool tasks that can no longer produce a usable result, whatever
+        # retired them. Recorded rather than re-derived: see
+        # ``_retired_tool_tasks``.
+        self._retired_tool_task_set: set[asyncio.Task] = set()
+        self._tool_tasks_by_call_id: Dict[str, set[asyncio.Task]] = {}
+        self._cancelled_tool_call_ids: set[tuple[int, int, str]] = set()
         # Teardown owns the socket it detached, so a cancelled caller cannot
         # strand it. Both close paths run as one task per connection and every
         # caller awaits it through a shield: cancelling the caller stops the
@@ -165,6 +212,10 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._close_task = None
         self._failed_transport_close_task = None
         self._gemini_close_task = None
+        # A replacement can reset the connection-wide close latch while the
+        # retired Gemini context is still exiting. Keep a separate latch per
+        # context so every path joins the same one-shot ``__aexit__`` call.
+        self._gemini_context_close_tasks: dict[int, tuple[Any, asyncio.Task]] = {}
         # Bumped when a replacement connection attaches. A teardown that
         # outlived its caller compares it after every await: the socket it
         # detached is still its own to close, but client-wide state (silence
@@ -275,16 +326,32 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._image_description = _IMAGE_ANALYSIS_PENDING_DESCRIPTION
         self._latest_image_b64 = None  # Cached latest screenshot for proactive injection
         self._latest_image_generation = 0  # Distinguishes identical consecutive frames
+        self._latest_image_captured_at = 0.0
+        self._latest_image_source = "unknown"
+        self._latest_image_request_id = None
         self._proactive_image_consumed = True  # Whether the cached image has been used by a proactive nudge
+        # Native is the backwards-compatible session default. Independent ASR
+        # explicitly switches this to EXTERNAL_DESCRIPTION through the neutral
+        # session API; provider capability remains a separate concern.
+        self._visual_delivery_mode = VisualDeliveryMode.NATIVE
+        self._raw_visual_delivery_blocked = False
+        self._visual_delivery_epoch = 0
+        # Callback-owned native media and user turns share this boundary. Core
+        # passes its voice-proactive lock so the whole callback media+text
+        # transaction is mutually exclusive with both server-VAD and external
+        # ASR turn admission. Standalone clients keep an equivalent local lock.
+        self._turn_admission_lock = turn_admission_lock or asyncio.Lock()
 
         # Silence detection for auto-closing inactive sessions
         # 只在 GLM 和 free API 时启用90秒静默超时，Qwen 和 Step 放行
         self._last_speech_time = None
         self._api_type = api_type or ""
         self._livestream_mode = bool(livestream_mode)
-        # 只在 GLM 和 free 时启用静默超时；livestream 模式（主播长会话）整路跳过
+        # 判据用推断后的 api_type：api_type 为空、靠 free 模型名 + lanlan 路由
+        # 推断出来的那条也是 free，和本类其余 free 判断保持一致。
+        # livestream 模式（主播长会话）整路跳过。
         self._enable_silence_timeout = (
-            self._api_type.lower() in ['glm', 'free']
+            _effective_api_type.lower() in ['glm', 'free']
             and not self._livestream_mode
         )
         self._silence_timeout_seconds = 90  # 90秒无语音输入则自动关闭
@@ -474,6 +541,11 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # was optimistically pruned after send. Entries also self-expire to
         # avoid leaks if the server never acks.
         self._inject_rejection_handlers: Dict[str, Callable[[str], None]] = {}
+        # ``session.updated`` is the ordered Provider acknowledgement used by
+        # hot-swap passive-media delivery barriers. Each waiter names the exact
+        # instructions snapshot sent after its media writes, so an older
+        # connection-setup acknowledgement cannot settle a later handoff.
+        self._session_update_ack_waiters: list[tuple[str, asyncio.Future]] = []
         # One-shot gate for the no-event_id content fallback in
         # ``_route_inject_rejection``. True only between "a proactive inject
         # just sent its ``response.create``" and "that inject's outcome was
@@ -485,6 +557,32 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._proactive_inject_awaiting_outcome = False
         self._proactive_inject_outcome_token: Optional[str] = None
         self._gemini_proactive_outcome: Optional[tuple] = None
+        # The task currently parked inside Gemini's proactive SDK send. A new
+        # independent-ASR turn cancels and joins it before opening its own turn,
+        # closing the post-activity-check race where the stale inject could land
+        # while user speech was already being captured.
+        self._gemini_proactive_submit_task: Optional[asyncio.Task] = None
+        # 那条在飞的 send 属于哪个 SDK session。守卫按它收窄——不能只看"有没有
+        # 在飞的 send"：替换连接attach 之后，卡在**退休** session 上的旧 send
+        # 跟新 session 上的 inject 根本不争同一条链路。
+        self._gemini_proactive_submit_session: object | None = None
+        self._gemini_proactive_quarantine_task: Optional[asyncio.Task] = None
+        # External-ASR Gemini sends have the same accepted-before-cancellation
+        # ambiguity as proactive sends. Keep the submit identity after its
+        # visual record is abandoned so a successor turn can join quarantine
+        # and retire the owning SDK session before reconnecting.
+        self._gemini_external_submit_task: Optional[asyncio.Task] = None
+        # ``send_client_content`` returning only proves that Gemini accepted the
+        # turn; the response still owns this session until its terminal event.
+        # Keep a distinct token because the submit coroutine itself may already
+        # be finished when the next external-ASR utterance starts.
+        self._gemini_external_outcome_token: Optional[object] = None
+        self._gemini_cancelled_terminal_pending = False
+        self._gemini_cancelled_terminal_deadline: Optional[float] = None
+        self._gemini_cancelled_terminal_awaiting_delivery = False
+        self._gemini_cancelled_terminal_id: Optional[object] = None
+        self._gemini_external_quarantine_task: Optional[asyncio.Task] = None
+        self._gemini_proactive_outcome_owner: Optional[tuple] = None
 
     def _create_audio_processor(self) -> AudioProcessor:
         """Create session-owned audio state, including native RNNoise state."""
@@ -501,3 +599,65 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         return task
+
+    async def _cancel_frame_copies(self) -> None:
+        """End every in-flight frame copy. The dual of the offline client's.
+
+        ``_bg_tasks`` is never cancelled on close, so without this a copy
+        parked in the cross-loop handoff outlives the session holding its
+        base64, and publishes a frame from a retired session if the bridge
+        later recovers. Cancel then collect -- a cancelled task has not
+        stopped until it has been awaited.
+        """
+        # Latch before draining, the same way the offline client does. Draining
+        # alone races: an image send already awaiting the provider (Gemini's
+        # send_realtime_input, a queued WebSocket event) resolves after the
+        # drain, fires a fresh copy, and that copy outlives the closed session
+        # with nothing left to collect it.
+        self._frame_copies_closed = True
+        tasks = getattr(self, "_frame_copy_tasks", None)
+        if not tasks:
+            return
+        # Snapshot: the done-callbacks discard from the live sets as they end.
+        draining = list(tasks)
+        for task in draining:
+            task.cancel()
+        await asyncio.gather(*draining, return_exceptions=True)
+        tasks.clear()
+
+    def _fire_frame_copy(self, coro):
+        """``_fire_task`` for frame copies only, and bounded.
+
+        The ceiling is counted in its OWN set, not in ``_bg_tasks``: that set
+        holds quarantine and lifecycle work whose whole job is to finish, and
+        capping it would drop exactly the tasks that must not be dropped. A
+        frame copy is the only thing here that is both optional and
+        multi-megabyte, so it is the only thing that gets one.
+
+        The task itself is still created through ``_fire_task``, so it stays
+        registered for teardown like every other background task, and the
+        single seam tests use to observe or refuse one keeps working.
+        """
+        from main_logic.agent_event_bus import spawn_bounded_frame_copy
+
+        if getattr(self, "_frame_copies_closed", False):
+            # close() has begun. A copy started now describes a session that is
+            # gone, and the drain has already run -- nothing would collect it.
+            coro.close()
+            return None
+        tasks = getattr(self, "_frame_copy_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._frame_copy_tasks = tasks
+        return spawn_bounded_frame_copy(
+            coro, tasks, label="realtime bus copy", spawn=self._fire_task,
+        )
+
+    def _ensure_turn_admission_lock(self) -> asyncio.Lock:
+        """Return the shared callback/user-turn boundary, lazily for doubles."""
+
+        lock = getattr(self, "_turn_admission_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._turn_admission_lock = lock
+        return lock

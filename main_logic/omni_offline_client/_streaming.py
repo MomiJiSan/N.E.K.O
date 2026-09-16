@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Sequence
+
+from main_logic.proactive_delivery import (
+    TURN_ATTACHED_IMAGE_MAX_TOTAL_BYTES,
+    fit_images_to_turn_budget,
+)
+
 from ._shared import (
     AIMessage,
     Any,
@@ -47,6 +54,13 @@ from ._shared import (
     set_call_type,
     time,
     truncate_to_tokens,
+)
+
+from ._media import (
+    _FRAME_SOURCE_PLUGIN,
+    _FRAME_SOURCE_SCREEN,
+    _FRAME_SOURCE_UNKNOWN,
+    _FRAME_SOURCE_USER,
 )
 
 from ._genai_support import (
@@ -122,6 +136,9 @@ class _StreamingMixin:
     async def connect(self, instructions: str, native_audio=False) -> None:
         """Initialize the client with system instructions."""
         self._instructions = instructions
+        # 与 realtime 侧同：close() 立起来的抄送闭锁在这里落下，否则同一个实例
+        # 被复用时，重新 connect 之后帧/对话都不再上总线。
+        self._bus_copies_closed = False
         # Add system message to conversation history using langchain format
         self._conversation_history = [
             SystemMessage(content=instructions)
@@ -172,11 +189,32 @@ class _StreamingMixin:
             # 先创建新 client，成功后再原子替换，避免半切换状态。
             # max_completion_tokens 跟随当前 max_response_length 同步设置
             # （和 __init__ 一致）。
+            _derived_max_tokens = _budget_to_max_tokens(self.max_response_length)
+            # 但不能只看 max_response_length：这个函数会在**回合中途**被调用
+            # （工具返回图片要切 vision 模型），而那时 stream_text 可能已经把
+            # 当前 client 的 max_completion_tokens 抬到 summary 档、或者加了
+            # 凝神轮的 token 头寸。按 max_response_length 重算等于把那一档丢掉，
+            # 追问和最终回答会被 provider 提前截断——而回合的 finally 随后又把
+            # **旧** client 存下的值写到这个新 client 上。
+            #
+            # 只往高处继承：低于基线的旧值是上一次抬升退回后的残留，不该复活。
+            _live_max_tokens = getattr(
+                getattr(self, "llm", None), "max_completion_tokens", None
+            )
+            # None 是 unlimited sentinel（_budget_to_max_tokens 对无上限预算返回
+            # None，让请求整个省掉这个字段），它已经是最高的一档，没有什么可继承
+            # 的——拿一个有限的实时值盖上去反而是降级。而且不先判空的话，下面这个
+            # 比较就是 int > None，直接 TypeError，卡死在本修复要保护的那条路上。
+            if (
+                _derived_max_tokens is not None
+                and isinstance(_live_max_tokens, int)
+                and _live_max_tokens > _derived_max_tokens
+            ):
+                _derived_max_tokens = _live_max_tokens
             new_llm = await create_chat_llm_async(
                 new_model, base_url, api_key,
                 streaming=True, max_retries=0,
-                # 普通 budget；summary 的 3000 抬升只在 stream_text 内临时生效。
-                max_completion_tokens=_budget_to_max_tokens(self.max_response_length),
+                max_completion_tokens=_derived_max_tokens,
                 timeout=DIALOG_LLM_STREAM_TIMEOUT_SECONDS,  # hang-guard; generous so normal/long replies aren't truncated
                 provider_type=provider_type,
             )
@@ -490,6 +528,19 @@ class _StreamingMixin:
         text: str,
         *,
         system_prefix: str | None = None,
+        system_prefix_images: Optional[list[str]] = None,
+        turn_images: Optional[Sequence[str]] = None,
+        # 这一轮 turn_images 的采集通道（"screen" / "camera"）。独立 ASR 的帧
+        # 到这里就只是一串 base64 了，看不出它是屏幕还是摄像头；不带上的话
+        # 它们会被当成普通用户附件标成 "user"，而按 source 过滤的插件正好会
+        # 拿错。realtime 那侧走的是 MultimodalTurn.source，这是它的离线对偶。
+        turn_source: Optional[str] = None,
+        # turn_images 里**前几张**才属于这个通道。独立 ASR 提交时会把用户已经
+        # 拖进来的附件接在抽样帧后面一起送（见 _media.py 的排序说明），而附件
+        # 是他自己给的东西，不该跟着这一轮的采集通道走。
+        turn_source_count: Optional[int] = None,
+        turn_id: Optional[str] = None,
+        on_turn_committed: Optional[Callable[[], None]] = None,
         thinking_on: bool = False,
         input_transcript_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         history_replacement_text: str | None = None,
@@ -537,10 +588,43 @@ class _StreamingMixin:
         ``response_discarded_callback`` binds discard ownership to this invocation.
         It avoids re-reading mutable session-level request state after a later text
         request has already started.
+
+        ``system_prefix_images`` binds passive callback media to the same
+        invocation as ``system_prefix``.  Unlike ``_pending_images``, this list
+        cannot be consumed by a concurrently scheduled text request while Core
+        awaits its Focus decision.
+
+        ``turn_id`` identifies an independent-ASR utterance and travels no
+        further than the plugin frame bus, where it is what lets a plugin see
+        that several frames were sampled from one utterance. Ordinary text
+        turns have no such identity and leave it None.
         """  # noqa: DOCSTRING_CJK
+        prefix_images = list(system_prefix_images or [])
+        # 本轮自带的用户帧（独立 ASR 抽样出的开头/中间/结尾）。刻意不走
+        # _pending_images：那条队列是 session 级的"下一个消费者拿走"，一次性附件
+        # （拖图 / 聊天贴图）随时可能在 staging 与本次消费之间挤进来，被这一轮
+        # 连带吞掉，用户那张图就配错了发言。invocation-local 才没有这个窗口。
+        own_images = [image for image in (turn_images or []) if image]
+        # 一个自带帧的回合（独立 ASR）绝不消费共享附件队列。那条队列是 session 级
+        # 的「下一个消费者拿走」：本轮 await（switch_model / provider 请求）期间到达
+        # 的附件会被顺手清掉，既配错了发言，也不再能给它自己的追问用。附件在
+        # submit 入口已经按快照取走过一次，这里只负责不再碰活的队列。
+        # 取走必须和拷贝在同一个同步步骤里完成，中间不能有 await：下面
+        # switch_model() 一让出，另一条并发的普通文本请求就会拷到同一批附件，两轮
+        # 各发一次同样的图，随后的按前缀删除还会切到别人的队列。
+        if own_images:
+            attachment_images = []
+        else:
+            attachment_images = list(self._pending_images)
+            del self._pending_images[:len(attachment_images)]
         if not text or not text.strip():
             # If only images without text, use a default prompt
-            if self._pending_images:
+            if (
+                attachment_images
+                or prefix_images
+                or own_images
+                or getattr(self, "_pending_plugin_images", None)
+            ):
                 text = "请分析这些图片。"
             else:
                 return
@@ -583,7 +667,20 @@ class _StreamingMixin:
                 self._proactive_image_staged_at = 0.0
                 self._proactive_image_history_len = 0
                 proactive_image = None
-        has_images = bool(proactive_image) or len(self._pending_images) > 0
+        # Plugin `read` frames sit in their own quota-bounded list. Instances
+        # built via __new__ (tests, legacy callers) never ran __init__, so read
+        # it the same defensive way the proactive slot is read above.
+        #
+        # 只在这里做**判断**，内容留到下面和用户列表一起读：切 vision model 是
+        # 个 await，此刻取快照会漏掉切换期间到达的插件图，而它随后又会被清掉，
+        # 等于从每一轮里都丢失（Codex P2）。
+        has_images = (
+            bool(proactive_image)
+            or bool(prefix_images)
+            or bool(own_images)
+            or bool(attachment_images)
+            or len(getattr(self, "_pending_plugin_images", None) or []) > 0
+        )
         # 就地植入 system_prefix：拼到 user content 的 text 段前缀（watermark
         # 自带，不补 separator 也能区分）。callback 文本随 HumanMessage 一起
         # 落 history，跟 voice mode user-role 注入对偶。
@@ -599,23 +696,152 @@ class _StreamingMixin:
             # (cannot switch back because image data remains in conversation history)
             if self.vision_model and self.vision_model != self.model:
                 logger.info(f"🖼️ Temporarily switching to vision model: {self.vision_model} (from {self.model})")
-                await self.switch_model(self.vision_model, use_vision_config=True)
+                try:
+                    await self.switch_model(self.vision_model, use_vision_config=True)
+                except BaseException:
+                    # 附件在上面已经原子出队了。这里是出队之后、真正拼进消息之前
+                    # 唯一的 await：切 vision model 要新建 LLM 客户端，网络抖动 /
+                    # key 失效都会抛。不放回去的话用户刚选的图既没发出去也不在队列
+                    # 里了。与 submit_multimodal_turn 的失败回滚同一判据。
+                    if attachment_images:
+                        self._pending_images[0:0] = attachment_images
+                    raise
 
             # Multi-modal message: images + text
             content = []
 
-            # Add images first. Temporal order: the proactive screenshot (the
-            # screen she commented on, BEFORE the user spoke) leads, then the
-            # user's own pending frame(s) — so the model doesn't mistake the
-            # earlier screen for what the user just captured.
-            if proactive_image:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{proactive_image}"
-                    }
-                })
-            for img_b64 in self._pending_images:
+            # 在模型切换的 await **之后**读取，且到下面的清理之间没有挂起点，
+            # 保证「附上的」和「清掉的」是同一批（用户那条列表靠就地迭代天然拥有
+            # 这个性质）。
+            plugin_images = list(getattr(self, "_pending_plugin_images", None) or [])
+            # 就地取走所有权：读完立刻清空，中间**不能**有 await（否则模型调用期间
+            # 到达的插件图会被下面的清理连带抹掉，等于从每一轮里丢失）。取走之后
+            # 这批字节已经归本轮所有，后面再做异步的压缩/抽样就安全了。
+            _plugin_pending = getattr(self, "_pending_plugin_images", None)
+            if _plugin_pending is not None:
+                _plugin_pending.clear()
+            # 顺序既是时间顺序也是相关性顺序（#2964 × #2835 合并）：
+            #   1. 主动搭话截图 —— 用户开口**之前**屏幕上的东西，最远；
+            #   2. 插件提供的上下文；
+            #   3. passive callback 带的图（同样是上下文，不是用户这一刻拍的）；
+            #   4. 本回合自己抽样的帧（独立 ASR 的开头/中间/结尾）；
+            #   5. 用户显式投递的附件 —— 离它所属的文本最近。
+            # 4/5 放最后，是为了不让模型把更早的屏幕误当成用户刚拍的东西。
+            _ordered_images = (
+                ([proactive_image] if proactive_image else [])
+                + plugin_images
+                + list(prefix_images)
+                + list(own_images)
+                + list(attachment_images)
+            )
+            # 与上面那张列表逐位对齐的来源标签，只为帧总线服务（模型看到的还是
+            # 同一批字节，标签不进 content）。在这里算、而不是在发布点重新推断：
+            # 此刻每一张图属于哪个桶是**确定**的，fit 之后就只剩一个字符串列表了。
+            # 通道只盖住前 turn_source_count 张；没给计数就退回旧语义（要么
+            # 整段是这一轮的帧，要么整段是用户的）。
+            _channelled = (
+                0 if not turn_source
+                else (
+                    len(own_images) if turn_source_count is None
+                    else max(0, min(int(turn_source_count), len(own_images)))
+                )
+            )
+            _own_image_sources = (
+                [turn_source] * _channelled
+                + [_FRAME_SOURCE_USER] * (len(own_images) - _channelled)
+            )
+            _ordered_sources = (
+                ([_FRAME_SOURCE_SCREEN] if proactive_image else [])
+                + [_FRAME_SOURCE_PLUGIN] * len(plugin_images)
+                + [_FRAME_SOURCE_PLUGIN] * len(prefix_images)
+                # own_images 是这一轮自带的帧。独立 ASR 交接过来时前 k 张是
+                # 屏幕或摄像头，其余是被并进来的用户附件——所以标签在这里按
+                # 位置切开，而不是整段套同一个通道。
+                + _own_image_sources
+                + [_FRAME_SOURCE_USER] * len(attachment_images)
+            )
+            # 各来源的**张数**配额是分开的（谁也花不了谁的额度），但它们最终落在
+            # 同一条 HumanMessage 上，provider 看到的是**总和**——超过单请求上限
+            # 会整条请求被拒，而不是丢几张图。从**前面**裁：离文本最近的那些才是
+            # 它要讲的。
+            # 超预算时按阶梯处理，**不静默丢弃**：先抽样成开头/中间/结尾三张，
+            # 还超就压缩，都不行才从最旧的开始丢——并且无论走到哪一级都告诉用户。
+            # 整条请求超限会被 provider 整个拒掉，所以必须有人让步；让步的顺序是
+            # 「先减冗余、再降质量、最后才是丢内容」。
+            def _restore_consumed_queues() -> None:
+                """Put both queues back when this turn dies before committing.
+
+                The user's attachments were dequeued atomically above and the
+                plugin list was cleared at read time, so from here until the
+                message reaches history nothing else owns those bytes. A
+                teardown landing on one of the awaits below would otherwise
+                lose them from every future turn.
+                """
+                if attachment_images:
+                    self._pending_images[0:0] = attachment_images
+                if plugin_images:
+                    _queue = getattr(self, "_pending_plugin_images", None)
+                    if _queue is not None:
+                        _queue[0:0] = plugin_images
+
+            try:
+                _attached_images, _budget_notice = await fit_images_to_turn_budget(
+                    _ordered_images,
+                    TURN_ATTACHED_IMAGE_MAX_TOTAL_BYTES,
+                )
+            except BaseException:
+                _restore_consumed_queues()
+                raise
+            # 帧总线的来源标签按**下标**对应，所以只在张数没变时成立：rung 0 的
+            # 归一化和重压都是逐张映射（长度不变），抽样和丢弃则会改变张数，而
+            # 结果本身读不回它在原列表里的下标。这时退回 unknown —— 把插件推的
+            # 图标成 "screen" 比不标来源糟得多。
+            _attached_sources = (
+                _ordered_sources
+                if len(_attached_images) == len(_ordered_images)
+                else [_FRAME_SOURCE_UNKNOWN] * len(_attached_images)
+            )
+            if _budget_notice:
+                # 级别跟着「有没有东西真的没了」走，与弹窗同一个判据。rung 0 是
+                # 无条件的，所以随手拖进来的一张手机照片每轮都会产生一条 notice；
+                # 全按 warning 打，日志里就分不出「图小了一点」和「有几张整张没
+                # 送出去」了——而后者才是排查时要一眼找到的那类。
+                _budget_log = (
+                    logger.warning
+                    if _budget_notice.get("user_visible")
+                    else logger.info
+                )
+                _budget_log(
+                    "Turn images fitted for the %d-byte budget: %d -> %d image(s) "
+                    "(normalized=%s sampled=%s compressed=%s dropped=%d)",
+                    TURN_ATTACHED_IMAGE_MAX_TOTAL_BYTES,
+                    _budget_notice["original_count"],
+                    _budget_notice["final_count"],
+                    _budget_notice.get("normalized"),
+                    _budget_notice["sampled"],
+                    _budget_notice["compressed"],
+                    _budget_notice["dropped"],
+                )
+                # 日志每种情况都打，弹窗只在**整张图没了**时弹——丢弃和抽样都算：
+                # 抽样只留开头/中间/结尾三张，中间那些是整张扔掉的，用户那侧看不出
+                # 它跟丢弃有什么分别。归一化 / 重压不弹：图还在，只是小一点，而 rung 0
+                # 几乎每个带图的回合都会跑，照旧「有 notice 就弹」的话用户会被一串
+                # 「图片已调整」刷屏，而其中绝大多数他根本没损失什么。
+                if _budget_notice.get("user_visible") and self.on_status_message:
+                    try:
+                        await self.on_status_message(json.dumps({
+                            "code": "TURN_IMAGES_TRIMMED",
+                            "details": _budget_notice,
+                        }))
+                    except asyncio.CancelledError:
+                        _restore_consumed_queues()
+                        raise
+                    except Exception as _notice_error:
+                        logger.warning(
+                            "could not report the image trim to the user: %s",
+                            _notice_error,
+                        )
+            for img_b64 in _attached_images:
                 content.append({
                     "type": "image_url",
                     "image_url": {
@@ -630,16 +856,30 @@ class _StreamingMixin:
             })
 
             user_message = HumanMessage(content=content)
-            _img_count = len(self._pending_images) + (1 if proactive_image else 0)
+            # Report what was ATTACHED, not what was staged. The trim above
+            # takes a prefix, and the proactive screenshot is that prefix's
+            # first element, so it survives exactly when nothing was dropped.
+            _img_count = len(_attached_images)
+            # 直接问「它在不在最终附上的那批里」。原来算的是「有没有丢过东西」，
+            # 那个近似在只有丢弃时成立；现在预算阶梯还会**抽样**（只留头/中/尾），
+            # 队头同样可能不在结果里，成员判断才是准的。
+            _proactive_attached = (
+                bool(proactive_image)
+                and proactive_image in _attached_images
+            )
             logger.info(
                 f"Sending multi-modal message with {_img_count} image(s)"
-                f"{' (incl. proactive screen)' if proactive_image else ''}"
+                f"{' (incl. proactive screen)' if _proactive_attached else ''}"
             )
 
             # Clear pending images after using them (content already holds the
             # data urls). The proactive screenshot is one-shot: consumed by this
             # reply, then cleared so it never re-injects into later turns.
-            self._pending_images.clear()
+            # 用户附件在上面取快照时就已经**原子地**出队了，这里不能再整体
+            # clear：那会连带吃掉模型调用期间新到的附件（本 PR 专门修过的竞态）。
+            # 插件那条列表在上面读取时就已经原子地清空了（那里到读取之间不能有
+            # await），此处不再重复。
+            # 一次性的主动搭话截图同样在这里清掉。
             self._proactive_image_to_inject = None
             self._proactive_image_staged_at = 0.0
             self._proactive_image_history_len = 0
@@ -648,6 +888,10 @@ class _StreamingMixin:
             user_message = HumanMessage(content=_user_text_with_prefix)
 
         self._conversation_history.append(user_message)
+        # 本次调用自己的「已提交」标记。调用方不能用全局 history 长度判断：并发的
+        # 另一条文本请求或收尾中的响应同样会追加，长度增长并不代表**这一轮**进去了。
+        if callable(on_turn_committed):
+            on_turn_committed()
         history_replacement_index = len(self._conversation_history) - 1
         history_replacement_text = (
             str(history_replacement_text).strip()
@@ -656,8 +900,20 @@ class _StreamingMixin:
         )
         if history_replacement_text and _prefix_clean:
             history_replacement_text = f"{_prefix_clean}\n\n{history_replacement_text}"
+        # 帧总线的待发布快照；None = 没有帧要抄（纯文本轮）或已经发过了。
+        _pending_bus_frames = None
         if has_images:
             self._evict_old_images()
+            # 这一轮真正送出的帧只先**存**在这里，等确认送达之后再抄给插件
+            # 总线。进了 _conversation_history 不等于 provider 收到了：下面的输入
+            # transcript 回调会抛、用户会在请求发出前取消、三次 attempt 也可能全
+            # 失败——那些回合一个字节都没到过 provider，在这里发布就是替它们
+            # 宣布了一次从未发生的送达。真正的发布点在下面「第一个 chunk 到达」
+            # 处，对偶于 realtime 那侧的 ``if sent:``。
+            #
+            # 存的是 _attached_images —— fit 之后的字节，不是调用方给的原图。
+            # 归一化几乎每轮都会重编码，总线上必须是模型真正看到的那一张。
+            _pending_bus_frames = (_attached_images, _attached_sources)
 
         # Callback for user input
         transcript_callback = input_transcript_callback or self.on_input_transcript
@@ -695,8 +951,15 @@ class _StreamingMixin:
                 self.max_response_length, summary_mode=True,
             )
 
+        response_generation = self._begin_response_generation()
+        # 这一轮的工具图槽位，跨 attempt 存活。见 _astream_visible_with_tools
+        # 里的说明：由内层 finally 释放的话，一次可重试的失败会把像素换成占位
+        # 符，而重试用的是同一份历史。
+        _turn_tool_image_slots: list = []
+        # 同一个理由，另一半：暂存待抄送的工具帧也必须跨 attempt 存活，否则
+        # 重试成功的那轮"模型看到了、插件读不到"。
+        _turn_tool_bus_frames: list = []
         try:
-            self._is_responding = True
             reroll_count = 0
             set_call_type("conversation")
 
@@ -722,7 +985,10 @@ class _StreamingMixin:
                 # 用 hasattr 守卫：单元测试用 __new__ 绕过 __init__ 不会设这个
                 # 属性，但真实代码 __init__ 必设；区分"未初始化（测试桩）"和
                 # "已关闭（生产）"两种情况。
-                if (hasattr(self, "llm") and self.llm is None) or not self._is_responding:
+                if (
+                    (hasattr(self, "llm") and self.llm is None)
+                    or not self._response_generation_is_active(response_generation)
+                ):
                     logger.info("OmniOfflineClient.stream_text: client 已 close 或响应已被取消，终止 retry")
                     # 标记 status_reported 抑制 finally 的 LLM_NO_RESPONSE 兜底：
                     # 这是用户主动 cancel / close，不是 LLM 故障，前端不该看到
@@ -739,7 +1005,9 @@ class _StreamingMixin:
                     _ttft_start = time.time()
                     _ttft_recorded = False
                     while guard_attempt <= self.max_response_rerolls:
-                        self._is_responding = True
+                        if not self._resume_response_generation(response_generation):
+                            status_reported = True
+                            break
                         assistant_message = ""           # 仅最后一段未持久化的 text，用于 final AIMessage append
                         assistant_message_total = ""     # 全轮累积，用于 _check_repetition / 长度 guard
                         is_first_chunk = True
@@ -834,8 +1102,14 @@ class _StreamingMixin:
                             if thinking_on and leaks_thinking_in_content(self.model)
                             else None
                         )
+                        # 工具图上总线时带上本轮的 turn_id，和这一轮的用户帧
+                        # 归到同一个回合下；普通文本轮没有 turn_id，那里就是 None。
+                        _focus_overrides["_tool_frames_turn_id"] = turn_id
                         async for chunk in self._astream_visible_with_tools(
-                            self._conversation_history, **_focus_overrides,
+                            self._conversation_history,
+                            _tool_image_slots=_turn_tool_image_slots,
+                            _tool_bus_frames=_turn_tool_bus_frames,
+                            **_focus_overrides,
                         ):
                             if not _ttft_recorded:
                                 _ttft_recorded = True
@@ -845,6 +1119,26 @@ class _StreamingMixin:
                                 except Exception:
                                     # 埋点 best-effort，绝不打断流式响应主路径。
                                     pass
+                            # 帧总线：provider 已经吐出东西了——这一轮的消息（连同那批
+                            # 图）确凿地被它收下了。这是本函数里最早能这么断言的地方：
+                            # astream 是惰性的，请求要到第一次 __anext__ 才真正发出去，
+                            # 在那之前任何位置发布都只是在赌。清标记在 await 之前：一轮
+                            # 只发一次，attempt 重试和 reroll 都不会把同一批图再抄一遍。
+                            if _pending_bus_frames is not None:
+                                _bus_images, _bus_sources = _pending_bus_frames
+                                _pending_bus_frames = None
+                                # 只发布、不等待。这条 hop 可能跨 loop（见
+                                # _fire_bus_task），而这里正卡在用户回复的第一个
+                                # chunk 上：一个卡住的 bridge 不该换来一次沉默的
+                                # 回合。要抄的字节和标签在上面就已经冻结好了，
+                                # 任务里不再读任何活状态。
+                                self._fire_bus_task(
+                                    self._publish_provider_frames(
+                                        _bus_images,
+                                        _bus_sources,
+                                        turn_id=turn_id,
+                                    )
+                                )
                             if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                                 chunk_usage = chunk.usage_metadata
                                 logger.debug(f"🔍 [Usage] {chunk_usage}")
@@ -911,7 +1205,7 @@ class _StreamingMixin:
                                 summary_trigger_tokens = 0
                                 summary_overflow_offset = 0
                                 continue
-                            if not self._is_responding:
+                            if not self._response_generation_is_active(response_generation):
                                 break
 
                             if fence_triggered:
@@ -937,7 +1231,7 @@ class _StreamingMixin:
                                             guard_triggered = True
                                             discard_reason = "role_hallucination"
                                             logger.info(f"OmniOfflineClient: 检测到主人名前缀 '{prefix_buffer[:master_match]}'，触发重试")
-                                            self._is_responding = False
+                                            self._pause_response_generation(response_generation)
                                             break
                                         elif lanlan_match:
                                             logger.info(f"OmniOfflineClient: 剥离角色名前缀 '{prefix_buffer[:lanlan_match]}'")
@@ -1001,7 +1295,7 @@ class _StreamingMixin:
                                                 discard_reason = f"length>{self.max_response_length}"
                                                 length_guard_original_tokens = current_length
                                                 logger.info(f"OmniOfflineClient: 检测到长回复 ({current_length} tokens)，准备停止生成")
-                                                self._is_responding = False
+                                                self._pause_response_generation(response_generation)
                                                 emit_content = ""
                                                 if not _is_gibberish_response(candidate_total):
                                                     capped = truncate_to_tokens(
@@ -1100,7 +1394,7 @@ class _StreamingMixin:
                                                             "命中 (%d tokens)，中止本轮生成",
                                                             tail_tokens,
                                                         )
-                                                        self._is_responding = False
+                                                        self._pause_response_generation(response_generation)
                                                     else:
                                                         summary_next_gibberish_check = (
                                                             tail_tokens + _SUMMARY_GIBBERISH_RECHECK_TOKENS
@@ -1675,7 +1969,10 @@ class _StreamingMixin:
                         status_reported = True
                     break
         finally:
-            self._is_responding = False
+            # 先于其它收尾：把 base64 从历史里摘掉，别让它跟着后续每一次请求
+            # 走（token 计数器把图像部分算成短占位符，截断器看不见它）。
+            self._release_tool_image_slots(_turn_tool_image_slots)
+            self._finish_response_generation(response_generation)
 
             if (
                 history_replacement_text

@@ -93,6 +93,82 @@ async def test_registry_local_handler_runs():
 
 
 @pytest.mark.asyncio
+async def test_registry_local_handler_envelope_extracts_images():
+    """Local handlers share the remote ``{output, images}`` envelope.
+
+    Without normalization, pixels stay inside ``output`` and never reach
+    ``_route_tool_images`` — the model gets base64 text instead of a picture.
+    """
+    from main_logic.tool_calling import ToolCall, ToolDefinition, ToolRegistry
+
+    jpeg_b64 = (
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////"
+        "////////////////////////////////////////////wAALCAABAAEBAREA/8QAFAABAAAAAAAA"
+        "AAAAAAAAAAAAA//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AN//Z"
+    )
+
+    async def screenshot_handler(_args):
+        return {
+            "output": {"ok": True},
+            "images": [{
+                "data_b64": jpeg_b64,
+                "mime": "image/jpeg",
+                "vision_prompt": "minimap",
+            }],
+        }
+
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(
+        name="shot", description="shot", handler=screenshot_handler))
+    result = await reg.execute(ToolCall(name="shot", arguments={}, call_id="c1"))
+
+    assert result.is_error is False
+    assert result.output == {"ok": True}
+    assert "images" not in result.output
+    assert len(result.images) == 1
+    assert result.images[0].data_b64 == jpeg_b64
+    assert result.images[0].vision_prompt == "minimap"
+
+
+@pytest.mark.asyncio
+async def test_registry_local_handler_keeps_data_dicts_that_contain_output():
+    """``output`` alone is not an envelope marker — same rule as the remote
+    plugin callback. Unwrapping would drop sibling fields the model needs."""
+    from main_logic.tool_calling import ToolCall, ToolDefinition, ToolRegistry
+
+    async def ready_handler(_args):
+        return {"output": "ready", "duration": 12}
+
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(
+        name="ready", description="ready", handler=ready_handler))
+    result = await reg.execute(ToolCall(name="ready", arguments={}, call_id="c1"))
+
+    assert result.is_error is False
+    assert result.output == {"output": "ready", "duration": 12}
+    assert result.images == []
+
+
+@pytest.mark.asyncio
+async def test_registry_local_handler_keeps_business_images_as_plain_data():
+    from main_logic.tool_calling import ToolCall, ToolDefinition, ToolRegistry
+
+    payload = {
+        "query": "cats",
+        "images": [{"url": "https://example.test/cat.jpg"}],
+    }
+
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(
+        name="search", description="search", handler=lambda _args: payload))
+    result = await reg.execute(ToolCall(name="search", arguments={}, call_id="c1"))
+
+    assert result.is_error is False
+    assert result.output == payload
+    assert result.images == []
+
+
+@pytest.mark.asyncio
 async def test_registry_unknown_tool_returns_error_not_raise():
     from main_logic.tool_calling import ToolCall, ToolRegistry
 
@@ -3360,6 +3436,97 @@ def _bare_genai_client(rounds, handler, *, cap, finalize_parts=None):
     return client, calls
 
 
+@pytest.mark.asyncio
+async def test_genai_image_budget_omission_refreshes_tool_response(monkeypatch):
+    from main_logic.tool_calling import ToolCall, ToolImage, ToolResult
+
+    monkeypatch.setattr(_ofc_genai, "_GENAI_AVAILABLE", True)
+
+    async def handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            call_id=call.call_id,
+            name=call.name,
+            output={"ok": True},
+            images=[ToolImage(data_b64=call.name.upper())],
+        )
+
+    client, _calls = _bare_genai_client(
+        [
+            [
+                _GenaiPart(
+                    function_call=_GenaiFunctionCall(name, {}, id_=name)
+                )
+                for name in ("first", "second", "third")
+            ],
+            [_GenaiPart(text="done")],
+        ],
+        handler,
+        cap=2,
+    )
+    client._user_language_provider = lambda: "en"
+    messages = [{"role": "user", "content": "inspect the images"}]
+
+    async for _chunk in client._astream_genai_with_tools(messages):
+        pass
+
+    third_result = next(
+        message
+        for message in messages
+        if message.get("role") == "tool" and message.get("name") == "third"
+    )
+    payload = json.loads(third_result["content"])
+    assert any(
+        "omitted" in warning and "turn image budget" in warning
+        for warning in payload["_image_warnings"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_genai_tool_loop_rebuilds_a_client_a_tool_handler_dropped(monkeypatch):
+    """A tool that hands back a picture makes the host call
+    ``prepare_for_tool_images``, whose ``switch_model`` drops
+    ``_genai_client`` -- the vision slot may carry its own key. The loop has
+    to rebuild it before the next round rather than dereference None."""
+    from main_logic.tool_calling import ToolCall, ToolResult
+
+    monkeypatch.setattr(_ofc_genai, "_GENAI_AVAILABLE", True)
+
+    async def handler(call: ToolCall) -> ToolResult:
+        # Exactly what switch_model does to the client mid tool loop.
+        client._genai_client = None
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client, calls = _bare_genai_client(
+        [
+            [_GenaiPart(function_call=_GenaiFunctionCall("inspect", {}, id_="c1"))],
+            [_GenaiPart(text="done")],
+        ],
+        handler,
+        cap=2,
+    )
+    stub = client._genai_client
+    rebuilt: list = []
+
+    class _FakeGenaiModule:
+        @staticmethod
+        def Client(**kwargs):
+            rebuilt.append(kwargs)
+            return stub
+
+    monkeypatch.setattr(_ofc_genai, "_genai", _FakeGenaiModule)
+
+    chunks = [
+        chunk
+        async for chunk in client._astream_genai_with_tools(
+            [{"role": "user", "content": "look at this"}]
+        )
+    ]
+
+    assert rebuilt, "the loop never rebuilt the client the tool handler dropped"
+    assert len(calls) == 2, "the round after the tool call never ran"
+    assert any(getattr(chunk, "content", "") == "done" for chunk in chunks)
+
+
 class _ToolAwareFakeLLM:
     """OpenAI-path fake：按请求里有没有 tools 选脚本，而不是按调用序号。
 
@@ -4550,6 +4717,49 @@ async def test_stream_text_replaces_full_prompt_history_after_memory_callback(mo
     assert "full document prompt" not in [
         getattr(message, "content", "") for message in client._conversation_history
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_text_keeps_system_prefix_images_invocation_local(monkeypatch):
+    from main_logic.omni_offline_client import OmniOfflineClient
+    from utils.llm_client import HumanMessage, LLMStreamChunk
+
+    observed_user_content = []
+
+    async def _astream(self, messages, **overrides):
+        del overrides
+        observed_user_content.append(
+            [msg for msg in messages if isinstance(msg, HumanMessage)][-1].content
+        )
+        yield LLMStreamChunk(content="ok")
+
+    monkeypatch.setattr(OmniOfflineClient, "_astream_with_tools", _astream)
+
+    async def noop(*_a, **_kw):
+        pass
+
+    client = _minimal_offline_client_for_leak_tests()
+    client.on_text_delta = noop
+    client.on_input_transcript = noop
+    client.on_response_done = noop
+    client.on_response_discarded = None
+    client.on_status_message = noop
+    client.on_repetition_detected = None
+
+    await client.stream_text(
+        "user text",
+        system_prefix="callback context",
+        system_prefix_images=["callback-image"],
+    )
+
+    assert observed_user_content == [[
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,callback-image"},
+        },
+        {"type": "text", "text": "callback context\n\nuser text"},
+    ]]
+    assert client._pending_images == []
 
 
 @pytest.mark.asyncio

@@ -1578,6 +1578,15 @@ class PluginUiQueryService:
                                 for item in context_actions
                                 if isinstance(item, Mapping)
                             ]
+                        # provider 缺失 / 抛错 / 超时不再让整次查询失败（否则连
+                        # actions 都拿不到），但诊断信息必须照旧落到 warning 上。
+                        context_error = ui_context_result.get("context_error")
+                        if context_error:
+                            warnings.append(PluginUiWarning(
+                                path=f"plugin.ui.{kind}.{surface_id}.context",
+                                code="ui_context_failed",
+                                message=f"Failed to load UI context '{context_id}': {context_error}",
+                            ).model_dump())
                 except Exception as exc:
                     warnings.append(PluginUiWarning(
                         path=f"plugin.ui.{kind}.{surface_id}.context",
@@ -1920,7 +1929,11 @@ class PluginUiQueryService:
                 "has_ui": has_ui,
                 "explicitly_registered": explicitly_registered,
                 "ui_path": f"/plugin/{plugin_id}/ui/" if has_ui else None,
-                "static_dir": str(static_dir) if static_dir is not None else None,
+                "static_dir": (
+                    str(static_dir) if static_dir is not None
+                    and plugin_meta.get("source") != "development"
+                    and not plugin_meta.get("development_ref") else None
+                ),
                 "static_files": static_files[:50],
                 "static_files_count": len(static_files),
             }

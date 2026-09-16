@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Awaitable, Callable
 import dataclasses
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -30,26 +32,29 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from plugin.logging_config import get_logger
-from plugin.core.plugin_layout import resolve_plugin_layout
+from plugin.core.plugin_layout import PluginLayout, resolve_plugin_layout
 from plugin.neko_plugin_cli.public import inspect_package
 from plugin.server.application.install_source import (
     InstallSourceError,
+    InstallSourceManager,
     LockEntry,
     SourceDetailMarket,
     classify_plugin_path,
     get_install_source_manager,
 )
+from plugin.server.application.install_source.scanner import PluginDirectoryScanner
 from plugin.server.application.plugin_cli import PluginCliService
 from plugin.server.application.plugin_cli.paths import PluginCliPathPolicy
 from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
-from plugin.server.application.plugins.upgrade_support import (
+from plugin.server.application.plugins.installation_transactions import (
     ReplacePluginError,
-    plugin_is_running,
-    remove_directory,
+    ReplacePluginResult,
+    is_manual_takeover_entry,
+    manual_takeover_snapshot_sha256,
     replace_plugin,
-    start_plugin_after_upgrade,
-    stop_plugin_for_upgrade,
 )
+from plugin.server.application.plugins.source_switch import SourceSwitchError
+from plugin.server.domain.errors import ServerDomainError
 from plugin.settings import (
     MARKET_API_URL,
     MARKET_WEB_URL,
@@ -275,20 +280,25 @@ def _plugin_config_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _read_plugin_toml_id(manifest: Path) -> str | None:
+def _read_plugin_toml_metadata(manifest: Path) -> tuple[str | None, str]:
     try:
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         logger.warning("Failed to read plugin manifest {}: {}", manifest, exc)
-        return None
+        return None, ""
 
     plugin_table = data.get("plugin")
     if not isinstance(plugin_table, dict):
-        return None
+        return None, ""
     plugin_id = plugin_table.get("id")
     if not isinstance(plugin_id, str) or not plugin_id.strip():
-        return None
-    return plugin_id.strip()
+        return None, ""
+    version = plugin_table.get("version")
+    return plugin_id.strip(), version.strip() if isinstance(version, str) else ""
+
+
+def _read_plugin_toml_id(manifest: Path) -> str | None:
+    return _read_plugin_toml_metadata(manifest)[0]
 
 
 # ─── 请求/响应模型 ─────────────────────────────────────────────────
@@ -334,9 +344,12 @@ class MarketInstallRequest(BaseModel):
         description="Market 上 latest_version.created_at；None 时由客户端兜底为当前时间",
     )
     # v2: install / upgrade / reinstall mode 选择；旧客户端不传 mode 则默认 install
-    mode: Literal["install", "upgrade", "reinstall"] = Field(
+    mode: Literal["install", "upgrade", "reinstall", "override_builtin"] = Field(
         default="install",
-        description="install=全新安装；upgrade=覆盖旧版本；reinstall=同版本重装",
+        description=(
+            "install=全新安装；upgrade=覆盖旧版本；reinstall=同版本重装；"
+            "override_builtin=以 Market 版本覆盖同 ID 的内置插件"
+        ),
     )
     # v2 (Option C): plugin 身份一致性校验 —— Market slug 透传给客户端，
     # 客户端 unpack 后比对包内 plugin.toml [plugin].id；install 不一致时
@@ -354,7 +367,23 @@ class MarketInstallRequest(BaseModel):
     # the legacy value so cached Market clients remain compatible, then
     # normalise it to the non-renaming behaviour.
     on_conflict: str = Field(default="fail", pattern=r"^(fail|rename)$")
-    require_confirm: bool = Field(default=True, description="是否需要用户确认（预留）")
+    require_confirm: bool = Field(default=True, description="是否需要用户确认")
+    confirmation_token: str | None = Field(
+        default=None,
+        description="override_builtin 预检返回、与当前覆盖计划绑定的确认令牌",
+    )
+    verified_builtin_manifest_sha256: str | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="服务端内部传递的已确认 builtin manifest 指纹",
+    )
+    verified_manual_snapshot_sha256: str | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="服务端内部传递的已确认 manual ownership/content 指纹",
+    )
 
     @field_validator("package_sha256", mode="before")
     @classmethod
@@ -372,6 +401,22 @@ class MarketInstallResponse(BaseModel):
     task_id: str
     status: str  # "pending" | "downloading" | "installing" | "completed" | "failed"
     message: str = ""
+
+
+class MarketOverrideConfirmationResponse(BaseModel):
+    plugin_id: str
+    current_version: str
+    target_version: str
+    confirmation_token: str
+    builtin_manifest_sha256: str = Field(default="", exclude=True, repr=False)
+
+
+class MarketManualTakeoverConfirmationResponse(BaseModel):
+    plugin_id: str
+    current_version: str
+    target_version: str
+    confirmation_token: str
+    manual_snapshot_sha256: str = Field(default="", exclude=True, repr=False)
 
 
 class MarketTaskStatus(BaseModel):
@@ -397,6 +442,11 @@ class MarketTaskStatus(BaseModel):
 class MarketInstalledPlugin(BaseModel):
     plugin_id: str
     path: str
+    effective_source: Literal["builtin", "market", "manual", "imported", "unknown"] = "unknown"
+    effective_version: str = ""
+    market_installed: bool = False
+    builtin_version: str = ""
+    latest_market_version: str = ""
     # v2 (R6.1 / R6.6 / design §3.5): 让前端在不二次请求的前提下展示 yank /
     # channel / 版本对比信息。仅 channel="market" 的 entry 投影；非 market /
     # 没有 lock entry 时为 None。
@@ -627,6 +677,24 @@ async def market_catalog_plugin_readme(
     )
 
 
+@router.get("/catalog/api/v1/plugins/{plugin_id}/comments")
+async def market_catalog_plugin_comments(
+    request: Request,
+    plugin_id: str,
+) -> Response:
+    """Proxy the public Market comment thread for an in-app detail view.
+
+    This intentionally exposes only the Market's read-only conversation
+    endpoint. Posting and moderation continue to happen in the Market web app,
+    where its authenticated session and permission checks are available.
+    """
+
+    return await _proxy_market_catalog(
+        request,
+        f"/plugins/{quote(plugin_id, safe='')}/comments",
+    )
+
+
 @router.get("/catalog/api/v1/plugins/{plugin_id}")
 async def market_catalog_plugin(request: Request, plugin_id: str) -> Response:
     return await _proxy_market_catalog(
@@ -653,6 +721,15 @@ async def market_status():
         market_url=MARKET_API_URL,
         market_web_url=MARKET_WEB_URL,
     )
+
+
+# 一整轮镜像测速的墙钟上限。单源的 per-I/O 超时乘以重定向跳数之后并不封顶，
+# 这个才封。12s 的取法：健康时实测一轮 4.6s，留出两倍余量，同时远小于用户会
+# 愿意干等的时间。
+# Env: NEKO_MARKET_PROXY_PROBE_TOTAL_BUDGET
+from plugin.server.application.plugins._env_budgets import env_seconds
+
+_GITHUB_PROXY_PROBE_TOTAL_BUDGET = env_seconds("NEKO_MARKET_PROXY_PROBE_TOTAL_BUDGET", 12.0)
 
 
 async def _measure_github_proxy_sources() -> tuple[dict[str, object], ...]:
@@ -685,9 +762,29 @@ async def _measure_github_proxy_sources() -> tuple[dict[str, object], ...]:
             "status_code": status_code,
         }
 
-    measured = await asyncio.gather(
-        *(probe(source_id, base_url) for source_id, base_url in _GITHUB_PROXY_SOURCES)
+    # 整轮加一个总预算。
+    #
+    # 现有的 httpx.Timeout 是 per-I/O-op 的，而这里开了 follow_redirects 且允许
+    # 5 跳，所以单个源的上界是"跳数 × 每跳超时"，六个源在慢重定向链下能叠到几十
+    # 秒——实测六源各挂在 3s/跳、深 5 的 301 链后是 37.5s，8s 的那个超时一次都
+    # 没触发。而调用它的前端用的是裸 fetch，没有超时。
+    #
+    # 超预算时保留已经量到的结果，而不是整批丢弃：慢但可用的镜像也是有用信息。
+    tasks = [
+        asyncio.ensure_future(probe(source_id, base_url))
+        for source_id, base_url in _GITHUB_PROXY_SOURCES
+    ]
+    done, pending = await asyncio.wait(
+        tasks, timeout=_GITHUB_PROXY_PROBE_TOTAL_BUDGET
     )
+    for task in pending:
+        task.cancel()
+    if pending:
+        # cancel() 只是排一个 CancelledError，任务要到下一轮事件循环才真的停。
+        # 不等就返回的话，这些 HTTP 连接会在响应发出之后才收尾，留下一批看不见
+        # 的悬挂任务（CodeRabbit）。
+        await asyncio.gather(*pending, return_exceptions=True)
+    measured = [task.result() for task in tasks if task in done and not task.cancelled()]
     return tuple(measured)
 
 
@@ -714,6 +811,333 @@ async def measure_github_proxy_sources() -> dict[str, object]:
     return {"sources": measured}
 
 
+async def _fetch_authoritative_market_override_release(
+    payload: MarketInstallRequest,
+) -> dict[str, object]:
+    market_id = str(payload.plugin_id or "").strip()
+    base_url = _normalized_base_url(MARKET_API_URL)
+    if not market_id or not base_url:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "market_catalog_not_configured",
+                "message": "builtin override requires a configured Market catalog",
+            },
+        )
+
+    channel = str(payload.channel or "stable").strip() or "stable"
+    url = f"{base_url}/api/v1/plugins/{quote(market_id, safe='')}/versions"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=3.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(url, params={"channel": channel})
+        if 300 <= response.status_code < 400:
+            raise httpx.HTTPStatusError(
+                "Market catalog redirect rejected",
+                request=response.request,
+                response=response,
+            )
+        response.raise_for_status()
+        releases = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "market_catalog_unavailable",
+                "message": "Market release metadata could not be verified",
+            },
+        ) from exc
+
+    if not isinstance(releases, list):
+        releases = []
+    requested_version = str(payload.version or "").strip()
+    release = next(
+        (
+            item
+            for item in releases
+            if isinstance(item, dict)
+            and str(item.get("version") or "").strip() == requested_version
+            and str(item.get("channel") or "stable").strip() == channel
+        ),
+        None,
+    )
+    canonical_package_url = str(
+        payload.canonical_package_url or payload.package_url or ""
+    ).strip()
+    if release is None:
+        mismatch = True
+    else:
+        mismatch = any(
+            (
+                str(release.get("package_url") or "").strip() != canonical_package_url,
+                str(release.get("package_sha256") or "").strip().lower()
+                != payload.package_sha256,
+                bool(payload.payload_hash)
+                and str(release.get("payload_hash") or "").strip()
+                != str(payload.payload_hash or "").strip(),
+                bool(payload.published_at)
+                and str(release.get("created_at") or release.get("published_at") or "").strip()
+                != str(payload.published_at or "").strip(),
+            )
+        )
+    if mismatch:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "market_release_mismatch",
+                "message": "builtin override request does not match the Market catalog",
+            },
+        )
+
+    assert release is not None
+    return {
+        "plugin_market_id": market_id,
+        "version": requested_version,
+        "channel": channel,
+        "package_url": canonical_package_url,
+        "package_sha256": payload.package_sha256,
+        "payload_hash": release.get("payload_hash"),
+        "published_at": release.get("created_at") or release.get("published_at"),
+    }
+
+
+async def _build_market_override_confirmation(
+    payload: MarketInstallRequest,
+) -> MarketOverrideConfirmationResponse:
+    """Bind a client confirmation to the current builtin and Market artifact."""
+
+    if payload.mode != "override_builtin":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "override_confirmation_not_applicable",
+                "message": "override confirmation requires mode=override_builtin",
+            },
+        )
+
+    plugin_id = (payload.expected_plugin_toml_id or "").strip()
+    if (
+        not plugin_id
+        or plugin_id in {".", ".."}
+        or len(Path(plugin_id).parts) != 1
+        or Path(plugin_id).name != plugin_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "override_source_changed",
+                "message": "builtin override requires one canonical plugin id",
+            },
+        )
+
+    policy = PluginCliPathPolicy.from_settings()
+    target_dir = policy.user_plugins_root / plugin_id
+    if target_dir.exists() or target_dir.is_symlink():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "override_target_exists",
+                "message": "builtin override target is no longer empty",
+            },
+        )
+
+    builtin_manifest = policy.builtin_plugins_root / plugin_id / "plugin.toml"
+    try:
+        manifest_bytes = builtin_manifest.read_bytes()
+        manifest_data = tomllib.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        manifest_data = {}
+        manifest_bytes = b""
+    plugin_table = manifest_data.get("plugin")
+    manifest_plugin_id = (
+        str(plugin_table.get("id") or "").strip()
+        if isinstance(plugin_table, dict)
+        else ""
+    )
+    current_version = (
+        str(plugin_table.get("version") or "").strip()
+        if isinstance(plugin_table, dict)
+        else ""
+    )
+    target_version = (payload.version or "").strip()
+    if manifest_plugin_id != plugin_id or not current_version or not target_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "override_source_changed",
+                "message": "builtin override source or version is no longer valid",
+            },
+        )
+
+    authoritative_release = await _fetch_authoritative_market_override_release(payload)
+    request_evidence = payload.model_dump(
+        mode="json",
+        exclude={"confirmation_token"},
+    )
+    evidence = {
+        "request": request_evidence,
+        "plugin_id": plugin_id,
+        "current_version": current_version,
+        "target_version": target_version,
+        "market_release": authoritative_release,
+        "builtin_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "target_dir": str(target_dir.resolve(strict=False)),
+    }
+    encoded = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token = hmac.new(
+        _BRIDGE_TOKEN.encode("utf-8"),
+        encoded,
+        hashlib.sha256,
+    ).hexdigest()
+    return MarketOverrideConfirmationResponse(
+        plugin_id=plugin_id,
+        current_version=current_version,
+        target_version=target_version,
+        confirmation_token=token,
+        builtin_manifest_sha256=evidence["builtin_manifest_sha256"],
+    )
+
+
+@router.post(
+    "/override-confirmation",
+    response_model=MarketOverrideConfirmationResponse,
+)
+async def market_override_confirmation(
+    payload: MarketInstallRequest,
+    token: str = Query(..., description="Bridge token"),
+) -> MarketOverrideConfirmationResponse:
+    """Issue confirmation evidence before a builtin override is dispatched."""
+
+    _verify_token(token)
+    return await _build_market_override_confirmation(payload)
+
+
+async def _build_market_manual_takeover_confirmation(
+    payload: MarketInstallRequest,
+) -> MarketManualTakeoverConfirmationResponse:
+    """Bind Market confirmation to release, target content and manual owner."""
+
+    if payload.mode not in {"upgrade", "reinstall"}:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "manual_takeover_confirmation_not_applicable",
+                "message": "manual takeover confirmation requires a replacement mode",
+            },
+        )
+    plugin_id = (payload.expected_plugin_toml_id or "").strip()
+    manager = get_install_source_manager()
+    if manager is None or bool(getattr(manager, "is_degraded", False)):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "install_source_read_only",
+                "message": "manual takeover requires a writable install-source lock",
+            },
+        )
+    entry = _find_active_user_entry(manager, plugin_id)
+    if not is_manual_takeover_entry(entry):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "manual_takeover_source_changed",
+                "message": "the target is no longer the confirmed manual plugin",
+            },
+        )
+    assert entry is not None
+    policy = PluginCliPathPolicy.from_settings()
+    target_dir = (policy.user_plugins_root / entry.directory_name).resolve()
+    if PluginDirectoryScanner._load_plugin_id(target_dir) != entry.plugin_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "manual_takeover_source_changed",
+                "message": "manual plugin identity no longer matches its ownership entry",
+            },
+        )
+    try:
+        snapshot_sha256 = await asyncio.to_thread(
+            manual_takeover_snapshot_sha256,
+            entry=entry,
+            target_dir=target_dir,
+        )
+        manifest = tomllib.loads((target_dir / "plugin.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "manual_takeover_source_changed",
+                "message": "manual plugin content cannot be confirmed",
+            },
+        ) from exc
+    plugin_table = manifest.get("plugin")
+    current_version_obj = (
+        plugin_table.get("version")
+        if isinstance(plugin_table, dict)
+        else manifest.get("version")
+    )
+    current_version = (
+        current_version_obj.strip()
+        if isinstance(current_version_obj, str)
+        else ""
+    )
+    authoritative_release = await _fetch_authoritative_market_override_release(payload)
+    request_evidence = payload.model_dump(
+        mode="json",
+        exclude={
+            "confirmation_token",
+            "verified_builtin_manifest_sha256",
+            "verified_manual_snapshot_sha256",
+        },
+    )
+    evidence = {
+        "request": request_evidence,
+        "plugin_id": entry.plugin_id,
+        "target_dir": str(target_dir),
+        "manual_snapshot_sha256": snapshot_sha256,
+        "market_release": authoritative_release,
+    }
+    encoded = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token = hmac.new(
+        _BRIDGE_TOKEN.encode("utf-8"),
+        encoded,
+        hashlib.sha256,
+    ).hexdigest()
+    return MarketManualTakeoverConfirmationResponse(
+        plugin_id=entry.plugin_id,
+        current_version=current_version,
+        target_version=(payload.version or "").strip(),
+        confirmation_token=token,
+        manual_snapshot_sha256=snapshot_sha256,
+    )
+
+
+@router.post(
+    "/takeover-confirmation",
+    response_model=MarketManualTakeoverConfirmationResponse,
+)
+async def market_manual_takeover_confirmation(
+    payload: MarketInstallRequest,
+    token: str = Query(..., description="Bridge token"),
+) -> MarketManualTakeoverConfirmationResponse:
+    """Issue confirmation evidence before Market replaces a manual plugin."""
+
+    _verify_token(token)
+    return await _build_market_manual_takeover_confirmation(payload)
+
+
 @router.post("/install", response_model=MarketInstallResponse)
 async def market_install(
     payload: MarketInstallRequest,
@@ -729,13 +1153,52 @@ async def market_install(
     旧目录 → unpack → record → start，失败时按 rollback steps 逆序回滚。
     """
     _verify_token(token)
+    # ``exclude=True`` affects serialization only; Pydantic still accepts these
+    # fields from request bodies. Strip all caller-provided server evidence and
+    # add back only values verified during this request.
+    task_payload = payload.model_copy(
+        update={
+            "verified_builtin_manifest_sha256": None,
+            "verified_manual_snapshot_sha256": None,
+        }
+    )
 
-    # mode=upgrade 立即校验 lock entry 存在性（R5.5）；reinstall 同样需要
-    # 已装才能"重装"，install 不要求。
+    if payload.mode == "override_builtin":
+        supplied_token = (payload.confirmation_token or "").strip()
+        if not supplied_token:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "override_confirmation_required",
+                    "message": "confirm the current builtin override plan before install",
+                },
+            )
+        rebuilt = await _build_market_override_confirmation(payload)
+        if not secrets.compare_digest(
+            supplied_token,
+            rebuilt.confirmation_token,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "override_confirmation_changed",
+                    "message": "builtin or Market package changed after confirmation",
+                },
+            )
+        task_payload = task_payload.model_copy(
+            update={
+                "verified_builtin_manifest_sha256": rebuilt.builtin_manifest_sha256,
+            }
+        )
+
+    # Replacement requires one exact active user candidate. A manual
+    # candidate is accepted only with confirmation bound to its current
+    # ownership and replaceable content snapshot.
     if payload.mode in ("upgrade", "reinstall"):
         mgr = get_install_source_manager()
         expected_plugin_id = payload.expected_plugin_toml_id or payload.plugin_id or ""
-        if mgr is None or mgr.find_active_market_entry(expected_plugin_id) is None:
+        entry = _find_active_user_entry(mgr, expected_plugin_id) if mgr is not None else None
+        if entry is None:
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -744,6 +1207,41 @@ async def market_install(
                         f"plugin {expected_plugin_id!r} has no active market lock "
                         "entry; cannot upgrade / reinstall"
                     ),
+                },
+            )
+        if is_manual_takeover_entry(entry):
+            supplied_token = (payload.confirmation_token or "").strip()
+            if not supplied_token:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "manual_takeover_confirmation_required",
+                        "message": "confirm ownership transfer before replacing the manual plugin",
+                    },
+                )
+            rebuilt = await _build_market_manual_takeover_confirmation(payload)
+            if not secrets.compare_digest(
+                supplied_token,
+                rebuilt.confirmation_token,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "manual_takeover_plan_changed",
+                        "message": "manual plugin or Market package changed after confirmation",
+                    },
+                )
+            task_payload = task_payload.model_copy(
+                update={
+                    "verified_manual_snapshot_sha256": rebuilt.manual_snapshot_sha256,
+                }
+            )
+        elif getattr(entry, "channel", "market") != "market":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "plugin_replacement_source_unsupported",
+                    "message": "only Market or confirmed manual plugins can be replaced",
                 },
             )
 
@@ -768,7 +1266,7 @@ async def market_install(
 
     # 异步执行安装
     _task_workers[task_id] = asyncio.create_task(
-        _execute_install(task_id, payload),
+        _execute_install(task_id, task_payload),
         name=f"market-install-{task_id}",
     )
 
@@ -838,6 +1336,8 @@ async def market_installed(
     try:
         # 一次性拿全量 lock 索引
         mgr = get_install_source_manager()
+        if mgr is not None:
+            await asyncio.to_thread(mgr.load)
         snapshot = mgr.snapshot() if mgr is not None else None
         entries_by_pid: dict[str, LockEntry] = {}
         entries_by_dir: dict[tuple[str, str], LockEntry] = {}
@@ -853,15 +1353,23 @@ async def market_installed(
                 if not e.removed and e.root_id and e.directory_name
             }
 
-        installed_by_pid: dict[str, MarketInstalledPlugin] = {}
+        discovered: dict[
+            str,
+            dict[str, list[tuple[Path, str, LockEntry | None]]],
+        ] = {}
+        path_policy = PluginCliPathPolicy.from_settings()
         for root in _plugin_config_roots():
             if not root.is_dir():
                 continue
-            for manifest in root.glob("*/plugin.toml"):
+            root_kind = "builtin" if root.resolve() == path_policy.builtin_plugins_root.resolve() else "user"
+            for manifest in sorted(root.glob("*/plugin.toml")):
                 if not manifest.is_file():
                     continue
                 plugin_dir = manifest.parent
-                plugin_id = _read_plugin_toml_id(manifest) or plugin_dir.name
+                if plugin_dir.name.startswith("."):
+                    continue
+                manifest_plugin_id, version = _read_plugin_toml_metadata(manifest)
+                plugin_id = manifest_plugin_id or plugin_dir.name
                 entry: LockEntry | None = None
                 if mgr is not None:
                     try:
@@ -881,23 +1389,77 @@ async def market_installed(
                     ):
                         entry = pid_entry
 
-                projected_source = _project_market_source_detail(entry)
-                candidate = MarketInstalledPlugin(
-                    plugin_id=plugin_id,
-                    path=str(plugin_dir),
-                    latest_install_source=projected_source,
+                discovered.setdefault(plugin_id, {}).setdefault(root_kind, []).append(
+                    (plugin_dir, version, entry)
                 )
-                existing = installed_by_pid.get(plugin_id)
-                if existing is None or (
-                    existing.latest_install_source is None
-                    and candidate.latest_install_source is not None
-                ):
-                    installed_by_pid[plugin_id] = candidate
+
+        installed_by_pid: dict[str, MarketInstalledPlugin] = {}
+        for plugin_id, sources in discovered.items():
+            builtin_candidates = sources.get("builtin", [])
+            user_candidates = sources.get("user", [])
+            builtin = next(
+                (candidate for candidate in builtin_candidates if candidate[0].name == plugin_id),
+                builtin_candidates[0] if builtin_candidates else None,
+            )
+            canonical_user = next(
+                (candidate for candidate in user_candidates if candidate[0].name == plugin_id),
+                None,
+            )
+            # Only the canonical cross-root pair may form a user override.
+            # Any noncanonical builtin or user directory remains a real ID
+            # conflict, matching registry_service._select_effective_records.
+            if builtin is None:
+                user = user_candidates[0] if user_candidates else None
+            elif builtin[0].name == plugin_id:
+                user = canonical_user
+            else:
+                user = None
+            effective = user or builtin
+            if effective is None:  # pragma: no cover - discovered always contains one source
+                continue
+            plugin_dir, effective_version, entry = effective
+            projected_source = _project_market_source_detail(entry if user is not None else None)
+            is_market_installed = projected_source is not None
+            if is_market_installed:
+                effective_source: Literal[
+                    "builtin", "market", "manual", "imported", "unknown"
+                ] = "market"
+            elif user is None:
+                effective_source = "builtin"
+            elif is_manual_takeover_entry(entry):
+                effective_source = "manual"
+            elif (
+                entry is not None
+                and not entry.removed
+                and entry.root_id == "user"
+                and entry.channel == "imported"
+            ):
+                effective_source = "imported"
+            else:
+                # A discovered user directory without an exact active source
+                # row must stay visibly blocked; it is not safe to advertise
+                # the ownership-transfer action reserved for manual entries.
+                effective_source = "unknown"
+            installed_by_pid[plugin_id] = MarketInstalledPlugin(
+                plugin_id=plugin_id,
+                path=str(plugin_dir),
+                effective_source=effective_source,
+                effective_version=effective_version,
+                market_installed=is_market_installed,
+                builtin_version=builtin[1] if builtin is not None else "",
+                latest_market_version=(
+                    str(projected_source.get("version") or "") if projected_source is not None else ""
+                ),
+                latest_install_source=projected_source,
+            )
         installed = list(installed_by_pid.values())
         return MarketInstalledResponse(installed=installed, count=len(installed))
     except Exception as exc:
         logger.warning("Failed to list installed plugins: {}", exc)
-        return MarketInstalledResponse(installed=[], count=0)
+        raise HTTPException(
+            status_code=500,
+            detail="market_installed_enumeration_failed",
+        ) from exc
 
 
 def _project_market_source_detail(
@@ -2615,7 +3177,7 @@ async def _execute_install(task_id: str, payload: MarketInstallRequest) -> None:
 
     try:
         _raise_if_task_cancel_requested(task)
-        if payload.mode == "install":
+        if payload.mode in ("install", "override_builtin"):
             await _do_install(task, payload, log_ctx)
         elif payload.mode == "upgrade":
             await _do_upgrade(task, payload, log_ctx)
@@ -2764,6 +3326,10 @@ _HUMAN_MESSAGES: dict[str, str] = {
     "download_failed": "下载失败",
     "package_hash_mismatch": "插件包校验失败",
     "install_failed": "安装失败，已清理临时文件",
+    "override_rollback_completed": "内置插件升级失败，已恢复内置版本",
+    "override_rollback_incomplete": "内置插件升级失败，回滚未完整完成，请检查插件状态",
+    "override_source_changed": "插件来源已变化，请刷新后重试",
+    "override_start_failed": "Market 版本启动失败，已尝试恢复内置版本",
 }
 
 
@@ -2796,7 +3362,7 @@ def _raise_if_task_cancel_requested(task: dict[str, Any]) -> None:
 def _with_market_operation_status(
     result: dict[str, object],
     *,
-    operation: Literal["install", "upgrade"],
+    operation: Literal["install", "upgrade", "override_builtin"],
     restarted: bool,
     rollback_status: str,
 ) -> dict[str, object]:
@@ -2828,6 +3394,16 @@ async def _do_install(
     but threads the v2 fields (``channel`` / ``published_at``) through
     to the lock record.
     """
+
+    install_source_manager = get_install_source_manager()
+    if install_source_manager is not None and bool(
+        getattr(install_source_manager, "is_degraded", False)
+    ):
+        raise _TaskError(
+            code="install_source_read_only",
+            message="Market installation requires a writable install-source lock",
+            http_status=503,
+        )
 
     _set_task_stage(
         task,
@@ -2883,7 +3459,10 @@ async def _do_install(
         )
 
         filename = _extract_filename(payload.package_url)
-        market_override = _build_market_override(payload, mode="install")
+        operation: Literal["install", "override_builtin"] = (
+            "override_builtin" if payload.mode == "override_builtin" else "install"
+        )
+        market_override = _build_market_override(payload, mode=operation)
 
         try:
             result = await _cli_service.upload_and_install(
@@ -2899,16 +3478,31 @@ async def _do_install(
                     message=str(exc.message),
                 ) from exc
             raise _TaskError(code="internal_error", message=str(exc.message)) from exc
+        except SourceSwitchError as exc:
+            task["rollback"] = exc.as_payload()
+            raise _TaskError(code=exc.code, message=str(exc)) from exc
+        except ServerDomainError as exc:
+            raise _TaskError(
+                code=exc.code.lower(),
+                message=exc.message,
+                http_status=exc.status_code,
+            ) from exc
         except Exception as exc:
             raise _TaskError(code="install_failed", message=str(exc)) from exc
     finally:
         _cleanup_download_file(package_path)
 
     _post_install_payload_check(payload, result)
+    unpack_result = result.get("unpack") if isinstance(result, dict) else None
+    install_result = result.get("install") if isinstance(result, dict) else None
+    restarted = bool(
+        (unpack_result.get("restarted") if isinstance(unpack_result, dict) else False)
+        or (install_result.get("restarted") if isinstance(install_result, dict) else False)
+    )
     result = _with_market_operation_status(
         result,
-        operation="install",
-        restarted=False,
+        operation=operation,
+        restarted=restarted,
         rollback_status="not_needed",
     )
 
@@ -2923,21 +3517,35 @@ async def _do_install(
 @serialized_plugin_operation
 async def _replace_market_plugin_transaction(
     *,
-    manager: Any,
+    manager: InstallSourceManager,
     expected_plugin_id: str,
     original_entry: LockEntry,
     original_entry_fingerprint: tuple[object, ...],
     installed_package_id: str,
-    replace_kwargs: dict[str, Any],
-    rollback_install_source: Any | None = None,
-) -> Any:
+    plugin_dir: Path,
+    layout: PluginLayout,
+    install_new: Callable[[], Awaitable[dict[str, object]]],
+    additional_targets: tuple[Path, ...] = (),
+    preserve_targets: tuple[Path, ...] = (),
+    validate_channel_specific: Callable[[], Awaitable[None]] | None = None,
+    on_rollback_start: Callable[[], None] | None = None,
+    manual_snapshot_sha256: str = "",
+    rollback_install_source: Callable[[], Awaitable[None]] | None = None,
+) -> ReplacePluginResult:
     """Revalidate and replace under the shared plugin filesystem lock."""
-    active_entry = manager.find_active_market_entry(expected_plugin_id)
+    reload_install_source = getattr(manager, "load", None)
+    if callable(reload_install_source):
+        await asyncio.to_thread(reload_install_source)
+    active_entry = _find_active_user_entry(manager, expected_plugin_id)
+    original_is_manual = is_manual_takeover_entry(original_entry)
     if active_entry is None or (
         active_entry.plugin_id != original_entry.plugin_id
         or active_entry.directory_name != original_entry.directory_name
-        or (getattr(active_entry, "package_id", "") or active_entry.plugin_id)
-        != installed_package_id
+        or (
+            not original_is_manual
+            and (getattr(active_entry, "package_id", "") or active_entry.plugin_id)
+            != installed_package_id
+        )
         or _market_entry_fingerprint(active_entry) != original_entry_fingerprint
     ):
         raise _TaskError(
@@ -2945,12 +3553,64 @@ async def _replace_market_plugin_transaction(
             message="plugin installation changed while the package was downloading",
             http_status=409,
         )
+    if original_is_manual:
+        live_snapshot = await asyncio.to_thread(
+            manual_takeover_snapshot_sha256,
+            entry=active_entry,
+            target_dir=plugin_dir,
+        )
+        if not manual_snapshot_sha256 or not secrets.compare_digest(
+            manual_snapshot_sha256,
+            live_snapshot,
+        ):
+            raise _TaskError(
+                code="manual_takeover_plan_changed",
+                message="manual plugin changed after takeover confirmation",
+                http_status=409,
+            )
+
+        async def validate_manual_backup(backup_dir: Path) -> None:
+            staged_snapshot = await asyncio.to_thread(
+                manual_takeover_snapshot_sha256,
+                entry=active_entry,
+                target_dir=backup_dir,
+            )
+            if not secrets.compare_digest(
+                manual_snapshot_sha256,
+                staged_snapshot,
+            ):
+                raise ServerDomainError(
+                    code="MANUAL_TAKEOVER_PLAN_CHANGED",
+                    message="manual plugin changed while it was being stopped",
+                    status_code=409,
+                )
+
+    else:
+        validate_manual_backup = None
     try:
-        return await replace_plugin(**replace_kwargs)
+        return await replace_plugin(
+            layout=layout,
+            install_new=install_new,
+            additional_targets=additional_targets,
+            preserve_targets=preserve_targets,
+            validate_backup=validate_manual_backup,
+            validate_channel_specific=validate_channel_specific,
+            on_rollback_start=on_rollback_start,
+        )
     except ReplacePluginError:
         if rollback_install_source is not None:
             await rollback_install_source()
         raise
+
+
+def _find_active_user_entry(manager: Any, plugin_ref: str) -> LockEntry | None:
+    """Use the broad user-candidate lookup while preserving test adapters."""
+
+    finder = getattr(manager, "find_active_user_entry", None)
+    if callable(finder):
+        return finder(plugin_ref)
+    market_finder = getattr(manager, "find_active_market_entry", None)
+    return market_finder(plugin_ref) if callable(market_finder) else None
 
 
 def _market_entry_fingerprint(entry: object) -> tuple[object, ...]:
@@ -2958,11 +3618,13 @@ def _market_entry_fingerprint(entry: object) -> tuple[object, ...]:
     source_detail = getattr(entry, "source_detail", None)
     return (
         getattr(entry, "root_id", ""),
+        getattr(entry, "channel", ""),
         getattr(entry, "directory_name", ""),
         getattr(entry, "plugin_id", ""),
         getattr(entry, "package_id", ""),
         getattr(entry, "installed_at", ""),
         getattr(entry, "updated_at", ""),
+        getattr(entry, "removed", False),
         getattr(source_detail, "version", ""),
         getattr(source_detail, "package_sha256", ""),
     )
@@ -2993,19 +3655,55 @@ async def _do_upgrade(
             code="plugin_not_installed_for_upgrade",
             message="install source manager not initialised",
         )
+    if bool(getattr(mgr, "is_degraded", False)):
+        raise _TaskError(
+            code="install_source_read_only",
+            message="Market upgrade requires a writable install-source lock",
+            http_status=503,
+        )
 
-    entry = mgr.find_active_market_entry(expected_plugin_id)
+    entry = _find_active_user_entry(mgr, expected_plugin_id)
     if entry is None:
         raise _TaskError(
             code="plugin_not_installed_for_upgrade",
             message=f"plugin {expected_plugin_id!r} has no active market lock entry",
             http_status=400,
         )
+    manual_takeover = is_manual_takeover_entry(entry)
+    if not manual_takeover and getattr(entry, "channel", "market") != "market":
+        raise _TaskError(
+            code="plugin_replacement_source_unsupported",
+            message="only Market or confirmed manual plugins can be replaced",
+            http_status=409,
+        )
+    manual_snapshot_sha256 = str(
+        getattr(payload, "verified_manual_snapshot_sha256", None) or ""
+    ).strip()
+    if manual_takeover and not manual_snapshot_sha256:
+        raise _TaskError(
+            code="manual_takeover_confirmation_required",
+            message="manual takeover requires bound confirmation",
+            http_status=409,
+        )
     installed_plugin_id = entry.plugin_id
     entry_fingerprint = _market_entry_fingerprint(entry)
 
     path_policy = PluginCliPathPolicy.from_settings()
     plugin_dir = (path_policy.user_plugins_root / entry.directory_name).resolve()
+    builtin_manifest = path_policy.builtin_plugins_root / installed_plugin_id / "plugin.toml"
+    builtin_plugin_id = await asyncio.to_thread(_read_plugin_toml_id, builtin_manifest)
+    continues_builtin_override = builtin_plugin_id == installed_plugin_id
+    authoritative_release: dict[str, object] | None = None
+    if continues_builtin_override:
+        try:
+            authoritative_release = await _fetch_authoritative_market_override_release(payload)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            raise _TaskError(
+                code=str(detail.get("code") or "market_catalog_unavailable"),
+                message=str(detail.get("message") or exc.detail),
+                http_status=exc.status_code,
+            ) from exc
     package_path: Path | None = None
     try:
         _set_task_stage(
@@ -3064,8 +3762,12 @@ async def _do_upgrade(
         ):
             raise _TaskError(code="install_failed", message=f"invalid package id: {package_id!r}")
 
-        installed_package_id = getattr(entry, "package_id", "") or installed_plugin_id
-        if package_id != installed_package_id:
+        installed_package_id = (
+            package_id
+            if manual_takeover
+            else getattr(entry, "package_id", "") or installed_plugin_id
+        )
+        if not manual_takeover and package_id != installed_package_id:
             raise _TaskError(
                 code="package_id_change",
                 message=(
@@ -3096,11 +3798,26 @@ async def _do_upgrade(
                 code="unsafe_profile_path",
                 message=f"recorded package profile path does not match package id: {profile_dir}",
             )
+        manual_package_has_profiles = bool(
+            manual_takeover and getattr(inspected, "profile_names", ())
+        )
+        if manual_package_has_profiles and (
+            profile_dir.exists() or profile_dir.is_symlink()
+        ):
+            raise _TaskError(
+                code="manual_takeover_profile_target_exists",
+                message="manual takeover cannot claim an existing package profile",
+                http_status=409,
+            )
         market_override = _build_market_override(
             payload,
             mode="reinstall" if record_as_reinstall else "upgrade",
             directory_name=entry.directory_name,
         )
+        if authoritative_release is not None:
+            market_detail = market_override["market_detail"]
+            market_detail.update(authoritative_release)
+            market_detail["expected_plugin_toml_id"] = payload.expected_plugin_toml_id
 
         source_write_attempted = False
         source_restored = True
@@ -3132,15 +3849,16 @@ async def _do_upgrade(
                     restore_exc,
                 )
 
-        async def validate_new() -> None:
-            actual_plugin_id = _read_plugin_toml_id(plugin_dir / "plugin.toml")
-            if actual_plugin_id and actual_plugin_id != installed_plugin_id:
-                raise ValueError(
-                    "installed plugin identity does not match the Market replacement target"
+        async def validate_channel_specific() -> None:
+            if continues_builtin_override:
+                from plugin.server.application.plugins.lifecycle_service import (
+                    plugin_registry_service,
                 )
 
-        async def start(plugin_id: str) -> None:
-            await start_plugin_after_upgrade(plugin_id, strict=True)
+                await plugin_registry_service.validate_plugin_runtime_source(
+                    plugin_id=installed_plugin_id,
+                    config_path=plugin_dir / "plugin.toml",
+                )
 
         def mark_rollback_running() -> None:
             _set_task_stage(
@@ -3176,26 +3894,30 @@ async def _do_upgrade(
                 original_entry=entry,
                 original_entry_fingerprint=entry_fingerprint,
                 installed_package_id=installed_package_id,
+                plugin_dir=plugin_dir,
+                layout=resolve_plugin_layout(installed_plugin_id, plugin_dir),
+                install_new=install_new,
+                additional_targets=(
+                    (profile_dir,)
+                    if not manual_takeover or manual_package_has_profiles
+                    else ()
+                ),
+                preserve_targets=(() if manual_takeover else (profile_dir,)),
+                validate_channel_specific=validate_channel_specific,
+                on_rollback_start=mark_rollback_running,
+                manual_snapshot_sha256=manual_snapshot_sha256,
                 rollback_install_source=rollback_install_source,
-                replace_kwargs={
-                    "layout": resolve_plugin_layout(installed_plugin_id, plugin_dir),
-                    "install_new": install_new,
-                    "validate_new": validate_new,
-                    "is_running": plugin_is_running,
-                    "stop": stop_plugin_for_upgrade,
-                    "start": start,
-                    "cleanup_backup": _async_remove_dir,
-                    "additional_targets": (profile_dir,),
-                    "preserve_targets": (profile_dir,),
-                    "on_rollback_start": mark_rollback_running,
-                },
             )
         except ReplacePluginError as exc:
             rollback_ok = exc.rollback_status == "completed" and source_restored
-            cause_code = exc.cause.code if isinstance(exc.cause, InstallSourceError) else None
+            cause_code = (
+                exc.cause.code
+                if isinstance(exc.cause, (InstallSourceError, ServerDomainError))
+                else None
+            )
             cause_message = (
                 str(exc.cause.message)
-                if isinstance(exc.cause, InstallSourceError)
+                if isinstance(exc.cause, (InstallSourceError, ServerDomainError))
                 else str(exc.cause)
             )
             task["rollback"] = {
@@ -3272,6 +3994,17 @@ def _build_market_override(
             "expected_plugin_toml_id": payload.expected_plugin_toml_id,
         },
     }
+    if mode == "override_builtin" and payload.verified_builtin_manifest_sha256:
+        override["override_confirmation"] = {
+            "builtin_manifest_sha256": payload.verified_builtin_manifest_sha256,
+        }
+    verified_manual_snapshot_sha256 = str(
+        getattr(payload, "verified_manual_snapshot_sha256", None) or ""
+    ).strip()
+    if mode in {"upgrade", "reinstall"} and verified_manual_snapshot_sha256:
+        # Internal evidence only: market_install strips caller-provided values
+        # and sets this after rebuilding the exact manual takeover plan.
+        override["manual_takeover_snapshot_sha256"] = verified_manual_snapshot_sha256
     if directory_name:
         override["directory_name"] = directory_name
     return override
@@ -3351,13 +4084,6 @@ def _post_install_payload_check(
         )
 
 
-async def _async_remove_dir(target_dir: Path) -> None:
-    """Async best-effort rmtree for backup cleanup."""
-
-    try:
-        await remove_directory(target_dir)
-    except Exception as exc:  # pragma: no cover - platform-specific cleanup failure
-        logger.warning("backup cleanup failed for {}: {}", target_dir, exc)
 def _utc_iso_now() -> str:
     """Current UTC time in ISO 8601 with microsecond precision and ``Z`` suffix."""
 
