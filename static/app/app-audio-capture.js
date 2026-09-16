@@ -27,6 +27,9 @@
         }
     }
     function clearVoiceInputRecoveryTimer() { if (S.voiceInputRecoveryTimer) clearTimeout(S.voiceInputRecoveryTimer); S.voiceInputRecoveryTimer = null; }
+    function isVoiceInputRecoveryPending() {
+        return S.voiceInputRecoveryState === 'recovering' || S.voiceInputRecoveryState === 'timed_out';
+    }
     function beginVoiceInputRecovery() {
         clearVoiceInputRecoveryTimer();
         const generation = ++S.voiceInputRecoveryGeneration;
@@ -39,29 +42,32 @@
         }
         S.voiceInputRecoveryState = 'recovering'; updateRecoveryStatus('recovering');
         S.voiceInputRecoverySessionEpoch = S.voiceSessionEpoch ?? S.sessionEpoch ?? null;
-        // setMicMuted/toggleMicMute sync the lease immediately after this
-        // transition, so the next outbound generation is the one to match.
-        S.voiceInputRecoveryLeaseGeneration = voiceLeaseGeneration + 1;
+        // Bind to the actual lease snapshot sent below, including reconnect
+        // replay, whose generation starts again at one.
+        S.voiceInputRecoveryLeaseGeneration = null;
         window.dispatchEvent(new CustomEvent('voice-input-recovery-changed', { detail: { state: 'recovering', generation } }));
         S.voiceInputRecoveryTimer = setTimeout(() => {
             if (generation !== S.voiceInputRecoveryGeneration || S.voiceInputRecoveryState !== 'recovering') return;
-            S.voiceInputRecoveryState = 'failed'; updateRecoveryStatus('failed');
-            window.dispatchEvent(new CustomEvent('voice-input-recovery-changed', { detail: { state: 'failed', generation } }));
+            S.voiceInputRecoveryTimer = null;
+            // This UI deadline does not cancel the backend transport attempt.
+            // Keep dropping PCM, but accept a current READY arriving later.
+            S.voiceInputRecoveryState = 'timed_out'; updateRecoveryStatus('failed');
+            window.dispatchEvent(new CustomEvent('voice-input-recovery-changed', { detail: { state: 'timed_out', generation } }));
         }, 4000);
     }
     window.addEventListener('voice-input-recovery-ready', (event) => {
-        if (S.independentAsrActive !== true || S.isMicMuted || S.voiceInputRecoveryState !== 'recovering') return;
+        if (S.independentAsrActive !== true || S.isMicMuted || !isVoiceInputRecoveryPending()) return;
         const detail = event?.detail || {};
         const generation = detail.generation;
         if (generation != null && generation !== S.voiceInputRecoveryGeneration) return;
         if (detail.session_epoch != null && S.voiceInputRecoverySessionEpoch != null
                 && detail.session_epoch !== S.voiceInputRecoverySessionEpoch) return;
-        if (detail.lease_generation != null && S.voiceInputRecoveryLeaseGeneration != null
+        if (detail.lease_generation != null
                 && detail.lease_generation !== S.voiceInputRecoveryLeaseGeneration) return;
         clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'ready'; updateRecoveryStatus('ready');
     });
     window.addEventListener('voice-input-recovery-failed', (event) => {
-        if (S.independentAsrActive !== true || S.isMicMuted || S.voiceInputRecoveryState !== 'recovering') return;
+        if (S.independentAsrActive !== true || S.isMicMuted || !isVoiceInputRecoveryPending()) return;
         const detail = event?.detail || {};
         const generation = detail.generation;
         if (generation != null && generation !== S.voiceInputRecoveryGeneration) return;
@@ -141,19 +147,23 @@
         if (!S.socket || S.socket.readyState !== WebSocket.OPEN) return false;
         const state = currentVoiceInputControlState();
         const fingerprint = JSON.stringify(state);
-        if (force !== true && fingerprint === lastVoiceLeaseFingerprint) return true;
-        voiceLeaseGeneration += 1;
+        if (force === true || fingerprint !== lastVoiceLeaseFingerprint) {
+            voiceLeaseGeneration += 1;
+            S.socket.send(JSON.stringify({
+                action: 'voice_input_control',
+                event: 'lease_sync',
+                owner: state.owner,
+                hard_muted: state.hard_muted,
+                focus_suppressed: state.focus_suppressed,
+                engaged: state.engaged,
+                lease_generation: voiceLeaseGeneration
+            }));
+            lastVoiceLeaseFingerprint = fingerprint;
+        }
         S.voiceInputCurrentLeaseGeneration = voiceLeaseGeneration;
-        S.socket.send(JSON.stringify({
-            action: 'voice_input_control',
-            event: 'lease_sync',
-            owner: state.owner,
-            hard_muted: state.hard_muted,
-            focus_suppressed: state.focus_suppressed,
-            engaged: state.engaged,
-            lease_generation: voiceLeaseGeneration
-        }));
-        lastVoiceLeaseFingerprint = fingerprint;
+        if (isVoiceInputRecoveryPending()) {
+            S.voiceInputRecoveryLeaseGeneration = voiceLeaseGeneration;
+        }
         return true;
     }
 
@@ -223,7 +233,8 @@
     function canUploadOrdinaryMicFrame() {
         if (refreshMicLease() !== MIC_LEASE.CORE) return false;
         const state = currentVoiceInputControlState();
-        return !state.hard_muted && !state.focus_suppressed && !['recovering', 'failed'].includes(S.voiceInputRecoveryState);
+        return !state.hard_muted && !state.focus_suppressed
+            && !isVoiceInputRecoveryPending() && S.voiceInputRecoveryState !== 'failed';
     }
 
     // ======================== DOM 辅助 ========================

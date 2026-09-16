@@ -3575,6 +3575,7 @@
                             S.voiceSessionEpoch = statusDetails.session_epoch;
                         }
                         if (statusCode === 'ASR_INDEPENDENT_READY') {
+                            var wasIndependentAsrActive = S.independentAsrActive === true;
                             S.independentAsrActive = true;
                             S.voiceInputRouteBlocked = false;
                             if (S.gameRouteActive === true) {
@@ -3585,7 +3586,9 @@
                                     reason: 'asr_ready'
                                 });
                             }
-                            if (typeof window.showStatusToast === 'function') {
+                            // Background reconnect/warm-idle wake only refreshes
+                            // routing. Recovery has its own VOICE_INPUT_READY toast.
+                            if (!wasIndependentAsrActive && typeof window.showStatusToast === 'function') {
                                 window.showStatusToast(
                                     window.t ? window.t('microphone.independentAsrActive', { providerKey: asrProvider || 'unknown' }) : ('Independent ASR active: ' + asrProvider),
                                     3000
