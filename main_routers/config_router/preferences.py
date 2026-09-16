@@ -184,14 +184,14 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
             prepare_voice_identity_audio_contract_change,
             reconcile_voice_identity_audio_contract_change,
         ) = _VOICE_IDENTITY_AUDIO_CONTRACT_CALLBACKS
-        current = await aload_global_conversation_settings_snapshot(strict=True)
+        current = await aload_global_conversation_settings_snapshot()
         if current.settings.get("noiseReductionEnabled") is not enabled:
             return
         prepare_started = False
         try:
             prepare_started = True
             prepared = await prepare_voice_identity_audio_contract_change(enabled)
-            current = await aload_global_conversation_settings_snapshot(strict=True)
+            current = await aload_global_conversation_settings_snapshot()
             if current.settings.get("noiseReductionEnabled") is not enabled:
                 return
             if not prepared:
@@ -200,8 +200,8 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
                     runtime_ready=False,
                 )
                 return
-            runtime_ready = await _apply_noise_reduction_to_active_sessions(enabled)
-            current = await aload_global_conversation_settings_snapshot(strict=True)
+            await _apply_noise_reduction_to_active_sessions(enabled)
+            current = await aload_global_conversation_settings_snapshot()
             if current.settings.get("noiseReductionEnabled") is not enabled:
                 return
             await reconcile_voice_identity_audio_contract_change(
@@ -209,7 +209,7 @@ async def _apply_noise_reduction_if_current_locked(enabled: bool) -> None:
                 # Registry compares each manager with this settled snapshot.  A
                 # failed manager stays required+pending while managers that did
                 # settle receive independent fresh WAITING runtimes.
-                runtime_ready=runtime_ready,
+                runtime_ready=True,
             )
         except Exception:
             if prepare_started:

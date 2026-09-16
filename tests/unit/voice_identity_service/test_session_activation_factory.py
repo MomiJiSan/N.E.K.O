@@ -255,5 +255,3 @@ def test_closed_factory_and_closed_source_profile_reject_creation(
             activation_generation="activation-closed-source",
             enforce=True,
         )
-
-pytestmark = pytest.mark.runtime

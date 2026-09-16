@@ -361,7 +361,7 @@ async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild
 
     events: list[str] = []
 
-    async def snapshot(*, strict: bool = False):
+    async def snapshot():
         return SimpleNamespace(
             revision=1,
             settings={"noiseReductionEnabled": False},
@@ -379,7 +379,7 @@ async def test_noise_reduction_setting_revokes_voice_identity_before_dsp_rebuild
 
     async def reconcile(enabled: bool, *, runtime_ready: bool) -> None:
         assert enabled is False
-        assert runtime_ready is False
+        assert runtime_ready is True
         events.append("reconcile")
 
     monkeypatch.setattr(
@@ -413,7 +413,7 @@ async def test_noise_reduction_reconcile_finishes_after_caller_cancellation(
     release_apply = asyncio.Event()
     reconciled = asyncio.Event()
 
-    async def snapshot(*, strict: bool = False):
+    async def snapshot():
         return SimpleNamespace(
             revision=1,
             settings={"noiseReductionEnabled": False},
@@ -463,5 +463,3 @@ async def test_noise_reduction_reconcile_finishes_after_caller_cancellation(
     finally:
         release_apply.set()
         preferences.configure_voice_identity_audio_contract_callbacks()
-
-pytestmark = pytest.mark.runtime

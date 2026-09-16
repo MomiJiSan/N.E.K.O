@@ -132,14 +132,7 @@ class EnrollmentAudioNormalizer:
                     frame.sample_rate_hz != OWNER_CAMPPLUS_TARGET_SAMPLE_RATE_HZ
                     or type(frame.pcm16) is not bytes
                     or len(frame.pcm16) % 2
-                    or (
-                        self._nr_enabled
-                        and (
-                            not frame.rnnoise_available
-                            or frame.rnnoise_evidence is None
-                            or frame.rnnoise_evidence.frame_count <= 0
-                        )
-                    )
+                    or (self._nr_enabled and not frame.rnnoise_available)
                 ):
                     raise EnrollmentAudioNormalizationError(
                         "audio_processing_unavailable"

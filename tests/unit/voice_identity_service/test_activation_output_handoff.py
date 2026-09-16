@@ -695,5 +695,3 @@ async def test_expired_replay_tail_cannot_be_reused_as_new_activation_preroll():
         assert runtime.state is ActivationState.ACTIVE
     finally:
         await runtime.close()
-
-pytestmark = pytest.mark.runtime

@@ -2,8 +2,7 @@
 
 import pytest
 
-from main_logic.voice_identity_service.service import VoiceIdentityServiceError
-from tests.support.voice_identity_fakes import _pcm, _service
+from tests.unit.voice_identity_service.test_service import _pcm, _service
 
 
 @pytest.mark.asyncio
@@ -29,14 +28,9 @@ async def test_failed_audio_contract_reconcile_retries_same_setting(
         )
         assert failed.state.effective_reason == "runtime_degraded"
         assert not failed.state.effective_enabled
-        # A degraded DSP runtime keeps the compatible profile resident so a
-        # same-value reconciliation can reactivate it after recovery.
-        assert activations[-1][0] is not None
+        assert activations[-1][0] is None
         assert service._runtime_noise_reduction_enabled is previous
         assert service._runtime_audio_contract_transition_pending
-
-        with pytest.raises(VoiceIdentityServiceError, match="runtime_degraded"):
-            await service.start_enrollment()
 
         assert await service.prepare_runtime_audio_contract_change(enabled)
         restored = await service.update_runtime_noise_reduction_enabled(
@@ -52,5 +46,3 @@ async def test_failed_audio_contract_reconcile_retries_same_setting(
         assert len(activations) == count
     finally:
         await service.close()
-
-pytestmark = pytest.mark.runtime

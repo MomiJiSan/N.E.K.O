@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
 import math
@@ -414,7 +413,7 @@ class OwnerVoiceRuntimeRegistry:
             if self._detach_pending:
                 self._ensure_detach_watchdog()
 
-        async with self._activation_request_lock(request_revision):
+        async with self._lock:
             if self._closed:
                 return VoiceIdentityActivationResult.RUNTIME_DEGRADED
             try:
@@ -532,9 +531,7 @@ class OwnerVoiceRuntimeRegistry:
                     old_activation.close()
                 self._settle_required_intent(request_revision)
                 return activation_result
-            # Required intent already revoked every manager before acquiring
-            # the lock, including those an attachment failure never reaches.
-            changed: list[object] = list(self._managers) if required else []
+            changed: list[object] = []
             activation_result = VoiceIdentityActivationResult.READY
             self._required = required
             try:
@@ -549,8 +546,7 @@ class OwnerVoiceRuntimeRegistry:
                     if not aligned:
                         raise RuntimeError("speaker verifier audio contract mismatch")
                     factory = next_activation.factory_for(manager)
-                    if manager not in changed:
-                        changed.append(manager)
+                    changed.append(manager)
                     try:
                         updated = await asyncio.wait_for(
                             self._set_manager_activation_factory(
@@ -705,27 +701,6 @@ class OwnerVoiceRuntimeRegistry:
         if request_revision == self._authority_request_revision:
             self._required_intent_revision = None
             self._required_intent_generation = None
-
-    @asynccontextmanager
-    async def _activation_request_lock(self, request_revision: int):
-        acquired = False
-        try:
-            await self._lock.acquire()
-            acquired = True
-            yield
-        finally:
-            # Cancellation during acquire never enters activate's body. The
-            # latest authority must settle even an inherited required intent:
-            # an optional request supersedes authority without replacing it.
-            if (
-                self._required_intent_revision is not None
-                and self._authority_request_revision == request_revision
-            ):
-                self._settle_required_intent(request_revision)
-                if not self._closed:
-                    self._rollback_activation(list(self._managers), self._activation)
-            if acquired:
-                self._lock.release()
 
     async def _set_empty_manager_authority_bounded(
         self,

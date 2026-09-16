@@ -150,5 +150,3 @@ def test_invalid_host_capacity_is_rejected_before_allocation(capacity):
             factory=_LengthFactory(), terminate_timeout_seconds=0.25,
             max_pcm_bytes=capacity,
         )
-
-pytestmark = pytest.mark.unit_fast

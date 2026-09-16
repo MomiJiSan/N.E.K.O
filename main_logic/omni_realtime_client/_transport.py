@@ -162,18 +162,6 @@ class _TransportMixin:
         self._voice_handoff_input_open = True
         return self._voice_handoff_input_sequence
 
-    def _rollback_voice_handoff_input_open(self, expected_sequence: int) -> None:
-        """Undo an onset marker when this frame was definitely not admitted."""
-        if (
-            getattr(self, "_voice_handoff_input_sequence", 0) == expected_sequence
-            and getattr(self, "_voice_handoff_input_generation", None)
-            == getattr(self, "_connection_generation", None)
-            and getattr(self, "_voice_handoff_sent_input_sequence", 0)
-            < expected_sequence
-        ):
-            self._voice_handoff_input_open = False
-            self._voice_handoff_input_sequence = max(0, expected_sequence - 1)
-
     def _ensure_voice_handoff_audio_timeline(self) -> None:
         generation = self._connection_generation
         if getattr(self, "_voice_handoff_audio_generation", None) == generation:
@@ -1236,7 +1224,6 @@ class _TransportMixin:
 
             # Skip if RNNoise is buffering (returns empty)
             if len(audio_chunk) == 0:
-                self._rollback_voice_handoff_input_open(handoff_input_sequence)
                 return None
 
         audio_processor = self._audio_processor
@@ -1317,7 +1304,6 @@ class _TransportMixin:
             # uplink rate as the very last step (24kHz for OpenAI; no-op others).
             audio_chunk = self._resample_uplink(audio_chunk)
             if not audio_chunk:
-                self._rollback_voice_handoff_input_open(handoff_input_sequence)
                 return None  # resampler still buffering — nothing to send this frame
 
             audio_b64 = base64.b64encode(audio_chunk).decode()
@@ -1326,17 +1312,13 @@ class _TransportMixin:
                 "type": "input_audio_buffer.append",
                 "audio": audio_b64
             }
-            sent = await self.send_event(
+            return await self.send_event(
                 append_event,
-            )
-            if sent:
-                self._note_voice_handoff_audio_append(
+                pre_send=lambda _event: self._note_voice_handoff_audio_append(
                     samples=len(audio_chunk) // 2,
                     input_sequence=handoff_input_sequence,
-                )
-            elif sent is False:
-                self._rollback_voice_handoff_input_open(handoff_input_sequence)
-            return sent
+                ),
+            )
 
     async def _analyze_image_with_vision_model(
         self,

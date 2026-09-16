@@ -3534,16 +3534,7 @@ class LifecycleMixin:
                         _settle_owned_replacement_close
                     )
                 if voice_handoff_ticket is None:
-                    try:
-                        await close_task
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as close_err:
-                        logger.debug(
-                            "Final Swap Sequence: %s close failed (ignored): %s",
-                            stage,
-                            close_err,
-                        )
+                    await close_task
                     return
                 remaining = max(
                     0.0,
@@ -4042,15 +4033,6 @@ class LifecycleMixin:
                     raise RuntimeError(
                         "voice activation handoff commit was rejected"
                     )
-
-            # Clear stale state only after promotion, listener installation,
-            # and any activation handoff commit have all succeeded.
-            if (
-                self.session is new_session
-                and self.message_handler_task is not None
-                and not self.message_handler_task.done()
-            ):
-                self.session_closed_by_server = False
 
             # ── 步骤 5：flush 热切换音频缓存到新 session ─────────────────────────
             # 必须在 promote 之后调用：_flush_hot_swap_audio_cache 使用 self.session

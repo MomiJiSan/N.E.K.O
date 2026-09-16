@@ -565,5 +565,3 @@ def test_scorer_constructor_rejects_incompatible_profile() -> None:
             CampPlusActivationScorer(profile, scorer_generation=1)
     finally:
         profile.close()
-
-pytestmark = pytest.mark.unit_fast

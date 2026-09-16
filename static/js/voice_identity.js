@@ -432,17 +432,10 @@
         state.ttlSettling = true;
         stopTtlClock();
         const expiredEnrollmentId = state.enrollmentId;
-        const expiredProfileId = state.profileId;
-        const nonce = ++state.operationNonce;
+        ++state.operationNonce;
         stopMicrophone('stale_enrollment');
         try {
-            const canonical = await getCanonicalStatus().catch(function () { return null; });
-            if (nonce !== state.operationNonce || state.closeStarted) return;
-            if (canonical) applyStatus(canonical);
-            if (completionMatches(canonical, expiredEnrollmentId, expiredProfileId)) {
-                finishEnrollment(canonical, expiredEnrollmentId, expiredProfileId, null);
-                return;
-            }
+            const canonical = await reconcileStatus();
             if (canonical && state.enrollmentId === expiredEnrollmentId && remainingSeconds() > 0) {
                 startTtlClock();
                 return;
@@ -452,10 +445,8 @@
             }
             setMessage(translate('voiceIdentity.errorStaleEnrollment', '本次录入已过期，请重新开始。'), true);
         } finally {
-            if (nonce === state.operationNonce) {
-                state.busy = false;
-                state.cancelPending = false;
-            }
+            state.busy = false;
+            state.cancelPending = false;
             state.ttlSettling = false;
             render();
         }

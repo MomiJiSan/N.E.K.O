@@ -53,5 +53,3 @@ def test_unknown_contract_or_revision_is_rejected(
             revision=revision,
             noise_reduction_enabled=True,
         )
-
-pytestmark = pytest.mark.unit_fast

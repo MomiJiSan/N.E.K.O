@@ -14,7 +14,7 @@ from tests.unit.test_voice_session import (
 )
 
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.integration_serial]
+pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("interruption", ["local", "provider"])

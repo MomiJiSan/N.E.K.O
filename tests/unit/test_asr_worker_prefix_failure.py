@@ -8,7 +8,7 @@ import pytest
 from main_logic.asr_client._infra import AsrSessionConfig, _RealtimeAsrSessionImpl
 from main_logic.asr_client.workers import qwen
 from tests.unit.test_asr_protected_prefix import _close, _cold_runtime
-from tests.support.realtime_harness import _FakeConnector, _FakeWebSocket, _wait_until
+from tests.unit.test_asr_workers import _FakeConnector, _FakeWebSocket, _wait_until
 
 
 @pytest.mark.asyncio
@@ -98,5 +98,3 @@ async def test_worker_callback_classifies_once_after_real_socket_write(
     finally:
         await session.close()
         await _close(manager)
-
-pytestmark = pytest.mark.integration_serial
