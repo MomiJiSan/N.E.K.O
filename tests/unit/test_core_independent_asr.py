@@ -45,6 +45,8 @@ from main_logic.asr_client.lifecycle import VoiceInputLifecycleController
 from main_logic.asr_client.provider_policy import resolve_provider_policy
 from main_logic.voice_turn.activity_evidence import RnnoiseEvidence
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
+from main_logic.voice_identity_service.activation_runtime import VoiceSessionActivationRuntime
+from main_logic.voice_identity_service.activation_scoring import ActivationScoreResult, ActivationScoreStatus
 from main_logic.voice_turn.contracts import (
     AsrFailureEvent,
     AsrLifecycleNotification,
@@ -76,6 +78,28 @@ from utils import preferences
 
 
 pytestmark = pytest.mark.asyncio
+
+
+class _CoreActivationScorer:
+    profile_generation = "profile"
+    scorer_generation = 1
+
+    def __init__(self, *, similarity: float = 0.8) -> None:
+        self.similarity = similarity
+        self.calls = 0
+        self.closed = False
+
+    async def prepare(self) -> ActivationScoreStatus:
+        return ActivationScoreStatus.READY
+
+    async def score(self, identity, pcm16: bytes, *, sample_rate_hz: int):
+        assert pcm16
+        assert sample_rate_hz == 16_000
+        self.calls += 1
+        return ActivationScoreResult(identity, ActivationScoreStatus.READY, self.similarity)
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class _Runtime(AsrRuntimeMixin):
