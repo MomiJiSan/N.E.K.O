@@ -65,6 +65,14 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
+        "2026-09-11-soccer-sdk-migration",
+        "2026-09-11-voice-session-activation-main",
+        "2026-09-11-voice-wake-word-activation",
+        "2026-09-11-voice-wake-word-activation-main",
+        "2026-09-12-voice-session-activation-main",
+        "2026-09-12-voice-wake-word-kws2-main",
+        "2026-09-10-drawing-guess-pngtuber-import-status",
+        "2026-09-09-voice-session-activation-pngtuber",
         "2026-01-31-1",
         "2026-02-04-1",
         "2026-02-23-1",
