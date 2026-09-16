@@ -105,6 +105,11 @@ def test_session_route_ack_clears_stale_independent_asr_state() -> None:
     assert "response.microphone_route === 'native'" in websocket
     assert "response.microphone_route === 'independent'" in websocket
     assert "S.independentAsrActive = response.microphone_route === 'independent';" in websocket
+    native = websocket.split("if (response.microphone_route === 'native')", 1)[1].split(
+        "if (_ackAnswersThisWindow)", 1
+    )[0]
+    assert "clearTimeout(S.voiceInputRecoveryTimer)" in native
+    assert "S.voiceInputRecoveryState = 'idle'" in native
 
 
 def test_recovery_ready_reads_runtime_session_and_is_fenced() -> None:

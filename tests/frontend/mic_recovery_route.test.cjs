@@ -37,7 +37,7 @@ function loadCapture(active, enabled = active) {
     timers.clear(); // Module startup UI timers are outside this test's scope.
     return {
         window, S, messages, controls, timers,
-        recoveryTimers: () => [...timers.values()].filter(timer => timer.delay === 12000),
+        recoveryTimers: () => [...timers.values()].filter(timer => timer.delay === 32000),
         emit: type => window.dispatchEvent({ type }),
     };
 }

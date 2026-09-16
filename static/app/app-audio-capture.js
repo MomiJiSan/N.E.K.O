@@ -47,10 +47,9 @@
             if (generation !== S.voiceInputRecoveryGeneration || S.voiceInputRecoveryState !== 'recovering') return;
             S.voiceInputRecoveryState = 'failed'; updateRecoveryStatus('failed');
             window.dispatchEvent(new CustomEvent('voice-input-recovery-changed', { detail: { state: 'failed', generation } }));
-        // A provider connection may take up to the backend's 10 s readiness
-        // timeout. Keep the client gate open long enough for that contract
-        // (and a small scheduling margin) to complete.
-        }, 12000);
+        // Soniox may make three 10 s connection attempts with retry backoff.
+        // Keep the client gate open for the complete backend recovery budget.
+        }, 32000);
     }
     window.addEventListener('voice-input-recovery-ready', (event) => {
         if (S.independentAsrActive !== true || S.isMicMuted || S.voiceInputRecoveryState !== 'recovering') return;

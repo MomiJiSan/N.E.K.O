@@ -549,6 +549,9 @@ async function destroyLive2DPreviewContext() {
     try {
         await clearLive2DPreview();
     } finally {
+        if (typeof manager.cleanupEventListeners === 'function') {
+            manager.cleanupEventListeners();
+        }
         manager._isLoadingModel = false;
         manager._modelLoadState = 'idle';
         manager._isModelReadyForInteraction = false;

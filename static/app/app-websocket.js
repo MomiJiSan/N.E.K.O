@@ -4734,6 +4734,14 @@
                             && (response.microphone_route === 'native'
                                 || response.microphone_route === 'independent')) {
                         S.independentAsrActive = response.microphone_route === 'independent';
+                        if (response.microphone_route === 'native') {
+                            ++S.voiceInputRecoveryGeneration;
+                            if (S.voiceInputRecoveryTimer) clearTimeout(S.voiceInputRecoveryTimer);
+                            S.voiceInputRecoveryTimer = null;
+                            S.voiceInputRecoveryState = 'idle';
+                            S.voiceInputRecoverySessionEpoch = null;
+                            S.voiceInputRecoveryLeaseGeneration = null;
+                        }
                     }
                     if (_ackAnswersThisWindow) S.voiceStartPending = false;
                     // NOTE: the fail-closed latch is deliberately NOT cleared
