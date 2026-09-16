@@ -2312,21 +2312,10 @@
     function attachStartSessionHandshake(ws) {
         var rawSend = ws.send.bind(ws);
         ws.send = function (data) {
-            if (typeof data === 'string' && /start_session|pause_session|end_session/.test(data)) {
+            if (typeof data === 'string' && data.indexOf('start_session') !== -1) {
                 try {
                     var msg = JSON.parse(data);
                     var handshakeStamped = false;
-                    if (msg && ['start_session', 'pause_session', 'end_session'].indexOf(msg.action) !== -1) {
-                        // Low-frequency diagnostics: send only bundled script names and
-                        // line numbers, never a full stack, URL, or user message.
-                        try {
-                            var sites = String(new Error().stack || '').match(/app-[a-z-]+\.js:\d{1,6}:\d{1,6}/g);
-                            if (sites) {
-                                msg.lifecycle_trace = sites.slice(0, 4).join(';');
-                                handshakeStamped = true;
-                            }
-                        } catch (_) { /* Diagnostics must not prevent sending. */ }
-                    }
                     if (msg && msg.action === 'start_session' && S.settingsHydrated === true && S.independentAsrAuthoritative === true) {
                         msg.independent_asr_enabled = S.independentAsrEnabled === true;
                         handshakeStamped = true;
@@ -3351,24 +3340,6 @@
                         }
                     } catch (_) { }
 
-                    if (statusCode === 'ASR_INPUT_CONNECTING'
-                        || statusCode === 'ASR_INPUT_DELIVERY_FAILED'
-                        || statusCode === 'ASR_INPUT_DELIVERY_UNCERTAIN') {
-                        var deliveryMessages = {
-                            ASR_INPUT_CONNECTING: ['microphone.inputConnecting', 'Connecting speech recognition. Your audio is waiting to be sent.'],
-                            ASR_INPUT_DELIVERY_FAILED: ['microphone.inputDeliveryFailed', 'Your speech could not be delivered completely. Restart voice input and say it again.'],
-                            ASR_INPUT_DELIVERY_UNCERTAIN: ['microphone.inputDeliveryUncertain', 'Speech delivery was interrupted. Some audio may have been received; it will not be resent automatically.']
-                        };
-                        var deliveryMessage = deliveryMessages[statusCode];
-                        if (typeof window.showStatusToast === 'function') {
-                            window.showStatusToast(
-                                window.t ? window.t(deliveryMessage[0]) : deliveryMessage[1],
-                                statusCode === 'ASR_INPUT_CONNECTING' ? 3000 : 6000
-                            );
-                        }
-                        return;
-                    }
-
                     if (statusCode === 'ASR_LIFECYCLE_STATE') {
                         var lifecycleState = (statusDetails && statusDetails.state) || '';
                         var allowedLifecycleStates = [
@@ -3414,61 +3385,14 @@
                         return;
                     }
 
-                    if (statusCode === 'VOICE_SESSION_ACTIVATION_STATE') {
-                        var activationState = (statusDetails && statusDetails.state) || '';
-                        var allowedActivationStates = [
-                            'disabled', 'preparing', 'waiting', 'verifying',
-                            'replaying', 'active', 'unavailable', 'closed'
-                        ];
-                        if (allowedActivationStates.indexOf(activationState) !== -1) {
-                            var activationIdentity = [
-                                statusDetails.session_id,
-                                statusDetails.microphone_generation,
-                                statusDetails.route_generation,
-                                statusDetails.profile_revision,
-                                statusDetails.permission_revision
-                            ].join(':');
-                            var activationRevision = Number(statusDetails.revision) || 0;
-                            if (S.voiceSessionActivationIdentity === activationIdentity
-                                && activationRevision <= (S.voiceSessionActivationRevision || 0)) {
-                                return;
-                            }
-                            var previousActivationState = S.voiceSessionActivationState || '';
-                            S.voiceSessionActivationIdentity = activationIdentity;
-                            S.voiceSessionActivationRevision = activationRevision;
-                            S.voiceSessionActivationState = activationState;
-                            document.documentElement.setAttribute(
-                                'data-voice-session-activation-state',
-                                activationState
-                            );
-                            window.dispatchEvent(new CustomEvent(
-                                'voice-session-activation-changed',
-                                { detail: statusDetails }
-                            ));
-                            if (previousActivationState !== activationState
-                                && S.isRecording === true
-                                && typeof window.showStatusToast === 'function') {
-                                if (activationState === 'waiting') {
-                                    window.showStatusToast(
-                                        window.t ? window.t('voiceIdentity.sessionWaiting') : 'Waiting for your voice to activate the conversation.',
-                                        2500
-                                    );
-                                } else if (activationState === 'active') {
-                                    window.showStatusToast(
-                                        window.t ? window.t('voiceIdentity.sessionActive') : 'Voice conversation activated.',
-                                        2500
-                                    );
-                                } else if (activationState === 'unavailable') {
-                                    window.showStatusToast(
-                                        window.t ? window.t('voiceIdentity.sessionUnavailable') : 'Voice activation is unavailable. Standby audio will not be uploaded.',
-                                        5000
-                                    );
-                                }
-                            }
-                        }
+                    if (statusCode === 'VOICE_INPUT_READY') {
+                        window.dispatchEvent(new CustomEvent('voice-input-recovery-ready', { detail: statusDetails || {} }));
                         return;
                     }
-
+                    if (statusCode === 'VOICE_INPUT_RECOVERY_FAILED') {
+                        window.dispatchEvent(new CustomEvent('voice-input-recovery-failed', { detail: statusDetails || {} }));
+                        return;
+                    }
                     if (statusCode === 'VOICE_INPUT_LEASE_RESYNC_REQUIRED') {
                         // 仅采集中的窗口重发 lease 快照；非采集窗口忽略，避免多窗口互相覆盖
                         if (S.isRecording === true
@@ -3502,6 +3426,9 @@
                     if (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0) {
                         var asrProvider = (statusDetails && statusDetails.provider) || '';
                         S.independentAsrProvider = asrProvider;
+                        if (statusDetails && statusDetails.session_epoch != null) {
+                            S.voiceSessionEpoch = statusDetails.session_epoch;
+                        }
                         if (statusCode === 'ASR_INDEPENDENT_READY') {
                             S.independentAsrActive = true;
                             S.voiceInputRouteBlocked = false;
@@ -4693,8 +4620,6 @@
 
                 // -------- session_preparing --------
                 } else if (response.type === 'session_preparing') {
-                    if (window.sessionStartNotificationIsRetired(response)
-                            || !window.sessionStartNotificationAnswersPending(response)) return;
                     console.log(window.t('console.sessionPreparingReceived'), response.input_mode);
                     if (response.input_mode !== 'text') {
                         if (typeof window.isNekoGoodbyeModeActive === 'function'
@@ -4708,7 +4633,6 @@
 
                 // -------- session_started --------
                 } else if (response.type === 'session_started') {
-                    if (window.sessionStartNotificationIsRetired(response)) return;
                     if (response.input_mode !== 'text'
                             && typeof window.isNekoGoodbyeModeActive === 'function'
                             && window.isNekoGoodbyeModeActive()) {
@@ -4779,8 +4703,9 @@
                     //
                     // 只 gate「收口」（清超时 + resolve），不 gate 下面的 UI 同步：
                     // 后端确实起了一个会话，文本框显隐、停麦这些对本窗口照样成立。
-                    // 内部路径没有请求标识时仍同步会话 UI，但不能收口本窗口
-                    // 在途的用户请求：同模式的旧内部启动也可能迟到。
+                    // ack 不带标识时按「是我的」处理：后端内部路径（proactive /
+                    // greeting / 断线自恢复）不经用户请求、没有标识，而它们撞上
+                    // pending 启动的情形本就由上面的模式守卫负责。
                     //
                     // 主判据是 resolver 而不是标识本身：清 resolver 的地方有十来处，
                     // 指望每一处都记得连标识一起清是靠不住的，漏一处就会留下一个陈旧
@@ -4789,6 +4714,7 @@
                     // 在等 = 本窗口没有启动在途 = 任何 ack 都按旧行为处理。
                     var _ackAnswersThisWindow = !S.sessionStartedResolver
                         || !S._pendingSessionStartRequestId
+                        || !response.request_id
                         || response.request_id === S._pendingSessionStartRequestId;
                     if (!_ackAnswersThisWindow) {
                         console.log('[App] session_started answers another start',
@@ -4798,6 +4724,17 @@
                     S.suppressAssistantStreamUntilNextSession = false;
                     S.isTextSessionActive = response.input_mode === 'text';
                     S.voiceChatActive = response.input_mode !== 'text';
+                    if (response.session_epoch != null) {
+                        S.voiceSessionEpoch = response.session_epoch;
+                    }
+                    // The session acknowledgement is the authoritative route
+                    // for this session. Clear stale independent-ASR state when
+                    // a new native realtime session replaces an old ASR one.
+                    if (response.input_mode !== 'text'
+                            && (response.microphone_route === 'native'
+                                || response.microphone_route === 'independent')) {
+                        S.independentAsrActive = response.microphone_route === 'independent';
+                    }
                     if (_ackAnswersThisWindow) S.voiceStartPending = false;
                     // NOTE: the fail-closed latch is deliberately NOT cleared
                     // here. lifecycle.py runs _start_independent_asr_if_enabled
@@ -4925,14 +4862,12 @@
                     // acknowledged the text session at all (Codex P2). Resolve
                     // only if the slot still holds the very start we acked.
                     var _ackedResolver = _ackAnswersThisWindow ? S.sessionStartedResolver : null;
-                    var _ackedClaimSeq = window.sessionStartClaimSeq();
                     setTimeout(function () {
                         // Not gated on the resolver: a window with no pending
                         // start (chat.html) still has to drop the banner. Gated
                         // on the request guard, though -- a window still waiting
                         // for ITS ack must keep showing "preparing".
-                        if (_ackAnswersThisWindow && !window.sessionStartsSince(_ackedClaimSeq)
-                                && typeof window.hideVoicePreparingToast === 'function') window.hideVoicePreparingToast();
+                        if (_ackAnswersThisWindow && typeof window.hideVoicePreparingToast === 'function') window.hideVoicePreparingToast();
                         if (!_ackedResolver) return;
                         if (S.sessionStartedResolver === _ackedResolver) {
                             // Still ours: release the shared slot and its timer.
@@ -4984,8 +4919,6 @@
 
                 // -------- session_failed --------
                 } else if (response.type === 'session_failed') {
-                    if (window.sessionStartNotificationIsRetired(response)
-                            || !window.sessionStartNotificationAnswersPending(response)) return;
                     console.log(window.t('console.sessionFailedReceived'), response.input_mode);
                     // 跨模式 fail 守卫（与上方 session_started 守卫对偶）：用户的启动正在
                     // await 时，并发的后台会话（如 proactive 自起的 text）若启动失败会发
