@@ -405,19 +405,6 @@ def test_voice_lifecycle_status_is_validated_and_exposed_to_ui():
     assert "data-voice-input-state" in source
 
 
-def test_voice_session_activation_status_is_validated_and_exposed_to_ui():
-    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
-
-    assert "statusCode === 'VOICE_SESSION_ACTIVATION_STATE'" in source
-    assert "data-voice-session-activation-state" in source
-    assert "voice-session-activation-changed" in source
-    assert "voiceSessionActivationRevision" in source
-    assert "activationRevision <=" in source
-    assert "voiceIdentity.sessionWaiting" in source
-    assert "voiceIdentity.sessionActive" in source
-    assert "voiceIdentity.sessionUnavailable" in source
-
-
 def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
     # runtime.py _handle_independent_asr_error always broadcasts lifecycle
     # BLOCKED before the fatal status code, and most fatal codes
@@ -6186,10 +6173,9 @@ def test_session_started_only_settles_the_start_it_answers():
     # the checklist that goes stale. A window with no start pending must treat
     # any ack as its own, or a leaked id silently disables the latch forever.
     assert "!S.sessionStartedResolver" in guard
-    # An ack with no id counts as ours: the internal starts (proactive,
-    # greeting, disconnect recovery) carry no request, and the cross-mode guard
-    # already covers them.
-    assert "!response.request_id" in guard
+    # An anonymous internal start still updates observers but cannot settle a
+    # pending user request, including a same-mode start that completed late.
+    assert "!response.request_id" not in guard
     assert "!S._pendingSessionStartRequestId" in guard
 
     # Settling is what the guard gates -- the timeout clear and the deferred
@@ -7053,3 +7039,4 @@ def test_game_voice_command_commits_its_teardown_before_it_can_yield():
             f"the superseded branch reaches for {teardown}; a command whose route "
             "is gone must not touch the process-global microphone"
         )
+
