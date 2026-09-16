@@ -5013,6 +5013,7 @@ async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback
         "details": {
             "reason": "ASR_INDEPENDENT_FAILED",
             "session_epoch": runtime._asr_session_epoch,
+            "lease_generation": runtime._voice_lease_generation,
         },
     }
     assert "private provider detail" not in str(runtime.send_status.await_args_list)

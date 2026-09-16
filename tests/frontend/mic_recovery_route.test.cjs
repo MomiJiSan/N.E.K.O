@@ -37,7 +37,7 @@ function loadCapture(active, enabled = active) {
     timers.clear(); // Module startup UI timers are outside this test's scope.
     return {
         window, S, messages, controls, timers,
-        recoveryTimers: () => [...timers.values()].filter(timer => timer.delay === 4000),
+        recoveryTimers: () => [...timers.values()].filter(timer => timer.delay === 12000),
         emit: type => window.dispatchEvent({ type }),
     };
 }
@@ -102,4 +102,37 @@ test('independent timeout blocks upload; remuting cancels the next recovery', ()
     assert.equal(env.S.voiceInputRecoveryState, 'idle');
     assert.equal(env.recoveryTimers().length, 0);
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), false);
+});
+
+test('stale recovery failure cannot fail a newer lease generation', () => {
+    const env = loadCapture(true);
+    env.window.setMicMuted(false);
+    const lease = env.S.voiceInputRecoveryLeaseGeneration;
+    env.window.setMicMuted(true);
+    env.window.setMicMuted(false);
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-failed',
+        detail: { session_epoch: env.S.voiceInputRecoverySessionEpoch, lease_generation: lease },
+    });
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+});
+
+test('reasserting an unmuted state does not start a second recovery', () => {
+    const env = loadCapture(true);
+    env.window.setMicMuted(false);
+    const generation = env.S.voiceInputRecoveryGeneration;
+    env.window.setMicMuted(false);
+    assert.equal(env.S.voiceInputRecoveryGeneration, generation);
+    assert.equal(env.recoveryTimers().length, 1);
+});
+
+test('stopping recording cancels pending recovery even when already stopped', () => {
+    const env = loadCapture(true);
+    env.window.setMicMuted(false);
+    env.S.isRecording = false;
+    env.window.stopRecording();
+    assert.equal(env.S.voiceInputRecoveryState, 'idle');
+    assert.equal(env.recoveryTimers().length, 0);
+    assert.equal(env.S.voiceInputRecoverySessionEpoch, null);
+    assert.equal(env.S.voiceInputRecoveryLeaseGeneration, null);
 });

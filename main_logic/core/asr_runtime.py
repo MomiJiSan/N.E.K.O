@@ -4413,7 +4413,7 @@ class AsrRuntimeMixin:
                 )
             elif event.code in {"ASR_INDEPENDENT_FAILED", "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE"}:
                 logger.info("[voice-recovery] failure session_epoch=%s code=%s", event.session_epoch, event.code)
-                await self._send_voice_control_status(json.dumps({"code": "VOICE_INPUT_RECOVERY_FAILED", "details": {"session_epoch": event.session_epoch, "reason": "ASR_INDEPENDENT_FAILED"}}))
+                await self._send_voice_control_status(json.dumps({"code": "VOICE_INPUT_RECOVERY_FAILED", "details": {"session_epoch": event.session_epoch, "lease_generation": self._voice_lease_generation, "reason": "ASR_INDEPENDENT_FAILED"}}))
 
     async def _send_core_asr_lifecycle(
         self,
