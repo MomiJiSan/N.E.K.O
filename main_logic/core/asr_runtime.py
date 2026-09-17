@@ -1411,6 +1411,20 @@ class AsrRuntimeMixin:
             and self._independent_asr_transport_is_ready()
         )
 
+    def _voice_input_recovery_failure_is_current(
+        self,
+        source_identity: tuple[object, ...],
+        session_epoch: int,
+    ) -> bool:
+        # Failure cannot reuse the ready predicate: the transport is already
+        # dead, so requiring `_independent_asr_transport_is_ready()` would
+        # suppress the only event the frontend uses to enter `failed`.
+        return bool(
+            self._core_asr_operation_identity_matches(source_identity)
+            and session_epoch
+            == self._core_asr_identity_ingress_token(source_identity).session_epoch
+        )
+
     def _ingress_token_matches(self, token: VoiceIngressToken) -> bool:
         return bool(
             token.connection_id == self._voice_lease_connection_id
@@ -6009,7 +6023,40 @@ class AsrRuntimeMixin:
                 )
             elif event.code in {"ASR_INDEPENDENT_FAILED", "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE"}:
                 logger.info("[voice-recovery] failure session_epoch=%s code=%s", event.session_epoch, event.code)
-                await self._send_voice_control_status(json.dumps({"code": "VOICE_INPUT_RECOVERY_FAILED", "details": {"session_epoch": event.session_epoch, "reason": "ASR_INDEPENDENT_FAILED"}}))
+                # The original status send above is an await; re-check before
+                # publishing the recovery-failure identity used by the frontend.
+                recovery_lease_generation = self._voice_lease_generation
+                if not self._voice_input_recovery_failure_is_current(
+                    source_identity,
+                    event.session_epoch,
+                ):
+                    logger.info(
+                        "[voice-recovery] failure_suppressed_stale session_epoch=%s lease_generation=%s",
+                        event.session_epoch,
+                        recovery_lease_generation,
+                    )
+                    return
+                logger.info(
+                    "[voice-recovery] failure_emitting session_epoch=%s lease_generation=%s",
+                    event.session_epoch,
+                    recovery_lease_generation,
+                )
+                await self._send_voice_control_status(
+                    json.dumps(
+                        {
+                            "code": "VOICE_INPUT_RECOVERY_FAILED",
+                            "details": {
+                                "session_epoch": event.session_epoch,
+                                "lease_generation": recovery_lease_generation,
+                                "reason": "ASR_INDEPENDENT_FAILED",
+                            },
+                        }
+                    ),
+                    still_current=lambda: self._voice_input_recovery_failure_is_current(
+                        source_identity,
+                        event.session_epoch,
+                    ),
+                )
 
     async def _send_core_asr_lifecycle(
         self,

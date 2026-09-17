@@ -263,6 +263,7 @@ async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback
     assert statuses[-1] == {
         "code": "VOICE_INPUT_RECOVERY_FAILED",
         "details": {
+            "lease_generation": runtime._voice_lease_generation,
             "reason": "ASR_INDEPENDENT_FAILED",
             "session_epoch": runtime._asr_session_epoch,
         },
@@ -329,6 +330,7 @@ async def test_restart_default_attempts_follow_single_attempt_policy(
     ]
     assert any(status["code"] == "ASR_INDEPENDENT_FAILED" for status in statuses)
     assert statuses[-1]["code"] == "VOICE_INPUT_RECOVERY_FAILED"
+    assert statuses[-1]["details"]["lease_generation"] == runtime._voice_lease_generation
     assert "private restart connect detail" not in str(
         runtime.send_status.await_args_list
     )
