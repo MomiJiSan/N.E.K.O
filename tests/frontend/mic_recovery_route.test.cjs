@@ -90,7 +90,10 @@ test('active independent route waits even if its next-session setting is disable
     assert.equal(env.S.voiceInputRecoveryState, 'recovering');
     assert.equal(env.recoveryTimers().length, 1);
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), false);
-    env.emit('voice-input-recovery-ready');
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-ready',
+        detail: { lease_generation: env.S.voiceInputRecoveryLeaseGeneration },
+    });
     assert.equal(env.S.voiceInputRecoveryState, 'ready');
     assert.equal(env.recoveryTimers().length, 0);
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), true);
@@ -160,9 +163,14 @@ for (const timedOut of [false, true]) {
         env.S.voiceSessionEpoch = 12;
         env.window.setMicMuted(false);
         if (timedOut) env.recoveryTimers()[0].callback();
-        env.window.dispatchEvent({ type: 'voice-input-recovery-failed', detail: { session_epoch: 11 } });
+        const lease = env.S.voiceInputRecoveryLeaseGeneration;
+        env.window.dispatchEvent({ type: 'voice-input-recovery-failed', detail: { session_epoch: 11, lease_generation: lease } });
         assert.equal(env.S.voiceInputRecoveryState, timedOut ? 'timed_out' : 'recovering');
         env.window.dispatchEvent({ type: 'voice-input-recovery-failed', detail: { session_epoch: 12 } });
+        assert.equal(env.S.voiceInputRecoveryState, timedOut ? 'timed_out' : 'recovering');
+        env.window.dispatchEvent({ type: 'voice-input-recovery-failed', detail: { session_epoch: 12, lease_generation: lease - 1 } });
+        assert.equal(env.S.voiceInputRecoveryState, timedOut ? 'timed_out' : 'recovering');
+        env.window.dispatchEvent({ type: 'voice-input-recovery-failed', detail: { session_epoch: 12, lease_generation: lease } });
         env.emit('voice-input-recovery-ready');
         assert.equal(env.S.voiceInputRecoveryState, 'failed');
         assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), false);
@@ -223,4 +231,40 @@ test('ASR status updates routing but only the first activation displays its toas
     assert.equal(env.S.voiceInputRecoveryState, 'ready');
     assert.equal(env.messages.at(-1), '语音识别已恢复');
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), true);
+});
+
+test('READY and FAILED without the current lease identity cannot finish recovery', () => {
+    const env = loadCapture(true);
+    env.S.voiceSessionEpoch = 12;
+    env.window.setMicMuted(false);
+    const lease = env.S.voiceInputRecoveryLeaseGeneration;
+    env.emit('voice-input-recovery-ready');
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-ready',
+        detail: { session_epoch: 12 },
+    });
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-failed',
+        detail: { session_epoch: 12 },
+    });
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), false);
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-ready',
+        detail: { session_epoch: 12, lease_generation: lease },
+    });
+    assert.equal(env.S.voiceInputRecoveryState, 'ready');
+});
+
+test('websocket recovery failure requires the current lease generation', () => {
+    const env = loadCapture(true);
+    env.loadWebsocket();
+    env.S.voiceSessionEpoch = 12;
+    env.window.setMicMuted(false);
+    const lease = env.controls.at(-1).lease_generation;
+    env.status('VOICE_INPUT_RECOVERY_FAILED', { session_epoch: 12 });
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    env.status('VOICE_INPUT_RECOVERY_FAILED', { session_epoch: 12, lease_generation: lease });
+    assert.equal(env.S.voiceInputRecoveryState, 'failed');
+    assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), false);
 });

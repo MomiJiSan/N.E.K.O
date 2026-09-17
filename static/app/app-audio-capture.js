@@ -30,6 +30,19 @@
     function isVoiceInputRecoveryPending() {
         return S.voiceInputRecoveryState === 'recovering' || S.voiceInputRecoveryState === 'timed_out';
     }
+    function matchesCurrentVoiceInputRecovery(detail) {
+        const payload = detail || {};
+        const generation = payload.generation;
+        if (generation != null && generation !== S.voiceInputRecoveryGeneration) return false;
+        if (payload.session_epoch != null && S.voiceInputRecoverySessionEpoch != null
+                && payload.session_epoch !== S.voiceInputRecoverySessionEpoch) return false;
+        // Bind happens on the actual lease_sync send. An unbound cycle or an
+        // unsigned event cannot prove it belongs to this recovery period.
+        if (S.voiceInputRecoveryLeaseGeneration == null
+                || payload.lease_generation == null
+                || payload.lease_generation !== S.voiceInputRecoveryLeaseGeneration) return false;
+        return true;
+    }
     function beginVoiceInputRecovery() {
         clearVoiceInputRecoveryTimer();
         const generation = ++S.voiceInputRecoveryGeneration;
@@ -57,22 +70,12 @@
     }
     window.addEventListener('voice-input-recovery-ready', (event) => {
         if (S.independentAsrActive !== true || S.isMicMuted || !isVoiceInputRecoveryPending()) return;
-        const detail = event?.detail || {};
-        const generation = detail.generation;
-        if (generation != null && generation !== S.voiceInputRecoveryGeneration) return;
-        if (detail.session_epoch != null && S.voiceInputRecoverySessionEpoch != null
-                && detail.session_epoch !== S.voiceInputRecoverySessionEpoch) return;
-        if (detail.lease_generation != null
-                && detail.lease_generation !== S.voiceInputRecoveryLeaseGeneration) return;
+        if (!matchesCurrentVoiceInputRecovery(event?.detail)) return;
         clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'ready'; updateRecoveryStatus('ready');
     });
     window.addEventListener('voice-input-recovery-failed', (event) => {
         if (S.independentAsrActive !== true || S.isMicMuted || !isVoiceInputRecoveryPending()) return;
-        const detail = event?.detail || {};
-        const generation = detail.generation;
-        if (generation != null && generation !== S.voiceInputRecoveryGeneration) return;
-        if (detail.session_epoch != null && S.voiceInputRecoverySessionEpoch != null
-                && detail.session_epoch !== S.voiceInputRecoverySessionEpoch) return;
+        if (!matchesCurrentVoiceInputRecovery(event?.detail)) return;
         clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'failed'; updateRecoveryStatus('failed');
     });
     const C = window.appConst;
