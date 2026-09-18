@@ -29,6 +29,7 @@ from main_logic.asr_client.runtime import (
     AsrStartResult,
     AsrStartStatus,
     IndependentAsrRuntime,
+    _CandidateRejectionSuppression,
 )
 from main_logic.asr_client.endpointing.detector_runtime import DetectorFeedResult, DetectorRuntime
 from main_logic.voice_input import VoiceInputDispatchResult
@@ -1812,6 +1813,43 @@ async def test_rejected_transcript_submission_settles_the_prepared_turn() -> Non
 
     runtime.handle_input_transcript.assert_not_awaited()
     runtime.session.create_response.assert_not_awaited()
+    runtime.session.abandon_external_voice_turn.assert_called_once_with(turn_id)
+
+
+async def test_teardown_settles_a_turn_parked_on_the_rejection_suppression() -> None:
+    """A teardown must adopt the debt the rejection path left on the suppression.
+
+    The candidate rejection clears the prepared slot inside the final lock and
+    parks the promise on its suppression, then releases the lock to await the
+    lease, the session close and the detector reset. A teardown landing in that
+    window clears the suppression, which makes
+    ``_complete_candidate_rejection`` return without notifying Core -- so the
+    reset is the only settler left and must be able to name the turn.
+    """
+
+    runtime = _Runtime()
+    runtime.session.prepare_external_voice_turn = AsyncMock()
+    runtime.session.abandon_external_voice_turn = MagicMock()
+    await _start_and_seal_turn(runtime)
+    turn_id = runtime.session.prepare_external_voice_turn.await_args.kwargs["turn_id"]
+
+    prepared = runtime._asr_prepared_turn_token
+    assert prepared is not None
+
+    runtime._asr_prepared_turn_token = None
+    runtime._asr_candidate_rejection = _CandidateRejectionSuppression(
+        request=MagicMock(),
+        turn_token=prepared,
+        final_key=MagicMock(),
+        lifecycle=runtime._asr_lifecycle,
+        detector=runtime._asr_detector,
+    )
+
+    runtime._settle_discarded_prepared_turn(runtime._reset_asr_turn_state())
+    settling = tuple(runtime._asr_close_tasks)
+    assert settling, "the reset found nobody to settle"
+    await asyncio.gather(*settling)
+
     runtime.session.abandon_external_voice_turn.assert_called_once_with(turn_id)
 
 
