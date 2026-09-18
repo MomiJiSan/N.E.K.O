@@ -1778,6 +1778,43 @@ async def test_empty_final_completes_turn_without_core_injection() -> None:
     assert runtime._omni_mic_audio_bytes == 0
 
 
+async def test_rejected_transcript_submission_settles_the_prepared_turn() -> None:
+    """A refused envelope must still release the turn's dispatch pause.
+
+    Submission is where the preparation promise was to be handed to Core, and
+    the prepared-turn slot is cleared just before it, so no later teardown can
+    name this turn. What settles it is the voice-input registry cancelling the
+    route, which abandons the turn through the Core-chat consumer. Should that
+    owner stop covering this path, the pause would only be released by its own
+    bound, and the warning doing so would describe a leak rather than this
+    rejection.
+    """
+
+    runtime = _Runtime()
+    runtime.session.prepare_external_voice_turn = AsyncMock()
+    runtime.session.abandon_external_voice_turn = MagicMock()
+    await _start_and_seal_turn(runtime)
+    turn_id = runtime.session.prepare_external_voice_turn.await_args.kwargs["turn_id"]
+
+    # The dispatcher refuses the envelope: its contract raises RuntimeError
+    # once the slot backing this final is no longer reserved, which an
+    # identity barrier can do while the final is still in flight.
+    runtime._asr_runtime._asr_transcript_dispatcher.submit = MagicMock(
+        side_effect=RuntimeError("ASR_TRANSCRIPT_SLOT_NOT_RESERVED"),
+    )
+
+    await runtime._handle_independent_asr_final(
+        "hello",
+        runtime._asr_session_epoch,
+        "qwen",
+    )
+    await runtime._wait_asr_transcript_dispatch_idle()
+
+    runtime.handle_input_transcript.assert_not_awaited()
+    runtime.session.create_response.assert_not_awaited()
+    runtime.session.abandon_external_voice_turn.assert_called_once_with(turn_id)
+
+
 async def test_blocked_consumer_callback_does_not_block_next_turn_lifecycle() -> (
     None
 ):
