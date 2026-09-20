@@ -270,6 +270,24 @@ def _embedding(axis: int = 0) -> np.ndarray:
     result[axis] = 1.0
     return result
 
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validator_factory_timeout_closes_loaded_model(tmp_path: Path) -> None:
+    service, model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+
+    def timeout_factory():
+        raise TimeoutError("validator factory timed out")
+
+    service._speech_validator_factory = timeout_factory
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.start_enrollment()
+
+    assert model.closed is True
+    assert service._speech_validator_load_cleanup_task is None
+    await service.close()
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_segment_progress_is_server_owned_idempotent_and_profile_bound(

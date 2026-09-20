@@ -559,6 +559,8 @@ class VoiceIdentityService:
                 self._record_failure(VoiceIdentityEffectiveReason.MODEL_UNAVAILABLE)
                 raise VoiceIdentityServiceError("model_unavailable")
 
+            speech_validator = None
+            validator_load_task = None
             try:
                 speech_validator = self._speech_validator_factory()
                 validator_load_task = asyncio.create_task(
@@ -572,15 +574,18 @@ class VoiceIdentityService:
                     )
                 )
             except TimeoutError as exc:
-                self._retain_timed_out_validator_load(
-                    model,
-                    speech_validator,
-                    validator_load_task,
-                )
+                if speech_validator is not None and validator_load_task is not None:
+                    self._retain_timed_out_validator_load(
+                        model,
+                        speech_validator,
+                        validator_load_task,
+                    )
+                else:
+                    await self._close_model(model)
                 self._record_failure(VoiceIdentityEffectiveReason.MODEL_UNAVAILABLE)
                 raise VoiceIdentityServiceError("model_unavailable") from exc
             except asyncio.CancelledError as exc:
-                if "validator_load_task" in locals():
+                if speech_validator is not None and validator_load_task is not None:
                     self._retain_timed_out_validator_load(
                         model,
                         speech_validator,
@@ -590,7 +595,7 @@ class VoiceIdentityService:
                     await self._close_model(model)
                 raise exc
             except Exception as exc:
-                if "speech_validator" in locals():
+                if speech_validator is not None:
                     await self._close_speech_validator(speech_validator)
                 await self._close_model(model)
                 self._record_failure(VoiceIdentityEffectiveReason.MODEL_UNAVAILABLE)
