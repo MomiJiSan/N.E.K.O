@@ -14,7 +14,7 @@ from tests.support.asr_fakes import (
     _Runtime,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.unit_fast]
+pytestmark = [pytest.mark.unit_fast]
 
 
 async def test_final_without_observed_pending_preserves_racing_next_onset() -> None:

@@ -1181,4 +1181,4 @@ async def test_cancelled_profile_delete_reconciles_memory_and_runtime(
     assert activations[-1][0] is None
     await service.close()
 
-pytestmark = pytest.mark.unit_fast
+pytestmark = pytest.mark.runtime

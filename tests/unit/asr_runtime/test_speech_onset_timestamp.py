@@ -1,7 +1,7 @@
 import inspect
 import pytest
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
+pytestmark = [pytest.mark.runtime]
 
 
 @pytest.mark.unit

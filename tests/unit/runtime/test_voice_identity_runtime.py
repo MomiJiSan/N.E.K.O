@@ -1226,6 +1226,95 @@ async def test_cancelled_optional_request_settles_inherited_required_intent(succ
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("successor", [False, True])
+@pytest.mark.parametrize("prior_authority", [False, True])
+async def test_cancelled_optional_waiter_does_not_restore_while_activation_holds_lock(
+    monkeypatch, successor, prior_authority
+):
+    registry = OwnerVoiceRuntimeRegistry(
+        enforce=True,
+        restore_retry_interval_seconds=0.01,
+        restore_retry_timeout_seconds=1.0,
+    )
+    manager = _Manager()
+    await registry.register_manager(manager)
+    old_profile, new_profile = _profile("old"), _profile("new")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_align = registry._align_manager_audio_contract
+    tasks = []
+
+    async def align_with_active_request(target, activation):
+        if activation.generation == "required":
+            assert registry._lock.locked()
+            entered.set()
+            await release.wait()
+        return await original_align(target, activation)
+
+    try:
+        if prior_authority:
+            assert await registry.activate(
+                old_profile, "old", activation_required=True
+            ) is VoiceIdentityActivationResult.READY
+        monkeypatch.setattr(
+            registry, "_align_manager_audio_contract", align_with_active_request
+        )
+        required = asyncio.create_task(
+            registry.activate(new_profile, "required", activation_required=True)
+        )
+        tasks.append(required)
+        await asyncio.wait_for(entered.wait(), 1.0)
+        calls_before_cancel = list(manager.verifier_calls)
+        optional = asyncio.create_task(registry.activate(None, "optional"))
+        tasks.append(optional)
+        await asyncio.sleep(0)
+        if successor:
+            latest = asyncio.create_task(
+                registry.activate(new_profile, "latest", activation_required=True)
+            )
+            tasks.append(latest)
+            await asyncio.sleep(0)
+        optional.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(optional, 1.0)
+        # Cancellation only settles intent and queues repair. Even after the
+        # watchdog wakes, no factory can be installed while A holds the lock.
+        await asyncio.sleep(0.03)
+        assert registry._lock.locked()
+        assert not required.done()
+        assert manager.verifier_calls == calls_before_cancel
+        assert manager.activation_required and manager.activation_degraded
+        assert registry._required_intent_generation == (
+            "latest" if successor else None
+        )
+        release.set()
+        assert await required is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        if successor:
+            assert await latest is VoiceIdentityActivationResult.READY
+        await _wait_until(
+            lambda: not registry._attach_pending and not registry._detach_pending
+        )
+        assert registry._required_intent_revision is None
+        if successor or prior_authority:
+            assert not manager.activation_degraded
+            assert manager.verifier_calls[-1][1] == (
+                "latest" if successor else "old"
+            )
+        else:
+            assert registry.activation_status() is VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            assert manager.activation_required
+            assert manager.verifier_calls[-1][0] is None
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await registry.close()
+        old_profile.close()
+        new_profile.close()
+
+
+@pytest.mark.unit
 async def test_failed_required_activation_restores_unreached_managers():
     registry = OwnerVoiceRuntimeRegistry(
         enforce=True,

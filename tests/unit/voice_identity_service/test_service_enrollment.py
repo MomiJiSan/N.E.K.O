@@ -1134,4 +1134,4 @@ async def test_cancelled_enrollment_cancel_retains_cleanup_to_completion(
     assert service.status().state.effective_reason == "disabled"
     await service.close()
 
-pytestmark = pytest.mark.unit_fast
+pytestmark = pytest.mark.runtime
