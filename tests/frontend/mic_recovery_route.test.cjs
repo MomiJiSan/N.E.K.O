@@ -6,17 +6,20 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../../static/app/app-audio-capture.js'), 'utf8');
 const websocketSource = fs.readFileSync(path.join(__dirname, '../../static/app/app-websocket.js'), 'utf8');
+const stateSource = fs.readFileSync(path.join(__dirname, '../../static/app/app-state.js'), 'utf8');
 
 function loadCapture(active, enabled = active) {
     const timers = new Map();
     const listeners = new Map();
     const messages = [];
     const controls = [];
+    const frames = [];
+    const send = data => typeof data === 'string' ? controls.push(JSON.parse(data)) : frames.push(data);
     let timerId = 0;
-    const S = {
+    let S = {
         isRecording: true, isMicMuted: true, independentAsrActive: active,
         independentAsrEnabled: enabled, voiceInputLifecycleState: 'off',
-        socket: { readyState: 1, send: text => controls.push(JSON.parse(text)) },
+        socket: { readyState: 1, send },
     };
     const window = {
         appState: S, appConst: {}, appUtils: {},
@@ -33,7 +36,7 @@ function loadCapture(active, enabled = active) {
     class FakeWebSocket {
         static OPEN = 1;
         constructor(url) { this.url = url; this.readyState = 1; }
-        send(text) { controls.push(JSON.parse(text)); }
+        send(data) { send(data); }
     }
     const context = {
         window, console, navigator: {}, WebSocket: FakeWebSocket, Blob,
@@ -41,6 +44,7 @@ function loadCapture(active, enabled = active) {
         document: {
             getElementById: id => id === 'status-toast' ? {} : null,
             documentElement: { setAttribute() {} },
+            querySelectorAll: () => [],
         },
         setTimeout(callback, delay) {
             const id = ++timerId;
@@ -49,10 +53,45 @@ function loadCapture(active, enabled = active) {
         },
         clearTimeout(id) { timers.delete(id); },
     };
+    vm.runInNewContext(stateSource, context);
+    Object.assign(window.appState, S);
+    S = window.appState;
     vm.runInNewContext(source, context);
     timers.clear(); // Module startup UI timers are outside this test's scope.
     return {
-        window, S, messages, controls, timers,
+        window, S, messages, controls, frames, timers,
+        installMicrophone() {
+            const node = extra => Object.assign({ connect() {}, disconnect() {} }, extra);
+            class FakeAudioContext {
+                constructor() {
+                    this.state = 'running'; this.sampleRate = 48000;
+                    this.audioWorklet = { addModule: async () => {} };
+                }
+                createMediaStreamSource() { return node(); }
+                createGain() { return node({ gain: { value: 1 } }); }
+                createAnalyser() { return node(); }
+                async close() { this.state = 'closed'; }
+                async resume() { this.state = 'running'; }
+            }
+            class FakeMediaStream {
+                constructor() { this.track = { label: 'test mic', enabled: true, readyState: 'live', stop() { this.readyState = 'ended'; } }; }
+                getTracks() { return [this.track]; }
+                getAudioTracks() { return this.getTracks(); }
+            }
+            context.AudioContext = window.AudioContext = FakeAudioContext;
+            context.MediaStream = FakeMediaStream;
+            context.AudioWorkletNode = class {
+                constructor() { this.port = { onmessage: null, postMessage() {} }; }
+                connect() {}
+                disconnect() {}
+            };
+            context.fetch = async () => ({ ok: true, json: async () => ({}) });
+            context.navigator.mediaDevices = {
+                getUserMedia: async () => new FakeMediaStream(),
+                enumerateDevices: async () => [],
+            };
+        },
+        sendFrame() { S.workletNode.port.onmessage({ data: [100, -100] }); },
         recoveryTimers: () => [...timers.values()].filter(timer => timer.delay === 4000),
         emit: type => window.dispatchEvent({ type }),
         loadWebsocket() {
@@ -267,4 +306,171 @@ test('websocket recovery failure requires the current lease generation', () => {
     env.status('VOICE_INPUT_RECOVERY_FAILED', { session_epoch: 12, lease_generation: lease });
     assert.equal(env.S.voiceInputRecoveryState, 'failed');
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), false);
+});
+
+for (const state of ['recovering', 'failed', 'timed_out']) {
+    test(`${state}: stopping retires recovery and a new session actually sends PCM`, async () => {
+        const env = loadCapture(true);
+        env.installMicrophone();
+        env.S.voiceSessionEpoch = 12;
+        env.window.setMicMuted(false);
+        const oldGeneration = env.S.voiceInputRecoveryGeneration;
+        const oldTimer = env.recoveryTimers()[0];
+        if (state === 'timed_out') oldTimer.callback();
+        if (state === 'failed') env.window.dispatchEvent({
+            type: 'voice-input-recovery-failed',
+            detail: { session_epoch: 12, lease_generation: env.S.voiceInputRecoveryLeaseGeneration },
+        });
+        assert.equal(env.S.voiceInputRecoveryState, state);
+        env.window.stopRecording({ notifyServer: false });
+        assert.equal(env.S.voiceInputRecoveryState, 'idle');
+        assert.ok(env.S.voiceInputRecoveryGeneration > oldGeneration);
+        assert.equal(env.S.voiceInputRecoverySessionEpoch, null);
+        assert.equal(env.S.voiceInputRecoveryLeaseGeneration, null);
+        assert.equal(env.recoveryTimers().length, 0);
+        const owner = env.window.claimSessionStart('audio', () => {}, () => {});
+        env.S.voiceSessionEpoch = 13;
+        env.S.independentAsrActive = true;
+        assert.equal(await env.window.startMicCapture(), true);
+        env.window.releaseSessionStart(owner);
+        oldTimer.callback(); // Even a callback already queued before clearTimeout is stale.
+        assert.equal(env.S.voiceInputRecoveryState, 'idle');
+        env.sendFrame();
+        assert.equal(env.frames.length, 1);
+        assert.equal(env.frames[0].byteLength, 12);
+    });
+}
+
+test('stop before recording commits clears recovery and cancels an in-flight microphone start', async () => {
+    const env = loadCapture(true);
+    env.installMicrophone();
+    env.window.setMicMuted(false);
+    let release;
+    env.window.ensureAudioPlayerContext = () => new Promise(resolve => { release = resolve; });
+    env.S.isRecording = false;
+    const pending = env.window.startMicCapture();
+    env.window.stopRecording({ notifyServer: false });
+    assert.equal(env.S.voiceInputRecoveryState, 'idle');
+    assert.equal(env.recoveryTimers().length, 0);
+    release();
+    assert.equal(await pending, false);
+    assert.equal(env.S.isRecording, false);
+    assert.equal(env.frames.length, 0);
+});
+
+test('only a newly claimed audio session resets recovery, before displaced cleanup runs', () => {
+    const env = loadCapture(true);
+    const firstOwner = env.window.claimSessionStart('audio', () => {}, () => {
+        assert.equal(env.window.sessionStartIsCurrent(firstOwner), false);
+        assert.equal(env.S.voiceInputRecoveryState, 'idle');
+    });
+    env.window.setMicMuted(false);
+    const generation = env.S.voiceInputRecoveryGeneration;
+    env.window.claimSessionStart('audio', () => {}, () => {});
+    assert.ok(env.S.voiceInputRecoveryGeneration > generation);
+    assert.equal(env.S.voiceInputRecoveryLeaseGeneration, null);
+    env.window.setMicMuted(false);
+    const nextGeneration = env.S.voiceInputRecoveryGeneration;
+    env.window.claimSessionStart('text', () => {}, () => {});
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    assert.equal(env.S.voiceInputRecoveryGeneration, nextGeneration);
+});
+
+test('old session READY and FAILED cannot complete a new recovery even with a reused lease', () => {
+    const env = loadCapture(true);
+    env.S.voiceSessionEpoch = 12;
+    env.window.setMicMuted(false);
+    const oldLease = env.S.voiceInputRecoveryLeaseGeneration;
+    env.window.stopRecording({ notifyServer: false });
+    env.window.claimSessionStart('audio', () => {}, () => {});
+    env.S.isRecording = true;
+    env.S.independentAsrActive = true;
+    env.S.voiceSessionEpoch = 13;
+    env.window.setMicMuted(false);
+    // Reconnect may reuse a lease generation: session identity must still fence it.
+    env.S.voiceInputRecoveryLeaseGeneration = oldLease;
+    for (const type of ['voice-input-recovery-ready', 'voice-input-recovery-failed']) {
+        env.window.dispatchEvent({ type, detail: { session_epoch: 12, lease_generation: oldLease } });
+        assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    }
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-ready', detail: { session_epoch: 13, lease_generation: oldLease },
+    });
+    assert.equal(env.S.voiceInputRecoveryState, 'ready');
+});
+
+test('same-session microphone replacement preserves recovery until the matching READY', async () => {
+    const env = loadCapture(true);
+    env.installMicrophone();
+    env.window.setMicMuted(false);
+    const generation = env.S.voiceInputRecoveryGeneration;
+    assert.equal(await env.window.startMicCapture(), true);
+    const previousWorklet = env.S.workletNode;
+    const selection = env.window.selectMicrophone(null);
+    for (let i = 0; i < 30 && ![...env.timers.values()].some(timer => timer.delay === 500); i++) await Promise.resolve();
+    const delay = [...env.timers.values()].find(timer => timer.delay === 500);
+    assert.ok(delay, 'device change reached its restart delay');
+    delay.callback();
+    await selection;
+    assert.notEqual(env.S.workletNode, previousWorklet);
+    assert.equal(env.S.voiceInputRecoveryGeneration, generation);
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    env.sendFrame();
+    assert.equal(env.frames.length, 0);
+    env.window.dispatchEvent({
+        type: 'voice-input-recovery-ready', detail: { lease_generation: env.S.voiceInputRecoveryLeaseGeneration },
+    });
+    env.sendFrame();
+    assert.equal(env.frames.length, 1);
+});
+
+test('game-STT pipeline repair preserves the same session recovery gate', async () => {
+    const env = loadCapture(true);
+    env.installMicrophone();
+    env.window.setMicMuted(false);
+    const generation = env.S.voiceInputRecoveryGeneration;
+    env.S.gameVoiceSttGateActive = true;
+    env.window.stopGameVoiceSttGate(); // No ordinary pipeline yet: invokes the real repair path.
+    for (let i = 0; i < 30 && !env.S.workletNode; i++) await Promise.resolve();
+    assert.ok(env.S.workletNode);
+    assert.equal(env.S.voiceInputRecoveryGeneration, generation);
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    env.sendFrame();
+    assert.equal(env.frames.length, 0);
+});
+
+test('a failed cold microphone start leaves the new session recovery state retired', async () => {
+    const env = loadCapture(true);
+    env.S.voiceInputRecoveryState = 'failed';
+    env.S.isRecording = false;
+    env.window.claimSessionStart('audio', () => {}, () => {});
+    const error = new Error('audio playback initialization rejected');
+    env.window.ensureAudioPlayerContext = async () => { throw error; };
+    await assert.rejects(env.window.startMicCapture(), candidate => candidate === error);
+    assert.equal(env.S.isRecording, false);
+    assert.equal(env.S.voiceInputRecoveryState, 'idle');
+    assert.equal(env.recoveryTimers().length, 0);
+});
+
+test('a superseded microphone start failing late cannot retire the new owner recovery', async () => {
+    const env = loadCapture(true);
+    env.installMicrophone();
+    let rejectOld;
+    env.window.ensureAudioPlayerContext = () => new Promise((resolve, reject) => { rejectOld = reject; });
+    const oldStart = env.window.startMicCapture();
+    const oldRejection = assert.rejects(oldStart, /old playback setup failed/);
+    delete env.window.ensureAudioPlayerContext;
+    env.window.claimSessionStart('audio', () => {}, () => {});
+    assert.equal(await env.window.startMicCapture(), true);
+    env.window.setMicMuted(false);
+    const generation = env.S.voiceInputRecoveryGeneration;
+    const worklet = env.S.workletNode;
+    rejectOld(new Error('old playback setup failed'));
+    await oldRejection;
+    assert.equal(env.S.workletNode, worklet);
+    assert.equal(env.S.isRecording, true);
+    assert.equal(env.S.voiceInputRecoveryGeneration, generation);
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    env.sendFrame();
+    assert.equal(env.frames.length, 0);
 });
