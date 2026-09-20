@@ -12,9 +12,9 @@ from main_logic.voice_input.activation import (
     VoiceActivationController,
     WakeWordDetection,
 )
-from tests.unit import test_voice_activation_handoff as handoff
-from tests.unit import test_voice_activation_cold_prefix as cold
-from tests.unit.test_core_independent_asr import _CoreActivationScorer
+from tests.support import activation_harness as handoff
+from tests.unit.activation import test_voice_activation_cold_prefix as cold
+from tests.support.asr_fakes import _CoreActivationScorer
 
 
 pytestmark = pytest.mark.asyncio
