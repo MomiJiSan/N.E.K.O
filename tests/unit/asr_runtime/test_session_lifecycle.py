@@ -245,6 +245,7 @@ async def test_session_activation_resolves_asr_before_frontend_ack() -> None:
     manager = LLMSessionManager.__new__(LLMSessionManager)
     manager.lock = asyncio.Lock()
     manager.input_cache_lock = asyncio.Lock()
+    manager._bg_tasks = set()
     manager.is_active = False
     manager._session_turn_count = 0
     manager.session_start_failure_count = 1
