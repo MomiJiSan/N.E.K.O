@@ -705,3 +705,5 @@ async def test_idle_timeout_returns_to_waiting_without_retracting_output() -> No
     assert decision.state is ActivationState.WAITING
     assert len(sent) == committed
     await runtime.close()
+
+pytestmark = pytest.mark.runtime

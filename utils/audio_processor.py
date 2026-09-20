@@ -281,6 +281,7 @@ class AudioProcessor:
         self._rnnoise_last: float | None = None
         self._rnnoise_ema: float | None = None
         self._rnnoise_ema_state: float | None = None
+        self._rnnoise_processing_failed = False
         
         # AGC state
         self._agc_gain = 1.0
@@ -441,6 +442,7 @@ class AudioProcessor:
             Denoised int16 numpy array
         """
         self._rnnoise_frame_count = 0
+        self._rnnoise_processing_failed = False
         self._rnnoise_peak = None
         self._rnnoise_mean = None
         self._rnnoise_last = None
@@ -485,6 +487,7 @@ class AudioProcessor:
                 output[output_offset : output_offset + self.RNNOISE_FRAME_SIZE] = denoised
             except Exception as e:
                 logger.error(f"❌ RNNoise processing error: {e}")
+                self._rnnoise_processing_failed = True
                 output[output_offset : output_offset + self.RNNOISE_FRAME_SIZE] = frame
             output_offset += self.RNNOISE_FRAME_SIZE
 
@@ -636,6 +639,11 @@ class AudioProcessor:
         return self._rnnoise_frame_count
 
     @property
+    def rnnoise_processing_failed(self) -> bool:
+        """Whether any RNNoise frame fell back to the original PCM."""
+        return bool(self._rnnoise_processing_failed)
+
+    @property
     def rnnoise_available(self) -> bool:
         """Whether this processor can currently produce RNNoise evidence."""
 
@@ -659,6 +667,7 @@ class AudioProcessor:
     
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable noise reduction."""
+        self._require_mutable()
         prev = self.noise_reduce_enabled
         self.noise_reduce_enabled = enabled
         if enabled:

@@ -162,3 +162,5 @@ async def test_native_activation_old_close_that_swallows_cancel_cannot_exceed_de
                 break
             await asyncio.sleep(0.01)
         assert set(_ORPHAN_SESSION_REAPER_TASKS) <= baseline
+
+pytestmark = pytest.mark.runtime

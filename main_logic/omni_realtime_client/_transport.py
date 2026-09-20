@@ -162,6 +162,18 @@ class _TransportMixin:
         self._voice_handoff_input_open = True
         return self._voice_handoff_input_sequence
 
+    def _rollback_voice_handoff_input_open(self, expected_sequence: int) -> None:
+        """Undo an onset marker when this frame was definitely not admitted."""
+        if (
+            getattr(self, "_voice_handoff_input_sequence", 0) == expected_sequence
+            and getattr(self, "_voice_handoff_input_generation", None)
+            == getattr(self, "_connection_generation", None)
+            and getattr(self, "_voice_handoff_sent_input_sequence", 0)
+            < expected_sequence
+        ):
+            self._voice_handoff_input_open = False
+            self._voice_handoff_input_sequence = max(0, expected_sequence - 1)
+
     def _ensure_voice_handoff_audio_timeline(self) -> None:
         generation = self._connection_generation
         if getattr(self, "_voice_handoff_audio_generation", None) == generation:
@@ -739,10 +751,11 @@ class _TransportMixin:
             # server-side tool stripping the user mentioned will be
             # lifted, after which our tools propagate naturally.
             # lanlan.app (international free) backs onto Vertex AI
-            # Live; that path is currently TODO (no client→server
-            # tools propagation confirmed). Tools below match the
-            # StepFun shape and become a no-op on lanlan.app until
-            # the proxy supports them.
+            # Live. It forwards the StepFun-shape tools list below and
+            # returns response.function_call_arguments.* events
+            # (observed 2026-09-07: minecraft_task calls in
+            # lanlan_app_gemini voice sessions; 2026-09-12: 29
+            # recall_memory calls in voice mode).
             #
             # MANUAL mode: both proxies receive ``turn_detection: null``
             # via the StepFun-shape websocket session config. lanlan.tech
@@ -1058,7 +1071,23 @@ class _TransportMixin:
                 transport = self.ws
                 if not transport:
                     return False
+                # 结构化 wire trace（NEKO_REALTIME_WIRE_TRACE，默认关）：写出之后才记，
+                # 只记类型/id/计数；recorder 自己吞掉异常，不会影响发送结果。
+                # generation 必须在 await send 之前同步读：等待期间换上新连接会把
+                # generation 加 1，这条写到旧 socket 上的事件不能记到新连接名下。
+                wire_trace = getattr(self, "_wire_trace", None)
+                trace_generation = (
+                    getattr(self, "_connection_generation", None)
+                    if wire_trace is not None
+                    else None
+                )
                 await transport.send(payload)
+                if wire_trace is not None:
+                    wire_trace.record_send(
+                        event,
+                        generation=trace_generation,
+                        size=len(payload),
+                    )
                 return True
             except _RealtimeEventOwnerRetired:
                 raise
@@ -1224,6 +1253,7 @@ class _TransportMixin:
 
             # Skip if RNNoise is buffering (returns empty)
             if len(audio_chunk) == 0:
+                self._rollback_voice_handoff_input_open(handoff_input_sequence)
                 return None
 
         audio_processor = self._audio_processor
@@ -1304,6 +1334,7 @@ class _TransportMixin:
             # uplink rate as the very last step (24kHz for OpenAI; no-op others).
             audio_chunk = self._resample_uplink(audio_chunk)
             if not audio_chunk:
+                self._rollback_voice_handoff_input_open(handoff_input_sequence)
                 return None  # resampler still buffering — nothing to send this frame
 
             audio_b64 = base64.b64encode(audio_chunk).decode()
@@ -1312,13 +1343,17 @@ class _TransportMixin:
                 "type": "input_audio_buffer.append",
                 "audio": audio_b64
             }
-            return await self.send_event(
+            sent = await self.send_event(
                 append_event,
-                pre_send=lambda _event: self._note_voice_handoff_audio_append(
+            )
+            if sent:
+                self._note_voice_handoff_audio_append(
                     samples=len(audio_chunk) // 2,
                     input_sequence=handoff_input_sequence,
-                ),
-            )
+                )
+            elif sent is False:
+                self._rollback_voice_handoff_input_open(handoff_input_sequence)
+            return sent
 
     async def _analyze_image_with_vision_model(
         self,
@@ -2987,10 +3022,14 @@ class _TransportMixin:
                 )
                 return True
 
+            # 结构化 wire trace（默认关）：在任何分发/过滤之前记录，陈旧事件也照记。
+            wire_trace = getattr(self, "_wire_trace", None)
             async for message in message_ws:
                 if await retire_if_replaced():
                     return
                 event = json.loads(message)
+                if wire_trace is not None:
+                    wire_trace.record_recv(event, generation=message_generation)
                 event_type = event.get("type")
 
                 # if event_type not in ["response.audio.delta", "response.audio_transcript.delta",  "response.output_audio.delta", "response.output_audio_transcript.delta"]:
@@ -3111,6 +3150,19 @@ class _TransportMixin:
                         # its first turn onward and the stale filter behaves
                         # exactly as before.
                         and self._announces_responses
+                        # A mismatched function/terminal ID alone does not
+                        # enter this branch: the observed Lanlan/livestream
+                        # trace never announced response.created. Its original
+                        # timeout was owner binding, not this stale filter.
+                        # Do not exempt mismatched function-call IDs here,
+                        # even on the Lanlan route. A first-time delayed call
+                        # from a cancelled response can have an unseen call ID;
+                        # capturing the CURRENT tool scope below would bless it
+                        # as the successor's work. Neither deduplication nor a
+                        # post-receive scope check proves its origin. Without
+                        # independent correlation, quarantine ambiguous calls
+                        # on announcing connections. Never-announcing proxies
+                        # retain their existing path via the latch above.
                     ):
                         if event_type == "response.done":
                             # A terminal event must reach the arbiter even when

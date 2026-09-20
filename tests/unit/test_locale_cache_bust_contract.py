@@ -45,6 +45,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "static" / "i18n-i18next.js"
 LOCALES_DIR = ROOT / "static" / "locales"
@@ -142,10 +144,12 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-02-vllm-omni-clone-preflight",
         "2026-09-02-vllm-omni-clone-tts-state",
         "2026-09-08-drawing-guess",
-        "2026-09-03-voice-identity-five-second-verification",
-        "2026-09-08-voice-session-activation",
         "2026-09-09-pngtuber-import-status",
         "2026-09-10-drawing-guess-pngtuber-import-status",
+        "2026-09-11-soccer-sdk-migration",
+        "2026-09-09-voice-session-activation-pngtuber",
+        "2026-09-03-voice-identity-five-second-verification",
+        "2026-09-08-voice-session-activation",
     }
 )
 
@@ -158,7 +162,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = '6f923f64e4f0a366d75b4969094ccaf9a49054f2568abdd3bee0f5869ae347c4'
+LOCALE_KEY_SIGNATURE = "befbdff8b39c171d77f80e41f7bdce1bcddf1d68a7ee0424bd3bb49576b2d9c9"
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
@@ -272,3 +276,5 @@ def test_bump_instructions_name_every_step_of_the_fix() -> None:
     assert "LOCALE_VERSION" in _BUMP_INSTRUCTIONS
     assert "RETIRED_LOCALE_VERSIONS" in _BUMP_INSTRUCTIONS
     assert "LOCALE_KEY_SIGNATURE" in _BUMP_INSTRUCTIONS
+
+pytestmark = pytest.mark.frontend_contract

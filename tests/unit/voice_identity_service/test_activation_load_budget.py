@@ -173,3 +173,5 @@ async def test_real_process_load_timeout_retires_host(monkeypatch):
         await asyncio.wait_for(scorer.close(), 2)
         profile.close()
     assert host is not None and not host.alive
+
+pytestmark = pytest.mark.integration_serial

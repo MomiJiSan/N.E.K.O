@@ -316,3 +316,5 @@ async def test_old_item_stop_cannot_clear_a_new_server_utterance():
         assert client.can_handoff_voice_input()
     finally:
         await _finish_loop(socket, receive_loop)
+
+pytestmark = pytest.mark.runtime

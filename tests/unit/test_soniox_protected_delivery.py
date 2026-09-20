@@ -8,8 +8,8 @@ import pytest
 
 from main_logic.asr_client._infra import AsrSessionConfig, _RealtimeAsrSessionImpl
 from main_logic.asr_client.workers import soniox
-from tests.unit.test_asr_protected_prefix import _close, _cold_runtime
-from tests.unit.test_asr_workers import _FakeConnector, _FakeWebSocket, _wait_until
+from tests.support.asr_delivery_fakes import _close, _cold_runtime
+from tests.support.realtime_harness import _FakeConnector, _FakeWebSocket, _wait_until
 
 
 @pytest.mark.asyncio
@@ -84,3 +84,5 @@ async def test_soniox_protected_prefix_blocks_replay_but_preserves_ordinary_poli
     finally:
         await session.close()
         await _close(manager)
+
+pytestmark = pytest.mark.integration_serial

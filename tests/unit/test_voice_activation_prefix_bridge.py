@@ -11,7 +11,7 @@ from main_logic.voice_input.activation import (
     VerificationResultKind,
 )
 from main_logic.voice_turn.contracts import AsrSubmitResult, AsrSubmitStatus
-from tests.unit.test_core_independent_asr import _CoreActivationFactory, _Runtime
+from tests.support.asr_fakes import _CoreActivationFactory, _Runtime
 from tests.unit.test_voice_session_activation import _frame, _generation, _waiting_controller
 
 
@@ -92,3 +92,5 @@ async def test_core_marks_first_replay_frame_and_keeps_batch_on_live_tail() -> N
         await manager.set_voice_session_activation_factory(
             None, activation_generation="disabled"
         )
+
+pytestmark = pytest.mark.runtime

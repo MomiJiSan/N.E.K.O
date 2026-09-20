@@ -451,6 +451,10 @@ class _RealtimeAsrSessionImpl:
 
             self._state = _SessionState.CONNECTING
             self._request_queue = _AsrRequestQueue()
+            # This session owns the queue before any worker can dispatch audio.
+            # Record definite non-delivery now; missing evidence on an unknown
+            # session implementation must still mean uncertainty to callers.
+            delivery_evidence(self._request_queue)
             self._response_queue = asyncio.Queue(maxsize=_RESPONSE_QUEUE_SIZE)
             self._callback_queue = asyncio.Queue(maxsize=_CALLBACK_QUEUE_SIZE)
             self._ready_future = asyncio.get_running_loop().create_future()

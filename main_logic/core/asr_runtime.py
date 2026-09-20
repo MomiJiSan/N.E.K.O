@@ -11,6 +11,7 @@ import asyncio
 import bisect
 import json
 import math
+import os
 import struct
 import time
 from dataclasses import dataclass, replace
@@ -325,6 +326,7 @@ class AsrRuntimeMixin:
         self._hot_swap_sequence_progress = asyncio.Event()
         self._hot_swap_sequence_progress.set()
         self._omni_mic_audio_bytes = 0
+        self._voice_regression_trace_frames = 0
         self._asr_route_mode = "blocked"
         self._visual_route_mode: Literal["native", "independent"] = "native"
         self._microphone_route_generation = 0
@@ -2129,6 +2131,23 @@ class AsrRuntimeMixin:
                 "[%s] voice-session activation preparation failed",
                 self.lanlan_name,
             )
+            try:
+                await runtime.mark_unavailable("prepare_failed")
+            finally:
+                if (
+                    self._voice_session_activation_runtime is runtime
+                    and self._capture_voice_session_activation_generation()
+                    == generation
+                ):
+                    # Detach before close so CLOSED cannot supersede the
+                    # terminal UNAVAILABLE decision or trigger an immediate
+                    # retry on the next microphone frame.
+                    self._voice_session_activation_runtime = None
+                    self._voice_session_activation_degraded = True
+                    await runtime.close()
+                else:
+                    await runtime.close()
+            return
         if (
             self._voice_session_activation_runtime is not runtime
             or self._capture_voice_session_activation_generation() != generation
@@ -3842,11 +3861,30 @@ class AsrRuntimeMixin:
         received_at: float | None = None,
         captured_at: float | None = None,
     ) -> bool:
+        if os.environ.get("NEKO_VOICE_REGRESSION_TRACE") == "1":
+            self._voice_regression_trace_frames = (
+                getattr(self, "_voice_regression_trace_frames", 0) + 1
+            )
+            if self._voice_regression_trace_frames % 100 == 0:
+                logger.info(
+                    "[%s] voice-regression-trace frames=%d route=%s "
+                    "voice_factory=%s voice_required=%s independent=%s "
+                    "session_closed=%s",
+                    self.lanlan_name,
+                    self._voice_regression_trace_frames,
+                    self._asr_route_mode,
+                    self._voice_session_activation_factory is not None,
+                    self._voice_session_activation_required,
+                    bool(getattr(self, "_independent_asr_enabled", False)),
+                    bool(getattr(self, "session_closed_by_server", False)),
+                )
         if self._voice_session_activation_degraded:
             return True
         factory = self._voice_session_activation_factory
-        if factory is None:
-            if self._voice_session_activation_required:
+        if factory is None or getattr(factory, "enforce", True) is False:
+            # Shadow is observational: use ordinary delivery without creating
+            # an activation writer, protected prefix, or replay retry policy.
+            if factory is None and self._voice_session_activation_required:
                 # Requested protection without a usable authority is a
                 # deliberate fail-closed state.  Consuming the local frame here
                 # prevents both native and independent-ASR downstream sends.
@@ -3871,7 +3909,7 @@ class AsrRuntimeMixin:
                     )
                     if (
                         not reconnected
-                        or self._voice_session_activation_factory is not None
+                        or self._voice_session_activation_factory is not factory
                         or self._capture_voice_session_activation_generation()
                         != generation
                     ):
@@ -3985,6 +4023,25 @@ class AsrRuntimeMixin:
                     logger.warning(
                         "[%s] voice-session activation runtime creation failed",
                         self.lanlan_name,
+                    )
+                    decision = ActivationDecision(
+                        ActivationState.UNAVAILABLE,
+                        "runtime_creation_failed",
+                    )
+                    self._voice_session_activation_status = (
+                        generation,
+                        decision.state,
+                        decision.reason,
+                    )
+                    self._voice_session_activation_status_revision += 1
+                    AsrRuntimeMixin._schedule_core_asr_cleanup(
+                        self,
+                        self._send_voice_session_activation_status(
+                            generation,
+                            decision,
+                            self._voice_session_activation_status_revision,
+                        ),
+                        name="voice-session-activation-runtime-unavailable",
                     )
                     return True
                 self._voice_session_activation_runtime = runtime
@@ -4361,7 +4418,18 @@ class AsrRuntimeMixin:
             except asyncio.CancelledError:
                 raise
             except web_exceptions.ConnectionClosedOK:
-                if native_send_is_current():
+                # A normal provider close is expected during ordinary client
+                # handoff. Only the voice-identity takeover path latches the
+                # server-close guard; ordinary clients keep BASE delivery
+                # semantics on the successor session.
+                activation_factory = getattr(
+                    self, "_voice_session_activation_factory", None
+                )
+                if (
+                    native_send_is_current()
+                    and activation_factory is not None
+                    and getattr(activation_factory, "enforce", True)
+                ):
                     self.session_closed_by_server = True
                 return OutputCommit.UNKNOWN
             except (web_exceptions.ConnectionClosed, AttributeError) as exc:

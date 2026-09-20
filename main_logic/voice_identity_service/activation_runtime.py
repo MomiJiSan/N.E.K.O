@@ -331,6 +331,15 @@ class VoiceSessionActivationRuntime:
                 )
             )
 
+    async def mark_unavailable(self, reason: str) -> ActivationDecision:
+        """Publish a terminal preparation failure before retiring the runtime."""
+        async with self._lock:
+            if self._closed:
+                return self._publish(self._controller.close())
+            return self._publish(
+                self._controller.mark_unavailable(self._generation, reason)
+            )
+
     async def feed(
         self,
         frame: AudioFrame,
@@ -514,11 +523,17 @@ class VoiceSessionActivationRuntime:
         )
         if checkpoint is None:
             return None
-        self._attempted_checkpoints.add(checkpoint)
         decision = self._controller.request_verification(
             candidate_start_sequence=start_sequence,
             candidate_end_sequence=frame.sequence,
         )
+        if decision.reason == "candidate_unavailable":
+            # Cold preparation can outlast the bounded PCM cache. Start a new
+            # candidate on subsequent speech; evicted evidence cannot consume
+            # either scoring checkpoint or contribute to the new duration.
+            self._clear_candidate()
+        else:
+            self._attempted_checkpoints.add(checkpoint)
         self._publish(decision)
         return decision.verification_request
 
