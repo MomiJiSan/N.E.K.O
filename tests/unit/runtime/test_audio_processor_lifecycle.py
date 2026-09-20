@@ -26,6 +26,61 @@ class _FakeRnnoise:
         self.destroyed.append(state)
 
 
+@pytest.mark.parametrize("terminal", ["close", "finalize_stream"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_terminal_processor_cannot_toggle_or_recreate_denoiser(monkeypatch, terminal, enabled):
+    processor = AudioProcessor(noise_reduce_enabled=False)
+    allocations = []
+    monkeypatch.setattr(processor, "_init_denoiser", lambda: allocations.append(object()))
+    getattr(processor, terminal)()
+    error = "AUDIO_PROCESSOR_CLOSED" if terminal == "close" else "AUDIO_PROCESSOR_STREAM_FINALIZED"
+    try:
+        with pytest.raises(RuntimeError, match=f"^{error}$"):
+            processor.set_enabled(enabled)
+        assert allocations == []
+        assert processor.noise_reduce_enabled is False
+        assert processor._denoiser is None
+    finally:
+        processor.close()
+
+
+def test_rnnoise_failure_evidence_is_defined_before_processing_and_tracks_failure(monkeypatch):
+    class _Denoiser:
+        fail = True
+
+        def process_frame(self, frame):
+            if self.fail:
+                raise RuntimeError("native processing failed")
+            return frame.copy(), 0.5
+
+        def close(self):
+            pass
+
+    processor = AudioProcessor(
+        input_sample_rate=48000, output_sample_rate=48000,
+        noise_reduce_enabled=False, agc_enabled=False, limiter_enabled=False,
+    )
+    denoiser = _Denoiser()
+    monkeypatch.setattr(processor, "_init_denoiser", lambda: setattr(processor, "_denoiser", denoiser))
+    pcm = np.ones(480, dtype=np.int16).tobytes()
+    try:
+        assert processor.rnnoise_processing_failed is False
+        assert processor.process_chunk(pcm) == pcm
+        assert processor.rnnoise_processing_failed is False
+        processor.set_enabled(True)
+        assert processor.process_chunk(pcm) == pcm
+        assert processor.rnnoise_processing_failed is True
+        denoiser.fail = False
+        assert processor.process_chunk(pcm) == pcm
+        assert processor.rnnoise_processing_failed is False
+        processor.set_enabled(False)
+        processor.set_enabled(True)
+        assert processor.process_chunk(pcm) == pcm
+        assert processor.rnnoise_processing_failed is False
+    finally:
+        processor.close()
+
+
 def test_lite_denoiser_close_destroys_native_state_once() -> None:
     library = _FakeRnnoise()
     denoiser = _LiteDenoiser(library)

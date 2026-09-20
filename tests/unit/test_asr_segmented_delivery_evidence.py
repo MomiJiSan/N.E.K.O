@@ -1,6 +1,7 @@
 """Segmented SDK/HTTP dispatch is an attempt, not definitive non-delivery."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,67 @@ from main_logic.asr_client.workers import gemini, glm
 from main_logic.asr_client.workers.gemini import gemini_asr_worker
 from main_logic.asr_client.workers.glm import glm_asr_worker
 from tests.unit.test_asr_glm_worker import _FakeResponse
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["gemini", "glm"])
+async def test_connected_session_prefix_overflow_is_definite_non_delivery(provider):
+    from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
+    from main_logic.voice_turn.contracts import AsrSubmitStatus
+    from tests.support.asr_delivery_fakes import _cold_runtime, _close
+
+    dispatch = AsyncMock(side_effect=AssertionError("prefix must not be dispatched"))
+    worker_entry_evidence = []
+
+    async def worker(requests, responses, api_key, config):
+        # Observe before the provider worker gets a chance to initialize it.
+        worker_entry_evidence.append(
+            getattr(requests, "_transport_delivery_evidence", None)
+        )
+        if provider == "gemini":
+            client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=dispatch)))
+            await gemini_asr_worker(requests, responses, api_key, config, client=client)
+        else:
+            await glm_asr_worker(requests, responses, api_key, config, http_client=SimpleNamespace(post=dispatch))
+
+    session = _RealtimeAsrSessionImpl(
+        worker_fn=worker, api_key="key", config=AsrSessionConfig(endpointing_mode="manual"),
+        on_input_transcript=AsyncMock(), on_connection_error=AsyncMock(),
+    )
+    manager, lifecycle, detector, token, prefix, *_ = _cold_runtime()
+    try:
+        assert session.transport_write_attempted is None
+        await session.connect()
+        assert worker_entry_evidence[0] is not None
+        assert session.transport_write_attempted is False
+        assert not worker_entry_evidence[0].protected
+        manager._asr_runtime._asr_session = session
+        assert manager._asr_runtime._protected_delivery_failure_code() == "ASR_INPUT_DELIVERY_FAILED"
+
+        # Exercise the actual overflow path before protect_audio_delivery can
+        # create evidence as a side effect or any audio can reach the worker.
+        lifecycle._pre_roll.append(b"\x01\x00" * 160)
+        lifecycle._pending_connect.append(bytes(lifecycle.prefix_capacity_bytes))
+        result = await manager._asr_runtime.submit(
+            ProcessedVoiceFrame(bytes(320), 16000, .9, True),
+            ingress_token=token, preserve_prefix=prefix,
+        )
+        assert result.status is AsrSubmitStatus.UNAVAILABLE
+        codes = [json.loads(call.args[0]).get("code") for call in manager.send_status.await_args_list]
+        assert codes.count("ASR_INPUT_DELIVERY_FAILED") == 1
+        assert "ASR_INPUT_DELIVERY_UNCERTAIN" not in codes
+        assert not lifecycle.prefix_protected
+        detector.feed.assert_not_awaited()
+        dispatch.assert_not_awaited()
+    finally:
+        await session.close()
+        await _close(manager)
+
+
+@pytest.mark.parametrize("session", [SimpleNamespace(), SimpleNamespace(transport_write_attempted=None)])
+def test_missing_transport_evidence_remains_uncertain(session):
+    host = SimpleNamespace(_asr_session=session)
+    assert IndependentAsrRuntime._protected_delivery_failure_code(host) == "ASR_INPUT_DELIVERY_UNCERTAIN"
 
 
 @pytest.mark.asyncio

@@ -174,4 +174,4 @@ async def test_real_process_load_timeout_retires_host(monkeypatch):
         profile.close()
     assert host is not None and not host.alive
 
-pytestmark = pytest.mark.unit_fast
+pytestmark = pytest.mark.integration_serial
