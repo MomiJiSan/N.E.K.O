@@ -6,6 +6,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $wakeSourceCommit = '11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf'
 $wakeOutput = [IO.Path]::GetFullPath($OutputDirectory)
+$wakePython = [IO.Path]::GetFullPath($Python)
+if (-not (Test-Path -LiteralPath $wakePython -PathType Leaf)) {
+    throw "Python executable not found: $wakePython"
+}
 $wakeSource = Join-Path $wakeOutput 'sherpa-onnx'
 $wakePatches = @(
     (Join-Path $PSScriptRoot 'patches/sherpa-onnx-kws-timestamps.patch'),
@@ -55,12 +59,12 @@ try {
     $wakeCandidates = if ($Variant -in @('combined', 'candidates')) { 'ON' } else { 'OFF' }
     $env:SHERPA_ONNX_CMAKE_ARGS += " -DSHERPA_ONNX_NEKO_KWS_MERGE=$wakeMerge -DSHERPA_ONNX_NEKO_KWS_CANDIDATES=$wakeCandidates"
     if ($Variant -ne 'combined') { $env:SHERPA_ONNX_CMAKE_ARGS += ' -DSHERPA_ONNX_NEKO_KWS_ABLATION=ON' }
-    $wakePythonPath = [IO.Path]::GetFullPath($Python).Replace('\', '/')
+    $wakePythonPath = $wakePython.Replace('\', '/')
     $env:SHERPA_ONNX_CMAKE_ARGS += ' -DPython_EXECUTABLE="' + $wakePythonPath + '" -DPYTHON_EXECUTABLE="' + $wakePythonPath + '"'
     Push-Location $wakeSource
     try {
         New-Item -ItemType Directory -Force -Path 'build/sherpa_onnx/bin' | Out-Null
-        uv run --no-project --python $Python --with cmake==3.31.10 --with setuptools==83.0.0 --with wheel==0.48.0 python setup.py build --build-temp b
+        uv run --no-project --python $wakePython --with cmake==3.31.10 --with setuptools==83.0.0 --with wheel==0.48.0 python setup.py build --build-temp b
         if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
         # setuptools can append Release to --build-temp. Locate the source's
         # cache, excluding dependency/subbuild caches, instead of assuming b.
@@ -70,20 +74,22 @@ try {
         })
         if ($wakeRootCaches.Count -ne 1) { throw 'Expected exactly one source CMake cache' }
         $wakeBuildDirectory = $wakeRootCaches[0].DirectoryName
-        uv run --no-project --python $Python --with cmake==3.31.10 cmake --build $wakeBuildDirectory --config Release --target neko-kws-decoder-test neko-kws-lifecycle-test --parallel 2
+        uv run --no-project --python $wakePython --with cmake==3.31.10 cmake --build $wakeBuildDirectory --config Release --target neko-kws-decoder-test neko-kws-lifecycle-test --parallel 2
         if ($LASTEXITCODE -ne 0) { throw 'Native test build failed' }
         $wakeNativeTests = @(Get-ChildItem -LiteralPath 'b' -Recurse -Filter 'neko-kws-decoder-test.exe')
         if ($wakeNativeTests.Count -ne 1) { throw 'Expected exactly one native KWS test executable' }
+        $wakeLifecycleTests = @(Get-ChildItem -LiteralPath 'b' -Recurse -Filter 'neko-kws-lifecycle-test.exe')
+        if ($wakeLifecycleTests.Count -ne 1) { throw 'Expected exactly one native KWS lifecycle executable' }
         & $wakeNativeTests[0].FullName
         if ($LASTEXITCODE -ne 0) { throw 'Native KWS tests failed' }
-        uv run --no-project --python $Python --with cmake==3.31.10 --with setuptools==83.0.0 --with wheel==0.48.0 python setup.py bdist_wheel --skip-build
+        uv run --no-project --python $wakePython --with cmake==3.31.10 --with setuptools==83.0.0 --with wheel==0.48.0 python setup.py bdist_wheel --skip-build
         if ($LASTEXITCODE -ne 0) { throw 'Wheel build failed' }
         $wakeWheels = @(Get-ChildItem -LiteralPath (Join-Path $wakeSource 'dist') -Filter '*.whl')
         if ($wakeWheels.Count -ne 1) { throw 'Expected exactly one runtime wheel' }
         # Import outside the source tree so a checkout cannot shadow the wheel.
         Push-Location $wakeOutput
         try {
-            $wakeImportJson = uv run --no-project --python $Python --with $wakeWheels[0].FullName python -c 'import json,sys,sherpa_onnx as s; print(json.dumps(dict(package_version=s.__version__,native_version=s.version,onnxruntime_version=s.onnxruntime_version,git_sha1=s.git_sha1,python=sys.version)))'
+            $wakeImportJson = uv run --no-project --python $wakePython --with $wakeWheels[0].FullName python -c 'import json,sys,sherpa_onnx as s; print(json.dumps(dict(package_version=s.__version__,native_version=s.version,onnxruntime_version=s.onnxruntime_version,git_sha1=s.git_sha1,python=sys.version)))'
             if ($LASTEXITCODE -ne 0) { throw 'Built wheel import failed' }
             $wakeImport = $wakeImportJson | ConvertFrom-Json
             if ($wakeImport.package_version -ne $wakeVersion -or $wakeImport.native_version -ne $wakeVersion) {
@@ -109,9 +115,17 @@ try {
         }
         $wakeNativeOutput = Join-Path $wakeOutput 'native'
         New-Item -ItemType Directory -Path $wakeNativeOutput | Out-Null
-        Get-ChildItem -LiteralPath $wakeNativeTests[0].DirectoryName -File | Where-Object {
-            $_.Name -like 'neko-kws-*.exe' -or $_.Name -like 'onnxruntime*.dll'
-        } | Copy-Item -Destination $wakeNativeOutput
+        $wakeNativeArtifacts = @(@($wakeNativeTests[0], $wakeLifecycleTests[0]) | ForEach-Object {
+            Get-ChildItem -LiteralPath $_.DirectoryName -File | Where-Object {
+                $_.Name -like 'neko-kws-*.exe' -or $_.Name -like 'onnxruntime*.dll'
+            }
+        } | Sort-Object FullName -Unique)
+        $wakeNativeArtifacts | Copy-Item -Destination $wakeNativeOutput -Force
+        foreach ($wakeRequiredArtifact in @('neko-kws-decoder-test.exe', 'neko-kws-lifecycle-test.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $wakeNativeOutput $wakeRequiredArtifact) -PathType Leaf)) {
+                throw "Required native artifact was not copied: $wakeRequiredArtifact"
+            }
+        }
         $wakeManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $wakeOutput 'build-manifest.json') -Encoding utf8
         $wakeWheels | Get-FileHash -Algorithm SHA256
     } finally { Pop-Location }

@@ -191,3 +191,13 @@ try {
     ]
     assert '-G "Visual Studio 17 2022" -A x64' in record["configuration"]
     assert not (output / "build-manifest.json").exists()
+from pathlib import Path
+
+
+def test_build_script_fences_python_path_and_native_artifacts():
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "build_wake_word_runtime.ps1").read_text(encoding="utf-8")
+    assert "$wakePython = [IO.Path]::GetFullPath($Python)" in script
+    assert "--python $wakePython" in script
+    assert "-Filter 'neko-kws-lifecycle-test.exe'" in script
+    assert "Expected exactly one native KWS lifecycle executable" in script
+    assert "Required native artifact was not copied" in script
