@@ -27,6 +27,17 @@
         }
     }
     function clearVoiceInputRecoveryTimer() { if (S.voiceInputRecoveryTimer) clearTimeout(S.voiceInputRecoveryTimer); S.voiceInputRecoveryTimer = null; }
+    function resetVoiceInputRecoveryState() {
+        clearVoiceInputRecoveryTimer();
+        // Retire callbacks already queued by the previous session as well as
+        // its transport identity. A hardware restart within a session must not
+        // call this: it still has to wait for the current recovery verdict.
+        S.voiceInputRecoveryGeneration += 1;
+        S.voiceInputRecoverySessionEpoch = null;
+        S.voiceInputRecoveryLeaseGeneration = null;
+        S.voiceInputRecoveryState = 'idle';
+    }
+    mod.resetVoiceInputRecoveryState = resetVoiceInputRecoveryState;
     function isVoiceInputRecoveryPending() {
         return S.voiceInputRecoveryState === 'recovering' || S.voiceInputRecoveryState === 'timed_out';
     }
@@ -2355,6 +2366,9 @@
     function stopRecording(options) {
         options = options || {};
         const notifyServer = options.notifyServer !== false;
+        // Also retire recovery when startup failed before isRecording became
+        // true. The owning session's failure path uses this same teardown.
+        resetVoiceInputRecoveryState();
         // 停止语音期间主动视觉定时
         if (typeof window.stopProactiveVisionDuringSpeech === 'function') {
             window.stopProactiveVisionDuringSpeech();
