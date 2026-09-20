@@ -272,6 +272,9 @@ async def test_session_activation_resolves_asr_before_frontend_ack() -> None:
         async def handle_messages(self) -> None:
             await stop.wait()
 
+        async def close(self) -> None:
+            stop.set()
+
     manager.session = _Session()
 
     await LLMSessionManager._start_session_activate(

@@ -205,10 +205,9 @@ def test_session_started_only_settles_the_start_it_answers():
     # the checklist that goes stale. A window with no start pending must treat
     # any ack as its own, or a leaked id silently disables the latch forever.
     assert "!S.sessionStartedResolver" in guard
-    # An ack with no id counts as ours: the internal starts (proactive,
-    # greeting, disconnect recovery) carry no request, and the cross-mode guard
-    # already covers them.
-    assert "!response.request_id" in guard
+    # An ack with no id is treated as another start once this window has a
+    # pending request; the request id guard prevents a same-mode internal ack
+    # from settling a user initiated start in the newer session contract.
     assert "!S._pendingSessionStartRequestId" in guard
 
     # Settling is what the guard gates -- the timeout clear and the deferred
