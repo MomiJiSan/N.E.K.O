@@ -13,7 +13,7 @@ from tests.support.asr_fakes import (
     _Runtime,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.unit_fast]
+pytestmark = [pytest.mark.unit_fast]
 
 
 async def test_hot_swap_cache_replay_preserves_rnnoise_evidence() -> None:
