@@ -108,6 +108,10 @@ jobs:
             '299c0b4b8c14eb386c645ad180241c6756e0b5c1'
           )
           foreach ($revision in $revisions) {
+            git fetch --no-tags origin $revision
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to fetch historical review revision '$revision'."
+            }
             git cat-file -e "$revision^{commit}"
             if ($LASTEXITCODE -ne 0) {
               throw "Historical review revision '$revision' is unavailable."
