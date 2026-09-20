@@ -151,4 +151,4 @@ def test_invalid_host_capacity_is_rejected_before_allocation(capacity):
             max_pcm_bytes=capacity,
         )
 
-pytestmark = pytest.mark.unit_fast
+pytestmark = pytest.mark.integration_serial

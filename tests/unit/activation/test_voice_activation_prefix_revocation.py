@@ -36,6 +36,18 @@ async def _settle(manager):
         await asyncio.gather(*tuple(manager._core_asr_cleanup_tasks))
 
 
+@pytest.mark.parametrize("missing_attribute", [True, False])
+async def test_source_overflow_without_transport_evidence_remains_uncertain(missing_attribute):
+    manager, receiver, generation = _source(write_attempted=None)
+    if missing_attribute:
+        del receiver._asr_session.transport_write_attempted
+    manager._revoke_voice_activation_prefix(generation, "output_queue_overflow")
+    await _settle(manager)
+    statuses = [json.loads(call.args[0]) for call in manager.send_status.await_args_list]
+    assert sum(status.get("code") == "ASR_INPUT_DELIVERY_UNCERTAIN" for status in statuses) == 1
+    assert not any(status.get("code") == "ASR_INPUT_DELIVERY_FAILED" for status in statuses)
+
+
 @pytest.mark.parametrize("attempted,code", [
     (False, "ASR_INPUT_DELIVERY_FAILED"),
     (True, "ASR_INPUT_DELIVERY_UNCERTAIN"),

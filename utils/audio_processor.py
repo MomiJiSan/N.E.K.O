@@ -281,6 +281,7 @@ class AudioProcessor:
         self._rnnoise_last: float | None = None
         self._rnnoise_ema: float | None = None
         self._rnnoise_ema_state: float | None = None
+        self._rnnoise_processing_failed = False
         
         # AGC state
         self._agc_gain = 1.0
@@ -666,6 +667,7 @@ class AudioProcessor:
     
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable noise reduction."""
+        self._require_mutable()
         prev = self.noise_reduce_enabled
         self.noise_reduce_enabled = enabled
         if enabled:
