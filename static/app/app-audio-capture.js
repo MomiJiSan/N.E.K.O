@@ -22,8 +22,10 @@
         const el = recoveryStatusElement();
         if (!el) return;
         const messages = { recovering: '正在恢复语音识别…', ready: '语音识别已恢复', failed: '语音识别恢复失败，请重试' };
+        const keys = { recovering: 'microphone.voiceInputRecoveryRecovering', ready: 'microphone.voiceInputRecoveryReady', failed: 'microphone.voiceInputRecoveryFailed' };
+        const localized = keys[state] && typeof window.t === 'function' ? window.t(keys[state]) : null;
         if (messages[state] && typeof window.showStatusToast === 'function') {
-            window.showStatusToast(messages[state], state === 'ready' ? 1600 : 4000);
+            window.showStatusToast(localized && localized !== keys[state] ? localized : messages[state], state === 'ready' ? 1600 : 4000);
         }
     }
     function clearVoiceInputRecoveryTimer() { if (S.voiceInputRecoveryTimer) clearTimeout(S.voiceInputRecoveryTimer); S.voiceInputRecoveryTimer = null; }
