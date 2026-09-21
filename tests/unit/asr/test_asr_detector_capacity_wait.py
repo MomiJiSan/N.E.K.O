@@ -81,4 +81,38 @@ async def test_runtime_capacity_bridge_rechecks_detector_ownership(change):
     queue.get_nowait()
     assert await asyncio.wait_for(waiter, 0.2) is (change == "none")
 
+
+@pytest.mark.asyncio
+async def test_runtime_capacity_wait_wakes_when_retained_tail_is_released():
+    queue = DetectorDurationQueue(capacity_us=10000, max_frames=1)
+    tail_changed = asyncio.Event()
+    adapter = SimpleNamespace(
+        _queue=queue,
+        _tail_capacity_changed=tail_changed,
+        failed=False,
+        tail_full=True,
+    )
+    runtime = object.__new__(DetectorRuntime)
+    runtime._semantic_adapter = adapter
+    runtime._detector_epoch = 2
+    runtime._closed = False
+
+    def capacity_check(duration_us, *, identity=None, detector_identity=None):
+        del duration_us, identity, detector_identity
+        return not adapter.tail_full
+
+    adapter._audio_capacity_available = capacity_check
+    waiter = asyncio.create_task(
+        runtime.wait_audio_capacity(
+            bytes(320),
+            sample_rate_hz=16000,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    adapter.tail_full = False
+    tail_changed.set()
+    assert await asyncio.wait_for(waiter, 0.2)
+
 pytestmark = pytest.mark.unit_fast
