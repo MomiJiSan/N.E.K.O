@@ -270,6 +270,38 @@ class _VoiceTurnAdapter:
         self._successor_audio_fence: tuple[_Identity, int, _Identity] | None = None
         self._smart_turn_pin_count = 0
 
+    def _audio_capacity_available(
+        self,
+        duration_us: int,
+        *,
+        identity: _Identity | None = None,
+        detector_identity: DetectorIngressIdentity | None = None,
+    ) -> bool:
+        """Apply the same queue/tail/identity budget used by ``push_audio``."""
+
+        if not self._queue.can_accept_audio(duration_us):
+            return False
+        pending = self._pending_complete_confirmation
+        retains_for_confirmation = (
+            pending is not None
+            and identity is not None
+            and detector_identity is not None
+            and pending.identity == identity
+            and pending.detector_identity is not None
+            and detector_identity.detector_epoch
+            == pending.detector_identity.detector_epoch
+            and detector_identity.sequence_no > pending.detector_identity.sequence_no
+        )
+        if self._evaluation_task is None and not retains_for_confirmation:
+            return True
+        return (
+            self._evaluation_tail_duration_us
+            + self._confirmation_tail_duration_us
+            + self._queue.audio_duration_us
+            + duration_us
+            <= self._evaluation_tail_capacity_us
+        )
+
     async def start(self) -> None:
         if self._closed:
             raise RuntimeError("ASR_VOICE_TURN_CLOSED: adapter is closed")
@@ -361,23 +393,10 @@ class _VoiceTurnAdapter:
         self._ensure_running()
         samples = len(pcm16) // 2
         duration_us = (samples * 1_000_000 + sample_rate_hz - 1) // sample_rate_hz
-        pending = self._pending_complete_confirmation
-        retains_for_confirmation = (
-            pending is not None
-            and pending.identity == (generation, buffer_epoch, utterance_id)
-            and pending.detector_identity is not None
-            and detector_identity is not None
-            and detector_identity.detector_epoch
-            == pending.detector_identity.detector_epoch
-            and detector_identity.sequence_no > pending.detector_identity.sequence_no
-        )
-        if (
-            (self._evaluation_task is not None or retains_for_confirmation)
-            and self._evaluation_tail_duration_us
-            + self._confirmation_tail_duration_us
-            + self._queue.audio_duration_us
-            + duration_us
-            > self._evaluation_tail_capacity_us
+        if not self._audio_capacity_available(
+            duration_us,
+            identity=(generation, buffer_epoch, utterance_id),
+            detector_identity=detector_identity,
         ):
             # Surface the shared duration budget at ingress so DetectorRuntime
             # can use its existing whole-candidate backpressure recovery. Once
@@ -2351,9 +2370,14 @@ class DetectorRuntime:
             return successor_present
 
     async def wait_audio_capacity(
-        self, pcm16: bytes, *, sample_rate_hz: int, deadline: float,
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+        deadline: float,
+        ingress_token: VoiceIngressToken | None = None,
     ) -> bool:
-        """Wait for the bounded audio ingress queue, not semantic evaluation."""
+        """Wait for the complete queue/evaluation-tail admission budget."""
         if not isinstance(pcm16, bytes) or len(pcm16) % 2:
             raise ValueError("DetectorRuntime requires complete PCM16 bytes")
         if sample_rate_hz <= 0:
@@ -2365,10 +2389,40 @@ class DetectorRuntime:
         if not pcm16:
             return True
         duration_us = (len(pcm16) // 2 * 1_000_000 + sample_rate_hz - 1) // sample_rate_hz
+        candidate_identity = None
+        detector_identity = None
+        if ingress_token is not None:
+            candidate_identity = (
+                self._semantic_generation,
+                0,
+                self._semantic_turn_id,
+            )
+            detector_identity = DetectorIngressIdentity(
+                ingress_token=ingress_token,
+                detector_epoch=self._detector_epoch,
+                sequence_no=self._sequence_no + 1,
+            )
+        capacity_check = getattr(adapter, "_audio_capacity_available", None)
+        if capacity_check is not None and capacity_check(
+            duration_us,
+            identity=candidate_identity,
+            detector_identity=detector_identity,
+        ):
+            return True
         available = await adapter._queue.wait_audio_capacity(duration_us, deadline)
+        complete_capacity = (
+            capacity_check is None
+            or capacity_check(
+                duration_us,
+                identity=candidate_identity,
+                detector_identity=detector_identity,
+            )
+        )
         return bool(
             available and not self._closed and not adapter.failed
-            and self._semantic_adapter is adapter and self._detector_epoch == epoch
+            and self._semantic_adapter is adapter
+            and self._detector_epoch == epoch
+            and complete_capacity
         )
 
     async def submit_audio(

@@ -2809,7 +2809,10 @@ class IndependentAsrRuntime:
                         if deadline is None:
                             deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
                         has_capacity = await wait_capacity(
-                            pcm16, sample_rate_hz=sample_rate_hz, deadline=deadline,
+                            pcm16,
+                            sample_rate_hz=sample_rate_hz,
+                            deadline=deadline,
+                            ingress_token=ingress_token,
                         )
                         if not ingress_is_current():
                             return AsrSubmitResult(AsrSubmitStatus.STALE)

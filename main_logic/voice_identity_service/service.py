@@ -1624,8 +1624,11 @@ class VoiceIdentityService:
                 # subsequent activation succeeds.
                 self._runtime_audio_contract_transition_pending = (
                     not runtime_ready
-                    or self._effective_reason
-                    is VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    or (
+                        self._runtime_mode != "off"
+                        and self._effective_reason
+                        is VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
                 )
 
     async def _update_runtime_noise_reduction_enabled_locked(

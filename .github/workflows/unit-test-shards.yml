@@ -137,4 +137,6 @@ jobs:
           node-version: '22'
 
       - name: Run frontend contract tests
-        run: node --test tests/frontend/asr_input_delivery_status.test.cjs
+        run: |
+          node --test tests/frontend/asr_input_delivery_status.test.cjs
+          node --test tests/frontend/test_game_voice_control_runtime.js

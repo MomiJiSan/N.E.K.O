@@ -10,6 +10,8 @@ This directory contains the automated test suite for Project N.E.K.O.
   by success, failure, cancellation, and authority.
 - `unit/websocket_static/` groups frontend source contracts and Node harness
   tests by status, preview, settings synchronization, and session/microphone control.
+  The Node CI shard also runs the microphone recovery route harness in
+  `tests/frontend/test_game_voice_control_runtime.js`.
 - `support/` contains shared fakes and environment construction. Package-local
   `_scenarios.py` modules retain shared helpers with scenario assertions; helpers
   used by only one test module stay in that module.
