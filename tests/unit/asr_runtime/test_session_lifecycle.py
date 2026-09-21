@@ -252,6 +252,7 @@ async def test_session_activation_resolves_asr_before_frontend_ack() -> None:
     manager._memory_error_retry_after = 1.0
     manager._session_start_circuit_open = True
     manager.pending_agent_callbacks = []
+    manager._bg_tasks = set()
     manager._activity_tracker = type(
         "Tracker", (), {"on_voice_mode": lambda self, value: None}
     )()
@@ -271,6 +272,9 @@ async def test_session_activation_resolves_asr_before_frontend_ack() -> None:
     class _Session:
         async def handle_messages(self) -> None:
             await stop.wait()
+
+        async def close(self) -> None:
+            stop.set()
 
     manager.session = _Session()
 
