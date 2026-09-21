@@ -4873,7 +4873,6 @@
                     // 在等 = 本窗口没有启动在途 = 任何 ack 都按旧行为处理。
                     var _ackAnswersThisWindow = !S.sessionStartedResolver
                         || !S._pendingSessionStartRequestId
-                        || !response.request_id
                         || response.request_id === S._pendingSessionStartRequestId;
                     if (!_ackAnswersThisWindow) {
                         console.log('[App] session_started answers another start',
