@@ -273,7 +273,9 @@ async def test_manual_detector_capacity_wait_resumes_or_fails_bounded(monkeypatc
             detector = h.manager._asr_detector
             wait_capacity = detector.wait_audio_capacity
 
-            async def controlled_wait(pcm16, *, sample_rate_hz, deadline):
+            async def controlled_wait(
+                pcm16, *, sample_rate_hz, deadline, ingress_token=None,
+            ):
                 if detector.queued_audio_ms == 1000:
                     # The first dequeue can precede entry into the physical
                     # gate; let that slot settle before observing saturation.
@@ -287,7 +289,10 @@ async def test_manual_detector_capacity_wait_resumes_or_fails_bounded(monkeypatc
                         # detector before the precondition is asserted.
                         deadline = asyncio.get_running_loop().time()
                 return await wait_capacity(
-                    pcm16, sample_rate_hz=sample_rate_hz, deadline=deadline,
+                    pcm16,
+                    sample_rate_hz=sample_rate_hz,
+                    deadline=deadline,
+                    ingress_token=ingress_token,
                 )
 
             monkeypatch.setattr(detector, "wait_audio_capacity", controlled_wait)
