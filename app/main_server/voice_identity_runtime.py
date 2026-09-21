@@ -321,7 +321,30 @@ class OwnerVoiceRuntimeRegistry:
             # for an operation that can never be performed.
             if not self._manager_supports_session_activation(manager):
                 self._detach_pending.pop(manager, None)
+                was_restore_pending = manager in self._restore_pending
                 self._restore_pending.discard(manager)
+                if self._suppressed or was_restore_pending:
+                    # Session activation support and enrollment suppression are
+                    # independent capabilities.  Removing a legacy manager
+                    # must still release the input gate installed by the
+                    # enrollment path.
+                    self._restore_pending.add(manager)
+                    try:
+                        restored = await self._restore_manager_bounded(
+                            manager,
+                            "voice_identity_enrollment",
+                        )
+                    except asyncio.CancelledError:
+                        self._ensure_restore_watchdog(
+                            "voice_identity_enrollment"
+                        )
+                        raise
+                    if restored:
+                        self._restore_pending.discard(manager)
+                    else:
+                        self._ensure_restore_watchdog(
+                            "voice_identity_enrollment"
+                        )
                 return
             detach_generation = str(uuid.uuid4())
             cancellation: asyncio.CancelledError | None = None

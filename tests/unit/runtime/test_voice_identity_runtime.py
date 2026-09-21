@@ -297,6 +297,40 @@ async def test_legacy_manager_does_not_receive_incompatible_session_factory() ->
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_unregister_legacy_manager_restores_enrollment_suppression() -> None:
+    class LegacyManager:
+        def __init__(self) -> None:
+            self._asr_runtime = object()
+            self.suppression_calls: list[tuple[str, bool]] = []
+
+        async def set_speaker_verifier_factory(self, *args, **kwargs):
+            del args, kwargs
+            return True
+
+        async def set_voice_input_suppressed(
+            self,
+            reason: str,
+            *,
+            suppressed: bool,
+        ) -> None:
+            self.suppression_calls.append((reason, suppressed))
+
+    registry = OwnerVoiceRuntimeRegistry(enforce=True)
+    manager = LegacyManager()
+    await registry.register_manager(manager)
+    await registry.suppress("voice_identity_enrollment")
+    await registry.unregister_manager(manager)
+
+    assert manager.suppression_calls == [
+        ("voice_identity_enrollment", True),
+        ("voice_identity_enrollment", False),
+    ]
+    assert manager not in registry._restore_pending  # type: ignore[attr-defined]
+    await registry.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_late_registration_preserves_unsupported_route_result() -> None:
     registry = OwnerVoiceRuntimeRegistry(enforce=True)
     profile = _profile("profile")

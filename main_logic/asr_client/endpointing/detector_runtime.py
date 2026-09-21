@@ -227,6 +227,10 @@ class _VoiceTurnAdapter:
         self._evaluation_tail_duration_us = 0
         self._confirmation_tail: list[_AudioItem] = []
         self._confirmation_tail_duration_us = 0
+        # Queue capacity has its own wake-up event.  Retained evaluation and
+        # confirmation audio needs a separate one so admission waiters do not
+        # mistake a dequeue for complete capacity.
+        self._tail_capacity_changed = asyncio.Event()
         self._continuation_timeout_seconds = continuation_timeout_seconds
         self._max_endpoint_wait_seconds = max_endpoint_wait_seconds
         self._candidate_complete_confirmation_seconds = (
@@ -739,6 +743,7 @@ class _VoiceTurnAdapter:
         evaluation_tail = tuple(self._evaluation_tail)
         self._evaluation_tail.clear()
         self._evaluation_tail_duration_us = 0
+        self._tail_capacity_changed.set()
         reevaluate = self._reevaluation_requested
         reevaluation_reason = self._reevaluation_reason or item.reason
         self._reevaluation_requested = False
@@ -926,6 +931,7 @@ class _VoiceTurnAdapter:
         items = tuple(self._confirmation_tail)
         self._confirmation_tail.clear()
         self._confirmation_tail_duration_us = 0
+        self._tail_capacity_changed.set()
         return items
 
     def _complete_observed_candidate(
@@ -972,6 +978,7 @@ class _VoiceTurnAdapter:
         self._latest_detector_identity = None
         self._evaluation_tail.clear()
         self._evaluation_tail_duration_us = 0
+        self._tail_capacity_changed.set()
         self._clear_confirmation_audio()
         self._successor_audio_fence = None
         self._smart_turn_audio_evidence.discard()
@@ -2403,27 +2410,80 @@ class DetectorRuntime:
                 sequence_no=self._sequence_no + 1,
             )
         capacity_check = getattr(adapter, "_audio_capacity_available", None)
+        if (
+            self._semantic_adapter is not adapter
+            or self._detector_epoch != epoch
+        ):
+            return False
         if capacity_check is not None and capacity_check(
             duration_us,
             identity=candidate_identity,
             detector_identity=detector_identity,
         ):
             return True
-        available = await adapter._queue.wait_audio_capacity(duration_us, deadline)
-        complete_capacity = (
-            capacity_check is None
-            or capacity_check(
-                duration_us,
-                identity=candidate_identity,
-                detector_identity=detector_identity,
+        # Queue dequeue and retained evaluation/confirmation tails are
+        # independent capacity changes.  Waiting only on the queue can wake
+        # while a tail still occupies the shared budget and turn temporary
+        # backpressure into a session-failing overflow.
+        loop = asyncio.get_running_loop()
+        tail_changed = getattr(adapter, "_tail_capacity_changed", None)
+        while loop.time() < deadline:
+            if (
+                self._closed
+                or adapter.failed
+                or self._semantic_adapter is not adapter
+                or self._detector_epoch != epoch
+            ):
+                return False
+            complete_capacity = (
+                adapter._queue.can_accept_audio(duration_us)
+                if capacity_check is None
+                else capacity_check(
+                    duration_us,
+                    identity=candidate_identity,
+                    detector_identity=detector_identity,
+                )
             )
-        )
-        return bool(
-            available and not self._closed and not adapter.failed
-            and self._semantic_adapter is adapter
-            and self._detector_epoch == epoch
-            and complete_capacity
-        )
+            if complete_capacity:
+                return True
+            # If the queue already has room, its wait method would complete
+            # immediately and spin while a retained tail is still full.  In
+            # that case wait only for the tail event.
+            queue_wait = None
+            if not adapter._queue.can_accept_audio(duration_us):
+                queue_wait = asyncio.create_task(
+                    adapter._queue.wait_audio_capacity(duration_us, deadline)
+                )
+            tail_wait = (
+                asyncio.create_task(tail_changed.wait())
+                if tail_changed is not None
+                else None
+            )
+            waiters = set()
+            if queue_wait is not None:
+                waiters.add(queue_wait)
+            if tail_wait is not None:
+                waiters.add(tail_wait)
+            if not waiters:
+                return False
+            try:
+                await asyncio.wait(
+                    waiters,
+                    timeout=max(0.0, deadline - loop.time()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for waiter in waiters:
+                    if not waiter.done():
+                        waiter.cancel()
+                await asyncio.gather(*waiters, return_exceptions=True)
+            if tail_wait is not None and tail_wait.done() and tail_changed is not None:
+                tail_changed.clear()
+            if self._closed or adapter.failed or self._semantic_adapter is not adapter:
+                return False
+            if self._detector_epoch != epoch:
+                return False
+        return False
 
     async def submit_audio(
         self,
