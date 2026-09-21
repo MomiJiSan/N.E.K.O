@@ -68,7 +68,21 @@ async def test_audio_contract_change_invalidates_active_enrollment(tmp_path):
         await service.complete_enrollment(initial.enrollment_id, "profile-a", _pcm())
         await service.set_filter(True)
         enrollment = await service.start_enrollment()
+        detach_observed_enrollment = []
+        original_activate = service._activate
+
+        async def observe_detach(profile, generation, **kwargs):
+            if profile is None:
+                current = service._enrollment
+                detach_observed_enrollment.append(
+                    current is not None
+                    and current.enrollment_id == enrollment.enrollment_id
+                )
+            return await original_activate(profile, generation, **kwargs)
+
+        service._activate = observe_detach
         assert await service.prepare_runtime_audio_contract_change(False)
+        assert detach_observed_enrollment[0] is True
         assert service.status().enrollment is None
         with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
             await service.submit_enrollment_segment(

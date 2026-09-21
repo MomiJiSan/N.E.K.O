@@ -1751,8 +1751,8 @@ class VoiceIdentityService:
             if enrollment is not None:
                 # A DSP transition changes the enrollment audio contract. Do
                 # not let a segment already in flight commit under the old
-                # snapshot after the runtime has been detached.
-                self._enrollment = None
+                # snapshot after the runtime has been detached. Keep the
+                # suppression lease until that detach has completed.
                 operation_task = enrollment.operation_task
                 self._invalidate_session(enrollment)
                 if (
@@ -1761,6 +1761,13 @@ class VoiceIdentityService:
                     and not operation_task.done()
                 ):
                     operation_task.cancel()
+            detached = await _await_cancellation_safe(
+                self._activate(None, str(uuid.uuid4())),
+                name="voice-identity-audio-contract-transition-detach",
+                cancellations=cancellations,
+            )
+            if enrollment is not None and detached:
+                self._enrollment = None
                 cleanup_ok = await _await_cancellation_safe(
                     self._cleanup_session(enrollment),
                     name="voice-identity-audio-contract-enrollment-cleanup",
@@ -1770,11 +1777,6 @@ class VoiceIdentityService:
                     self._set_ineffective(
                         VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
                     )
-            detached = await _await_cancellation_safe(
-                self._activate(None, str(uuid.uuid4())),
-                name="voice-identity-audio-contract-transition-detach",
-                cancellations=cancellations,
-            )
             self._set_ineffective(
                 VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
             )
