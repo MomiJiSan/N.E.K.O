@@ -207,6 +207,76 @@ async def test_cancelled_prepare_late_spawn_cleans_its_own_process(monkeypatch):
     assert detector._process is None and detector._connection is None
 
 
+class StubbornProcess:
+    def __init__(self):
+        self.release = threading.Event()
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.join_calls = []
+        self.close_calls = 0
+
+    def is_alive(self):
+        return not self.release.is_set()
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+    def join(self, timeout=None):
+        self.join_calls.append(timeout)
+        if timeout is None:
+            self.release.wait(3)
+
+    def close(self):
+        self.close_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_stubborn_process_is_owned_by_background_reaper_until_exit():
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig("unused", ("x @name",)))
+    process = StubbornProcess()
+    detector._process = process
+
+    await asyncio.to_thread(detector._stop)
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.close_calls == 0
+    assert detector._process is None
+    assert len(detector._reaper_threads) == 1
+
+    process.release.set()
+    for _ in range(30):
+        if process.close_calls:
+            break
+        await asyncio.sleep(0.01)
+    assert process.close_calls == 1
+    assert not detector._reaper_threads
+
+
+@pytest.mark.asyncio
+async def test_close_during_prepare_owns_late_spawn_cleanup(monkeypatch):
+    monkeypatch.setattr(backend, "_worker", responsive_worker)
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig("unused", ("x @name",)))
+    original = detector._launch
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed_launch():
+        entered.set()
+        assert release.wait(3)
+        original()
+
+    monkeypatch.setattr(detector, "_launch", delayed_launch)
+    preparing = asyncio.create_task(detector.prepare())
+    assert await asyncio.to_thread(entered.wait, 3)
+    await detector.close()
+    release.set()
+    with pytest.raises(backend.WakeWordBackendError, match="CLOSED"):
+        await asyncio.wait_for(preparing, 3)
+    assert detector._process is None and detector._connection is None
+
+
 @pytest.mark.asyncio
 async def test_concurrent_close_has_one_handle_cleanup_owner(monkeypatch):
     monkeypatch.setattr(backend, "_worker", responsive_worker)
