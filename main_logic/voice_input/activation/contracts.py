@@ -160,3 +160,37 @@ class AudioFrameSink(Protocol):
     """Single-writer boundary implemented by an ASR or native route."""
 
     async def send(self, lease: OutputLease) -> OutputCommit: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WakeWordDetection:
+    """Keyword evidence on the original PCM timeline, never speaker identity."""
+
+    keyword: str
+    generation: ActivationGeneration
+    epoch: int
+    sample_start: int
+    sample_end: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.keyword, str) or not self.keyword.strip():
+            raise ValueError("VOICE_WAKE_WORD_KEYWORD_INVALID")
+        if type(self.epoch) is not int or self.epoch < 0:
+            raise ValueError("VOICE_WAKE_WORD_EPOCH_INVALID")
+        if (
+            type(self.sample_start) is not int
+            or type(self.sample_end) is not int
+            or self.sample_start < 0
+            or self.sample_end <= self.sample_start
+        ):
+            raise ValueError("VOICE_WAKE_WORD_SAMPLE_RANGE_INVALID")
+
+
+class WakeWordDetector(Protocol):
+    """Bounded asynchronous local detector with an isolated inference owner."""
+
+    async def prepare(self) -> None: ...
+
+    async def feed(self, frame: AudioFrame, epoch: int) -> WakeWordDetection | None: ...
+
+    async def close(self) -> None: ...
