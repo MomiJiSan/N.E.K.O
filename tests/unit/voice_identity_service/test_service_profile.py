@@ -733,6 +733,27 @@ async def test_off_mode_records_profile_without_runtime_activation(
     assert activations == []
     await service.close()
 
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_off_mode_reconcile_clears_intentional_degraded_transition(
+    tmp_path: Path,
+) -> None:
+    service, _model, activations, _events = _service(
+        tmp_path,
+        runtime_mode="off",
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    await service.complete_enrollment(enrollment.enrollment_id, "profile-a", _pcm())
+
+    status = await service.update_runtime_noise_reduction_enabled(False)
+
+    assert status.state.effective_reason == "runtime_degraded"
+    assert not service._runtime_audio_contract_transition_pending  # type: ignore[attr-defined]
+    assert activations == []
+    await service.close()
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_shadow_mode_records_profile_without_reporting_enforced(

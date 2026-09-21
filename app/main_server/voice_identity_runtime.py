@@ -316,6 +316,13 @@ class OwnerVoiceRuntimeRegistry:
         async with self._lock:
             self._managers.discard(manager)
             self._attach_pending.discard(manager)
+            # Legacy Core managers predate session activation and have no
+            # factory setter to detach.  Do not manufacture a retry obligation
+            # for an operation that can never be performed.
+            if not self._manager_supports_session_activation(manager):
+                self._detach_pending.pop(manager, None)
+                self._restore_pending.discard(manager)
+                return
             detach_generation = str(uuid.uuid4())
             cancellation: asyncio.CancelledError | None = None
             try:
@@ -670,6 +677,12 @@ class OwnerVoiceRuntimeRegistry:
             activation_generation=activation_generation,
             activation_required=activation_required,
             expected_policy_revision=expected_policy_revision,
+        )
+
+    @staticmethod
+    def _manager_supports_session_activation(manager) -> bool:
+        return callable(
+            getattr(manager, "set_voice_session_activation_factory", None)
         )
 
     @staticmethod
@@ -1127,6 +1140,9 @@ class OwnerVoiceRuntimeRegistry:
                     if not targets:
                         return
                     for manager, generation in targets:
+                        if not self._manager_supports_session_activation(manager):
+                            self._detach_pending.pop(manager, None)
+                            continue
                         call_timeout = min(
                             _WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
                             deadline - loop.time(),
@@ -1236,6 +1252,8 @@ class OwnerVoiceRuntimeRegistry:
             self._detach_pending.clear()
             try:
                 for manager in managers:
+                    if not self._manager_supports_session_activation(manager):
+                        continue
                     try:
                         await asyncio.wait_for(
                             self._restore_manager(

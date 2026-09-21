@@ -3289,7 +3289,11 @@ class AsrRuntimeMixin:
             )
         except ValueError:
             self._complete_hot_swap_ingress_sequence(ingress_sequence)
-            logger.warning("[%s] invalid microphone ingress frame", self.lanlan_name)
+            logger.warning(
+                "[%s] invalid microphone ingress frame route=%s",
+                self.lanlan_name,
+                self._asr_route_mode,
+            )
             return
         self._voice_activation_pending_capture[ingress_sequence] = frame.received_at
         self._ensure_audio_stream_worker()
@@ -3712,7 +3716,10 @@ class AsrRuntimeMixin:
         )
         try:
             if not isinstance(data, list):
-                logger.error("Microphone input rejected: expected a PCM sample list")
+                logger.error(
+                    "Microphone input rejected: expected a PCM sample list route=%s",
+                    self._asr_route_mode,
+                )
                 return
             audio_bytes = struct.pack(f"<{len(data)}h", *data)
             declared_rate_hz = message.get("sample_rate_hz")
@@ -3722,8 +3729,9 @@ class AsrRuntimeMixin:
                 source_rate_hz = int(declared_rate_hz)
             else:
                 logger.error(
-                    "Microphone input rejected: unsupported sample rate %r",
+                    "Microphone input rejected: unsupported sample rate %r route=%s",
                     declared_rate_hz,
+                    self._asr_route_mode,
                 )
                 return
             try:
@@ -3840,11 +3848,17 @@ class AsrRuntimeMixin:
                 captured_at=audio_captured_at,
             )
         except struct.error:
-            logger.error("Microphone input rejected: invalid PCM samples")
+            logger.error(
+                "Microphone input rejected: invalid PCM samples route=%s",
+                self._asr_route_mode,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.error("Microphone preprocessing or ASR routing failed")
+            logger.error(
+                "Microphone preprocessing or ASR routing failed route=%s",
+                self._asr_route_mode,
+            )
         finally:
             if sequence_owned:
                 self._complete_hot_swap_ingress_sequence(ingress_sequence)
