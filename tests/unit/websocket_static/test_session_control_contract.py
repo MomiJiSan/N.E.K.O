@@ -205,10 +205,10 @@ def test_session_started_only_settles_the_start_it_answers():
     # the checklist that goes stale. A window with no start pending must treat
     # any ack as its own, or a leaked id silently disables the latch forever.
     assert "!S.sessionStartedResolver" in guard
-    # An ack with no id counts as ours: the internal starts (proactive,
-    # greeting, disconnect recovery) carry no request, and the cross-mode guard
-    # already covers them.
-    assert "!response.request_id" in guard
+    # When a start request has an id, an ack without an id cannot be attributed
+    # to that request. Anonymous acks remain compatible only when there is no
+    # pending request id, via the guard below.
+    assert "!response.request_id" not in guard
     assert "!S._pendingSessionStartRequestId" in guard
 
     # Settling is what the guard gates -- the timeout clear and the deferred
@@ -316,3 +316,17 @@ def test_deferred_session_start_resolve_is_pinned_to_the_ack_it_belongs_to():
         "release the slot before settling, so the awaiter never observes a slot "
         "that still points at an already-settled start"
     )
+
+
+def test_session_started_ack_never_uses_anonymous_id_when_a_start_is_pending():
+    """An anonymous ACK cannot settle a start that has an ownership token."""
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    guard = source.split("var _ackAnswersThisWindow =", 1)[1].split(";", 1)[0]
+
+    assert "!S.sessionStartedResolver" in guard
+    assert "!S._pendingSessionStartRequestId" in guard
+    assert "response.request_id === S._pendingSessionStartRequestId" in guard
+    assert "!response.request_id" not in guard
+    assert "if (_ackAnswersThisWindow) S.voiceStartPending = false;" in source
+    assert "if (_ackAnswersThisWindow && S.sessionStartedResolver" in source
+    assert "var _ackedResolver = _ackAnswersThisWindow ?" in source
