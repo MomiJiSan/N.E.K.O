@@ -4100,6 +4100,8 @@ class AsrRuntimeMixin:
                 voice_activity=self._voice_session_activation_has_speech(
                     pcm16,
                     speech_probability=speech_probability,
+                    rnnoise_available=rnnoise_available,
+                    rnnoise_evidence=rnnoise_evidence,
                 ),
             )
         return True
@@ -4349,10 +4351,19 @@ class AsrRuntimeMixin:
         pcm16: bytes,
         *,
         speech_probability: float | None,
+        rnnoise_available: bool | None = None,
+        rnnoise_evidence: RnnoiseEvidence | None = None,
     ) -> bool:
-        if isinstance(speech_probability, (int, float)) and math.isfinite(
-            float(speech_probability)
+        probability_is_authoritative = True
+        if rnnoise_available is False:
+            probability_is_authoritative = False
+        if rnnoise_evidence is not None and (
+            rnnoise_evidence.available and rnnoise_evidence.frame_count <= 0
         ):
+            probability_is_authoritative = False
+        if probability_is_authoritative and isinstance(
+            speech_probability, (int, float)
+        ) and math.isfinite(float(speech_probability)):
             return float(speech_probability) >= 0.5
         samples = memoryview(pcm16).cast("h")
         if not samples:

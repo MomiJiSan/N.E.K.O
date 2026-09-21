@@ -3,6 +3,9 @@
 import pytest
 
 from main_logic.voice_identity_service.service import VoiceIdentityServiceError
+from main_logic.voice_identity_service.audio_contract import (
+    OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID,
+)
 from tests.support.voice_identity_fakes import _pcm, _service
 
 
@@ -54,3 +57,27 @@ async def test_failed_audio_contract_reconcile_retries_same_setting(
         await service.close()
 
 pytestmark = pytest.mark.runtime
+
+
+@pytest.mark.asyncio
+async def test_audio_contract_change_invalidates_active_enrollment(tmp_path):
+    service, _model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+    try:
+        initial = await service.start_enrollment()
+        await service.complete_enrollment(initial.enrollment_id, "profile-a", _pcm())
+        await service.set_filter(True)
+        enrollment = await service.start_enrollment()
+        assert await service.prepare_runtime_audio_contract_change(False)
+        assert service.status().enrollment is None
+        with pytest.raises(VoiceIdentityServiceError, match="stale_enrollment"):
+            await service.submit_enrollment_segment(
+                enrollment.enrollment_id,
+                "profile-a",
+                1,
+                _pcm(),
+                sample_rate_hz=48_000,
+                audio_contract_id=OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID,
+            )
+    finally:
+        await service.close()

@@ -1747,6 +1747,29 @@ class VoiceIdentityService:
             ):
                 return True
             cancellations: list[asyncio.CancelledError] = []
+            enrollment = self._enrollment
+            if enrollment is not None:
+                # A DSP transition changes the enrollment audio contract. Do
+                # not let a segment already in flight commit under the old
+                # snapshot after the runtime has been detached.
+                self._enrollment = None
+                operation_task = enrollment.operation_task
+                self._invalidate_session(enrollment)
+                if (
+                    operation_task is not None
+                    and operation_task is not asyncio.current_task()
+                    and not operation_task.done()
+                ):
+                    operation_task.cancel()
+                cleanup_ok = await _await_cancellation_safe(
+                    self._cleanup_session(enrollment),
+                    name="voice-identity-audio-contract-enrollment-cleanup",
+                    cancellations=cancellations,
+                )
+                if not cleanup_ok:
+                    self._set_ineffective(
+                        VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
             detached = await _await_cancellation_safe(
                 self._activate(None, str(uuid.uuid4())),
                 name="voice-identity-audio-contract-transition-detach",
