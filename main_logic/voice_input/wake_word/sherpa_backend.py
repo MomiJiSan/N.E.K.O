@@ -200,6 +200,7 @@ class SherpaWakeWordDetector:
         self._busy = False
         self._ready = False
         self._runtime_info = None
+        self._reaper_threads: set[threading.Thread] = set()
 
     @property
     def runtime_info(self) -> Mapping | None:
@@ -239,6 +240,26 @@ class SherpaWakeWordDetector:
             raise WakeWordBackendError("WAKE_WORD_CLOSED")
         return result
 
+    def _reap_process(self, process) -> None:
+        """Wait for a stubborn child and close its handle outside the stop budget."""
+        try:
+            process.join()
+        finally:
+            try:
+                process.close()
+            finally:
+                with self._lifecycle_lock:
+                    self._reaper_threads.discard(threading.current_thread())
+
+    def _handoff_process_reaper(self, process) -> None:
+        reaper = threading.Thread(
+            target=self._reap_process, args=(process,),
+            name="neko-wake-word-process-reaper", daemon=True,
+        )
+        with self._lifecycle_lock:
+            self._reaper_threads.add(reaper)
+        reaper.start()
+
     def _stop(self) -> None:
         with self._lifecycle_lock:
             process, self._process = self._process, None
@@ -250,7 +271,9 @@ class SherpaWakeWordDetector:
             if process.is_alive():
                 process.kill()
                 process.join(timeout=0.5)
-            if not process.is_alive():
+            if process.is_alive():
+                self._handoff_process_reaper(process)
+            else:
                 process.close()
         if connection is not None:
             connection.close()
