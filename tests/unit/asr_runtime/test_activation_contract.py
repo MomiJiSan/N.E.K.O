@@ -6,6 +6,8 @@ import pytest
 from main_logic.asr_client.runtime import AsrStartResult, AsrStartStatus
 import main_logic.core as core_module
 import main_logic.voice_turn.audio_input as audio_input_module
+from main_logic.core.asr_runtime import AsrRuntimeMixin
+from main_logic.voice_turn.activity_evidence import RnnoiseEvidence
 
 from tests.support.asr_fakes import (
     _CoreActivationFactory,
@@ -239,3 +241,16 @@ async def test_start_installs_latest_verifier_published_during_connect(
     stale_factory.assert_not_called()
     current_factory.assert_called_once_with()
     assert detector_factory.call_args.kwargs["speaker_shadow"] is current_shadow
+
+
+async def test_voice_activity_uses_pcm_when_rnnoise_is_disabled():
+    pcm = b"\xff\x7f" * 160
+    assert AsrRuntimeMixin._voice_session_activation_has_speech(
+        pcm, speech_probability=0.0, rnnoise_available=False
+    )
+    assert AsrRuntimeMixin._voice_session_activation_has_speech(
+        pcm,
+        speech_probability=0.0,
+        rnnoise_available=True,
+        rnnoise_evidence=RnnoiseEvidence(True, 0, None, None, None, None),
+    )
