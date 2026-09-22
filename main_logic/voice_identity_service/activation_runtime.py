@@ -104,6 +104,12 @@ class VoiceSessionActivationRuntime:
         self._wake_queue: deque[tuple[AudioFrame, int]] = deque()
         self._wake_queue_bytes = 0
         self._wake_inflight_bytes = 0
+        # Frames received while the scorer / wake detector is preparing must
+        # still be offered to the detector once the runtime enters WAITING.
+        # Keep a separate bounded copy because the controller's buffer is also
+        # the source for speaker verification and replay.
+        self._wake_prepare_backlog: deque[AudioFrame] = deque()
+        self._wake_prepare_backlog_bytes = 0
         self._wake_epoch: int | None = None
         self._output_task: asyncio.Task[None] | None = None
         self._output_retry_task: asyncio.Task[None] | None = None
@@ -316,6 +322,7 @@ class VoiceSessionActivationRuntime:
             if status is ActivationScoreStatus.READY:
                 if wake_error:
                     self._wake_ready = False
+                    self._clear_wake_prepare_backlog_locked()
                     return self._publish(
                         self._controller.mark_unavailable(
                             self._generation,
@@ -323,7 +330,16 @@ class VoiceSessionActivationRuntime:
                         )
                     )
                 self._wake_ready = self._wake_detector is not None
-                return self._publish(self._controller.mark_ready(self._generation))
+                decision = self._controller.mark_ready(self._generation)
+                if self._wake_ready and not self._flush_wake_prepare_backlog_locked():
+                    self._wake_ready = False
+                    return self._publish(
+                        self._controller.mark_unavailable(
+                            self._generation,
+                            "wake_word_queue_overflow",
+                        )
+                    )
+                return self._publish(decision)
             return self._publish(
                 self._controller.mark_unavailable(
                     self._generation,
@@ -336,6 +352,7 @@ class VoiceSessionActivationRuntime:
         async with self._lock:
             if self._closed:
                 return self._publish(self._controller.close())
+            self._clear_wake_prepare_backlog_locked()
             return self._publish(
                 self._controller.mark_unavailable(self._generation, reason)
             )
@@ -351,10 +368,19 @@ class VoiceSessionActivationRuntime:
             if self._closed:
                 return self._publish(self._controller.close())
             decision = self._controller.ingest(frame, voice_activity=voice_activity)
+            if decision.state is ActivationState.UNAVAILABLE:
+                self._clear_wake_prepare_backlog_locked()
             if (
                 decision.reason == "frame_buffered"
                 and decision.state is ActivationState.PREPARING
             ):
+                if not self._queue_wake_prepare_frame_locked(frame):
+                    return self._publish(
+                        self._controller.mark_unavailable(
+                            self._generation,
+                            "wake_word_queue_overflow",
+                        )
+                    )
                 self._advance_candidate(
                     frame,
                     voice_activity=voice_activity,
@@ -385,6 +411,8 @@ class VoiceSessionActivationRuntime:
         async with self._lock:
             current = self._qualification_now_locked(now)
             decision = self._capture_progress_failure or self._controller.tick(current)
+            if decision.state is ActivationState.UNAVAILABLE:
+                self._clear_wake_prepare_backlog_locked()
             if decision.state is ActivationState.WAITING:
                 self._clear_candidate()
             return self._publish(decision)
@@ -445,6 +473,7 @@ class VoiceSessionActivationRuntime:
                 )
             shutdown_tasks = self._shutdown_tasks
             self._clear_wake_queue_locked()
+            self._clear_wake_prepare_backlog_locked()
             self._pending_verification_request = None
         for task in shutdown_tasks:
             if not task.done():
@@ -628,6 +657,35 @@ class VoiceSessionActivationRuntime:
     def _clear_wake_queue_locked(self) -> None:
         self._wake_queue.clear()
         self._wake_queue_bytes = 0
+
+    def _clear_wake_prepare_backlog_locked(self) -> None:
+        self._wake_prepare_backlog.clear()
+        self._wake_prepare_backlog_bytes = 0
+
+    def _queue_wake_prepare_frame_locked(self, frame: AudioFrame) -> bool:
+        """Bound audio captured before the wake detector becomes ready."""
+        if self._wake_detector is None:
+            return True
+        projected = self._wake_prepare_backlog_bytes + len(frame.pcm)
+        if projected > self._config.wake_queue_bytes:
+            self._clear_wake_prepare_backlog_locked()
+            return False
+        self._wake_prepare_backlog.append(frame)
+        self._wake_prepare_backlog_bytes = projected
+        return True
+
+    def _flush_wake_prepare_backlog_locked(self) -> bool:
+        """Feed preparation-time frames before accepting new live frames."""
+        if self._wake_detector is None or not self._wake_prepare_backlog:
+            self._clear_wake_prepare_backlog_locked()
+            return True
+        frames = tuple(self._wake_prepare_backlog)
+        self._clear_wake_prepare_backlog_locked()
+        for frame in frames:
+            if not self._enqueue_wake_locked(frame):
+                self._clear_wake_queue_locked()
+                return False
+        return True
 
     def _enqueue_wake_locked(self, frame: AudioFrame) -> bool:
         if self._wake_detector is None or not self._wake_ready:
