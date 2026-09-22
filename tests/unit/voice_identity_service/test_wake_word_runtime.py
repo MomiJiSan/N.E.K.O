@@ -83,9 +83,39 @@ class Detector:
         self.closed = True
 
 
+class PrepareBlockedDetector(Detector):
+    def __init__(self, hit_at=None):
+        super().__init__(hit_at=hit_at)
+        self.ready = asyncio.Event()
+
+    async def prepare(self):
+        await self.ready.wait()
+
+
 async def settle():
     for _ in range(40):
         await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_frames_received_during_prepare_are_replayed_to_wake_detector():
+    detector = PrepareBlockedDetector(hit_at=0)
+    instance, _, sent, statuses = runtime(detector)
+    preparing = asyncio.create_task(instance.prepare())
+    await asyncio.sleep(0)
+
+    await instance.feed(frame(0), voice_activity=False)
+    assert detector.frames == []
+
+    detector.ready.set()
+    await asyncio.wait_for(preparing, 1)
+    await settle()
+
+    assert [audio.sequence for audio, _ in detector.frames] == [0]
+    assert sent == [frame(0)]
+    assert instance.state is ActivationState.ACTIVE
+    assert sum(item.reason == "wake_word_detected" for item in statuses) == 1
+    await instance.close()
 
 
 def runtime(detector, *, clock=lambda: 1.5, config=None):
