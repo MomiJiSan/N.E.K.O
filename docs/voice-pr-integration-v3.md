@@ -6,8 +6,8 @@ the merge result and cross-PR validation.
 
 | Source | Head SHA |
 | --- | --- |
-| `upstream/main` | `edae4bbc7c0e0df8cf644ccfd7622f7646e912de` |
-| PR #3078 | `5449e71672f6a0f869feb02ea0afad8480cba498` |
+| `upstream/main` | `cd17a21164ae5e734040042efd2b7cb810944e9f` |
+| PR #3078 | `ff546a086d976acb509eec745aac49d4f2992964` |
 | PR #3089 | `a9ad1ad46420c36bf20fad22d594fc2694043e03` |
 | PR #3103 | `a799b0cb2248f31f0fcdfd601c25927fc8f7e86e` |
 | PR #3130 | `6548ed9dd221da81b49711a8e77c00fc4ac389a7` |
