@@ -40,6 +40,46 @@ def classify_failure(code: str, *, source: FailureSource) -> RecoveryDisposition
     return RecoveryDisposition.STOP
 
 
+@dataclass(frozen=True, slots=True)
+class FailureDecision:
+    """Keep fault ownership separate from old-input delivery diagnostics."""
+
+    cause_code: str
+    failure_source: FailureSource
+    delivery_risk: str | None
+    recovery_disposition: RecoveryDisposition
+    notification_code: str
+
+
+def decide_failure(
+    cause_code: str, *, source: FailureSource, delivery_risk: str | None = None,
+) -> FailureDecision:
+    """Classify the original cause; a protected prefix is not a failure cause.
+
+    Legacy generic delivery paths still need their existing failure notice.
+    Explicit provider, detector, ordering, delivery and recovery-terminal codes
+    retain their meaning. This decision grants no permission to replay audio.
+    """
+    disposition = classify_failure(cause_code, source=source)
+    notification_code = cause_code
+    if delivery_risk is not None and cause_code in {
+        "ASR_INDEPENDENT_FAILED",
+        "ASR_INDEPENDENT_STREAM_FAILED",
+        "ASR_STREAM_BACKPRESSURE",
+        "ASR_QWEN_CONNECTION_CLOSED",
+        "ASR_QWEN_WORKER_FAILED",
+        "ASR_STEP_CONNECTION_CLOSED",
+        "ASR_STEP_WORKER_FAILED",
+        "ASR_OPENAI_WORKER_FAILED",
+        "ASR_SONIOX_PROTECTED_REPLAY_DISABLED",
+        "ASR_SONIOX_REPLAY_INCOMPLETE",
+    }:
+        notification_code = delivery_risk
+    return FailureDecision(
+        cause_code, source, delivery_risk, disposition, notification_code,
+    )
+
+
 @dataclass(slots=True)
 class RecoveryBudget:
     """Replacement attempts survive handshakes and successive failed sessions.

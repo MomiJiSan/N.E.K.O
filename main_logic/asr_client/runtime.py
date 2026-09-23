@@ -66,7 +66,7 @@ from .lifecycle import (
     VoiceTransportToken,
 )
 from .provider_policy import resolve_provider_policy
-from .recovery import FailureSource, RecoveryBudget, RecoveryDisposition, classify_failure
+from .recovery import FailureSource, RecoveryBudget, RecoveryDisposition, classify_failure, decide_failure
 from .speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
     SpeakerShadowObserver,
@@ -5378,25 +5378,26 @@ class IndependentAsrRuntime:
         ):
             return
         prefix = getattr(self, "_asr_protected_prefix", None)
+        delivery_risk = None
         if prefix is not None and self._ingress_token_matches(prefix.ingress):
-            delivery_code = self._protected_delivery_failure_code()
-            if status_code != delivery_code:
-                logger.warning(
-                    "[%s] ASR protected delivery failed cause=%s delivery=%s "
-                    "batch=%s epoch=%s transport_trace=%s",
-                    self.display_name, status_code, delivery_code,
-                    prefix.batch_id, epoch,
-                    getattr(self._asr_session, "transport_delivery_trace_id", None),
-                )
-            # Replace, rather than append a second failure status. Provider
-            # callbacks and dispatcher failures share this ownership-checked
-            # decision before teardown destroys the actual write evidence.
-            status_code = delivery_code
-        if allow_recovery and classify_failure(
-            status_code, source=failure_source,
-        ) is RecoveryDisposition.RECOVER:
-            if await self._begin_asr_recovery(epoch, provider, status_code, expected_identity, failure_source):
+            delivery_risk = self._protected_delivery_failure_code()
+        decision = decide_failure(
+            status_code, source=failure_source, delivery_risk=delivery_risk,
+        )
+        logger.warning(
+            "[%s] ASR failure cause_code=%s failure_source=%s delivery_risk=%s "
+            "recovery_disposition=%s epoch=%s transport_trace=%s",
+            self.display_name, decision.cause_code, decision.failure_source.value,
+            decision.delivery_risk, decision.recovery_disposition.value, epoch,
+            getattr(self._asr_session, "transport_delivery_trace_id", None),
+        )
+        if allow_recovery and decision.recovery_disposition is RecoveryDisposition.RECOVER:
+            recovery_identity = self._capture_runtime_identity()
+            if await self._begin_asr_recovery(epoch, provider, decision.cause_code, expected_identity, failure_source):
                 return
+            if not self._runtime_identity_matches(recovery_identity):
+                return
+        status_code = decision.notification_code
         recovery = self._asr_recovery
         if recovery is not None:
             if self._recovery_is_current(recovery):
