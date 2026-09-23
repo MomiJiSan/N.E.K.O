@@ -993,6 +993,7 @@
         "voiceInputRecoveryRecovering": "音声入力を復旧しています…",
         "voiceInputRecoveryReady": "音声入力が復旧しました",
         "voiceInputRecoveryFailed": "音声入力の復旧に失敗しました。もう一度お試しください",
+        "voiceInputTurnIncomplete": "直前の発話を処理できませんでした。音声認識の復旧後にもう一度話してください。",
         "accessFailed": "マイクにアクセスできません",
         "gainLabel": "マイクゲイン",
         "gainHint": "0dBが元の音量、正の値で増幅、負の値で減衰",

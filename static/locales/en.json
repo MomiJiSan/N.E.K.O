@@ -993,6 +993,7 @@
         "voiceInputRecoveryRecovering": "Recovering voice input…",
         "voiceInputRecoveryReady": "Voice input recovered",
         "voiceInputRecoveryFailed": "Voice input recovery failed, please try again",
+        "voiceInputTurnIncomplete": "The previous sentence was not completed. Please say it again after voice input recovers.",
         "accessFailed": "Cannot access microphone",
         "gainLabel": "Microphone Gain",
         "gainHint": "0dB is original volume, positive amplifies, negative reduces",

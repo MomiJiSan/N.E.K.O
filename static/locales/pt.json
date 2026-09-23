@@ -993,6 +993,7 @@
         "voiceInputRecoveryRecovering": "A recuperar a entrada de voz…",
         "voiceInputRecoveryReady": "Entrada de voz recuperada",
         "voiceInputRecoveryFailed": "Falha ao recuperar a entrada de voz. Tente novamente",
+        "voiceInputTurnIncomplete": "A frase anterior não foi concluída. Repita-a após a recuperação do reconhecimento de voz.",
         "accessFailed": "Não é possível acessar o microfone",
         "gainLabel": "Ganho do microfone",
         "gainHint": "0dB é o volume original, positivo amplifica, negativo reduz",
