@@ -38,7 +38,7 @@ from .detector import (
     SmartTurnCompletionFence,
 )
 from .silero_vad import SileroActivityGate, SileroVad
-from .admission_gate import AdmissionActivity, AdmissionActivityGate
+from .admission_gate import AdmissionActivity, AdmissionActivityGate, AdmissionAudioRangeError
 from .smart_turn_audio_evidence import create_smart_turn_audio_evidence_recorder
 from .smart_turn_diagnostics import create_smart_turn_runtime_diagnostics
 from .smart_turn_v3 import SmartTurnV3
@@ -626,6 +626,11 @@ class _VoiceTurnAdapter:
                 )
             else:
                 events = await asyncio.to_thread(self._gate.feed, item.pcm16)
+        except AdmissionAudioRangeError:
+            # Broken ownership is not model unavailability. It must never
+            # enable the SmartTurn no-VAD fallback and upload uncertain PCM.
+            self._report_failure("runtime_error", "vad_feed")
+            return
         except Exception:
             if self._smart_turn_required:
                 self._vad_degraded = True
@@ -2165,6 +2170,7 @@ class DetectorRuntime:
         rnnoise_evidence: RnnoiseEvidence | None = None,
         ingress_token: VoiceIngressToken | None = None,
         allow_baseline_update: bool = False,
+        source_end_sample: int | None = None,
     ) -> DetectorFeedResult:
         if not isinstance(pcm16, bytes) or len(pcm16) % 2:
             raise ValueError("DetectorRuntime requires complete PCM16 bytes")
@@ -2196,6 +2202,7 @@ class DetectorRuntime:
                 rnnoise_available=bool(rnnoise_available),
                 rnnoise_evidence=rnnoise_evidence,
                 allow_baseline_update=allow_baseline_update,
+                source_end_sample=source_end_sample,
             )
             if submitted.status is DetectorSubmitStatus.SKIPPED_QUIET:
                 return DetectorFeedResult(
@@ -2284,7 +2291,10 @@ class DetectorRuntime:
                     )
             try:
                 if self.admission_enabled:
-                    self.submitted_samples += len(pcm16) // 2
+                    self.submitted_samples = (
+                        source_end_sample if source_end_sample is not None
+                        else self.submitted_samples + len(pcm16) // 2
+                    )
                     await asyncio.to_thread(self._gate.feed_at, pcm16, self.submitted_samples)
                     events = self._gate.admission_events
                 else:
@@ -2362,7 +2372,13 @@ class DetectorRuntime:
             candidate=candidate,
         )
 
-    async def seal_provider_candidate(self, *, preserve_admission: bool = False) -> ProviderCandidateFence | None:
+    async def seal_provider_candidate(
+        self,
+        *,
+        preserve_admission: bool = False,
+        admission_start_sample: int | None = None,
+        admission_boundary: Callable[[], int] | None = None,
+    ) -> ProviderCandidateFence | None:
         """Seal local detector activity after a streaming Provider endpoint."""
 
         async with self._lock:
@@ -2371,14 +2387,19 @@ class DetectorRuntime:
             existing = self._provider_candidate_fence
             if existing is not None:
                 return existing
+            # A feed may have committed another old-turn block while this
+            # operation waited for the detector lock. Resolve ownership here,
+            # synchronously, so the fence and admission boundary are atomic.
+            if admission_boundary is not None:
+                admission_start_sample = admission_boundary()
             fence = ProviderCandidateFence(
                 detector_epoch=self._detector_epoch,
                 candidate_generation=self._candidate_generation,
                 through_sequence_no=self._sequence_no,
             )
-            self._provider_candidate_fence = fence
             if self.admission_enabled and not preserve_admission:
-                self._gate.seal_admission()
+                self._gate.seal_admission(start_sample=admission_start_sample)
+            self._provider_candidate_fence = fence
             self._provider_discarded_through_sequence_no = None
             self._candidate_generation += 1
             self._candidate_open = False
@@ -2568,6 +2589,7 @@ class DetectorRuntime:
         rnnoise_available: bool,
         rnnoise_evidence: RnnoiseEvidence | None = None,
         allow_baseline_update: bool = False,
+        source_end_sample: int | None = None,
     ) -> DetectorSubmitResult:
         """Validate and enqueue one frame without waiting for detector inference."""
 
@@ -2647,7 +2669,10 @@ class DetectorRuntime:
             ingress_token=ingress_token,
             detector_epoch=self._detector_epoch,
             sequence_no=next_sequence,
-            audio_end_sample=self.submitted_samples + len(pcm16) // 2,
+            audio_end_sample=(
+                source_end_sample if source_end_sample is not None
+                else self.submitted_samples + len(pcm16) // 2
+            ),
         )
         try:
             await adapter.push_audio(

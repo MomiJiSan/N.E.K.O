@@ -18,6 +18,10 @@ from .silero_vad import SileroActivityGate, SileroVad
 logger = logging.getLogger(__name__)
 
 
+class AdmissionAudioRangeError(ValueError):
+    """Source PCM cannot be attributed to one continuous admission stream."""
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionActivity:
     activity: SpeechActivityEvent
@@ -68,15 +72,36 @@ class AdmissionActivityGate(SileroActivityGate):
         )
 
     def feed_at(self, pcm16: bytes, source_end_sample: int):
-        self._seen_samples += len(pcm16) // 2
+        count = len(pcm16) // 2
+        if source_end_sample < count or len(pcm16) % 2:
+            raise AdmissionAudioRangeError("invalid admission PCM source range")
+        if self._seen_samples and source_end_sample != (
+            self._source_offset + self._seen_samples + count
+        ):
+            raise AdmissionAudioRangeError("discontinuous admission PCM source range")
+        self._seen_samples += count
         self._source_offset = source_end_sample - self._seen_samples
         return self.feed(pcm16)
 
-    def seal_admission(self):
+    def seal_admission(self, *, start_sample: int | None = None):
+        """End admission at the owner's absolute PCM boundary.
+
+        The VAD can still hold a partial model window before this boundary.
+        Keep that context for inference, but never count it for the successor.
+        """
+        boundary = (
+            self._sample_cursor if start_sample is None
+            else start_sample - self._source_offset
+        )
+        if boundary < self._sample_cursor:
+            raise ValueError("admission boundary precedes observed audio")
         sealed = self._admission.seal()
         self._published = False
         self.admission_events = ()
-        self._rejected_end = self._sample_cursor
+        self._rejected_end = max(
+            self._rejected_end,
+            boundary,
+        )
         self.event_evidence = None
         self.event_audio_start_sample = None
         self.had_admission = False
@@ -92,7 +117,13 @@ class AdmissionActivityGate(SileroActivityGate):
             raw_events.extend(raw)
             previous = self._admission.snapshot
             end = self._sample_cursor + SileroVad.WINDOW_SAMPLES
-            local = self._admission.observe(self._sample_cursor, end, probability)
+            start = max(self._sample_cursor, self._rejected_end)
+            # Probability describes the whole model window; weight only its
+            # owned successor duration. Raw VAD above still sees every window.
+            local = (
+                self._admission.observe(start, end, probability)
+                if start < end else None
+            )
             self._sample_cursor = end
             if local is not None and local.decision is AdmissionDecision.REJECT:
                 self._rejected_end = max(self._rejected_end, local.audio_end_sample)
@@ -137,7 +168,7 @@ class AdmissionActivityGate(SileroActivityGate):
                 # ASR audio and raw SmartTurn continuation stay uninterrupted.
                 self._admission.seal()
                 self._published = False
-                self._rejected_end = self._sample_cursor
+                self._rejected_end = max(self._rejected_end, self._sample_cursor)
         self.admission_records = tuple(records)
         self.admission_events = tuple(record.activity for record in records)
         self.event_evidence = records[-1].evidence if records else self.evidence
