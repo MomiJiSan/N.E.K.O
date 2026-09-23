@@ -65,6 +65,8 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
+        "2026-09-12-voice-wake-word-kws2-main",
+        "2026-09-14-plugin-model-api-proactive-community",
         "2026-09-11-soccer-sdk-migration",
         "2026-09-11-voice-session-activation-main",
         "2026-09-11-voice-wake-word-activation",
@@ -72,6 +74,13 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-12-voice-session-activation-main",
         "2026-09-10-drawing-guess-pngtuber-import-status",
         "2026-09-09-voice-session-activation-pngtuber",
+        "2026-09-12-watch-together-image-generation",
+        "2026-09-13-plugin-model-api-watch-together",
+        "2026-09-14-proactive-community-chat",
+        "2026-09-12-watch-together-automatic",
+        "2026-09-12-core-image-generation",
+        "2026-09-12-watch-together-history-pages",
+        "2026-09-11-watch-together-next-video",
         "2026-01-31-1",
         "2026-02-04-1",
         "2026-02-23-1",
@@ -150,6 +159,10 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-09-voice-session-activation-pngtuber",
         "2026-09-03-voice-identity-five-second-verification",
         "2026-09-08-voice-session-activation",
+        "2026-09-11-watch-together-soccer-sdk",
+        "2026-09-11-watch-together",
+        "2026-09-11-watch-together-discovery",
+        "2026-09-06-plugin-model-api",
     }
 )
 
@@ -162,7 +175,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = "b68ff7e15c58b9515e3dd29734ae08f53fb076df9eb84448ca52d4f072eca139"
+LOCALE_KEY_SIGNATURE = "3115041681bcbde4547326c9e377a3845bc853a1642091387e677600e4da9779"
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
