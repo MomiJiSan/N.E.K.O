@@ -118,6 +118,24 @@ async def test_gemini_activation_uses_actual_send_outcome(outcome):
             assert not sent
 
 
+async def test_ordinary_gemini_stream_audio_keeps_base_error_boundary():
+    client = _make_client("gemini", "gemini-test")
+    client._audio_processor = None
+    failure = RuntimeError("connection closed")
+    send = AsyncMock(side_effect=failure)
+    client._gemini_session = SimpleNamespace(send_realtime_input=send)
+
+    assert await client.stream_audio(bytes(3200)) is True
+    assert client._fatal_error_occurred is True
+    send.assert_awaited_once()
+
+    client._fatal_error_occurred = False
+    with pytest.raises(RuntimeError) as raised:
+        await client.stream_audio(bytes(3200), raise_on_error=True)
+    assert raised.value is failure
+    assert send.await_count == 2
+
+
 @pytest.mark.parametrize("receipt", [True, False], ids=["written", "not-written"])
 async def test_non_gemini_activation_uses_actual_send_receipt(receipt):
     async with _harness("native") as h:

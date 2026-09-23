@@ -1195,6 +1195,7 @@ class _TransportMixin:
         audio_chunk: bytes,
         *,
         captured_at: float | None = None,
+        raise_on_error: bool = False,
     ) -> bool | None:
         """Stream raw audio data to the API.
 
@@ -1326,7 +1327,10 @@ class _TransportMixin:
 
             # Gemini uses different API (16kHz, no uplink resample needed)
             if self._is_gemini:
-                await self._stream_audio_gemini(audio_chunk)
+                await self._stream_audio_gemini(
+                    audio_chunk,
+                    raise_on_error=raise_on_error,
+                )
                 return True
 
             # By this point audio_chunk is always 16kHz (RNNoise-downsampled,

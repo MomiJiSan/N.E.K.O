@@ -244,11 +244,18 @@ class _GeminiMixin:
                 await self.on_connection_error(error_msg)
             raise
 
-    async def _stream_audio_gemini(self, audio_chunk: bytes) -> None:
+    async def _stream_audio_gemini(
+        self,
+        audio_chunk: bytes,
+        *,
+        raise_on_error: bool = True,
+    ) -> None:
         """Send audio data to Gemini Live API."""
         session = self._gemini_session
         if session is None:
-            raise ConnectionError("Gemini audio session is not connected")
+            if raise_on_error:
+                raise ConnectionError("Gemini audio session is not connected")
+            return
         connection_generation = self._connection_generation
 
         def send_is_current() -> bool:
@@ -268,9 +275,8 @@ class _GeminiMixin:
             logger.error(f"Error sending audio to Gemini: {e}")
             if send_is_current() and "closed" in str(e).lower():
                 self._fatal_error_occurred = True
-            # Returning normally is the native boundary's write receipt.
-            # Preserve the original error so Core can retire uncertain output.
-            raise
+            if raise_on_error:
+                raise
 
     async def signal_user_activity_end(self) -> None:
         """Explicitly signal end-of-turn in MANUAL VAD mode.

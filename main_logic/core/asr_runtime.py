@@ -4175,6 +4175,7 @@ class AsrRuntimeMixin:
             ingress_token=context.ingress_token,
             captured_at=context.captured_at,
             preserve_prefix=prefix,
+            require_output_commit=True,
         )
         if (
             self._capture_voice_session_activation_generation() != generation
@@ -4382,6 +4383,7 @@ class AsrRuntimeMixin:
         ingress_token: VoiceIngressToken | None = None,
         captured_at: float | None = None,
         preserve_prefix: PreserveUnsentPrefix | None = None,
+        require_output_commit: bool = False,
     ) -> OutputCommit:
         route_mode = self._asr_route_mode
         if not self._voice_input_accepts_pcm():
@@ -4426,7 +4428,11 @@ class AsrRuntimeMixin:
                 return OutputCommit.NOT_SENT
             try:
                 if isinstance(session_ref, _core_facade.OmniRealtimeClient):
-                    written = await stream_audio(pcm16, captured_at=captured_at)
+                    written = await stream_audio(
+                        pcm16,
+                        captured_at=captured_at,
+                        raise_on_error=require_output_commit,
+                    )
                 else:
                     written = await stream_audio(pcm16)
                 if written is False:
@@ -4443,17 +4449,15 @@ class AsrRuntimeMixin:
             except asyncio.CancelledError:
                 raise
             except web_exceptions.ConnectionClosedOK:
-                # A normal provider close is expected during ordinary client
-                # handoff. Only the voice-identity takeover path latches the
-                # server-close guard; ordinary clients keep BASE delivery
-                # semantics on the successor session.
                 activation_factory = getattr(
                     self, "_voice_session_activation_factory", None
                 )
                 if (
                     native_send_is_current()
-                    and activation_factory is not None
-                    and getattr(activation_factory, "enforce", True)
+                    and (
+                        activation_factory is None
+                        or getattr(activation_factory, "enforce", True)
+                    )
                 ):
                     self.session_closed_by_server = True
                 return OutputCommit.UNKNOWN
