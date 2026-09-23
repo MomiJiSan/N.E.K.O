@@ -4428,21 +4428,27 @@ class AsrRuntimeMixin:
                 return OutputCommit.NOT_SENT
             try:
                 if isinstance(session_ref, _core_facade.OmniRealtimeClient):
-                    written = await stream_audio(
-                        pcm16,
-                        captured_at=captured_at,
-                        raise_on_error=require_output_commit,
-                    )
+                    if require_output_commit:
+                        written = await stream_audio(
+                            pcm16,
+                            captured_at=captured_at,
+                            raise_on_error=True,
+                            require_output_commit=True,
+                        )
+                    else:
+                        await stream_audio(
+                            pcm16,
+                            captured_at=captured_at,
+                        )
+                        written = None
                 else:
-                    written = await stream_audio(pcm16)
-                if written is False:
+                    await stream_audio(pcm16)
+                    written = None
+                if require_output_commit and written is False:
                     return OutputCommit.NOT_SENT
                 if not native_send_is_current():
                     return OutputCommit.UNKNOWN
-                if (
-                    isinstance(session_ref, _core_facade.OmniRealtimeClient)
-                    and written is None
-                ):
+                if require_output_commit and written is None:
                     return OutputCommit.LOCAL_ACCEPTED
                 self._record_omni_microphone_audio(len(pcm16))
                 return OutputCommit.TRANSPORT_WRITTEN
