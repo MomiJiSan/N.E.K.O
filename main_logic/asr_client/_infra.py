@@ -798,6 +798,11 @@ class _RealtimeAsrSessionImpl:
             self._closing_event.set()
             self._state = _SessionState.CLOSING
             self._generation += 1
+            if self._request_queue is not None:
+                # close() cancels input; result-preserving finish drains first
+                # and calls close afterwards. Do not spend recovery's retirement
+                # budget waiting for a provider finish acknowledgement here.
+                connection_registry(self._request_queue).start_all()
             if self._finish_future is not None and not self._finish_future.done():
                 self._finish_future.set_exception(
                     RuntimeError("ASR_SESSION_NOT_READY: finish was cancelled by close")

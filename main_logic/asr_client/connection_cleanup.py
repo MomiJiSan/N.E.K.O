@@ -157,9 +157,14 @@ class ConnectionRetirementRegistry:
         if self.sealed or self.failure is not None:
             self.connections.append(owner)
             owner.start()
-            raise ConnectionRetirementError(
+            error = ConnectionRetirementError(
                 "ASR connection arrived after retirement began"
             )
+            # A worker may translate this exception into a protocol error and
+            # return normally. Preserve failed ownership independently of that
+            # callback; an earlier retirement snapshot cannot prove this socket.
+            self.record_failure(error)
+            raise error
         self.tasks = {task for task in self.tasks if not task.done()}
         if not self.tasks:
             self.connections = [

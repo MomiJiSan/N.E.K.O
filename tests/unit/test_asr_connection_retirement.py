@@ -150,3 +150,48 @@ async def test_internal_clear_waits_for_forced_socket_retirement(
             await session.close()
         assert all(client.state.name == "CLOSED" for client in clients)
         assert session._worker_task.done()
+
+
+@pytest.mark.asyncio
+async def test_qwen_close_does_not_wait_for_unresponsive_finish(monkeypatch):
+    """Fault retirement fits the runtime's two-second candidate cleanup budget."""
+    peer_closed = asyncio.Event()
+    clients = []
+
+    async def peer(socket):
+        try:
+            async for raw in socket:
+                event = json.loads(raw)
+                if event["type"] == "session.update":
+                    await socket.send(json.dumps({"type": "session.updated"}))
+                # This provider deliberately never acknowledges session.finish.
+        finally:
+            peer_closed.set()
+
+    real_connect = websockets.connect
+    async with websockets.serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+
+        async def connect(_url, **kwargs):
+            client = await real_connect(f"ws://127.0.0.1:{port}", **kwargs)
+            clients.append(client)
+            return client
+
+        monkeypatch.setattr(qwen.websockets, "connect", connect)
+        session = _RealtimeAsrSessionImpl(
+            worker_fn=qwen.qwen_asr_worker,
+            api_key="test-key",
+            config=AsrSessionConfig(endpointing_mode="provider"),
+            on_input_transcript=AsyncMock(),
+            on_connection_error=AsyncMock(),
+        )
+        try:
+            await session.connect()
+            await asyncio.wait_for(session.close(), timeout=2)
+            await asyncio.wait_for(peer_closed.wait(), timeout=0.2)
+            assert clients[0].state.name == "CLOSED"
+            assert session._worker_task.done()
+            assert session._response_task.done()
+            assert session._callback_task.done()
+        finally:
+            await session.close()
