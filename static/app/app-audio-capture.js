@@ -2110,7 +2110,7 @@
             const baseAudioConstraints = {
                 noiseSuppression: false,
                 echoCancellation: true,
-                autoGainControl: true,
+                autoGainControl: false,
                 channelCount: 1
             };
 
@@ -2146,12 +2146,18 @@
             // 检查音频轨道状态
             const audioTracks = ownStream.getAudioTracks();
             console.log(window.t('console.audioTrackCount'), audioTracks.length);
-            console.log(window.t('console.audioTrackStatus'), audioTracks.map(track => ({
-                label: track.label,
-                enabled: track.enabled,
-                muted: track.muted,
-                readyState: track.readyState
-            })));
+            console.log(window.t('console.audioTrackStatus'), audioTracks.map(track => {
+                const settings = typeof track.getSettings === 'function'
+                    ? track.getSettings()
+                    : {};
+                return {
+                    label: track.label,
+                    enabled: track.enabled,
+                    muted: track.muted,
+                    readyState: track.readyState,
+                    autoGainControl: settings.autoGainControl
+                };
+            }));
 
             if (audioTracks.length === 0) {
                 console.error(window.t('console.noAudioTrackAvailable'));
