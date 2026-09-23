@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import logging
+import socket
 import time
 import uuid
 from collections import deque
@@ -128,6 +130,29 @@ def _qwen_language_code(language: str) -> str | None:
 
 def _qwen_is_auth_rejection(exc: BaseException) -> bool:
     return is_auth_rejection(exc)
+
+
+def _qwen_setup_error_code(exc: BaseException) -> str:
+    """Only typed transient setup failures authorize another connection."""
+    if _qwen_is_auth_rejection(exc):
+        return "ASR_CREDENTIALS_REJECTED"
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    if status is not None:
+        if isinstance(status, int) and (status == 429 or 500 <= status <= 599):
+            return "ASR_QWEN_CONNECTION_FAILED"
+        return "ASR_QWEN_SETUP_FAILED"
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror)):
+        return "ASR_QWEN_CONNECTION_FAILED"
+    if isinstance(exc, OSError) and exc.errno in {
+        errno.ENETUNREACH, errno.ENETDOWN, errno.ENETRESET,
+        errno.EHOSTUNREACH, errno.ECONNREFUSED, errno.ECONNRESET,
+        errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE,
+    }:
+        return "ASR_QWEN_CONNECTION_FAILED"
+    return "ASR_QWEN_SETUP_FAILED"
 
 
 def _qwen_session_update(
@@ -741,17 +766,14 @@ async def qwen_asr_worker(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                code = _qwen_setup_error_code(exc)
                 await _emit_qwen_error_once(
                     response_queue,
                     state,
-                    (
-                        "ASR_CREDENTIALS_REJECTED"
-                        if _qwen_is_auth_rejection(exc)
-                        else "ASR_QWEN_CONNECTION_FAILED"
-                    ),
+                    code,
                     (
                         "Qwen ASR credentials were rejected"
-                        if _qwen_is_auth_rejection(exc)
+                        if code == "ASR_CREDENTIALS_REJECTED"
                         else "Qwen ASR connection or session setup failed"
                     ),
                 )
