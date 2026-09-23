@@ -5200,10 +5200,17 @@ class AsrRuntimeMixin:
         return True
 
     async def _handle_core_asr_turn_abandoned(self, token: VoiceTurnToken) -> None:
-        self._voice_input_registry.invalidate_utterance(
-            token,
-            reason="asr_turn_abandoned",
-        )
+        try:
+            await self._send_core_asr_preview_clear(
+                f"asr-{token.ingress.session_epoch}-{token.turn_id}"
+            )
+        finally:
+            # The token, rather than current preview ownership, owns the pause.
+            # Even cancellation during notification must release that old debt.
+            self._voice_input_registry.invalidate_utterance(
+                token,
+                reason="asr_turn_abandoned",
+            )
         await self._voice_input_registry.wait_idle()
 
     def _independent_asr_user_turn_active(self) -> bool:
@@ -5254,7 +5261,7 @@ class AsrRuntimeMixin:
     async def _dispatch_voice_input_final(
         self,
         event: VoiceTranscriptEvent,
-    ) -> None:
+    ) -> bool:
         result = await self._voice_input_registry.dispatch_final(event)
         if result is VoiceInputDispatchResult.CALLBACK_FAILED:
             await self._send_core_asr_status(
@@ -5271,6 +5278,7 @@ class AsrRuntimeMixin:
                 event.turn_token.ingress.session_epoch,
                 event.turn_token.turn_id,
             )
+        return result is VoiceInputDispatchResult.DELIVERED
 
     async def _cancel_core_chat_voice_turn(
         self,
@@ -5449,7 +5457,7 @@ class AsrRuntimeMixin:
         *,
         session_ref: object | None = None,
         source_game_route_identity: tuple[str, str, str] | None = None,
-    ) -> None:
+    ) -> bool | None:
         token = event.turn_token.ingress
         external_turn_id = f"asr-{token.session_epoch}-{event.turn_token.turn_id}"
         logger.info(
@@ -5789,6 +5797,8 @@ class AsrRuntimeMixin:
                         "code": "ASR_MULTIMODAL_TURN_FAILED",
                         "details": {"stage": "offline_vlm_handoff"},
                     }))
+                return bool(delivered)
+            return True
         finally:
             self._abandon_core_voice_turn(
                 external_turn_id,
@@ -6002,6 +6012,32 @@ class AsrRuntimeMixin:
             ),
         )
 
+    def _asr_recovery_notice_is_current(self, event) -> bool:
+        """Recovery notices retain their captured lease, including after failure."""
+        return event.recovery_id is None or (
+            event.lease_generation is not None
+            and event.lease_generation == self._voice_lease_generation
+            and event.route_generation is not None
+            and event.route_generation == self._capture_ingress_token().route_generation
+            and self._voice_lease_owner == "core"
+            and not self._voice_lease_hard_muted
+        )
+
+    @staticmethod
+    def _asr_recovery_notice_details(event) -> dict:
+        if event.recovery_id is None:
+            return {}
+        return {
+            "recovery_id": event.recovery_id,
+            "lease_generation": event.lease_generation,
+            "route_generation": event.route_generation,
+            "session_epoch": (
+                event.recovery_session_epoch
+                if event.recovery_session_epoch is not None else event.session_epoch
+            ),
+            "buffering": event.buffering,
+        }
+
     async def _send_core_asr_status(self, event: AsrStatusEvent) -> None:
         source_identity = self._capture_core_asr_operation_identity()
         async with self._asr_notification_lock:
@@ -6010,6 +6046,8 @@ class AsrRuntimeMixin:
                 or event.session_epoch
                 != self._core_asr_identity_ingress_token(source_identity).session_epoch
             ):
+                return
+            if not self._asr_recovery_notice_is_current(event):
                 return
             delivery_failure = event.code in {
                 "ASR_INPUT_DELIVERY_FAILED", "ASR_INPUT_DELIVERY_UNCERTAIN",
@@ -6025,10 +6063,14 @@ class AsrRuntimeMixin:
                         "details": {
                             "provider": event.provider,
                             "session_epoch": event.session_epoch,
+                            **self._asr_recovery_notice_details(event),
                         },
                     }
                 ),
-                still_current=lambda: self._core_asr_operation_identity_matches(source_identity),
+                still_current=lambda: (
+                    self._core_asr_operation_identity_matches(source_identity)
+                    and self._asr_recovery_notice_is_current(event)
+                ),
             )
             if (delivery_failure and any(delivered)
                     and self._core_asr_operation_identity_matches(source_identity)):
@@ -6111,6 +6153,8 @@ class AsrRuntimeMixin:
                 != self._core_asr_identity_ingress_token(source_identity).session_epoch
             ):
                 return
+            if not self._asr_recovery_notice_is_current(event):
+                return
             await self._send_voice_control_status(
                 json.dumps(
                     {
@@ -6120,8 +6164,13 @@ class AsrRuntimeMixin:
                             "state": event.state,
                             "route_mode": self._asr_route_mode,
                             "session_epoch": event.session_epoch,
+                            **self._asr_recovery_notice_details(event),
                         },
                     }
+                ),
+                still_current=lambda: (
+                    self._core_asr_operation_identity_matches(source_identity)
+                    and self._asr_recovery_notice_is_current(event)
                 ),
             )
 

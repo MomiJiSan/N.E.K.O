@@ -65,6 +65,7 @@ from .lifecycle import (
     VoiceTransportToken,
 )
 from .provider_policy import resolve_provider_policy
+from .recovery import FailureSource, RecoveryBudget, RecoveryDisposition, classify_failure
 from .speaker_shadow.contracts import (
     SpeakerShadowCandidateKey,
     SpeakerShadowObserver,
@@ -125,7 +126,7 @@ class AsrRuntimeCallbacks:
     display_name: Callable[[], str]
     on_prepare_turn: Callable[[VoiceTurnToken], Awaitable[bool]]
     on_partial: Callable[[VoicePartialEvent], Awaitable[None]]
-    on_final: Callable[[VoiceTranscriptEvent], Awaitable[None]]
+    on_final: Callable[[VoiceTranscriptEvent], Awaitable[bool | None]]
     on_turn_abandoned: Callable[[VoiceTurnToken], Awaitable[None]]
     on_failure: Callable[[AsrFailureEvent], Awaitable[None]]
     on_status: Callable[[AsrStatusEvent], Awaitable[None]]
@@ -172,6 +173,24 @@ class _AsrConnectOperation:
     original_identity: _AsrRuntimeIdentity | None = None
     adopted_identity: _AsrRuntimeIdentity | None = None
     request_identity: _AsrRuntimeIdentity | None = None
+    recovery: _AsrRecoveryOperation | None = None
+
+
+@dataclass(slots=True)
+class _AsrRecoveryOperation:
+    sequence: int
+    identity: _AsrRuntimeIdentity
+    ingress: VoiceIngressToken
+    old_session: Any
+    deadline: float
+    failure_code: str
+    quiet: asyncio.Event
+    input_ready: asyncio.Event
+    task: asyncio.Task[None] | None = None
+    connect_allowed: bool = False
+    completed: bool = False
+    failed: bool = False
+    abandoned: VoiceTurnToken | None = None
 
 
 class IndependentAsrRuntime:
@@ -412,6 +431,11 @@ class IndependentAsrRuntime:
             return
 
     def _begin_asr_start_operation(self) -> int:
+        recovery = getattr(self, "_asr_recovery", None)
+        self._asr_recovery = None
+        if recovery is not None and recovery.task is not None:
+            if recovery.task is not asyncio.current_task():
+                recovery.task.cancel()
         self._asr_start_generation += 1
         return self._asr_start_generation
 
@@ -596,6 +620,10 @@ class IndependentAsrRuntime:
         return self._asr_transcript_dispatcher.has_pending_delivery
 
     def _init_asr_runtime_state(self) -> None:
+        self._asr_recovery: _AsrRecoveryOperation | None = None
+        self._asr_recovery_sequence = 0
+        self._asr_recovery_budget = RecoveryBudget()
+        self._asr_recovery_failure_notice: _AsrRecoveryOperation | None = None
         self._asr_admission_evidence = {}
         self._asr_candidate_evidence = None
         self._asr_held_preview = None
@@ -969,6 +997,11 @@ class IndependentAsrRuntime:
             stale_metrics = getattr(envelope.lifecycle_ref, "metrics", None)
             if stale_metrics is not None:
                 stale_metrics.detector_stale_event_count += 1
+            return
+        recovery = self._asr_recovery
+        if recovery is not None and (recovery.failed or not recovery.input_ready.is_set()):
+            if getattr(detector, "recovery_boundary_ready", False):
+                recovery.quiet.set()
             return
         assert detector is not None
         assert lifecycle is not None
@@ -1558,6 +1591,15 @@ class IndependentAsrRuntime:
         lifecycle = self._asr_lifecycle
         if lifecycle is None or not self._ingress_token_matches(token):
             return
+        recovery = self._asr_recovery
+        if recovery is not None:
+            await self._emit_recovery_status(recovery, "ASR_TURN_INCOMPLETE")
+            if self._recovery_is_current(recovery):
+                await self._handle_independent_asr_error(
+                    token.session_epoch, self._asr_provider or "unknown",
+                    status_code="ASR_INGRESS_BACKPRESSURE", allow_recovery=False,
+                )
+            return
         epoch = self._asr_session_epoch
         detector = self._asr_detector
         provider = self._asr_provider or "unknown"
@@ -1787,6 +1829,8 @@ class IndependentAsrRuntime:
         # must target this start instead of re-awaiting that retired teardown.
         self._asr_runtime_close_task = None
         operation_generation = self._begin_asr_start_operation()
+        self._asr_recovery_budget = RecoveryBudget()
+        self._asr_recovery_failure_notice = None
         cleanup = self._detach_independent_asr(
             operation_generation=operation_generation,
         )
@@ -1922,7 +1966,12 @@ class IndependentAsrRuntime:
             async def on_error(_message: str) -> None:
                 if not is_adopted_candidate():
                     return
-                await self._handle_independent_asr_error(epoch, candidate_provider)
+                await self._handle_independent_asr_error(
+                    epoch, candidate_provider,
+                    status_code=getattr(candidate_session, "last_failure_code", None)
+                    or _message.partition(":")[0],
+                    failure_source=FailureSource.PROVIDER,
+                )
 
             async def on_status(_message: str) -> None:
                 # Provider status strings are intentionally not forwarded verbatim.
@@ -2832,6 +2881,9 @@ class IndependentAsrRuntime:
         if not self._ingress_token_matches(ingress_token):
             return AsrSubmitResult(AsrSubmitStatus.STALE)
         self._asr_current_ingress_token = ingress_token
+        recovery = self._asr_recovery
+        if recovery is not None and (recovery.failed or not recovery.input_ready.is_set()):
+            return await self._observe_recovery_input(recovery, frame, ingress_token)
         lifecycle = self._asr_lifecycle
         identity = self._capture_runtime_identity(ingress_token=ingress_token)
         if preserve_prefix is not None:
@@ -3306,6 +3358,10 @@ class IndependentAsrRuntime:
     ) -> asyncio.Task[None]:
         if max_attempts is not None and max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
+        recovery = self._asr_recovery
+        if recovery is not None and (recovery.failed or not recovery.connect_allowed):
+            assert recovery.task is not None
+            return recovery.task
         task = self._asr_transport_task
         if task is not None and not task.done():
             operation = getattr(self, "_asr_connect_operation", None)
@@ -3329,7 +3385,11 @@ class IndependentAsrRuntime:
             deadline=time.monotonic() + attempts * _READY_TIMEOUT_SECONDS + backoff,
             max_attempts=attempts,
             request_identity=self._capture_runtime_identity(),
+            recovery=recovery,
         )
+        if recovery is not None:
+            operation.deadline = min(operation.deadline, recovery.deadline)
+            operation.max_attempts = min(operation.max_attempts, 2)
         task = asyncio.create_task(
             self._run_transport_connect_operation(operation),
             name="independent-asr-transport-restart",
@@ -3559,6 +3619,12 @@ class IndependentAsrRuntime:
                     return
                 if time.monotonic() >= operation.deadline:
                     break
+                if operation.recovery is not None and (
+                    operation.recovery.failed
+                    or not self._recovery_is_current(operation.recovery)
+                    or not self._asr_recovery_budget.claim_attempt(time.monotonic())
+                ):
+                    break
                 if lifecycle.snapshot.state is VoiceLifecycleState.BACKOFF:
                     lifecycle.transition(VoiceLifecycleEvent.RETRY)
                     lifecycle.metrics.reconnect_count += 1
@@ -3577,7 +3643,9 @@ class IndependentAsrRuntime:
                     connect_started_at = time.monotonic()
                     candidate = factory(selection)
                     await self._connect_candidate(candidate, operation)
-                    if not self._runtime_identity_matches(identity):
+                    if not self._runtime_identity_matches(identity) or (
+                        operation.recovery is not None and operation.recovery.failed
+                    ):
                         try:
                             await self._close_connect_candidate(candidate)
                         except Exception:
@@ -3688,6 +3756,7 @@ class IndependentAsrRuntime:
                             expected_identity=adopted_identity,
                         )
                         return
+                    failure_code = getattr(candidate, "last_failure_code", None)
                     if candidate is not None:
                         try:
                             cleaned = await self._close_connect_candidate(candidate)
@@ -3698,6 +3767,10 @@ class IndependentAsrRuntime:
                             getattr(self, "_asr_connect_cleanup_tasks", ())
                         ):
                             break
+                    if operation.recovery is not None and classify_failure(
+                        failure_code or "ASR_INDEPENDENT_FAILED", source=FailureSource.CONNECT,
+                    ) is not RecoveryDisposition.RETRY_CONNECT:
+                        break
                     if not self._runtime_identity_matches(identity):
                         return
                     if lifecycle.snapshot.state is VoiceLifecycleState.PREWARMING:
@@ -3729,7 +3802,7 @@ class IndependentAsrRuntime:
             await self._handle_independent_asr_error(
                 identity.session_epoch,
                 identity.provider or "unknown",
-                status_code="ASR_INDEPENDENT_FAILED",
+                status_code="ASR_RECOVERY_EXHAUSTED" if operation.recovery is not None else "ASR_INDEPENDENT_FAILED",
                 expected_identity=identity,
             )
 
@@ -4010,6 +4083,10 @@ class IndependentAsrRuntime:
                     epoch,
                     self._asr_provider or "unknown",
                     status_code="ASR_PROVIDER_FINAL_TIMEOUT",
+                    expected_identity=self._capture_runtime_identity(
+                        ingress_token=sealed_token.turn.ingress,
+                        turn_token=sealed_token.turn,
+                    ),
                 )
             except asyncio.CancelledError:
                 return
@@ -4060,6 +4137,11 @@ class IndependentAsrRuntime:
         # 同上：onset 是收到这个语音活动事件的时刻。
         detected_at = time.monotonic()
         if epoch != self._asr_session_epoch:
+            return
+        recovery = self._asr_recovery
+        if recovery is not None and (recovery.failed or not recovery.input_ready.is_set()):
+            if getattr(self._asr_detector, "recovery_boundary_ready", False):
+                recovery.quiet.set()
             return
         if getattr(self._asr_detector, "admission_enabled", False) and event in {
             SpeechActivityEvent.SPEECH_STARTED, SpeechActivityEvent.SPEECH_RESUMED,
@@ -4901,6 +4983,14 @@ class IndependentAsrRuntime:
                         ingress_token=sealed_token.turn.ingress,
                         turn_token=sealed_token.turn,
                     )
+                    # Acceptance and queue ownership are one synchronous commit.
+                    # Recovery's wait_idle must never miss an accepted reservation
+                    # suspended at SmartTurn lease.release().
+                    try:
+                        transcript_dispatcher.submit(envelope)
+                    except RuntimeError:
+                        ordering_failure_identity = final_identity
+                    envelope = None
 
         if ordering_failure_identity is not None:
             await self._handle_independent_asr_error(
@@ -4941,26 +5031,11 @@ class IndependentAsrRuntime:
                     self.display_name,
                 )
             if not self._runtime_identity_matches(final_identity):
-                transcript_dispatcher.release(final_key)
-                # The accepted final can no longer be delivered, so release
-                # the Core-side pause keyed to this turn.
-                await self._notify_asr_turn_abandoned(accepted_turn_token)
+                # The accepted queue already owns this turn's settlement.
+                # A transport retirement must not revoke its Core delivery.
                 return
         elif not self._runtime_identity_matches(final_identity):
-            transcript_dispatcher.release(final_key)
-            await self._notify_asr_turn_abandoned(accepted_turn_token)
             return
-        if envelope is not None:
-            try:
-                transcript_dispatcher.submit(envelope)
-            except RuntimeError:
-                await self._handle_independent_asr_error(
-                    final_identity.session_epoch,
-                    final_identity.provider or provider,
-                    status_code="ASR_AUDIO_ORDERING_FAILED",
-                    expected_identity=final_identity,
-                )
-                return
         delivered = await self._send_asr_lifecycle_state(
             VoiceLifecycleState.WARM_IDLE,
             provider=provider,
@@ -5139,7 +5214,7 @@ class IndependentAsrRuntime:
             logger.info("[voice-admission] turn_id=%s decision=reject reason=%s",
                         envelope.turn_token.turn_id, admission.reason)
         try:
-            await self._callbacks.on_final(
+            accepted = await self._callbacks.on_final(
                 VoiceTranscriptEvent(
                     turn_token=envelope.turn_token,
                     provider=envelope.provider,
@@ -5147,6 +5222,10 @@ class IndependentAsrRuntime:
                     evidence=envelope.evidence,
                 )
             )
+            if (accepted is True and not rejected and envelope.text.strip()
+                    and self._asr_recovery is None
+                    and self._ingress_token_matches(ingress_token)):
+                self._asr_recovery_budget.mark_completed_turn()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -5164,6 +5243,8 @@ class IndependentAsrRuntime:
         *,
         status_code: str = "ASR_INDEPENDENT_FAILED",
         expected_identity: _AsrRuntimeIdentity | None = None,
+        failure_source: FailureSource = FailureSource.RUNTIME,
+        allow_recovery: bool = True,
     ) -> None:
         if epoch != self._asr_session_epoch or (
             expected_identity is not None
@@ -5185,6 +5266,23 @@ class IndependentAsrRuntime:
             # callbacks and dispatcher failures share this ownership-checked
             # decision before teardown destroys the actual write evidence.
             status_code = delivery_code
+        if allow_recovery and classify_failure(
+            status_code, source=failure_source,
+        ) is RecoveryDisposition.RECOVER:
+            if await self._begin_asr_recovery(epoch, provider, status_code, expected_identity, failure_source):
+                return
+        recovery = self._asr_recovery
+        if recovery is not None:
+            if self._recovery_is_current(recovery):
+                if not recovery.failed:
+                    self._stop_recovery_input(recovery)
+                    await self._emit_recovery_status(recovery, "ASR_RECOVERY_FAILED")
+                if not self._recovery_is_current(recovery):
+                    return
+                self._asr_recovery_failure_notice = recovery
+            self._asr_recovery = None
+            if recovery.task is not None and recovery.task is not asyncio.current_task():
+                recovery.task.cancel()
         # The provider callback that reported failure must not be allowed to
         # deliver a queued final into the surviving Omni session.
         self._asr_session_epoch += 1
@@ -5288,6 +5386,278 @@ class IndependentAsrRuntime:
                 self.display_name,
             )
 
+    def _recovery_is_current(self, operation: _AsrRecoveryOperation) -> bool:
+        identity = operation.identity
+        return bool(
+            self._asr_recovery is operation
+            and identity.start_generation == self._asr_start_generation
+            and identity.session_epoch == self._asr_session_epoch
+            and identity.audio_generation == self._asr_audio_generation
+            and self._asr_lifecycle is identity.lifecycle
+            and self._asr_detector is identity.detector
+            and self._asr_session_factory is identity.session_factory
+            and self._asr_current_ingress_token == operation.ingress
+            and self._ingress_token_matches(operation.ingress)
+        )
+
+    async def _emit_recovery_status(self, operation: _AsrRecoveryOperation, code: str) -> None:
+        if not self._recovery_is_current(operation):
+            return
+        event = AsrStatusEvent(
+            code=code, provider=operation.identity.provider or "unknown",
+            session_epoch=operation.identity.session_epoch,
+            recovery_id=operation.sequence,
+            recovery_session_epoch=operation.ingress.session_epoch,
+            lease_generation=operation.ingress.lease_generation,
+            route_generation=operation.ingress.route_generation,
+            buffering=True,
+        )
+        logger.info("[asr-recovery] recovery_id=%s session_epoch=%s failure_code=%s "
+                    "status=%s attempt=%s",
+                    operation.sequence, operation.ingress.session_epoch,
+                    operation.failure_code, code, self._asr_recovery_budget.attempts_used)
+        try:
+            async with asyncio.timeout(1.0):
+                await self._callbacks.on_status(event)
+        except Exception:
+            logger.warning("[asr-recovery] recovery_id=%s status_delivery_failed=true", operation.sequence)
+
+    def _stop_recovery_input(self, operation: _AsrRecoveryOperation) -> None:
+        operation.failed = True
+        operation.connect_allowed = False
+        self._asr_audio_dispatcher.abort()
+        connect = getattr(self, "_asr_connect_operation", None)
+        if connect is not None and connect.recovery is operation:
+            if connect.task is not None and connect.task is not asyncio.current_task():
+                connect.task.cancel()
+
+    async def _begin_asr_recovery(
+        self, epoch: int, provider: str, code: str,
+        expected_identity: _AsrRuntimeIdentity | None,
+        source: FailureSource,
+    ) -> bool:
+        boundary = time.monotonic()
+        failure_started = getattr(self._asr_session, "failure_started_at", None)
+        if source is FailureSource.PROVIDER and isinstance(failure_started, (float, int)):
+            boundary = min(boundary, failure_started)
+        deadline = boundary + self._asr_recovery_budget.total_seconds
+        try:
+            async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                return await self._claim_asr_recovery(
+                    epoch, provider, code, expected_identity, source, deadline,
+                )
+        except TimeoutError:
+            return False
+
+    async def _claim_asr_recovery(
+        self, epoch: int, provider: str, code: str,
+        expected_identity: _AsrRuntimeIdentity | None,
+        source: FailureSource, deadline: float,
+    ) -> bool:
+        async with self._asr_final_lock:
+            if epoch != self._asr_session_epoch or (
+                expected_identity is not None and not self._runtime_identity_matches(expected_identity)
+            ):
+                return True
+            if source is FailureSource.RUNTIME and code == "ASR_PROVIDER_FINAL_TIMEOUT" and (
+                self._asr_lifecycle is None
+                or self._asr_lifecycle.snapshot.state is not VoiceLifecycleState.DRAINING
+                or self._asr_sealed_turn_token is None
+            ):
+                return True  # The accepted final won the same settlement lock.
+            if self._asr_recovery is not None:
+                # A new adopted transport failing before READY is a failed
+                # replacement, never permission to start another retry budget.
+                return False
+            ingress = self._asr_current_ingress_token
+            lifecycle = self._asr_lifecycle
+            if (ingress is None or not self._ingress_token_matches(ingress)
+                    or lifecycle is None or self._asr_detector is None
+                    or self._asr_session_factory is None
+                    or lifecycle.snapshot.state in {VoiceLifecycleState.BLOCKED, VoiceLifecycleState.SUSPENDED}):
+                return False
+            self._asr_recovery_sequence += 1
+            operation = _AsrRecoveryOperation(
+                sequence=self._asr_recovery_sequence,
+                identity=self._capture_runtime_identity(ingress_token=ingress),
+                ingress=ingress, old_session=self._asr_session,
+                deadline=deadline,
+                failure_code=code, quiet=asyncio.Event(), input_ready=asyncio.Event(),
+            )
+            self._asr_recovery_budget.begin(deadline - self._asr_recovery_budget.total_seconds)
+            self._asr_recovery = operation
+            logger.info("[asr-recovery] recovery_id=%s failure_code=%s failure_stage=%s "
+                        "endpoint_received=%s uploaded_audio_ms=%s pending_audio_bytes=%s",
+                        operation.sequence, code, source.value,
+                        self._asr_sealed_turn_token is not None,
+                        getattr(operation.old_session, "provider_wire_audio_ms", 0),
+                        lifecycle.pending_connect_bytes)
+            # A connection callback can no longer adopt its old final. The
+            # accepted final queue keeps its ingress identity until drained.
+            self._asr_session = None
+            self._asr_audio_dispatcher.abort()
+            self._asr_detector_dispatcher.invalidate_all()
+            for name in ("_asr_transport_task", "_asr_final_watchdog_task", "_asr_warm_expiry_task"):
+                task = getattr(self, name, None)
+                setattr(self, name, None)
+                if task is not None and task is not asyncio.current_task():
+                    task.cancel()
+            if getattr(self._asr_detector, "recovery_boundary_ready", False):
+                operation.quiet.set()
+            operation.task = asyncio.create_task(
+                self._run_asr_recovery(operation), name="independent-asr-fault-recovery",
+            )
+            operation.task.add_done_callback(self._log_asr_background_task_failure)
+            return True
+
+    async def _observe_recovery_input(
+        self, operation: _AsrRecoveryOperation, frame: ProcessedVoiceFrame,
+        ingress: VoiceIngressToken,
+    ) -> AsrSubmitResult:
+        if not self._recovery_is_current(operation) or ingress != operation.ingress:
+            return AsrSubmitResult(AsrSubmitStatus.STALE)
+        if operation.failed:
+            # Failure was already made visible; never retain or upload frames
+            # racing the frontend's pause while accepted Core delivery finishes.
+            return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+        # Keep local VAD alive to observe the end of the failed sentence. Its
+        # already-uploaded prefix and remaining tail must not become a new turn.
+        if not operation.quiet.is_set():
+            result = await operation.identity.detector.feed(
+                frame.pcm16, speech_probability=frame.speech_probability,
+                rnnoise_available=frame.rnnoise_available,
+                rnnoise_evidence=frame.rnnoise_evidence, ingress_token=ingress,
+            )
+            if not self._recovery_is_current(operation):
+                return AsrSubmitResult(AsrSubmitStatus.STALE)
+            if not result.throttle_available or not result.endpointing_available:
+                await self._handle_independent_asr_error(
+                    ingress.session_epoch, self._asr_provider or "unknown",
+                    status_code="ASR_ENDPOINTING_FAILED", allow_recovery=False,
+                )
+                return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+            if getattr(operation.identity.detector, "recovery_boundary_ready", False):
+                operation.quiet.set()
+            return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+        # Serialize the first fresh frame behind detector reset. The existing
+        # upstream PCM queue remains bounded; no second recovery audio queue.
+        try:
+            async with asyncio.timeout(max(0.0, operation.deadline - time.monotonic())):
+                await operation.input_ready.wait()
+        except TimeoutError:
+            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+        if not self._recovery_is_current(operation):
+            if not (
+                operation.completed and self._asr_recovery is None
+                and self._asr_start_generation == operation.identity.start_generation
+                and self._asr_lifecycle is operation.identity.lifecycle
+                and self._ingress_token_matches(ingress)
+            ):
+                return AsrSubmitResult(AsrSubmitStatus.STALE)
+        return await self.submit(frame, ingress_token=ingress)
+
+    async def _run_asr_recovery(self, operation: _AsrRecoveryOperation) -> None:
+        started = time.monotonic()
+        old_closed = False
+        try:
+            async with asyncio.timeout(max(0.0, operation.deadline - time.monotonic())):
+                await self._emit_recovery_status(operation, "ASR_RECOVERY_STARTED")
+                if not self._recovery_is_current(operation):
+                    return
+                await self._asr_transcript_dispatcher.wait_idle()
+                if not self._recovery_is_current(operation):
+                    return
+                # Final acceptance and recovery retirement share the same lock.
+                # Only an unaccepted reservation may be released here.
+                async with self._asr_final_lock:
+                    if not self._recovery_is_current(operation):
+                        return
+                    reserved = self._asr_reserved_final_key
+                    if reserved is not None:
+                        self._asr_transcript_dispatcher.release(reserved)
+                    operation.abandoned = self._reset_asr_turn_state()
+                    self._asr_current_ingress_token = operation.ingress
+                    operation.identity.lifecycle.invalidate_audio()
+                    operation.identity.lifecycle.invalidate_transport()
+                if operation.abandoned is not None:
+                    await self._notify_asr_turn_abandoned(operation.abandoned)
+                    if not self._recovery_is_current(operation):
+                        return
+                    await self._emit_recovery_status(operation, "ASR_TURN_INCOMPLETE")
+                if not self._recovery_is_current(operation):
+                    return
+                if operation.old_session is not None:
+                    old_closed = await self._close_connect_candidate(operation.old_session)
+                    if not old_closed:
+                        raise RuntimeError("ASR_RECOVERY_RETIRE_FAILED")
+                if not self._recovery_is_current(operation):
+                    return
+                await operation.quiet.wait()
+                if not self._recovery_is_current(operation):
+                    return
+                lease, self._asr_smart_turn_lease = self._asr_smart_turn_lease, None
+                if lease is not None:
+                    await lease.release()
+                    if not self._recovery_is_current(operation):
+                        return
+                await operation.identity.detector.reset()
+                if not self._recovery_is_current(operation):
+                    return
+                operation.identity.lifecycle.transition(VoiceLifecycleEvent.SOFT_WAKE)
+                operation.connect_allowed = True
+                operation.input_ready.set()
+                connect_task = self._ensure_transport_restart_task(max_attempts=2)
+                await asyncio.shield(connect_task)
+                if not self._recovery_is_current(operation):
+                    return
+                if self._asr_session is None or not getattr(self._asr_session, "is_ready", False):
+                    raise RuntimeError("ASR_RECOVERY_NOT_READY")
+                await self._emit_recovery_status(operation, "ASR_RECOVERY_READY")
+                if not self._recovery_is_current(operation):
+                    return
+                logger.info("[asr-recovery] recovery_id=%s attempt=%s elapsed_ms=%s result=ready",
+                            operation.sequence, self._asr_recovery_budget.attempts_used,
+                            int((time.monotonic() - started) * 1000))
+                operation.completed = True
+                self._asr_recovery = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._recovery_is_current(operation):
+                self._stop_recovery_input(operation)
+                await self._emit_recovery_status(operation, "ASR_RECOVERY_FAILED")
+                if not self._recovery_is_current(operation):
+                    return
+                # Recovery has ended at its deadline. An already accepted
+                # Core delivery is a different operation and must keep its
+                # existing lifetime, including its normal failure handling.
+                # Do not extend the recovery or start any replacement worker.
+                if self._asr_transcript_dispatcher.has_pending_delivery:
+                    def finalize_failed_route() -> None:
+                        if self._recovery_is_current(operation):
+                            identity = self._capture_runtime_identity(ingress_token=operation.ingress)
+                            self._schedule_owned_cleanup(
+                                self._handle_independent_asr_error(
+                                    operation.ingress.session_epoch,
+                                    operation.identity.provider or "unknown",
+                                    status_code="ASR_RECOVERY_EXHAUSTED", allow_recovery=False,
+                                    expected_identity=identity,
+                                ), name="asr-recovery-final-delivery-settled",
+                            )
+                    self._asr_transcript_dispatcher.when_idle(finalize_failed_route)
+                    return
+                await self._handle_independent_asr_error(
+                    operation.ingress.session_epoch, operation.identity.provider or "unknown",
+                    status_code="ASR_RECOVERY_EXHAUSTED", allow_recovery=False,
+                )
+        finally:
+            operation.input_ready.set()
+            if not old_closed and operation.old_session is not None:
+                self._schedule_owned_cleanup(
+                    self._close_asr_session(operation.old_session),
+                    name="asr-recovery-retired-transport",
+                )
+
     async def _send_asr_status(
         self,
         code: str,
@@ -5296,6 +5666,8 @@ class IndependentAsrRuntime:
         session_epoch: int,
         expected_identity: _AsrRuntimeIdentity,
     ) -> bool:
+        if code == "ASR_INDEPENDENT_READY" and self._asr_recovery is not None:
+            return self._runtime_identity_matches(expected_identity)
         if (
             session_epoch != expected_identity.session_epoch
             or not self._runtime_identity_matches(expected_identity)
@@ -5330,11 +5702,16 @@ class IndependentAsrRuntime:
         ):
             return False
         try:
+            recovery = self._asr_recovery_failure_notice if state is VoiceLifecycleState.BLOCKED else None
             await self._callbacks.on_lifecycle(
                 AsrLifecycleNotification(
                     state=state.value,
                     provider=provider,
                     session_epoch=session_epoch,
+                    recovery_id=recovery.sequence if recovery else None,
+                    recovery_session_epoch=recovery.ingress.session_epoch if recovery else None,
+                    lease_generation=recovery.ingress.lease_generation if recovery else None,
+                    route_generation=recovery.ingress.route_generation if recovery else None,
                 )
             )
         except Exception:
