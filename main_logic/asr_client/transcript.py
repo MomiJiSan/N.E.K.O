@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from main_logic.voice_turn.admission import SpeechEvidence
+
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -177,6 +179,7 @@ class TranscriptEnvelope:
     turn_token: VoiceTurnToken
     provider: str
     text: str
+    evidence: SpeechEvidence | None = None
 
     @property
     def final_key(self) -> FinalKey:

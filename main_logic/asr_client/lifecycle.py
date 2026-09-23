@@ -529,6 +529,60 @@ class VoiceInputLifecycleController:
 
         self.metrics.add_provider_wire_audio(duration_ms)
 
+    def buffer_admission_audio(self, pcm16: bytes, *, through_sample: int, confirmed: bool, pending_only: bool = False) -> AudioDecision:
+        """Save PCM before async detection; cap only unpromised candidates."""
+        self._admission_audio_end = through_sample
+        if pending_only:
+            if self._pending_turn.byte_count + len(pcm16) > self.config.pending_audio_ms * 32:
+                return AudioDecision(AudioDisposition.BLOCK, backpressure=True)
+            self._pending_turn.append(pcm16)
+            self.metrics.add_local_audio(len(pcm16) // 32)
+            self.metrics.add_suppressed_audio(len(pcm16) // 32)
+            return AudioDecision(AudioDisposition.BUFFER)
+        decision = self.accept_audio(pcm16, sample_rate_hz=16_000)
+        if confirmed or self._prefix_protected or self._pending_turn_speech:
+            return decision
+        capacity = 700 * 32
+        if self._state is VoiceLifecycleState.DRAINING:
+            payload = self._pending_turn.drain()
+            self._pending_turn.append(payload[-capacity:])
+        elif self._state in {VoiceLifecycleState.LOCAL_LISTEN, VoiceLifecycleState.WARM_IDLE,
+                             VoiceLifecycleState.PREWARMING, VoiceLifecycleState.BACKOFF,
+                             VoiceLifecycleState.DEEP_SLEEP}:
+            payload = self._pending_connect.drain() + self._pre_roll.drain()
+            target = self._pending_connect if self._state in {
+                VoiceLifecycleState.PREWARMING, VoiceLifecycleState.BACKOFF,
+            } else self._pre_roll
+            target.append(payload[-capacity:])
+        return decision
+
+    def retain_admitted_candidate(self, *, start_sample: int) -> bool:
+        """Trim rejected predecessors without touching a sealed/active turn.
+
+        Refuse a lagging candidate whose prefix was evicted, rather than
+        silently uploading a sentence with its first word missing.
+        """
+        if self._state is VoiceLifecycleState.ACTIVE or self._pending_turn_speech:
+            return True
+        count = (getattr(self, "_admission_audio_end", 0) - start_sample) * 2
+        if self._state is VoiceLifecycleState.DRAINING:
+            payload = self._pending_turn.peek()
+            if count <= 0 or count > len(payload):
+                return False
+            self._pending_turn.clear()
+            self._pending_turn.append(payload[-count:])
+            return True
+        payload = self._pending_connect.peek() + self._pre_roll.peek()
+        if count <= 0 or count > len(payload):
+            return False
+        self._pending_connect.clear()
+        self._pre_roll.clear()
+        target = self._pending_connect if self._state in {
+            VoiceLifecycleState.PREWARMING, VoiceLifecycleState.BACKOFF,
+        } else self._pre_roll
+        target.append(payload[-count:])
+        return True
+
     def matches(self, identity: VoiceAsyncIdentity) -> bool:
         matches = (
             identity == self.identity

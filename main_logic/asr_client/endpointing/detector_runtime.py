@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from enum import Enum
 from typing import Literal, TypeAlias
 
 from main_logic.voice_turn.activity_evidence import RnnoiseEvidence
+from main_logic.voice_turn.admission import SpeechEvidence
 from main_logic.voice_turn.contracts import (
     EvaluationStatus,
     SpeechActivityEvent,
@@ -36,6 +38,7 @@ from .detector import (
     SmartTurnCompletionFence,
 )
 from .silero_vad import SileroActivityGate, SileroVad
+from .admission_gate import AdmissionActivity, AdmissionActivityGate
 from .smart_turn_audio_evidence import create_smart_turn_audio_evidence_recorder
 from .smart_turn_diagnostics import create_smart_turn_runtime_diagnostics
 from .smart_turn_v3 import SmartTurnV3
@@ -617,7 +620,12 @@ class _VoiceTurnAdapter:
             return
 
         try:
-            events = await asyncio.to_thread(self._gate.feed, item.pcm16)
+            if isinstance(self._gate, AdmissionActivityGate) and item.detector_identity is not None:
+                events = await asyncio.to_thread(
+                    self._gate.feed_at, item.pcm16, item.detector_identity.audio_end_sample,
+                )
+            else:
+                events = await asyncio.to_thread(self._gate.feed, item.pcm16)
         except Exception:
             if self._smart_turn_required:
                 self._vad_degraded = True
@@ -625,7 +633,17 @@ class _VoiceTurnAdapter:
             else:
                 self._report_failure("runtime_error", "vad_feed")
             return
-        for event in events:
+        admitted_events = (
+            self._gate.admission_events
+            if isinstance(self._gate, AdmissionActivityGate) else events
+        )
+        for index, event in enumerate(admitted_events):
+            if isinstance(self._gate, AdmissionActivityGate):
+                # The detector worker owns publication. Capture each window's
+                # immutable evidence before its scoped callback can yield.
+                record = self._gate.admission_records[index]
+                self._gate.event_evidence = record.evidence
+                self._gate.event_audio_start_sample = record.audio_start_sample
             if self._on_activity is not None:
                 await self._on_activity(event)
             if (
@@ -633,6 +651,7 @@ class _VoiceTurnAdapter:
                 and item.detector_identity is not None
             ):
                 await self._on_scoped_activity(event, item.detector_identity)
+        for event in events:
             await self._coordinator.on_activity_event(event)
 
         if any(
@@ -665,6 +684,10 @@ class _VoiceTurnAdapter:
 
     async def _process_without_vad(self, item: _AudioItem) -> None:
         """Keep SmartTurn authoritative when Silero cannot provide candidates."""
+
+        if isinstance(self._gate, AdmissionActivityGate):
+            self._report_failure("unavailable", "vad_admission")
+            return
 
         started_now = False
         if not self._fallback_speech_started:
@@ -1376,6 +1399,9 @@ class DetectorFeedResult:
     throttle_available: bool
     endpointing_available: bool = True
     throttle_action: ThrottleAction | None = None
+    evidence: SpeechEvidence | None = None
+    audio_start_sample: int | None = None
+    admission_records: tuple[AdmissionActivity, ...] = ()
 
 
 class SmartTurnReadiness(Enum):
@@ -1437,20 +1463,26 @@ class DetectorRuntime:
         on_turn_complete: Callable[[], Awaitable[None]] | None = None,
         on_endpointing_failure: Callable[[], Awaitable[None]] | None = None,
         on_event: Callable[[DetectorEvent], Awaitable[None]] | None = None,
+        admission_enabled: bool | None = None,
     ) -> None:
         if not 0.0 <= rnnoise_onset_probability <= 1.0:
             raise ValueError("RNNoise onset probability must be within [0, 1]")
+        if admission_enabled is None:
+            admission_enabled = os.environ.get("NEKO_ASR_ADMISSION", "0") == "1"
         if vad is None:
             config = SmartTurnConfig(enabled=True)
             vad = SileroVad(
                 enabled=True,
                 inference_error_limit=config.inference_error_limit,
             )
-            gate = SileroActivityGate(vad, config)
+            gate = (AdmissionActivityGate if admission_enabled else SileroActivityGate)(vad, config)
         if gate is None:
             raise ValueError("DetectorRuntime gate is required with a custom VAD")
         self._vad = vad
         self._gate = gate
+        self.admission_enabled = isinstance(gate, AdmissionActivityGate)
+        if admission_enabled and not self.admission_enabled:
+            raise ValueError("admission requires an evidence-capable activity gate")
         self._lock = asyncio.Lock()
         self._load_attempted = False
         self._available = True
@@ -1491,6 +1523,7 @@ class DetectorRuntime:
         self._overflow_reset_task: asyncio.Task[None] | None = None
         self._detector_epoch = 0
         self._sequence_no = 0
+        self.submitted_samples = 0
         self._ingress_token: VoiceIngressToken | None = None
         self._candidate_open = False
         self._candidate_generation = 0
@@ -1547,6 +1580,7 @@ class DetectorRuntime:
                     semantic_turn_id=turn_id,
                     successor_candidate_generation=self._candidate_generation + 1,
                     successor_present=successor_present,
+                    admission_confirmed=(not self.admission_enabled or self._gate.had_admission),
                 )
                 self._completion_fences[(generation, buffer_epoch, turn_id)] = fence
                 self._semantic_generation += 1
@@ -1567,6 +1601,9 @@ class DetectorRuntime:
                     (generation, buffer_epoch, turn_id),
                     None,
                 )
+                if fence is not None and not fence.admission_confirmed:
+                    self._deferred_completions.pop(fence.candidate, None)
+                    return
                 if fence is None:
                     self._candidate_open = False
                     self._policy_event_candidate = None
@@ -1613,6 +1650,8 @@ class DetectorRuntime:
                             self._candidate_generation,
                         ),
                         activity=event,
+                        evidence=self.admission_evidence,
+                        audio_start_sample=(self._gate.event_audio_start_sample if self.admission_enabled else None),
                     )
                 )
 
@@ -1628,6 +1667,8 @@ class DetectorRuntime:
                 ):
                     return
                 fence = self._completion_fences.get((generation, buffer_epoch, turn_id))
+                if fence is not None and not fence.admission_confirmed:
+                    return
                 candidate = (
                     fence.candidate
                     if fence is not None
@@ -1659,6 +1700,10 @@ class DetectorRuntime:
     @property
     def smart_turn_readiness(self) -> SmartTurnReadiness:
         return self._smart_turn_readiness
+
+    @property
+    def admission_evidence(self):
+        return self._gate.event_evidence if self.admission_enabled else None
 
     @property
     def detector_epoch(self) -> int:
@@ -2201,7 +2246,7 @@ class DetectorRuntime:
                 candidate_open=candidate_admission_open,
                 allow_baseline_update=allow_baseline_update,
             )
-            if throttle.action is ThrottleAction.SKIP_IDLE_PCM:
+            if throttle.action is ThrottleAction.SKIP_IDLE_PCM and not self.admission_enabled:
                 return DetectorFeedResult(
                     (),
                     True,
@@ -2220,7 +2265,12 @@ class DetectorRuntime:
                         throttle_action=throttle.action,
                     )
             try:
-                events = tuple(await asyncio.to_thread(self._gate.feed, pcm16))
+                if self.admission_enabled:
+                    self.submitted_samples += len(pcm16) // 2
+                    await asyncio.to_thread(self._gate.feed_at, pcm16, self.submitted_samples)
+                    events = self._gate.admission_events
+                else:
+                    events = tuple(await asyncio.to_thread(self._gate.feed, pcm16))
             except Exception:
                 self._available = False
                 return DetectorFeedResult(
@@ -2260,7 +2310,10 @@ class DetectorRuntime:
         return DetectorFeedResult(
             events,
             True,
-            throttle_action=throttle.action,
+            throttle_action=(None if self.admission_enabled else throttle.action),
+            evidence=self.admission_evidence,
+            audio_start_sample=(self._gate.event_audio_start_sample if self.admission_enabled else None),
+            admission_records=(self._gate.admission_records if self.admission_enabled else ()),
         )
 
     def observe_provider_audio(
@@ -2291,7 +2344,7 @@ class DetectorRuntime:
             candidate=candidate,
         )
 
-    async def seal_provider_candidate(self) -> ProviderCandidateFence | None:
+    async def seal_provider_candidate(self, *, preserve_admission: bool = False) -> ProviderCandidateFence | None:
         """Seal local detector activity after a streaming Provider endpoint."""
 
         async with self._lock:
@@ -2306,6 +2359,8 @@ class DetectorRuntime:
                 through_sequence_no=self._sequence_no,
             )
             self._provider_candidate_fence = fence
+            if self.admission_enabled and not preserve_admission:
+                self._gate.seal_admission()
             self._provider_discarded_through_sequence_no = None
             self._candidate_generation += 1
             self._candidate_open = False
@@ -2559,7 +2614,7 @@ class DetectorRuntime:
             candidate_open=self._candidate_open,
             allow_baseline_update=allow_baseline_update,
         )
-        if throttle.action is ThrottleAction.SKIP_IDLE_PCM:
+        if throttle.action is ThrottleAction.SKIP_IDLE_PCM and not self.admission_enabled:
             return DetectorSubmitResult(
                 DetectorSubmitStatus.SKIPPED_QUIET,
                 adapter.throttle_available,
@@ -2574,6 +2629,7 @@ class DetectorRuntime:
             ingress_token=ingress_token,
             detector_epoch=self._detector_epoch,
             sequence_no=next_sequence,
+            audio_end_sample=self.submitted_samples + len(pcm16) // 2,
         )
         try:
             await adapter.push_audio(
@@ -2620,6 +2676,7 @@ class DetectorRuntime:
                 None,
             )
         self._sequence_no = next_sequence
+        self.submitted_samples = identity.audio_end_sample
         candidate = DetectorCandidateKey(
             identity.detector_epoch,
             self._candidate_generation,
@@ -2637,7 +2694,7 @@ class DetectorRuntime:
                     candidate=candidate,
                     kind=(
                         "continuous"
-                        if throttle.action is ThrottleAction.PROCESS_PCM
+                        if throttle.action is ThrottleAction.PROCESS_PCM and not self.admission_enabled
                         else "prewarm"
                     ),
                 )

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from main_logic.voice_turn.admission import AdmissionDecision
+from main_logic.voice_turn.transcript_admission import assess_transcript, TranscriptDisposition
+
 import asyncio
 import time
 from collections import OrderedDict, deque
@@ -593,6 +596,13 @@ class IndependentAsrRuntime:
         return self._asr_transcript_dispatcher.has_pending_delivery
 
     def _init_asr_runtime_state(self) -> None:
+        self._asr_admission_evidence = {}
+        self._asr_candidate_evidence = None
+        self._asr_held_preview = None
+        self._asr_overlap_onset_proof = None
+        self._asr_overlap_completed_proofs = deque()
+        self._asr_pending_admission_evidence = None
+        self._asr_previously_sent_turns = set()
         self._asr_session = None
         self._asr_session_epoch = 0
         self._asr_start_generation = 0
@@ -709,6 +719,10 @@ class IndependentAsrRuntime:
         self._log_asr_background_task_failure(task)
 
     def _ensure_asr_runtime_state(self) -> None:
+        if not hasattr(self, "_asr_admission_evidence"):
+            self._asr_admission_evidence = {}
+            self._asr_candidate_evidence = None
+            self._asr_held_preview = None
         # A number of focused unit tests intentionally construct the manager via
         # __new__. Keep those narrow lifecycle doubles compatible.
         if not hasattr(self, "_asr_session_epoch"):
@@ -1000,6 +1014,8 @@ class IndependentAsrRuntime:
             await self._handle_independent_asr_activity(
                 event.activity,
                 envelope.session_epoch,
+                evidence=event.evidence,
+                audio_start_sample=event.audio_start_sample,
             )
             if not self._detector_envelope_is_current(envelope):
                 return
@@ -1066,6 +1082,9 @@ class IndependentAsrRuntime:
         epoch: int,
     ) -> None:
         """Prepare segmented endpointing and transport without final authority."""
+
+        if getattr(detector, "admission_enabled", False) and event.kind == "continuous":
+            return
 
         # 用户开口的时刻是**进这个处理函数**的时刻，不是底下 prewarm / transport
         # gather 跑完的时刻。视觉所有权拿 onset 当下界，晚打点会把整段 prewarm+
@@ -1370,6 +1389,8 @@ class IndependentAsrRuntime:
         buffered_pcm16: bytes | None = None,
     ) -> bool:
         detector = self._asr_detector
+        if getattr(detector, "admission_enabled", False) and not self._asr_turn_prepared:
+            return False
         session_ref = self._asr_session
         if (
             session_ref is None
@@ -2523,6 +2544,14 @@ class IndependentAsrRuntime:
         would ever report the stall.
         """
 
+        self._asr_admission_evidence.clear()
+        self._asr_candidate_evidence = None
+        self._asr_held_preview = None
+        self._asr_overlap_onset_proof = None
+        self._asr_overlap_completed_proofs.clear()
+        self._asr_pending_admission_evidence = None
+        self._asr_previously_sent_turns.clear()
+
         abandoned = self._asr_prepared_turn_token
         self._asr_prepared_turn_token = None
         self._asr_turn_prepared = False
@@ -2854,6 +2883,24 @@ class IndependentAsrRuntime:
         try:
             lifecycle = identity.lifecycle
             detector = identity.detector
+            admission_enabled = bool(getattr(detector, "admission_enabled", False))
+            buffered_before_detection = False
+            pending_only = bool(admission_enabled and lifecycle.has_pending_turn and (
+                self._asr_overlap_completed_turns > 0
+                or self._capture_turn_token(lifecycle) in self._asr_previously_sent_turns
+            ))
+            if admission_enabled and (lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE or pending_only):
+                buffered = lifecycle.buffer_admission_audio(
+                    pcm16, through_sample=detector.submitted_samples + len(pcm16) // 2,
+                    confirmed=self._asr_pending_speech_confirmed,
+                    pending_only=pending_only,
+                )
+                if buffered.disposition is AudioDisposition.BLOCK:
+                    await self._handle_audio_ingress_backpressure(
+                        ingress_token, observed_state=lifecycle.snapshot.state,
+                    )
+                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                buffered_before_detection = True
 
             def ingress_is_current() -> bool:
                 nonlocal identity
@@ -2960,6 +3007,12 @@ class IndependentAsrRuntime:
                         )
                         return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
                     if not submitted.throttle_available:
+                        if admission_enabled:
+                            await self._handle_independent_asr_error(
+                                identity.session_epoch, identity.provider or "unknown",
+                                status_code="ASR_ENDPOINTING_FAILED", expected_identity=identity,
+                            )
+                            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
                         lifecycle.enable_independent_asr_fail_open()
                         if (
                             not submitted.control_event_emitted
@@ -3015,16 +3068,30 @@ class IndependentAsrRuntime:
                             and not lifecycle.prefix_protected):
                         return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
                     if not detector_result.throttle_available:
+                        if admission_enabled:
+                            await self._handle_independent_asr_error(
+                                identity.session_epoch, identity.provider or "unknown",
+                                status_code="ASR_ENDPOINTING_FAILED", expected_identity=identity,
+                            )
+                            return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
                         lifecycle.enable_independent_asr_fail_open()
                     else:
-                        for event in detector_result.events:
+                        records = (
+                            ((record.activity, record.evidence, record.audio_start_sample)
+                             for record in detector_result.admission_records)
+                            if admission_enabled else
+                            ((event, None, None) for event in detector_result.events)
+                        )
+                        for event, evidence, start_sample in records:
                             await self._handle_independent_asr_activity(
                                 event,
                                 identity.session_epoch,
+                                evidence=evidence,
+                                audio_start_sample=start_sample,
                             )
                             if not ingress_is_current():
                                 return AsrSubmitResult(AsrSubmitStatus.STALE)
-                    if (
+                    if not admission_enabled and (
                         not detector_result.throttle_available
                         or not self._voice_input_resource_optimization_enabled
                     ) and not await self._ensure_continuous_provider_wake(
@@ -3036,6 +3103,20 @@ class IndependentAsrRuntime:
                         return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
             if lifecycle is not None and not ingress_is_current():
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
+            if buffered_before_detection:
+                if pending_only:
+                    return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+                if lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE:
+                    token = self._capture_turn_token(lifecycle)
+                    if not self._activate_asr_audio_dispatcher(lifecycle, token):
+                        await self._handle_independent_asr_error(
+                            identity.session_epoch, identity.provider or "unknown",
+                            status_code="ASR_AUDIO_ORDERING_FAILED", expected_identity=identity,
+                        )
+                        return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                elif lifecycle.snapshot.state is VoiceLifecycleState.PREWARMING:
+                    self._ensure_transport_restart_task()
+                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
             suppression = self._asr_candidate_rejection
             if (
                 suppression is not None
@@ -3971,11 +4052,30 @@ class IndependentAsrRuntime:
         self,
         event: SpeechActivityEvent,
         epoch: int,
+        *,
+        evidence=None,
+        audio_start_sample: int | None = None,
+        audio_already_sent: bool = False,
     ) -> None:
         # 同上：onset 是收到这个语音活动事件的时刻。
         detected_at = time.monotonic()
         if epoch != self._asr_session_epoch:
             return
+        if getattr(self._asr_detector, "admission_enabled", False) and event in {
+            SpeechActivityEvent.SPEECH_STARTED, SpeechActivityEvent.SPEECH_RESUMED,
+        }:
+            if evidence is None or evidence.decision is not AdmissionDecision.ADMIT:
+                return
+            lifecycle = self._asr_lifecycle
+            if lifecycle is None or audio_start_sample is None:
+                return
+            if not audio_already_sent and not lifecycle.retain_admitted_candidate(start_sample=audio_start_sample):
+                await self._handle_independent_asr_error(
+                    epoch, self._asr_provider or "unknown", status_code="ASR_INGRESS_BACKPRESSURE",
+                    expected_identity=self._capture_runtime_identity(),
+                )
+                return
+            self._asr_candidate_evidence = evidence
         provider = self._asr_provider or "unknown"
         lifecycle = self._asr_lifecycle
         if (
@@ -3988,6 +4088,7 @@ class IndependentAsrRuntime:
             }
         ):
             lifecycle.mark_pending_turn_speech()
+            self._asr_pending_admission_evidence = evidence
             if self._asr_pending_turn_onset_at is None:
                 self._asr_pending_turn_onset_at = detected_at
             return
@@ -3995,6 +4096,7 @@ class IndependentAsrRuntime:
             lifecycle is not None
             and lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
             and lifecycle.has_pending_turn
+            and not audio_already_sent
             and event
             in {
                 SpeechActivityEvent.SPEECH_STARTED,
@@ -4090,9 +4192,12 @@ class IndependentAsrRuntime:
                 # in WARM_IDLE proves a queued turn exists and redeems it.
                 onset_token = self._asr_overlap_onset_token
                 onset_at = self._asr_overlap_onset_at
+                onset_proof = self._asr_overlap_onset_proof
+                self._asr_overlap_onset_proof = None
                 self._asr_overlap_onset_token = None
                 self._asr_overlap_onset_at = None
                 if onset_token is not None:
+                    self._asr_overlap_completed_proofs.append(onset_proof)
                     # 一张 credit 配一个时刻，按兑付顺序排队。
                     self._asr_overlap_completed_onsets.append(
                         onset_at if onset_at is not None else detected_at
@@ -4107,6 +4212,9 @@ class IndependentAsrRuntime:
                         last = self._asr_overlap_completed_onsets.pop()
                         self._asr_overlap_completed_onsets.clear()
                         self._asr_overlap_completed_onsets.append(last)
+                        last_proof = self._asr_overlap_completed_proofs.pop()
+                        self._asr_overlap_completed_proofs.clear()
+                        self._asr_overlap_completed_proofs.append(last_proof)
                         self._asr_overlap_completed_token = onset_token
                         self._asr_overlap_completed_turns = 1
             return
@@ -4123,6 +4231,7 @@ class IndependentAsrRuntime:
                 # final can replay it instead of dropping the next turn.
                 self._asr_overlap_onset_token = self._asr_current_ingress_token
                 self._asr_overlap_onset_at = detected_at
+                self._asr_overlap_onset_proof = (evidence, audio_start_sample)
             return
         if (
             lifecycle is not None
@@ -4130,9 +4239,9 @@ class IndependentAsrRuntime:
         ):
             return
 
-        await self._prepare_independent_asr_turn(epoch)
+        await self._prepare_independent_asr_turn(epoch, evidence=evidence, audio_already_sent=audio_already_sent)
 
-    async def _prepare_independent_asr_turn(self, epoch: int) -> None:
+    async def _prepare_independent_asr_turn(self, epoch: int, *, evidence=None, audio_already_sent: bool = False) -> None:
         """Prepare an identified turn without deciding its endpoint."""
 
         if epoch != self._asr_session_epoch or self._asr_turn_prepared:
@@ -4146,6 +4255,13 @@ class IndependentAsrRuntime:
             return
         turn_token = self._capture_turn_token(lifecycle)
         final_key = FinalKey.from_turn(turn_token)
+        if getattr(self._asr_detector, "admission_enabled", False):
+            evidence = evidence or self._asr_candidate_evidence
+            if evidence is None or evidence.decision is not AdmissionDecision.ADMIT:
+                return
+            self._asr_admission_evidence[turn_token] = evidence
+            if audio_already_sent:
+                self._asr_previously_sent_turns.add(turn_token)
         transcript_dispatcher = self._asr_transcript_dispatcher
         if not transcript_dispatcher.try_reserve(final_key):
             await self._handle_independent_asr_error(
@@ -4202,9 +4318,12 @@ class IndependentAsrRuntime:
         self._asr_overlap_completed_turns -= 1
         if self._asr_overlap_completed_onsets:
             self._asr_overlap_completed_onsets.popleft()
+        if self._asr_overlap_completed_proofs:
+            self._asr_overlap_completed_proofs.popleft()
         if self._asr_overlap_completed_turns == 0:
             self._asr_overlap_completed_token = None
             self._asr_overlap_completed_onsets.clear()
+            self._asr_overlap_completed_proofs.clear()
 
     async def _handle_independent_asr_endpoint(self, epoch: int) -> None:
         """Seal the current turn immediately at its semantic endpoint."""
@@ -4231,6 +4350,8 @@ class IndependentAsrRuntime:
                 # instead of waking a stale replacement turn.
                 self._asr_overlap_completed_token = None
                 self._asr_overlap_completed_turns = 0
+                self._asr_overlap_completed_proofs.clear()
+                self._asr_overlap_completed_onsets.clear()
                 return
             # A provider endpoint reaching Core in WARM_IDLE means the ordered
             # FIFO holds a turn whose local onset and pause both happened while
@@ -4259,9 +4380,12 @@ class IndependentAsrRuntime:
                 _lent_pending_onset = True
             pending_before = self._asr_pending_speech_confirmed
             credit_consumed = False
+            replay_proof = (self._asr_overlap_completed_proofs[0]
+                            if self._asr_overlap_completed_proofs else None) or (None, None)
             await self._handle_independent_asr_activity(
                 SpeechActivityEvent.SPEECH_RESUMED,
                 epoch,
+                evidence=replay_proof[0], audio_start_sample=replay_proof[1], audio_already_sent=True,
             )
             if (
                 epoch != self._asr_session_epoch
@@ -4412,7 +4536,12 @@ class IndependentAsrRuntime:
                     turn_token=turn_token,
                 )
                 try:
-                    provider_fence = await detector.seal_provider_candidate()
+                    if getattr(detector, "admission_enabled", False):
+                        provider_fence = await detector.seal_provider_candidate(
+                            preserve_admission=turn_token in self._asr_previously_sent_turns,
+                        )
+                    else:
+                        provider_fence = await detector.seal_provider_candidate()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -4467,6 +4596,12 @@ class IndependentAsrRuntime:
 
         if epoch != self._asr_session_epoch:
             return
+        if (getattr(self._asr_detector, "admission_enabled", False)
+                and self._asr_overlap_completed_turns > 0
+                and self._asr_overlap_completed_token == self._asr_current_ingress_token):
+            # Already-uploaded turns own earlier positions in the provider FIFO.
+            # Leave the buffered successor and its proof intact until they settle.
+            return
         lifecycle = self._asr_lifecycle
         if lifecycle is None or not lifecycle.has_pending_turn:
             # has_pending_turn 还要求 pending buffer 里真有音频：speech 先到、或者
@@ -4481,6 +4616,8 @@ class IndependentAsrRuntime:
             self._asr_pending_turn_onset_at = None
             self._asr_pending_detector_candidate = None
             return
+        pending_evidence = self._asr_pending_admission_evidence
+        self._asr_pending_admission_evidence = None
         payload = lifecycle.begin_pending_turn()
         # begin_pending_turn() 内部完成 SPEECH_CONFIRMED 迁移（lifecycle.py），是第
         # 五个迁移点 —— 之前给另外四处补 onset 打点时漏了它，因为守卫只扫本模块的
@@ -4517,7 +4654,7 @@ class IndependentAsrRuntime:
         )
         if not delivered:
             return
-        await self._prepare_independent_asr_turn(epoch)
+        await self._prepare_independent_asr_turn(epoch, evidence=pending_evidence)
         if not self._runtime_identity_matches(identity):
             return
         asr_session = identity.session
@@ -4596,8 +4733,16 @@ class IndependentAsrRuntime:
             )
             self._asr_first_partial_recorded = True
         try:
+            evidence = self._asr_admission_evidence.get(turn_token)
+            preview = VoicePartialEvent(turn_token=turn_token, text=clean, evidence=evidence)
+            verdict = assess_transcript(clean, evidence, is_voice_source=True, final=False)
+            if verdict.disposition is TranscriptDisposition.HOLD:
+                self._asr_held_preview = preview
+                return
+            if self._asr_held_preview is not None and self._asr_held_preview.turn_token == turn_token:
+                self._asr_held_preview = None
             await self._callbacks.on_partial(
-                VoicePartialEvent(turn_token=turn_token, text=clean)
+                preview
             )
         except Exception:
             logger.debug(
@@ -4738,7 +4883,11 @@ class IndependentAsrRuntime:
                         turn_token=sealed_token.turn,
                         provider=provider,
                         text=clean,
+                        evidence=self._asr_admission_evidence.pop(sealed_token.turn, None),
                     )
+                    self._asr_previously_sent_turns.discard(sealed_token.turn)
+                    if self._asr_held_preview is not None and self._asr_held_preview.turn_token == sealed_token.turn:
+                        self._asr_held_preview = None
                     if not clean:
                         lifecycle_ref.metrics.false_wake_count += 1
                     if successor_present and not has_pending_turn:
@@ -4823,6 +4972,7 @@ class IndependentAsrRuntime:
 
         await self._activate_pending_independent_turn(epoch)
         overlap_token = self._asr_overlap_onset_token
+        overlap_proof = self._asr_overlap_onset_proof or (None, None)
         overlap_onset_at = self._asr_overlap_onset_at
         if overlap_token is not None and self._asr_overlap_completed_turns > 0:
             # 单槽 onset 和已兑换成 credit 的旧周期同时存在时，credit 排在前面。
@@ -4839,6 +4989,7 @@ class IndependentAsrRuntime:
         else:
             self._asr_overlap_onset_token = None
             self._asr_overlap_onset_at = None
+            self._asr_overlap_onset_proof = None
         if (
             detector_ref is not None
             and self._asr_lifecycle is lifecycle_ref
@@ -4889,6 +5040,7 @@ class IndependentAsrRuntime:
         await self._handle_independent_asr_activity(
             SpeechActivityEvent.SPEECH_RESUMED,
             epoch,
+            evidence=overlap_proof[0], audio_start_sample=overlap_proof[1], audio_already_sent=True,
         )
         if (
             epoch != self._asr_session_epoch
@@ -4981,12 +5133,18 @@ class IndependentAsrRuntime:
             ingress_token=ingress_token,
             turn_token=envelope.turn_token,
         )
+        admission = assess_transcript(envelope.text, envelope.evidence, is_voice_source=True, final=True)
+        rejected = admission.disposition is TranscriptDisposition.REJECT
+        if rejected:
+            logger.info("[voice-admission] turn_id=%s decision=reject reason=%s",
+                        envelope.turn_token.turn_id, admission.reason)
         try:
             await self._callbacks.on_final(
                 VoiceTranscriptEvent(
                     turn_token=envelope.turn_token,
                     provider=envelope.provider,
-                    text=envelope.text,
+                    text="" if rejected else envelope.text,
+                    evidence=envelope.evidence,
                 )
             )
         except asyncio.CancelledError:

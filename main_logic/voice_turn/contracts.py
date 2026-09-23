@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .admission import SpeechEvidence
+
 from dataclasses import dataclass
 from enum import Enum
 from collections.abc import Awaitable, Callable
@@ -82,6 +84,7 @@ class VoiceTranscriptEvent:
     turn_token: VoiceTurnToken
     provider: str
     text: str
+    evidence: SpeechEvidence | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,7 @@ class VoicePartialEvent:
 
     turn_token: VoiceTurnToken
     text: str
+    evidence: SpeechEvidence | None = None
 
     @property
     def session_epoch(self) -> int:
