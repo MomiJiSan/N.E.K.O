@@ -171,6 +171,7 @@ async def test_qwen_actual_worker_finish_preserves_result_and_resampler_tail(mon
             self.incoming = asyncio.Queue()
             self.messages = []
             self.audio = b""
+            self.closed = False
 
         async def send(self, raw):
             message = json.loads(raw)
@@ -200,6 +201,7 @@ async def test_qwen_actual_worker_finish_preserves_result_and_resampler_tail(mon
             return json.dumps(event)
 
         async def close(self):
+            self.closed = True
             await self.incoming.put(None)
 
     socket = Socket()

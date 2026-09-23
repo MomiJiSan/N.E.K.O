@@ -31,6 +31,7 @@ from typing import Any, TypeAlias
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from ..connection_cleanup import connection_registry
 from ..delivery import (
     TransportDeliveryEvidence,
     begin_transport_write,
@@ -344,10 +345,9 @@ async def _qwen_sender(
 
                 if request.kind == "clear":
                     state.intentional_close.set()
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
+                    await connection_registry(request_queue).register(
+                        ws, worker_identity="qwen"
+                    ).retire()
                     return "clear", request
 
                 if request.kind in ("shutdown", "finish"):
@@ -382,10 +382,9 @@ async def _qwen_sender(
                                 )
                             )
                     state.intentional_close.set()
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
+                    await connection_registry(request_queue).register(
+                        ws, worker_identity="qwen"
+                    ).retire()
                     return "shutdown", request
 
                 await _emit_qwen_error_once(
@@ -701,6 +700,8 @@ async def qwen_asr_worker(
                 emit_ready=first_connection,
             )
             active_state = state
+            retirement = None
+            registry = connection_registry(request_queue)
             ws: Any | None = None
             sender_task: asyncio.Task[tuple[str, _AsrWorkerRequest | None]] | None = (
                 None
@@ -715,10 +716,12 @@ async def qwen_asr_worker(
                     additional_headers={"Authorization": f"Bearer {api_key}"},
                     close_timeout=0.5,
                 )
+                retirement = registry.register(ws, worker_identity="qwen")
                 receiver_task = asyncio.create_task(
                     _qwen_receiver(ws, response_queue, config, state),
                     name="qwen-asr-receiver",
                 )
+                registry.register_tasks(receiver_task)
                 await ws.send(json.dumps(session_update))
                 sender_task = asyncio.create_task(
                     _qwen_sender(
@@ -736,6 +739,7 @@ async def qwen_asr_worker(
                     _qwen_watch_stalled_items(response_queue, state),
                     name="qwen-asr-stalled-watch",
                 )
+                registry.register_tasks(sender_task, receiver_task, stalled_watch_task)
                 done, pending = await asyncio.wait(
                     {sender_task, receiver_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -759,10 +763,6 @@ async def qwen_asr_worker(
                         outcome = "error"
                     elif receiver_outcome == "closed" and outcome != "clear":
                         outcome = "shutdown"
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -779,22 +779,18 @@ async def qwen_asr_worker(
                 )
                 outcome = "error"
             finally:
+                if retirement is not None:
+                    state.intentional_close.set()
+                    retirement.start()
+                registry.register_tasks(sender_task, receiver_task, stalled_watch_task)
                 for task in (sender_task, receiver_task, stalled_watch_task):
                     if task is not None and not task.done():
                         task.cancel()
-                pending_tasks = [
-                    task
-                    for task in (sender_task, receiver_task, stalled_watch_task)
-                    if task is not None and not task.done()
-                ]
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                if ws is not None:
-                    state.intentional_close.set()
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
+                try:
+                    if retirement is not None:
+                        await retirement.retire()
+                finally:
+                    await registry.join_tasks()
 
             closed_sent = state.closed_sent.is_set()
             if outcome == "clear" and outcome_request is not None:

@@ -29,6 +29,11 @@ import numpy as np
 import soxr
 
 from .delivery import delivery_evidence, log_delivery_phase
+from .connection_cleanup import (
+    ConnectionRetirementError,
+    TASK_EXIT_TIMEOUT_SECONDS,
+    connection_registry,
+)
 from .provider_policy import AsrProviderPolicy
 from .transcript import SegmentAggregator
 
@@ -776,7 +781,13 @@ class _RealtimeAsrSessionImpl:
             self._callback_close_waiter = current
             self._callback_close_event.set()
 
+        # CLOSED is published only after retirement proof. Status callbacks can
+        # re-enter close here; waiting on the task publishing them would cycle.
         if self._state is _SessionState.CLOSED:
+            if self._request_queue is not None:
+                connection_registry(self._request_queue).raise_if_failed()
+            if self._close_task is not None and self._close_task.done():
+                await asyncio.shield(self._close_task)
             return
 
         close_task = self._close_task
@@ -838,7 +849,10 @@ class _RealtimeAsrSessionImpl:
                         timeout=_WORKER_CLOSE_TIMEOUT_SECONDS,
                     )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
-                    self._worker_task.cancel()
+                    if self._request_queue is not None:
+                        connection_registry(self._request_queue).start_all()
+                    if not self._worker_task.cancelling():
+                        self._worker_task.cancel()
 
             if self._callback_queue is not None:
                 drain_task = asyncio.create_task(self._callback_queue.join())
@@ -1321,12 +1335,20 @@ class _RealtimeAsrSessionImpl:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, ConnectionRetirementError):
+                # Protocol events aren't proof that a physical resource was
+                # retired. Keep the failure even when the consumer has left.
+                connection_registry(self._request_queue).record_failure(exc)
             if self._state in (
                 _SessionState.CLOSING,
                 _SessionState.CLOSED,
                 _SessionState.FAILED,
             ):
+                if not isinstance(exc, ConnectionRetirementError):
+                    connection_registry(self._request_queue).record_failure(
+                        ConnectionRetirementError("ASR_CONNECTION_RETIRE_FAILED: worker cleanup raised")
+                    )
                 return
             await self._response_queue.put(
                 _AsrWorkerEvent(
@@ -1627,11 +1649,14 @@ class _RealtimeAsrSessionImpl:
         error = f"{safe_code}: {safe_message}"
         if self._ready_future is not None and not self._ready_future.done():
             self._ready_future.set_exception(RuntimeError(error))
+        if self._request_queue is not None:
+            connection_registry(self._request_queue).start_all()
         if (
             self._worker_task is not None
             and self._worker_task is not asyncio.current_task()
         ):
-            self._worker_task.cancel()
+            if not self._worker_task.cancelling():
+                self._worker_task.cancel()
         await self._unload_voice_turn_adapter(context="during failure")
         # Finals already accepted by the ordered response consumer must get
         # their one chance to settle before the runtime retires this lease.
@@ -1895,6 +1920,15 @@ class _RealtimeAsrSessionImpl:
             logger.exception("ASR connection error callback failed")
 
     async def _shutdown(self) -> None:
+        registry = (
+            connection_registry(self._request_queue)
+            if self._request_queue is not None
+            else None
+        )
+        # Close resources before joining tasks that can be blocked on them.
+        # Owners persist on the queue if a worker is cancelled a second time.
+        if registry is not None:
+            registry.start_all()
         current = asyncio.current_task()
         tasks = [
             task
@@ -1907,13 +1941,34 @@ class _RealtimeAsrSessionImpl:
                 task is not None
                 and task is not current
                 and task is not self._callback_close_waiter
-                and not task.done()
             )
         ]
         for task in tasks:
-            task.cancel()
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if registry is not None:
+            try:
+                await registry.retire_all()
+            except ConnectionRetirementError as exc:
+                registry.record_failure(exc)
+            try:
+                await registry.join_tasks()
+            except ConnectionRetirementError as exc:
+                registry.record_failure(exc)
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(tasks, timeout=TASK_EXIT_TIMEOUT_SECONDS)
+            for task in done:
+                if not task.cancelled():
+                    error = task.exception()
+                    if isinstance(error, ConnectionRetirementError) and registry is not None:
+                        registry.record_failure(error)
+            if pending:
+                error = ConnectionRetirementError("ASR_CONNECTION_RETIRE_FAILED: session tasks did not exit")
+                if registry is not None:
+                    registry.record_failure(error)
+                raise error
+        if registry is not None:
+            registry.raise_if_failed()
 
     def _validate_language(self, language: str) -> str:
         # Kept as a private seam for future worker-specific language mapping.
