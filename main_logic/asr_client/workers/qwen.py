@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 from collections import deque
@@ -38,6 +39,8 @@ from ..delivery import (
 from .._infra import AsrSessionConfig, _AsrWorkerEvent, _AsrWorkerRequest
 from ._shared import is_auth_rejection
 
+logger = logging.getLogger(__name__)
+
 _QWEN_MODEL = "qwen3-asr-flash-realtime"
 _QWEN_CN_URL = f"wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={_QWEN_MODEL}"
 _QWEN_INTL_URL = (
@@ -46,9 +49,8 @@ _QWEN_INTL_URL = (
 _QWEN_FINISH_TIMEOUT_SECONDS = 3.0
 # Server VAD publishes speech_stopped/committed as the logical endpoint of a
 # turn, but the transcription completed event may be delayed or never arrive.
-# An item that outlives this deadline after its endpoint is completed with an
-# empty final so the upstream utterance lifecycle converges instead of waiting
-# unboundedly. Mirrors the OpenAI worker's stalled-item deadline.
+# An item that outlives this deadline after its endpoint fails explicitly so
+# the runtime can settle its owned turn and recover without inventing a final.
 _QWEN_STALLED_ITEM_TIMEOUT_SECONDS = 30.0
 _QWEN_SUPPORTED_LANGUAGES = frozenset(
     {
@@ -190,6 +192,11 @@ def _qwen_arm_stalled_item_deadline(
     if item_id and item_id in state.item_keys and item_id not in state.item_deadlines:
         state.item_deadlines[item_id] = time.monotonic()
         state.stalled_deadline_armed.set()
+        key = state.item_keys[item_id]
+        logger.info(
+            "ASR provider wait stage=awaiting_final generation=%s buffer_epoch=%s utterance_id=%s endpoint_received=true",
+            *key,
+        )
 
 
 async def _qwen_expire_stalled_items(
@@ -203,20 +210,20 @@ async def _qwen_expire_stalled_items(
         if now - armed_at >= _QWEN_STALLED_ITEM_TIMEOUT_SECONDS
     ]
     for item_id in expired_ids:
-        del state.item_deadlines[item_id]
+        armed_at = state.item_deadlines.pop(item_id)
         # Popping the key tombstones the item: a late completed event finds
         # no mapping and is dropped instead of resurrecting the closed turn.
         key = state.item_keys.pop(item_id, None)
         if key is None:
             continue
-        await response_queue.put(
-            _AsrWorkerEvent(
-                kind="final",
-                generation=key[0],
-                buffer_epoch=key[1],
-                utterance_id=key[2],
-                text="",
-            )
+        logger.warning(
+            "ASR provider wait stage=awaiting_final generation=%s buffer_epoch=%s utterance_id=%s elapsed_ms=%s failure_code=ASR_PROVIDER_FINAL_TIMEOUT",
+            *key, round((now - armed_at) * 1000),
+        )
+        await _emit_qwen_error_once(
+            response_queue, state, "ASR_PROVIDER_FINAL_TIMEOUT",
+            "Qwen ASR final did not arrive after the provider endpoint",
+            item_key=key,
         )
 
 
@@ -318,7 +325,7 @@ async def _qwen_sender(
                         pass
                     return "clear", request
 
-                if request.kind == "shutdown":
+                if request.kind in ("shutdown", "finish"):
                     state.shutdown_request = request
                     await ws.send(
                         json.dumps(
@@ -334,6 +341,11 @@ async def _qwen_sender(
                             timeout=_QWEN_FINISH_TIMEOUT_SECONDS,
                         )
                     except asyncio.TimeoutError:
+                        if request.kind == "finish":
+                            await _emit_qwen_error_once(
+                                response_queue, state, "ASR_FINISH_TIMEOUT",
+                                "Qwen ASR did not acknowledge explicit finish",
+                            )
                         if not state.closed_sent.is_set():
                             state.closed_sent.set()
                             await response_queue.put(
@@ -476,6 +488,10 @@ async def _qwen_receiver(
                 state.next_utterance_id += 1
                 state.last_utterance_id = key[2]
                 state.item_keys[item_id] = key
+                logger.info(
+                    "ASR provider wait stage=awaiting_endpoint generation=%s buffer_epoch=%s utterance_id=%s endpoint_received=false",
+                    *key,
+                )
                 await response_queue.put(
                     _AsrWorkerEvent(
                         kind="utterance_started",
@@ -577,7 +593,7 @@ async def _qwen_receiver(
                     request = state.shutdown_request
                     await response_queue.put(
                         _AsrWorkerEvent(
-                            kind="closed",
+                            kind=("finished" if request and request.kind == "finish" else "closed"),
                             generation=(
                                 request.generation if request else state.generation
                             ),
@@ -597,7 +613,7 @@ async def _qwen_receiver(
             await _emit_qwen_error_once(
                 response_queue,
                 state,
-                "ASR_QWEN_CONNECTION_CLOSED",
+                "ASR_QWEN_READ_DISCONNECTED",
                 "Qwen ASR connection closed unexpectedly",
             )
             return "error"
@@ -609,7 +625,7 @@ async def _qwen_receiver(
             await _emit_qwen_error_once(
                 response_queue,
                 state,
-                "ASR_QWEN_CONNECTION_CLOSED",
+                "ASR_QWEN_READ_DISCONNECTED",
                 "Qwen ASR connection closed unexpectedly",
             )
             return "error"
