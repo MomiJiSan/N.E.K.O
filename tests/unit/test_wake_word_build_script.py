@@ -10,6 +10,12 @@ import sys
 import pytest
 
 
+# These tests launch real Windows PowerShell / pwsh processes. Keep them in
+# the existing serial subprocess shard instead of the bulk xdist unit gate;
+# the 20-second timeout remains a guard, not a startup performance assertion.
+pytestmark = pytest.mark.integration_serial
+
+
 BUILD_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "build_wake_word_runtime.ps1"
 PACKAGING_FLAGS = ("SHERPA_ONNX_SPLIT_PYTHON_PACKAGE", "SHERPA_ONNX_IS_FOR_PYPI")
 POWERSHELLS = [path for name in ("powershell", "pwsh") if (path := shutil.which(name))]
