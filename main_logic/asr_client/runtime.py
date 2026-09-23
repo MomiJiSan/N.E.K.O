@@ -34,6 +34,7 @@ from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 
 from ._infra import logger, _READY_TIMEOUT_SECONDS
 from .audio import AsrAudioDispatcher
+from .audio_ranges import AudioSampleSpan
 from .candidate_control import CandidateRejectionOutcome, CandidateRejectionRequest
 from ._registry_meta import AsrProviderAvailability
 from .endpointing.detector import (
@@ -675,6 +676,11 @@ class IndependentAsrRuntime:
         self._asr_provider_candidate_fence: ProviderCandidateFence | None = None
         self._asr_audio_sequence = 0
         self._asr_audio_generation = 0
+        # Input positions belong to ingress, not a detector instance or turn.
+        self._asr_sample_ingress: VoiceIngressToken | None = None
+        self._asr_input_sample_end = 0
+        self._asr_committed_sample_end = 0
+        self._asr_pending_activation_turn: VoiceTurnToken | None = None
         self._asr_current_ingress_token: VoiceIngressToken | None = None
         self._asr_partial_turn_token: VoiceTurnToken | None = None
         self._asr_accepted_final_keys: OrderedDict[FinalKey, None] = OrderedDict()
@@ -1420,6 +1426,7 @@ class IndependentAsrRuntime:
         turn_token: VoiceTurnToken,
         *,
         buffered_pcm16: bytes | None = None,
+        buffered_spans: tuple[AudioSampleSpan, ...] = (),
     ) -> bool:
         detector = self._asr_detector
         if getattr(detector, "admission_enabled", False) and not self._asr_turn_prepared:
@@ -1449,6 +1456,11 @@ class IndependentAsrRuntime:
             if buffered_pcm16 is None
             else buffered_pcm16
         )
+        spans = (
+            lifecycle.peek_active_start_spans()
+            if buffered_pcm16 is None
+            else buffered_spans
+        )
         activated = self._asr_audio_dispatcher.activate(
             turn_token,
             session_ref,
@@ -1456,8 +1468,14 @@ class IndependentAsrRuntime:
             sample_rate_hz=16_000,
         )
         if activated:
+            if spans and spans[-1].end is not None:
+                self._asr_committed_sample_end = max(
+                    self._asr_committed_sample_end, spans[-1].end,
+                )
             if buffered_pcm16 is None:
                 lifecycle.drain_active_start_audio()
+            if self._asr_pending_activation_turn == turn_token:
+                self._asr_pending_activation_turn = None
             self._notify_prefix_capacity()
             prefix = getattr(self, "_asr_protected_prefix", None)
             if payload and prefix is not None:
@@ -2620,6 +2638,7 @@ class IndependentAsrRuntime:
         self._asr_overlap_completed_turns = 0
         self._asr_audio_sequence = 0
         self._asr_current_ingress_token = None
+        self._asr_pending_activation_turn = None
         self._asr_partial_turn_token = None
         self._asr_accepted_final_keys.clear()
         self._asr_reserved_final_key = None
@@ -2888,7 +2907,8 @@ class IndependentAsrRuntime:
         self._asr_current_ingress_token = ingress_token
         recovery = self._asr_recovery
         if recovery is not None and (recovery.failed or not recovery.input_ready.is_set()):
-            return await self._observe_recovery_input(recovery, frame, ingress_token)
+            recovery_result = await self._observe_recovery_input(recovery, frame, ingress_token)
+            return AsrSubmitResult(recovery_result.status, recovery_result.delivery_stage)
         lifecycle = self._asr_lifecycle
         identity = self._capture_runtime_identity(ingress_token=ingress_token)
         if preserve_prefix is not None:
@@ -2941,23 +2961,82 @@ class IndependentAsrRuntime:
             lifecycle = identity.lifecycle
             detector = identity.detector
             admission_enabled = bool(getattr(detector, "admission_enabled", False))
+            source_start = source_end = None
+            committed_before_detection = None
+            if admission_enabled:
+                if self._asr_sample_ingress != ingress_token:
+                    self._asr_sample_ingress = ingress_token
+                    self._asr_input_sample_end = 0
+                    self._asr_committed_sample_end = 0
+                source_start = self._asr_input_sample_end
+                source_end = source_start + len(pcm16) // 2
+                self._asr_input_sample_end = source_end
             buffered_before_detection = False
+            buffered_for_activation = bool(
+                admission_enabled
+                and self._asr_pending_activation_turn == self._capture_turn_token(lifecycle)
+            )
             pending_only = bool(admission_enabled and lifecycle.has_pending_turn and (
                 self._asr_overlap_completed_turns > 0
                 or self._capture_turn_token(lifecycle) in self._asr_previously_sent_turns
             ))
-            if admission_enabled and (lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE or pending_only):
+            if buffered_for_activation:
+                buffered = lifecycle.buffer_active_start_audio(pcm16, start_sample=source_start)
+                if buffered.disposition is AudioDisposition.BLOCK:
+                    self._log_candidate_audio_failure(lifecycle, source_start, source_end)
+                    await self._handle_independent_asr_error(
+                        identity.session_epoch, identity.provider or "unknown",
+                        status_code="ASR_INGRESS_BACKPRESSURE", expected_identity=identity,
+                    )
+                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                buffered_before_detection = True
+            elif admission_enabled and (lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE or pending_only):
                 buffered = lifecycle.buffer_admission_audio(
-                    pcm16, through_sample=detector.submitted_samples + len(pcm16) // 2,
+                    pcm16, start_sample=source_start, through_sample=source_end,
                     confirmed=self._asr_pending_speech_confirmed,
                     pending_only=pending_only,
                 )
                 if buffered.disposition is AudioDisposition.BLOCK:
+                    self._log_candidate_audio_failure(lifecycle, source_start, source_end)
                     await self._handle_audio_ingress_backpressure(
                         ingress_token, observed_state=lifecycle.snapshot.state,
                     )
                     return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
                 buffered_before_detection = True
+
+            # A confirmed streaming turn owns this complete block before model
+            # inference yields. An endpoint arriving during inference can then
+            # seal a precise queue boundary without losing or replaying PCM.
+            if (admission_enabled and not buffered_before_detection
+                    and not _uses_smart_turn_endpointing(lifecycle.provider_policy)
+                    and self._asr_turn_prepared
+                    and self._asr_session is not None
+                    and getattr(self._asr_session, "is_ready", True)):
+                turn = self._capture_turn_token(lifecycle)
+                decision = lifecycle.accept_audio(
+                    pcm16, sample_rate_hz=sample_rate_hz, start_sample=source_start,
+                )
+                payload = decision.pre_roll if decision.disposition is AudioDisposition.FORWARD_WITH_PRE_ROLL else pcm16
+                if (decision.disposition not in {AudioDisposition.FORWARD, AudioDisposition.FORWARD_WITH_PRE_ROLL}
+                        or not self._activate_asr_audio_dispatcher(lifecycle, turn)):
+                    await self._handle_independent_asr_error(
+                        identity.session_epoch, identity.provider or "unknown",
+                        status_code="ASR_AUDIO_ORDERING_FAILED", expected_identity=identity,
+                    )
+                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                self._asr_audio_sequence += 1
+                if not self._asr_audio_dispatcher.enqueue_audio(
+                    turn, self._asr_session, payload, sample_rate_hz=sample_rate_hz,
+                    sequence_no=self._asr_audio_sequence,
+                ):
+                    await self._handle_independent_asr_error(
+                        identity.session_epoch, identity.provider or "unknown",
+                        status_code="ASR_AUDIO_ORDERING_FAILED", expected_identity=identity,
+                    )
+                    return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
+                self._asr_committed_sample_end = source_end
+                committed_before_detection = turn
+                self._observe_provider_speaker_shadow(detector, payload, sample_rate_hz=sample_rate_hz)
 
             def ingress_is_current() -> bool:
                 nonlocal identity
@@ -2998,6 +3077,7 @@ class IndependentAsrRuntime:
                     detector_submit_started_at = time.perf_counter()
                     submitted = await submit_audio(
                         pcm16,
+                        **({"source_end_sample": source_end} if admission_enabled else {}),
                         ingress_token=ingress_token,
                         sample_rate_hz=sample_rate_hz,
                         speech_probability=speech_probability,
@@ -3099,6 +3179,7 @@ class IndependentAsrRuntime:
                 else:
                     detector_result = await detector.feed(
                         pcm16,
+                        **({"source_end_sample": source_end} if admission_enabled else {}),
                         speech_probability=speech_probability,
                         rnnoise_available=rnnoise_available,
                         rnnoise_evidence=rnnoise_evidence,
@@ -3113,6 +3194,13 @@ class IndependentAsrRuntime:
                     )
                     if not ingress_is_current():
                         return AsrSubmitResult(AsrSubmitStatus.STALE)
+                    if committed_before_detection is not None and (
+                        lifecycle.snapshot.state is not VoiceLifecycleState.ACTIVE
+                        or self._capture_turn_token(lifecycle) != committed_before_detection
+                    ):
+                        # This result describes the sealed owner's PCM. It must
+                        # not prepare a successor after that owner's final.
+                        return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
                     if not detector_result.endpointing_available:
                         await self._handle_independent_asr_error(
                             identity.session_epoch,
@@ -3139,12 +3227,13 @@ class IndependentAsrRuntime:
                             if admission_enabled else
                             ((event, None, None) for event in detector_result.events)
                         )
-                        for event, evidence, start_sample in records:
+                        for event, evidence, start_sample in (() if buffered_for_activation else records):
                             await self._handle_independent_asr_activity(
                                 event,
                                 identity.session_epoch,
                                 evidence=evidence,
                                 audio_start_sample=start_sample,
+                                audio_already_sent=committed_before_detection is not None,
                             )
                             if not ingress_is_current():
                                 return AsrSubmitResult(AsrSubmitStatus.STALE)
@@ -3160,6 +3249,10 @@ class IndependentAsrRuntime:
                         return AsrSubmitResult(AsrSubmitStatus.UNAVAILABLE)
             if lifecycle is not None and not ingress_is_current():
                 return AsrSubmitResult(AsrSubmitStatus.STALE)
+            if buffered_for_activation:
+                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
+            if committed_before_detection is not None:
+                return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
             if buffered_before_detection:
                 if pending_only:
                     return AsrSubmitResult(AsrSubmitStatus.ACCEPTED)
@@ -3208,7 +3301,7 @@ class IndependentAsrRuntime:
                 if not ingress_is_current():
                     return AsrSubmitResult(AsrSubmitStatus.STALE)
             decision = (
-                lifecycle.accept_audio(pcm16, sample_rate_hz=sample_rate_hz)
+                lifecycle.accept_audio(pcm16, sample_rate_hz=sample_rate_hz, start_sample=source_start)
                 if lifecycle is not None
                 else None
             )
@@ -3320,6 +3413,8 @@ class IndependentAsrRuntime:
                 payload,
                 sample_rate_hz=sample_rate_hz,
             )
+            if admission_enabled:
+                self._asr_committed_sample_end = max(self._asr_committed_sample_end, source_end)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4130,6 +4225,15 @@ class IndependentAsrRuntime:
                 fallback_audio_bytes * 1_000 // (16_000 * 2)
             )
 
+    def _log_candidate_audio_failure(self, lifecycle, start_sample, end_sample) -> None:
+        logger.warning(
+            "ASR candidate audio rejected epoch=%s turn=%s reason=%s "
+            "requested_start=%s requested_end=%s sealed_turn_boundary=%s ranges=%s",
+            self._asr_session_epoch, lifecycle.snapshot.turn_id,
+            lifecycle.admission_failure_reason, start_sample, end_sample,
+            self._asr_committed_sample_end, lifecycle.admission_range_diagnostics,
+        )
+
     async def _handle_independent_asr_activity(
         self,
         event: SpeechActivityEvent,
@@ -4157,6 +4261,13 @@ class IndependentAsrRuntime:
             if lifecycle is None or audio_start_sample is None:
                 return
             if not audio_already_sent and not lifecycle.retain_admitted_candidate(start_sample=audio_start_sample):
+                logger.warning(
+                    "ASR candidate range rejected epoch=%s turn=%s candidate=%s reason=%s "
+                    "sealed_turn_boundary=%s ranges=%s",
+                    epoch, lifecycle.snapshot.turn_id, evidence.candidate_id,
+                    lifecycle.admission_failure_reason,
+                    self._asr_committed_sample_end, lifecycle.admission_range_diagnostics,
+                )
                 await self._handle_independent_asr_error(
                     epoch, self._asr_provider or "unknown", status_code="ASR_INGRESS_BACKPRESSURE",
                     expected_identity=self._capture_runtime_identity(),
@@ -4624,8 +4735,17 @@ class IndependentAsrRuntime:
                 )
                 try:
                     if getattr(detector, "admission_enabled", False):
+                        def committed_boundary() -> int:
+                            # Called synchronously under the detector lock. A
+                            # submit can commit more old-turn PCM while seal
+                            # waits for that lock, so freeze only here.
+                            if not self._runtime_identity_matches(endpoint_identity):
+                                raise RuntimeError("stale_candidate_identity")
+                            return self._asr_committed_sample_end
+
                         provider_fence = await detector.seal_provider_candidate(
                             preserve_admission=turn_token in self._asr_previously_sent_turns,
+                            admission_boundary=committed_boundary,
                         )
                     else:
                         provider_fence = await detector.seal_provider_candidate()
@@ -4706,6 +4826,8 @@ class IndependentAsrRuntime:
         pending_evidence = self._asr_pending_admission_evidence
         self._asr_pending_admission_evidence = None
         payload = lifecycle.begin_pending_turn()
+        if payload:
+            self._asr_pending_activation_turn = self._capture_turn_token(lifecycle)
         # begin_pending_turn() 内部完成 SPEECH_CONFIRMED 迁移（lifecycle.py），是第
         # 五个迁移点 —— 之前给另外四处补 onset 打点时漏了它，因为守卫只扫本模块的
         # 字面量。不补的话 _asr_turn_onset_at 还留着**上一轮**的值（它只在
@@ -4779,7 +4901,6 @@ class IndependentAsrRuntime:
         if not self._activate_asr_audio_dispatcher(
             lifecycle,
             turn_token,
-            buffered_pcm16=payload,
         ):
             await self._handle_independent_asr_error(
                 identity.session_epoch,
