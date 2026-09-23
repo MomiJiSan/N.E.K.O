@@ -7,6 +7,8 @@ delivery concerns. Provider sessions and endpointing remain encapsulated by
 
 from __future__ import annotations
 
+from main_logic.voice_turn.transcript_admission import assess_transcript, TranscriptDisposition
+
 import asyncio
 import bisect
 import json
@@ -5468,7 +5470,13 @@ class AsrRuntimeMixin:
                 or session_ref is None
             ):
                 return
-            if not event.text.strip():
+            admission = assess_transcript(
+                event.text, event.evidence, is_voice_source=True, final=True,
+            )
+            if admission.disposition is TranscriptDisposition.REJECT:
+                logger.info("[voice-admission] turn_id=%s decision=reject reason=%s",
+                            external_turn_id, admission.reason)
+            if not event.text.strip() or admission.disposition is TranscriptDisposition.REJECT:
                 # An empty final still completed the turn provider-side (e.g.
                 # the OpenAI/Step stalled-item timeouts): Core deliberately
                 # injects no user_transcript for empty text, yet the frontend
@@ -5793,6 +5801,12 @@ class AsrRuntimeMixin:
         *,
         remember: bool = True,
     ) -> None:
+        admission = assess_transcript(event.text, event.evidence, is_voice_source=True, final=False)
+        if admission.disposition is TranscriptDisposition.HOLD:
+            return
+        preview_owner = self._core_asr_preview_turn_token
+        if event.evidence is not None and preview_owner is not None and preview_owner != event.turn_token:
+            return
         if (
             event.session_epoch != self._capture_ingress_token().session_epoch
             or self._voice_lease_owner != "core"
