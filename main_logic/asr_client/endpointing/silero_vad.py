@@ -95,6 +95,16 @@ class SileroActivityGate:
     def feed(self, pcm16_le: bytes) -> tuple[SpeechActivityEvent, ...]:
         return self.process_probabilities(self._vad.process_pcm16(pcm16_le))
 
+    @property
+    def recovery_boundary_ready(self) -> bool:
+        """Whether existing raw activity is idle or paused after a feed.
+
+        This is the current gate state, not whether a packet contained a pause:
+        a later resumed window in that same packet makes the boundary unsafe.
+        Owners must read it after inference, under their existing serialization.
+        """
+        return not self._speech_confirmed or self._candidate_emitted
+
     def process_probabilities(
         self, probabilities: Iterable[float]
     ) -> tuple[SpeechActivityEvent, ...]:

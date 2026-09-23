@@ -1714,6 +1714,24 @@ class DetectorRuntime:
         return self._candidate_open
 
     @property
+    def recovery_boundary_ready(self) -> bool:
+        """Expose local raw pause/idle, never provider candidate ownership.
+
+        Read after the serialized audio feed completes. Unavailable or unloaded
+        VAD cannot establish a safe boundary, including SmartTurn fallback.
+        """
+        if self._closed or not self._available:
+            return False
+        adapter = self._semantic_adapter
+        if adapter is not None:
+            if (adapter.failed or not adapter._vad_available
+                    or not adapter.throttle_available):
+                return False
+        elif not self._load_attempted:
+            return False
+        return getattr(self._gate, "recovery_boundary_ready", False) is True
+
+    @property
     def throttle_shadow_metrics(self) -> ThrottleShadowMetrics:
         return self._throttle_policy.shadow_metrics
 
