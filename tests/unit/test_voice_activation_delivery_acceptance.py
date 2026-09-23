@@ -7,12 +7,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from main_logic.voice_input.activation import ActivationState
+from main_logic.voice_input.activation import ActivationState, OutputCommit
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
 from main_logic.voice_turn.contracts import AsrSubmitStatus
 from tests.unit.test_external_visual_delivery import _make_client
 from tests.support.activation_harness import _cold_harness, _feed, _until
 from tests.support.activation_harness import _harness
+from tests.support.asr_fakes import _Runtime
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.runtime]
@@ -116,6 +117,94 @@ async def test_gemini_activation_uses_actual_send_outcome(outcome):
             )
             await h.feed(4000)
             assert not sent
+
+
+async def test_ordinary_gemini_stream_audio_keeps_base_error_boundary():
+    client = _make_client("gemini", "gemini-test")
+    client._audio_processor = None
+    failure = RuntimeError("connection closed")
+    send = AsyncMock(side_effect=failure)
+    client._gemini_session = SimpleNamespace(send_realtime_input=send)
+
+    assert await client.stream_audio(bytes(3200)) is None
+    assert client._fatal_error_occurred is True
+    send.assert_awaited_once()
+
+    client._fatal_error_occurred = False
+    with pytest.raises(RuntimeError) as raised:
+        await client.stream_audio(bytes(3200), raise_on_error=True)
+    assert raised.value is failure
+    assert send.await_count == 2
+
+
+@pytest.mark.parametrize("receipt", [True, False], ids=["written", "not-written"])
+async def test_ordinary_native_stream_audio_keeps_base_receipt_boundary(receipt):
+    client = _make_client("openai", "gpt-4o-realtime")
+    client._audio_processor = None
+    client._connection_generation = 1
+    client.send_event = AsyncMock(return_value=receipt)
+
+    assert await client.stream_audio(bytes(3200)) is None
+    client.send_event.assert_awaited_once()
+
+    client._fatal_error_occurred = True
+    assert await client.stream_audio(bytes(3200)) is None
+    assert await client.stream_audio(bytes(3200), require_output_commit=True) is False
+
+
+@pytest.mark.parametrize("receipt", [True, False], ids=["written", "not-written"])
+async def test_ordinary_native_core_keeps_base_accounting(receipt):
+    runtime = _Runtime()
+    client = _make_client("openai", "gpt-4o-realtime")
+    client._audio_processor = None
+    client._connection_generation = 1
+    client.send_event = AsyncMock(return_value=receipt)
+    runtime.session = client
+    runtime._set_microphone_route("native")
+
+    committed = await runtime._route_microphone_audio_unfiltered(
+        bytes(3200),
+        sample_rate_hz=16_000,
+    )
+
+    assert committed is OutputCommit.TRANSPORT_WRITTEN
+    assert runtime._omni_mic_audio_bytes == 3200
+
+
+async def test_ordinary_native_core_keeps_base_accounting_when_resampler_buffers():
+    runtime = _Runtime()
+    client = _make_client("openai", "gpt-4o-realtime")
+    client._audio_processor = None
+    client._connection_generation = 1
+    client._resample_uplink = MagicMock(return_value=b"")
+    client.send_event = AsyncMock()
+    runtime.session = client
+    runtime._set_microphone_route("native")
+
+    committed = await runtime._route_microphone_audio_unfiltered(
+        bytes(3200),
+        sample_rate_hz=16_000,
+    )
+
+    assert committed is OutputCommit.TRANSPORT_WRITTEN
+    assert runtime._omni_mic_audio_bytes == 3200
+    client.send_event.assert_not_awaited()
+
+
+@pytest.mark.parametrize("receipt", [True, False], ids=["written", "not-written"])
+async def test_activation_transport_can_opt_into_output_receipt(receipt):
+    client = _make_client("openai", "gpt-4o-realtime")
+    client._audio_processor = None
+    client._connection_generation = 1
+    client.send_event = AsyncMock(return_value=receipt)
+
+    assert (
+        await client.stream_audio(
+            bytes(3200),
+            require_output_commit=True,
+        )
+        is receipt
+    )
 
 
 @pytest.mark.parametrize("receipt", [True, False], ids=["written", "not-written"])

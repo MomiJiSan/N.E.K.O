@@ -65,6 +65,7 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
+        "2026-09-22-voice-session-activation",
         "2026-09-12-voice-wake-word-kws2-main",
         "2026-09-14-plugin-model-api-proactive-community",
         "2026-09-11-soccer-sdk-migration",
@@ -154,15 +155,13 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-02-vllm-omni-clone-tts-state",
         "2026-09-08-drawing-guess",
         "2026-09-09-pngtuber-import-status",
-        "2026-09-10-drawing-guess-pngtuber-import-status",
-        "2026-09-11-soccer-sdk-migration",
-        "2026-09-09-voice-session-activation-pngtuber",
-        "2026-09-03-voice-identity-five-second-verification",
-        "2026-09-08-voice-session-activation",
+        "2026-09-11-watch-together-preparation-i18n",
         "2026-09-11-watch-together-soccer-sdk",
         "2026-09-11-watch-together",
         "2026-09-11-watch-together-discovery",
         "2026-09-06-plugin-model-api",
+        "2026-09-03-voice-identity-five-second-verification",
+        "2026-09-08-voice-session-activation",
     }
 )
 

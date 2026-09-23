@@ -4210,6 +4210,7 @@ class AsrRuntimeMixin:
             ingress_token=context.ingress_token,
             captured_at=context.captured_at,
             preserve_prefix=prefix,
+            require_output_commit=True,
         )
         if (
             self._capture_voice_session_activation_generation() != generation
@@ -4417,6 +4418,7 @@ class AsrRuntimeMixin:
         ingress_token: VoiceIngressToken | None = None,
         captured_at: float | None = None,
         preserve_prefix: PreserveUnsentPrefix | None = None,
+        require_output_commit: bool = False,
     ) -> OutputCommit:
         route_mode = self._asr_route_mode
         if not self._voice_input_accepts_pcm():
@@ -4461,34 +4463,42 @@ class AsrRuntimeMixin:
                 return OutputCommit.NOT_SENT
             try:
                 if isinstance(session_ref, _core_facade.OmniRealtimeClient):
-                    written = await stream_audio(pcm16, captured_at=captured_at)
+                    if require_output_commit:
+                        written = await stream_audio(
+                            pcm16,
+                            captured_at=captured_at,
+                            raise_on_error=True,
+                            require_output_commit=True,
+                        )
+                    else:
+                        await stream_audio(
+                            pcm16,
+                            captured_at=captured_at,
+                        )
+                        written = None
                 else:
-                    written = await stream_audio(pcm16)
-                if written is False:
+                    await stream_audio(pcm16)
+                    written = None
+                if require_output_commit and written is False:
                     return OutputCommit.NOT_SENT
                 if not native_send_is_current():
                     return OutputCommit.UNKNOWN
-                if (
-                    isinstance(session_ref, _core_facade.OmniRealtimeClient)
-                    and written is None
-                ):
+                if require_output_commit and written is None:
                     return OutputCommit.LOCAL_ACCEPTED
                 self._record_omni_microphone_audio(len(pcm16))
                 return OutputCommit.TRANSPORT_WRITTEN
             except asyncio.CancelledError:
                 raise
             except web_exceptions.ConnectionClosedOK:
-                # A normal provider close is expected during ordinary client
-                # handoff. Only the voice-identity takeover path latches the
-                # server-close guard; ordinary clients keep BASE delivery
-                # semantics on the successor session.
                 activation_factory = getattr(
                     self, "_voice_session_activation_factory", None
                 )
                 if (
                     native_send_is_current()
-                    and activation_factory is not None
-                    and getattr(activation_factory, "enforce", True)
+                    and (
+                        activation_factory is None
+                        or getattr(activation_factory, "enforce", True)
+                    )
                 ):
                     self.session_closed_by_server = True
                 return OutputCommit.UNKNOWN

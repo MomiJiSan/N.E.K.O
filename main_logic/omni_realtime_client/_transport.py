@@ -1195,6 +1195,8 @@ class _TransportMixin:
         audio_chunk: bytes,
         *,
         captured_at: float | None = None,
+        raise_on_error: bool = False,
+        require_output_commit: bool = False,
     ) -> bool | None:
         """Stream raw audio data to the API.
 
@@ -1205,10 +1207,14 @@ class _TransportMixin:
         ``False`` means the provider transport definitively did not accept the
         frame. ``None`` preserves the legacy locally-buffered result for DSP or
         resampler frames that did not produce a provider write yet.
+
+        ``require_output_commit`` is an activation-only receipt contract.  The
+        ordinary microphone path deliberately keeps the BASE return value of
+        ``None`` even when the transport reports a definitive result.
         """
         # 检查是否已发生致命错误，如果是则直接返回
         if self._fatal_error_occurred:
-            return False
+            return False if require_output_commit else None
 
         audio_timeline_at = (
             float(captured_at)
@@ -1326,8 +1332,11 @@ class _TransportMixin:
 
             # Gemini uses different API (16kHz, no uplink resample needed)
             if self._is_gemini:
-                await self._stream_audio_gemini(audio_chunk)
-                return True
+                await self._stream_audio_gemini(
+                    audio_chunk,
+                    raise_on_error=raise_on_error,
+                )
+                return True if require_output_commit else None
 
             # By this point audio_chunk is always 16kHz (RNNoise-downsampled,
             # mobile-native, or hot-swap-cache replay). Upsample to the provider
@@ -1353,7 +1362,7 @@ class _TransportMixin:
                 )
             elif sent is False:
                 self._rollback_voice_handoff_input_open(handoff_input_sequence)
-            return sent
+            return sent if require_output_commit else None
 
     async def _analyze_image_with_vision_model(
         self,

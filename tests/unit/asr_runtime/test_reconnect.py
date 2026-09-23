@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 import pytest
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from main_logic.core import LLMSessionManager
 from main_logic.asr_client.endpointing.detector_runtime import DetectorFeedResult
 from main_logic.asr_client.lifecycle import VoiceLifecycleEvent, VoiceLifecycleState, VoiceRouteMode
@@ -86,15 +87,22 @@ async def test_reconnect_listener_replacement_cancels_retired_receive_task() -> 
     await asyncio.gather(manager.message_handler_task, return_exceptions=True)
 
 
-async def test_native_connection_close_is_latched_and_not_retried() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        AttributeError("connection already closed"),
+        ConnectionClosedError(None, None),
+        ConnectionClosedOK(None, None),
+    ],
+    ids=["attribute-error", "closed-error", "closed-ok"],
+)
+async def test_native_connection_close_is_latched_and_not_retried(error) -> None:
     runtime = _Runtime()
     runtime._set_microphone_route("native")
     runtime.session_closed_by_server = False
     runtime.last_audio_send_error_time = 0.0
     runtime.audio_error_log_interval = 2.0
-    runtime.session.stream_audio = AsyncMock(
-        side_effect=AttributeError("connection already closed")
-    )
+    runtime.session.stream_audio = AsyncMock(side_effect=error)
 
     assert (
         await runtime._route_microphone_audio(b"\x01\x00", sample_rate_hz=16_000)
@@ -107,6 +115,22 @@ async def test_native_connection_close_is_latched_and_not_retried() -> None:
 
     assert runtime.session_closed_by_server is True
     runtime.session.stream_audio.assert_awaited_once()
+
+
+async def test_shadow_native_connection_close_is_not_latched() -> None:
+    runtime = _Runtime()
+    runtime._set_microphone_route("native")
+    runtime.session_closed_by_server = False
+    runtime._voice_session_activation_factory = SimpleNamespace(enforce=False)
+    runtime.session.stream_audio = AsyncMock(
+        side_effect=ConnectionClosedOK(None, None)
+    )
+
+    await runtime._route_microphone_audio(b"\x01\x00", sample_rate_hz=16_000)
+    await runtime._route_microphone_audio(b"\x01\x00", sample_rate_hz=16_000)
+
+    assert runtime.session_closed_by_server is False
+    assert runtime.session.stream_audio.await_count == 2
 
 
 async def test_transport_only_close_enters_deep_sleep_without_closing_detector() -> (

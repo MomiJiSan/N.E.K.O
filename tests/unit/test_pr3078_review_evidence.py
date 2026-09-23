@@ -26,7 +26,10 @@ from main_logic.voice_identity.profile import SpeakerProfile
 from tests.unit.test_hot_swap_cancellation import _FakeSession, _make_swap_manager, _drain_task
 
 BASE = "16a48f711f6842e3fbd181c41675459bb3c025bc"
-HEAD = "299c0b4b8c14eb386c645ad180241c6756e0b5c1"
+# Keep the audit differential pinned to the PR's actual head.  The previous
+# merge commit predates the final Gemini delivery fix and therefore exercised
+# an intermediate, intentionally superseded implementation.
+HEAD = "52556bde9a824ad25354ad15ab3ffbff4b1ed9c4"
 
 
 def revision_method(revision, path, class_name, method_name, namespace):
@@ -106,7 +109,10 @@ async def test_c1_closed_gemini_then_real_swap_differential():
     # contract even when the retired Gemini connection closes normally.
     assert outcomes["BASE"]["successor_bytes"] == 320
     assert outcomes["HEAD"]["successor_bytes"] == 320
-    assert outcomes["HEAD"]["latched_before_swap"] is False
+    # The current head records the retired connection close so activation
+    # recovery can distinguish it from an ordinary transport write.  The
+    # completed swap clears that latch before successor delivery above.
+    assert outcomes["HEAD"]["latched_before_swap"] is True
 
 
 @pytest.mark.asyncio
@@ -132,7 +138,9 @@ async def test_c9_replacement_close_exception_changes_cleanup():
         outcomes[label] = {"error": error, "cleanup_calls": mgr._cleanup_pending_session_resources.await_count, "reset_calls": mgr._reset_preparation_state.await_count}
     print("C9", json.dumps(outcomes))
     assert outcomes["BASE"] == {"error": None, "cleanup_calls": 1, "reset_calls": 1}
-    assert outcomes["HEAD"] == {"error": "replacement-close-failed", "cleanup_calls": 0, "reset_calls": 0}
+    # The current head keeps replacement-close failures best-effort, matching
+    # the base cleanup contract while still completing the cancellation path.
+    assert outcomes["HEAD"] == {"error": None, "cleanup_calls": 1, "reset_calls": 1}
 
 
 @pytest.mark.asyncio
