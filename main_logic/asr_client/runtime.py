@@ -2032,6 +2032,7 @@ class IndependentAsrRuntime:
                     asr_session = None
                     raise
                 except Exception:
+                    failure_code = getattr(asr_session, "last_failure_code", None)
                     try:
                         await asr_session.close()
                     except Exception:
@@ -2039,6 +2040,10 @@ class IndependentAsrRuntime:
                     asr_session = None
                     if not operation_is_current():
                         return stale_result(provider)
+                    if failure_code is not None and classify_failure(
+                        failure_code, source=FailureSource.CONNECT,
+                    ) is not RecoveryDisposition.RETRY_CONNECT:
+                        raise
                     if attempt + 1 >= max_attempts:
                         raise
                     backoff = min(
@@ -3767,7 +3772,7 @@ class IndependentAsrRuntime:
                             getattr(self, "_asr_connect_cleanup_tasks", ())
                         ):
                             break
-                    if operation.recovery is not None and classify_failure(
+                    if (operation.recovery is not None or failure_code is not None) and classify_failure(
                         failure_code or "ASR_INDEPENDENT_FAILED", source=FailureSource.CONNECT,
                     ) is not RecoveryDisposition.RETRY_CONNECT:
                         break
