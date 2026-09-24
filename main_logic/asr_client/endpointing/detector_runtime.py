@@ -13,7 +13,7 @@ from enum import Enum
 from typing import Literal, TypeAlias
 
 from main_logic.voice_turn.activity_evidence import RnnoiseEvidence
-from main_logic.voice_turn.admission import SpeechEvidence
+from main_logic.voice_turn.admission import AdmissionConfig, SpeechEvidence
 from main_logic.voice_turn.contracts import (
     EvaluationStatus,
     SpeechActivityEvent,
@@ -1469,6 +1469,8 @@ class DetectorRuntime:
         on_endpointing_failure: Callable[[], Awaitable[None]] | None = None,
         on_event: Callable[[DetectorEvent], Awaitable[None]] | None = None,
         admission_enabled: bool | None = None,
+        admission_config: AdmissionConfig | None = None,
+        admission_shadow_config: AdmissionConfig | None = None,
     ) -> None:
         if not 0.0 <= rnnoise_onset_probability <= 1.0:
             raise ValueError("RNNoise onset probability must be within [0, 1]")
@@ -1480,7 +1482,13 @@ class DetectorRuntime:
                 enabled=True,
                 inference_error_limit=config.inference_error_limit,
             )
-            gate = (AdmissionActivityGate if admission_enabled else SileroActivityGate)(vad, config)
+            gate = (
+                AdmissionActivityGate(
+                    vad, config, admission_config=admission_config,
+                    admission_shadow_config=admission_shadow_config,
+                )
+                if admission_enabled else SileroActivityGate(vad, config)
+            )
         if gate is None:
             raise ValueError("DetectorRuntime gate is required with a custom VAD")
         self._vad = vad

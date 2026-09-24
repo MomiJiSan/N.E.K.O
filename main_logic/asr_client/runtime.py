@@ -55,6 +55,7 @@ from .endpointing.detector_runtime import (
     SmartTurnLease,
 )
 from .endpointing.throttle_policy import ThrottleAction
+from .endpointing.admission_policy import resolve_admission_policy
 from .lifecycle import (
     AudioDisposition,
     FinalKey,
@@ -1884,6 +1885,7 @@ class IndependentAsrRuntime:
         try:
             # The resolver reads core config synchronously from disk; keep
             # that blocking read off the event loop.
+            admission_policy = resolve_admission_policy()
             selection = await asyncio.to_thread(_resolve_asr_selection, core_type)
             selected_provider = getattr(selection, "provider_key", None)
             if not isinstance(selected_provider, str) or not selected_provider.strip():
@@ -2169,6 +2171,9 @@ class IndependentAsrRuntime:
                         ),
                         on_event=on_detector_event,
                         speaker_shadow=speaker_shadow,
+                        admission_enabled=admission_policy.enabled,
+                        admission_config=admission_policy.config,
+                        admission_shadow_config=admission_policy.shadow_config,
                     )
                 except Exception:
                     await self._close_created_speaker_shadow(speaker_shadow)

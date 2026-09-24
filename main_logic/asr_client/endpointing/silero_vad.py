@@ -95,6 +95,30 @@ class SileroActivityGate:
     def feed(self, pcm16_le: bytes) -> tuple[SpeechActivityEvent, ...]:
         return self.process_probabilities(self._vad.process_pcm16(pcm16_le))
 
+    def confirm_admitted_activity(
+        self, *, trailing_silence_windows: int
+    ) -> tuple[SpeechActivityEvent, ...]:
+        """Bridge an owner's accepted short utterance into existing activity.
+
+        The caller owns admission and invokes this only once for that candidate.
+        No model state is reset and the normal pause threshold stays unchanged.
+        Silence already observed before admission is credited, not waited twice.
+        """
+        if trailing_silence_windows < 0:
+            raise ValueError("trailing silence cannot be negative")
+        if self._speech_confirmed:
+            return ()
+        self._speech_confirmed = True
+        self._speech_windows = self._minimum_speech_windows
+        self._silence_windows = trailing_silence_windows
+        self._candidate_emitted = (
+            self._silence_windows >= self._candidate_silence_windows
+        )
+        events = (SpeechActivityEvent.SPEECH_STARTED,)
+        if self._candidate_emitted:
+            events += (SpeechActivityEvent.CANDIDATE_PAUSE,)
+        return events
+
     @property
     def recovery_boundary_ready(self) -> bool:
         """Whether existing raw activity is idle or paused after a feed.
