@@ -186,10 +186,25 @@ class WakeWordDetection:
             raise ValueError("VOICE_WAKE_WORD_SAMPLE_RANGE_INVALID")
 
 
+@dataclass(frozen=True, slots=True)
+class WakeWordBatchResult:
+    """Acknowledged original frames; keyword timestamps are not delivery boundaries."""
+
+    consumed_frames: int
+    detection: WakeWordDetection | None = None
+
+
 class WakeWordDetector(Protocol):
     """Bounded asynchronous local detector with an isolated inference owner."""
 
+    @property
+    def inference_timeout_seconds(self) -> float: ...
+
     async def prepare(self) -> None: ...
+
+    async def feed_batch(
+        self, frames: tuple[AudioFrame, ...], epoch: int,
+    ) -> WakeWordBatchResult: ...
 
     async def feed(self, frame: AudioFrame, epoch: int) -> WakeWordDetection | None: ...
 
