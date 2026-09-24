@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import logging
 import math
 import os
+from itertools import islice
 
 from main_logic.voice_input.activation import (
     ActivationDecision,
@@ -20,6 +21,7 @@ from main_logic.voice_input.activation import (
     VerificationResultKind,
     VoiceActivationController,
     WakeWordDetector,
+    WakeWordBatchResult,
 )
 
 from .activation_scoring import (
@@ -36,6 +38,18 @@ ActivationStatusCallback = Callable[[ActivationDecision], None]
 logger = logging.getLogger(__name__)
 
 _OUTPUT_RETRY_DELAY_SECONDS = 0.25
+_WAKE_BATCH_SAMPLES = 640
+_WAKE_DIRECT_SAMPLES = 512
+_WAKE_BATCH_FRAMES = 16
+_WAKE_BATCH_WAIT = 0.030
+
+
+@dataclass(frozen=True, slots=True)
+class _WakeQueuedFrame:
+    frame: AudioFrame
+    epoch: int
+    enqueued_at: float
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +60,7 @@ class VoiceSessionActivationRuntimeConfig:
     candidate_silence_seconds: float = 0.5
     shutdown_timeout_seconds: float = 1.0
     wake_queue_bytes: int = 256_000
+    wake_batching_enabled: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -61,6 +76,8 @@ class VoiceSessionActivationRuntimeConfig:
             raise ValueError("candidate_silence_seconds must be positive")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
+        if type(self.wake_batching_enabled) is not bool:
+            raise TypeError("wake_batching_enabled must be bool")
         if type(self.wake_queue_bytes) is not int or self.wake_queue_bytes <= 0:
             raise ValueError("wake_queue_bytes must be a positive integer")
 
@@ -101,14 +118,15 @@ class VoiceSessionActivationRuntime:
         self._wake_ready = False
         self._wake_close_complete = False
         self._wake_task: asyncio.Task[None] | None = None
-        self._wake_queue: deque[tuple[AudioFrame, int]] = deque()
+        self._wake_queue: deque[_WakeQueuedFrame] = deque()
+        self._wake_changed = asyncio.Event()
         self._wake_queue_bytes = 0
         self._wake_inflight_bytes = 0
         # Frames received while the scorer / wake detector is preparing must
         # still be offered to the detector once the runtime enters WAITING.
         # Keep a separate bounded copy because the controller's buffer is also
         # the source for speaker verification and replay.
-        self._wake_prepare_backlog: deque[AudioFrame] = deque()
+        self._wake_prepare_backlog: deque[tuple[AudioFrame, float]] = deque()
         self._wake_prepare_backlog_bytes = 0
         self._wake_epoch: int | None = None
         self._output_task: asyncio.Task[None] | None = None
@@ -657,6 +675,7 @@ class VoiceSessionActivationRuntime:
     def _clear_wake_queue_locked(self) -> None:
         self._wake_queue.clear()
         self._wake_queue_bytes = 0
+        self._wake_changed.set()
 
     def _clear_wake_prepare_backlog_locked(self) -> None:
         self._wake_prepare_backlog.clear()
@@ -670,7 +689,7 @@ class VoiceSessionActivationRuntime:
         if projected > self._config.wake_queue_bytes:
             self._clear_wake_prepare_backlog_locked()
             return False
-        self._wake_prepare_backlog.append(frame)
+        self._wake_prepare_backlog.append((frame, self._wake_now()))
         self._wake_prepare_backlog_bytes = projected
         return True
 
@@ -681,13 +700,15 @@ class VoiceSessionActivationRuntime:
             return True
         frames = tuple(self._wake_prepare_backlog)
         self._clear_wake_prepare_backlog_locked()
-        for frame in frames:
-            if not self._enqueue_wake_locked(frame):
+        for frame, enqueued_at in frames:
+            if not self._enqueue_wake_locked(frame, enqueued_at=enqueued_at):
                 self._clear_wake_queue_locked()
                 return False
         return True
 
-    def _enqueue_wake_locked(self, frame: AudioFrame) -> bool:
+    def _enqueue_wake_locked(
+        self, frame: AudioFrame, *, enqueued_at: float | None = None
+    ) -> bool:
         if self._wake_detector is None or not self._wake_ready:
             return True
         epoch = self._controller.standby_epoch
@@ -700,85 +721,162 @@ class VoiceSessionActivationRuntime:
         ):
             self._clear_wake_queue_locked()
             return False
-        self._wake_queue.append((frame, epoch))
+        self._wake_queue.append(_WakeQueuedFrame(
+            frame, epoch, self._wake_now() if enqueued_at is None else enqueued_at
+        ))
+        self._wake_changed.set()
         self._wake_queue_bytes += len(frame.pcm)
         self._ensure_wake_task_locked()
         return True
 
     def _ensure_wake_task_locked(self) -> None:
-        if self._closed or not self._wake_queue:
+        if not self._wake_is_current() or not self._wake_queue:
             return
         if self._wake_task is None or self._wake_task.done():
             self._wake_task = asyncio.create_task(
                 self._run_wake_detector(), name="voice-wake-word"
             )
 
+    def _wake_now(self) -> float:
+        return asyncio.get_running_loop().time()
+
+    def _wake_is_current(self, epoch: int | None = None) -> bool:
+        return (
+            not self._closed and self._wake_ready
+            and self.state in {ActivationState.WAITING, ActivationState.VERIFYING}
+            and (epoch is None or epoch == self._controller.standby_epoch)
+        )
+
+    def _select_wake_batch_locked(self) -> tuple[int, float, str]:
+        """Inspect without claiming; caller clears the event under the same lock."""
+        first = self._wake_queue[0]
+        if not self._config.wake_batching_enabled:
+            return 1, 0.0, "disabled"
+        samples = first.frame.sample_end - first.frame.sample_start
+        if samples >= _WAKE_DIRECT_SAMPLES:
+            return 1, 0.0, "large_frame"
+        count = 1
+        previous = first
+        for item in islice(self._wake_queue, 1, _WAKE_BATCH_FRAMES + 1):
+            if count >= _WAKE_BATCH_FRAMES:
+                return count, 0.0, "frame_limit"
+            frame = item.frame
+            size = frame.sample_end - frame.sample_start
+            if (item.epoch != first.epoch or frame.generation != first.frame.generation
+                    or frame.sample_start != previous.frame.sample_end
+                    or frame.sequence != previous.frame.sequence + 1):
+                return count, 0.0, "boundary"
+            if size >= _WAKE_DIRECT_SAMPLES or samples + size > _WAKE_BATCH_SAMPLES:
+                return count, 0.0, "next_frame"
+            count += 1
+            samples += size
+            previous = item
+            if samples == _WAKE_BATCH_SAMPLES:
+                return count, 0.0, "target"
+        if count == _WAKE_BATCH_FRAMES:
+            return count, 0.0, "frame_limit"
+        wait = max(0.0, first.enqueued_at + _WAKE_BATCH_WAIT - self._wake_now())
+        return count, wait, "deadline"
+
+    async def _wait_wake_changed(self, timeout: float) -> None:
+        try:
+            async with asyncio.timeout(timeout):
+                await self._wake_changed.wait()
+        except TimeoutError:
+            pass
+
+    @staticmethod
+    def _validate_wake_batch_result(result, frames, epoch) -> None:
+        if not isinstance(result, WakeWordBatchResult):
+            raise ValueError("wake batch result invalid")
+        count = result.consumed_frames
+        if type(count) is not int or not 1 <= count <= len(frames):
+            raise ValueError("wake consumed count invalid")
+        detection = result.detection
+        if detection is None:
+            if count != len(frames):
+                raise ValueError("wake incomplete acknowledgement")
+        elif (detection.generation != frames[0].generation or detection.epoch != epoch
+              or detection.sample_end > frames[count - 1].sample_end):
+            raise ValueError("wake evidence identity or future range invalid")
+
     async def _run_wake_detector(self) -> None:
         current_task = asyncio.current_task()
         diagnostics = os.getenv("NEKO_WAKE_WORD_DIAGNOSTICS") == "1"
+        tail: tuple[_WakeQueuedFrame, ...] = ()
+        deadline = 0.0
+        reason = "tail"
+        retire_detector = False
         try:
             while True:
+                wait = 0.0
                 async with self._lock:
-                    if self._closed or self.state not in {
-                        ActivationState.WAITING,
-                        ActivationState.VERIFYING,
-                    }:
+                    if not self._wake_is_current():
                         self._clear_wake_queue_locked()
                         return
-                    if not self._wake_queue:
-                        return
-                    frame, epoch = self._wake_queue.popleft()
-                    self._wake_queue_bytes -= len(frame.pcm)
-                    if epoch != self._controller.standby_epoch:
-                        continue
-                    self._wake_inflight_bytes = len(frame.pcm)
+                    if tail and not self._wake_is_current(tail[0].epoch):
+                        tail = ()
+                        self._wake_inflight_bytes = 0
+                    if not tail:
+                        while self._wake_queue and not self._wake_is_current(self._wake_queue[0].epoch):
+                            self._wake_queue_bytes -= len(self._wake_queue.popleft().frame.pcm)
+                        if not self._wake_queue:
+                            return
+                        count, wait, reason = self._select_wake_batch_locked()
+                        if wait:
+                            self._wake_changed.clear()
+                        else:
+                            tail = tuple(self._wake_queue.popleft() for _ in range(count))
+                            size = sum(len(item.frame.pcm) for item in tail)
+                            self._wake_queue_bytes -= size
+                            self._wake_inflight_bytes = size
+                            deadline = 0.0
+                if wait:
+                    await self._wait_wake_changed(wait)
+                    continue
+                frames = tuple(item.frame for item in tail)
+                epoch = tail[0].epoch
                 failed = False
+                started = self._wake_now()
                 try:
-                    detection = await self._wake_detector.feed(frame, epoch)
+                    if not deadline:
+                        budget = self._wake_detector.inference_timeout_seconds
+                        if not math.isfinite(budget) or budget <= 0:
+                            raise ValueError("wake inference budget invalid")
+                        deadline = self._wake_now() + budget
+                    if self._wake_now() >= deadline:
+                        raise TimeoutError("wake batch deadline expired")
+                    async with asyncio.timeout_at(deadline):
+                        result = await self._wake_detector.feed_batch(frames, epoch)
+                    self._validate_wake_batch_result(result, frames, epoch)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     failed = True
-                    detection = None
                 async with self._lock:
-                    self._wake_inflight_bytes = 0
-                    if (
-                        self._closed
-                        or epoch != self._controller.standby_epoch
-                        or self.state
-                        not in {ActivationState.WAITING, ActivationState.VERIFYING}
-                    ):
-                        if diagnostics and detection is not None:
+                    if not self._wake_is_current(epoch):
+                        tail = ()
+                        self._wake_inflight_bytes = 0
+                        if diagnostics:
                             self._log_wake_diagnostic("stale_request", epoch)
                         continue
                     if failed:
+                        retire_detector = True
                         self._wake_ready = False
                         self._clear_wake_queue_locked()
-                        self._publish(
-                            self._controller.mark_unavailable(
-                                self._generation,
-                                "wake_word_runtime_failed",
-                            )
-                        )
+                        self._publish(self._controller.mark_unavailable(
+                            self._generation, "wake_word_runtime_failed"))
                         return
+                    oldest = tail[0].enqueued_at
+                    tail = tail[result.consumed_frames:]
+                    self._wake_inflight_bytes = sum(len(item.frame.pcm) for item in tail)
+                    if diagnostics:
+                        self._log_wake_batch(frames, epoch, reason, oldest, started, result)
+                    detection = result.detection
                     if detection is not None:
-                        # Check evidence identity before capture-progress checks,
-                        # which can themselves fail the current input closed.
-                        if (
-                            detection.generation != self._generation
-                            or detection.epoch != epoch
-                        ):
-                            if diagnostics:
-                                self._log_wake_diagnostic("stale_evidence", epoch)
-                            continue
                         self._qualification_now_locked()
-                        decision = (
-                            self._capture_progress_failure
-                            or self._controller.apply_wake_word(
-                                detection,
-                                now=self._controller.monotonic_now(),
-                            )
-                        )
+                        decision = self._capture_progress_failure or self._controller.apply_wake_word(
+                            detection, now=self._controller.monotonic_now())
                         self._publish(decision)
                         if diagnostics:
                             self._log_wake_diagnostic(decision.reason, epoch)
@@ -788,12 +886,38 @@ class VoiceSessionActivationRuntime:
                             self._clear_wake_queue_locked()
                             self._ensure_output_task_locked()
                             self._ensure_idle_task_locked()
+                    reason = "tail"
         finally:
-            async with self._lock:
-                if self._wake_task is current_task:
-                    self._wake_inflight_bytes = 0
-                    self._wake_task = None
-                    self._ensure_wake_task_locked()
+            try:
+                if retire_detector:
+                    try:
+                        async with asyncio.timeout(self._config.shutdown_timeout_seconds):
+                            await self._wake_detector.close()
+                        self._wake_close_complete = True
+                    except Exception:
+                        # Session close retries unresolved resource retirement.
+                        logger.warning("Wake detector retirement incomplete")
+            finally:
+                # Session teardown may cancel the bounded retirement await.
+                # Bookkeeping must settle even when resource close is retried.
+                async with self._lock:
+                    if self._wake_task is current_task:
+                        self._wake_inflight_bytes = 0
+                        self._wake_task = None
+                        self._ensure_wake_task_locked()
+
+    def _log_wake_batch(self, frames, epoch, reason, oldest, started, result) -> None:
+        try:
+            logger.info(
+                "Wake batch epoch=%s batch_frames=%s batch_samples=%s flush_reason=%s "
+                "queue_wait_ms=%.3f scheduling_overrun_ms=%.3f ipc_elapsed_ms=%.3f "
+                "consumed_frames=%s remaining_frames=%s queued_bytes=%s inflight_bytes=%s",
+                epoch, len(frames), sum(len(frame.pcm) // 2 for frame in frames), reason,
+                (started - oldest) * 1000, max(0.0, started - oldest - _WAKE_BATCH_WAIT) * 1000,
+                (self._wake_now() - started) * 1000, result.consumed_frames,
+                len(frames) - result.consumed_frames, self._wake_queue_bytes, self._wake_inflight_bytes)
+        except Exception:
+            pass
 
     def _log_wake_diagnostic(self, reason: str, epoch: int) -> None:
         try:
@@ -959,6 +1083,13 @@ class VoiceSessionActivationRuntime:
         self._attempted_checkpoints.clear()
 
     def _publish(self, decision: ActivationDecision) -> ActivationDecision:
+        # Every controller transition wakes the sole collector. It rechecks
+        # identity/state under the lock before claiming or sending more PCM.
+        if self._wake_detector is not None:
+            self._wake_changed.set()
+            if self.state not in {ActivationState.WAITING, ActivationState.VERIFYING,
+                                  ActivationState.PREPARING}:
+                self._clear_wake_queue_locked()
         if self._status_callback is not None:
             try:
                 self._status_callback(decision)

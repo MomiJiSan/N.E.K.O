@@ -14,11 +14,14 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from types import MappingProxyType
 
-from main_logic.voice_input.activation.contracts import AudioFrame, WakeWordDetection
+from main_logic.voice_input.activation.contracts import AudioFrame, WakeWordBatchResult, WakeWordDetection
 from .diagnostics import WakeWordDiagnostics
 
 
 SUPPORTED_RUNTIME_VERSION = "1.13.8+neko.kws2"
+BATCH_PROTOCOL_VERSION = 1
+MAX_BATCH_FRAMES = 16
+MAX_BATCH_SAMPLES = 640
 
 
 class WakeWordBackendError(RuntimeError):
@@ -152,11 +155,57 @@ class _StreamingSpotter:
 
 def _runtime_details(config: SherpaWakeWordConfig, version: str, native_version: str) -> dict:
     """Configuration supplied to the native constructor, plus its loaded version."""
-    return dict(runtime_version=version, native_version=native_version,
+    return dict(batch_protocol_version=BATCH_PROTOCOL_VERSION,
+                runtime_version=version, native_version=native_version,
                 max_active_paths=config.max_active_paths,
                 keyword_threshold=config.keyword_threshold, keyword_score=config.keyword_score,
                 num_threads=config.num_threads, num_trailing_blanks=1,
                 sample_rate=16000, provider="cpu")
+
+
+def _validate_batch(frames: tuple[AudioFrame, ...], epoch: int,
+                    config: SherpaWakeWordConfig) -> None:
+    """Check the whole envelope before any original frame reaches the model."""
+    if (type(epoch) is not int or epoch < 0 or not isinstance(frames, tuple)
+            or not 1 <= len(frames) <= MAX_BATCH_FRAMES):
+        raise WakeWordBackendError("WAKE_WORD_BATCH_INVALID")
+    previous = None
+    samples = 0
+    for frame in frames:
+        if (not isinstance(frame, AudioFrame) or frame.sample_rate != 16000
+                or type(frame.sequence) is not int or frame.sequence < 0
+                or type(frame.sample_start) is not int or frame.sample_start < 0
+                or type(frame.sample_end) is not int
+                or not 0 < frame.sample_end - frame.sample_start <= config.max_frame_samples
+                or not isinstance(frame.pcm, bytes)
+                or len(frame.pcm) != (frame.sample_end - frame.sample_start) * 2):
+            raise WakeWordBackendError("WAKE_WORD_FRAME_INVALID")
+        if previous is not None and (
+                frame.generation != previous.generation
+                or frame.sequence != previous.sequence + 1
+                or frame.sample_start != previous.sample_end):
+            raise WakeWordBackendError("WAKE_WORD_BATCH_DISCONTINUOUS")
+        samples += frame.sample_end - frame.sample_start
+        previous = frame
+    if len(frames) > 1 and samples > MAX_BATCH_SAMPLES:
+        raise WakeWordBackendError("WAKE_WORD_BATCH_TOO_LARGE")
+
+
+def _validate_batch_result(result: WakeWordBatchResult,
+                           frames: tuple[AudioFrame, ...], epoch: int) -> None:
+    if (not isinstance(result, WakeWordBatchResult)
+            or type(result.consumed_frames) is not int
+            or not 1 <= result.consumed_frames <= len(frames)):
+        raise WakeWordBackendError("WAKE_WORD_BATCH_RESULT_INVALID")
+    detection = result.detection
+    if detection is None:
+        if result.consumed_frames != len(frames):
+            raise WakeWordBackendError("WAKE_WORD_BATCH_RESULT_INVALID")
+        return
+    if (not isinstance(detection, WakeWordDetection)
+            or detection.generation != frames[0].generation or detection.epoch != epoch
+            or detection.sample_end > frames[result.consumed_frames - 1].sample_end):
+        raise WakeWordBackendError("WAKE_WORD_BATCH_RESULT_INVALID")
 
 
 def _worker(connection: Connection, config: SherpaWakeWordConfig) -> None:
@@ -168,14 +217,19 @@ def _worker(connection: Connection, config: SherpaWakeWordConfig) -> None:
         diagnostics.emit("ready", **runtime_info)
         connection.send((True, runtime_info))
         while True:
-            frame, epoch = connection.recv()
-            previous_stream = spotter.stream
-            started = time.perf_counter()
-            detection = spotter.feed(frame, epoch)
-            diagnostics.record(frame, epoch, detection,
-                               restarted=spotter.stream is not previous_stream,
-                               inference_ms=(time.perf_counter() - started) * 1000)
-            connection.send((True, detection))
+            frames, epoch = connection.recv()
+            _validate_batch(frames, epoch, config)
+            detection = None
+            for consumed, frame in enumerate(frames, 1):
+                previous_stream = spotter.stream
+                started = time.perf_counter()
+                detection = spotter.feed(frame, epoch)
+                diagnostics.record(frame, epoch, detection,
+                                   restarted=spotter.stream is not previous_stream,
+                                   inference_ms=(time.perf_counter() - started) * 1000)
+                if detection is not None:
+                    break
+            connection.send((True, WakeWordBatchResult(consumed, detection)))
     except (EOFError, BrokenPipeError):
         pass
     except Exception:
@@ -201,6 +255,11 @@ class SherpaWakeWordDetector:
         self._ready = False
         self._runtime_info = None
         self._reaper_threads: set[threading.Thread] = set()
+
+    @property
+    def inference_timeout_seconds(self) -> float:
+        """Budget shared by the runtime's original batch and acknowledged tails."""
+        return self.config.inference_timeout
 
     @property
     def runtime_info(self) -> Mapping | None:
@@ -307,18 +366,23 @@ class SherpaWakeWordDetector:
             self._busy = False
 
     async def feed(self, frame: AudioFrame, epoch: int) -> WakeWordDetection | None:
+        return (await self.feed_batch((frame,), epoch)).detection
+
+    async def feed_batch(self, frames: tuple[AudioFrame, ...], epoch: int) -> WakeWordBatchResult:
         if self._closed.is_set() or not self._ready:
             raise WakeWordBackendError("WAKE_WORD_NOT_READY")
         if self._busy:
             raise WakeWordBackendError("WAKE_WORD_CONCURRENT_CALL")
-        if frame.sample_rate != 16000 or frame.sample_end - frame.sample_start > self.config.max_frame_samples:
-            raise WakeWordBackendError("WAKE_WORD_FRAME_INVALID")
+        _validate_batch(frames, epoch, self.config)
         self._busy = True
         try:
-            result = await asyncio.wait_for(asyncio.to_thread(self._exchange,
-                (replace(frame, context=None), epoch), self.config.inference_timeout), self.config.inference_timeout)
+            request = (tuple(replace(frame, context=None) for frame in frames), epoch)
+            result = await asyncio.wait_for(asyncio.to_thread(
+                self._exchange, request, self.inference_timeout_seconds),
+                self.inference_timeout_seconds)
             if self._closed.is_set():
                 raise WakeWordBackendError("WAKE_WORD_CLOSED")
+            _validate_batch_result(result, frames, epoch)
             return result
         except BaseException:
             await self.close()

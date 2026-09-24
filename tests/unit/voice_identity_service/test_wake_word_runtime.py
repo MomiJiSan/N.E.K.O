@@ -17,6 +17,7 @@ from main_logic.voice_input.activation import (
     OutputCommit,
     VoiceActivationController,
     WakeWordDetection,
+    WakeWordBatchResult,
 )
 
 
@@ -56,6 +57,15 @@ class Scorer:
 
 
 class Detector:
+    inference_timeout_seconds = 2.0
+
+    async def feed_batch(self, frames, epoch):
+        for count, audio in enumerate(frames, 1):
+            hit = await self.feed(audio, epoch)
+            if hit is not None:
+                return WakeWordBatchResult(count, hit)
+        return WakeWordBatchResult(len(frames), None)
+
     def __init__(self, hit_at=None, *, fail_prepare=False, fail_feed=False):
         self.hit_at = hit_at
         self.fail_prepare = fail_prepare

@@ -111,7 +111,8 @@ def test_invalid_decoder_timestamps_never_become_evidence(times):
 
 
 def ready_info(config):
-    return dict(runtime_version="1.13.8+neko.kws2", native_version="1.13.8+neko.kws2",
+    return dict(batch_protocol_version=backend.BATCH_PROTOCOL_VERSION,
+                runtime_version="1.13.8+neko.kws2", native_version="1.13.8+neko.kws2",
                 max_active_paths=config.max_active_paths,
                 keyword_threshold=config.keyword_threshold, keyword_score=config.keyword_score,
                 num_threads=config.num_threads, num_trailing_blanks=1,
@@ -123,8 +124,8 @@ def responsive_worker(connection, config):
     try:
         while True:
             received, epoch = connection.recv()
-            assert received.context is None
-            connection.send((True, None))
+            assert all(frame.context is None for frame in received)
+            connection.send((True, backend.WakeWordBatchResult(len(received))))
     except EOFError:
         pass
 
@@ -357,7 +358,7 @@ def test_model_initialization_checks_paths_tokens_and_temporary_keyword_lifecycl
 class WorkerConnection:
     def __init__(self):
         self.responses = []
-        self.requests = [(frame(), 7)]
+        self.requests = [((frame(),), 7)]
         self.closed = False
 
     def send(self, result):
@@ -439,7 +440,7 @@ def test_worker_dispatches_and_reports_failure_without_audio_or_exception_detail
     else:
         assert connection.responses == [
             (True, ready_info(backend.SherpaWakeWordConfig("unused", ("x @name",)))),
-            (True, None),
+            (True, backend.WakeWordBatchResult(1)),
         ]
 
 
@@ -521,3 +522,137 @@ def test_native_result_is_consumed_once_with_its_timestamps(monkeypatch):
     result = worker.feed(frame(), 1)
     assert len(calls) == 1
     assert (result.sample_start, result.sample_end) == (16320, 17920)
+
+
+def batch_frames(count=4, samples=160, start=16000):
+    return tuple(replace(frame(start + i * samples, samples), sequence=i,
+                         pcm=i.to_bytes(2, 'little') * samples)
+                 for i in range(count))
+
+
+@pytest.mark.asyncio
+async def test_spawned_batch_preserves_frames_and_strips_every_context(monkeypatch):
+    monkeypatch.setattr(backend, '_worker', responsive_worker)
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    await detector.prepare()
+    try:
+        frames = tuple(replace(item, context=lambda: None) for item in batch_frames())
+        result = await detector.feed_batch(frames, 3)
+        assert result == backend.WakeWordBatchResult(4)
+        assert detector.inference_timeout_seconds == 2.0
+    finally:
+        await detector.close()
+
+
+def test_batch_worker_stops_at_first_hit_and_keeps_original_pcm(monkeypatch):
+    calls = []
+    worker = streaming()
+    frames = batch_frames()
+    detection = backend.WakeWordDetection('name', GENERATION, 7, 15000, 16200)
+
+    def feed(item, epoch):
+        calls.append((item, epoch))
+        return detection if len(calls) == 2 else None
+
+    monkeypatch.setattr(worker, 'feed', feed)
+    monkeypatch.setattr(backend, '_StreamingSpotter', lambda config: worker)
+    connection = WorkerConnection()
+    connection.requests = [(frames, 7)]
+    backend._worker(connection, backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    assert calls == [(frames[0], 7), (frames[1], 7)]
+    assert connection.responses[-1] == (True, backend.WakeWordBatchResult(2, detection))
+
+
+@pytest.mark.parametrize('change', ['gap', 'sequence', 'generation', 'rate', 'capacity', 'frame_count'])
+def test_whole_batch_validated_before_worker_processes_first_frame(monkeypatch, change):
+    frames = list(batch_frames())
+    if change == 'gap':
+        frames[-1] = replace(frames[-1], sample_start=20000, sample_end=20160)
+    elif change == 'sequence':
+        frames[-1] = replace(frames[-1], sequence=8)
+    elif change == 'generation':
+        frames[-1] = replace(frames[-1], generation=replace(GENERATION, route=2))
+    elif change == 'rate':
+        frames[-1] = replace(frames[-1], sample_rate=8000)
+    elif change == 'capacity':
+        frames = list(batch_frames(5))
+    else:
+        frames = list(batch_frames(17, samples=1))
+    calls = []
+    worker = streaming()
+    monkeypatch.setattr(worker, 'feed', lambda *args: calls.append(args))
+    monkeypatch.setattr(backend, '_StreamingSpotter', lambda config: worker)
+    connection = WorkerConnection()
+    connection.requests = [(tuple(frames), 7)]
+    backend._worker(connection, backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    assert not calls
+    assert connection.responses[-1] == (False, 'WAKE_WORD_WORKER_FAILED')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reply', [None, backend.WakeWordBatchResult(True),
+    backend.WakeWordBatchResult(0), backend.WakeWordBatchResult(5),
+    backend.WakeWordBatchResult(2),
+    backend.WakeWordBatchResult(2, backend.WakeWordDetection('name', GENERATION, 8, 15000, 16200)),
+    backend.WakeWordBatchResult(2, backend.WakeWordDetection('name', GENERATION, 7, 15000, 16500)),
+    backend.WakeWordBatchResult(2, backend.WakeWordDetection('name', replace(GENERATION, route=2), 7, 15000, 16200)),
+])
+async def test_invalid_ack_is_terminal_and_never_retried(monkeypatch, reply):
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    detector._ready = True
+    requests = []
+
+    def exchange(request, timeout):
+        requests.append(request)
+        return reply
+
+    monkeypatch.setattr(detector, '_exchange', exchange)
+    with pytest.raises(backend.WakeWordBackendError, match='BATCH_RESULT_INVALID'):
+        await detector.feed_batch(batch_frames(), 7)
+    assert len(requests) == 1
+    assert detector._closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_ack_accepts_keyword_start_before_current_batch(monkeypatch):
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    detector._ready = True
+    result = backend.WakeWordBatchResult(2, backend.WakeWordDetection('name', GENERATION, 7, 12000, 16200))
+    monkeypatch.setattr(detector, '_exchange', lambda *args: result)
+    try:
+        assert await detector.feed_batch(batch_frames(), 7) == result
+    finally:
+        await detector.close()
+
+
+@pytest.mark.asyncio
+async def test_single_and_batch_share_single_flight_guard(monkeypatch):
+    monkeypatch.setattr(backend, '_worker', stuck_worker)
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    await detector.prepare()
+    started = asyncio.Event()
+
+    async def run_batch():
+        started.set()
+        return await detector.feed_batch(batch_frames(), 1)
+
+    task = asyncio.create_task(run_batch())
+    await started.wait()
+    with pytest.raises(backend.WakeWordBackendError, match='CONCURRENT'):
+        await detector.feed(frame(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert detector._closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_ready_requires_batch_protocol_even_with_correct_native_version(monkeypatch):
+    detector = backend.SherpaWakeWordDetector(backend.SherpaWakeWordConfig('unused', ('x @name',)))
+    reply = ready_info(detector.config)
+    del reply['batch_protocol_version']
+    monkeypatch.setattr(detector, '_launch', lambda: None)
+    monkeypatch.setattr(detector, '_exchange', lambda *args: reply)
+    with pytest.raises(backend.WakeWordBackendError, match='RUNTIME_INFO_INVALID'):
+        await detector.prepare()
+    assert detector._closed.is_set()
