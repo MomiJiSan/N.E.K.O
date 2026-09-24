@@ -65,6 +65,8 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
+        "2026-09-23-voice-integration-main",
+        "2026-09-23-plugin-html-content-main-merge",
         "2026-09-22-voice-session-activation",
         "2026-09-12-voice-wake-word-kws2-main",
         "2026-09-14-plugin-model-api-proactive-community",
@@ -153,6 +155,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-01-vllm-omni-clone-preflight",
         "2026-09-02-vllm-omni-clone-preflight",
         "2026-09-02-vllm-omni-clone-tts-state",
+        "2026-09-07-plugin-html-content",
         "2026-09-08-drawing-guess",
         "2026-09-09-pngtuber-import-status",
         "2026-09-11-watch-together-preparation-i18n",
@@ -162,6 +165,15 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-06-plugin-model-api",
         "2026-09-03-voice-identity-five-second-verification",
         "2026-09-08-voice-session-activation",
+        "2026-09-09-voice-session-activation-pngtuber",
+        "2026-09-13-plugin-html-content-main-merge",
+        "2026-09-13-plugin-html-content-proactive-community",
+        "2026-09-14-plugin-html-content-main-merge",
+        "2026-09-14-plugin-model-api-proactive-community",
+        "2026-09-22-plugin-html-content-main-merge",
+        "2026-09-23-voice-integration-main",
+        "2026-09-23-plugin-html-content-main-merge",
+        "2026-09-22-voice-session-activation",
     }
 )
 
@@ -174,7 +186,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = "3115041681bcbde4547326c9e377a3845bc853a1642091387e677600e4da9779"
+LOCALE_KEY_SIGNATURE = "41d5066ebc144f744a3c74cb7dc3b4367b4d6215716d5c1d868ccb02fb3e76eb"
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "

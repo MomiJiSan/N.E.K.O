@@ -29,8 +29,8 @@
     const SUPPORTED_LANGUAGES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'ru', 'es', 'pt'];
 
     // locale 资源版本（用于 cache-busting，避免客户端长期缓存旧语言包导致新增 key 不生效）
-    // 同步主分支插件设置与整合分支语音、唤醒词语言包。
-    const LOCALE_VERSION = '2026-09-23-voice-integration-main';
+    // 同步插件卡片、唤醒词及独立 ASR 恢复语言包。
+    const LOCALE_VERSION = '2026-09-24-voice-integration-refresh';
     function initDecorativeImageDragGuard() {
         const markImage = (img) => {
             if (!(img instanceof HTMLImageElement)) return;
