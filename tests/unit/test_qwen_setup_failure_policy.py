@@ -58,7 +58,12 @@ async def test_worker_http_setup_status_is_classified_without_message_matching(m
 async def test_worker_session_update_configuration_failure_does_not_retry(monkeypatch):
     class Socket:
         send = AsyncMock(side_effect=ValueError("invalid setup"))
-        close = AsyncMock()
+        closed = False
+        close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            self.closed = True
 
         def __aiter__(self):
             return self
@@ -67,8 +72,12 @@ async def test_worker_session_update_configuration_failure_does_not_retry(monkey
             await asyncio.Event().wait()
 
     connection = Socket()
-    monkeypatch.setattr(qwen.websockets, "connect", AsyncMock(return_value=connection))
+    connect = AsyncMock(return_value=connection)
+    monkeypatch.setattr(qwen.websockets, "connect", connect)
     responses = asyncio.Queue()
     await qwen.qwen_asr_worker(asyncio.Queue(), responses, "key", AsrSessionConfig())
     assert responses.get_nowait().error_code == "ASR_QWEN_SETUP_FAILED"
-    connection.close.assert_awaited_once()
+    connect.assert_awaited_once()
+    connection.send.assert_awaited_once()
+    assert connection.close_calls == 1
+    assert connection.closed
