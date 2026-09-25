@@ -5978,6 +5978,30 @@ class AsrRuntimeMixin:
             delivery_failure = event.code in {
                 "ASR_INPUT_DELIVERY_FAILED", "ASR_INPUT_DELIVERY_UNCERTAIN",
             }
+            # Independent-ASR failures can arrive through two notification
+            # paths for the same runtime event: the failure callback emits the
+            # status before revoking the lease, then the worker callback may
+            # publish its queued status after that callback returns.  Keep the
+            # pre-revoke ordering, but commit a per-route-operation receipt so
+            # the same failure is delivered once.  The route-operation
+            # generation lets a later recovery episode reuse the same session
+            # epoch without being hidden by an old receipt.
+            independent_failure_notice = None
+            if event.code in {
+                "ASR_INDEPENDENT_FAILED",
+                "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
+            }:
+                independent_failure_notice = (
+                    event.code,
+                    event.provider,
+                    event.session_epoch,
+                    self._asr_route_operation_generation,
+                )
+                if (
+                    getattr(self, "_voice_independent_failure_notice", None)
+                    == independent_failure_notice
+                ):
+                    return
             notice = (event, source_identity)
             if (delivery_failure
                     and getattr(self, "_voice_delivery_failure_notice", None) == notice):
@@ -5997,6 +6021,8 @@ class AsrRuntimeMixin:
             if (delivery_failure and any(delivered)
                     and self._core_asr_operation_identity_matches(source_identity)):
                 self._voice_delivery_failure_notice = notice
+            if independent_failure_notice is not None and any(delivered):
+                self._voice_independent_failure_notice = independent_failure_notice
             if event.code == "ASR_INDEPENDENT_READY":
                 logger.info("[voice-recovery] transport_ready session_epoch=%s", event.session_epoch)
                 # A transport-ready callback is not sufficient on its own:
