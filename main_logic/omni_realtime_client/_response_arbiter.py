@@ -807,16 +807,28 @@ class RealtimeResponseArbiter:
                 or not self._connection_available
             ):
                 return
-            logger.warning(
-                "realtime dispatch held paused for its full %.1fs bound "
-                "(owner=%s preparations=%d current=%s queued=%d); releasing "
-                "the lane because nothing claimed the pause",
-                timeout,
-                self._pause_owner,
-                self._turn_preparations,
-                self.current_source,
-                self._queue.qsize(),
-            )
+            if self._turn_preparations:
+                logger.warning(
+                    "realtime dispatch held paused for its full %.1fs bound "
+                    "(owner=%s preparations=%d current=%s queued=%d); "
+                    "preparation still owns the lane",
+                    timeout,
+                    self._pause_owner,
+                    self._turn_preparations,
+                    self.current_source,
+                    self._queue.qsize(),
+                )
+            else:
+                logger.warning(
+                    "realtime dispatch held paused for its full %.1fs bound "
+                    "(owner=%s preparations=%d current=%s queued=%d); releasing "
+                    "the lane because nothing claimed the pause",
+                    timeout,
+                    self._pause_owner,
+                    self._turn_preparations,
+                    self.current_source,
+                    self._queue.qsize(),
+                )
             self.resume_dispatch()
 
         self._pause_expiry = loop.create_task(

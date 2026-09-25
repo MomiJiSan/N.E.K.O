@@ -67,6 +67,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
     {
         "2026-09-23-voice-integration-main",
         "2026-09-23-plugin-html-content-main-merge",
+        "2026-09-23-voice-wake-word-main",
         "2026-09-22-voice-session-activation",
         "2026-09-12-voice-wake-word-kws2-main",
         "2026-09-14-plugin-model-api-proactive-community",

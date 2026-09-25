@@ -648,6 +648,13 @@ class IndependentAsrRuntime:
         self._asr_received_audio = False
         self._asr_close_tasks: set[asyncio.Task[None]] = set()
         self._asr_owned_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        # Connection cleanup belongs to the session epoch that created it.
+        # A stubborn task from an invalidated epoch may finish later, but it
+        # must not block a new session from attempting to connect.
+        self._asr_connect_cleanup_tasks_by_epoch: dict[
+            int, set[asyncio.Task[Any]]
+        ] = {0: set()}
+        self._asr_connect_cleanup_tasks = self._asr_connect_cleanup_tasks_by_epoch[0]
         self._asr_runtime_close_task: asyncio.Task[None] | None = None
         self._asr_lifecycle: VoiceInputLifecycleController | None = None
         self._asr_detector: DetectorRuntime | None = None
@@ -752,6 +759,37 @@ class IndependentAsrRuntime:
     def _owned_cleanup_done(self, task: asyncio.Task[Any]) -> None:
         self._asr_owned_cleanup_tasks.discard(task)
         self._log_asr_background_task_failure(task)
+
+    def _connect_cleanup_tasks_for_epoch(
+        self, epoch: int | None = None,
+    ) -> set[asyncio.Task[Any]]:
+        """Return the cleanup ledger for one ASR session epoch."""
+
+        self._ensure_asr_runtime_state()
+        ledgers = getattr(self, "_asr_connect_cleanup_tasks_by_epoch", None)
+        if ledgers is None:
+            ledgers = self._asr_connect_cleanup_tasks_by_epoch = {}
+        if epoch is None:
+            epoch = self._asr_session_epoch
+        pending = ledgers.setdefault(epoch, set())
+        if epoch == self._asr_session_epoch:
+            self._asr_connect_cleanup_tasks = pending
+        return pending
+
+    def _advance_asr_session_epoch(self) -> int:
+        """Invalidate callbacks and give the new epoch a fresh cleanup ledger."""
+
+        self._ensure_asr_runtime_state()
+        self._asr_session_epoch += 1
+        pending = self._connect_cleanup_tasks_for_epoch(self._asr_session_epoch)
+        # Completed historical ledgers are no longer needed.  Keep non-empty
+        # ledgers until their callbacks remove the last owned task.
+        ledgers = self._asr_connect_cleanup_tasks_by_epoch
+        for epoch, tasks in list(ledgers.items()):
+            if epoch != self._asr_session_epoch and not tasks:
+                ledgers.pop(epoch, None)
+        self._asr_connect_cleanup_tasks = pending
+        return self._asr_session_epoch
 
     def _ensure_asr_runtime_state(self) -> None:
         if not hasattr(self, "_asr_admission_evidence"):
@@ -2725,7 +2763,7 @@ class IndependentAsrRuntime:
             operation_generation = self._begin_asr_start_operation()
         elif not self._asr_start_operation_matches(operation_generation):
             return None
-        self._asr_session_epoch += 1
+        self._advance_asr_session_epoch()
         self._asr_audio_generation += 1
         transcript_dispatcher = self._asr_transcript_dispatcher
         detector_dispatcher = self._asr_detector_dispatcher
@@ -3565,12 +3603,18 @@ class IndependentAsrRuntime:
                     session_epoch=identity.session_epoch, expected_identity=identity,
                 )
 
+        cleanup_epoch = (
+            operation.identity.session_epoch
+            if operation.identity is not None
+            else self._asr_session_epoch
+        )
         notification = asyncio.create_task(notify_waiting())
         try:
             identity = operation.identity
             if identity is None or not self._runtime_identity_matches(identity):
                 return
-            blocked = getattr(self, "_asr_connect_cleanup_tasks", set())
+            cleanup_epoch = identity.session_epoch
+            blocked = self._connect_cleanup_tasks_for_epoch(cleanup_epoch)
             if any(not task.done() for task in blocked):
                 await self._handle_independent_asr_error(
                     identity.session_epoch, identity.provider or "unknown",
@@ -3584,9 +3628,7 @@ class IndependentAsrRuntime:
                 {notification}, timeout=_CONNECT_CLEANUP_TIMEOUT_SECONDS,
             )
             if not done:
-                pending = getattr(self, "_asr_connect_cleanup_tasks", None)
-                if pending is None:
-                    pending = self._asr_connect_cleanup_tasks = set()
+                pending = self._connect_cleanup_tasks_for_epoch(cleanup_epoch)
                 pending.add(notification)
                 notification.add_done_callback(pending.discard)
             notification.add_done_callback(self._log_asr_background_task_failure)
@@ -3597,9 +3639,7 @@ class IndependentAsrRuntime:
     async def _close_connect_candidate(self, candidate: Any) -> bool:
         """Bound coordination; retain stubborn cleanup and block new workers."""
         task = asyncio.create_task(candidate.close())
-        pending = getattr(self, "_asr_connect_cleanup_tasks", None)
-        if pending is None:
-            pending = self._asr_connect_cleanup_tasks = set()
+        pending = self._connect_cleanup_tasks_for_epoch()
         pending.add(task)
         task.add_done_callback(pending.discard)
         task.add_done_callback(self._log_asr_background_task_failure)
@@ -3614,6 +3654,7 @@ class IndependentAsrRuntime:
     async def _connect_candidate(
         self, candidate: Any, operation: _AsrConnectOperation,
     ) -> None:
+        pending = self._connect_cleanup_tasks_for_epoch()
         task = asyncio.create_task(candidate.connect())
         try:
             done, _ = await asyncio.wait(
@@ -3627,9 +3668,6 @@ class IndependentAsrRuntime:
         finally:
             if not task.done():
                 task.cancel()
-                pending = getattr(self, "_asr_connect_cleanup_tasks", None)
-                if pending is None:
-                    pending = self._asr_connect_cleanup_tasks = set()
                 pending.add(task)
                 task.add_done_callback(self._log_asr_background_task_failure)
 
@@ -3862,8 +3900,10 @@ class IndependentAsrRuntime:
                         except Exception:
                             cleaned = False
                         if not cleaned or any(
-                            not task.done() for task in
-                            getattr(self, "_asr_connect_cleanup_tasks", ())
+                            not task.done()
+                            for task in self._connect_cleanup_tasks_for_epoch(
+                                identity.session_epoch
+                            )
                         ):
                             break
                     if (operation.recovery is not None or failure_code is not None) and classify_failure(
@@ -5411,8 +5451,7 @@ class IndependentAsrRuntime:
                 recovery.task.cancel()
         # The provider callback that reported failure must not be allowed to
         # deliver a queued final into the surviving Omni session.
-        self._asr_session_epoch += 1
-        failure_epoch = self._asr_session_epoch
+        failure_epoch = self._advance_asr_session_epoch()
         self._asr_audio_generation += 1
         transcript_dispatcher = self._asr_transcript_dispatcher
         detector_dispatcher = self._asr_detector_dispatcher

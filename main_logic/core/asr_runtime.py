@@ -3948,7 +3948,7 @@ class AsrRuntimeMixin:
                     self._asr_route_mode,
                     self._voice_session_activation_factory is not None,
                     self._voice_session_activation_required,
-                    bool(getattr(self, "_independent_asr_enabled", False)),
+                    self._asr_route_mode == "independent",
                     bool(getattr(self, "session_closed_by_server", False)),
                 )
         if self._voice_session_activation_degraded:
