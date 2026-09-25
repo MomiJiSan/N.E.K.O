@@ -3569,10 +3569,16 @@
                     }
 
                     if (statusCode && statusCode.indexOf('ASR_INDEPENDENT_') === 0) {
+                        var statusSessionEpoch = statusDetails && statusDetails.session_epoch;
+                        if (statusSessionEpoch != null
+                                && S.voiceSessionEpoch != null
+                                && Number(statusSessionEpoch) < Number(S.voiceSessionEpoch)) {
+                            return;
+                        }
                         var asrProvider = (statusDetails && statusDetails.provider) || '';
                         S.independentAsrProvider = asrProvider;
-                        if (statusDetails && statusDetails.session_epoch != null) {
-                            S.voiceSessionEpoch = statusDetails.session_epoch;
+                        if (statusSessionEpoch != null) {
+                            S.voiceSessionEpoch = statusSessionEpoch;
                         }
                         if (statusCode === 'ASR_INDEPENDENT_READY') {
                             var wasIndependentAsrActive = S.independentAsrActive === true;

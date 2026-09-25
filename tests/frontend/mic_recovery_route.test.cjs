@@ -272,6 +272,18 @@ test('ASR status updates routing but only the first activation displays its toas
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), true);
 });
 
+test('stale ASR status cannot replace the current session epoch', () => {
+    const env = loadCapture(false);
+    env.loadWebsocket();
+    env.S.voiceSessionEpoch = 12;
+    env.status('ASR_INDEPENDENT_READY', { provider: 'current', session_epoch: 12 });
+    assert.equal(env.S.voiceSessionEpoch, 12);
+    assert.equal(env.S.independentAsrProvider, 'current');
+    env.status('ASR_INDEPENDENT_READY', { provider: 'stale', session_epoch: 11 });
+    assert.equal(env.S.voiceSessionEpoch, 12);
+    assert.equal(env.S.independentAsrProvider, 'current');
+});
+
 test('READY and FAILED without the current lease identity cannot finish recovery', () => {
     const env = loadCapture(true);
     env.S.voiceSessionEpoch = 12;

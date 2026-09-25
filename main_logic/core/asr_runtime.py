@@ -5956,7 +5956,12 @@ class AsrRuntimeMixin:
             status=(
                 AsrStatusEvent(code=event.code, provider=event.provider,
                                session_epoch=event.session_epoch)
-                if event.code in {"ASR_INPUT_DELIVERY_FAILED", "ASR_INPUT_DELIVERY_UNCERTAIN"}
+                if event.code in {
+                    "ASR_INPUT_DELIVERY_FAILED",
+                    "ASR_INPUT_DELIVERY_UNCERTAIN",
+                    "ASR_INDEPENDENT_FAILED",
+                    "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
+                }
                 else None
             ),
         )

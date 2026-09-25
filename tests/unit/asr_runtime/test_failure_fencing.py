@@ -1,7 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 from main_logic.asr_client.runtime import AsrStartResult, AsrStartStatus
 from main_logic.asr_client.lifecycle import VoiceLifecycleEvent, VoiceLifecycleState
@@ -181,6 +181,7 @@ async def test_runtime_failure_from_a_live_route_still_revokes_the_lease() -> No
     runtime._voice_lease_connection_id = "socket-a"
     runtime._voice_input_websocket = object()
 
+    expected_lease_generation = runtime._voice_lease_generation
     await runtime._handle_core_asr_failure(
         AsrFailureEvent(
             code="ASR_INDEPENDENT_FAILED",
@@ -191,6 +192,14 @@ async def test_runtime_failure_from_a_live_route_still_revokes_the_lease() -> No
 
     assert runtime._asr_route_mode == "blocked"
     assert runtime._voice_lease_connection_id == ""
+    payloads = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    assert any(
+        payload.get("code") == "VOICE_INPUT_RECOVERY_FAILED"
+        and payload.get("details", {}).get("lease_generation") == expected_lease_generation
+        for payload in payloads
+    )
 
 
 async def test_old_abort_release_cannot_close_replacement_session() -> None:
