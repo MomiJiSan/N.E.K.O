@@ -4811,6 +4811,7 @@ class AsrRuntimeMixin:
     ) -> None:
         self._ensure_asr_runtime_state()
         self._voice_input_transition_generation += 1
+        transition_snapshot = self._voice_input_transition_generation
         previous = (
             self._voice_lease_owner,
             self._voice_lease_hard_muted,
@@ -4852,6 +4853,10 @@ class AsrRuntimeMixin:
             and (previous[1] or previous[2])
             and reason in {"hard_unmute", "focus_resume", "lease_sync"}
             and self._asr_route_mode == "independent"
+            and self._voice_input_transition_generation == transition_snapshot
+            and self._voice_lease_owner == "core"
+            and not self._voice_lease_hard_muted
+            and not self._voice_lease_focus_suppressed
         ):
             logger.info(
                 "[voice-recovery] unmute_requested owner=%s route=%s "
@@ -4900,6 +4905,10 @@ class AsrRuntimeMixin:
                 and (previous[1] or previous[2])
                 and reason in {"hard_unmute", "focus_resume", "lease_sync"}
                 and self._asr_route_mode == "independent"
+                and self._voice_input_transition_generation == transition_snapshot
+                and self._voice_lease_owner == "core"
+                and not self._voice_lease_hard_muted
+                and not self._voice_lease_focus_suppressed
             ):
                 logger.info("[voice-recovery] restart_requested reason=%s lease_generation=%s", reason, self._voice_lease_generation)
                 restart = getattr(self._asr_runtime, "_ensure_transport_restart_task", None)
