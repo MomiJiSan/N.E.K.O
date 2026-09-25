@@ -654,7 +654,9 @@ class IndependentAsrRuntime:
         self._asr_connect_cleanup_tasks_by_epoch: dict[
             int, set[asyncio.Task[Any]]
         ] = {0: set()}
-        self._asr_connect_cleanup_tasks = self._asr_connect_cleanup_tasks_by_epoch[0]
+        # Compatibility/diagnostic view of every still-owned cleanup task.
+        # Connection admission consults the epoch-specific ledgers instead.
+        self._asr_connect_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._asr_runtime_close_task: asyncio.Task[None] | None = None
         self._asr_lifecycle: VoiceInputLifecycleController | None = None
         self._asr_detector: DetectorRuntime | None = None
@@ -772,9 +774,27 @@ class IndependentAsrRuntime:
         if epoch is None:
             epoch = self._asr_session_epoch
         pending = ledgers.setdefault(epoch, set())
-        if epoch == self._asr_session_epoch:
-            self._asr_connect_cleanup_tasks = pending
         return pending
+
+    def _track_connect_cleanup_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        epoch: int | None = None,
+        pending: set[asyncio.Task[Any]] | None = None,
+    ) -> None:
+        """Retain a cleanup task in both its epoch ledger and diagnostics view."""
+
+        if pending is None:
+            pending = self._connect_cleanup_tasks_for_epoch(epoch)
+        pending.add(task)
+        self._asr_connect_cleanup_tasks.add(task)
+
+        def discard(completed: asyncio.Task[Any]) -> None:
+            pending.discard(completed)
+            self._asr_connect_cleanup_tasks.discard(completed)
+
+        task.add_done_callback(discard)
 
     def _advance_asr_session_epoch(self) -> int:
         """Invalidate callbacks and give the new epoch a fresh cleanup ledger."""
@@ -788,7 +808,6 @@ class IndependentAsrRuntime:
         for epoch, tasks in list(ledgers.items()):
             if epoch != self._asr_session_epoch and not tasks:
                 ledgers.pop(epoch, None)
-        self._asr_connect_cleanup_tasks = pending
         return self._asr_session_epoch
 
     def _ensure_asr_runtime_state(self) -> None:
@@ -3628,9 +3647,9 @@ class IndependentAsrRuntime:
                 {notification}, timeout=_CONNECT_CLEANUP_TIMEOUT_SECONDS,
             )
             if not done:
-                pending = self._connect_cleanup_tasks_for_epoch(cleanup_epoch)
-                pending.add(notification)
-                notification.add_done_callback(pending.discard)
+                self._track_connect_cleanup_task(
+                    notification, epoch=cleanup_epoch,
+                )
             notification.add_done_callback(self._log_asr_background_task_failure)
             notify_capacity = getattr(self, "_notify_prefix_capacity", None)
             if notify_capacity is not None:
@@ -3639,9 +3658,7 @@ class IndependentAsrRuntime:
     async def _close_connect_candidate(self, candidate: Any) -> bool:
         """Bound coordination; retain stubborn cleanup and block new workers."""
         task = asyncio.create_task(candidate.close())
-        pending = self._connect_cleanup_tasks_for_epoch()
-        pending.add(task)
-        task.add_done_callback(pending.discard)
+        self._track_connect_cleanup_task(task)
         task.add_done_callback(self._log_asr_background_task_failure)
         done, _ = await asyncio.wait({task}, timeout=_CONNECT_CLEANUP_TIMEOUT_SECONDS)
         if not done:
@@ -3668,14 +3685,13 @@ class IndependentAsrRuntime:
         finally:
             if not task.done():
                 task.cancel()
-                pending.add(task)
+                self._track_connect_cleanup_task(task, pending=pending)
                 task.add_done_callback(self._log_asr_background_task_failure)
 
                 def close_late_connection(completed: asyncio.Task[None]) -> None:
                     if not completed.cancelled() and completed.exception() is None:
                         cleanup = asyncio.create_task(candidate.close())
-                        pending.add(cleanup)
-                        cleanup.add_done_callback(pending.discard)
+                        self._track_connect_cleanup_task(cleanup, pending=pending)
                         cleanup.add_done_callback(self._log_asr_background_task_failure)
                     pending.discard(completed)
 
