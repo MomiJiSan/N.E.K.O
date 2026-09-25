@@ -213,6 +213,35 @@ async def test_recovery_failed_status_carries_current_lease_generation() -> None
     assert payloads[-1]["details"]["lease_generation"] == 7
 
 
+async def test_independent_failure_retries_only_undelivered_recovery_notice() -> None:
+    runtime = _Runtime()
+    runtime._set_microphone_route("independent")
+    epoch = runtime._asr_session_epoch
+    outcomes = iter([True, False, True])
+
+    async def send_status(payload: str) -> bool:
+        return next(outcomes)
+
+    runtime.send_status = AsyncMock(side_effect=send_status)
+    event = AsrStatusEvent(
+        code="ASR_INDEPENDENT_FAILED",
+        provider="qwen",
+        session_epoch=epoch,
+    )
+
+    await runtime._send_core_asr_status(event)
+    await runtime._send_core_asr_status(event)
+
+    payloads = [
+        json.loads(call.args[0]) for call in runtime.send_status.await_args_list
+    ]
+    assert [payload["code"] for payload in payloads] == [
+        "ASR_INDEPENDENT_FAILED",
+        "VOICE_INPUT_RECOVERY_FAILED",
+        "VOICE_INPUT_RECOVERY_FAILED",
+    ]
+
+
 async def test_blocked_text_notice_commits_only_for_current_connection() -> None:
     runtime = _Runtime()
     runtime.input_mode = "text"

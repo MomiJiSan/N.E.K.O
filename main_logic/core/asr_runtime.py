@@ -5982,11 +5982,13 @@ class AsrRuntimeMixin:
             # paths for the same runtime event: the failure callback emits the
             # status before revoking the lease, then the worker callback may
             # publish its queued status after that callback returns.  Keep the
-            # pre-revoke ordering, but commit a per-route-operation receipt so
-            # the same failure is delivered once.  The route-operation
+            # pre-revoke ordering, but keep separate per-plane delivery
+            # ledgers for the primary and recovery notices.  A retry can then
+            # fill only the plane that failed, while the route-operation
             # generation lets a later recovery episode reuse the same session
-            # epoch without being hidden by an old receipt.
+            # epoch without being hidden by an old ledger.
             independent_failure_notice = None
+            independent_failure_progress = None
             if event.code in {
                 "ASR_INDEPENDENT_FAILED",
                 "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
@@ -5997,9 +5999,25 @@ class AsrRuntimeMixin:
                     event.session_epoch,
                     self._asr_route_operation_generation,
                 )
+                stored_progress = getattr(
+                    self, "_voice_independent_failure_delivery", None
+                )
                 if (
-                    getattr(self, "_voice_independent_failure_notice", None)
-                    == independent_failure_notice
+                    stored_progress is None
+                    or stored_progress[0] != independent_failure_notice
+                ):
+                    stored_progress = (
+                        independent_failure_notice,
+                        {"primary": set(), "recovery": set()},
+                    )
+                    self._voice_independent_failure_delivery = stored_progress
+                independent_failure_progress = stored_progress[1]
+                if all(
+                    plane in independent_failure_progress["primary"]
+                    for plane in ("display_delivered", "voice_owner_settled")
+                ) and all(
+                    plane in independent_failure_progress["recovery"]
+                    for plane in ("display_delivered", "voice_owner_settled")
                 ):
                     return
             notice = (event, source_identity)
@@ -6016,13 +6034,14 @@ class AsrRuntimeMixin:
                         },
                     }
                 ),
+                progress=(None, independent_failure_progress["primary"])
+                if independent_failure_progress is not None
+                else None,
                 still_current=lambda: self._core_asr_operation_identity_matches(source_identity),
             )
             if (delivery_failure and any(delivered)
                     and self._core_asr_operation_identity_matches(source_identity)):
                 self._voice_delivery_failure_notice = notice
-            if independent_failure_notice is not None and any(delivered):
-                self._voice_independent_failure_notice = independent_failure_notice
             if event.code == "ASR_INDEPENDENT_READY":
                 logger.info("[voice-recovery] transport_ready session_epoch=%s", event.session_epoch)
                 # A transport-ready callback is not sufficient on its own:
@@ -6083,6 +6102,7 @@ class AsrRuntimeMixin:
                             },
                         }
                     ),
+                    progress=(None, independent_failure_progress["recovery"]),
                     still_current=lambda: self._voice_input_recovery_failure_is_current(
                         source_identity,
                         event.session_epoch,
