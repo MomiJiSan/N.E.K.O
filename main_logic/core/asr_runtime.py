@@ -4848,6 +4848,7 @@ class AsrRuntimeMixin:
         if (
             owner == "core"
             and not hard_muted
+            and not focus_suppressed
             and (previous[1] or previous[2])
             and reason in {"hard_unmute", "focus_resume", "lease_sync"}
             and self._asr_route_mode == "independent"
@@ -4895,6 +4896,7 @@ class AsrRuntimeMixin:
             if (
                 owner == "core"
                 and not hard_muted
+                and not focus_suppressed
                 and (previous[1] or previous[2])
                 and reason in {"hard_unmute", "focus_resume", "lease_sync"}
                 and self._asr_route_mode == "independent"

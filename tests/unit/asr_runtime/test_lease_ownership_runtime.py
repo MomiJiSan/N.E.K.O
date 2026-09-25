@@ -283,6 +283,14 @@ async def test_focus_resume_restarts_independent_asr_after_focus_abort() -> None
     await runtime._apply_voice_lease_state(
         owner="core",
         hard_muted=False,
+        focus_suppressed=True,
+        reason="lease_sync",
+        force_abort=True,
+    )
+    runtime._asr_runtime._ensure_transport_restart_task.assert_not_called()
+    await runtime._apply_voice_lease_state(
+        owner="core",
+        hard_muted=False,
         focus_suppressed=False,
         reason="focus_resume",
         force_abort=True,
