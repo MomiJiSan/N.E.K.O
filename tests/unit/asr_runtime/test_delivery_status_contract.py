@@ -1,7 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, MagicMock
 import pytest
 from main_logic.asr_client.lifecycle import VoiceTurnToken
 from main_logic.voice_turn.contracts import AsrLifecycleNotification, AsrStatusEvent, VoicePartialEvent
@@ -240,6 +240,42 @@ async def test_independent_failure_retries_only_undelivered_recovery_notice() ->
         "VOICE_INPUT_RECOVERY_FAILED",
         "VOICE_INPUT_RECOVERY_FAILED",
     ]
+
+
+async def test_fail_closed_retries_recovery_before_revoking_voice_lease() -> None:
+    runtime = _Runtime()
+    runtime._set_microphone_route("blocked")
+    runtime._voice_lease_connection_id = "voice-window"
+    runtime._voice_lease_generation = 3
+    owner_socket = object()
+    runtime._voice_owner_socket = MagicMock(return_value=owner_socket)
+    runtime._send_to_voice_owner = AsyncMock(
+        side_effect=[owner_socket, None, owner_socket]
+    )
+    runtime.send_status = AsyncMock(return_value=True)
+    operation_generation = runtime._begin_asr_route_operation()
+
+    revoked = await runtime._fail_closed_voice_route(
+        "independent_asr_failure",
+        operation_generation=operation_generation,
+        status=AsrStatusEvent(
+            code="ASR_INDEPENDENT_FAILED",
+            provider="qwen",
+            session_epoch=runtime._asr_session_epoch,
+        ),
+    )
+
+    assert revoked is True
+    assert runtime._send_to_voice_owner.await_count == 3
+    assert [
+        json.loads(call.args[0]["message"])["code"]
+        for call in runtime._send_to_voice_owner.await_args_list
+    ] == [
+        "ASR_INDEPENDENT_FAILED",
+        "VOICE_INPUT_RECOVERY_FAILED",
+        "VOICE_INPUT_RECOVERY_FAILED",
+    ]
+    assert runtime._voice_lease_connection_id == ""
 
 
 async def test_blocked_text_notice_commits_only_for_current_connection() -> None:

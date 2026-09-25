@@ -4897,7 +4897,8 @@
                     // The session acknowledgement is the authoritative route
                     // for this session. Clear stale independent-ASR state when
                     // a new native realtime session replaces an old ASR one.
-                    if (response.input_mode !== 'text'
+                    if (_ackAnswersThisWindow
+                            && response.input_mode !== 'text'
                             && (response.microphone_route === 'native'
                                 || response.microphone_route === 'independent')) {
                         S.independentAsrActive = response.microphone_route === 'independent';

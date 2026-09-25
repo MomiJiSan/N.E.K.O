@@ -284,6 +284,24 @@ test('stale ASR status cannot replace the current session epoch', () => {
     assert.equal(env.S.independentAsrProvider, 'current');
 });
 
+test('a session_started ack for another window cannot replace the current ASR route', () => {
+    const env = loadCapture(true);
+    env.loadWebsocket();
+    env.S.independentAsrActive = true;
+    env.S.sessionStartedResolver = () => {};
+    env.S._pendingSessionStartMode = 'audio';
+    env.S._pendingSessionStartRequestId = 'current-request';
+
+    env.S.socket.onmessage({ data: JSON.stringify({
+        type: 'session_started',
+        input_mode: 'audio',
+        microphone_route: 'native',
+        request_id: 'older-window-request',
+    }) });
+
+    assert.equal(env.S.independentAsrActive, true);
+});
+
 test('READY and FAILED without the current lease identity cannot finish recovery', () => {
     const env = loadCapture(true);
     env.S.voiceSessionEpoch = 12;

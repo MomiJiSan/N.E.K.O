@@ -267,6 +267,30 @@ async def test_voice_control_status_resolves_owner_after_display_delivery() -> N
     )
 
 
+async def test_focus_resume_restarts_independent_asr_after_focus_abort() -> None:
+    runtime = _Runtime()
+    runtime._set_microphone_route("independent")
+    runtime._asr_runtime.abort = AsyncMock()
+    runtime._asr_runtime._ensure_transport_restart_task = MagicMock()
+
+    await runtime._apply_voice_lease_state(
+        owner="core",
+        hard_muted=False,
+        focus_suppressed=True,
+        reason="focus_suppress",
+        force_abort=True,
+    )
+    await runtime._apply_voice_lease_state(
+        owner="core",
+        hard_muted=False,
+        focus_suppressed=False,
+        reason="focus_resume",
+        force_abort=True,
+    )
+
+    runtime._asr_runtime._ensure_transport_restart_task.assert_called_once_with()
+
+
 async def test_synchronized_none_owner_pcm_signals_lease_resync() -> None:
     runtime = _Runtime()
     assert runtime._begin_voice_input_connection("chat-window") is True

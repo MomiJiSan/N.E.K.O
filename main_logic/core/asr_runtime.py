@@ -4848,8 +4848,8 @@ class AsrRuntimeMixin:
         if (
             owner == "core"
             and not hard_muted
-            and previous[1]
-            and reason in {"hard_unmute", "lease_sync"}
+            and (previous[1] or previous[2])
+            and reason in {"hard_unmute", "focus_resume", "lease_sync"}
             and self._asr_route_mode == "independent"
         ):
             logger.info(
@@ -4895,8 +4895,8 @@ class AsrRuntimeMixin:
             if (
                 owner == "core"
                 and not hard_muted
-                and previous[1]
-                and reason in {"hard_unmute", "lease_sync"}
+                and (previous[1] or previous[2])
+                and reason in {"hard_unmute", "focus_resume", "lease_sync"}
                 and self._asr_route_mode == "independent"
             ):
                 logger.info("[voice-recovery] restart_requested reason=%s lease_generation=%s", reason, self._voice_lease_generation)
@@ -5024,6 +5024,19 @@ class AsrRuntimeMixin:
                 notified = True
         if status is not None:
             await self._send_core_asr_status(status)
+            # The first send can deliver the display plane while the
+            # voice-owner plane is still unsettled. Give that recovery notice
+            # one bounded follow-up while the lease is current; after revoke,
+            # the identity fence must reject stale callbacks.
+            if (
+                status.code
+                in {
+                    "ASR_INDEPENDENT_FAILED",
+                    "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
+                }
+                and operation_is_current()
+            ):
+                await self._send_core_asr_status(status)
             notified = True
         if notified and not operation_is_current():
             return False
