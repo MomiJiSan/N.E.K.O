@@ -19,7 +19,7 @@ import main_routers.voice_identity_router as voice_identity_router
 
 API_ROOT = "/api/voice-identity"
 PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=16000;channels=1"
-MAX_PCM_BYTES = 16_000 * 4 * 2
+MAX_PCM_BYTES = 16_000 * 8 * 2
 MAX_FILTER_JSON_BYTES = 1024
 AUTH_HEADERS = {
     "Origin": "http://testserver",
@@ -50,6 +50,7 @@ def _fake_service(payload: dict[str, object] | None = None) -> SimpleNamespace:
         status=MagicMock(return_value=status),
         start_enrollment=AsyncMock(),
         complete_enrollment=AsyncMock(return_value=status),
+        complete_enrollment_segment=AsyncMock(return_value=status),
         cancel_enrollment=AsyncMock(return_value=True),
         set_filter=AsyncMock(return_value=status),
         delete_profile=AsyncMock(return_value=status),
@@ -224,7 +225,7 @@ def test_start_returns_canonical_status_without_private_model_data(
 
 
 @pytest.mark.unit
-def test_binary_profile_upload_forwards_exact_headers_and_body_idempotently(
+def test_binary_profile_upload_forwards_eight_second_body_idempotently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _fake_service()
@@ -259,6 +260,55 @@ def test_binary_profile_upload_forwards_exact_headers_and_body_idempotently(
 
 
 @pytest.mark.unit
+def test_segment_upload_forwards_segment_header_and_pcm_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+    pcm16 = bytes(48_000)
+    headers = {
+        "Content-Type": PCM_CONTENT_TYPE,
+        "X-Voice-Identity-Enrollment": "enrollment-1",
+        "X-Voice-Identity-Profile": "profile-1",
+        "X-Voice-Identity-Segment": "2",
+    }
+
+    response = client.put(
+        f"{API_ROOT}/enrollment/segment",
+        content=pcm16,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    service.complete_enrollment_segment.assert_awaited_once_with(
+        "enrollment-1", "profile-1", 2, pcm16
+    )
+    service.complete_enrollment.assert_not_awaited()
+    _assert_private_values_absent(response.json())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("segment", ["", "0", "4", "x"])
+def test_segment_upload_rejects_invalid_segment_header(
+    monkeypatch: pytest.MonkeyPatch,
+    segment: str,
+) -> None:
+    service = _fake_service()
+    client = _client(monkeypatch, service)
+    response = client.put(
+        f"{API_ROOT}/enrollment/segment",
+        content=bytes(48_000),
+        headers={
+            "Content-Type": PCM_CONTENT_TYPE,
+            "X-Voice-Identity-Segment": segment,
+        },
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error_code": "invalid_enrollment_segment"}
+    service.complete_enrollment_segment.assert_not_awaited()
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("body_size", "content_type", "expected_status", "expected_code"),
     [
@@ -266,7 +316,7 @@ def test_binary_profile_upload_forwards_exact_headers_and_body_idempotently(
         (MAX_PCM_BYTES + 1, PCM_CONTENT_TYPE, 413, "audio_too_long"),
     ],
 )
-def test_profile_upload_rejects_wrong_type_and_more_than_four_seconds(
+def test_profile_upload_rejects_wrong_type_and_more_than_eight_seconds(
     monkeypatch: pytest.MonkeyPatch,
     body_size: int,
     content_type: str,

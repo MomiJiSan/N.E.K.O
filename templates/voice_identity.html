@@ -17,7 +17,18 @@
 <body class="voice-identity-page">
     <main class="voice-identity-shell container">
         <header class="voice-identity-header container-header page-title-bar">
-            <h2 data-i18n="voiceIdentity.pageTitle" data-text="Owner 声纹">Owner 声纹</h2>
+            <div class="voice-identity-brand">
+                <span class="brand-cat-paw" aria-hidden="true">
+                    <svg viewBox="0 0 44 36" focusable="false">
+                        <ellipse cx="22" cy="24" rx="10" ry="8"></ellipse>
+                        <circle cx="9" cy="12" r="4"></circle>
+                        <circle cx="18" cy="7" r="4"></circle>
+                        <circle cx="28" cy="7" r="4"></circle>
+                        <circle cx="37" cy="12" r="4"></circle>
+                    </svg>
+                </span>
+                <h2 data-i18n="voiceIdentity.pageTitle" data-text="Owner 声纹">Owner 声纹</h2>
+            </div>
             <div class="neko-window-controls">
                 <button type="button" class="neko-window-control-btn"
                     data-neko-window-control="pin"
@@ -63,7 +74,8 @@
                     <div class="status-copy">
                         <span class="status-dot" id="voice-identity-status-dot" aria-hidden="true"></span>
                         <div>
-                            <h2 id="profile-status-title" data-i18n="voiceIdentity.profileStatus">声纹状态</h2>
+                            <p class="status-card-label" id="profile-status-title"
+                                data-i18n="voiceIdentity.profileStatus">声纹状态</p>
                             <p id="voice-identity-profile-status" role="status"
                                 aria-live="polite" aria-atomic="true"
                                 data-i18n="voiceIdentity.profileMissing">尚未录入 Owner 声纹</p>
@@ -72,28 +84,57 @@
                 </section>
 
                 <section class="enrollment-card" id="voice-identity-enrollment"
-                    aria-labelledby="voice-identity-enrollment-title">
+                    aria-labelledby="voice-identity-step-title">
+                    <span class="card-cat-paw card-cat-paw-top" aria-hidden="true">
+                        <svg viewBox="0 0 44 36" focusable="false">
+                            <ellipse cx="22" cy="24" rx="10" ry="8"></ellipse>
+                            <circle cx="9" cy="12" r="4"></circle>
+                            <circle cx="18" cy="7" r="4"></circle>
+                            <circle cx="28" cy="7" r="4"></circle>
+                            <circle cx="37" cy="12" r="4"></circle>
+                        </svg>
+                    </span>
                     <div class="enrollment-copy">
+                        <div class="segment-progress" id="voice-identity-progress" role="list"
+                            aria-label="三段录入进度">
+                            <span role="listitem" data-step="1" aria-label="第 1 段">1</span>
+                            <span role="listitem" data-step="2" aria-label="第 2 段">2</span>
+                            <span role="listitem" data-step="3" aria-label="第 3 段">3</span>
+                        </div>
+                        <p class="step-count" id="voice-identity-step-count" aria-live="polite"
+                            aria-atomic="true"></p>
                         <p class="eyebrow" data-i18n="voiceIdentity.localOnly">仅在本机处理</p>
-                        <h2 id="voice-identity-enrollment-title" tabindex="-1"
-                            data-i18n="voiceIdentity.privacyTitle">说几句话，即可完成</h2>
-                        <p class="enrollment-help" data-i18n="voiceIdentity.privacyBody">
-                            点击后自然说话约 4 秒。声纹会加密保存在本机，不会发送给 ASR Provider，也不用于身份认证。
+                        <h2 id="voice-identity-step-title" tabindex="-1"
+                            data-i18n="voiceIdentity.introTitle">录入 3 段声纹</h2>
+                        <p id="voice-identity-step-body" class="enrollment-help" data-i18n="voiceIdentity.privacyBody">
+                            按提示说完 3 段话，每段最长 8 秒，说完后点击保存。停顿不会自动结束。
                         </p>
+                        <blockquote id="voice-identity-prompt" class="voice-prompt" hidden></blockquote>
                     </div>
                     <div class="capture-status" id="voice-identity-capture-status" hidden>
                         <span class="record-icon" aria-hidden="true"></span>
                         <span id="voice-identity-capture-label" data-i18n="voiceIdentity.recording">正在录音…</span>
-                        <span class="recording-timer" id="voice-identity-timer" aria-hidden="true"></span>
+                        <span id="voice-identity-voice-state" class="voice-activity-state"
+                            data-i18n="voiceIdentity.voiceWaiting">等待说话</span>
+                            <span class="recording-timer" id="voice-identity-timer" aria-hidden="true"></span>
                     </div>
+                    <p class="enrollment-rule-note" data-i18n="voiceIdentity.fixedHelp">
+                        每段最长 8 秒，说完后点击保存；中间停顿不会自动结束。
+                    </p>
                     <div class="enrollment-actions">
                         <button type="button" class="primary-button" id="voice-identity-start"
-                            data-i18n="voiceIdentity.enrollAndEnable">录入并启用声纹</button>
+                            data-i18n="voiceIdentity.enrollAndEnable">开始录入</button>
+                        <button type="button" class="primary-button" id="voice-identity-finish" hidden
+                            data-i18n="voiceIdentity.finish">说完了，保存</button>
+                        <button type="button" class="primary-button" id="voice-identity-next" hidden
+                            data-i18n="voiceIdentity.nextSegment">开始下一段</button>
                         <button type="button" class="secondary-button" id="voice-identity-cancel" hidden
                             data-i18n="voiceIdentity.cancel">取消录入</button>
                     </div>
                     <p id="voice-identity-message" class="enrollment-message"
                         role="status" aria-live="polite" aria-atomic="true"></p>
+                    <button type="button" class="secondary-button retry-connection" id="voice-identity-retry"
+                        data-i18n="voiceIdentity.retryConnection" hidden>重试连接</button>
                 </section>
 
                 <section class="profile-card" id="voice-identity-profile-controls"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Literal, Protocol, TypeVar
 import uuid
@@ -69,6 +69,7 @@ ActivationCallback = Callable[
 RuntimeStatusCallback = Callable[[], VoiceIdentityActivationResult]
 VoiceIdentityRuntimeMode = Literal["off", "shadow", "enforce"]
 _ResultT = TypeVar("_ResultT")
+_ENROLLMENT_SEGMENT_SIMILARITY_THRESHOLD = 0.40
 
 
 async def _await_cancellation_safe(
@@ -132,6 +133,9 @@ class _EnrollmentSession:
     lease: VoiceInputSuppressionLease
     expiry_task: asyncio.Task[None]
     embedding_task: asyncio.Task[np.ndarray] | None = None
+    segment_embeddings: list[np.ndarray] = field(default_factory=list)
+    segment_profile_id: str | None = None
+    finalizing: bool = False
 
 
 class VoiceIdentityService:
@@ -146,7 +150,7 @@ class VoiceIdentityService:
         activation_callback: ActivationCallback,
         *,
         runtime_mode: VoiceIdentityRuntimeMode = "enforce",
-        enrollment_ttl_seconds: float = 30.0,
+        enrollment_ttl_seconds: float = 60.0,
         model_timeout_seconds: float = 30.0,
         activation_timeout_seconds: float = 5.0,
         runtime_status_callback: RuntimeStatusCallback | None = None,
@@ -177,8 +181,8 @@ class VoiceIdentityService:
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        if enrollment_ttl_seconds > 30.0:
-            raise ValueError("enrollment_ttl_seconds cannot exceed 30 seconds")
+        if enrollment_ttl_seconds > 60.0:
+            raise ValueError("enrollment_ttl_seconds cannot exceed 60 seconds")
 
         self._profile_store = profile_store
         self._preference_store = preference_store
@@ -407,6 +411,8 @@ class VoiceIdentityService:
         enrollment_id: str,
         profile_id: str,
         pcm16: bytes,
+        *,
+        _embedding_override: np.ndarray | None = None,
     ) -> VoiceIdentityServiceStatus:
         _require_identifier("enrollment_id", enrollment_id)
         _require_identifier("profile_id", profile_id)
@@ -455,25 +461,28 @@ class VoiceIdentityService:
             old_activation_restore_result: VoiceIdentityActivationResult | None = None
             failure_reason = VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
             try:
-                await asyncio.to_thread(validate_enrollment_pcm16, pcm16)
-                try:
-                    embedding_task = asyncio.create_task(
-                        asyncio.to_thread(
-                            session.model.embedding_from_pcm16,
-                            pcm16,
-                            sample_rate_hz=CAMPPLUS_SAMPLE_RATE_HZ,
-                        ),
-                        name="voice-identity-model-inference",
-                    )
-                    session.embedding_task = embedding_task
-                    embedding = await asyncio.wait_for(
-                        asyncio.shield(embedding_task),
-                        timeout=self._model_timeout_seconds,
-                    )
-                    session.embedding_task = None
-                except Exception as exc:
-                    failure_reason = VoiceIdentityEffectiveReason.MODEL_UNAVAILABLE
-                    raise VoiceIdentityServiceError("model_unavailable") from exc
+                if _embedding_override is None:
+                    await asyncio.to_thread(validate_enrollment_pcm16, pcm16)
+                    try:
+                        embedding_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                session.model.embedding_from_pcm16,
+                                pcm16,
+                                sample_rate_hz=CAMPPLUS_SAMPLE_RATE_HZ,
+                            ),
+                            name="voice-identity-model-inference",
+                        )
+                        session.embedding_task = embedding_task
+                        embedding = await asyncio.wait_for(
+                            asyncio.shield(embedding_task),
+                            timeout=self._model_timeout_seconds,
+                        )
+                        session.embedding_task = None
+                    except Exception as exc:
+                        failure_reason = VoiceIdentityEffectiveReason.MODEL_UNAVAILABLE
+                        raise VoiceIdentityServiceError("model_unavailable") from exc
+                else:
+                    embedding = _embedding_override
                 try:
                     reference = SpeakerReference(
                         SpeakerModelIdentity(
@@ -611,6 +620,156 @@ class VoiceIdentityService:
                 if not cleanup_ok and not self._effective_enabled:
                     self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
             return self.status()
+
+    async def complete_enrollment_segment(
+        self,
+        enrollment_id: str,
+        profile_id: str,
+        segment: int,
+        pcm16: bytes,
+    ) -> VoiceIdentityServiceStatus:
+        """Accept one of three prompt recordings for a single enrollment.
+
+        Segments are validated and embedded independently.  The service keeps
+        only the temporary embeddings until segment three, then averages them
+        and runs the existing atomic profile replacement path.
+        """
+
+        _require_identifier("enrollment_id", enrollment_id)
+        _require_identifier("profile_id", profile_id)
+        if type(segment) is not int or segment not in (1, 2, 3):
+            raise VoiceIdentityServiceError("invalid_enrollment_segment")
+        async with self._operation_lock:
+            self._require_initialized()
+            if segment == 3 and self._last_completed == (enrollment_id, profile_id):
+                return self.status()
+            session = self._enrollment
+            if session is None or session.enrollment_id != enrollment_id:
+                raise VoiceIdentityServiceError("stale_enrollment")
+            if session.finalizing:
+                raise VoiceIdentityServiceError("enrollment_in_progress")
+            if asyncio.get_running_loop().time() >= session.expires_at:
+                self._enrollment = None
+                cancellations: list[asyncio.CancelledError] = []
+                cleanup_ok = await _await_cancellation_safe(
+                    self._cleanup_session(session),
+                    name="voice-identity-expired-segment-cleanup",
+                    cancellations=cancellations,
+                )
+                if not self._effective_enabled:
+                    self._set_ineffective(
+                        self._idle_reason()
+                        if cleanup_ok
+                        else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
+                if cancellations:
+                    raise cancellations[0]
+                raise VoiceIdentityServiceError("stale_enrollment")
+            expected_segment = len(session.segment_embeddings) + 1
+            if segment != expected_segment:
+                raise VoiceIdentityServiceError("invalid_enrollment_segment")
+            if session.segment_profile_id is None:
+                session.segment_profile_id = profile_id
+            elif session.segment_profile_id != profile_id:
+                raise VoiceIdentityServiceError("invalid_profile_id")
+            try:
+                await asyncio.to_thread(validate_enrollment_pcm16, pcm16)
+            except EnrollmentAudioError as exc:
+                raise VoiceIdentityServiceError(exc.code) from exc
+            try:
+                embedding_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        session.model.embedding_from_pcm16,
+                        pcm16,
+                        sample_rate_hz=CAMPPLUS_SAMPLE_RATE_HZ,
+                    ),
+                    name="voice-identity-segment-inference",
+                )
+                session.embedding_task = embedding_task
+                embedding = await asyncio.wait_for(
+                    asyncio.shield(embedding_task),
+                    timeout=self._model_timeout_seconds,
+                )
+                session.embedding_task = None
+            except asyncio.CancelledError as exc:
+                self._enrollment = None
+                cancellations = [exc]
+                cleanup_ok = await _await_cancellation_safe(
+                    self._cleanup_session(session),
+                    name="voice-identity-cancelled-segment-cleanup",
+                    cancellations=cancellations,
+                )
+                if not self._effective_enabled:
+                    self._set_ineffective(
+                        self._idle_reason()
+                        if cleanup_ok
+                        else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
+                raise cancellations[0]
+            except Exception as exc:
+                self._enrollment = None
+                cleanup_ok = await self._cleanup_session(session)
+                if not cleanup_ok and not self._effective_enabled:
+                    self._set_ineffective(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED)
+                raise VoiceIdentityServiceError("model_unavailable") from exc
+            if not isinstance(embedding, np.ndarray):
+                self._enrollment = None
+                cleanup_ok = await self._cleanup_session(session)
+                if not self._effective_enabled:
+                    self._set_ineffective(
+                        self._idle_reason()
+                        if cleanup_ok
+                        else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
+                raise VoiceIdentityServiceError("model_unavailable")
+            try:
+                owned_embedding = np.array(embedding, dtype=np.float32, copy=True)
+            except Exception as exc:
+                self._enrollment = None
+                cleanup_ok = await self._cleanup_session(session)
+                if not self._effective_enabled:
+                    self._set_ineffective(
+                        self._idle_reason()
+                        if cleanup_ok
+                        else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
+                raise VoiceIdentityServiceError("model_unavailable") from exc
+            finally:
+                if isinstance(embedding, np.ndarray) and embedding.flags.writeable:
+                    embedding.fill(0.0)
+            session.segment_embeddings.append(owned_embedding)
+            if segment < 3:
+                return self.status()
+
+            session.finalizing = True
+            try:
+                _validate_segment_consistency(session.segment_embeddings)
+                aggregate = np.mean(
+                    np.stack(session.segment_embeddings, axis=0),
+                    axis=0,
+                    dtype=np.float32,
+                )
+            except ValueError as exc:
+                self._enrollment = None
+                cleanup_ok = await self._cleanup_session(session)
+                if not self._effective_enabled:
+                    self._set_ineffective(
+                        self._idle_reason()
+                        if cleanup_ok
+                        else VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+                    )
+                raise VoiceIdentityServiceError("inconsistent_segments") from exc
+
+        try:
+            return await self.complete_enrollment(
+                enrollment_id,
+                profile_id,
+                b"",
+                _embedding_override=aggregate,
+            )
+        finally:
+            if aggregate.flags.writeable:
+                aggregate.fill(0.0)
 
     async def cancel_enrollment(self, enrollment_id: str | None = None) -> bool:
         async with self._operation_lock:
@@ -836,6 +995,10 @@ class VoiceIdentityService:
                         session.model,
                         embedding_task,
                     )
+                    for segment_embedding in session.segment_embeddings:
+                        if segment_embedding.flags.writeable:
+                            segment_embedding.fill(0.0)
+                    session.segment_embeddings.clear()
                     return False
                 except asyncio.CancelledError:
                     if not embedding_task.done():
@@ -853,6 +1016,10 @@ class VoiceIdentityService:
             else:
                 if isinstance(embedding, np.ndarray) and embedding.flags.writeable:
                     embedding.fill(0.0)
+        for segment_embedding in session.segment_embeddings:
+            if isinstance(segment_embedding, np.ndarray) and segment_embedding.flags.writeable:
+                segment_embedding.fill(0.0)
+        session.segment_embeddings.clear()
         await self._close_model(session.model)
         return ok
 
@@ -988,3 +1155,33 @@ class VoiceIdentityService:
 def _require_identifier(name: str, value: str) -> None:
     if type(value) is not str or not value.strip() or len(value) > 128:
         raise VoiceIdentityServiceError(f"invalid_{name}")
+
+
+def _validate_segment_consistency(embeddings: list[np.ndarray]) -> None:
+    """Require all prompt embeddings to remain speaker-consistent."""
+
+    if len(embeddings) != 3:
+        raise ValueError("segment_count")
+    normalized: list[np.ndarray] = []
+    try:
+        for embedding in embeddings:
+            if embedding.shape != (CAMPPLUS_EMBEDDING_DIM,):
+                raise ValueError("segment_embedding_shape")
+            if not bool(np.all(np.isfinite(embedding))):
+                raise ValueError("segment_embedding_finite")
+            norm = float(np.linalg.norm(embedding))
+            if not math.isfinite(norm) or norm <= 0.0:
+                raise ValueError("segment_embedding_norm")
+            normalized.append(embedding / np.float32(norm))
+        for index, first in enumerate(normalized):
+            for second in normalized[index + 1 :]:
+                similarity = float(np.dot(first, second))
+                if (
+                    not math.isfinite(similarity)
+                    or similarity < _ENROLLMENT_SEGMENT_SIMILARITY_THRESHOLD
+                ):
+                    raise ValueError("segment_similarity")
+    finally:
+        for embedding in normalized:
+            if embedding.flags.writeable:
+                embedding.fill(0.0)

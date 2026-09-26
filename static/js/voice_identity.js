@@ -2,8 +2,13 @@
     'use strict';
 
     const TARGET_SAMPLE_RATE = 16000;
-    const RECORDING_MS = 4000;
+    const MAX_RECORDING_MS = 8000;
+    const ENROLLMENT_SEGMENT_COUNT = 3;
+    const SEGMENT_HEADER = 'X-Voice-Identity-Segment';
     const CAPTURE_TIMEOUT_GRACE_MS = 1000;
+    const FLUSH_TIMEOUT_MS = 400;
+    const SILENCE_HINT_MS = 800;
+    const ACTIVE_FRAME_RMS = 0.008;
     const WINDOW_CLOSE_START_WAIT_MS = 500;
     const SESSION_HEADER = 'X-Voice-Identity-Enrollment';
     const PROFILE_HEADER = 'X-Voice-Identity-Profile';
@@ -22,7 +27,12 @@
     });
     const ENROLLMENT_ERROR_MESSAGES = Object.freeze({
         invalid_pcm: ['voiceIdentity.errorInvalidPcm', '录音格式无效，请重新录入。'],
-        audio_too_long: ['voiceIdentity.errorAudioTooLong', '录音时间过长，请重新录入。']
+        audio_too_long: ['voiceIdentity.errorAudioTooLong', '录音时间过长，请换一句较短的话重新录入。'],
+        speech_too_short: ['voiceIdentity.errorSpeechTooShort', '没有检测到足够的语音，请重新说一句完整的话。'],
+        silence: ['voiceIdentity.errorSilence', '没有检测到声音，请检查麦克风后重试。'],
+        severe_clipping: ['voiceIdentity.errorSevereClipping', '声音过大或失真，请稍微远离麦克风。'],
+        incomplete_capture: ['voiceIdentity.errorIncompleteCapture', '录音没有完整采集，请重试。'],
+        inconsistent_segments: ['voiceIdentity.errorInconsistentSegments', '三段声音差异较大，请按提示重新录入。']
     });
 
     const state = {
@@ -37,6 +47,7 @@
         mediaStream: null,
         audioContext: null,
         captureAbort: null,
+        captureFinish: null,
         recording: false,
         saving: false,
         cancelPending: false,
@@ -44,7 +55,14 @@
         busy: false,
         initialized: false,
         closeStarted: false,
-        startSettled: null
+        startSettled: null,
+        voiceStatus: 'waiting',
+        lastVoiceAt: 0,
+        segmentIndex: 0,
+        segmentPhase: 'idle',
+        segmentAdvance: null,
+        uiPhase: 'idle',
+        initializationError: false
     };
 
     const elements = {};
@@ -64,10 +82,19 @@
         elements.profileStatus = document.getElementById('voice-identity-profile-status');
         elements.enrollment = document.getElementById('voice-identity-enrollment');
         elements.captureStatus = document.getElementById('voice-identity-capture-status');
+        elements.stepCount = document.getElementById('voice-identity-step-count');
+        elements.stepTitle = document.getElementById('voice-identity-step-title');
+        elements.stepBody = document.getElementById('voice-identity-step-body');
+        elements.prompt = document.getElementById('voice-identity-prompt');
+        elements.progress = typeof document.querySelectorAll === 'function' ? Array.from(document.querySelectorAll('#voice-identity-progress span')) : [];
+        elements.next = document.getElementById('voice-identity-next');
         elements.captureLabel = document.getElementById('voice-identity-capture-label');
+        elements.voiceState = document.getElementById('voice-identity-voice-state');
         elements.timer = document.getElementById('voice-identity-timer');
         elements.message = document.getElementById('voice-identity-message');
+        elements.retry = document.getElementById('voice-identity-retry');
         elements.start = document.getElementById('voice-identity-start');
+        elements.finish = document.getElementById('voice-identity-finish');
         elements.cancel = document.getElementById('voice-identity-cancel');
         elements.profileControls = document.getElementById('voice-identity-profile-controls');
         elements.reenroll = document.getElementById('voice-identity-reenroll');
@@ -243,14 +270,30 @@
     function setMessage(message, isError) {
         elements.message.textContent = message || '';
         elements.message.classList.toggle('error', Boolean(isError));
+        if (typeof elements.message.setAttribute === 'function') {
+            elements.message.setAttribute('role', isError ? 'alert' : 'status');
+            elements.message.setAttribute('aria-live', isError ? 'assertive' : 'polite');
+        }
+        if (elements.retry) elements.retry.hidden = !isError || !state.initializationError;
     }
 
     function enrollmentErrorMessage(error) {
-        const configured = error && ENROLLMENT_ERROR_MESSAGES[error.message];
-        if (!configured) {
-            return translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。');
-        }
-        return translate(configured[0], configured[1]);
+        const code = error && (error.message || error.code);
+        const configured = code && ENROLLMENT_ERROR_MESSAGES[code];
+        if (configured) return translate(configured[0], configured[1]);
+        if (['invalid_pcm', 'speech_too_short', 'silence', 'severe_clipping', 'audio_too_long', 'incomplete_capture'].includes(code)) return translate('voiceIdentity.qualityCheckFailed', '声音质量未达标，请重录当前段。');
+        if (code === 'media_devices_unavailable' || code === 'audio_worklet_unavailable' || (error && ['NotAllowedError', 'NotFoundError', 'NotReadableError'].includes(error.name))) return translate('voiceIdentity.microphoneDenied', '无法使用麦克风，请检查权限和设备。');
+        if (code === 'page_config_unavailable' || code === 'csrf_token_unavailable' || code === 'status_unavailable' || code === 'initialization_failed') return translate('voiceIdentity.initializationFailed', '声纹录入初始化失败，请检查连接后重试。');
+        if (code === 'profile_status_unavailable' || code === 'profile_not_confirmed' || code === 'request_failed' || (error && error.status >= 500)) return translate('voiceIdentity.saveFailed', '声纹保存未完成，请稍后重试。');
+        if (code === 'crypto_unavailable') return translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。');
+        if (error && (error.status === 0 || !error.status)) return translate('voiceIdentity.backendUnavailable', '无法连接声纹服务，请检查网络后重试。');
+        return translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。');
+    }
+
+    function phaseLabel() {
+        const labels = { idle: ['voiceIdentity.phaseIdle', '准备录入'], preparing: ['voiceIdentity.phasePreparing', '正在准备录音…'], recording: ['voiceIdentity.phaseRecording', '正在录音…'], checking: ['voiceIdentity.phaseChecking', '正在检查声音质量…'], ready: ['voiceIdentity.phaseSegmentReady', '本段已保存，可以继续下一段'], retry: ['voiceIdentity.phaseRetry', '请重录当前段'], finalizing: ['voiceIdentity.phaseFinalizing', '正在完成声纹保存…'], success: ['voiceIdentity.phaseSuccess', '声纹录入完成'] };
+        const item = labels[state.uiPhase] || labels.idle;
+        return translate(item[0], item[1]);
     }
 
     function reasonMessage() {
@@ -305,21 +348,76 @@
             && state.effectiveReason === 'secure_storage_unavailable';
         elements.start.hidden = state.profileAvailable || state.busy || state.cancelPending;
         elements.start.disabled = pending || enrollmentUnavailable;
+        elements.start.textContent = translate('voiceIdentity.startEnrollment', '开始录入');
         elements.cancel.hidden = !state.busy && !state.cancelPending && !state.enrollmentId;
         elements.cancel.disabled = state.cancelPending;
         elements.reenroll.disabled = pending;
         elements.delete.disabled = pending;
         if (!state.filterPending) elements.filter.checked = state.requestedEnabled;
         elements.filter.disabled = pending;
+        if (elements.retry) {
+            elements.retry.hidden = !state.initializationError || state.busy;
+            elements.retry.disabled = state.busy;
+        }
+    }
+
+    function fixedPrompts() {
+        let translated = null;
+        if (window.i18next && typeof window.i18next.t === 'function') translated = window.i18next.t('voiceIdentity.fixedPrompts', { returnObjects: true });
+        else if (typeof window.t === 'function') translated = window.t('voiceIdentity.fixedPrompts', { returnObjects: true });
+        if (Array.isArray(translated) && translated.length === ENROLLMENT_SEGMENT_COUNT) return translated;
+        return ['今天我想和你分享一件趣事。', '窗外的光线正在慢慢变化。', '今天也用自然的声音聊天。'];
     }
 
     function renderEnrollment() {
+        const active = state.segmentIndex > 0;
         const captureVisible = state.recording || state.saving;
         elements.captureStatus.hidden = !captureVisible;
         elements.captureStatus.classList.toggle('saving', state.saving);
-        elements.captureLabel.textContent = state.saving
-            ? translate('voiceIdentity.saving', '正在加密保存并启用…')
-            : translate('voiceIdentity.recording', '正在录音…');
+        elements.captureStatus.classList.toggle('voice-detected', state.voiceStatus === 'detected');
+        elements.captureStatus.classList.toggle('voice-quiet', state.voiceStatus === 'quiet');
+        elements.captureStatus.classList.toggle('voice-waiting', state.voiceStatus === 'waiting');
+        elements.captureLabel.textContent = phaseLabel();
+        if (elements.voiceState) {
+            const voiceStatusKeys = { detected: ['voiceIdentity.voiceDetected', '检测到声音'], quiet: ['voiceIdentity.voiceQuiet', '声音偏小，请靠近麦克风'], waiting: ['voiceIdentity.voiceWaiting', '等待说话'] };
+            const configured = voiceStatusKeys[state.voiceStatus] || voiceStatusKeys.waiting;
+            elements.voiceState.textContent = state.saving ? '' : translate(configured[0], configured[1]);
+        }
+        if (elements.finish) {
+            elements.finish.hidden = !state.recording;
+            elements.finish.disabled = !state.recording;
+            elements.finish.textContent = translate('voiceIdentity.finish', '说完了，保存');
+        }
+        if (elements.next) {
+            const nextVisible = state.segmentPhase === 'ready' || state.segmentPhase === 'retry';
+            elements.next.hidden = !nextVisible;
+            elements.next.disabled = !nextVisible;
+            elements.next.textContent = translate(state.segmentPhase === 'retry' ? 'voiceIdentity.retrySegment' : 'voiceIdentity.nextSegment', state.segmentPhase === 'retry' ? '重录本段' : '开始下一段');
+        }
+        if (elements.stepCount) {
+            const fallback = '第 ' + state.segmentIndex + ' / ' + ENROLLMENT_SEGMENT_COUNT + ' 段';
+            elements.stepCount.textContent = active ? translate('voiceIdentity.stepCount', fallback, { current: state.segmentIndex, total: ENROLLMENT_SEGMENT_COUNT }) : '';
+        }
+        if (elements.progress) elements.progress.forEach((item, index) => {
+            const completed = active && index < state.segmentIndex - 1;
+            const current = active && index === state.segmentIndex - 1;
+            item.classList.toggle('active', completed || current);
+            item.classList.toggle('completed', completed);
+            item.classList.toggle('current', current);
+            if (typeof item.setAttribute === 'function') {
+                item.setAttribute('aria-current', current ? 'step' : 'false');
+                item.setAttribute('aria-label', `${index + 1}${completed ? '（已完成）' : current ? '（当前）' : ''}`);
+            }
+            if (completed) item.textContent = '✓';
+            else item.textContent = String(index + 1);
+        });
+        if (elements.stepTitle) elements.stepTitle.textContent = active ? translate('voiceIdentity.fixedTitle', '朗读提示语') : translate('voiceIdentity.introTitle', '录入 3 段声纹');
+        if (elements.stepBody) elements.stepBody.textContent = active ? translate('voiceIdentity.fixedHelp', '请使用平时聊天的自然音量和语速朗读下面这句话，说完后点击保存。') : translate('voiceIdentity.introHelp', '按提示说完 3 段话，每段最长 8 秒，说完后点击保存。停顿不会自动结束。');
+        if (elements.prompt) {
+            const prompt = active ? fixedPrompts()[state.segmentIndex - 1] : '';
+            elements.prompt.textContent = prompt || '';
+            elements.prompt.hidden = !prompt;
+        }
     }
 
     function render() {
@@ -353,6 +451,33 @@
         }
     }
 
+    function asPcm16(data) {
+        if (data instanceof Int16Array) return data;
+        if (data instanceof ArrayBuffer) return new Int16Array(data);
+        if (data && data.buffer instanceof ArrayBuffer) {
+            return new Int16Array(data.buffer, data.byteOffset || 0, data.byteLength / 2);
+        }
+        return new Int16Array(data || 0);
+    }
+
+    function updateVoiceActivity(chunk) {
+        if (!chunk || !chunk.length) return;
+        let sumSquares = 0;
+        for (let index = 0; index < chunk.length; index += 1) {
+            const sample = chunk[index] / 32768;
+            sumSquares += sample * sample;
+        }
+        const rms = Math.sqrt(sumSquares / chunk.length);
+        const now = performance.now();
+        if (rms >= ACTIVE_FRAME_RMS) {
+            state.voiceStatus = 'detected';
+            state.lastVoiceAt = now;
+        } else if (rms > ACTIVE_FRAME_RMS * 0.25) {
+            state.voiceStatus = 'quiet';
+        }
+        renderEnrollment();
+    }
+
     async function capturePcm16() {
         await ensureMicrophone();
         const context = state.audioContext;
@@ -368,51 +493,93 @@
         });
         const mute = context.createGain();
         const chunks = [];
-        const targetSamples = TARGET_SAMPLE_RATE * RECORDING_MS / 1000;
         let capturedSamples = 0;
+        let startedAt = performance.now();
         let finishCapture = null;
+        let flushTimeoutId = null;
         mute.gain.value = 0;
         source.connect(processor);
         processor.connect(mute);
         mute.connect(context.destination);
         await context.resume();
 
-        const startedAt = performance.now();
+        state.voiceStatus = 'waiting';
+        state.lastVoiceAt = startedAt;
         const timer = window.setInterval(function () {
-            const elapsed = Math.min(RECORDING_MS, performance.now() - startedAt);
+            const now = performance.now();
+            const elapsed = Math.min(MAX_RECORDING_MS, now - startedAt);
             elements.timer.textContent = translate(
                 'voiceIdentity.recordingSeconds',
                 `${(elapsed / 1000).toFixed(1)} 秒`,
                 { seconds: (elapsed / 1000).toFixed(1) }
             );
+            if (now - state.lastVoiceAt >= SILENCE_HINT_MS) {
+                state.voiceStatus = 'waiting';
+                renderEnrollment();
+            }
+            if (elapsed >= MAX_RECORDING_MS && finishCapture) finishCapture();
         }, 100);
         try {
             await new Promise(function (resolve, reject) {
                 let settled = false;
-                const timeoutId = window.setTimeout(function () {
-                    finishCapture(new Error('incomplete_capture'));
-                }, RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS);
-                finishCapture = function (error) {
+                let flushing = false;
+                const captureTimeoutId = window.setTimeout(function () {
+                    if (finishCapture) finishCapture(new Error('incomplete_capture'));
+                }, MAX_RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS);
+                const settle = function (error) {
                     if (settled) return;
                     settled = true;
-                    window.clearTimeout(timeoutId);
+                    window.clearTimeout(captureTimeoutId);
+                    if (flushTimeoutId !== null) window.clearTimeout(flushTimeoutId);
                     if (error) reject(error);
                     else resolve();
                 };
-                state.captureAbort = finishCapture;
+                finishCapture = function (error) {
+                    if (settled) return;
+                    if (error) {
+                        settle(error);
+                        return;
+                    }
+                    if (flushing) return;
+                    flushing = true;
+                    try {
+                        processor.port.postMessage({ type: 'flush' });
+                    } catch (_) {
+                        settle(new Error('incomplete_capture'));
+                        return;
+                    }
+                    flushTimeoutId = window.setTimeout(function () {
+                        settle(new Error('incomplete_capture'));
+                    }, FLUSH_TIMEOUT_MS);
+                };
+                state.captureAbort = function (error) {
+                    settle(error || new Error('capture_cancelled'));
+                };
+                state.captureFinish = finishCapture;
                 processor.port.onmessage = function (event) {
-                    const chunk = event.data instanceof Int16Array
-                        ? event.data
-                        : new Int16Array(event.data);
+                    const data = event.data;
+                    if (data && data.type === 'flush_complete') {
+                        const tail = asPcm16(data.pcmData);
+                        if (tail.length) {
+                            chunks.push(tail);
+                            capturedSamples += tail.length;
+                            updateVoiceActivity(tail);
+                        }
+                        settle();
+                        return;
+                    }
+                    const chunk = asPcm16(data);
                     if (chunk.length === 0) return;
                     chunks.push(chunk);
                     capturedSamples += chunk.length;
-                    if (capturedSamples >= targetSamples) finishCapture();
+                    updateVoiceActivity(chunk);
                 };
             });
         } finally {
             state.captureAbort = null;
+            state.captureFinish = null;
             window.clearInterval(timer);
+            if (flushTimeoutId !== null) window.clearTimeout(flushTimeoutId);
             processor.port.onmessage = null;
             processor.disconnect();
             source.disconnect();
@@ -420,11 +587,12 @@
             elements.timer.textContent = '';
         }
 
-        if (capturedSamples < targetSamples) throw new Error('incomplete_capture');
-        const pcm = new Int16Array(targetSamples);
+        if (capturedSamples <= 0) throw new Error('incomplete_capture');
+        const maximumSamples = TARGET_SAMPLE_RATE * MAX_RECORDING_MS / 1000;
+        const pcm = new Int16Array(Math.min(capturedSamples, maximumSamples));
         let offset = 0;
         for (const chunk of chunks) {
-            const remaining = targetSamples - offset;
+            const remaining = pcm.length - offset;
             if (remaining <= 0) break;
             pcm.set(chunk.subarray(0, remaining), offset);
             offset += Math.min(chunk.length, remaining);
@@ -498,129 +666,112 @@
         if (state.busy || state.filterPending || state.cancelPending) return;
         let startSettled = null;
         let settleStart = null;
-        let uploadStarted = false;
+        let segmentRequestPending = false;
         const profileWasAvailable = state.profileAvailable;
         const profileRevisionBefore = state.profileRevision;
         state.busy = true;
+        state.segmentIndex = 0;
+        state.segmentPhase = 'preparing';
+        state.uiPhase = 'preparing';
         setMessage('');
         render();
         try {
             await ensureMicrophone();
             if (state.closeStarted || state.cancelPending) return;
-            startSettled = new Promise(function (resolve) {
-                settleStart = resolve;
-            });
+            startSettled = new Promise(function (resolve) { settleStart = resolve; });
             state.startSettled = startSettled;
             let started;
-            try {
-                started = await apiRequest('/enrollment/start', { method: 'POST' });
-            } finally {
+            try { started = await apiRequest('/enrollment/start', { method: 'POST' }); }
+            finally {
                 if (settleStart) settleStart();
                 if (state.startSettled === startSettled) state.startSettled = null;
             }
             applyStatus(started);
-            state.enrollmentId = firstString(
-                [started, started.enrollment],
-                ['enrollment_id', 'id', 'session_id'],
-                state.enrollmentId
-            );
-            state.profileId = firstString(
-                [started, started.enrollment],
-                ['profile_id'],
-                state.profileId || createProfileId()
-            );
+            state.enrollmentId = firstString([started, started.enrollment], ['enrollment_id', 'id', 'session_id'], state.enrollmentId);
+            state.profileId = firstString([started, started.enrollment], ['profile_id'], state.profileId || createProfileId());
             if (!state.enrollmentId) throw new Error('enrollment_id_missing');
-            if (state.closeStarted || state.cancelPending) {
-                await cancelSession({
-                    keepalive: state.closeStarted,
-                    silent: true
-                });
-                return;
-            }
-
-            state.recording = true;
-            render();
-            const pcm16 = await capturePcm16();
-            state.recording = false;
-            state.saving = true;
-            stopMicrophone();
-            render();
-            uploadStarted = true;
-            const completed = await apiRequest('/enrollment/profile', {
-                method: 'PUT',
-                body: pcm16,
-                headers: {
-                    'Content-Type': 'audio/pcm;format=pcm_s16le;rate=16000;channels=1',
-                    [SESSION_HEADER]: state.enrollmentId,
-                    [PROFILE_HEADER]: state.profileId
+            if (state.closeStarted || state.cancelPending) { await cancelSession({ keepalive: state.closeStarted, silent: true }); return; }
+            for (let segment = 1; segment <= ENROLLMENT_SEGMENT_COUNT; segment += 1) {
+                state.segmentIndex = segment;
+                let segmentAccepted = false;
+                while (!segmentAccepted) {
+                    state.segmentPhase = 'recording'; state.uiPhase = 'recording';
+                    state.recording = true;
+                    state.saving = false;
+                    render();
+                    let pcm16;
+                    try { pcm16 = await capturePcm16(); }
+                    finally { state.recording = false; stopMicrophone(); }
+                    if (state.cancelPending || state.closeStarted) return;
+                    state.segmentPhase = 'checking'; state.uiPhase = 'checking';
+                    state.saving = true;
+                    render();
+                    segmentRequestPending = true;
+                    try {
+                        const payload = await apiRequest('/enrollment/segment', { method: 'PUT', body: pcm16, headers: { 'Content-Type': 'audio/pcm;format=pcm_s16le;rate=16000;channels=1', [SESSION_HEADER]: state.enrollmentId, [PROFILE_HEADER]: state.profileId, [SEGMENT_HEADER]: String(segment) } });
+                        segmentRequestPending = false;
+                        applyStatus(payload);
+                        segmentAccepted = true;
+                    } catch (error) {
+                        const retryable = ['speech_too_short', 'silence', 'severe_clipping', 'audio_too_long'].includes(error && error.message);
+                        if (!retryable || !state.enrollmentId) throw error;
+                        segmentRequestPending = false;
+                        if (window.__voiceIdentityTestAutoAdvance) throw error;
+                        state.saving = false;
+                        state.segmentPhase = 'retry'; state.uiPhase = 'retry';
+                        setMessage(enrollmentErrorMessage(error), true);
+                        render();
+                        const proceed = await new Promise(function (resolve) {
+                            state.segmentAdvance = resolve;
+                        });
+                        state.segmentAdvance = null;
+                        if (!proceed || state.cancelPending || state.closeStarted) return;
+                    }
                 }
-            });
-            applyStatus(completed);
-            if (!state.profileAvailable && !await reconcileStatus()) {
-                throw new Error('profile_status_unavailable');
+                state.saving = false;
+                if (segment < ENROLLMENT_SEGMENT_COUNT) {
+                    state.segmentPhase = 'ready'; state.uiPhase = 'ready';
+                    render();
+                    const proceed = await new Promise(function (resolve) {
+                        state.segmentAdvance = resolve;
+                        if (window.__voiceIdentityTestAutoAdvance && elements.next) window.setTimeout(function () { elements.next.emit('click'); }, 0);
+                    });
+                    state.segmentAdvance = null;
+                    if (!proceed || state.cancelPending || state.closeStarted) return;
+                }
             }
+            state.segmentPhase = 'finalizing'; state.uiPhase = 'finalizing';
+            state.saving = true;
+            render();
+            if (!state.profileAvailable && !await reconcileStatus()) throw new Error('profile_status_unavailable');
             if (!state.profileAvailable) throw new Error('profile_not_confirmed');
             state.enrollmentId = null;
             state.profileId = null;
+            state.uiPhase = 'success';
             setMessage(enrollmentCompleteMessage(), false);
         } catch (error) {
             stopMicrophone();
             const reconciled = await reconcileStatus();
-            const replacementConfirmed = uploadStarted
-                && reconciled
-                && state.profileAvailable
-                && (
-                    !profileWasAvailable
-                    || (
-                        profileRevisionBefore !== null
-                        && state.profileRevision !== null
-                        && state.profileRevision !== profileRevisionBefore
-                    )
-                );
+            const replacementConfirmed = segmentRequestPending && reconciled && state.profileAvailable && (!profileWasAvailable || (profileRevisionBefore !== null && state.profileRevision !== null && state.profileRevision !== profileRevisionBefore));
             if (replacementConfirmed) {
-                state.enrollmentId = null;
-                state.profileId = null;
-                setMessage(enrollmentCompleteMessage(), false);
+                state.enrollmentId = null; state.profileId = null; setMessage(enrollmentCompleteMessage(), false);
             } else {
-                try {
-                    await cancelSession();
-                } catch (_) {}
-                const microphoneError = error && (
-                    error.name === 'NotAllowedError'
-                    || error.name === 'NotFoundError'
-                    || error.name === 'NotReadableError'
-                    || error.message === 'audio_worklet_unavailable'
-                    || error.message === 'media_devices_unavailable'
-                );
-                if (!state.cancelPending && !state.closeStarted) {
-                    setMessage(
-                        microphoneError
-                            ? translate(
-                                'voiceIdentity.microphoneDenied',
-                                '无法使用麦克风，请检查权限和设备。'
-                            )
-                            : enrollmentErrorMessage(error),
-                        true
-                    );
-                }
+                try { await cancelSession(); } catch (_) {}
+                const microphoneError = error && (error.name === 'NotAllowedError' || error.name === 'NotFoundError' || error.name === 'NotReadableError' || error.message === 'audio_worklet_unavailable' || error.message === 'media_devices_unavailable');
+                if (!state.cancelPending && !state.closeStarted) setMessage(microphoneError ? translate('voiceIdentity.microphoneDenied', '无法使用麦克风，请检查权限和设备。') : enrollmentErrorMessage(error), true);
             }
         } finally {
             stopMicrophone();
-            if (settleStart && state.startSettled === startSettled) {
-                state.startSettled = null;
-                settleStart();
-            }
-            state.recording = false;
-            state.saving = false;
-            state.busy = false;
-            state.cancelPending = false;
-            render();
+            if (settleStart && state.startSettled === startSettled) { state.startSettled = null; settleStart(); }
+            if (state.segmentAdvance) { state.segmentAdvance(false); state.segmentAdvance = null; }
+            state.recording = false; state.saving = false; state.segmentPhase = 'idle'; state.uiPhase = 'idle'; state.segmentIndex = 0; state.voiceStatus = 'waiting'; state.busy = false; state.cancelPending = false; render();
         }
     }
 
     async function cancelEnrollment(options) {
         const config = options || {};
         state.cancelPending = true;
+        if (state.segmentAdvance) { state.segmentAdvance(false); state.segmentAdvance = null; }
         stopMicrophone('capture_cancelled');
         render();
         try {
@@ -711,11 +862,18 @@
     function bindEvents() {
         elements.start.addEventListener('click', startEnrollment);
         elements.reenroll.addEventListener('click', startEnrollment);
+        if (elements.next) elements.next.addEventListener('click', function () {
+            if ((state.segmentPhase === 'ready' || state.segmentPhase === 'retry') && state.segmentAdvance) state.segmentAdvance(true);
+        });
+        elements.finish.addEventListener('click', function () {
+            if (state.recording && state.captureFinish) state.captureFinish();
+        });
         elements.cancel.addEventListener('click', function () {
             cancelEnrollment().catch(function () {});
         });
         elements.delete.addEventListener('click', deleteProfile);
         elements.filter.addEventListener('change', updateFilter);
+        if (elements.retry) elements.retry.addEventListener('click', retryConnection);
         window.addEventListener('localechange', render);
         window.nekoBeforeWindowClose = async function () {
             state.closeStarted = true;
@@ -754,6 +912,26 @@
         });
     }
 
+    async function retryConnection() {
+        if (state.busy) return;
+        state.busy = true;
+        state.initializationError = false;
+        setMessage('');
+        render();
+        try {
+            await loadCsrfToken();
+            const status = await apiRequest('/status', { method: 'GET' });
+            state.initialized = true;
+            applyStatus(status);
+        } catch (error) {
+            state.initializationError = true;
+            setMessage(enrollmentErrorMessage(error), true);
+        } finally {
+            state.busy = false;
+            render();
+        }
+    }
+
     async function initialize() {
         cacheElements();
         bindEvents();
@@ -763,12 +941,11 @@
             await loadCsrfToken();
             const status = await apiRequest('/status', { method: 'GET' });
             state.initialized = true;
+            state.initializationError = false;
             applyStatus(status);
-        } catch (_) {
-            setMessage(
-                translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。'),
-                true
-            );
+        } catch (error) {
+            state.initializationError = true;
+            setMessage(enrollmentErrorMessage(error), true);
         } finally {
             state.busy = false;
             render();

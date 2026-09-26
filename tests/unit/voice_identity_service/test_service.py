@@ -65,8 +65,25 @@ class _Model:
         self.closed = True
 
 
-def _pcm() -> bytes:
-    samples = np.full(24_000, 4_000, dtype="<i2")
+class _SequenceModel(_Model):
+    def __init__(self, embeddings: list[np.ndarray]) -> None:
+        super().__init__()
+        self._embeddings = [np.array(item, dtype=np.float32, copy=True) for item in embeddings]
+
+    def embedding_from_pcm16(
+        self,
+        pcm16: bytes,
+        *,
+        sample_rate_hz: int,
+    ) -> np.ndarray:
+        del pcm16, sample_rate_hz
+        if not self._embeddings:
+            raise RuntimeError("no embedding")
+        return self._embeddings.pop(0).copy()
+
+
+def _pcm(milliseconds: int = 1_500) -> bytes:
+    samples = np.full(16_000 * milliseconds // 1_000, 4_000, dtype="<i2")
     return samples.tobytes()
 
 
@@ -166,6 +183,97 @@ async def test_first_enrollment_loads_before_suppression_and_enables(
     assert activations[-1][1] == "profile-a"
     assert suppression_events[-1] == "restore:voice_identity_enrollment"
     assert model.closed
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_three_segment_enrollment_commits_only_after_third_segment(
+    tmp_path: Path,
+) -> None:
+    service, model, activations, suppression_events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+
+    first = await service.complete_enrollment_segment(
+        enrollment.enrollment_id, "profile-three", 1, _pcm()
+    )
+    assert first.enrollment is not None
+    assert not first.state.has_profile
+    assert not activations
+
+    second = await service.complete_enrollment_segment(
+        enrollment.enrollment_id, "profile-three", 2, _pcm()
+    )
+    assert second.enrollment is not None
+    assert not second.state.has_profile
+
+    third = await service.complete_enrollment_segment(
+        enrollment.enrollment_id, "profile-three", 3, _pcm()
+    )
+    assert third.enrollment is None
+    assert third.state.has_profile
+    assert third.profile_generation == "profile-three"
+    assert model.closed
+    assert suppression_events[-1] == "restore:voice_identity_enrollment"
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_segment_enrollment_requires_order_and_keeps_session_on_audio_error(
+    tmp_path: Path,
+) -> None:
+    service, _model, _activations, _events = _service(tmp_path)
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+
+    with pytest.raises(VoiceIdentityServiceError) as order_error:
+        await service.complete_enrollment_segment(
+            enrollment.enrollment_id, "profile-three", 2, _pcm()
+        )
+    assert order_error.value.code == "invalid_enrollment_segment"
+    with pytest.raises(VoiceIdentityServiceError) as audio_error:
+        await service.complete_enrollment_segment(
+            enrollment.enrollment_id, "profile-three", 1, b"\x00" * 100
+        )
+    assert audio_error.value.code == "speech_too_short"
+    status = service.status()
+    assert status.enrollment is not None
+    assert not status.state.has_profile
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_inconsistent_third_segment_keeps_existing_profile(
+    tmp_path: Path,
+) -> None:
+    first = np.zeros(CAMPPLUS_EMBEDDING_DIM, dtype=np.float32)
+    first[0] = 1.0
+    second = np.zeros(CAMPPLUS_EMBEDDING_DIM, dtype=np.float32)
+    second[1] = 1.0
+    model = _SequenceModel([first, first, first, second])
+    service, _model, _activations, _events = _service(tmp_path, model=model)
+    await service.initialize()
+    initial = await service.start_enrollment()
+    await service.complete_enrollment(initial.enrollment_id, "old-profile", _pcm())
+    assert service.status().profile_generation == "old-profile"
+
+    replacement = await service.start_enrollment()
+    await service.complete_enrollment_segment(
+        replacement.enrollment_id, "new-profile", 1, _pcm()
+    )
+    await service.complete_enrollment_segment(
+        replacement.enrollment_id, "new-profile", 2, _pcm()
+    )
+    with pytest.raises(VoiceIdentityServiceError) as error:
+        await service.complete_enrollment_segment(
+            replacement.enrollment_id, "new-profile", 3, _pcm()
+        )
+    assert error.value.code == "inconsistent_segments"
+    assert service.status().profile_generation == "old-profile"
+    assert service.status().state.has_profile
     await service.close()
 
 
@@ -407,7 +515,11 @@ async def test_commit_failure_rolls_back_old_activation_and_profile(
 
     monkeypatch.setattr(service._profile_store, "astage", staged_with_failed_commit)  # type: ignore[attr-defined]
     with pytest.raises(VoiceIdentityServiceError, match="runtime_degraded"):
-        await service.complete_enrollment(second.enrollment_id, "profile-b", _pcm())
+        await service.complete_enrollment(
+            second.enrollment_id,
+            "profile-b",
+            _pcm(8_000),
+        )
 
     assert activations[-1][1] == "profile-a"
     assert service.status().state.effective_enabled
@@ -835,6 +947,51 @@ async def test_timed_out_embedding_is_cancelled_and_model_is_released(
     retry = await service.start_enrollment()
     assert model.load_calls == 2
     assert await service.cancel_enrollment(retry.enrollment_id)
+    await service.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_timed_out_segment_releases_enrollment_session(
+    tmp_path: Path,
+) -> None:
+    class BlockingSegmentModel(_Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def embedding_from_pcm16(
+            self,
+            pcm16: bytes,
+            *,
+            sample_rate_hz: int,
+        ) -> np.ndarray:
+            self.started.set()
+            self.release.wait(1.0)
+            return super().embedding_from_pcm16(
+                pcm16,
+                sample_rate_hz=sample_rate_hz,
+            )
+
+        def cancel_inference(self) -> None:
+            self.release.set()
+
+    model = BlockingSegmentModel()
+    service, _selected, _activations, _events = _service(
+        tmp_path,
+        model=model,
+        model_timeout_seconds=0.05,
+    )
+    await service.initialize()
+    enrollment = await service.start_enrollment()
+    with pytest.raises(VoiceIdentityServiceError, match="model_unavailable"):
+        await service.complete_enrollment_segment(
+            enrollment.enrollment_id, "profile", 1, _pcm()
+        )
+    assert await asyncio.to_thread(model.started.wait, 1.0)
+    assert service._enrollment is None  # type: ignore[attr-defined]
+    assert model.closed
     await service.close()
 
 

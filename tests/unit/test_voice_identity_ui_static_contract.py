@@ -116,7 +116,7 @@ def test_voice_identity_header_keeps_title_bounded() -> None:
     assert "text-overflow: ellipsis" in title_layers.group(1)
 
 
-def test_voice_identity_template_is_a_single_action_enrollment_flow() -> None:
+def test_voice_identity_template_is_a_three_segment_enrollment_flow() -> None:
     template = (ROOT / "templates/voice_identity.html").read_text(encoding="utf-8")
     stylesheet = (ROOT / "static/css/voice_identity.css").read_text(encoding="utf-8")
 
@@ -126,15 +126,23 @@ def test_voice_identity_template_is_a_single_action_enrollment_flow() -> None:
     assert 'class="container-content"' in template
     assert 'data-neko-window-control="pin"' in template
     assert 'id="voice-identity-start"' in template
+    assert 'id="voice-identity-finish"' in template
+    assert 'data-i18n="voiceIdentity.finish"' in template
+    assert 'id="voice-identity-next"' in template
+    assert 'data-i18n="voiceIdentity.nextSegment"' in template
+    assert 'id="voice-identity-progress"' in template
+    assert 'aria-labelledby="voice-identity-step-title"' in template
+    assert 'id="voice-identity-step-title" tabindex="-1"' in template
+    assert 'id="voice-identity-prompt"' in template
+    assert 'id="voice-identity-voice-state"' in template
     assert 'data-i18n="voiceIdentity.enrollAndEnable"' in template
     assert 'id="voice-identity-capture-status" hidden' in template
     assert 'id="voice-identity-profile-controls"' in template
     assert 'aria-labelledby="voice-filter-title"' in template
     assert 'aria-describedby="voice-filter-help"' in template
     assert 'role="status" aria-live="polite" aria-atomic="true"' in template
-    assert "step-progress" not in template
+    assert "segment-progress" in template
     assert "voice-identity-record" not in template
-    assert "voice-identity-prompt" not in template
     assert "embedding" not in template.lower()
     assert "similarity" not in template.lower()
 
@@ -159,8 +167,8 @@ def test_voice_identity_enrollment_focus_target_is_programmatically_focusable() 
     template = (ROOT / "templates/voice_identity.html").read_text(encoding="utf-8")
     stylesheet = (ROOT / "static/css/voice_identity.css").read_text(encoding="utf-8")
 
-    assert 'id="voice-identity-enrollment-title" tabindex="-1"' in template
-    assert "#voice-identity-enrollment-title:focus-visible" in stylesheet
+    assert 'id="voice-identity-step-title" tabindex="-1"' in template
+    assert "#voice-identity-step-title:focus-visible" in stylesheet
 
 
 def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close() -> None:
@@ -174,10 +182,10 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
         "audioWorklet.addModule('/static/audio-processor.js')",
         "Int16Array",
         "TARGET_SAMPLE_RATE = 16000",
-        "RECORDING_MS = 4000",
+        "MAX_RECORDING_MS = 8000",
         "API_ROOT = '/api/voice-identity'",
         "'/enrollment/start'",
-        "'/enrollment/profile'",
+        "'/enrollment/segment'",
         "'/enrollment/cancel'",
         "'/profile'",
         "'/filter'",
@@ -191,19 +199,19 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
     ):
         assert contract in script
 
-    assert "RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS" in script
-    assert "targetSamples = TARGET_SAMPLE_RATE * RECORDING_MS / 1000" in script
-    assert "capturedSamples < targetSamples" in script
+    assert "MAX_RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS" in script
+    assert "processor.port.postMessage({ type: 'flush' })" in script
+    assert "flush_complete" in script
+    assert "capturedSamples <= 0" in script
     assert "state.profileId || createProfileId()" in script
     assert "['has_profile', 'profile_available', 'available']" in script
-    assert "const replacementConfirmed = uploadStarted" in script
+    assert "const replacementConfirmed = segmentRequestPending" in script
     assert "state.profileRevision !== profileRevisionBefore" in script
     assert "MediaRecorder" not in script
     assert "createScriptProcessor" not in script
-    assert "'/enrollment/segment'" not in script
     assert "'/enrollment/verify'" not in script
     assert "'/enrollment/commit'" not in script
-    assert "fixedPrompts" not in script
+    assert "fixedPrompts" in script
     assert "ready_to_commit" not in script
     assert "embedding" not in script.lower()
     assert "similarity" not in script.lower()
@@ -376,17 +384,23 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "requestFailed",
         "deleteConfirm",
     }
-    removed_wizard_keys = {
+    required_segment_keys = {
         "fixedTitle",
         "fixedHelp",
         "fixedPrompts",
-        "freeTitle1",
-        "freeTitle2",
-        "freePrompt1",
-        "freePrompt2",
         "stepCount",
-        "verificationPassed",
-        "verificationRetry",
+        "nextSegment",
+        "retrySegment",
+        "finish",
+        "voiceWaiting",
+        "voiceDetected",
+        "voiceQuiet",
+        "errorSpeechTooShort",
+        "errorSilence",
+        "errorSevereClipping",
+        "errorAudioTooLong",
+        "errorIncompleteCapture",
+        "errorInconsistentSegments",
     }
     for locale in LOCALES:
         payload = json.loads(
@@ -394,7 +408,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         )
         copy = payload["voiceIdentity"]
         assert required <= set(copy)
-        assert removed_wizard_keys.isdisjoint(copy)
+        assert required_segment_keys <= set(copy)
         assert all(isinstance(copy[key], str) and copy[key].strip() for key in required)
         assert payload["settings"]["menu"]["voiceIdentity"]
 

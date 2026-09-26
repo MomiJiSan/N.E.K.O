@@ -11,6 +11,7 @@ from main_logic.voice_identity_service.registry import (
     VoiceIdentityServiceRegistryError,
     get_voice_identity_service_for_router,
 )
+from main_logic.voice_identity_service.enrollment import ENROLLMENT_MAXIMUM_PCM_BYTES
 from main_logic.voice_identity_service.service import VoiceIdentityServiceError
 from main_routers.system_router import _validate_local_mutation_request
 
@@ -18,8 +19,9 @@ from main_routers.system_router import _validate_local_mutation_request
 router = APIRouter(prefix="/api/voice-identity", tags=["voice-identity"])
 _ENROLLMENT_HEADER = "X-Voice-Identity-Enrollment"
 _PROFILE_HEADER = "X-Voice-Identity-Profile"
+_SEGMENT_HEADER = "X-Voice-Identity-Segment"
 _PCM_CONTENT_TYPE = "audio/pcm;format=pcm_s16le;rate=16000;channels=1"
-_MAX_PCM_BYTES = 16_000 * 4 * 2
+_MAX_PCM_BYTES = ENROLLMENT_MAXIMUM_PCM_BYTES
 _MAX_FILTER_JSON_BYTES = 1024
 
 
@@ -40,7 +42,7 @@ def _service_unavailable() -> JSONResponse:
 def _service_error(exc: VoiceIdentityServiceError) -> JSONResponse:
     if exc.code in {"invalid_enrollment_id", "invalid_profile_id"}:
         status_code = 400
-    elif exc.code == "stale_enrollment":
+    elif exc.code in {"stale_enrollment", "enrollment_in_progress"}:
         status_code = 409
     elif exc.code in {
         "invalid_pcm",
@@ -48,6 +50,8 @@ def _service_error(exc: VoiceIdentityServiceError) -> JSONResponse:
         "audio_too_long",
         "silence",
         "severe_clipping",
+        "invalid_enrollment_segment",
+        "inconsistent_segments",
     }:
         status_code = 422
     else:
@@ -130,6 +134,59 @@ async def complete_voice_identity_enrollment(request: Request):
         status = await service.complete_enrollment(
             request.headers.get(_ENROLLMENT_HEADER, ""),
             request.headers.get(_PROFILE_HEADER, ""),
+            pcm16,
+        )
+    except VoiceIdentityServiceError as exc:
+        return _service_error(exc)
+    return status.as_dict()
+
+
+@router.put("/enrollment/segment")
+async def complete_voice_identity_enrollment_segment(request: Request):
+    """Accept one prompt segment; segment three atomically saves the profile."""
+
+    rejected = _validate_mutation(request)
+    if rejected is not None:
+        return rejected
+    if request.headers.get("content-type", "").lower() != _PCM_CONTENT_TYPE:
+        return JSONResponse({"error_code": "invalid_pcm"}, status_code=415)
+    segment_header = request.headers.get(_SEGMENT_HEADER, "")
+    try:
+        segment = int(segment_header)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error_code": "invalid_enrollment_segment"},
+            status_code=422,
+        )
+    if segment not in (1, 2, 3):
+        return JSONResponse(
+            {"error_code": "invalid_enrollment_segment"},
+            status_code=422,
+        )
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            parsed_content_length = int(content_length)
+            if parsed_content_length < 0:
+                raise ValueError
+            if parsed_content_length > _MAX_PCM_BYTES:
+                return JSONResponse(
+                    {"error_code": "audio_too_long"},
+                    status_code=413,
+                )
+        except ValueError:
+            return JSONResponse({"error_code": "invalid_pcm"}, status_code=400)
+    pcm16 = await _read_bounded_body(request, _MAX_PCM_BYTES)
+    if pcm16 is None:
+        return JSONResponse({"error_code": "audio_too_long"}, status_code=413)
+    service = _service()
+    if service is None:
+        return _service_unavailable()
+    try:
+        status = await service.complete_enrollment_segment(
+            request.headers.get(_ENROLLMENT_HEADER, ""),
+            request.headers.get(_PROFILE_HEADER, ""),
+            segment,
             pcm16,
         )
     except VoiceIdentityServiceError as exc:
