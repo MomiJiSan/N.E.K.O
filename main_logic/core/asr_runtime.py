@@ -1429,6 +1429,8 @@ class AsrRuntimeMixin:
                 or failure_ingress_token.connection_id != current_token.connection_id
                 or failure_ingress_token.lease_generation
                 != current_token.lease_generation
+                or failure_ingress_token.route_generation
+                != current_token.route_generation
             )
         ):
             return False
@@ -5988,9 +5990,28 @@ class AsrRuntimeMixin:
                 post_transition_identity
             ),
             status=(
-                AsrStatusEvent(code=event.code, provider=event.provider,
-                               session_epoch=event.session_epoch,
-                               ingress_token=event.ingress_token)
+                AsrStatusEvent(
+                    code=event.code,
+                    provider=event.provider,
+                    session_epoch=event.session_epoch,
+                    # The failure token was validated before this handler's
+                    # own independent -> blocked transition. Rebase only its
+                    # route generation to that transition so the status still
+                    # carries the original lease/session identity while a
+                    # competing route change remains fenced.
+                    ingress_token=(
+                        replace(
+                            event.ingress_token,
+                            route_generation=(
+                                self._core_asr_identity_ingress_token(
+                                    post_transition_identity
+                                ).route_generation
+                            ),
+                        )
+                        if event.ingress_token is not None
+                        else None
+                    ),
+                )
                 if event.code in {
                     "ASR_INPUT_DELIVERY_FAILED",
                     "ASR_INPUT_DELIVERY_UNCERTAIN",
@@ -6011,6 +6032,11 @@ class AsrRuntimeMixin:
                 != current_token.session_epoch
                 or (
                     event.ingress_token is not None
+                    and event.code
+                    in {
+                        "ASR_INDEPENDENT_FAILED",
+                        "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
+                    }
                     and not self._voice_input_recovery_failure_is_current(
                         source_identity,
                         event.session_epoch,

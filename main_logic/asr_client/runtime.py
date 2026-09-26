@@ -23,6 +23,7 @@ from main_logic.voice_turn.contracts import (
     AsrSubmitStatus,
     PreserveUnsentPrefix,
     SpeechActivityEvent,
+    VoiceIngressToken,
     VoicePartialEvent,
     VoiceTranscriptEvent,
     VoiceTurnToken,
@@ -5030,6 +5031,7 @@ class IndependentAsrRuntime:
                 provider,
                 session_epoch=failure_epoch,
                 expected_identity=failure_identity,
+                ingress_token=failure_ingress_token,
             )
         finally:
             # A dispatcher can report its own failure from inside its worker.
@@ -5056,6 +5058,7 @@ class IndependentAsrRuntime:
         *,
         session_epoch: int,
         expected_identity: _AsrRuntimeIdentity,
+        ingress_token: VoiceIngressToken | None = None,
     ) -> bool:
         if (
             session_epoch != expected_identity.session_epoch
@@ -5068,6 +5071,7 @@ class IndependentAsrRuntime:
                     code=code,
                     provider=provider,
                     session_epoch=session_epoch,
+                    ingress_token=ingress_token,
                 )
             )
         except Exception:
