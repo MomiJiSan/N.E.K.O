@@ -96,18 +96,19 @@
                     </span>
                     <div class="enrollment-copy">
                         <div class="segment-progress" id="voice-identity-progress" role="list"
-                            aria-label="三段录入进度">
+                            aria-label="四段录入进度">
                             <span role="listitem" data-step="1" aria-label="第 1 段">1</span>
                             <span role="listitem" data-step="2" aria-label="第 2 段">2</span>
                             <span role="listitem" data-step="3" aria-label="第 3 段">3</span>
+                            <span role="listitem" data-step="4" aria-label="第 4 段">4</span>
                         </div>
                         <p class="step-count" id="voice-identity-step-count" aria-live="polite"
                             aria-atomic="true"></p>
                         <p class="eyebrow" data-i18n="voiceIdentity.localOnly">仅在本机处理</p>
                         <h2 id="voice-identity-step-title" tabindex="-1"
-                            data-i18n="voiceIdentity.introTitle">录入 3 段声纹</h2>
+                            data-i18n="voiceIdentity.privacyTitle">录入 3 段声纹和 1 段验证语音</h2>
                         <p id="voice-identity-step-body" class="enrollment-help" data-i18n="voiceIdentity.privacyBody">
-                            按提示说完 3 段话，每段最长 8 秒，说完后点击保存。停顿不会自动结束。
+                            按提示完成 3 段参考录音和 1 段验证录音，第 1 至 3 段最长 3 秒，第 4 段最长 5 秒，说完后点击保存。
                         </p>
                         <blockquote id="voice-identity-prompt" class="voice-prompt" hidden></blockquote>
                     </div>
@@ -118,8 +119,8 @@
                             data-i18n="voiceIdentity.voiceWaiting">等待说话</span>
                             <span class="recording-timer" id="voice-identity-timer" aria-hidden="true"></span>
                     </div>
-                    <p class="enrollment-rule-note" data-i18n="voiceIdentity.fixedHelp">
-                        每段最长 8 秒，说完后点击保存；中间停顿不会自动结束。
+                    <p class="enrollment-rule-note" data-i18n="voiceIdentity.recordingRule">
+                        前 3 段参考录音最长 3 秒，第 4 段验证录音最长 5 秒；说完后点击保存，中间停顿不会自动结束。
                     </p>
                     <div class="enrollment-actions">
                         <button type="button" class="primary-button" id="voice-identity-start"

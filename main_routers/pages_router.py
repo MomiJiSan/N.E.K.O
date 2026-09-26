@@ -316,6 +316,13 @@ async def soccer_demo(request: Request):
     })
 
 
+@router.get("/watch_together", response_class=HTMLResponse)
+async def watch_together(request: Request):
+    return get_templates().TemplateResponse("templates/watch_together.html", {
+        "request": request, **_static_assets_ctx(),
+    })
+
+
 @router.get("/badminton_demo", response_class=HTMLResponse)
 async def badminton_demo(request: Request):
     """Badminton challenge mini-game."""
@@ -495,7 +502,11 @@ async def get_subtitle_page(request: Request):
 async def get_agenthud_page(request: Request):
     """Standalone AgentHUD window page."""
     templates = get_templates()
-    return templates.TemplateResponse("templates/agenthud.html", {"request": request})
+    return templates.TemplateResponse("templates/agenthud.html", {
+        "request": request,
+        **_static_assets_ctx(),
+        **_react_chat_assets_ctx(),
+    })
 
 
 @router.get("/card_maker", response_class=HTMLResponse)

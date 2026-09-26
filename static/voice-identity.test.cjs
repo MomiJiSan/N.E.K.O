@@ -15,15 +15,19 @@ const template = fs.readFileSync(
 );
 
 const API_ROOT = '/api/voice-identity';
-const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=16000;channels=1';
+const PCM_CONTENT_TYPE = 'audio/pcm;format=pcm_s16le;rate=48000;channels=1';
+const AUDIO_CONTRACT_ID = 'owner-campplus-desktop-v1';
 const PROFILE_HEADER = 'X-Voice-Identity-Profile';
-const TARGET_SAMPLE_RATE = 16000;
-const RECORDING_MS = 8000;
-const CAPTURE_TIMEOUT_MS = RECORDING_MS + 1000;
+const TARGET_SAMPLE_RATE = 48000;
+const REFERENCE_RECORDING_MS = 3000;
+const VERIFICATION_RECORDING_MS = 5000;
+const REFERENCE_TIMEOUT_MS = REFERENCE_RECORDING_MS + 1000;
+const VERIFICATION_TIMEOUT_MS = VERIFICATION_RECORDING_MS + 1000;
 const WINDOW_CLOSE_START_WAIT_MS = 500;
-const TARGET_SAMPLES = TARGET_SAMPLE_RATE * RECORDING_MS / 1000;
+const REFERENCE_SAMPLES = TARGET_SAMPLE_RATE * REFERENCE_RECORDING_MS / 1000;
+const VERIFICATION_SAMPLES = TARGET_SAMPLE_RATE * VERIFICATION_RECORDING_MS / 1000;
 const CHUNK_SAMPLES = 512;
-const FULL_AUDIO_CHUNKS = Math.ceil(TARGET_SAMPLES / CHUNK_SAMPLES);
+const FULL_AUDIO_CHUNKS = Math.ceil(VERIFICATION_SAMPLES / CHUNK_SAMPLES);
 
 function deferred() {
     let resolve;
@@ -121,6 +125,7 @@ function createHarness({
     autoFinish = true,
     autoAdvance = true,
     profileError,
+    verificationFailures = 0,
     profileTransportErrorAfterCommit = false,
     showConfirm,
     nativeConfirm = true,
@@ -160,6 +165,7 @@ function createHarness({
     let serverProfile = initialProfile;
     let serverProfileGeneration = initialProfile ? 'profile-0' : null;
     let serverRequested = initialRequested;
+    let remainingVerificationFailures = verificationFailures;
     let enrollmentId = null;
     let statusRequestCount = 0;
     let timerId = 0;
@@ -196,7 +202,14 @@ function createHarness({
         if (call.url === `${API_ROOT}/enrollment/segment` || call.url === `${API_ROOT}/enrollment/profile`) {
             const segment = call.options.headers.get('x-voice-identity-segment');
             if (profileError) return jsonResponse({ error_code: profileError }, { ok: false, status: 422 });
-            if (call.url.endsWith('/profile') || segment === '3') {
+            if (call.url.endsWith('/profile') || segment === '4') {
+                if (segment === '4' && remainingVerificationFailures > 0) {
+                    remainingVerificationFailures -= 1;
+                    return jsonResponse({
+                        ...statusPayload(),
+                        verification: { passed: false, match_percent: 31 },
+                    });
+                }
                 enrollmentId = null;
                 serverProfile = true;
                 serverProfileGeneration = call.options.headers.get(PROFILE_HEADER);
@@ -275,7 +288,7 @@ function createHarness({
         constructor(context, name, options) {
             assert.equal(name, 'audio-processor');
             assert.equal(options.processorOptions.originalSampleRate, context.sampleRate);
-            assert.equal(options.processorOptions.targetSampleRate, 16000);
+            assert.equal(options.processorOptions.targetSampleRate, TARGET_SAMPLE_RATE);
             this.port = {
                 onmessage: null,
                 postMessage(message) {
@@ -338,7 +351,7 @@ function createHarness({
         clearInterval() {},
         setTimeout(callback, delay) {
             timerId += 1;
-            if (delay === CAPTURE_TIMEOUT_MS) {
+            if (delay === REFERENCE_TIMEOUT_MS || delay === VERIFICATION_TIMEOUT_MS) {
                 if (!manualAudio) {
                     Promise.resolve().then(() => {
                         for (let index = 0; index < audioChunks; index += 1) {
@@ -480,7 +493,7 @@ test('mutation controls stay disabled until CSRF and canonical status resolve', 
     assert.equal(harness.elements.get('voice-identity-start').disabled, false);
 });
 
-test('one click requests permission, records up to eight seconds, and PUTs exact PCM16', async () => {
+test('one click records three reference segments and one five-second verification segment', async () => {
     const harness = createHarness();
     await harness.initialize();
 
@@ -494,16 +507,18 @@ test('one click requests permission, records up to eight seconds, and PUTs exact
         `${API_ROOT}/enrollment/segment`,
         `${API_ROOT}/enrollment/segment`,
         `${API_ROOT}/enrollment/segment`,
+        `${API_ROOT}/enrollment/segment`,
     ]);
     const upload = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).at(-1);
     assert.equal(upload.options.method, 'PUT');
-    assert.equal(upload.options.body.byteLength, TARGET_SAMPLES * 2);
+    assert.equal(upload.options.body.byteLength, VERIFICATION_SAMPLES * 2);
     assert.equal(upload.options.headers.get('content-type'), PCM_CONTENT_TYPE);
     assert.equal(upload.options.headers.get('x-voice-identity-enrollment'), 'enrollment-1');
     assert.equal(upload.options.headers.get('x-voice-identity-profile'), 'profile-1');
-    assert.equal(upload.options.headers.get('x-voice-identity-segment'), '3');
-    assert.equal(harness.mediaRequests, 3);
-    assert.deepEqual(harness.workletModules, ['/static/audio-processor.js', '/static/audio-processor.js', '/static/audio-processor.js']);
+    assert.equal(upload.options.headers.get('x-voice-identity-segment'), '4');
+    assert.equal(upload.options.headers.get('x-voice-audio-contract'), AUDIO_CONTRACT_ID);
+    assert.equal(harness.mediaRequests, 4);
+    assert.deepEqual(harness.workletModules, ['/static/audio-processor.js', '/static/audio-processor.js', '/static/audio-processor.js', '/static/audio-processor.js']);
     assert.equal(harness.mediaStreams[0].track.stopped, true);
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment complete.');
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
@@ -522,6 +537,25 @@ test('accepted segment waits for explicit next-segment action', async () => {
     assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length, 2);
     await harness.emit('voice-identity-cancel');
     await enrolling;
+});
+
+test('failed fourth verification stays in the session and retries the holdout', async () => {
+    const harness = createHarness({ verificationFailures: 1, autoAdvance: true });
+    await harness.initialize();
+
+    const enrolling = harness.emit('voice-identity-start');
+    await flush(12);
+    const segments = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`);
+    assert.equal(segments.length, 4);
+    assert.equal(harness.elements.get('voice-identity-next').hidden, false);
+    assert.match(harness.elements.get('voice-identity-message').textContent, /31/);
+    await harness.emit('voice-identity-next');
+    await enrolling;
+    assert.equal(
+        harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
+        5,
+    );
+    assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
 });
 
 test('underfilled capture cancels the lease and never uploads partial PCM', async () => {
@@ -741,7 +775,7 @@ test('user can save a short non-aligned capture after worklet flush', async () =
     ));
     assert.ok(upload);
     assert.equal(upload.options.body.byteLength, 700 * 2);
-    assert.ok(upload.options.body.byteLength < TARGET_SAMPLES * 2);
+    assert.ok(upload.options.body.byteLength < REFERENCE_SAMPLES * 2);
     assert.equal(
         harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length,
         1,

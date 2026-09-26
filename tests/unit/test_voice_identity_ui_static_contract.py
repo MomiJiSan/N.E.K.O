@@ -116,7 +116,7 @@ def test_voice_identity_header_keeps_title_bounded() -> None:
     assert "text-overflow: ellipsis" in title_layers.group(1)
 
 
-def test_voice_identity_template_is_a_three_segment_enrollment_flow() -> None:
+def test_voice_identity_template_is_a_four_segment_enrollment_flow() -> None:
     template = (ROOT / "templates/voice_identity.html").read_text(encoding="utf-8")
     stylesheet = (ROOT / "static/css/voice_identity.css").read_text(encoding="utf-8")
 
@@ -142,6 +142,7 @@ def test_voice_identity_template_is_a_three_segment_enrollment_flow() -> None:
     assert 'aria-describedby="voice-filter-help"' in template
     assert 'role="status" aria-live="polite" aria-atomic="true"' in template
     assert "segment-progress" in template
+    assert template.count('data-step="') == 4
     assert "voice-identity-record" not in template
     assert "embedding" not in template.lower()
     assert "similarity" not in template.lower()
@@ -181,8 +182,10 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
         "AudioWorkletNode",
         "audioWorklet.addModule('/static/audio-processor.js')",
         "Int16Array",
-        "TARGET_SAMPLE_RATE = 16000",
-        "MAX_RECORDING_MS = 8000",
+        "TARGET_SAMPLE_RATE = 48000",
+        "REFERENCE_RECORDING_MS = 3000",
+        "VERIFICATION_RECORDING_MS = 5000",
+        "capturePcm16(recordingDurationMs)",
         "API_ROOT = '/api/voice-identity'",
         "'/enrollment/start'",
         "'/enrollment/segment'",
@@ -191,7 +194,8 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
         "'/filter'",
         "X-Voice-Identity-Enrollment",
         "X-Voice-Identity-Profile",
-        "audio/pcm;format=pcm_s16le;rate=16000;channels=1",
+        "audio/pcm;format=pcm_s16le;rate=48000;channels=1",
+        "X-Voice-Audio-Contract",
         "X-CSRF-Token",
         "window.nekoBeforeWindowClose",
         "pagehide",
@@ -199,7 +203,7 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
     ):
         assert contract in script
 
-    assert "MAX_RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS" in script
+    assert "maxRecordingMs + CAPTURE_TIMEOUT_GRACE_MS" in script
     assert "processor.port.postMessage({ type: 'flush' })" in script
     assert "flush_complete" in script
     assert "capturedSamples <= 0" in script
@@ -211,7 +215,7 @@ def test_browser_capture_is_one_click_audio_worklet_pcm16_and_cancels_on_close()
     assert "createScriptProcessor" not in script
     assert "'/enrollment/verify'" not in script
     assert "'/enrollment/commit'" not in script
-    assert "fixedPrompts" in script
+    assert "readingPrompt${index}" in script
     assert "ready_to_commit" not in script
     assert "embedding" not in script.lower()
     assert "similarity" not in script.lower()
@@ -359,6 +363,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "localOnly",
         "privacyTitle",
         "privacyBody",
+        "recordingRule",
         "enrollAndEnable",
         "recording",
         "cancel",
@@ -385,10 +390,12 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "deleteConfirm",
     }
     required_segment_keys = {
-        "fixedTitle",
-        "fixedHelp",
-        "fixedPrompts",
-        "stepCount",
+        "readingPrompt1",
+        "readingPrompt2",
+        "readingPrompt3",
+        "readingPrompt4",
+        "readingPromptLabel",
+        "segmentProgress",
         "nextSegment",
         "retrySegment",
         "finish",
@@ -400,7 +407,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "errorSevereClipping",
         "errorAudioTooLong",
         "errorIncompleteCapture",
-        "errorInconsistentSegments",
+        "errorVoiceSamplesInconsistent",
     }
     for locale in LOCALES:
         payload = json.loads(

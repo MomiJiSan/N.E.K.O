@@ -154,7 +154,10 @@ class CustomStaticFiles(StaticFiles):
         response = await super().get_response(path, scope)
         if path.endswith(".js"):
             response.headers["Content-Type"] = "application/javascript"
-        if _has_generated_asset_version(scope.get("query_string", b"")):
+        if path.replace("\\", "/").startswith("game/") and path.endswith(".mjs"):
+            # Relative module imports keep stable URLs, so revalidate the graph.
+            response.headers["Cache-Control"] = "no-cache"
+        elif _has_generated_asset_version(scope.get("query_string", b"")):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return response
 
@@ -370,6 +373,7 @@ from main_routers.music_router import router as music_router  # noqa
 from main_routers.pages_router import router as pages_router  # noqa
 from main_routers.pngtuber_router import router as pngtuber_router  # noqa
 from main_routers.storage_location_router import router as storage_location_router  # noqa
+from main_routers.plugin_card_router import router as plugin_card_router  # noqa
 from main_routers.plugin_media_router import router as plugin_media_router  # noqa
 from main_routers.system_router import router as system_router  # noqa
 from main_routers.tool_router import router as tool_router  # noqa
@@ -380,6 +384,7 @@ from main_routers.websocket_router import router as websocket_router  # noqa
 from main_routers.workshop_router import router as workshop_router  # noqa
 from main_routers.cookies_login_router import router as cookies_login_router  # noqa
 from main_routers.game_router import router as game_router  # noqa
+from main_routers.watch_together_router import router as watch_together_router
 from main_routers.game_router.drawing_guess import router as drawing_guess_router  # noqa
 from main_routers.card_drop_router import (  # noqa
     _facts_cors_headers as _card_drop_cors_headers,
@@ -725,6 +730,7 @@ app.include_router(workshop_router)
 app.include_router(memory_router)
 app.include_router(cloudsave_router)
 app.include_router(storage_location_router)
+app.include_router(plugin_card_router)
 app.include_router(plugin_media_router)
 # 注意：pages_router 含 /{lanlan_name} 兜底路由，应最后挂载
 app.include_router(websocket_router)
@@ -738,6 +744,7 @@ app.include_router(galgame_router)
 app.include_router(widget_mode_router)
 app.include_router(icebreaker_router)
 app.include_router(game_router)
+app.include_router(watch_together_router)
 app.include_router(drawing_guess_router)
 app.include_router(card_assist_router)
 app.include_router(capture_router)

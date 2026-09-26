@@ -1,10 +1,14 @@
 (function () {
     'use strict';
 
-    const TARGET_SAMPLE_RATE = 16000;
-    const MAX_RECORDING_MS = 8000;
-    const ENROLLMENT_SEGMENT_COUNT = 3;
+    const TARGET_SAMPLE_RATE = 48000;
+    const REFERENCE_RECORDING_MS = 3000;
+    const VERIFICATION_RECORDING_MS = 5000;
+    const MAX_RECORDING_MS = VERIFICATION_RECORDING_MS;
+    const ENROLLMENT_SEGMENT_COUNT = 4;
     const SEGMENT_HEADER = 'X-Voice-Identity-Segment';
+    const AUDIO_CONTRACT_HEADER = 'X-Voice-Audio-Contract';
+    const AUDIO_CONTRACT_ID = 'owner-campplus-desktop-v1';
     const CAPTURE_TIMEOUT_GRACE_MS = 1000;
     const FLUSH_TIMEOUT_MS = 400;
     const SILENCE_HINT_MS = 800;
@@ -32,7 +36,9 @@
         silence: ['voiceIdentity.errorSilence', '没有检测到声音，请检查麦克风后重试。'],
         severe_clipping: ['voiceIdentity.errorSevereClipping', '声音过大或失真，请稍微远离麦克风。'],
         incomplete_capture: ['voiceIdentity.errorIncompleteCapture', '录音没有完整采集，请重试。'],
-        inconsistent_segments: ['voiceIdentity.errorInconsistentSegments', '三段声音差异较大，请按提示重新录入。']
+        inconsistent_segments: ['voiceIdentity.errorInconsistentSegments', '几段声音差异较大，请按提示重新录入。'],
+        voice_samples_inconsistent: ['voiceIdentity.errorVoiceSamplesInconsistent', '几段声音差异较大，请按提示重新录入。'],
+        owner_verification_failed: ['voiceIdentity.errorOwnerVerificationFailed', '声纹验证未通过，请重录当前段。']
     });
 
     const state = {
@@ -290,6 +296,27 @@
         return translate('voiceIdentity.requestFailed', '操作失败，请稍后重试。');
     }
 
+    function enrollmentVerification(payload) {
+        const verification = payload && typeof payload.verification === 'object'
+            ? payload.verification : null;
+        if (!verification || typeof verification.passed !== 'boolean') return null;
+        const matchPercent = Number(verification.match_percent);
+        return {
+            passed: verification.passed,
+            matchPercent: Number.isFinite(matchPercent) ? matchPercent : null,
+        };
+    }
+
+    function verificationRetryMessage(verification) {
+        const percent = verification && verification.matchPercent !== null
+            ? verification.matchPercent : '--';
+        return translate(
+            'voiceIdentity.verificationRetry',
+            `声纹验证未通过（最低匹配 ${percent}%），请保持自然语气重录当前段。`,
+            { percent },
+        );
+    }
+
     function phaseLabel() {
         const labels = { idle: ['voiceIdentity.phaseIdle', '准备录入'], preparing: ['voiceIdentity.phasePreparing', '正在准备录音…'], recording: ['voiceIdentity.phaseRecording', '正在录音…'], checking: ['voiceIdentity.phaseChecking', '正在检查声音质量…'], ready: ['voiceIdentity.phaseSegmentReady', '本段已保存，可以继续下一段'], retry: ['voiceIdentity.phaseRetry', '请重录当前段'], finalizing: ['voiceIdentity.phaseFinalizing', '正在完成声纹保存…'], success: ['voiceIdentity.phaseSuccess', '声纹录入完成'] };
         const item = labels[state.uiPhase] || labels.idle;
@@ -362,11 +389,14 @@
     }
 
     function fixedPrompts() {
-        let translated = null;
-        if (window.i18next && typeof window.i18next.t === 'function') translated = window.i18next.t('voiceIdentity.fixedPrompts', { returnObjects: true });
-        else if (typeof window.t === 'function') translated = window.t('voiceIdentity.fixedPrompts', { returnObjects: true });
-        if (Array.isArray(translated) && translated.length === ENROLLMENT_SEGMENT_COUNT) return translated;
-        return ['今天我想和你分享一件趣事。', '窗外的光线正在慢慢变化。', '今天也用自然的声音聊天。'];
+        const prompts = [];
+        for (let index = 1; index <= ENROLLMENT_SEGMENT_COUNT; index += 1) {
+            prompts.push(translate(
+                `voiceIdentity.readingPrompt${index}`,
+                ['今天我想和你分享一件趣事。', '窗外的光线正在慢慢变化。', '今天也用自然的声音聊天。', '我正在用自己平时的声音说话。'][index - 1],
+            ));
+        }
+        return prompts;
     }
 
     function renderEnrollment() {
@@ -411,8 +441,8 @@
             if (completed) item.textContent = '✓';
             else item.textContent = String(index + 1);
         });
-        if (elements.stepTitle) elements.stepTitle.textContent = active ? translate('voiceIdentity.fixedTitle', '朗读提示语') : translate('voiceIdentity.introTitle', '录入 3 段声纹');
-        if (elements.stepBody) elements.stepBody.textContent = active ? translate('voiceIdentity.fixedHelp', '请使用平时聊天的自然音量和语速朗读下面这句话，说完后点击保存。') : translate('voiceIdentity.introHelp', '按提示说完 3 段话，每段最长 8 秒，说完后点击保存。停顿不会自动结束。');
+        if (elements.stepTitle) elements.stepTitle.textContent = active ? translate('voiceIdentity.readingPromptLabel', '朗读提示语') : translate('voiceIdentity.privacyTitle', '录入 3 段声纹和 1 段验证语音');
+        if (elements.stepBody) elements.stepBody.textContent = active ? translate('voiceIdentity.privacyBody', '请使用平时聊天的自然音量和语速朗读下面这句话，说完后点击保存。') : translate('voiceIdentity.privacyBody', '按提示完成 3 段参考录音和 1 段验证录音，第 1 至 3 段最长 3 秒，第 4 段最长 5 秒，说完后点击保存。');
         if (elements.prompt) {
             const prompt = active ? fixedPrompts()[state.segmentIndex - 1] : '';
             elements.prompt.textContent = prompt || '';
@@ -478,7 +508,10 @@
         renderEnrollment();
     }
 
-    async function capturePcm16() {
+    async function capturePcm16(maxRecordingMs = MAX_RECORDING_MS) {
+        if (!Number.isFinite(maxRecordingMs) || maxRecordingMs <= 0) {
+            throw new Error('invalid_recording_duration');
+        }
         await ensureMicrophone();
         const context = state.audioContext;
         const source = context.createMediaStreamSource(state.mediaStream);
@@ -507,7 +540,7 @@
         state.lastVoiceAt = startedAt;
         const timer = window.setInterval(function () {
             const now = performance.now();
-            const elapsed = Math.min(MAX_RECORDING_MS, now - startedAt);
+            const elapsed = Math.min(maxRecordingMs, now - startedAt);
             elements.timer.textContent = translate(
                 'voiceIdentity.recordingSeconds',
                 `${(elapsed / 1000).toFixed(1)} 秒`,
@@ -517,7 +550,7 @@
                 state.voiceStatus = 'waiting';
                 renderEnrollment();
             }
-            if (elapsed >= MAX_RECORDING_MS && finishCapture) finishCapture();
+            if (elapsed >= maxRecordingMs && finishCapture) finishCapture();
         }, 100);
         try {
             await new Promise(function (resolve, reject) {
@@ -525,7 +558,7 @@
                 let flushing = false;
                 const captureTimeoutId = window.setTimeout(function () {
                     if (finishCapture) finishCapture(new Error('incomplete_capture'));
-                }, MAX_RECORDING_MS + CAPTURE_TIMEOUT_GRACE_MS);
+                }, maxRecordingMs + CAPTURE_TIMEOUT_GRACE_MS);
                 const settle = function (error) {
                     if (settled) return;
                     settled = true;
@@ -588,7 +621,7 @@
         }
 
         if (capturedSamples <= 0) throw new Error('incomplete_capture');
-        const maximumSamples = TARGET_SAMPLE_RATE * MAX_RECORDING_MS / 1000;
+        const maximumSamples = TARGET_SAMPLE_RATE * maxRecordingMs / 1000;
         const pcm = new Int16Array(Math.min(capturedSamples, maximumSamples));
         let offset = 0;
         for (const chunk of chunks) {
@@ -700,7 +733,9 @@
                     state.saving = false;
                     render();
                     let pcm16;
-                    try { pcm16 = await capturePcm16(); }
+                    const recordingDurationMs = segment === ENROLLMENT_SEGMENT_COUNT
+                        ? VERIFICATION_RECORDING_MS : REFERENCE_RECORDING_MS;
+                    try { pcm16 = await capturePcm16(recordingDurationMs); }
                     finally { state.recording = false; stopMicrophone(); }
                     if (state.cancelPending || state.closeStarted) return;
                     state.segmentPhase = 'checking'; state.uiPhase = 'checking';
@@ -708,9 +743,27 @@
                     render();
                     segmentRequestPending = true;
                     try {
-                        const payload = await apiRequest('/enrollment/segment', { method: 'PUT', body: pcm16, headers: { 'Content-Type': 'audio/pcm;format=pcm_s16le;rate=16000;channels=1', [SESSION_HEADER]: state.enrollmentId, [PROFILE_HEADER]: state.profileId, [SEGMENT_HEADER]: String(segment) } });
+                        const payload = await apiRequest('/enrollment/segment', { method: 'PUT', body: pcm16, headers: { 'Content-Type': 'audio/pcm;format=pcm_s16le;rate=48000;channels=1', [AUDIO_CONTRACT_HEADER]: AUDIO_CONTRACT_ID, [SESSION_HEADER]: state.enrollmentId, [PROFILE_HEADER]: state.profileId, [SEGMENT_HEADER]: String(segment) } });
                         segmentRequestPending = false;
                         applyStatus(payload);
+                        const verification = segment === ENROLLMENT_SEGMENT_COUNT
+                            ? enrollmentVerification(payload) : null;
+                        if (verification && !verification.passed) {
+                            const nextSegment = Number(
+                                payload && payload.enrollment && payload.enrollment.next_segment_index,
+                            );
+                            if (nextSegment === 1) segment = 0;
+                            state.saving = false;
+                            state.segmentPhase = 'retry'; state.uiPhase = 'retry';
+                            setMessage(verificationRetryMessage(verification), true);
+                            render();
+                            const proceed = await new Promise(function (resolve) {
+                                state.segmentAdvance = resolve;
+                            });
+                            state.segmentAdvance = null;
+                            if (!proceed || state.cancelPending || state.closeStarted) return;
+                            continue;
+                        }
                         segmentAccepted = true;
                     } catch (error) {
                         const retryable = ['speech_too_short', 'silence', 'severe_clipping', 'audio_too_long'].includes(error && error.message);

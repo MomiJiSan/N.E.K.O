@@ -47,7 +47,9 @@
             if (generation !== S.voiceInputRecoveryGeneration || S.voiceInputRecoveryState !== 'recovering') return;
             S.voiceInputRecoveryState = 'failed'; updateRecoveryStatus('failed');
             window.dispatchEvent(new CustomEvent('voice-input-recovery-changed', { detail: { state: 'failed', generation } }));
-        }, 4000);
+        // Soniox may make three 10 s connection attempts with retry backoff.
+        // Keep the client gate open for the complete backend recovery budget.
+        }, 32000);
     }
     window.addEventListener('voice-input-recovery-ready', (event) => {
         if (S.independentAsrActive !== true || S.isMicMuted || S.voiceInputRecoveryState !== 'recovering') return;
@@ -67,6 +69,9 @@
         if (generation != null && generation !== S.voiceInputRecoveryGeneration) return;
         if (detail.session_epoch != null && S.voiceInputRecoverySessionEpoch != null
                 && detail.session_epoch !== S.voiceInputRecoverySessionEpoch) return;
+        if (detail.lease_generation == null
+                || S.voiceInputRecoveryLeaseGeneration == null
+                || detail.lease_generation !== S.voiceInputRecoveryLeaseGeneration) return;
         clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'failed'; updateRecoveryStatus('failed');
     });
     const C = window.appConst;
@@ -164,7 +169,13 @@
         // 每条 WebSocket 都有独立的 generation scope；第一条消息就是完整状态。
         voiceLeaseGeneration = 0;
         lastVoiceLeaseFingerprint = '';
-        return sendVoiceInputControlState(true);
+        const sent = sendVoiceInputControlState(true);
+        // 重连重置了 generation scope；进行中的恢复要改为等待本连接刚发出的那一代，
+        // 否则新连接上的 ready/failed 通知都会因 generation 不匹配被丢弃。
+        if (sent && S.voiceInputRecoveryState === 'recovering') {
+            S.voiceInputRecoveryLeaseGeneration = voiceLeaseGeneration;
+        }
+        return sent;
     }
 
     function setVoiceInputLifecycleState(state) {
@@ -2366,6 +2377,11 @@
         // re-runs the route on every start_session).
         S.independentAsrActive = false;
         S.independentAsrProvider = '';
+        ++S.voiceInputRecoveryGeneration;
+        clearVoiceInputRecoveryTimer();
+        S.voiceInputRecoveryState = 'idle';
+        S.voiceInputRecoverySessionEpoch = null;
+        S.voiceInputRecoveryLeaseGeneration = null;
         // Cancel a start still inside its getUserMedia()/addModule() window,
         // BEFORE the isRecording early-out below. S.isRecording only flips at
         // the very end of startAudioWorklet, so every "stop the mic" path --
@@ -2722,8 +2738,16 @@
     };
 
     window.setMicMuted = function(muted, showToast = false) {
+        const wasMuted = S.isMicMuted;
         S.isMicMuted = muted;
-        if (!muted) beginVoiceInputRecovery(); else { ++S.voiceInputRecoveryGeneration; clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'idle'; updateRecoveryStatus('idle'); }
+        if (wasMuted && !muted) {
+            beginVoiceInputRecovery();
+        } else if (muted) {
+            ++S.voiceInputRecoveryGeneration;
+            clearVoiceInputRecoveryTimer();
+            S.voiceInputRecoveryState = 'idle';
+            updateRecoveryStatus('idle');
+        }
         refreshMicLease();
         if (S.isMicMuted) {
             stopSilenceDetection();
