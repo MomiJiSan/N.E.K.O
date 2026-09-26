@@ -256,6 +256,7 @@ async def test_soniox_connect_retries_exhausted_blocks_without_provider_fallback
     assert {
         "code": "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
         "details": {
+            "lease_generation": runtime._voice_lease_generation,
             "provider": "soniox",
             "session_epoch": runtime._asr_session_epoch,
         },

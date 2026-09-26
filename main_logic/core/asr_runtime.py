@@ -428,6 +428,7 @@ class AsrRuntimeMixin:
             on_failure=self._handle_core_asr_failure,
             on_status=self._send_core_asr_status,
             on_lifecycle=self._send_core_asr_lifecycle,
+            capture_ingress_token=self._capture_ingress_token,
         )
         self._asr_runtime = IndependentAsrRuntime(callbacks)
 
@@ -1415,14 +1416,25 @@ class AsrRuntimeMixin:
         self,
         source_identity: tuple[object, ...],
         session_epoch: int,
+        failure_ingress_token: VoiceIngressToken | None = None,
     ) -> bool:
         # Failure cannot reuse the ready predicate: the transport is already
         # dead, so requiring `_independent_asr_transport_is_ready()` would
         # suppress the only event the frontend uses to enter `failed`.
+        current_token = self._core_asr_identity_ingress_token(source_identity)
+        if (
+            failure_ingress_token is not None
+            and (
+                failure_ingress_token.session_epoch != current_token.session_epoch
+                or failure_ingress_token.connection_id != current_token.connection_id
+                or failure_ingress_token.lease_generation
+                != current_token.lease_generation
+            )
+        ):
+            return False
         return bool(
             self._core_asr_operation_identity_matches(source_identity)
-            and session_epoch
-            == self._core_asr_identity_ingress_token(source_identity).session_epoch
+            and session_epoch == current_token.session_epoch
         )
 
     def _ingress_token_matches(self, token: VoiceIngressToken) -> bool:
@@ -5923,12 +5935,10 @@ class AsrRuntimeMixin:
         route_operation_generation = self._asr_route_operation_generation
 
         def failure_is_current() -> bool:
-            return bool(
-                self._core_asr_operation_identity_matches(source_identity)
-                and event.session_epoch
-                == self._core_asr_identity_ingress_token(
-                    source_identity
-                ).session_epoch
+            return self._voice_input_recovery_failure_is_current(
+                source_identity,
+                event.session_epoch,
+                event.ingress_token,
             )
 
         async with self._asr_notification_lock:
@@ -5979,7 +5989,8 @@ class AsrRuntimeMixin:
             ),
             status=(
                 AsrStatusEvent(code=event.code, provider=event.provider,
-                               session_epoch=event.session_epoch)
+                               session_epoch=event.session_epoch,
+                               ingress_token=event.ingress_token)
                 if event.code in {
                     "ASR_INPUT_DELIVERY_FAILED",
                     "ASR_INPUT_DELIVERY_UNCERTAIN",
@@ -5993,10 +6004,19 @@ class AsrRuntimeMixin:
     async def _send_core_asr_status(self, event: AsrStatusEvent) -> None:
         source_identity = self._capture_core_asr_operation_identity()
         async with self._asr_notification_lock:
+            current_token = self._core_asr_identity_ingress_token(source_identity)
             if (
                 not self._core_asr_operation_identity_matches(source_identity)
                 or event.session_epoch
-                != self._core_asr_identity_ingress_token(source_identity).session_epoch
+                != current_token.session_epoch
+                or (
+                    event.ingress_token is not None
+                    and not self._voice_input_recovery_failure_is_current(
+                        source_identity,
+                        event.session_epoch,
+                        event.ingress_token,
+                    )
+                )
             ):
                 return
             delivery_failure = event.code in {
@@ -6048,14 +6068,24 @@ class AsrRuntimeMixin:
             if (delivery_failure
                     and getattr(self, "_voice_delivery_failure_notice", None) == notice):
                 return
+            status_details = {
+                "provider": event.provider,
+                "session_epoch": event.session_epoch,
+            }
+            if event.code in {
+                "ASR_INDEPENDENT_FAILED",
+                "ASR_INDEPENDENT_PROVIDER_UNAVAILABLE",
+            }:
+                status_details["lease_generation"] = (
+                    event.ingress_token.lease_generation
+                    if event.ingress_token is not None
+                    else self._voice_lease_generation
+                )
             delivered = await self._send_voice_control_status(
                 json.dumps(
                     {
                         "code": event.code,
-                        "details": {
-                            "provider": event.provider,
-                            "session_epoch": event.session_epoch,
-                        },
+                        "details": status_details,
                     }
                 ),
                 progress=(None, independent_failure_progress["primary"])
@@ -6099,10 +6129,15 @@ class AsrRuntimeMixin:
                 logger.info("[voice-recovery] failure session_epoch=%s code=%s", event.session_epoch, event.code)
                 # The original status send above is an await; re-check before
                 # publishing the recovery-failure identity used by the frontend.
-                recovery_lease_generation = self._voice_lease_generation
+                recovery_lease_generation = (
+                    event.ingress_token.lease_generation
+                    if event.ingress_token is not None
+                    else self._voice_lease_generation
+                )
                 if not self._voice_input_recovery_failure_is_current(
                     source_identity,
                     event.session_epoch,
+                    event.ingress_token,
                 ):
                     logger.info(
                         "[voice-recovery] failure_suppressed_stale session_epoch=%s lease_generation=%s",
@@ -6130,6 +6165,7 @@ class AsrRuntimeMixin:
                     still_current=lambda: self._voice_input_recovery_failure_is_current(
                         source_identity,
                         event.session_epoch,
+                        event.ingress_token,
                     ),
                 )
 

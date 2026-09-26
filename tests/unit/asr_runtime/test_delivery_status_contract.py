@@ -163,6 +163,7 @@ async def test_recovery_failed_status_drops_after_lease_takeover() -> None:
     runtime._set_microphone_route("independent")
     runtime._voice_lease_generation = 4
     epoch = runtime._asr_session_epoch
+    source_token = runtime._capture_ingress_token()
     first_send_entered = asyncio.Event()
     release_first_send = asyncio.Event()
     payloads = []
@@ -181,6 +182,7 @@ async def test_recovery_failed_status_drops_after_lease_takeover() -> None:
                 code="ASR_INDEPENDENT_FAILED",
                 provider="qwen",
                 session_epoch=epoch,
+                ingress_token=source_token,
             )
         )
     )
@@ -190,6 +192,27 @@ async def test_recovery_failed_status_drops_after_lease_takeover() -> None:
     await asyncio.wait_for(delivery, 1)
 
     assert [payload["code"] for payload in payloads] == ["ASR_INDEPENDENT_FAILED"]
+    assert payloads[0]["details"]["lease_generation"] == 4
+
+
+async def test_stale_failure_status_is_rejected_before_raw_route_teardown() -> None:
+    runtime = _Runtime()
+    runtime._set_microphone_route("independent")
+    runtime._voice_lease_generation = 4
+    epoch = runtime._asr_session_epoch
+    source_token = runtime._capture_ingress_token()
+    runtime._voice_lease_generation = 5
+
+    await runtime._send_core_asr_status(
+        AsrStatusEvent(
+            code="ASR_INDEPENDENT_FAILED",
+            provider="qwen",
+            session_epoch=epoch,
+            ingress_token=source_token,
+        )
+    )
+
+    runtime.send_status.assert_not_awaited()
 
 
 async def test_recovery_failed_status_carries_current_lease_generation() -> None:

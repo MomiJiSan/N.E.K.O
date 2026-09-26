@@ -284,6 +284,22 @@ test('stale ASR status cannot replace the current session epoch', () => {
     assert.equal(env.S.independentAsrProvider, 'current');
 });
 
+test('stale terminal ASR status cannot tear down the current lease', () => {
+    const env = loadCapture(true);
+    env.loadWebsocket();
+    env.S.voiceSessionEpoch = 12;
+    env.S.voiceInputCurrentLeaseGeneration = 5;
+
+    for (const details of [
+        { provider: 'old', session_epoch: 12 },
+        { provider: 'old', session_epoch: 12, lease_generation: 4 },
+    ]) {
+        env.status('ASR_INDEPENDENT_FAILED', details);
+        assert.equal(env.S.independentAsrActive, true);
+        assert.equal(env.S.voiceInputRouteBlocked, false);
+    }
+});
+
 test('a session_started ack for another window cannot replace the current ASR route', () => {
     const env = loadCapture(true);
     env.loadWebsocket();
@@ -300,6 +316,27 @@ test('a session_started ack for another window cannot replace the current ASR ro
     }) });
 
     assert.equal(env.S.independentAsrActive, true);
+});
+
+test('a current native session ack retires stale independent recovery', () => {
+    const env = loadCapture(true);
+    env.loadWebsocket();
+    env.window.setMicMuted(false);
+    assert.equal(env.S.voiceInputRecoveryState, 'recovering');
+    assert.equal(env.recoveryTimers().length, 1);
+
+    env.S.sessionStartedResolver = null;
+    env.S._pendingSessionStartRequestId = null;
+    env.S.socket.onmessage({ data: JSON.stringify({
+        type: 'session_started',
+        input_mode: 'audio',
+        microphone_route: 'native',
+    }) });
+
+    assert.equal(env.S.independentAsrActive, false);
+    assert.equal(env.S.voiceInputRecoveryState, 'idle');
+    assert.equal(env.recoveryTimers().length, 0);
+    assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), true);
 });
 
 test('READY and FAILED without the current lease identity cannot finish recovery', () => {

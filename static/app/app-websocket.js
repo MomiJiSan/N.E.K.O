@@ -3575,6 +3575,16 @@
                                 && Number(statusSessionEpoch) < Number(S.voiceSessionEpoch)) {
                             return;
                         }
+                        if (statusCode === 'ASR_INDEPENDENT_FAILED'
+                                || statusCode === 'ASR_INDEPENDENT_PROVIDER_UNAVAILABLE') {
+                            var statusLeaseGeneration = statusDetails && statusDetails.lease_generation;
+                            if (statusLeaseGeneration == null
+                                    || S.voiceInputCurrentLeaseGeneration == null
+                                    || Number(statusLeaseGeneration)
+                                        !== Number(S.voiceInputCurrentLeaseGeneration)) {
+                                return;
+                            }
+                        }
                         var asrProvider = (statusDetails && statusDetails.provider) || '';
                         S.independentAsrProvider = asrProvider;
                         if (statusSessionEpoch != null) {
@@ -4902,6 +4912,11 @@
                             && (response.microphone_route === 'native'
                                 || response.microphone_route === 'independent')) {
                         S.independentAsrActive = response.microphone_route === 'independent';
+                        if (response.microphone_route === 'native'
+                                && window.appAudioCapture
+                                && typeof window.appAudioCapture.resetVoiceInputRecoveryState === 'function') {
+                            window.appAudioCapture.resetVoiceInputRecoveryState();
+                        }
                     }
                     if (_ackAnswersThisWindow) S.voiceStartPending = false;
                     // NOTE: the fail-closed latch is deliberately NOT cleared
