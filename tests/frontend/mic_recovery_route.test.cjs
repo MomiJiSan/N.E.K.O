@@ -251,6 +251,20 @@ test('a deduplicated unmute uses the already-sent lease generation', () => {
     assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), true);
 });
 
+test('an idempotent unmute does not restart a completed recovery', () => {
+    const env = loadCapture(true);
+    env.window.setMicMuted(false);
+    const generation = env.S.voiceInputRecoveryGeneration;
+    const lease = env.S.voiceInputRecoveryLeaseGeneration;
+    env.window.dispatchEvent({ type: 'voice-input-recovery-ready', detail: { lease_generation: lease } });
+    assert.equal(env.S.voiceInputRecoveryState, 'ready');
+    env.window.setMicMuted(false);
+    assert.equal(env.S.voiceInputRecoveryGeneration, generation);
+    assert.equal(env.S.voiceInputRecoveryState, 'ready');
+    assert.equal(env.recoveryTimers().length, 0);
+    assert.equal(env.window.appAudioCapture.canUploadOrdinaryMicFrame(), true);
+});
+
 test('ASR status updates routing but only the first activation displays its toast', () => {
     const env = loadCapture(false);
     env.loadWebsocket();

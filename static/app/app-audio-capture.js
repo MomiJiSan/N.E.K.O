@@ -2752,8 +2752,11 @@
     };
 
     window.setMicMuted = function(muted, showToast = false) {
+        const wasMuted = S.isMicMuted;
         S.isMicMuted = muted;
-        if (!muted) beginVoiceInputRecovery(); else { ++S.voiceInputRecoveryGeneration; clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'idle'; updateRecoveryStatus('idle'); }
+        // An idempotent setter call must not restart a completed recovery, but
+        // a newly claimed session resets the state to idle while remaining unmuted.
+        if (!muted && (wasMuted || S.voiceInputRecoveryState === 'idle')) beginVoiceInputRecovery(); else if (muted) { ++S.voiceInputRecoveryGeneration; clearVoiceInputRecoveryTimer(); S.voiceInputRecoveryState = 'idle'; updateRecoveryStatus('idle'); }
         refreshMicLease();
         if (S.isMicMuted) {
             stopSilenceDetection();
