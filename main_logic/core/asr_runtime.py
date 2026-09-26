@@ -6090,7 +6090,14 @@ class AsrRuntimeMixin:
                     for plane in ("display_delivered", "voice_owner_settled")
                 ):
                     return
-            notice = (event, source_identity)
+            # The failure callback may rebase the token's route generation
+            # while moving the route to ``blocked``.  The subsequent worker
+            # status still carries the original token, so using the full
+            # event/operation identity here would treat one failure as two
+            # notices.  Session epoch plus code/provider is the stable
+            # identity of one runtime failure; a later recovery creates a
+            # new epoch before it can reuse this key.
+            notice = (event.code, event.provider, event.session_epoch)
             if (delivery_failure
                     and getattr(self, "_voice_delivery_failure_notice", None) == notice):
                 return
