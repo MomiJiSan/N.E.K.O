@@ -180,8 +180,17 @@ function createHarness({
         'voice-identity-delete',
         'voice-identity-filter',
         'voice-identity-retry',
+        'voice-identity-eyebrow',
+        'voice-identity-rule-note',
+        'voice-identity-actions',
+        'voice-identity-result',
+        'voice-identity-result-title',
+        'voice-identity-match-percent',
+        'voice-identity-score-help',
+        'voice-identity-result-status',
     ];
     const elements = new Map(elementIds.map(id => [id, createElement()]));
+    const progressSteps = Array.from({ length: 4 }, () => createElement());
     const documentListeners = new Map();
     const windowListeners = new Map();
     const fetchCalls = [];
@@ -316,6 +325,10 @@ function createHarness({
                 serverProfileGeneration = call.options.headers.get(PROFILE_HEADER);
                 serverRequested = initialProfile ? serverRequested : true;
                 if (profileTransportErrorAfterCommit) throw new Error('profile_response_lost');
+                return jsonResponse({
+                    ...statusPayload(),
+                    verification: { passed: true, match_percent: 86 },
+                });
             } else {
                 serverNextSegment = Number(segment) + 1;
             }
@@ -358,7 +371,7 @@ function createHarness({
     const document = {
         activeElement: null,
         querySelectorAll(selector) {
-            return selector === '#voice-identity-progress span' ? [createElement(), createElement(), createElement()] : [];
+            return selector === '#voice-identity-progress span' ? progressSteps : [];
         },
         getElementById(id) {
             return elements.get(id);
@@ -488,6 +501,9 @@ function createHarness({
                 'voiceIdentity.errorSecureStorageUnavailable': 'Secure storage unavailable.',
                 'voiceIdentity.deleteConfirm': 'Delete the profile?',
                 'voiceIdentity.delete': 'Delete voice profile',
+                'voiceIdentity.verificationResultTitle': 'Voice verification passed',
+                'voiceIdentity.verificationScoreLabel': 'Lowest voice similarity',
+                'voiceIdentity.verificationSavedStatus': 'Owner voice profile is saved and voice filtering is enabled.',
             };
             return translations[key] || key;
         },
@@ -621,6 +637,7 @@ function createHarness({
 
     return {
         elements,
+        progressSteps,
         fetchCalls,
         mediaStreams,
         workletModules,
@@ -761,6 +778,17 @@ test('one click records three reference segments and one five-second verificatio
     assert.equal(harness.elements.get('voice-identity-message').textContent, 'Enrollment complete.');
     assert.equal(harness.elements.get('voice-identity-enrollment').hidden, false);
     assert.equal(harness.elements.get('voice-identity-profile-controls').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-result').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-result-title').textContent, 'Voice verification passed');
+    assert.equal(harness.elements.get('voice-identity-match-percent').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-match-percent').textContent, '86%');
+    assert.equal(harness.elements.get('voice-identity-eyebrow').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-step-title').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-step-body').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-rule-note').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-actions').hidden, true);
+    assert.equal(harness.progressSteps.length, 4);
+    assert.equal(harness.progressSteps.every(step => step.classList.contains('completed')), true);
 });
 
 test('the first prompt is visible before recording starts', async () => {
@@ -1500,6 +1528,8 @@ test('failed fourth verification stays in the session and retries the holdout', 
     assert.equal(harness.elements.get('voice-identity-next').hidden, false);
     assert.equal(harness.elements.get('voice-identity-capture-status').hidden, true);
     assert.match(harness.elements.get('voice-identity-message').textContent, /31/);
+    assert.equal(harness.elements.get('voice-identity-result').hidden, true);
+    assert.equal(harness.elements.get('voice-identity-match-percent').hidden, true);
     await harness.emit('voice-identity-next');
     await enrolling;
     assert.equal(
@@ -1916,6 +1946,8 @@ test('re-enrollment recovers a lost response and preserves disabled preference',
         harness.elements.get('voice-identity-message').textContent,
         'Owner voice profile is saved; filtering is off',
     );
+    assert.equal(harness.elements.get('voice-identity-result').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-match-percent').hidden, true);
 });
 
 test('delete confirms, removes the profile, and returns to one-click enrollment', async () => {
