@@ -106,6 +106,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-28-voice-integration-main-merge",
         "2026-09-28-pr3149-voice-identity-merge",
         "2026-09-28-locale-key-sync",
+        "2026-09-28-voice-identity-activation-recovery-v2",
         "2026-09-27-pr3172-privacy-and-lifecycle",
         "2026-09-27-asr-recovery-main-merge",
         "2026-09-27-agent-screen-share-main-merge",
