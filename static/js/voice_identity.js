@@ -26,6 +26,8 @@
     const FINAL_STATUS_TIMEOUT_MS = 1000;
     const RETRY_CONNECTION_TIMEOUT_MS = 5000;
     const CANCEL_REQUEST_TIMEOUT_MS = 5000;
+    const ROUTE_RECOVERY_POLL_INTERVAL_MS = 600;
+    const ROUTE_RECOVERY_TIMEOUT_MS = 8000;
     const PROMPT_PAINT_TIMEOUT_MS = 1000;
     const SESSION_HEADER = 'X-Voice-Identity-Enrollment';
     const PROFILE_HEADER = 'X-Voice-Identity-Profile';
@@ -111,6 +113,7 @@
         // response. Keep the result in page state so the subsequent status
         // refresh and the finally block cannot discard it.
         completionResult: null,
+        routeRecoveryTask: null,
         initializationError: false,
         statusRefreshFallback: null,
         statusRefreshFallbackEpoch: 0,
@@ -345,6 +348,36 @@
             state.runtimeDisabled = status.runtime_mode === 'off';
         }
         render();
+        startRouteRecoveryPolling();
+    }
+
+    function routeRecoveryNeeded() {
+        return state.profileAvailable
+            && !state.effectiveEnabled
+            && ['runtime_degraded', 'unsupported_asr_route'].includes(
+                state.effectiveReason,
+            );
+    }
+
+    function startRouteRecoveryPolling() {
+        if (!routeRecoveryNeeded() || state.routeRecoveryTask) return;
+        const epoch = state.statusEpoch;
+        const deadline = Date.now() + ROUTE_RECOVERY_TIMEOUT_MS;
+        state.routeRecoveryTask = (async function () {
+            while (Date.now() < deadline) {
+                await new Promise(function (resolve) {
+                    window.setTimeout(resolve, ROUTE_RECOVERY_POLL_INTERVAL_MS);
+                });
+                if (epoch !== state.statusEpoch || state.closeStarted) return;
+                const status = await reconcileStatus({
+                    timeoutMs: FINAL_STATUS_TIMEOUT_MS,
+                });
+                if (status && (state.effectiveEnabled || !routeRecoveryNeeded())) return;
+            }
+        }()).finally(function () {
+            state.routeRecoveryTask = null;
+            render();
+        });
     }
 
     async function reconcileStatus(options) {

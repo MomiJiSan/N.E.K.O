@@ -148,6 +148,7 @@ function createHarness({
     nativeConfirm = true,
     webCryptoAvailable = true,
     initialEffectiveReason = null,
+    routeRecoveryReadyAfter = null,
     audioContextSampleRate = 48000,
     resumeGate,
     initialStatusError = false,
@@ -222,10 +223,14 @@ function createHarness({
 
     const statusPayload = () => ({
         requested_enabled: serverRequested,
-        effective_enabled: serverProfile && serverRequested,
-        effective_reason: initialEffectiveReason || (serverProfile
+        effective_enabled: serverProfile && serverRequested
+            && (routeRecoveryReadyAfter === null
+                || statusRequestCount >= routeRecoveryReadyAfter),
+        effective_reason: (routeRecoveryReadyAfter !== null
+            && statusRequestCount >= routeRecoveryReadyAfter)
+            ? 'ready' : (initialEffectiveReason || (serverProfile
             ? (serverRequested ? 'ready' : 'disabled')
-            : (enrollmentId ? 'enrollment_active' : 'no_profile')),
+            : (enrollmentId ? 'enrollment_active' : 'no_profile'))),
         has_profile: serverProfile,
         enrollment: enrollmentId
             ? { enrollment_id: enrollmentId, expires_at: 123.5, remaining_seconds: remainingSeconds, next_segment_index: serverNextSegment }
@@ -548,6 +553,8 @@ function createHarness({
                 }
             } else if (delay === 400) {
                 // Successful flush acknowledgement clears this watchdog.
+            } else if (delay === 600) {
+                Promise.resolve().then(callback);
             } else if (delay === 1000 || delay === 5000) {
                 // Both status and prompt-paint watchdogs are driven explicitly.
                 statusTimeouts.set(timerId, callback);
@@ -2223,6 +2230,20 @@ test('BFCache restore invalidates the pending enrollment workflow', async () => 
 
     assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/enrollment/segment`).length, 0);
     assert.ok(harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/cancel`));
+});
+
+test('route recovery polling clears a transient unsupported status', async () => {
+    const harness = createHarness({
+        initialProfile: true,
+        initialRequested: true,
+        initialEffectiveReason: 'unsupported_asr_route',
+        routeRecoveryReadyAfter: 2,
+    });
+    await harness.initialize();
+    await flush(8);
+
+    assert.ok(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length >= 2);
+    assert.equal(harness.elements.get('voice-identity-status-dot').className, 'status-dot ready');
 });
 
 test('the one-click page keeps complete dark-theme overrides', () => {
