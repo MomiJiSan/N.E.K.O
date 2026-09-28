@@ -374,3 +374,4 @@ def test_bump_instructions_name_every_step_of_the_fix() -> None:
     assert "LOCALE_KEY_SIGNATURE" in _BUMP_INSTRUCTIONS
 
 pytestmark = pytest.mark.frontend_contract
+

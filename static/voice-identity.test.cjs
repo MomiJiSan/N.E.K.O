@@ -2010,13 +2010,14 @@ test('cancellation aborts a pending segment upload and clears its PCM', async ()
     assert.ok(harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/cancel`));
 });
 
-test('manual finish rejects a capture shorter than the backend contract', async () => {
+test('manual finish stays available and explains the minimum duration', async () => {
     const harness = createHarness({ manualAudio: true, autoAdvance: false });
     await harness.initialize();
 
     const enrolling = harness.emit('voice-identity-start');
     await flush();
     assert.equal(harness.elements.get('voice-identity-finish').hidden, false);
+    assert.equal(harness.elements.get('voice-identity-finish').disabled, false);
 
     harness.emitAudio(new Int16Array(700).fill(1024));
     await harness.emit('voice-identity-finish');

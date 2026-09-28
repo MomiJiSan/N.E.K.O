@@ -519,6 +519,7 @@ def test_all_locales_define_complete_voice_identity_copy() -> None:
         "nextSegment",
         "retrySegment",
         "finish",
+        "finishTooSoon",
         "voiceWaiting",
         "voiceDetected",
         "voiceQuiet",
