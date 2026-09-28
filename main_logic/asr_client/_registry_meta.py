@@ -92,6 +92,7 @@ class AsrProviderMeta:
     # with ``importlib.util.find_spec`` (no import) and reports
     # ``MISSING_DEPENDENCY`` instead of starting a worker that cannot run.
     optional_dependency: str | None = None
+    supports_result_preserving_finish: bool = False
 
     @property
     def availability(self) -> AsrProviderAvailability:
@@ -201,6 +202,7 @@ ASR_PROVIDER_REGISTRY: dict[str, AsrProviderMeta] = {
         wire_sample_rate_hz=16_000,
         supported_endpointing_modes=frozenset({"manual", "provider"}),
         implementation_status="implemented",
+        supports_result_preserving_finish=True,
     ),
     "openai": AsrProviderMeta(
         provider_key="openai",
