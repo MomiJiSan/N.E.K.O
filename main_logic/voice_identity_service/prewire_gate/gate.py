@@ -8,9 +8,11 @@ from typing import TypeAlias
 
 from .contracts import (
     SAMPLE_RATE_HZ,
+    PrewireCommitStage,
     PrewireContiguousPlan,
     PrewireDecisionState,
     PrewireIntervalIdentity,
+    PrewireIntervalRecord,
     PrewireIntervalSpec,
     PrewireStreamKey,
     SampleRange,
@@ -21,7 +23,7 @@ from .decision import (
     PrewireScoreObservation,
     StrictPrewireEvidencePolicy,
 )
-from .ledger import PrewireIntervalLedger, PrewireTransitionError
+from .ledger import PrewireCapacityError, PrewireIntervalLedger, PrewireTransitionError
 from .scheduler import (
     ControlledScoringScheduler,
     IdentityReceipt,
@@ -292,11 +294,14 @@ class PrewireGate:
                     "stream_already_open_with_different_versions"
                 )
             return
-        self._ledger.open_stream(
-            stream,
-            original_cursor=original_cursor,
-            asr_cursor=asr_cursor,
-        )
+        try:
+            self._ledger.open_stream(
+                stream,
+                original_cursor=original_cursor,
+                asr_cursor=asr_cursor,
+            )
+        except PrewireCapacityError as exc:
+            raise PrewireGateCapacityError(str(exc)) from exc
         self._streams.setdefault(stream, state)
 
     def append_pcm(
@@ -349,7 +354,10 @@ class PrewireGate:
             )
         ranges = scoring_ranges or (spec.scoring_range,)
         self._validate_ranges(spec, ranges)
-        self._ledger.add(spec)
+        try:
+            self._ledger.add(spec)
+        except PrewireCapacityError as exc:
+            raise PrewireGateCapacityError(str(exc)) from exc
 
         pending = _PendingInterval(spec, (), ranges)
         self._pending[identity] = pending
@@ -441,6 +449,22 @@ class PrewireGate:
                 pending.emitted = True
         self._active_plans.pop(stream, None)
         self._discard_consumed_prefix(stream)
+
+    def advance_delivery(
+        self,
+        identity: PrewireIntervalIdentity,
+        *,
+        expected: PrewireCommitStage,
+        next_stage: PrewireCommitStage,
+    ) -> PrewireIntervalRecord:
+        """Record transport evidence, including after the PCM stream retires.
+
+        The delivery owner must supply actual evidence; local enqueue alone
+        never implies remote confirmation. Ledger identity and stage CAS apply.
+        """
+        return self._ledger.advance_commit(
+            identity, expected=expected, next_stage=next_stage
+        )
 
     def invalidate_stream(
         self, stream: PrewireStreamKey, *, reason: str = "stream_invalidated"
@@ -671,9 +695,11 @@ class PrewireGate:
 
     def _plan_stream(self, stream: PrewireStreamKey) -> PrewireGatePlan | None:
         active = self._active_plans.get(stream)
-        ledger_plan = self._ledger.plan_contiguous(stream)
-        if active is not None and active.ledger_plan == ledger_plan:
+        # One outstanding delivery plan per stream. Later resolvers must not
+        # replace a plan while its caller is awaiting downstream enqueue.
+        if active is not None:
             return active
+        ledger_plan = self._ledger.plan_contiguous(stream)
         if not ledger_plan.record_identities:
             self._active_plans.pop(stream, None)
             return None

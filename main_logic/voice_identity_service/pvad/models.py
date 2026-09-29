@@ -12,6 +12,7 @@ import threading
 import numpy as np
 
 from main_logic.voice_identity.reference import SpeakerReference
+from ..process_startup import PendingStartupRetirement, start_owned_process
 from .assets import ECAPA_ASSETS, ECAPA_IDENTITY, bundled_pvad, verify_asset
 
 SAMPLE_RATE = 16000
@@ -112,32 +113,47 @@ class EcapaExtractor:
             session = None
 
 
-async def extract_activity_reference(directory: Path, pcm16: bytes, *, timeout: float = 30) -> SpeakerReference:
-    """Extract in an owned process; cancellation joins retirement before returning.
+class EcapaStartupRetirementError(RuntimeError):
+    """Startup is still owned; do not replace it before confirmed retirement."""
 
-    A cancelled worker is terminated, then killed if necessary, before this
-    coroutine exits. Native process startup is joined before retirement. The
-    caller must still fence the returned reference against enrollment ownership.
+    def __init__(self, owner: PendingStartupRetirement):
+        super().__init__("ecapa_startup_retirement_pending")
+        self.retirement_owner = owner
+        self.retirement_task = owner.retirement_task
+
+
+async def extract_activity_reference(directory: Path, pcm16: bytes, *, timeout: float = 30) -> SpeakerReference:
+    """Extract with explicit ownership of process startup and retirement.
+
+    A started worker is terminated, then killed if necessary. Blocked startup
+    returns an explicit retirement owner instead of extending the request
+    timeout. The caller must fence both replacement and enrollment ownership.
     """
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("invalid_ecapa_timeout")
     if not isinstance(pcm16, bytes) or len(pcm16) % 2 or not 48000 <= len(pcm16) <= 160000:
         raise ValueError("invalid_ecapa_audio")
     deadline = asyncio.get_running_loop().time() + timeout
-    startup = asyncio.create_task(asyncio.to_thread(_start_ecapa_process, directory, pcm16))
+    native_startup = start_owned_process(_start_ecapa_process, directory, pcm16)
+    startup = asyncio.wrap_future(native_startup)
+    startup.add_done_callback(lambda future: None if future.cancelled() else future.exception())
     embedding = None
     reference = None
     try:
         # Windows spawn can block while bootstrapping/importing the child.
         # Shield startup so timeout/cancellation can still recover its handles.
-        process, receiver = await asyncio.wait_for(asyncio.shield(startup), timeout)
+        async with asyncio.timeout(timeout):
+            process, receiver = await asyncio.shield(startup)
         while not receiver.poll():
-            if not process.is_alive():
+            if not process.is_alive() and not receiver.poll():
                 raise RuntimeError("ecapa_worker_failed")
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("ecapa_extraction_timeout")
             await asyncio.sleep(0.01)
-        valid, result = receiver.recv()
+        try:
+            valid, result = receiver.recv()
+        except (EOFError, OSError) as exc:
+            raise RuntimeError("ecapa_worker_failed") from exc
         if not valid:
             raise RuntimeError(result)
         embedding = result
@@ -145,6 +161,10 @@ async def extract_activity_reference(directory: Path, pcm16: bytes, *, timeout: 
     finally:
         if embedding is not None:
             embedding.fill(0)
+        if not native_startup.done():
+            raise EcapaStartupRetirementError(
+                PendingStartupRetirement(native_startup, _stop_ecapa_process)
+            )
         retirement = asyncio.create_task(_finish_ecapa_process(startup))
         interrupted = False
         try:

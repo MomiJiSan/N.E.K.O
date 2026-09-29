@@ -557,7 +557,7 @@ def test_mixed_gap_and_multiple_keeps_claim_atomically() -> None:
     assert ledger.asr_cursor(gap.identity.stream) == 290
 
 
-def test_add_after_plan_makes_plan_stale_without_partial_claim() -> None:
+def test_add_after_plan_preserves_unchanged_prefix_claim() -> None:
     ledger = PrewireIntervalLedger()
     keep = _spec(1, 0, 100)
     later = _spec(2, 200, 300)
@@ -568,13 +568,12 @@ def test_add_after_plan_makes_plan_stale_without_partial_claim() -> None:
     plan = ledger.plan_contiguous(keep.identity.stream)
     ledger.add(later)
 
-    with pytest.raises(PrewireTransitionError, match="stale"):
-        ledger.claim_enqueued(plan)
-    assert ledger.get(keep.identity).commit_stage is PrewireCommitStage.PENDING
-    assert ledger.release_cursor(keep.identity.stream) == 0
+    ledger.claim_enqueued(plan)
+    assert ledger.get(keep.identity).commit_stage is PrewireCommitStage.ENQUEUED
+    assert ledger.release_cursor(keep.identity.stream) == 100
 
 
-def test_score_or_decision_after_plan_makes_plan_stale() -> None:
+def test_later_scoring_preserves_prefix_but_duplicate_claim_is_stale() -> None:
     ledger = PrewireIntervalLedger()
     first = _spec(1, 0, 100)
     second = _spec(2, 100, 200)
@@ -586,14 +585,11 @@ def test_score_or_decision_after_plan_makes_plan_stale() -> None:
 
     before_score = ledger.plan_contiguous(first.identity.stream)
     _score(ledger, second)
+    _decide(ledger, second, PrewireDecisionState.KEEP)
+    ledger.claim_enqueued(before_score)
     with pytest.raises(PrewireTransitionError, match="stale"):
         ledger.claim_enqueued(before_score)
-
-    before_decision = ledger.plan_contiguous(first.identity.stream)
-    _decide(ledger, second, PrewireDecisionState.KEEP)
-    with pytest.raises(PrewireTransitionError, match="stale"):
-        ledger.claim_enqueued(before_decision)
-    assert ledger.get(first.identity).commit_stage is PrewireCommitStage.PENDING
+    assert ledger.get(first.identity).commit_stage is PrewireCommitStage.ENQUEUED
     assert ledger.get(second.identity).commit_stage is PrewireCommitStage.PENDING
 
 

@@ -20,6 +20,7 @@ from typing import Sequence
 
 import numpy as np
 
+from ..process_startup import PendingStartupRetirement, start_owned_process
 from .reference import SpeakerExtractionReference
 from .contracts import SAMPLE_RATE, TSE_ENCODER_IDENTITY, TseAudioChunk, TseModelError, pcm_float32, reference_float32
 from .models import TseEncoder, TseModel
@@ -33,7 +34,7 @@ class TseEncoderRetirementError(TseModelError):
     not native termination and must never be treated as successful cleanup.
     """
 
-    def __init__(self, owner: _EncoderRetirementOwner) -> None:
+    def __init__(self, owner: _EncoderRetirementOwner | PendingStartupRetirement) -> None:
         super().__init__("TSE encoder process retirement is still pending")
         self.retirement_owner = owner
         self.retirement_task = owner.retirement_task
@@ -374,17 +375,23 @@ async def extract_extraction_reference(asset_dir: Path, reference_pcm: Sequence[
             pcm.fill(0)
         raise
     deadline = asyncio.get_running_loop().time() + timeout
-    startup = asyncio.create_task(asyncio.to_thread(_start_encoder_process, Path(asset_dir), recordings))
+    native_startup = start_owned_process(_start_encoder_process, Path(asset_dir), recordings)
+    startup = asyncio.wrap_future(native_startup)
+    startup.add_done_callback(lambda future: None if future.cancelled() else future.exception())
     embedding = reference = None
     try:
-        process, receiver = await asyncio.wait_for(asyncio.shield(startup), timeout)
+        async with asyncio.timeout(timeout):
+            process, receiver = await asyncio.shield(startup)
         while not receiver.poll():
-            if not process.is_alive():
+            if not process.is_alive() and not receiver.poll():
                 raise TseModelError("TSE encoder process exited without a reference")
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("TSE enrollment timed out")
             await asyncio.sleep(0.01)
-        valid, result = receiver.recv()
+        try:
+            valid, result = receiver.recv()
+        except (EOFError, OSError) as exc:
+            raise TseModelError("TSE encoder process exited without a reference") from exc
         if not valid:
             raise TseModelError("TSE enrollment failed")
         embedding = result
@@ -392,6 +399,13 @@ async def extract_extraction_reference(asset_dir: Path, reference_pcm: Sequence[
     finally:
         if embedding is not None:
             embedding.fill(0)
+        if not native_startup.done():
+            # The request deadline must not join a blocked OS spawn. The new
+            # owner retains PCM and late handles until physical retirement.
+            raise TseEncoderRetirementError(PendingStartupRetirement(
+                native_startup, _stop_encoder_process, recordings=recordings,
+                pending_error=_EncoderStartupRetirementPending,
+            ))
         retirement = asyncio.create_task(_finish_encoder_process(startup))
         interrupted = False
         try:
@@ -459,7 +473,7 @@ def _encoder_process(sender, directory: str, recordings: Sequence[np.ndarray]) -
         sender.close()
 
 
-async def _finish_encoder_process(startup: asyncio.Task) -> None:
+async def _finish_encoder_process(startup: asyncio.Future) -> None:
     try:
         process, receiver = await startup
     except _EncoderStartupRetirementPending as exc:

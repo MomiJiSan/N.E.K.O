@@ -1,6 +1,6 @@
 # 声纹拦截研发的配套模型与离线诊断工具
 
-> **状态：配套模块的实现记录，未生产接线。** #2980 的主目标是[会话激活后的 ASR 前音频拦截](/design/active-session-audio-interception)，以下模型、资源事务和离线分析能力为该目标提供研发基础。
+> **状态：配套模块的实现记录，未生产接线。** #2980 的主目标是[会话激活后的 ASR 前音频拦截](active-session-audio-interception.md)，以下模型、资源事务和离线分析能力为该目标提供研发基础。
 
 生产入口继续使用 `OwnerVoiceSessionActivationFactory`，录入、schema 3 档案、RNNoise 合同、唤醒词和独立 ASR 开关沿用 main。当前 ACTIVE 期间仍放行音频；不能把配套工具的存在视作拦截功能已经完成。
 

@@ -260,9 +260,13 @@ class ProcessContext:
 async def test_extraction_timeout_and_cancel_retire_owned_process(monkeypatch, tmp_path, cancel):
     context = ProcessContext()
     monkeypatch.setattr(models.multiprocessing, "get_context", lambda method: context)
-    task = asyncio.create_task(models.extract_activity_reference(tmp_path, bytes(48000), timeout=0.03))
+    task = asyncio.create_task(models.extract_activity_reference(
+        tmp_path, bytes(48000), timeout=1 if cancel else 0.03,
+    ))
     if cancel:
-        await asyncio.sleep(0.01)
+        async with asyncio.timeout(1):
+            while not getattr(context, "process", None) or not context.process.is_alive():
+                await asyncio.sleep(0.001)
         task.cancel()
     with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
         await task
@@ -314,17 +318,18 @@ async def test_blocked_spawn_keeps_loop_responsive_and_retains_handles_until_ret
         assert await asyncio.to_thread(entered.wait, 1)
         if outcome == "cancel":
             task.cancel()
-        for _ in range(10):
-            await asyncio.sleep(0.005)
-        assert loop.time() - began < 0.3  # A blocked native spawn must not block these heartbeats.
-        assert not task.done()  # Retirement must first recover the startup result.
-        if outcome == "cancel":
-            task.cancel()  # Repeated cancellation cannot abandon ownership.
-        await asyncio.sleep(0.01)
-        assert not task.done()
+        with pytest.raises(models.EcapaStartupRetirementError) as raised:
+            await asyncio.wait_for(task, 1)
+        error = raised.value
+        assert loop.time() - began < 1
+        assert not error.retirement_owner.confirmed_stopped
+        error.retirement_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await error.retirement_task
     finally:
         release.set()
-    with pytest.raises(asyncio.CancelledError if outcome == "cancel" else TimeoutError):
-        await asyncio.wait_for(task, 1)
+    async with asyncio.timeout(1):
+        while not error.retirement_owner.confirmed_stopped:
+            await asyncio.sleep(0.01)
     assert context.process.terminated and context.process.joined and context.process.closed
     assert all(pipe.closed for pipe in context.pipes)
