@@ -114,12 +114,25 @@ class EcapaExtractor:
 
 
 class EcapaStartupRetirementError(RuntimeError):
-    """Startup is still owned; do not replace it before confirmed retirement."""
+    """Native resources remain owned after startup or process retirement fails.
+
+    Do not replace enrollment before the owner confirms physical retirement.
+    The historical exception name is retained for existing callers.
+    """
 
     def __init__(self, owner: PendingStartupRetirement):
-        super().__init__("ecapa_startup_retirement_pending")
+        super().__init__("ecapa_process_retirement_pending")
         self.retirement_owner = owner
         self.retirement_task = owner.retirement_task
+
+
+class _EcapaStartupRetirementPending(RuntimeError):
+    """Carry handles when startup cleanup cannot prove the child has stopped."""
+
+    def __init__(self, process, receiver):
+        super().__init__("ecapa_startup_cleanup_pending")
+        self.process = process
+        self.receiver = receiver
 
 
 async def extract_activity_reference(directory: Path, pcm16: bytes, *, timeout: float = 30) -> SpeakerReference:
@@ -163,9 +176,12 @@ async def extract_activity_reference(directory: Path, pcm16: bytes, *, timeout: 
             embedding.fill(0)
         if not native_startup.done():
             raise EcapaStartupRetirementError(
-                PendingStartupRetirement(native_startup, _stop_ecapa_process)
+                PendingStartupRetirement(
+                    native_startup, _stop_ecapa_process,
+                    pending_error=_EcapaStartupRetirementPending,
+                )
             )
-        retirement = asyncio.create_task(_finish_ecapa_process(startup))
+        retirement = asyncio.create_task(_finish_ecapa_process(startup, native_startup))
         interrupted = False
         try:
             while True:
@@ -200,24 +216,38 @@ def _start_ecapa_process(directory: Path, pcm16: bytes):
         sender.close()
         return process, receiver
     except BaseException:
-        receiver.close()
         sender.close()
         if process is not None:
             if process.pid is not None:
-                _stop_ecapa_process(process)
+                try:
+                    _stop_ecapa_process(process)
+                except Exception as exc:
+                    raise _EcapaStartupRetirementPending(process, receiver) from exc
             else:
                 process.close()
+        receiver.close()
         raise
 
 
-async def _finish_ecapa_process(startup) -> None:
+async def _finish_ecapa_process(startup, native_startup) -> None:
     try:
         process, receiver = await startup
+    except _EcapaStartupRetirementPending as exc:
+        raise EcapaStartupRetirementError(PendingStartupRetirement(
+            native_startup, _stop_ecapa_process,
+            pending_error=_EcapaStartupRetirementPending,
+        )) from exc
     except Exception:
         # Startup owns cleanup if it fails before returning the handles.
         return
-    receiver.close()
-    await _retire_ecapa_process(process)
+    try:
+        await _retire_ecapa_process(process)
+    except Exception as exc:
+        raise EcapaStartupRetirementError(
+            PendingStartupRetirement(native_startup, _stop_ecapa_process)
+        ) from exc
+    else:
+        receiver.close()
 
 
 def _ecapa_worker(sender, directory: str, pcm16: bytes) -> None:
