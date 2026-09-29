@@ -30,6 +30,10 @@ These documents preserve design intent and implementation context. They are grou
 - [Live2D idle motion selection and recovery](/live2d_motion_plan)
 - [PNGTubeRemix layered physics compatibility](/pngtuber-remix-physics-plan)
 
+## Research goals and implementation foundations
+
+- [Active-session audio interception before ASR (not wired to production)](/design/active-session-audio-interception)
+
 ## Product-flow and interaction records
 
 - [Seven-day floating avatar guide](./avatar-floating-7day-complete-guide-dev)
