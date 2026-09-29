@@ -173,6 +173,7 @@ class _Job:
     future: asyncio.Future[ScoreResult]
     cancelled: bool = False
     released: bool = False
+    deadline_timer: asyncio.TimerHandle | None = None
 
 
 class ControlledScoringScheduler:
@@ -266,12 +267,45 @@ class ControlledScoringScheduler:
         )
         if not math.isfinite(receipt.absolute_deadline):
             raise SchedulerError("deadline_non_finite")
-        self._jobs[job_id] = _Job(request, receipt, loop.create_future())
+        job = _Job(request, receipt, loop.create_future())
+        self._jobs[job_id] = job
+        # Queued work must expire even while the single execution channel is
+        # waiting for a timed-out native call to physically return.
+        job.deadline_timer = loop.call_later(
+            self._deadline_seconds, self._expire_queued, job
+        )
         self._queue.append(job_id)
         self._buffered_pcm_bytes += size
         self._ensure_worker(loop)
         self._wake.set()
         return receipt
+
+    def _expire_queued(self, job: _Job) -> None:
+        if (
+            self._jobs.get(job.receipt.job_id) is not job
+            or job.future.done()
+            or self._active_job_id == job.receipt.job_id
+        ):
+            return
+        # Active work has its own execution timeout; do not race a completed
+        # backend result with this queue-only timer.
+        self._resolve(
+            job, ScoreResultStatus.TIMED_OUT, error_code="deadline_expired_in_queue"
+        )
+
+    def abandon(self, receipt: IdentityReceipt) -> bool:
+        """Cancel and release a receipt whose owner will never consume it.
+
+        Existing awaiters retain their captured future. The worker separately
+        owns any in-flight backend call and remains serial until it retires.
+        A later await_result for an abandoned receipt is an ownership error.
+        """
+        job = self._owned_job(receipt)
+        if job is None:
+            return False
+        self.cancel(receipt)
+        self._jobs.pop(receipt.job_id, None)
+        return True
 
     def reprioritize(self, receipt: IdentityReceipt) -> bool:
         """Move queued work forward without changing its first-queue deadline."""
@@ -401,6 +435,15 @@ class ControlledScoringScheduler:
         score: float | None = None,
         error_code: str | None = None,
     ) -> None:
+        if job.deadline_timer is not None:
+            job.deadline_timer.cancel()
+            job.deadline_timer = None
+        # Retiring a queued job also releases its queue node. Otherwise a
+        # stalled channel can accumulate dead IDs despite the job limit.
+        try:
+            self._queue.remove(job.receipt.job_id)
+        except ValueError:
+            pass
         self._release_pcm(job)
         if not job.future.done():
             job.future.set_result(ScoreResult(job.receipt, status, score, error_code))
