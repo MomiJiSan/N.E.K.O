@@ -553,7 +553,7 @@ async def test_session_start_failure_distinguishes_quota_from_429(error_text, ex
     manager.memory_server_port = 48912
     manager.send_status = AsyncMock()
     manager.send_session_failed = AsyncMock()
-    manager.cleanup = AsyncMock()
+    manager.end_session = AsyncMock()
     manager.input_cache_lock = asyncio.Lock()
     manager.pending_input_data = []
     manager._clear_pending_context_appends = lambda: None
@@ -564,6 +564,9 @@ async def test_session_start_failure_distinguishes_quota_from_429(error_text, ex
 
     codes = [json.loads(call.args[0])["code"] for call in manager.send_status.await_args_list]
     assert codes == ["SESSION_START_FAILED", expected_code]
+    manager.end_session.assert_awaited_once_with(
+        by_server=True, reset_starting_count=False
+    )
 
 
 @pytest.mark.asyncio
