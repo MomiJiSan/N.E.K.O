@@ -72,7 +72,8 @@ from ._shared import (
 from .notices import enqueue_voice_migration_notice
 from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE, GameSpeechCaptureOwner
 from .tts_records import (
-    TTS_FRAME_WRITE_TIMEOUT_SECONDS, TtsCapacityError, TtsRuntimeRecord, tts_output_runtime,
+    TTS_FRAME_WRITE_TIMEOUT_SECONDS, TTS_HANDLER_CANCEL_GRACE_SECONDS,
+    TTS_SOCKET_CLOSE_TIMEOUT_SECONDS, TtsCapacityError, TtsRuntimeRecord, tts_output_runtime,
 )
 
 # Late-binding read point for symbols that tests rebind on the facade via
@@ -363,7 +364,7 @@ class TtsRuntimeMixin:
         if not text:
             return
         self.tts_request_queue.put((speech_id, text))
-        logger.info(
+        logger.debug(
             "[voice-chain] stage=tts_enqueue speech_id=%s text_len=%d",
             speech_id,
             len(text),
@@ -1289,7 +1290,14 @@ class TtsRuntimeMixin:
                 GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
             handler_task.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(handler_task), timeout=1.0)
+                await asyncio.wait_for(
+                    asyncio.shield(handler_task),
+                    timeout=(
+                        TTS_FRAME_WRITE_TIMEOUT_SECONDS
+                        + TTS_SOCKET_CLOSE_TIMEOUT_SECONDS
+                        + TTS_HANDLER_CANCEL_GRACE_SECONDS
+                    ),
+                )
             except asyncio.CancelledError:
                 if not handler_task.done() or asyncio.current_task().cancelling():
                     raise
@@ -1635,6 +1643,11 @@ class TtsRuntimeMixin:
                 if not cleanup_tasks:
                     raise
                 self._tts_capacity_exhausted = False
+                # Retirement can precede replacement admission. Keep the
+                # waiting handler's ownership visible to startup polling.
+                fallback_task = asyncio.current_task()
+                if runtime is not None:
+                    runtime.fallback_task = fallback_task
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(
@@ -1645,6 +1658,9 @@ class TtsRuntimeMixin:
                     )
                 except asyncio.TimeoutError as error:
                     raise TtsCapacityError("TTS fallback capacity did not clear") from error
+                finally:
+                    if runtime is not None and runtime.fallback_task is fallback_task:
+                        runtime.fallback_task = None
                 if (
                     getattr(self, "session", None) is not expected_session
                     or getattr(self, "use_tts", None) != expected_use_tts
@@ -2137,7 +2153,7 @@ class TtsRuntimeMixin:
                 # A partial frame must never be followed by another frame on
                 # this socket. Close the captured transport, not a successor.
                 try:
-                    async with asyncio.timeout(1.0):
+                    async with asyncio.timeout(TTS_SOCKET_CLOSE_TIMEOUT_SECONDS):
                         await websocket.close(code=1011)
                 except Exception:
                     logger.warning("Failed to close stalled TTS audio transport", exc_info=True)
@@ -2726,7 +2742,7 @@ class TtsRuntimeMixin:
                 elif isinstance(data, tuple) and len(data) == 3 and data[0] == "__audio__":
                     _, speech_id, audio_payload = data
                     sent = await self.send_speech(audio_payload, speech_id=speech_id)
-                    logger.info(
+                    logger.debug(
                         "[voice-chain] stage=tts_audio_delivery speech_id=%s bytes=%d sent=%s",
                         speech_id,
                         len(audio_payload) if isinstance(audio_payload, (bytes, bytearray)) else 0,

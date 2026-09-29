@@ -115,6 +115,97 @@ async def test_stalled_frame_retirement_waits_for_writer_then_reclaims_runtime(m
 
 
 @pytest.mark.asyncio
+async def test_stopping_handler_waits_for_the_frame_write_deadline(monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowSocket(_RecordingWebsocket):
+        async def send_bytes(self, data):
+            entered.set()
+            await release.wait()
+            await super().send_bytes(data)
+
+    monkeypatch.setattr(runtime_module, "TTS_FRAME_WRITE_TIMEOUT_SECONDS", 2.0)
+    manager = Manager()
+    manager.websocket = SlowSocket()
+    manager.sync_message_queue = Queue()
+    release_worker = Event()
+    runtime = install(manager, release_worker)
+    runtime.response_queue.put(("__audio__", "old", b"pcm"))
+    handler = manager._start_tts_response_handler()
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        stopping = asyncio.create_task(manager._stop_tts_response_handler())
+        await asyncio.sleep(1.1)
+        assert not stopping.done(), "handler stop ignored the active frame deadline"
+        release.set()
+        await asyncio.wait_for(stopping, 1)
+        assert handler.done()
+    finally:
+        release.set()
+        release_worker.set()
+        manager._retire_tts_runtime(runtime)
+        await asyncio.gather(
+            handler,
+            *(task for task in (stopping, runtime.cleanup_task) if task is not None),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_stopping_handler_covers_frame_close_and_cancel_grace(monkeypatch):
+    entered = asyncio.Event()
+
+    class SlowCloseSocket(_RecordingWebsocket):
+        def __init__(self):
+            super().__init__()
+            self.closed_codes = []
+
+        async def send_bytes(self, data):
+            entered.set()
+            await asyncio.sleep(10)
+
+        async def close(self, *, code):
+            await asyncio.sleep(1.45)
+            self.closed_codes.append(code)
+
+    monkeypatch.setattr(runtime_module, "TTS_FRAME_WRITE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(runtime_module, "TTS_SOCKET_CLOSE_TIMEOUT_SECONDS", 1.5)
+    monkeypatch.setattr(runtime_module, "TTS_HANDLER_CANCEL_GRACE_SECONDS", 2.0)
+    manager = Manager()
+    socket = SlowCloseSocket()
+    manager.websocket = socket
+    manager.sync_message_queue = Queue()
+
+    async def handler_body():
+        try:
+            await manager._write_audio_frame(
+                socket, {"type": "audio_chunk", "speech_id": "old"}, b"pcm"
+            )
+        except Exception:
+            # The real response handler catches transport disconnects after the
+            # frame writer has closed the captured socket.
+            pass
+
+    handler = asyncio.create_task(handler_body())
+    manager.tts_handler_task = handler
+    manager._tts_handler_response_queue = manager.tts_response_queue
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        stopping = asyncio.create_task(manager._stop_tts_response_handler())
+        await asyncio.wait_for(stopping, 5)
+        assert handler.done()
+        assert socket.closed_codes == [1011]
+    finally:
+        for task in (stopping, handler):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(stopping, handler, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_pipeline_clear_cannot_steal_stopping_handlers_wakeup():
     entered, release_consumer, exited = Event(), Event(), Event()
 

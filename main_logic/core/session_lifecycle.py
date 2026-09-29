@@ -40,9 +40,39 @@ class SessionOwnershipMixin:
 
     def _current_start_deadline(self):
         operation = self._current_start_request()
-        return operation.deadline if operation is not None else (
+        # Long-lived handlers inherit the start context, but startup's budget
+        # stops governing recovery once publication has finished.
+        return operation.deadline if operation is not None and not operation.finished.is_set() else (
             asyncio.get_running_loop().time() + FRONTEND_START_SESSION_TIMEOUT_SECONDS
         )
+
+    async def _wait_session_end(self, task):
+        """Bound the caller's wait while the manager retains physical cleanup."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + FRONTEND_START_SESSION_TIMEOUT_SECONDS
+        record = next((item for item in self._session_retirements if item.task is task), None)
+        handoff = asyncio.create_task(record.handoff_safe.wait()) if record is not None else None
+        try:
+            watched = (task, handoff) if handoff is not None else (task,)
+            done, _ = await asyncio.wait(
+                watched, timeout=max(0, deadline - loop.time()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done:
+                return task.result()  # Preserve close errors and cancellation.
+            if handoff is None or not handoff.done():
+                raise TimeoutError("Session end did not reach safe handoff")
+            # Preserve prompt physical cleanup/error reporting, without making
+            # existing end-then-start callers depend on an uncooperative worker.
+            done, _ = await asyncio.wait(
+                (task,), timeout=min(2.0, max(0, deadline - loop.time())),
+            )
+            if task in done:
+                return task.result()
+        finally:
+            if handoff is not None:
+                handoff.cancel()
+                await asyncio.gather(handoff, return_exceptions=True)
 
     async def _wait_session_handoff(self, deadline):
         self._init_session_lifecycle_state()
@@ -136,6 +166,11 @@ class SessionOwnershipMixin:
 
     def _close_connection_record(self, record, *, initiating_task=None):
         record.retired = True
+        # A failed close leaves the physical state unknown and therefore keeps
+        # capacity reserved. A later retirement attempt may retry the provider
+        # close and release that slot only after a confirmed success.
+        if record.close_task is not None and record.close_task.done() and not record.closed:
+            record.close_task = None
         if record.close_task is None:
             initiating_task = initiating_task or asyncio.current_task()
             async def close():
@@ -170,10 +205,12 @@ class SessionOwnershipMixin:
                     # callback has unwound, even when provider close failed.
                     if callbacks:
                         await asyncio.gather(*callbacks, return_exceptions=True)
-                    # A provider close that raises must not strand the record:
-                    # capacity counting and pruning both key off `closed`, so
-                    # leaving it unset costs a slot for the process lifetime.
-                    record.closed = True
+                    # ``closed`` is the physical-release acknowledgement used
+                    # by capacity counting and pruning. If the authoritative
+                    # close raised, the provider may still own a live socket;
+                    # keep this record occupying its slot rather than claiming
+                    # a safe handoff we cannot prove.
+                    record.closed = close_error is None
                 if close_error is not None:
                     raise close_error
             record.close_task = self._own_cleanup_task(close())
@@ -193,9 +230,18 @@ class SessionOwnershipMixin:
             existing_record = self._connection_record(session)
             if existing_record is not None and existing_record.retired:
                 raise RuntimeError('Cannot reconnect a manager-retired session')
+            retried = set()
             while True:
                 live = [record for record in self._connection_records
                         if not record.closed and record is not existing_record]
+                for stale in live:
+                    if (stale.retired and stale not in retried
+                            and (stale.close_task is None or stale.close_task.done())):
+                        # Retry once per admission, not every 20ms. Failure
+                        # still occupies capacity and the startup budget bounds
+                        # waiting; a subsequent request may make a fresh attempt.
+                        retried.add(stale)
+                        self._close_connection_record(stale)
                 serial = not getattr(session, 'supports_session_overlap', True) or any(
                     not getattr(record.session, 'supports_session_overlap', True) for record in live
                 )
@@ -442,8 +488,12 @@ class SessionOwnershipMixin:
         record.handoff_safe.set()
         if record.tts is not None and record.tts.cleanup_task is not None:
             close_tasks.append(record.tts.cleanup_task)
+        cleanup_errors = []
         if close_tasks:
-            await asyncio.gather(*close_tasks)
+            results = await asyncio.gather(*close_tasks, return_exceptions=True)
+            cleanup_errors = [
+                result for result in results if isinstance(result, BaseException)
+            ]
         record.cleanup_complete.set()
         # Retain unresolved isolation and live resources, not a lifetime-long
         # history of closed sockets and completed operations.
@@ -453,3 +503,5 @@ class SessionOwnershipMixin:
             if item is record or not item.cleanup_complete.is_set()
             or (item.memory_completion is not None and not item.memory_completion.done())
         ]
+        if cleanup_errors:
+            raise cleanup_errors[0]

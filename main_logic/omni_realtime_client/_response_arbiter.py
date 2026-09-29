@@ -135,6 +135,14 @@ class ResponseTicket:
     done: asyncio.Future[ResponseDispatchResult]
 
 
+@dataclass(frozen=True, slots=True)
+class _TurnPreparationToken:
+    """Identity of one preparation promise on one arbiter connection."""
+
+    generation: int
+    serial: int
+
+
 def _retrieve_exception(future: asyncio.Future[Any]) -> None:
     """Mark a failed future's exception as observed.
 
@@ -386,6 +394,8 @@ class RealtimeResponseArbiter:
         self._dispatch_wakeup = asyncio.Event()
         self._dispatch_wakeup.set()
         self._turn_preparations = 0
+        self._turn_preparation_tokens: set[_TurnPreparationToken] = set()
+        self._turn_preparation_serial = 0
         self._dispatch_pause_timeout = _DISPATCH_PAUSE_TIMEOUT
         # Bumped by every pause so a resume followed by a re-pause retires the
         # earlier expiry instead of letting it fire against the new promise.
@@ -807,28 +817,26 @@ class RealtimeResponseArbiter:
                 or not self._connection_available
             ):
                 return
+            logger.warning(
+                "realtime dispatch held paused for its full %.1fs bound "
+                "(owner=%s preparations=%d current=%s queued=%d)",
+                timeout,
+                self._pause_owner,
+                self._turn_preparations,
+                self.current_source,
+                self._queue.qsize(),
+            )
             if self._turn_preparations:
-                logger.warning(
-                    "realtime dispatch held paused for its full %.1fs bound "
-                    "(owner=%s preparations=%d current=%s queued=%d); "
-                    "preparation still owns the lane",
-                    timeout,
-                    self._pause_owner,
-                    self._turn_preparations,
-                    self.current_source,
-                    self._queue.qsize(),
+                # A preparation owns the barrier until its caller reaches the
+                # matching end_turn_preparation() in its finally block.
+                # Opening dispatch while that owner is still alive would let a
+                # successor response cross an unfinished interruption. The
+                # pause timeout therefore fails closed for a stuck preparation
+                # instead of pretending resume_dispatch() released the lane.
+                await self._tear_down_transport(
+                    "realtime turn preparation exceeded dispatch pause timeout"
                 )
-            else:
-                logger.warning(
-                    "realtime dispatch held paused for its full %.1fs bound "
-                    "(owner=%s preparations=%d current=%s queued=%d); releasing "
-                    "the lane because nothing claimed the pause",
-                    timeout,
-                    self._pause_owner,
-                    self._turn_preparations,
-                    self.current_source,
-                    self._queue.qsize(),
-                )
+                return
             self.resume_dispatch()
 
         self._pause_expiry = loop.create_task(
@@ -855,16 +863,45 @@ class RealtimeResponseArbiter:
         self._dispatch_wakeup.set()
         self._ensure_worker()
 
-    def begin_turn_preparation(self, owner: str | None = None) -> None:
+    def begin_turn_preparation(
+        self,
+        owner: str | None = None,
+    ) -> _TurnPreparationToken:
         """Keep even completed tickets behind in-flight interruption cleanup."""
+        self._turn_preparation_serial += 1
+        token = _TurnPreparationToken(
+            self._connection_generation,
+            self._turn_preparation_serial,
+        )
+        self._turn_preparation_tokens.add(token)
         self._turn_preparations += 1
         self.pause_dispatch(owner)
+        return token
 
-    def end_turn_preparation(self) -> None:
+    def end_turn_preparation(
+        self,
+        token: _TurnPreparationToken,
+    ) -> None:
+        """Release only a preparation still owned by this connection.
+
+        Production callers retain the token returned by
+        ``begin_turn_preparation`` so a late finally block from a retired
+        connection cannot decrement the replacement's count.
+        """
+        if (
+            token.generation != self._connection_generation
+            or token not in self._turn_preparation_tokens
+        ):
+            return
+        self._turn_preparation_tokens.remove(token)
         self._turn_preparations -= 1
         self._dispatch_wakeup.set()
 
     def _can_dispatch(self, queued: _QueuedResponse) -> bool:
+        if queued.interrupted:
+            # Selection only settles the ticket: _process checks interruption
+            # before sending any event, even behind an active preparation.
+            return True
         return self._turn_preparations == 0 and (
             self._dispatch_allowed.is_set() or queued.dispatch_while_paused
         )
@@ -992,6 +1029,7 @@ class RealtimeResponseArbiter:
             return False
         queued.interrupted = True
         queued.interrupt_event.set()
+        self._dispatch_wakeup.set()
         # A ticket still waiting in the priority queue will observe the
         # interrupt before dispatch. Do not cancel the unrelated current owner.
         if queued is not self._current:
@@ -2038,6 +2076,11 @@ class RealtimeResponseArbiter:
             )
         self._connection_available = False
         self._connection_generation += 1
+        # Preparations belong to the connection that admitted them. Once that
+        # connection is lost, their owners may still run a finally block, but
+        # that late cleanup must not touch a successor's dispatch barrier.
+        self._turn_preparation_tokens.clear()
+        self._turn_preparations = 0
         self._cancel_pending_cancel_sends()
         # Wake a worker parked behind the dispatch barrier so it can observe
         # the failed connection and complete its selected ticket.
@@ -2083,6 +2126,12 @@ class RealtimeResponseArbiter:
         # Defensive: a cancel send spawned against a previous connection must
         # never fire into the replacement one.
         self._cancel_pending_cancel_sends()
+        # A reset is a new connection even when the previous transport did not
+        # report a loss first. Retire every old preparation token before
+        # reopening dispatch; its finally block will be ignored by identity.
+        self._connection_generation += 1
+        self._turn_preparation_tokens.clear()
+        self._turn_preparations = 0
         retired_worker = self._retire_connection_owners(
             "realtime connection replaced"
         )

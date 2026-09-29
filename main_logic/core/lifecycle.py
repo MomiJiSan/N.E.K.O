@@ -1464,13 +1464,25 @@ class LifecycleMixin:
         while True:
             self._check_start_operation()
             runtime = self._snapshot_tts_runtime()
+            ready = False
             if runtime is not None and not self._tts_runtime_is_current(runtime):
-                raise asyncio.CancelledError("TTS runtime retired during startup")
-            async with self.tts_cache_lock:
                 self._check_start_operation()
-                if not self._tts_runtime_is_current(runtime):
-                    continue
-                ready = bool(self.tts_ready and self.tts_thread and self.tts_thread.is_alive())
+                fallback_task = runtime.fallback_task
+                if not (
+                    fallback_task is not None
+                    and fallback_task is self.tts_handler_task
+                    and not fallback_task.done()
+                    and not fallback_task.cancelling()
+                ):
+                    raise RuntimeError("TTS runtime retired during startup")
+                # An owned fallback may wait for this worker's physical exit.
+                # Use the same bounded polling below until its successor is ready.
+            else:
+                async with self.tts_cache_lock:
+                    self._check_start_operation()
+                    if not self._tts_runtime_is_current(runtime):
+                        continue
+                    ready = bool(self.tts_ready and self.tts_thread and self.tts_thread.is_alive())
             if ready:
                 await self._flush_tts_pending_chunks()
                 self._check_start_operation()
@@ -4318,6 +4330,7 @@ class LifecycleMixin:
         after_memory_settlement=None, memory_settlement_timeout=15.0,
         preserve_pending_input=False,
     ):
+        """Wait for safe handoff with bounded cleanup grace; retain slow resources."""
         task = self.request_end_session(
             by_server=by_server, expected_session=expected_session,
             reset_starting_count=reset_starting_count,
@@ -4325,7 +4338,7 @@ class LifecycleMixin:
             memory_settlement_timeout=memory_settlement_timeout,
             preserve_pending_input=preserve_pending_input,
         )
-        await asyncio.shield(task)
+        await self._wait_session_end(task)
 
     async def cleanup(self, expected_websocket=None, *, expected_session=None, reset_starting_count=True):
         self._init_session_lifecycle_state()
@@ -4335,8 +4348,14 @@ class LifecycleMixin:
         if expected_session is not None and self.session is not expected_session:
             return
         generation = self._session_generation
-        await self.end_session(by_server=True, expected_session=expected_session,
-                               reset_starting_count=reset_starting_count)
+        try:
+            await self.end_session(by_server=True, expected_session=expected_session,
+                                   reset_starting_count=reset_starting_count)
+        except Exception as exc:
+            # Disconnect is terminal for this socket even when physical close
+            # failed. The retirement registry retains unsafe resources and
+            # capacity; unbinding below still obeys socket/generation identity.
+            logger.warning("Session disconnect cleanup failed: %s", exc)
         # A microphone pause uses end_session directly. Only a matching
         # disconnected transport may unbind the chat socket, after rechecking
         # both the connection and conversation ownership behind the lock.

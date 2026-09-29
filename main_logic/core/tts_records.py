@@ -8,6 +8,8 @@ from typing import Any
 
 # Bound a single frame while preserving its header/payload ordering on cancel.
 TTS_FRAME_WRITE_TIMEOUT_SECONDS = 5.0
+TTS_SOCKET_CLOSE_TIMEOUT_SECONDS = 1.0
+TTS_HANDLER_CANCEL_GRACE_SECONDS = 2.0
 
 
 class TtsCapacityError(RuntimeError):
@@ -24,6 +26,7 @@ class TtsRuntimeRecord:
     shutdown_sent: bool = False
     supports_runtime_overlap: bool = True
     cleanup_task: asyncio.Task | None = None
+    fallback_task: asyncio.Task | None = None
     cleanup_complete: asyncio.Event = field(default_factory=asyncio.Event)
     handoff_safe: asyncio.Event = field(default_factory=asyncio.Event)
 

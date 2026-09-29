@@ -117,6 +117,60 @@ async def test_unclaimed_dispatch_pause_expires_and_releases_the_lane(caplog):
     await arbiter.shutdown()
 
 
+async def test_stuck_preparation_timeout_fails_closed_instead_of_wedging_lane():
+    sent_events: list[dict] = []
+    arbiter: RealtimeResponseArbiter | None = None
+
+    async def send(event):
+        sent_events.append(dict(event))
+
+    _client, arbiter = _make_client(send)
+    arbiter._dispatch_pause_timeout = 0.05
+    abort_transport = AsyncMock()
+    arbiter._abort_transport = abort_transport
+    preparation_token = arbiter.begin_turn_preparation("turn-stuck")
+    ticket = await arbiter.enqueue(source="proactive")
+
+    with pytest.raises(ConnectionError, match="turn preparation"):
+        await asyncio.wait_for(ticket.sent, 2)
+
+    assert arbiter._connection_available is False
+    assert arbiter._turn_preparations == 0
+    assert sent_events == []
+    abort_transport.assert_awaited_once()
+
+    # The owner task may still execute its finally block after the connection
+    # is retired; that stale cleanup is now an identity no-op.
+    arbiter.end_turn_preparation(preparation_token)
+    await arbiter.shutdown()
+
+
+async def test_connection_reset_invalidates_old_preparation_token():
+    sent_events: list[dict] = []
+    arbiter: RealtimeResponseArbiter | None = None
+
+    async def send(event):
+        sent_events.append(dict(event))
+        if event["type"] == "response.create":
+            arbiter.notify_response_created({})
+            arbiter.notify_response_terminal({})
+
+    _client, arbiter = _make_client(send)
+    old_token = arbiter.begin_turn_preparation("old-connection")
+    arbiter.reset_connection_state()
+
+    assert arbiter._turn_preparations == 0
+    ticket = await arbiter.enqueue(source="new-connection")
+    await asyncio.wait_for(ticket.sent, 1)
+    assert sent_events[-1]["type"] == "response.create"
+
+    # The old finally block must not decrement a preparation admitted after
+    # the reset, even when the caller uses the token from the retired lane.
+    arbiter.end_turn_preparation(old_token)
+    assert arbiter._turn_preparations == 0
+    await arbiter.shutdown()
+
+
 async def test_claimed_dispatch_pause_is_not_expired():
     """Counter-test: expiry must not fire while the pause is still owned.
 
