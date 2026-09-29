@@ -162,3 +162,97 @@ async def test_partial_startup_failure_keeps_handles_through_retirement_retry():
     await asyncio.wait_for(asyncio.shield(owner.retirement_task), 2)
     assert owner.confirmed_stopped and closed.is_set()
     assert not recordings[0].any()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["started", "partial_startup", "cancelled_startup"])
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_failed_retirement_retains_child_until_physical_stop(
+    monkeypatch, process_api, phase, cancel_waiter,
+):
+    entered, release_start = threading.Event(), threading.Event()
+    attempted, allow_stop = threading.Event(), threading.Event()
+    pipe_closed = threading.Event()
+    sender_closes = []
+
+    class Process:
+        pid = 42
+        alive = True
+        closed = False
+
+        def start(self):
+            entered.set()
+            if phase == "cancelled_startup":
+                assert release_start.wait(5)
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            attempted.set()
+            if allow_stop.is_set():
+                self.alive = False
+
+        def kill(self):
+            self.terminate()
+
+        def join(self, timeout):
+            pass
+
+        def close(self):
+            assert not self.alive
+            self.closed = True
+
+    process = Process()
+
+    def close_sender():
+        sender_closes.append(True)
+        if phase != "started" and len(sender_closes) == 1:
+            raise OSError("parent pipe close failed after child started")
+
+    receiver = SimpleNamespace(
+        poll=lambda: True,
+        recv=lambda: (True, np.ones(192, np.float32)),
+        close=pipe_closed.set,
+    )
+    context = SimpleNamespace(
+        Pipe=lambda **kwargs: (receiver, SimpleNamespace(close=close_sender)),
+        Process=lambda **kwargs: process,
+    )
+    monkeypatch.setattr(process_api.module.multiprocessing, "get_context", lambda method: context)
+    task = asyncio.create_task(process_api.invoke(2))
+    owner = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        if phase == "cancelled_startup":
+            task.cancel()
+        with pytest.raises(process_api.retiring) as raised:
+            await asyncio.wait_for(task, 1)
+        owner = raised.value.retirement_owner
+        release_start.set()
+        assert await asyncio.to_thread(attempted.wait, 1)
+        # Neither startup failure nor an unsuccessful kill proves retirement.
+        assert process.alive and not process.closed
+        assert not owner.confirmed_stopped
+        assert not pipe_closed.is_set()
+        if cancel_waiter:
+            owner.retirement_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner.retirement_task
+        allow_stop.set()
+        async with asyncio.timeout(2):
+            while not owner.confirmed_stopped:
+                await asyncio.sleep(0.01)
+        assert not process.alive and process.closed and pipe_closed.is_set()
+        if not cancel_waiter:
+            await asyncio.wait_for(owner.retirement_task, 1)
+    finally:
+        release_start.set()
+        allow_stop.set()
+        if owner is not None:
+            async with asyncio.timeout(2):
+                while not owner.confirmed_stopped:
+                    await asyncio.sleep(0.01)
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

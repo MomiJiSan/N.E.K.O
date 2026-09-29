@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -526,3 +527,60 @@ async def test_request_must_use_an_injected_window_size() -> None:
     with pytest.raises(SchedulerError, match="sample_range_not_in_window_plan"):
         scheduler.submit(_request("unscheduled", samples=6))
     await scheduler.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("completed_at", [10.5, 11.0, 12.0])
+async def test_completed_result_rechecks_absolute_deadline(asynchronous, completed_at):
+    now = [10.0]
+
+    def score(*args):
+        now[0] = completed_at
+        return 0.9
+
+    async def score_async(*args):
+        return score(*args)
+
+    backend = SimpleNamespace(**{"score_async" if asynchronous else "score":
+                                 score_async if asynchronous else score})
+    scheduler = _scheduler(backend, clock=lambda: now[0])
+    try:
+        result = await scheduler.await_result(scheduler.submit(_request("deadline")))
+        assert result.receipt.absolute_deadline == 11.0
+        if completed_at < result.receipt.absolute_deadline:
+            assert result.status is ScoreResultStatus.COMPLETED
+            assert result.score == 0.9
+        else:
+            assert result.status is ScoreResultStatus.TIMED_OUT
+            assert result.score is None
+            assert result.error_code == "execution_deadline_expired"
+        # A physically completed late call must not fence the next request.
+        followup = await scheduler.await_result(scheduler.submit(_request("next")))
+        assert followup.status is ScoreResultStatus.COMPLETED
+    finally:
+        await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_delay_cannot_publish_an_expired_score():
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def score_async(*args):
+        entered.set()
+        await release.wait()
+        return 0.9
+
+    scheduler = _scheduler(SimpleNamespace(score_async=score_async), deadline_seconds=0.02)
+    try:
+        receipt = scheduler.submit(_request("delayed-loop"))
+        await entered.wait()
+        release.set()
+        # Deliberately delay the coordinator beyond the deadline. This is a
+        # failure injection, not a sleep used to guess the backend's ordering.
+        threading.Event().wait(0.05)
+        result = await scheduler.await_result(receipt)
+        assert result.status is ScoreResultStatus.TIMED_OUT
+        assert result.score is None
+    finally:
+        await scheduler.close()

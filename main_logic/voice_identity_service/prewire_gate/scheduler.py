@@ -544,6 +544,14 @@ class ControlledScoringScheduler:
                     error_code="result_isolated",
                 )
                 return
+            # A delayed event loop can observe both completion and timeout in
+            # one turn. Completion alone is not proof of an on-time result.
+            if float(self._clock()) >= job.receipt.absolute_deadline:
+                self._resolve(
+                    job, ScoreResultStatus.TIMED_OUT,
+                    error_code="execution_deadline_expired",
+                )
+                return
             try:
                 score = score_task.result()
             except asyncio.CancelledError:
