@@ -81,10 +81,21 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-28-avatar-tool-v3-main-merge",
         "2026-09-29-local-asr-prepare-screen-source-merge",
         "2026-09-29-local-asr-prepare-notices",
+<<<<<<< HEAD
+=======
+        "2026-09-29-screen-source-current-summary",
+        
+>>>>>>> 667e96acb (整合近期 ASR、声纹与唤醒矫正 PR)
         "2026-09-29-local-asr-model-status",
         "2026-09-28-local-asr-voiceprint-main-merge",
         "2026-09-28-local-asr-glm-voice-clone-merge",
         "2026-09-28-local-asr-screen-share-merge",
+<<<<<<< HEAD
+=======
+        "2026-09-29-pr3149-main-rebase",
+        "2026-09-29-voice-identity-off-mode",
+        "2026-09-28-glm-voice-clone-free-tts-merge",
+>>>>>>> 667e96acb (整合近期 ASR、声纹与唤醒矫正 PR)
         "2026-09-28-local-asr-and-quota-codes",
         "2026-09-28-free-tts-quota-codes",
         "2026-09-28-local-asr-toggle",
@@ -375,4 +386,5 @@ def test_bump_instructions_name_every_step_of_the_fix() -> None:
     assert "LOCALE_KEY_SIGNATURE" in _BUMP_INSTRUCTIONS
 
 pytestmark = pytest.mark.frontend_contract
+
 

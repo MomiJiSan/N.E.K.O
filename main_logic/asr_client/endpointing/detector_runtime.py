@@ -732,7 +732,10 @@ class _VoiceTurnAdapter:
         if self._evaluation_task is not None:
             self._smart_turn_coalesced_evaluation_count += 1
             self._reevaluation_requested = True
-            self._reevaluation_reason = reason
+            if reason != "periodic_no_vad" or self._reevaluation_reason is None:
+                # A periodic tick must not erase a pending pause or strict
+                # retry: only those can seal the turn once the wait expires.
+                self._reevaluation_reason = reason
             return
         coordinator_generation = int(getattr(self._coordinator, "generation", 0))
         activity_seq = int(getattr(self._coordinator, "activity_seq", 0))
@@ -891,8 +894,23 @@ class _VoiceTurnAdapter:
             )
             return
         if status is EvaluationStatus.OK and decision is TurnDecision.INCOMPLETE:
+            if (
+                item.reason != "periodic_no_vad"
+                and self._strict_endpoint_wait_expired()
+            ):
+                # An unfinished-sounding pause is still a semantic answer, not
+                # an endpointing failure: seal the turn instead of blocking
+                # the whole ASR session.
+                await self._publish_complete_result(
+                    item.identity,
+                    item.detector_identity,
+                    "semantic_timeout",
+                    probability=probability,
+                    evaluation_tail=evaluation_tail,
+                )
+                return
             self._observe_evaluation_tail(evaluation_tail)
-            if reevaluate:
+            if reevaluate and reevaluation_reason != "periodic_no_vad":
                 self._request_evaluation(
                     item.identity,
                     reevaluation_reason,
@@ -900,12 +918,20 @@ class _VoiceTurnAdapter:
                 )
                 return
             if item.reason != "periodic_no_vad":
+                # A periodic result never schedules a strict retry, so the
+                # strict wait must keep running across a coalesced tick.
                 if self._smart_turn_required and self._strict_endpoint_deadline is None:
                     self._strict_endpoint_deadline = (
                         asyncio.get_running_loop().time()
                         + self._max_endpoint_wait_seconds
                     )
                 self._schedule_fallback(item.identity, "semantic_incomplete")
+            if reevaluate:
+                self._request_evaluation(
+                    item.identity,
+                    reevaluation_reason,
+                    self._latest_detector_identity,
+                )
             return
         if self._smart_turn_required:
             failure_kind = (
@@ -1168,28 +1194,40 @@ class _VoiceTurnAdapter:
         """Schedule one strict retry through the single SmartTurn lane."""
 
         await asyncio.sleep(self._continuation_timeout_seconds)
-        if (
-            self._closed
-            or self._failed
-            or identity != self._identity
-            or self._coordinator.state is not CoordinatorState.WAIT_CONTINUATION
-        ):
+        state = self._coordinator.state
+        # A periodic no-VAD inference may be running; the retry then coalesces
+        # behind it instead of silently ending the strict wait.
+        waiting = state is CoordinatorState.WAIT_CONTINUATION or (
+            state is CoordinatorState.EVALUATING and self._evaluation_task is not None
+        )
+        if self._closed or self._failed or identity != self._identity or not waiting:
             return
-        deadline = self._strict_endpoint_deadline
-        if deadline is None or asyncio.get_running_loop().time() >= deadline:
+        if self._strict_endpoint_deadline is None:
             self._report_failure("unavailable", "smart_turn")
             return
+        # Past the deadline this retry is the last one: a still-incomplete
+        # result seals the turn as ``semantic_timeout``.
         self._request_evaluation(
             identity,
             "strict_retry",
             self._latest_detector_identity,
         )
 
+    def _strict_endpoint_wait_expired(self) -> bool:
+        deadline = self._strict_endpoint_deadline
+        return (
+            self._smart_turn_required
+            and deadline is not None
+            and asyncio.get_running_loop().time() >= deadline
+        )
+
     async def _publish_complete_result(
         self,
         identity: _Identity,
         detector_identity: DetectorIngressIdentity | None,
-        reason: Literal["candidate_pause", "periodic_no_vad", "strict_retry"],
+        reason: Literal[
+            "candidate_pause", "periodic_no_vad", "strict_retry", "semantic_timeout"
+        ],
         *,
         probability: float | None,
         evaluation_tail: tuple[_AudioItem, ...],
@@ -1584,6 +1622,10 @@ class DetectorRuntime:
                 turn_id: int,
                 identity: DetectorIngressIdentity,
             ) -> _Identity:
+                if identity.detector_epoch != self._detector_epoch:
+                    # A result evaluated before an overflow reset must not
+                    # advance the successor epoch's semantic identity.
+                    return (generation, buffer_epoch, turn_id)
                 successor_present = self._sequence_no > identity.sequence_no
                 fence = SmartTurnCompletionFence(
                     detector_epoch=identity.detector_epoch,
@@ -1616,6 +1658,12 @@ class DetectorRuntime:
                 )
                 if fence is not None and not fence.admission_confirmed:
                     self._deferred_completions.pop(fence.candidate, None)
+                    return
+                if fence is None and (generation, turn_id) != (
+                    self._semantic_generation,
+                    self._semantic_turn_id,
+                ):
+                    # An overflow or reset already retired this semantic turn.
                     return
                 if fence is None:
                     self._candidate_open = False
