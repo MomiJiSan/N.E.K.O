@@ -112,11 +112,13 @@ class PrewireWindowPlanner:
 
     def finish_event(self) -> tuple[PrewirePlannedRanges, ...]:
         """Return the remaining tail without assigning endpoint semantics."""
-        if self._next_commit_start >= self._captured_end:
-            return ()
-        tail = SampleRange(self._next_commit_start, self._captured_end)
-        self._next_commit_start = self._captured_end
-        return (PrewirePlannedRanges(tail, tail, tail),)
+        planned: list[PrewirePlannedRanges] = []
+        while self._next_commit_start < self._captured_end:
+            end = min(self._next_commit_start + self.step_samples, self._captured_end)
+            tail = SampleRange(self._next_commit_start, end)
+            planned.append(PrewirePlannedRanges(tail, tail, tail))
+            self._next_commit_start = end
+        return tuple(planned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +372,12 @@ class PrewireGate:
         if not self._classifier_available:
             self._decide_unavailable(pending, "calibration_package_unavailable")
             return PrewireSubmission(identity)
+        if any(
+            sample_range.sample_count not in self._scheduler.window_plan.sample_counts
+            for sample_range in ranges
+        ):
+            self._decide_unavailable(pending, "scoring_window_unsupported")
+            return PrewireSubmission(identity)
 
         receipts: list[IdentityReceipt] = []
         try:
@@ -392,7 +400,7 @@ class PrewireGate:
                 )
         except SchedulerError as exc:
             for receipt in receipts:
-                self._scheduler.cancel(receipt)
+                self._scheduler.abandon(receipt)
             self._decide_unavailable(
                 pending, f"scoring_not_queued:{type(exc).__name__}"
             )
@@ -444,7 +452,7 @@ class PrewireGate:
             if pending.spec.identity.stream != stream or pending.emitted:
                 continue
             for receipt in pending.receipts:
-                self._scheduler.cancel(receipt)
+                self._scheduler.abandon(receipt)
             self._decide_stale(pending, reason)
         identities: dict[PrewireIntervalIdentity, SampleRange] = {}
         active = self._active_plans.pop(stream, None)
@@ -487,7 +495,11 @@ class PrewireGate:
         # Any non-terminal uncertain/unavailable range still blocking the
         # ledger becomes stale at stream close rather than being released.
         for pending in tuple(self._pending.values()):
-            if pending.spec.identity.stream == stream and not pending.emitted:
+            if (
+                pending.spec.identity.stream == stream
+                and not pending.emitted
+                and not pending.spec.event_ended
+            ):
                 self._decide_stale(pending, "stream_finished_before_commit")
         plan = self._plan_stream(stream)
         if plan is not None:
@@ -513,6 +525,15 @@ class PrewireGate:
         return tuple(events)
 
     async def _resolve_pending(self, pending: _PendingInterval) -> None:
+        try:
+            await self._score_pending(pending)
+        finally:
+            # Includes early failures, invalidation, and cancelled resolution.
+            # Consumed receipts are already gone; abandonment is idempotent.
+            for receipt in pending.receipts:
+                self._scheduler.abandon(receipt)
+
+    async def _score_pending(self, pending: _PendingInterval) -> None:
         if pending.emitted or not pending.receipts:
             return
         identity = pending.spec.identity
@@ -720,14 +741,16 @@ class PrewireGate:
                 )
             if not sample_range.contains(spec.decision_range):
                 raise PrewireGateRangeError("scoring range must contain decision range")
-            if sample_range.sample_count != self._window_samples:
+            if sample_range.sample_count != self._window_samples and not (
+                spec.event_ended and sample_range.sample_count < self._window_samples
+            ):
                 raise PrewireGateRangeError("scoring range must equal window_samples")
             if (
                 not spec.event_ended
-                and sample_range.end - spec.decision_range.end < self._guard_samples
+                and spec.decision_range.end - spec.commit_range.end < self._guard_samples
             ):
                 raise PrewireGateRangeError(
-                    "live scoring range lacks the configured guard"
+                    "live decision range lacks the configured guard"
                 )
 
     @staticmethod

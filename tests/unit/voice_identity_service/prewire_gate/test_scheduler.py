@@ -374,28 +374,36 @@ async def test_uncooperative_async_backend_fences_scheduler_without_overlap(
     )
     active = scheduler.submit(_request("uncooperative-active"))
     queued = scheduler.submit(_request("must-not-run", start=10))
-    await backend.started.wait()
-    if trigger == "cancel":
-        assert scheduler.cancel(active)
+    try:
+        await backend.started.wait()
+        if trigger == "cancel":
+            assert scheduler.cancel(active)
 
-    active_result = await scheduler.await_result(active)
-    queued_result = await asyncio.wait_for(scheduler.await_result(queued), 0.2)
+        active_result = await scheduler.await_result(active)
+        queued_result = await asyncio.wait_for(scheduler.await_result(queued), 0.2)
 
-    assert active_result.status is (
-        ScoreResultStatus.TIMED_OUT
-        if trigger == "timeout"
-        else ScoreResultStatus.CANCELLED
-    )
-    assert queued_result.status is ScoreResultStatus.CANCELLED
-    assert queued_result.error_code == "scheduler_fenced"
-    assert backend.calls == 1
-    assert backend.max_active == 1
-    with pytest.raises(SchedulerClosedError):
-        scheduler.submit(_request("rejected-after-fence", start=20))
-
-    backend.release.set()
-    await asyncio.wait_for(backend.returned.wait(), 0.2)
-    await scheduler.close()
+        assert active_result.status is (
+            ScoreResultStatus.TIMED_OUT
+            if trigger == "timeout"
+            else ScoreResultStatus.CANCELLED
+        )
+        if trigger == "timeout":
+            # Its own queue deadline expires before physical cancellation
+            # finishes. That result must not be rewritten by the later fence.
+            assert queued_result.status is ScoreResultStatus.TIMED_OUT
+            assert queued_result.error_code == "deadline_expired_in_queue"
+        else:
+            assert queued_result.status is ScoreResultStatus.CANCELLED
+            assert queued_result.error_code == "scheduler_fenced"
+        await asyncio.wait_for(asyncio.shield(scheduler._worker), 0.2)
+        assert backend.calls == 1
+        assert backend.max_active == 1
+        with pytest.raises(SchedulerClosedError):
+            scheduler.submit(_request("rejected-after-fence", start=20))
+    finally:
+        backend.release.set()
+        await asyncio.wait_for(backend.returned.wait(), 0.2)
+        await scheduler.close()
 
 
 @pytest.mark.asyncio
