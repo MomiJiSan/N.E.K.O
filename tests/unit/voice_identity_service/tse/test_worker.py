@@ -260,11 +260,15 @@ async def test_enrollment_cancel_during_startup_joins_then_wipes_owned_copies(mo
         pcm.fill(0)
     assert all(pcm.all() for pcm in state.recordings)
     task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    gate.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        with pytest.raises(worker.TseEncoderRetirementError) as raised:
+            await asyncio.wait_for(task, 1)
+        error = raised.value
+        assert not error.retirement_owner.confirmed_stopped
+        assert all(pcm.all() for pcm in state.recordings)
+    finally:
+        gate.set()
+    await asyncio.wait_for(asyncio.shield(error.retirement_task), 1)
     assert state.retired.is_set() and state.receiver_closed
     assert all(not pcm.any() for pcm in state.recordings)
 

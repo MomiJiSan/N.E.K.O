@@ -14,6 +14,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .assets import RELEASE_MANIFEST
 from .contracts import EMBEDDING_DIM, REFERENCE_METHOD, STATE_SHAPE, TseModelError, reference_float32
 from .frontend import TseEnrollmentFrontend
 
@@ -28,8 +29,8 @@ def _make_session(path: Path) -> Any:
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     options.enable_cpu_mem_arena = False
     expected = {
-        "tse_stateful_fp32.onnx": (75778515, "bce77f0146c5ff01b0fc62a500b8dd94553212373b235639e8436d7be3d809a6"),
-        "tse_ecapa_fp32.onnx": (24897704, "6eb9e96eed042cc59b875631deb448ea8b11a7b40918a8424d0aa0161be70e99"),
+        name: (RELEASE_MANIFEST["files"][name]["bytes"], RELEASE_MANIFEST["files"][name]["sha256"])
+        for name in RELEASE_MANIFEST["onnx"]
     }
     if path.name not in expected:
         raise TseModelError("unrecognized TSE model file")

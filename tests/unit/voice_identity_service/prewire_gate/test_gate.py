@@ -300,7 +300,7 @@ async def test_invalidation_fences_late_score_and_accounts_one_gap() -> None:
 
 
 @pytest.mark.asyncio
-async def test_overlapping_windows_share_pcm_and_new_revision_replaces_old_plan() -> (
+async def test_overlapping_windows_share_pcm_and_preserve_outstanding_plan() -> (
     None
 ):
     gate = _gate(_ScoreBackend())
@@ -316,10 +316,15 @@ async def test_overlapping_windows_share_pcm_and_new_revision_replaces_old_plan(
     second_plan = await gate.resolve(second)
 
     assert second_plan is not None
-    assert second_plan is not first_plan
-    assert len(second_plan.events) == 2
+    assert second_plan is first_plan
+    assert len(second_plan.events) == 1
+    gate.claim(first_plan)
     with pytest.raises(PrewireGateIdentityError, match="stale"):
         gate.claim(first_plan)
+    second_plan = await gate.resolve(second)
+    assert second_plan is not first_plan
+    assert len(second_plan.events) == 1
+    assert second_plan.events[0].original_range == SampleRange(4, 8)
     gate.claim(second_plan)
     assert gate.pending_interval_count == 0
     assert gate.held_pcm_bytes == 8

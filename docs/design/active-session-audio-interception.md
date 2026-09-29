@@ -15,7 +15,7 @@ main 的会话激活负责 WAITING / VERIFYING 阶段的本地缓存、本人确
 | TSE worker 与 `PrewireExtractionAdapter` | 连续流及对齐基础 | 只输出授权区间对应的分离结果，缺少分离结果不回退原始音频；不证明真实多人分离效果。 |
 | 激活输出到门控、门控到两个 ASR 路由 | **未实现** | 当前运行应用仍会在 ACTIVE 期间放行后续音频，不能宣称已拦截旁人。 |
 
-模型与工具入口见[配套模型与诊断说明](/design/optional-voice-model-tools)。历史 ASR 日志检查器只读旧事件，不是当前门控的线上观测能力。
+模型与工具入口见[配套模型与诊断说明](optional-voice-model-tools.md)。历史 ASR 日志检查器只读旧事件，不是当前门控的线上观测能力。
 
 ## 目标架构与依赖
 
@@ -42,7 +42,7 @@ flowchart LR
 - PCM 使用本地连续的 16 kHz 原始采样轴；scoring / decision / commit 区间分开。网络 chunk 大小不能充当说话人边界，拒绝区间也不能被无记录地拼接。
 - `PrewireIntervalIdentity` 绑定 session、ingress、profile、model、config 与原始范围。异步结果必须仍属于提交时的实例，旧请求不能授权新流。
 - 仅 KEEP 生成 `PrewireAudioEvent`。DROP、UNCERTAIN、UNAVAILABLE、STALE 生成无 PCM 的 gap；缺少校准、模型失败或超时不能自动放行。
-- 释放计划不是发送回执。`claim` 只在调用方确认本地入队后推进 ENQUEUED；后续 WRITTEN / REMOTE_CONFIRMED / UNKNOWN 由持有同一账本的交付 owner 记录。未知交付不能重放。
+- 释放计划不是发送回执。`claim` 只在调用方确认本地入队后推进 ENQUEUED；交付 owner 通过 `advance_delivery` 按真实证据推进 WRITTEN / REMOTE_CONFIRMED / UNKNOWN，门控默认创建的账本也支持这一入口。流或门控关闭后仍可确认原身份的交付，未知交付不能重放。
 - 账本不能淘汰尚在交付或远端状态不明的记录；容量耗尽必须显式失败。评分线程无法强制终止，生产 scorer 必须自己拥有可终止的进程及退休协议，调度器的有界返回不代表 native 资源已退出。
 - TSE 对齐独立保留原始轴与 ASR 轴。TSE 结果不是身份授权；门控授权也不允许在 TSE 缺失时回退原始混合音频。
 - 保留的实验策略可将可信本地边界内、已经结束且独立的不足 200 ms 事件直接丢弃；这不是声纹识别结论，会损失主人的短词，不能不经效果验收就作为生产策略。该规则不能用于未结束的 chunk。
@@ -56,6 +56,12 @@ flowchart LR
 本地事件结束时，剩余尾音被拆成不超过提交步长的连续区间。尾音保留真实样本长度，只有评分计划明确支持该长度时才送入模型；否则形成 `scoring_window_unsupported` 的 UNAVAILABLE gap，收尾保留这一原因。该行为可能丢弃主人的尾音，需要后续真实数据校准短窗口；不能补零、借用前一窗口的本人证据或默认 KEEP。
 
 实时窗口的 guard 位于 decision 内、commit 之后，scoring 包含整个 decision。因此 `window >= step + guard` 的合法配置可直接使用规划器输出，不重复计算 guard；不足 guard 的实时区间仍被拒绝。
+
+每个流同时只持有一份尚未 claim 的计划。后续 resolver 返回同一计划，调用方须按计划身份去重交付，并在成功 claim 后获取下一份。账本 CAS 校验已选前缀、游标和映射；其他流或后续区间的评分不会让该前缀失效。前缀决策变化、重复 claim、伪造结束游标仍被拒绝。若等待发送时流身份已失效，调用方必须退休不安全的发送会话，不能把 claim 失败当成未发送而盲目重投。
+
+账本保留已见过的 stream 身份作为防重放依据，身份数量上限与记录容量相同（默认 128）。本对象用于一个有界的交付生命周期；上限耗尽时以 `PrewireGateCapacityError` 拒绝新增流或记录。应用 owner 必须先退休旧音频路由，在保留旧账本处理尚未确认的交付的前提下，为新的生命周期创建 gate / ledger，不能把同一个 gate 当成无限重连的进程级单例。不会通过删除 UNKNOWN / ENQUEUED 记录来释放容量。
+
+TSE 和 ECAPA 的进程启动共用服务层的显式归属辅助模块。启动超时或取消时若原生启动尚未返回，会抛出携带 `retirement_owner` 与 `retirement_task` 的退休中异常；后台 daemon owner 等待迟到句柄并终止进程。取消等待者不取消物理清理，TSE 参考音频副本由该 owner 保留至启动结束并清理。调用方必须在 `confirmed_stopped` 成立前阻止替代录入，不能把请求有界返回当成可安全重试。管道 EOF/OS 错误归类为模型 worker 失败，进程退出后再次检查管道，避免丢失刚刚到达的结果。
 
 ## 完成生产接线的必要工作
 

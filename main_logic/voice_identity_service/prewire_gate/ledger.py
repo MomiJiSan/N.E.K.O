@@ -450,14 +450,29 @@ class PrewireIntervalLedger:
             raise TypeError("plan must be PrewireContiguousPlan")
         if plan.ledger_id != self._ledger_id:
             raise PrewireIdentityError("contiguous plan belongs to another ledger")
-        if plan.revision != self._revision:
-            raise PrewireTransitionError("contiguous plan is stale")
         if (
             self._release_cursors.get(plan.stream) != plan.original_cursor_start
             or self._asr_cursors.get(plan.stream) != plan.asr_cursor_start
         ):
             raise PrewireTransitionError("contiguous plan cursors are stale")
-        if self.plan_contiguous(plan.stream) != plan:
+        current = self.plan_contiguous(plan.stream)
+        identities = current.record_identities[:len(plan.record_identities)]
+        releases = tuple(item for item in current.releases if item.identity in identities)
+        gaps = tuple(item for item in current.gaps if item.identity in identities)
+        original_end = (
+            self._require_exact(identities[-1]).spec.commit_range.end
+            if identities else current.original_cursor_start
+        )
+        # Only the claimed prefix participates in the CAS. Scoring a later
+        # interval or another stream cannot undo audio already locally queued.
+        expected = replace(
+            current, revision=plan.revision, record_identities=identities,
+            releases=releases, gaps=gaps, original_cursor_end=original_end,
+            asr_cursor_end=current.asr_cursor_start + sum(
+                item.asr_range.sample_count for item in releases
+            ),
+        )
+        if expected != plan:
             raise PrewireTransitionError(
                 "contiguous plan no longer matches ledger state"
             )
