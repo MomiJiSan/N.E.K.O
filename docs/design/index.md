@@ -19,6 +19,7 @@ These documents preserve design intent and implementation context. They are grou
 
 ## Implemented design records
 
+- [Optional voice models and offline diagnostics](/design/optional-voice-model-tools)
 - [ASR client phase record](./asr-client-phase1)
 - [Compact chat mode](./compact-chat-mode-design)
 - [Memory event journal](./memory-event-log-rfc)
