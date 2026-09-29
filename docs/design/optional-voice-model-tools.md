@@ -1,6 +1,8 @@
-# 可选声纹模型与离线诊断工具
+# 声纹拦截研发的配套模型与离线诊断工具
 
-本分支以会话激活架构为基础，保留可独立验证的模型、资源事务和离线分析能力。生产入口继续使用 `OwnerVoiceSessionActivationFactory`，录入、schema 3 档案、RNNoise 合同、唤醒词和独立 ASR 开关沿用 main。
+> **状态：配套模块的实现记录，未生产接线。** #2980 的主目标是[会话激活后的 ASR 前音频拦截](/design/active-session-audio-interception)，以下模型、资源事务和离线分析能力为该目标提供研发基础。
+
+生产入口继续使用 `OwnerVoiceSessionActivationFactory`，录入、schema 3 档案、RNNoise 合同、唤醒词和独立 ASR 开关沿用 main。当前 ACTIVE 期间仍放行音频；不能把配套工具的存在视作拦截功能已经完成。
 
 ## 可用范围
 
@@ -44,6 +46,6 @@ TSE 发行清单的 `source` 仍为空，在线下载会明确报 `tse_source_un
 
 资源操作按 generation 和 stop event 隔离，取消后重新初始化使用新事件。上传取消、校验失败和发布失败不留下可用的半成品；native 工作未退出时，关闭返回未退休状态，不能视为成功释放。TSE worker 的队列容量、超时、连续采样区间和清理结果由调用方显式处理。
 
-本 PR 不恢复旧 `asr_composition`、Admission、exact 逐句拒绝、prewire gate 或旧安装生命周期，也不迁移 schema 4/5 及旧模型录入界面。共享 CAMPPlus 宿主需要面向 activation scorer 重新设计，暂不作为生产实现迁入。后续实时模型接入须独立明确授权语义、录入事务、性能预算和 Web/Electron 验收；移除本 PR 新增工具不改变现有麦克风行为。
+本 PR 在服务层恢复独立的 `prewire_gate`、评分调度、区间账本与 TSE 对齐基础，以 ASR 前音频拦截为主线。旧 `asr_composition`、Admission、exact 逐句转写拒绝、旧安装生命周期、schema 4/5 及旧模型录入界面不迁入。共享 CAMPPlus 宿主需要面向新架构明确资源 owner，暂不作为生产实现迁入。实时接线、录入事务、校准、性能和 Web/Electron 验收仍未完成，详见主设计记录；移除当前新增模块不改变现有麦克风行为。
 
 数值与受控生命周期测试不能证明真实房间中的旁人抑制效果，也不能证明生产音频不上传。历史日志的缺席不代表成功，校准分数也不是身份概率。

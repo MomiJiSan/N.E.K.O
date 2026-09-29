@@ -37,6 +37,10 @@ These documents preserve design intent and implementation context. They are grou
 
 剧本工坊 SDK 的调用、宿主与发布合同见仓库 `theater_workshop/README.md`。
 
+## Research goals and implementation foundations
+
+- [Active-session audio interception before ASR (not wired to production)](/design/active-session-audio-interception)
+
 ## Product-flow and interaction records
 
 - [Seven-day floating avatar guide](./avatar-floating-7day-complete-guide-dev)
