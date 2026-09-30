@@ -215,6 +215,66 @@ async def test_cancel_joins_owned_io_before_cleaning_its_path(
 
 
 @pytest.mark.asyncio
+async def test_close_is_bounded_while_download_native_io_is_blocked(
+    monkeypatch, tmp_path, small_bundle,
+):
+    entered, release = threading.Event(), threading.Event()
+    original_mkdir = Path.mkdir
+
+    def blocked_mkdir(path, *args, **kwargs):
+        if path.name.startswith(".ecapa-"):
+            entered.set()
+            assert release.wait(2)
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", blocked_mkdir)
+    download = downloader(tmp_path, lambda request: httpx.Response(
+        200, content=small_bundle[request.url.path[1:]]))
+    download.start()
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    await asyncio.wait_for(download.close(timeout=0.01), 0.5)
+    assert not download._task.done()
+    assert download.snapshot() is None
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await download._task
+    assert not list(tmp_path.glob(".ecapa-*"))
+
+
+@pytest.mark.asyncio
+async def test_initialize_cancellation_keeps_verifier_owned_until_it_returns(
+    monkeypatch, tmp_path,
+):
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def blocked_verify(_directory):
+        entered.set()
+        assert release.wait(2)
+        finished.set()
+        raise ValueError("missing")
+
+    monkeypatch.setattr(assets, "_verify_bundle", blocked_verify)
+    download = downloader(tmp_path, lambda request: pytest.fail("unexpected download"))
+    startup = asyncio.create_task(download.initialize())
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert download._task is not None and not download._task.done()
+    assert not finished.is_set()
+
+    await asyncio.wait_for(download.close(timeout=0.01), 0.5)
+    assert not finished.is_set()
+
+    release.set()
+    await download._task
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_invalid_existing_bundle_is_not_ready(tmp_path, small_bundle):
     destination = tmp_path / assets.ECAPA_RESOURCE_REVISION
     destination.mkdir()
