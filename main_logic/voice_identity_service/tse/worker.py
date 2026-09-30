@@ -22,7 +22,16 @@ import numpy as np
 
 from ..process_startup import PendingStartupRetirement, start_owned_process
 from .reference import SpeakerExtractionReference
-from .contracts import SAMPLE_RATE, TSE_ENCODER_IDENTITY, TseAudioChunk, TseModelError, pcm_float32, reference_float32
+from .contracts import (
+    SAMPLE_RATE,
+    TSE_ENCODER_IDENTITY,
+    TseAudioChunk,
+    TseModelError,
+    TseTimeoutError,
+    TseWorkerFailureError,
+    pcm_float32,
+    reference_float32,
+)
 from .models import TseEncoder, TseModel
 
 
@@ -207,7 +216,9 @@ class TseWorker:
         if item.result.done():
             return
         if self._closed or item.generation != self._generation:
-            item.result.set_exception(TseModelError(self._failure_reason or "TSE generation retired"))
+            reason = self._failure_reason or "tse_generation_retired"
+            error_type = TseTimeoutError if reason == "tse_timeout" else TseWorkerFailureError
+            item.result.set_exception(error_type(reason))
         else:
             item.result.set_result(chunks)
 
@@ -239,8 +250,10 @@ class TseWorker:
                     chunks = stream.flush() if item.pcm is None else stream.push(item.pcm, start_sample=item.start_sample)
                     if time.monotonic() - item.created > self._max_age:
                         raise TimeoutError("TSE result arrived too late")
+                except TimeoutError:
+                    error = "tse_timeout"
                 except Exception:
-                    error = "tse_inference_failed_or_late"
+                    error = "tse_worker_failure"
                 finally:
                     with self._condition:
                         self._pending -= item.samples

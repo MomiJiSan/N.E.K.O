@@ -170,6 +170,7 @@ class _PendingInterval:
     spec: PrewireIntervalSpec
     receipts: tuple[IdentityReceipt, ...]
     scoring_ranges: tuple[SampleRange, ...]
+    quality_summaries: tuple[PrewireQualitySummary, ...]
     observations: list[PrewireScoreObservation] = field(default_factory=list)
     emitted: bool = False
     resolver_task: asyncio.Task[None] | None = None
@@ -337,6 +338,7 @@ class PrewireGate:
         spec: PrewireIntervalSpec,
         *,
         scoring_ranges: tuple[SampleRange, ...] | None = None,
+        quality_summaries: tuple[PrewireQualitySummary, ...] | None = None,
     ) -> PrewireSubmission:
         """Synchronously reference retained PCM and queue work; never await."""
         if self._closed:
@@ -354,12 +356,29 @@ class PrewireGate:
             )
         ranges = scoring_ranges or (spec.scoring_range,)
         self._validate_ranges(spec, ranges)
+        if quality_summaries is None:
+            qualities = tuple(
+                PrewireQualitySummary(speech_samples=None, continuous=True)
+                for _ in ranges
+            )
+        else:
+            if type(quality_summaries) is not tuple or len(quality_summaries) != len(ranges):
+                raise PrewireGateRangeError("quality summaries must match scoring ranges")
+            if any(type(quality) is not PrewireQualitySummary for quality in quality_summaries):
+                raise PrewireGateRangeError("quality summaries must be PrewireQualitySummary")
+            if any(
+                quality.speech_samples is not None
+                and quality.speech_samples > sample_range.sample_count
+                for sample_range, quality in zip(ranges, quality_summaries, strict=True)
+            ):
+                raise PrewireGateRangeError("speech_samples exceeds scoring range")
+            qualities = quality_summaries
         try:
             self._ledger.add(spec)
         except PrewireCapacityError as exc:
             raise PrewireGateCapacityError(str(exc)) from exc
 
-        pending = _PendingInterval(spec, (), ranges)
+        pending = _PendingInterval(spec, (), ranges, qualities)
         self._pending[identity] = pending
 
         immediate = self._policy.decide(
@@ -592,10 +611,7 @@ class PrewireGate:
                     scoring_range=sample_range,
                     decision_range=pending.spec.decision_range,
                     raw_similarity=result.score,
-                    quality=PrewireQualitySummary(
-                        speech_samples=None,
-                        continuous=True,
-                    ),
+                    quality=pending.quality_summaries[index],
                     profile_generation=identity.profile_generation,
                     model_generation=identity.model_generation,
                     config_generation=identity.config_generation,
@@ -805,6 +821,15 @@ class PrewireGate:
         start = (sample_range.start - state.buffer_start) * 2
         end = (sample_range.end - state.buffer_start) * 2
         return bytes(state.pcm16[start:end])
+
+    def copy_pcm(self, stream: PrewireStreamKey, sample_range: SampleRange) -> bytes:
+        """Return a bounded copy for an injected quality analyzer.
+
+        Callers cannot mutate the gate-owned ledger buffer; this accessor keeps
+        the quality/model adapter provider-neutral without exposing ownership.
+        """
+
+        return self._slice_pcm(stream, sample_range)
 
     def _discard_consumed_prefix(self, stream: PrewireStreamKey) -> None:
         state = self._streams.get(stream)

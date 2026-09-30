@@ -19,6 +19,7 @@ from main_logic.voice_identity_service.prewire_gate.decision import (
     CalibratedIdentityEvidence,
     CalibratedIdentityOutcome,
     PrewireScoreObservation,
+    PrewireQualitySummary,
 )
 from main_logic.voice_identity_service.prewire_gate.gate import (
     PrewireAudioEvent,
@@ -27,6 +28,7 @@ from main_logic.voice_identity_service.prewire_gate.gate import (
     PrewireGate,
     PrewireGateCapacityError,
     PrewireGateIdentityError,
+    PrewireGateRangeError,
     PrewireWindowPlanner,
 )
 from main_logic.voice_identity_service.prewire_gate.scheduler import (
@@ -183,6 +185,52 @@ async def test_submit_is_nonawaiting_and_keep_releases_only_original_commit_pcm(
     gate.claim(plan)
     assert gate.held_pcm_bytes == len(pcm) - 8
     await gate.close()
+
+
+@pytest.mark.asyncio
+async def test_submit_passes_explicit_quality_to_classifier_observation() -> None:
+    class RecordingClassifier(_Classifier):
+        def __init__(self) -> None:
+            super().__init__(CalibratedIdentityOutcome.OWNER)
+            self.observations: list[PrewireScoreObservation] = []
+
+        def classify(
+            self, observation: PrewireScoreObservation
+        ) -> CalibratedIdentityEvidence:
+            self.observations.append(observation)
+            return super().classify(observation)
+
+    classifier = RecordingClassifier()
+    gate = _gate(_ScoreBackend(), classifier=classifier)
+    gate.append_pcm(
+        PrewireStreamKey("session", 1), start_sample=0, pcm16=b"\x01\x00" * 8
+    )
+    quality = PrewireQualitySummary(
+        speech_samples=6,
+        rms=0.2,
+        peak=0.5,
+        near_silence=0.1,
+        clipping=0.0,
+        continuous=True,
+    )
+    submission = gate.submit_interval(_spec(1), quality_summaries=(quality,))
+
+    await gate.resolve(submission)
+
+    assert len(classifier.observations) == 1
+    assert classifier.observations[0].quality == quality
+    await gate.close()
+
+
+def test_submit_rejects_quality_that_exceeds_scoring_range() -> None:
+    gate = _gate(_ScoreBackend())
+    gate.append_pcm(
+        PrewireStreamKey("session", 1), start_sample=0, pcm16=b"\x01\x00" * 8
+    )
+    quality = PrewireQualitySummary(speech_samples=9, continuous=True)
+
+    with pytest.raises(PrewireGateRangeError, match="speech_samples exceeds"):
+        gate.submit_interval(_spec(1), quality_summaries=(quality,))
 
 
 @pytest.mark.asyncio
