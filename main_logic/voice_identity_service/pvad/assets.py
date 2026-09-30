@@ -119,13 +119,33 @@ class EcapaDownload:
         self._snapshot: EcapaModelSnapshot | None = None
 
     async def initialize(self) -> None:
+        if self._closed or (self._task is not None and not self._task.done()):
+            return
+        self._state = "verifying"
+        task = asyncio.create_task(
+            self._initialize(), name="voice-identity-ecapa-initialize",
+        )
+        self._task = task
         try:
-            snapshot = await asyncio.to_thread(
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Keep the operation task as the owner of the native verifier.  Its
+            # cancellation is observed by _finish_io, which joins the thread
+            # before the task retires.
+            task.cancel()
+            raise
+
+    async def _initialize(self) -> None:
+        try:
+            snapshot = await _finish_io(
                 _verify_bundle, self.directory / ECAPA_RESOURCE_REVISION,
             )
+        except asyncio.CancelledError:
+            self._state = "missing"
+            return
         except Exception:
             snapshot = None
-        if not self._closed and self._task is None:
+        if not self._closed:
             self._snapshot = snapshot
             self._state = "ready" if snapshot is not None else "missing"
 
@@ -201,15 +221,18 @@ class EcapaDownload:
         finally:
             await _finish_io(_discard_staging, self.directory, staging)
 
-    async def close(self) -> None:
+    async def close(self, timeout: float = 5.0) -> None:
         self._closed = True
         self._snapshot = None
         if self._task is not None and not self._task.done():
             self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            # Native filesystem/hash work cannot be interrupted by coroutine
+            # cancellation.  The operation task keeps owning that work after
+            # this bounded wait and will finish its private staging cleanup.
+            done, _ = await asyncio.wait({self._task}, timeout=max(0.0, timeout))
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
 
 
 async def _finish_io(call, *args, **kwargs):
@@ -226,6 +249,10 @@ async def _finish_io(call, *args, **kwargs):
                 raise
             # Repeated cancellation must not abandon the same native write/open.
             continue
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
     if cancelled:
         if hasattr(result, "close"):
             await _finish_io(result.close)
