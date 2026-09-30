@@ -81,21 +81,14 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-28-avatar-tool-v3-main-merge",
         "2026-09-29-local-asr-prepare-screen-source-merge",
         "2026-09-29-local-asr-prepare-notices",
-<<<<<<< HEAD
-=======
         "2026-09-29-screen-source-current-summary",
-        
->>>>>>> 667e96acb (整合近期 ASR、声纹与唤醒矫正 PR)
         "2026-09-29-local-asr-model-status",
         "2026-09-28-local-asr-voiceprint-main-merge",
         "2026-09-28-local-asr-glm-voice-clone-merge",
         "2026-09-28-local-asr-screen-share-merge",
-<<<<<<< HEAD
-=======
         "2026-09-29-pr3149-main-rebase",
         "2026-09-29-voice-identity-off-mode",
         "2026-09-28-glm-voice-clone-free-tts-merge",
->>>>>>> 667e96acb (整合近期 ASR、声纹与唤醒矫正 PR)
         "2026-09-28-local-asr-and-quota-codes",
         "2026-09-28-free-tts-quota-codes",
         "2026-09-28-local-asr-toggle",
@@ -270,7 +263,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = "43b7779725b94335098a509d1ece9521c6a993c5bbdb01bcf0092e82d6e886f9"
+LOCALE_KEY_SIGNATURE = "65e636edaa56f395d053c4f1b4d2a373e27a7231c770b72dce292014614285cf"
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
@@ -386,5 +379,3 @@ def test_bump_instructions_name_every_step_of_the_fix() -> None:
     assert "LOCALE_KEY_SIGNATURE" in _BUMP_INSTRUCTIONS
 
 pytestmark = pytest.mark.frontend_contract
-
-
