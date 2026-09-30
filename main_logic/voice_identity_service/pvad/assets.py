@@ -153,6 +153,16 @@ class EcapaDownload:
     def ready(self) -> bool:
         return not self._closed and self._state == "ready" and self._snapshot is not None
 
+    @property
+    def busy(self) -> bool:
+        """Whether a download or native verification task still owns work."""
+        return self._task is not None and not self._task.done()
+
+    @property
+    def confirmed_stopped(self) -> bool:
+        """Whether close has completed and no operation task remains."""
+        return self._closed and not self.busy
+
     def snapshot(self) -> EcapaModelSnapshot | None:
         return self._snapshot if self.ready else None
 
@@ -161,7 +171,8 @@ class EcapaDownload:
                 "total_bytes": sum(asset.size for asset in ECAPA_ASSETS),
                 "model_revision": ECAPA_REVISION,
                 "resource_revision": ECAPA_RESOURCE_REVISION,
-                "error_code": self._error}
+                "error_code": self._error, "busy": self.busy,
+                "confirmed_stopped": self.confirmed_stopped}
 
     def start(self) -> dict[str, object]:
         if self._closed:
@@ -221,7 +232,7 @@ class EcapaDownload:
         finally:
             await _finish_io(_discard_staging, self.directory, staging)
 
-    async def close(self, timeout: float = 5.0) -> None:
+    async def close(self, timeout: float = 5.0) -> bool:
         self._closed = True
         self._snapshot = None
         if self._task is not None and not self._task.done():
@@ -233,6 +244,7 @@ class EcapaDownload:
             for task in done:
                 if not task.cancelled():
                     task.exception()
+        return self.confirmed_stopped
 
 
 async def _finish_io(call, *args, **kwargs):

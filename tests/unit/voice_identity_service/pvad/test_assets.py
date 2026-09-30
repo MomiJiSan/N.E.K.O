@@ -299,3 +299,92 @@ def test_staging_cleanup_rejects_other_directories(tmp_path):
     with pytest.raises(ValueError, match="staging"):
         assets._discard_staging(tmp_path, outside)
     assert outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_public_retirement_status_for_idle_and_ready_resources(tmp_path, small_bundle):
+    download = downloader(tmp_path, lambda request: httpx.Response(
+        200, content=small_bundle[request.url.path[1:]]))
+    assert not download.busy and not download.confirmed_stopped
+    await finish(download)
+    assert download.ready and not download.busy
+    assert not download.status()["confirmed_stopped"]
+    assert await download.close() is True
+    assert download.confirmed_stopped and not download.status()["busy"]
+    assert download.snapshot() is None
+    assert await download.close(timeout=0) is True
+    with pytest.raises(RuntimeError, match="download_closed"):
+        download.start()
+
+    idle = assets.EcapaDownload(tmp_path)
+    assert await idle.close(timeout=0) is True
+    assert idle.status()["confirmed_stopped"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["initialize", "mkdir", "cleanup"])
+async def test_public_retirement_status_tracks_native_completion(
+    monkeypatch, tmp_path, small_bundle, boundary,
+):
+    entered, release = threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    close_waiting = asyncio.Event()
+    original_wait = asyncio.wait
+
+    async def observed_wait(*args, **kwargs):
+        close_waiting.set()
+        return await original_wait(*args, **kwargs)
+
+    def block():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+
+    if boundary == "initialize":
+        def blocked_verify(directory):
+            block()
+            return assets.EcapaModelSnapshot(directory)
+        monkeypatch.setattr(assets, "_verify_bundle", blocked_verify)
+    elif boundary == "mkdir":
+        original_mkdir = Path.mkdir
+        def blocked_mkdir(path, *args, **kwargs):
+            if path.name.startswith(".ecapa-"):
+                block()
+            return original_mkdir(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "mkdir", blocked_mkdir)
+    else:
+        original_cleanup = assets._discard_staging
+        def blocked_cleanup(*args):
+            block()
+            return original_cleanup(*args)
+        monkeypatch.setattr(assets, "_discard_staging", blocked_cleanup)
+
+    download = downloader(tmp_path, lambda request: httpx.Response(
+        200, content=small_bundle[request.url.path[1:]]))
+    startup = asyncio.create_task(download.initialize()) if boundary == "initialize" else None
+    if startup is None:
+        download.start()
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert download.status()["busy"] and not download.confirmed_stopped
+        assert await asyncio.wait_for(download.close(timeout=0), 1) is False
+        assert download.busy and not download.status()["confirmed_stopped"]
+        assert download.snapshot() is None
+
+        # Cancel the close waiter at its actual wait boundary, then repeat close.
+        monkeypatch.setattr(asyncio, "wait", observed_wait)
+        closing = asyncio.create_task(download.close(timeout=5))
+        await asyncio.wait_for(close_waiting.wait(), 1)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert download.busy and not download.confirmed_stopped
+        assert await download.close(timeout=0) is False
+    finally:
+        release.set()
+        assert await asyncio.wait_for(download.close(timeout=5), 6) is True
+        if startup is not None:
+            await asyncio.gather(startup, return_exceptions=True)
+    assert download.confirmed_stopped and not download.busy
+    assert download.status()["confirmed_stopped"]
+    assert download.snapshot() is None
+    assert not list(tmp_path.glob(".ecapa-*"))
