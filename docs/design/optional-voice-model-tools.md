@@ -46,6 +46,8 @@ TSE 发行清单的 `source` 仍为空，在线下载会明确报 `tse_source_un
 
 资源操作按 generation 和 stop event 隔离，取消后重新初始化使用新事件。上传取消、校验失败和发布失败不留下可用的半成品；native 工作未退出时，关闭返回未退休状态，不能视为成功释放。TSE worker 的队列容量、超时、连续采样区间和清理结果由调用方显式处理。
 
+ECAPA 资源管理器的 `status()` 暴露 `busy` 与 `confirmed_stopped`；`close(timeout)` 返回是否已经完成物理任务收尾。返回 `False` 时原 task 仍是资源 owner，调用方必须等待后续状态变为 `confirmed_stopped` 后才允许替换同一资源目录。
+
 本 PR 在服务层恢复独立的 `prewire_gate`、评分调度、区间账本与 TSE 对齐基础，以 ASR 前音频拦截为主线。旧 `asr_composition`、Admission、exact 逐句转写拒绝、旧安装生命周期、schema 4/5 及旧模型录入界面不迁入。共享 CAMPPlus 宿主需要面向新架构明确资源 owner，暂不作为生产实现迁入。实时接线、录入事务、校准、性能和 Web/Electron 验收仍未完成，详见主设计记录；移除当前新增模块不改变现有麦克风行为。
 
 数值与受控生命周期测试不能证明真实房间中的旁人抑制效果，也不能证明生产音频不上传。历史日志的缺席不代表成功，校准分数也不是身份概率。
