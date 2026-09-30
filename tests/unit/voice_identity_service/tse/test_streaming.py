@@ -6,7 +6,13 @@ import pytest
 
 pytestmark = pytest.mark.unit_fast
 
-from main_logic.voice_identity_service.tse import TseModel, TseModelError, TseStream
+from main_logic.voice_identity_service.tse import (
+    TseExtractionResult,
+    TseModel,
+    TseModelError,
+    TseOutputStatus,
+    TseStream,
+)
 from main_logic.voice_identity_service.tse.contracts import TseAudioChunk
 
 
@@ -100,6 +106,14 @@ def test_inference_failure_retires_stream_without_mixed_audio_fallback():
     for operation in (lambda: stream.push(np.ones(640, np.float32)), stream.flush):
         with pytest.raises(TseModelError):
             operation()
+
+
+def test_extraction_result_has_explicit_fail_closed_statuses():
+    assert TseExtractionResult.target_absent().status is TseOutputStatus.TARGET_ABSENT
+    assert TseExtractionResult.worker_failure().status is TseOutputStatus.WORKER_FAILURE
+    assert TseExtractionResult.timeout().status is TseOutputStatus.TIMEOUT
+    with pytest.raises(ValueError):
+        TseExtractionResult(TseOutputStatus.TARGET_AUDIO)
 
 
 def test_chunk_and_reference_reject_invalid_data():
