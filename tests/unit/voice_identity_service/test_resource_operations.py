@@ -327,6 +327,72 @@ def test_model_discovery_rejects_list_manifest_and_normalizes_path_io_errors(tmp
         model_bundle.resolve_cached_model_dir(root)
 
 
+def _directory_link(alias: Path, target: Path) -> None:
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError:
+        import os
+        if os.name != "nt":
+            pytest.skip("directory links unavailable")
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(target)], capture_output=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_redirected_cache_ancestors_work_but_replaced_root_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.delenv("NEKO_WAKE_WORD_MODEL_DIR", raising=False)
+    monkeypatch.delenv("NEKO_WAKE_WORD_ENABLED", raising=False)
+    actual = tmp_path / "actual-home"
+    actual.mkdir()
+    alias = tmp_path / "redirected-home"
+    _directory_link(alias, actual)
+    source = _archive(tmp_path)
+    monkeypatch.setattr(model_bundle, "MODEL_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
+    cache = alias / "voice-resources"
+    installed = model_bundle.install_bundle(cache, source)
+    assert installed.parent == actual / "voice-resources" / "versions"
+    assert model_bundle.resolve_cached_model_dir(cache) == installed
+    assert voice_wake_word.save_wake_word_preference(True, cache)["enabled"]
+    replaced = tmp_path / "replaced-cache"
+    _directory_link(replaced, actual / "voice-resources")
+    with pytest.raises(model_bundle.WakeWordBundleError, match="resource_cache_unsafe"):
+        model_bundle.install_bundle(replaced, source)
+    with pytest.raises(ValueError, match="resource_cache_unsafe"):
+        voice_wake_word.save_wake_word_preference(False, replaced)
+    assert voice_wake_word.wake_word_preference(cache)["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_reservations_keep_current_and_close_retires_trial_without_index_lookup(monkeypatch, tmp_path):
+    async def prepared(*args, **kwargs):
+        return {}
+    monkeypatch.setattr(resource_manager, "_run_worker", prepared)
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    operation = manager.start("prepare")
+    await manager._current.task
+    for _ in range(15):
+        manager.reserve("prepare")
+    with pytest.raises(resource_manager.VoiceResourceError, match="resource_operation_busy"):
+        manager.reserve("prepare")
+    assert manager._operations[operation["operation_id"]] is manager._current
+    # Recreate the old missing-index state to test shutdown independently of
+    # the eviction guard. The physical task remains owned by _current.
+    manager._operations.pop(operation["operation_id"])
+    entered, retired = asyncio.Event(), asyncio.Event()
+    async def trial_worker(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retired.set()
+    monkeypatch.setattr(resource_manager, "_run_worker", trial_worker)
+    trial = asyncio.create_task(manager.check_audio(b"\0" * 288000, noise_reduction_enabled=False))
+    await entered.wait()
+    await manager.close()
+    with pytest.raises(asyncio.CancelledError):
+        await trial
+    assert retired.is_set() and manager._trial_task is None
+
+
 @pytest.mark.asyncio
 async def test_worker_timeout_physically_retires_spawned_process(tmp_path, monkeypatch):
     monkeypatch.setattr(resource_manager, "_resource_worker", _hung_worker)

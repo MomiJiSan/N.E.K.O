@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 
 from config.voice_wake_word import wake_word_cache_root
-from config.resource_file_lock import ResourceFileLockBusy, resource_file_lock
+from config.resource_file_lock import ResourceFileLockBusy, canonical_resource_root, resource_file_lock
 
 MODEL_NAME = "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
 MODEL_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/{MODEL_NAME}.tar.bz2"
@@ -87,11 +87,11 @@ def _check_cancel(cancel: threading.Event) -> None:
 
 
 def _safe_root(root: Path) -> Path:
-    # Do not follow a user-replaced cache directory or a Windows junction.
-    for parent in (root, *root.parents):
-        if parent.is_symlink() or (hasattr(parent, "is_junction") and parent.is_junction()):
-            raise WakeWordBundleError("resource_cache_unsafe")
-    return root.resolve()
+    # Check each cache boundary/descendant, not trusted redirected ancestors.
+    try:
+        return canonical_resource_root(root)
+    except ValueError as exc:
+        raise WakeWordBundleError("resource_cache_unsafe") from exc
 
 
 def _remove_abandoned_stages(root: Path) -> None:

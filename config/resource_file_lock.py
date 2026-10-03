@@ -10,6 +10,22 @@ class ResourceFileLockBusy(OSError):
     pass
 
 
+def canonical_resource_root(root: Path) -> Path:
+    """Resolve redirected ancestors while rejecting a replaced cache root."""
+    if root.is_symlink():
+        raise ValueError("resource_cache_unsafe")
+    try:
+        metadata = root.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        # Python 3.11 has no Path.is_junction(). Include NTFS junctions and
+        # other reparse points at the cache boundary itself.
+        if getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            raise ValueError("resource_cache_unsafe")
+    return root.resolve()
+
+
 @contextmanager
 def resource_file_lock(path: Path):
     """The OS releases this lock when a worker is killed or the process exits."""

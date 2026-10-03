@@ -148,3 +148,13 @@ Windows 冻结安装包和定制唤醒组件的源码构建、安装、模型真
 | [DSP 切换误报录入中](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173622033) | 成立；试录隔离与试录检查一致返回 audio_contract_changed，实际录入仍返回 enrollment_in_progress |
 
 ASR 路由、全 voice_input、声纹服务／API、真实 WebSocket 与缓存契约联合回归 1,571 项通过、7 项跳过；最终冻结存储验收 helper 的真实双开关与发布分支另通过 1 项。Node 回归 160 项通过。Ruff、Core 契约、全仓分层与异步阻塞守门通过。冻结安装包的实际执行结果仍须由更新后的发布流水线验证。
+
+## 后续关闭、目录和继续录入审查
+
+[CodeRabbit](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173686420) 与 [独立审查](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173687763) 指向同一关闭问题，成立。预留记录淘汰排除当前操作，关闭直接退休当前对象，不依赖可淘汰的编号索引；试录退休置于 finally，防止当前操作异常跳过清理。回归覆盖已完成当前操作与 15 个未启动预留凑满容量，以及复现旧缺失索引后关闭仍退休试录。
+
+[重定向祖先目录](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173688093) 的兼容问题成立。共享底层函数先拒绝缓存根本身的符号链接／Windows reparse point，再解析系统或用户目录的祖先重定向，模型与偏好保持相同边界；缓存下层目录仍分别校验。真实目录链接回归验证通过重定向祖先安装、解析及保存偏好，同时拒绝被替换为链接的缓存根，不修改原偏好。
+
+[继续录入携带 null 契约](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173688555) 成立。恢复服务端既有录入时不要求新试录证明，也不发送 null 契约，沿用该录入已有合同；开始新录入仍需要有效试录，包括旧录入已被预检取消后的替代开始。按钮和请求同步修复，前端回归验证从服务端第三段继续和新录入不能绕过试录。
+
+本轮最终联合回归含模型交付共 1,576 项通过、7 项跳过；Node 162 项通过。Ruff、Core、分层与异步检查通过。上述结果对应源代码回归，最新 head 的 CI 和冻结包验收须分别核验。

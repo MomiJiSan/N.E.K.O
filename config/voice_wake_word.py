@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
-from config.resource_file_lock import ResourceFileLockBusy, resource_file_lock
+from config.resource_file_lock import ResourceFileLockBusy, canonical_resource_root, resource_file_lock
 
 
 # Phonetic token sequences, not English letter-by-letter spelling of the name.
@@ -75,9 +75,7 @@ def save_wake_word_preference(enabled: bool, cache_root: Path | None = None) -> 
         raise ValueError("wake_preference_managed")
     if before["reason"]:
         raise ValueError(before["reason"])
-    for parent in (root, *root.parents):
-        if parent.is_symlink() or (hasattr(parent, "is_junction") and parent.is_junction()):
-            raise ValueError("resource_cache_unsafe")
+    root = canonical_resource_root(root)
     root.mkdir(parents=True, exist_ok=True)
     pending = root / "preference.pending"
     try:

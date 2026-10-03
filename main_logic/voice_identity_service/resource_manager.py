@@ -366,7 +366,7 @@ class VoiceResourceManager:
         self._expire_reservations()
         while len(self._operations) >= 16:
             removable = next((key for key, value in self._operations.items()
-                              if value.state in {"succeeded", "failed", "cancelled"}
+                              if value is not self._current and value.state in {"succeeded", "failed", "cancelled"}
                               and (value.task is None or value.task.done())), None)
             if removable is None:
                 raise VoiceResourceError("resource_operation_busy")
@@ -499,6 +499,9 @@ class VoiceResourceManager:
 
     async def cancel(self, operation_id: str) -> dict:
         operation = self._get_operation(operation_id)
+        return await self._cancel_operation(operation)
+
+    async def _cancel_operation(self, operation: _Operation) -> dict:
         if operation.state == "reserved":
             operation.cancel.set()
             operation.state = "cancelled"
@@ -552,19 +555,19 @@ class VoiceResourceManager:
 
     async def close(self):
         self._closed = True
-        if self._current is not None:
-            refresh = self._current.refresh_task
-            if refresh is not None and not refresh.done():
-                # service.close owns the same service lock used by on_ready.
-                # Retire a lock waiter before waiting for committed delivery;
-                # publication stays committed and is never rolled back.
-                refresh.cancel()
-            await self.cancel(self._current.operation_id)
-        trial = self._trial_task
-        if trial is not None and not trial.done():
-            trial.cancel()
-            try:
-                await asyncio.shield(trial)
-            except asyncio.CancelledError:
-                if not trial.cancelled():
-                    raise
+        try:
+            if self._current is not None:
+                refresh = self._current.refresh_task
+                if refresh is not None and not refresh.done():
+                    # Retire the service-lock waiter before committed delivery.
+                    refresh.cancel()
+                await self._cancel_operation(self._current)
+        finally:
+            trial = self._trial_task
+            if trial is not None and not trial.done():
+                trial.cancel()
+                try:
+                    await asyncio.shield(trial)
+                except asyncio.CancelledError:
+                    if not trial.cancelled():
+                        raise
