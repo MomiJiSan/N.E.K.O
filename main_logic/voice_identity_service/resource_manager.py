@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+from copy import deepcopy
 from dataclasses import dataclass, field
 import importlib.util
 import multiprocessing
@@ -12,6 +13,7 @@ from pathlib import Path
 import platform
 import sys
 import threading
+import time
 from typing import Callable
 import uuid
 
@@ -228,10 +230,11 @@ class _Operation:
     committing: bool = False
     committed: bool = False
     refresh_task: asyncio.Task | None = None
+    reservation_deadline: float | None = None
 
     def snapshot(self) -> dict:
         return {"operation_id": self.operation_id, "kind": self.kind, "state": self.state, "reason": self.reason,
-                "progress": None, "result": self.result, "committed": self.committed}
+                "progress": None, "result": deepcopy(self.result), "committed": self.committed}
 
 
 class VoiceResourceManager:
@@ -252,6 +255,8 @@ class VoiceResourceManager:
         self._trial_task: asyncio.Task | None = None
         self._on_ready = on_ready
         self._prepared_noise_reduction: bool | None = None
+        self._prepared_revision = 0
+        self._now = time.monotonic
 
     async def save_preference(self, enabled: bool) -> dict:
         if self._closed:
@@ -267,13 +272,27 @@ class VoiceResourceManager:
                 and not self._current.cancel.is_set())
 
     async def resources(self) -> dict:
-        snapshot = await asyncio.to_thread(self._snapshot_sync)
+        nr = self._noise_reduction_snapshot()
+        revision = self._prepared_revision
+        snapshot = await asyncio.to_thread(self._snapshot_sync, nr)
         if self._closed:
             raise VoiceResourceError("runtime_degraded")
+        if nr is not self._noise_reduction_snapshot():
+            raise VoiceResourceError("audio_contract_changed")
+        # All mutable runtime state belongs to the event loop. Discovery may
+        # overlap publication, but must never certify a stale prepared version.
+        if revision == self._prepared_revision and self._prepared_noise_reduction is nr:
+            for name, value in self._prepared.items():
+                if snapshot["resources"][name]["state"] == "unchecked" or name == "noise_reduction":
+                    snapshot["resources"][name].update(deepcopy(value), required=snapshot["resources"][name]["required"])
+        snapshot["can_enroll"] = all(snapshot["resources"][name]["state"] == "ready" for name in ("campp", "silero", "noise_reduction"))
+        snapshot["operation"] = self._current.snapshot() if self._current is not None else None
+        if snapshot["repair_action"] != "app_repair":
+            snapshot["repair_action"] = ("source_models" if any(snapshot["resources"][name]["state"] != "ready"
+                                         for name in ("campp", "silero")) else "source_runtime")
         return snapshot
 
-    def _snapshot_sync(self) -> dict:
-        nr = self._noise_reduction_snapshot()
+    def _snapshot_sync(self, nr: bool) -> dict:
         resources = {}
         try:
             resolve_verified_campplus_asset()
@@ -307,10 +326,6 @@ class VoiceResourceManager:
         present_runtime = importlib.util.find_spec("sherpa_onnx") is not None
         resources["wake_runtime"] = _resource("unchecked" if present_runtime else "missing",
                                                  None if present_runtime else WakeWordFailureReason.RUNTIME_MISSING.value, enabled)
-        prepared = self._prepared if self._prepared_noise_reduction is nr else {}
-        for name, value in prepared.items():
-            if resources[name]["state"] == "unchecked" or name == "noise_reduction":
-                resources[name] = dict(value, required=resources[name]["required"])
         packaged = getattr(sys, "frozen", False) or "__compiled__" in globals()
         repair_action = "app_repair" if packaged else (
             "source_models" if any(resources[name]["state"] != "ready" for name in ("campp", "silero")) else "source_runtime"
@@ -323,27 +338,65 @@ class VoiceResourceManager:
                     None if preference["reason"] is None else WakeWordFailureReason.PREFERENCE_UNAVAILABLE.value),
                 "can_enroll": all(resources[name]["state"] == "ready" for name in ("campp", "silero", "noise_reduction")),
                 "audio_contract": {"contract_id": OWNER_CAMPPLUS_DESKTOP_CONTRACT_ID, "revision": 1, "noise_reduction_enabled": nr},
-                "operation": self._current.snapshot() if self._current is not None else None}
+                "operation": None}
 
     def start(self, kind: str) -> dict:
+        # Preserve the original empty-body endpoint for older clients.
+        reservation = self.reserve(kind)
+        return self.start_reserved(reservation["operation_id"])
+
+    def _expire_reservations(self) -> None:
+        for operation in self._operations.values():
+            if operation.state == "reserved" and self._now() >= operation.reservation_deadline:
+                operation.state = "cancelled"
+                operation.reason = "operation_cancelled"
+                operation.cancel.set()
+
+    def reserve(self, kind: str) -> dict:
         if self._closed:
             raise VoiceResourceError("runtime_degraded")
         if kind not in {"prepare", "download"}:
             raise VoiceResourceError("invalid_resource_operation")
         if self._current is not None and self._current.task is not None and not self._current.task.done():
             raise VoiceResourceError("resource_operation_busy")
-        operation = _Operation(str(uuid.uuid4()), kind)
-        self._current = operation
+        self._expire_reservations()
+        while len(self._operations) >= 16:
+            removable = next((key for key, value in self._operations.items()
+                              if value.state in {"succeeded", "failed", "cancelled"}
+                              and (value.task is None or value.task.done())), None)
+            if removable is None:
+                raise VoiceResourceError("resource_operation_busy")
+            del self._operations[removable]
+        operation = _Operation(str(uuid.uuid4()), kind, state="reserved", reservation_deadline=self._now() + 30)
         self._operations[operation.operation_id] = operation
-        while len(self._operations) > 16:
-            self._operations.pop(next(iter(self._operations)))
-        operation.task = asyncio.create_task(self._execute(operation), name=f"voice-resource-{kind}")
         return operation.snapshot()
 
-    def operation(self, operation_id: str) -> dict:
+    def _get_operation(self, operation_id: str) -> _Operation:
+        if type(operation_id) is not str or len(operation_id) > 128:
+            raise VoiceResourceError("invalid_resource_operation")
+        self._expire_reservations()
         operation = self._operations.get(operation_id)
         if operation is None:
             raise VoiceResourceError("invalid_resource_operation")
+        return operation
+
+    def start_reserved(self, operation_id: str) -> dict:
+        if self._closed:
+            raise VoiceResourceError("runtime_degraded")
+        operation = self._get_operation(operation_id)
+        # An expired, cancelled, completed or already-started ID is never a new
+        # operation. Evicted IDs are rejected rather than recreated.
+        if operation.state != "reserved":
+            return operation.snapshot()
+        if self._current is not None and self._current.task is not None and not self._current.task.done():
+            raise VoiceResourceError("resource_operation_busy")
+        self._current = operation
+        operation.state = "pending"
+        operation.task = asyncio.create_task(self._execute(operation), name=f"voice-resource-{operation.kind}")
+        return operation.snapshot()
+
+    def operation(self, operation_id: str) -> dict:
+        operation = self._get_operation(operation_id)
         return operation.snapshot()
 
     async def _execute(self, operation: _Operation):
@@ -395,9 +448,10 @@ class VoiceResourceManager:
             if operation.kind == "prepare":
                 if nr != self._noise_reduction_snapshot():
                     raise VoiceResourceError("audio_contract_changed")
-                self._prepared = result
+                self._prepared = deepcopy(result)
                 self._prepared_noise_reduction = nr
-            operation.result = result
+                self._prepared_revision += 1
+            operation.result = deepcopy(result)
             operation.state = "succeeded"
         except asyncio.CancelledError:
             operation.state = "failed" if operation.committed else "cancelled"
@@ -413,6 +467,8 @@ class VoiceResourceManager:
 
     async def _commit_download(self, operation: _Operation, version: str) -> None:
         """Retire a bounded publisher before resolving any cancellation request."""
+        self._prepared = {name: value for name, value in self._prepared.items() if name != "wake_model"}
+        self._prepared_revision += 1
         try:
             await _run_worker("publish", False, str(self._cache_root), pcm16=version.encode("ascii"), timeout=5)
         except VoiceResourceError:
@@ -422,7 +478,6 @@ class VoiceResourceManager:
                 raise
         operation.committed = True
         operation.result = {"installed": True}
-        self._prepared.pop("wake_model", None)
         if self._closed:
             raise VoiceResourceError("runtime_degraded")
         if self._on_ready is not None:
@@ -439,9 +494,11 @@ class VoiceResourceManager:
                     operation.refresh_task = None
 
     async def cancel(self, operation_id: str) -> dict:
-        operation = self._operations.get(operation_id)
-        if operation is None:
-            raise VoiceResourceError("invalid_resource_operation")
+        operation = self._get_operation(operation_id)
+        if operation.state == "reserved":
+            operation.cancel.set()
+            operation.state = "cancelled"
+            operation.reason = "operation_cancelled"
         if operation.task is not None and not operation.task.done():
             if not operation.committing:
                 with operation.commit_lock:

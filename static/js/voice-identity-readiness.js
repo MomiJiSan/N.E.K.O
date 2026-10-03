@@ -45,8 +45,8 @@
         function render(updateParent = true) {
             el.test.disabled = pending || hooks.enrolling();
             el['test-cancel'].hidden = !trialActive;
-            el.prepare.disabled = pending || hooks.enrolling();
-            el.download.disabled = pending || hooks.enrolling() || !resources || !resources.resources || !resources.resources.wake_runtime || ['missing', 'unavailable'].includes(resources.resources.wake_runtime.state);
+            el.prepare.disabled = pending || !!operation || hooks.enrolling();
+            el.download.disabled = pending || !!operation || hooks.enrolling() || !resources || !resources.resources || !resources.resources.wake_runtime || ['missing', 'unavailable'].includes(resources.resources.wake_runtime.state);
             el['wake-enable'].disabled = pending || hooks.enrolling() || !resources || resources.wake_managed === true;
             el['wake-enable'].checked = !!(resources && resources.wake_enabled);
             el.repair.hidden = !resources || !Object.values(resources.resources || {}).some(value => ['missing', 'unavailable'].includes(value.state));
@@ -238,17 +238,23 @@
             return t('voiceIdentity.resourceReason_' + reason, t('voiceIdentity.resourceRepair', 'Check or repair this resource.'));
         }
         async function runResource(kind) {
-            if (pending || hooks.enrolling()) return;
+            if (pending || operation || hooks.enrolling()) return;
             const at = ++epoch;
             accepted = null; pending = true;
             requestAbort = new AbortController(); render();
             let ownedOperation = null;
             try {
-                const payload = await hooks.request(kind === 'download' ? '/resources/wake-word/download' : '/resources/prepare', { method: 'POST', signal: requestAbort.signal });
-                if (at !== epoch) { if (payload.operation_id) hooks.request('/resources/operations/' + encodeURIComponent(payload.operation_id) + '/cancel', { method: 'POST' }).catch(() => {}); return; }
+                // Reserving an ID cannot load or download anything. Once start
+                // is sent we already own its ID, even if the receipt is lost.
+                const payload = await hooks.request('/resources/operations', { method: 'POST', signal: requestAbort.signal,
+                    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }) });
+                if (typeof payload.operation_id !== 'string' || !payload.operation_id || payload.operation_id.length > 128) throw new Error('invalid_resource_operation');
+                ownedOperation = payload.operation_id;
+                if (at !== epoch) { hooks.request('/resources/operations/' + encodeURIComponent(ownedOperation) + '/cancel', { method: 'POST', keepalive: true }).catch(() => {}); return; }
                 operation = payload.operation_id;
-                ownedOperation = operation;
                 render();
+                await hooks.request('/resources/operations/' + encodeURIComponent(operation) + '/start', { method: 'POST', signal: requestAbort.signal });
+                if (at !== epoch) { hooks.request('/resources/operations/' + encodeURIComponent(ownedOperation) + '/cancel', { method: 'POST', keepalive: true }).catch(() => {}); return; }
                 const deadline = Date.now() + 120000;
                 while (at === epoch && operation) {
                     const id = operation;
@@ -264,8 +270,20 @@
                 if (at === epoch) { await refreshResources(); await hooks.status(); }
             } catch (error) {
                 if (ownedOperation) {
-                    if (operation === ownedOperation) operation = null;
-                    try { await hooks.request('/resources/operations/' + encodeURIComponent(ownedOperation) + '/cancel', { method: 'POST' }); } catch (_) {}
+                    try {
+                        const result = await hooks.request('/resources/operations/' + encodeURIComponent(ownedOperation) + '/cancel', { method: 'POST', keepalive: true });
+                        if (operation === ownedOperation && ['succeeded', 'failed', 'cancelled'].includes(result.state)) operation = null;
+                        if (at === epoch && result.committed === true) {
+                            el['resource-message'].textContent = t('voiceIdentity.resourceOperation_' + result.state, result.state) + (result.reason ? ' — ' + operationReason(result.reason) : '');
+                            await refreshResources();
+                            if (at === epoch) await hooks.status();
+                            return;
+                        }
+                    } catch (cancelError) {
+                        // This server never recreates an unknown reservation.
+                        // Retirement is not reported as successful cancellation.
+                        if (operation === ownedOperation && cancelError.status === 400 && cancelError.message === 'invalid_resource_operation') operation = null;
+                    }
                 }
                 if (at === epoch) el['resource-message'].textContent = hooks.error(error);
             } finally {
@@ -273,19 +291,21 @@
             }
         }
         async function cancelOperation() {
-            const id = operation; operation = null;
+            const id = operation;
             invalidate('voiceIdentity.inputTestRequired');
             if (!id) return;
             const at = epoch;
             pending = true; render();
             try {
-                const result = await hooks.request('/resources/operations/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+                const result = await hooks.request('/resources/operations/' + encodeURIComponent(id) + '/cancel', { method: 'POST', keepalive: true });
+                if (operation === id && ['succeeded', 'failed', 'cancelled'].includes(result.state)) operation = null;
                 if (at !== epoch) return;
                 el['resource-message'].textContent = t('voiceIdentity.resourceOperation_' + result.state, result.state || '');
                 if (result.reason) el['resource-message'].textContent += ' — ' + operationReason(result.reason);
                 await refreshResources();
                 if (at === epoch) await hooks.status();
             } catch (error) {
+                if (operation === id && error.status === 400 && error.message === 'invalid_resource_operation') operation = null;
                 if (at === epoch) el['resource-message'].textContent = hooks.error(error);
             } finally { if (at === epoch) { pending = false; render(); } }
         }

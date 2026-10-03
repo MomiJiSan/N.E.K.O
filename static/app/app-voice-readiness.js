@@ -156,21 +156,29 @@
             // Stop fences pending microphone setup and tears down the graph before
             // asking the server to seal and drain its common PCM input route.
             let beginSent = false;
+            let physicalStopped = false;
             try {
                 await stop();
                 const hasLiveTrack = S.stream && typeof S.stream.getAudioTracks === 'function' && S.stream.getAudioTracks().some(track => track.readyState === 'live');
-                if (isolation !== owned || atSocket !== S.socket || S.isRecording || hasLiveTrack) throw new Error('capture_cancelled');
+                if (isolation !== owned || atSocket !== S.socket || identity.sessionId !== localSession || identity.revision !== String(revision) || S.isRecording || hasLiveTrack) throw new Error('capture_cancelled');
+                physicalStopped = true;
                 beginSent = true;
                 const result = await control('preview_begin', {}, request.operationId);
-                if (isolation !== owned || atSocket !== S.socket || !result.token || !(result.ttl_seconds > 0 && result.ttl_seconds <= 60)) {
+                if (isolation !== owned || atSocket !== S.socket || identity.sessionId !== localSession || identity.revision !== String(revision) || !result.token || !(result.ttl_seconds > 0 && result.ttl_seconds <= 60)) {
                     if (result.token) compensatePreview(result);
                     throw new Error('capture_cancelled');
                 }
                 owned.token = result.token;
                 boundIsolation(owned, result.ttl_seconds * 1000);
-                return { ...identity, stopped: true, token: result.token, ttl_seconds: result.ttl_seconds, noise_reduction_enabled: result.noise_reduction_enabled };
+                return { ...identity, stopped: true, physicalStopped: true, token: result.token, ttl_seconds: result.ttl_seconds, noise_reduction_enabled: result.noise_reduction_enabled };
             } catch (error) {
                 if (!beginSent || error.voiceControlConfirmed) clearIsolation(owned);
+                const hasLiveTrack = S.stream && typeof S.stream.getAudioTracks === 'function' && S.stream.getAudioTracks().some(track => track.readyState === 'live');
+                if (physicalStopped && atSocket === S.socket && identity.sessionId === localSession && identity.revision === String(revision) && !S.isRecording && !hasLiveTrack) {
+                    // Plain data survives contextBridge; custom Error fields do
+                    // not. This confirms capture only, never server isolation.
+                    return { ...identity, stopped: false, physicalStopped: true, reason: error.message };
+                }
                 throw error;
             }
         }

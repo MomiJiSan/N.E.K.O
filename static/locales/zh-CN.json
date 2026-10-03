@@ -3092,6 +3092,7 @@
         }
     },
     "voiceIdentity": {
+        "errorStopMainMicrophone": "主会话麦克风仍在使用，请先关闭主会话麦克风，再重试此操作。",
         "pageTitle": "Owner 声纹",
         "title": "Owner 声纹",
         "profileStatus": "声纹状态",

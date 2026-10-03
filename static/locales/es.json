@@ -3092,6 +3092,7 @@
         }
     },
     "voiceIdentity": {
+        "errorStopMainMicrophone": "El micrófono de la sesión principal sigue en uso. Desactívalo en la sesión principal y vuelve a intentar esta operación.",
         "pageTitle": "Perfil de voz del Owner",
         "title": "Perfil de voz del Owner",
         "profileStatus": "Estado del perfil de voz",

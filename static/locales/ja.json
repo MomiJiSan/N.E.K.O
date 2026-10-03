@@ -3092,6 +3092,7 @@
         }
     },
     "voiceIdentity": {
+        "errorStopMainMicrophone": "メインセッションのマイクが使用中です。メインセッションでマイクをオフにしてから、この操作を再試行してください。",
         "pageTitle": "Owner 声紋",
         "title": "Owner 声紋",
         "profileStatus": "声紋の状態",

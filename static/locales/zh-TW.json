@@ -3092,6 +3092,7 @@
         }
     },
     "voiceIdentity": {
+        "errorStopMainMicrophone": "主工作階段的麥克風仍在使用，請先關閉主工作階段的麥克風，再重試此操作。",
         "pageTitle": "Owner 聲紋",
         "title": "Owner 聲紋",
         "profileStatus": "聲紋狀態",

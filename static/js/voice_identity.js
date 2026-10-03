@@ -434,6 +434,7 @@
     function enrollmentErrorMessage(error) {
         const code = error && (error.message || error.code);
         const diagnostics = error && error.payload && error.payload.diagnostics;
+        if (code === 'preview_owner_active') return translate('voiceIdentity.errorStopMainMicrophone', '主会话麦克风仍在使用，请先关闭主会话麦克风，再重试此操作。');
         if (code === 'audio_contract_changed') return translate('voiceIdentity.inputChanged', '输入已变化，请重新试录并开始录入。');
         if (code === 'volume_too_low' && diagnostics && diagnostics.rms >= ACTIVE_FRAME_RMS && diagnostics.active_seconds < MINIMUM_RECORDING_MS / 1000) return translate('voiceIdentity.errorSpeechTooShort', '没有检测到足够的语音，请重新说一句完整的话。');
         if (code === 'microphone_unavailable' || (error && ['NotFoundError', 'NotReadableError'].includes(error.name))) return translate('voiceIdentity.inputReason_microphone_unavailable', '麦克风已断开或不可用，请重新选择或连接设备。');

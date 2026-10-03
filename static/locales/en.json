@@ -3092,6 +3092,7 @@
         }
     },
     "voiceIdentity": {
+        "errorStopMainMicrophone": "The main-session microphone is still in use. Turn it off in the main session, then retry this operation.",
         "pageTitle": "Owner Voice Profile",
         "title": "Owner Voice Profile",
         "profileStatus": "Voice profile status",
