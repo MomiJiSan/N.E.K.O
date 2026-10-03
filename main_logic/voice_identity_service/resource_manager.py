@@ -33,6 +33,7 @@ from .enrollment import (
 )
 from .enrollment_audio import EnrollmentAudioNormalizationError, EnrollmentAudioNormalizer
 from .state import VoiceIdentityEffectiveReason
+from .preference_worker import save_preference_worker
 
 MAX_TRIAL_PCM_BYTES = 48_000 * 3 * 2
 RESOURCE_STATES = frozenset({"unchecked", "ready", "missing", "unavailable"})
@@ -140,12 +141,6 @@ def _resource_worker(connection: Connection, kind: str, nr_enabled: bool, wake_p
             version = pcm16.decode("ascii")
             publish_bundle_version(Path(wake_path), version)
             result = {"installed": True}
-        elif kind == "preference":
-            from config.voice_wake_word import save_wake_word_preference
-            try:
-                result = save_wake_word_preference(pcm16 == b"\1", Path(wake_path))
-            except ValueError as exc:
-                raise VoiceResourceError(str(exc)) from exc
         else:
             result = asyncio.run(_check_audio(pcm16, nr_enabled) if kind == "audio" else _prepare_resources(nr_enabled, wake_path))
         connection.send({"ok": True, "result": result})
@@ -173,7 +168,8 @@ async def _stop_process(process) -> None:
 async def _run_worker(kind: str, nr_enabled: bool, wake_path: str | None = None, pcm16: bytes = b"", timeout: float = 30.0) -> dict:
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
-    process = context.Process(target=_resource_worker, args=(child, kind, nr_enabled, wake_path, pcm16), daemon=False)
+    target = save_preference_worker if kind == "preference" else _resource_worker
+    process = context.Process(target=target, args=(child, kind, nr_enabled, wake_path, pcm16), daemon=False)
     started = False
     try:
         try:

@@ -11,6 +11,8 @@ from pathlib import Path
 import threading
 import tarfile
 import time
+import subprocess
+import textwrap
 
 import pytest
 
@@ -257,6 +259,96 @@ async def test_actual_preference_worker_is_atomic_and_does_not_change_owner_filt
     assert owner_filter.read_text() == '{"enabled": false}'
     assert not tuple(tmp_path.glob("preference-*.tmp"))
     await manager.close()
+
+
+def test_preference_spawn_never_imports_audio_or_resource_manager(monkeypatch, tmp_path):
+    monkeypatch.delenv("NEKO_WAKE_WORD_MODEL_DIR", raising=False)
+    monkeypatch.delenv("NEKO_WAKE_WORD_ENABLED", raising=False)
+    probe = tmp_path / "preference_probe.py"
+    probe.write_text(textwrap.dedent('''
+        import asyncio
+        import importlib.abc
+        from pathlib import Path
+        import sys
+
+        sys.path.insert(0, sys.argv[1])
+        if __name__ == "__mp_main__":
+            class RejectHeavyImports(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "numpy" or fullname.startswith((
+                        "main_logic.voice_identity_service.resource_manager",
+                        "main_logic.voice_identity_service.enrollment",
+                        "main_logic.asr_client",
+                    )):
+                        raise RuntimeError("preference imported " + fullname)
+            sys.meta_path.insert(0, RejectHeavyImports())
+
+        if __name__ == "__main__":
+            from main_logic.voice_identity_service.resource_manager import VoiceResourceManager
+            async def run():
+                manager = VoiceResourceManager(lambda: False, cache_root=Path(sys.argv[2]))
+                try:
+                    assert (await manager.save_preference(True))["enabled"] is True
+                finally:
+                    await manager.close()
+            asyncio.run(run())
+            print("LIGHTWEIGHT_PREFERENCE_READY")
+    '''), encoding="utf-8")
+    result = subprocess.run(
+        ["uv", "run", "--no-sync", "python", str(probe), str(Path(__file__).resolve().parents[3]), str(tmp_path / "cache")],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LIGHTWEIGHT_PREFERENCE_READY" in result.stdout
+    assert voice_wake_word.wake_word_preference(tmp_path / "cache")["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_preference_cancellation_physically_retires_worker_without_writing(monkeypatch, tmp_path):
+    monkeypatch.setattr(resource_manager, "save_preference_worker", _hung_worker)
+    marker = tmp_path / "started"
+    task = asyncio.create_task(resource_manager._run_worker("preference", False, str(marker), b"\1"))
+    for _ in range(200):
+        if marker.exists():
+            break
+        await asyncio.sleep(0.025)
+    assert marker.exists()
+    pid = int(marker.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    import psutil
+    assert not psutil.pid_exists(pid)
+    assert not (tmp_path / "preference.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_preference_worker_preserves_managed_and_corrupt_preference_errors(monkeypatch, tmp_path):
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    try:
+        monkeypatch.setenv("NEKO_WAKE_WORD_ENABLED", "1")
+        with pytest.raises(resource_manager.VoiceResourceError, match="wake_preference_managed"):
+            await manager.save_preference(False)
+        monkeypatch.delenv("NEKO_WAKE_WORD_ENABLED")
+        monkeypatch.delenv("NEKO_WAKE_WORD_MODEL_DIR", raising=False)
+        (tmp_path / "preference.json").write_bytes(b"corrupt")
+        with pytest.raises(resource_manager.VoiceResourceError, match="wake_preference_unavailable"):
+            await manager.save_preference(True)
+        assert (tmp_path / "preference.json").read_bytes() == b"corrupt"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_frozen_preference_gate_uses_isolated_cache_and_restores_deployment(monkeypatch, capsys):
+    from main_logic.voice_identity_service.wake_word_release_smoke import check_preference_worker
+    monkeypatch.setenv("NEKO_WAKE_WORD_MODEL_DIR", "managed-model")
+    monkeypatch.setenv("NEKO_WAKE_WORD_ENABLED", "1")
+    await check_preference_worker()
+    import os
+    assert os.environ["NEKO_WAKE_WORD_MODEL_DIR"] == "managed-model"
+    assert os.environ["NEKO_WAKE_WORD_ENABLED"] == "1"
+    assert capsys.readouterr().out.count("WAKE_WORD_PREFERENCE_SMOKE_READY") == 2
 
 
 def test_repair_corrupt_bundle_publishes_new_directory_and_keeps_owned_old_files(tmp_path, monkeypatch):
