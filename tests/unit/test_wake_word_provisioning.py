@@ -7,7 +7,7 @@ import tarfile
 import pytest
 
 from scripts import provision_wake_word_model as provisioner
-from main_logic.voice_input.wake_word import model_bundle
+from main_logic.voice_identity_service import wake_word_bundle as model_bundle
 
 
 def make_archive(tmp_path, *, symlink=False):

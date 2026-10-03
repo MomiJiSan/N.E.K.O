@@ -51,6 +51,16 @@ class VoicePreviewIsolationRegistry:
         self.now = now
         self._managers: weakref.WeakSet = weakref.WeakSet()
         self._ticket: VoicePreviewTicket | None = None
+        # The audio-check finally consumes its ticket before the producer's
+        # matching preview_end arrives. Keep only a bounded cleanup receipt,
+        # never the ticket/current callback that would retain its manager.
+        self._consumed_releases: dict[str, tuple[weakref.ReferenceType, float]] = {}
+
+    def _prune_consumed_releases(self) -> None:
+        now = self.now()
+        for token, (owner, deadline) in tuple(self._consumed_releases.items()):
+            if owner() is None or now >= deadline:
+                del self._consumed_releases[token]
 
     def register(self, manager: object) -> None:
         self._managers.add(manager)
@@ -142,10 +152,24 @@ class VoicePreviewIsolationRegistry:
                    and secrets.compare_digest(ticket.token, ticket_or_token))
         if not matches:
             return False
+        if (isinstance(ticket_or_token, VoicePreviewTicket) and ticket.claimed
+                and ticket.owner is not None and ticket.owner() is not None):
+            self._prune_consumed_releases()
+            self._consumed_releases[ticket.token] = (ticket.owner, ticket.deadline)
+            while len(self._consumed_releases) > 32:
+                del self._consumed_releases[next(iter(self._consumed_releases))]
         self._ticket = None
         return True
 
     def release_owned(self, token: str, manager: object) -> bool:
+        if type(token) is not str or not token.isascii() or len(token) > 128:
+            raise VoicePreviewIsolationError("preview_invalid")
+        self._prune_consumed_releases()
+        receipt = self._consumed_releases.get(token)
+        if receipt is not None and receipt[0]() is manager:
+            # Acknowledge only this owner's genuinely consumed ticket. An old
+            # cleanup must not release a new reservation or restore PCM input.
+            return True
         ticket = self._live_ticket()
         if ticket is None or ticket.owner is None or ticket.owner() is not manager:
             raise VoicePreviewIsolationError("preview_invalid")

@@ -271,7 +271,19 @@
         async function cancelOperation() {
             const id = operation; operation = null;
             invalidate('voiceIdentity.inputTestRequired');
-            if (id) await hooks.request('/resources/operations/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+            if (!id) return;
+            const at = epoch;
+            pending = true; render();
+            try {
+                const result = await hooks.request('/resources/operations/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+                if (at !== epoch) return;
+                el['resource-message'].textContent = t('voiceIdentity.resourceOperation_' + result.state, result.state || '');
+                if (result.reason) el['resource-message'].textContent += ' — ' + t('voiceIdentity.resourceReason_' + result.reason, t('voiceIdentity.resourceRepair', 'Check or repair this resource.'));
+                await refreshResources();
+                if (at === epoch) await hooks.status();
+            } catch (error) {
+                if (at === epoch) el['resource-message'].textContent = hooks.error(error);
+            } finally { if (at === epoch) { pending = false; render(); } }
         }
         el.test.addEventListener('click', testInput);
         el['test-cancel'].addEventListener('click', () => invalidate('voiceIdentity.inputTestRequired'));

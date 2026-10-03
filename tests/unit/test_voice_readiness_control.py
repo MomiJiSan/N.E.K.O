@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+from pathlib import Path
+import shutil
 import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import weakref
 
+from fastapi import FastAPI
+import httpx
 import pytest
 
 import main_logic.core.asr_runtime as asr_module
 import main_logic.core.voice_readiness as readiness_module
 import main_logic.voice_input.preview as preview_module
 import main_routers.websocket_router as router
+import main_routers.voice_identity_router as identity_router
+from main_routers.system_router import _shared as system_shared
 from main_logic.core.streaming import StreamingMixin
 from main_logic.voice_input.activation import ActivationState
 from main_logic.voice_turn.contracts import AsrSubmitResult, AsrSubmitStatus
@@ -71,6 +79,211 @@ def retry_message(value, request_id="retry-a"):
         "profile_revision": generation.profile,
         "permission_revision": generation.permission,
     }
+
+
+@pytest.fixture
+def trial_api(monkeypatch):
+    # DSP is controlled; mutation validation, bounds, claim, validation and the
+    # API's finally release all run through the actual ASGI endpoint.
+    service = SimpleNamespace(check_trial_audio=AsyncMock(return_value={
+        "accepted": True, "audio_contract": "owner-campplus-desktop-v1",
+    }))
+    monkeypatch.setattr(identity_router, "get_voice_identity_service_for_router", lambda: service)
+    monkeypatch.setattr(system_shared, "AUTOSTART_CSRF_TOKEN", "coupled-trial-test")
+    app = FastAPI()
+    app.include_router(identity_router.router)
+    return app, service
+
+
+def trial_client(app):
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver", headers={
+            "Origin": "http://testserver", "X-CSRF-Token": "coupled-trial-test",
+        })
+
+
+async def check_actual_trial(client, token):
+    return await client.post("/api/voice-identity/audio/check", content=b"\0" * 288000,
+        headers={"Content-Type": "audio/pcm;format=pcm_s16le;rate=48000;channels=1",
+            "X-Voice-Audio-Contract": "owner-campplus-desktop-v1", "X-Voice-Input-Check": token})
+
+
+@pytest.mark.parametrize("route", ["native", "independent"])
+@pytest.mark.parametrize("cleanup_token_valid", [True, False])
+async def test_actual_core_api_and_frontend_keep_successful_trial_proof(registry, trial_api, route, cleanup_token_valid):
+    node = shutil.which("node")
+    assert node is not None, "Coupled frontend protocol validation requires Node.js"
+    value = manager(route)
+    app, service = trial_api
+    websocket = _EventWebSocket([])
+    operation_before = value._asr_route_operation_generation
+    process = await asyncio.create_subprocess_exec(node,
+        str(Path(__file__).parents[1] / "frontend" / "voice_preview_protocol.cjs"),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    channels = []
+    try:
+        async with trial_client(app) as client:
+            while True:
+                line = await asyncio.wait_for(process.stdout.readline(), 10)
+                assert line, (await process.stderr.read()).decode()
+                request = json.loads(line)
+                channels.append(request["channel"])
+                if request["channel"] == "result":
+                    frontend = request["payload"]
+                    break
+                if request["channel"] == "control":
+                    message = request["payload"]
+                    if message["event"] == "preview_end" and not cleanup_token_valid:
+                        message = {**message, "token": "invalid-cleanup-token"}
+                    await router._dispatch_voice_identity_control(value, websocket, message,
+                        connection_id="producer-a", owns_voice=lambda: True)
+                    status = json.loads(json.loads(websocket.sent_text[-1])["message"])
+                    assert status["code"] == "VOICE_IDENTITY_CONTROL_RESULT"
+                    result = status["details"]
+                    if result["event"] == "preview_begin":
+                        assert result["ok"] is True, result
+                        # The lambda reads the newly assigned closure cell;
+                        # incrementing the operation is not an owner change.
+                        assert value._asr_route_operation_generation > operation_before
+                else:
+                    assert request["channel"] == "audio-check"
+                    response = await client.post("/api/voice-identity/audio/check",
+                        content=b"\0" * request["payload"]["bytes"], headers=request["payload"]["headers"])
+                    assert response.status_code == 200, response.text
+                    result = response.json()
+                    assert registry._ticket is None  # The actual API has already released it.
+                process.stdin.write((json.dumps({"id": request["id"], "payload": result}) + "\n").encode())
+                await process.stdin.drain()
+        assert channels == ["control", "audio-check", "control", "result"]
+        assert frontend["canStart"] is cleanup_token_valid
+        assert frontend["audioContract"] == ("owner-campplus-desktop-v1" if cleanup_token_valid else None)
+        assert frontend["ownerBlocked"] is not cleanup_token_valid
+        assert frontend["recording"] is False
+        assert frontend["trackEnded"] and frontend["microphoneStops"] == 1
+        service.check_trial_audio.assert_awaited_once_with(b"\0" * 288000,
+            noise_reduction_enabled=value._voice_input_noise_reduction_enabled)
+        assert not value._voice_input_accepts_pcm()
+        await value._route_microphone_audio(b"\x01\x00" * 160, sample_rate_hz=16000)
+        value.session.stream_audio.assert_not_awaited()
+        value._asr_runtime.submit.assert_not_awaited()
+        assert await asyncio.wait_for(process.wait(), 5) == 0
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        await cleanup(value)
+
+
+async def test_api_consumed_receipt_cannot_release_new_ticket_or_accept_wrong_owner(registry, trial_api):
+    value, other = manager(), manager()
+    other._set_microphone_route("blocked")
+    other._voice_lease_owner = None
+    other._voice_lease_synchronized = False
+    app, _ = trial_api
+    try:
+        first = await value._handle_voice_identity_control(
+            {"event": "preview_begin", "request_id": "first"}, connection_id="producer-a")
+        assert first["ok"]
+        async with trial_client(app) as client:
+            assert (await check_actual_trial(client, first["token"])).status_code == 200
+            assert (await check_actual_trial(client, first["token"])).status_code == 409
+        second = await value._handle_voice_identity_control(
+            {"event": "preview_begin", "request_id": "second"}, connection_id="producer-a")
+        assert second["ok"]
+        successor = registry._ticket
+        for token, owner, expected in [(first["token"], value, True),
+                (first["token"], other, False), ("wrong-token", value, False),
+                (second["token"], other, False)]:
+            result = await owner._handle_voice_identity_control(
+                {"event": "preview_end", "request_id": "end", "token": token}, connection_id="producer-a")
+            assert result["ok"] is expected
+            assert registry._ticket is successor and registry.is_manager_isolated(value)
+        assert registry.claim(second["token"]) is successor
+        assert not value._voice_input_accepts_pcm()
+    finally:
+        registry.release(registry._ticket)
+        await cleanup(value)
+        await cleanup(other)
+
+
+async def test_consumed_cleanup_receipts_are_bounded_expiring_and_do_not_retain_owner(registry):
+    clock = [0.0]
+    registry.now = lambda: clock[0]
+    value = manager()
+    value._set_microphone_route("blocked")
+    value._voice_lease_owner = None
+    value._voice_lease_synchronized = False
+    tokens = []
+    try:
+        for index in range(33):
+            ticket = registry.begin(value, f"trial-{index}", noise_reduction_enabled=True, current=lambda: True)
+            registry.mark_ready(ticket)
+            registry.claim(ticket.token)
+            assert registry.release(ticket)
+            tokens.append(ticket.token)
+        assert len(registry._consumed_releases) == 32
+        with pytest.raises(preview_module.VoicePreviewIsolationError, match="preview_invalid"):
+            registry.release_owned(tokens[0], value)
+        assert registry.release_owned(tokens[-1], value)
+        clock[0] = 29
+        successor = registry.begin(value, "successor", noise_reduction_enabled=True, current=lambda: True)
+        registry.mark_ready(successor)
+        clock[0] = 30
+        with pytest.raises(preview_module.VoicePreviewIsolationError, match="preview_invalid"):
+            registry.release_owned(tokens[-1], value)
+        assert registry._ticket is successor
+        registry.claim(successor.token)
+        registry.release(successor)
+        assert len(registry._consumed_releases) == 1
+        # The callback is dropped with the consumed ticket; the receipt has
+        # just a weak owner and deadline, not a hidden runtime reference.
+        owner_ref = weakref.ref(value)
+        await cleanup(value)
+        del value
+        gc.collect()
+        assert owner_ref() is None
+        registry._prune_consumed_releases()
+        assert not registry._consumed_releases
+    finally:
+        if "value" in locals():
+            await cleanup(value)
+
+
+async def test_unclaimed_or_token_cancelled_ticket_does_not_create_consumed_receipt(registry):
+    value = manager()
+    try:
+        for claim, by_token in [(False, False), (True, True)]:
+            result = await value._handle_voice_identity_control(
+                {"event": "preview_begin", "request_id": "cancelled"}, connection_id="producer-a")
+            assert result["ok"]
+            ticket = registry._ticket
+            if claim:
+                registry.claim(ticket.token)
+            assert registry.release(ticket.token if by_token else ticket)
+            assert not registry._consumed_releases
+            retry = await value._handle_voice_identity_control(
+                {"event": "preview_end", "request_id": "repeat", "token": ticket.token}, connection_id="producer-a")
+            assert retry["ok"] is False and retry["reason"] == "preview_invalid"
+    finally:
+        await cleanup(value)
+
+
+@pytest.mark.parametrize("token", [None, 123, "声纹", "x" * 129])
+async def test_malformed_cleanup_capability_keeps_actual_core_ticket_isolated(registry, token):
+    value = manager()
+    try:
+        begin = await value._handle_voice_identity_control(
+            {"event": "preview_begin", "request_id": "trial"}, connection_id="producer-a")
+        assert begin["ok"]
+        ticket = registry._ticket
+        end = await value._handle_voice_identity_control(
+            {"event": "preview_end", "request_id": "end", "token": token}, connection_id="producer-a")
+        assert not end["ok"] and end["reason"] == "preview_invalid"
+        assert registry._ticket is ticket and registry.is_manager_isolated(value)
+        assert not value._voice_input_accepts_pcm()
+    finally:
+        registry.release(registry._ticket)
+        await cleanup(value)
 
 
 @pytest.mark.parametrize("route", ["native", "independent"])

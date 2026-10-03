@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from main_logic.voice_input.wake_word import resources as module
+from main_logic.voice_identity_service import wake_resources as module
 from main_logic.voice_input.wake_word.errors import WakeWordFailureReason, safe_wake_word_reason
-from main_logic.voice_input.wake_word.model_bundle import WakeWordBundleError
+from main_logic.voice_identity_service.wake_word_bundle import WakeWordBundleError
 from main_logic.voice_input.wake_word.sherpa_backend import (
     SherpaWakeWordConfig, SherpaWakeWordDetector, WakeWordBackendError,
 )

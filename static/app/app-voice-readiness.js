@@ -16,6 +16,7 @@
         let retry = null;
         let restart = null;
         let restartRequired = false;
+        let retryOperation = null;
         function clearIsolation(owned) {
             if (!owned) return;
             if (owned.expiry !== null) root.clearTimeout(owned.expiry);
@@ -41,6 +42,8 @@
             if (retiredSessions.size > 32) retiredSessions.delete(retiredSessions.values().next().value);
             activation = null;
             restartRequired = false;
+            retryOperation = null;
+            if (retry) retry.disabled = false;
             S.voiceSessionActivationIdentity = '';
             S.voiceSessionActivationRevision = 0;
             S.voiceSessionActivationState = '';
@@ -54,7 +57,7 @@
             label.textContent = t('voiceIdentity.activation_' + activation.state, activation.state);
             if (activation.reason && activation.state === 'unavailable') label.textContent += ' — ' + t('voiceIdentity.activationReason_' + activation.reason, t('voiceIdentity.activationRepair', 'Check resources and retry voice activation.'));
             if (restartRequired) label.textContent = t('voiceIdentity.activationRestartRequired', 'Close and reopen the microphone to start a new voice session.');
-            retry.hidden = activation.state !== 'unavailable';
+            retry.hidden = restartRequired || activation.state !== 'unavailable';
             restart.hidden = !restartRequired;
             retry.textContent = t('voiceIdentity.activationRetry', 'Retry activation');
             restart.textContent = t('voiceIdentity.activationRestart', 'Restart voice session');
@@ -67,15 +70,18 @@
             label = document.createElement('span'); label.setAttribute('role', 'status'); label.setAttribute('aria-live', 'polite');
             retry = document.createElement('button'); retry.type = 'button'; retry.textContent = t('voiceIdentity.activationRetry', 'Retry activation');
             retry.addEventListener('click', async () => {
-                if (!activation || !S.isRecording) return;
+                if (!activation || !S.isRecording || restartRequired) return;
                 const current = activation;
+                const requestSocket = S.socket;
+                const ownedRetry = {};
+                retryOperation = ownedRetry;
                 retry.disabled = true;
-                try { await control('activation_retry', { ...current }); } catch (error) { if (activation === current) {
-                    restartRequired = error.message === 'voice_session_restart_required';
+                try { await control('activation_retry', { ...current }); } catch (error) { if (retryOperation === ownedRetry && S.socket === requestSocket && S.isRecording && activation && activation.session_id === current.session_id && activation.microphone_generation === current.microphone_generation) {
+                    restartRequired = error.message === 'voice_session_restart_required' || (!error.voiceControlConfirmed && error.message === 'voice_control_timeout');
                     render();
                     label.textContent = restartRequired ? t('voiceIdentity.activationRestartRequired', 'Close and reopen the microphone to start a new voice session.') : t('voiceIdentity.activationRetryFailed', 'Retry failed. Check the connection and resources.');
                 } }
-                finally { retry.disabled = false; }
+                finally { if (retryOperation === ownedRetry) { retryOperation = null; retry.disabled = false; } }
             });
             restart = document.createElement('button'); restart.type = 'button'; restart.hidden = true;
             restart.addEventListener('click', async () => {
@@ -169,7 +175,7 @@
             }
         }
         function activationStatus(details, sourceSocket) {
-            if (!details || sourceSocket !== S.socket || S.isRecording !== true || retiredSessions.has(details.session_id)) return false;
+            if (!details || sourceSocket !== S.socket || S.isRecording !== true || restartRequired || retiredSessions.has(details.session_id)) return false;
             if (!['disabled', 'preparing', 'waiting', 'verifying', 'replaying', 'active', 'unavailable', 'closed'].includes(details.state)) return false;
             if (activation) {
                 if (details.session_id !== activation.session_id) {
@@ -215,7 +221,7 @@
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true }); else mount();
         return {
             register, reset, controlResult, activationStatus,
-            blocked: () => !!isolation,
+            blocked: () => !!isolation || restartRequired,
             disconnected: () => { reset(); waiting.forEach(p => { root.clearTimeout(p.timeout); p.reject(new Error('capture_owner_unavailable')); }); waiting.clear(); },
             stopped: () => { reset(); if (bridge && !isolation) register(false).catch(() => {}); }
         };

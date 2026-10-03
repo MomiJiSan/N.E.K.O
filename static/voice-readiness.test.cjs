@@ -15,7 +15,7 @@ function trackStream(readyState = 'live') {
 }
 function element() {
     const handlers = new Map();
-    return { value: '', textContent: '', checked: false, children: [], disabled: false, hidden: false, classList: { toggle() {} }, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { handlers.set(name, fn); }, appendChild(child) { this.children.push(child); }, append(...children) { this.children.push(...children); }, replaceChildren() { this.children = []; }, emit(name) { return handlers.get(name)?.({ target: this }); } };
+    return { value: '', textContent: '', checked: false, children: [], style: {}, disabled: false, hidden: false, classList: { toggle() {} }, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { handlers.set(name, fn); }, appendChild(child) { this.children.push(child); }, append(...children) { this.children.push(...children); }, replaceChildren() { this.children = []; }, emit(name, event = { target: this }) { return handlers.get(name)?.(event); } };
 }
 function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter } = {}) {
     const elements = new Map();
@@ -201,8 +201,83 @@ function isolationHarness(stopFailure = false) {
     vm.runInNewContext(ownerSource,{window:root,document,crypto,Set,Map}, { filename: path.join(__dirname, 'app/app-voice-readiness.js') });
     controller=root.createVoiceCaptureReadiness(S,async()=>{ if(stopFailure) throw new Error('stop_failed'); });
     function ack(message, extra = {}) { controller.controlResult({ ...message, ok:true, token:'ticket-'+message.request_id, ttl_seconds:60, ...extra },socket); }
-    return {controller,receive:request=>receive(request),sent,timers,ack,S};
+    return {controller,receive:request=>receive(request),sent,timers,ack,S,root,document};
 }
+
+test('an unconfirmed retry timeout fences audio and late control/status until an explicit microphone restart', async () => {
+    const h=isolationHarness();h.S.isRecording=true;const actions=[];
+    h.root.stopMicCapture=async()=>{actions.push('stop');h.S.isRecording=false;h.controller.reset();};
+    h.root.startMicCapture=async()=>{actions.push('start');h.S.isRecording=true;};
+    const identity={session_id:'retry-session',microphone_generation:1,route_generation:1,profile_revision:1,permission_revision:1,revision:1,state:'unavailable'};
+    h.controller.activationStatus(identity,h.S.socket);
+    const panel=h.document.body.children[0], retry=panel.children[1], restart=panel.children[2];
+    const pending=retry.emit('click');
+    assert.equal(h.sent[0].event,'activation_retry');
+    // Preparation notifications advance the object while the same retry is pending.
+    h.controller.activationStatus({...identity,permission_revision:2,revision:2,state:'preparing'},h.S.socket);
+    [...h.timers.values()].find(timer=>timer.delay===45000).fn();await pending;
+    assert.equal(h.controller.blocked(),true);assert.equal(retry.hidden,true);assert.equal(restart.hidden,false);assert.deepEqual(actions,[]);
+    await retry.emit('click');assert.equal(h.sent.length,1);
+    h.ack(h.sent[0]);assert.equal(h.controller.blocked(),true);
+    assert.equal(h.controller.activationStatus({...identity,permission_revision:2,revision:99,state:'active'},h.S.socket),false);
+    await restart.emit('click');assert.deepEqual(actions,['stop','start']);assert.equal(h.controller.blocked(),false);
+    assert.equal(h.controller.activationStatus({...identity,session_id:'new-session',revision:1,state:'waiting'},h.S.socket),true);
+});
+
+test('a confirmed activation failure keeps retry available without automatically restarting input', async () => {
+    const h=isolationHarness();h.S.isRecording=true;
+    h.controller.activationStatus({session_id:'known-failure',microphone_generation:1,route_generation:1,profile_revision:1,permission_revision:1,revision:1,state:'unavailable'},h.S.socket);
+    const panel=h.document.body.children[0], retry=panel.children[1], restart=panel.children[2];
+    const pending=retry.emit('click');h.ack(h.sent[0],{ok:false,reason:'prepare_failed'});await pending;
+    assert.equal(h.controller.blocked(),false);assert.equal(retry.hidden,false);assert.equal(restart.hidden,true);assert.equal(h.S.isRecording,true);
+});
+
+test('a retired retry acknowledgement cannot change a successor microphone retry button or fence', async () => {
+    const h=isolationHarness();h.S.isRecording=true;
+    const identity={session_id:'old-session',microphone_generation:1,route_generation:1,profile_revision:1,permission_revision:1,revision:1,state:'unavailable'};
+    h.controller.activationStatus(identity,h.S.socket);const retry=h.document.body.children[0].children[1];
+    const old=retry.emit('click');h.controller.reset();
+    h.controller.activationStatus({...identity,session_id:'new-session',microphone_generation:2},h.S.socket);
+    const current=retry.emit('click');assert.equal(h.sent.length,2);assert.equal(retry.disabled,true);
+    h.ack(h.sent[0],{ok:false,reason:'voice_session_restart_required'});await old;
+    assert.equal(h.controller.blocked(),false);assert.equal(retry.disabled,true);
+    h.ack(h.sent[1]);await current;assert.equal(retry.disabled,false);
+});
+
+for (const state of ['succeeded','failed']) test('resource cancellation displays committed '+state+' and refreshes the installed resource snapshot', async () => {
+    const poll=deferred();let resourceQueries=0;
+    const h=harness({requestRouter:async url=>{
+        if(url==='/resources'){resourceQueries++;return {can_enroll:resourceQueries>1,resources:{campp:{state:resourceQueries>1?'ready':'missing'}}};}
+        if(url==='/resources/wake-word/download')return {operation_id:'commit-boundary',state:'pending'};
+        if(url==='/resources/operations/commit-boundary'){await poll.promise;return {state:'running'};}
+        if(url.endsWith('/cancel'))return {operation_id:'commit-boundary',state,committed:true,reason:state==='failed'?'resource_storage_unavailable':null};
+        return {};
+    }});
+    await h.controller.refreshResources();const downloading=h.elements.get('voice-identity-download').emit('click');
+    while(!h.calls.some(call=>call.url==='/resources/operations/commit-boundary'))await new Promise(resolve=>setImmediate(resolve));
+    await h.elements.get('voice-identity-resource-cancel').emit('click');poll.resolve();await downloading;
+    assert.equal(resourceQueries,2);assert.match(h.elements.get('voice-identity-resource-message').textContent,new RegExp('^'+state));
+    assert.doesNotMatch(h.elements.get('voice-identity-resource-message').textContent,/cancelled/);
+    assert.equal(h.elements.get('voice-identity-resources').children[0].textContent,'campp: ready');assert.equal(h.controller.isPending(),false);
+});
+
+test('both real avatar menu entries use the desktop bridge without the main-page microphone helper and recover synchronous IPC failure', async () => {
+    const popupSource=fs.readFileSync(path.join(__dirname,'avatar/avatar-ui-popup.js'),'utf8');
+    const managerTemplate=fs.readFileSync(path.join(__dirname,'../templates/model_manager.html'),'utf8');
+    assert.match(managerTemplate,/avatar-ui-popup\.js/);assert.doesNotMatch(managerTemplate,/microphone-input\.js/);
+    let opened=0,toasts=0,directWindows=0;
+    const root={crypto,screen:{width:1280,height:900},nekoVoiceEnrollment:{open({operationId}){assert.match(operationId,/^[a-f0-9-]{36}$/);opened++;if(opened%2===1)throw new Error('controlled synchronous IPC failure');return Promise.resolve({opened:true});}},open(){directWindows++;},showStatusToast(){toasts++;}};
+    const document={createElement:element,getElementById:()=>element()};
+    const context={window:root,document,screen:root.screen,setTimeout,clearTimeout,console};
+    vm.runInNewContext(popupSource,context,{filename:path.join(__dirname,'avatar/avatar-ui-popup.js')});
+    const manager={};root.AvatarPopupMixin.apply(manager,'vrm');
+    const item={id:'voice-identity',action:'navigate',url:'/voice_identity'};
+    for(const menu of [context.createSidePanelMenuItem(manager,'vrm',item),manager._createMenuItem(item)]){
+        menu.emit('click',{stopPropagation(){}});await new Promise(resolve=>setImmediate(resolve));
+        menu.emit('click',{stopPropagation(){}});await new Promise(resolve=>setImmediate(resolve));
+    }
+    assert.equal(opened,4);assert.equal(toasts,2);assert.equal(directWindows,0);
+});
 
 test('a failed actual stop releases only its local isolation fence', async () => {
     const h=isolationHarness(true);

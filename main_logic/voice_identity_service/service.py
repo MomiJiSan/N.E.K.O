@@ -2383,12 +2383,30 @@ class VoiceIdentityService:
         self._require_initialized()
         if self._enrollment is not None:
             raise VoiceResourceError("enrollment_in_progress")
-        profile = self._profile if self._requested_enabled else None
+        profile = self._profile
+        reason = None
+        if not self._requested_enabled:
+            reason = VoiceIdentityEffectiveReason.DISABLED
+        elif profile is None:
+            reason = VoiceIdentityEffectiveReason.NO_PROFILE
+        elif not self._profile_is_compatible(profile):
+            reason = VoiceIdentityEffectiveReason.PROFILE_INCOMPATIBLE
+        elif not self._audio_contract_matches_runtime(self._profile_audio_contract):
+            reason = VoiceIdentityEffectiveReason.AUDIO_CONTRACT_MISMATCH
+        elif self._runtime_mode == "off" or self._runtime_audio_contract_transition_pending:
+            reason = VoiceIdentityEffectiveReason.RUNTIME_DEGRADED
+        if reason is not None:
+            # Refresh resources without promoting an unusable saved identity
+            # into activation authority, even if the adapter reports READY.
+            profile = None
+            self._set_ineffective(reason)
         generation = str(uuid.uuid4())
         result = await self._activate(profile, generation,
             protection_requested=self._requested_enabled,
             noise_reduction_enabled=self._runtime_noise_reduction_enabled)
-        if self._requested_enabled:
+        if reason is not None:
+            self._set_ineffective(reason)
+        else:
             self._apply_activation_result(result)
         return result
 

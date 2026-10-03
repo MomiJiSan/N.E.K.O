@@ -28,7 +28,7 @@ if __name__ == "__main__":
     if os.environ.get("NEKO_WAKE_WORD_RELEASE_SMOKE") == "1":
         from multiprocessing import freeze_support as _wake_freeze_support
         _wake_freeze_support()
-        from main_logic.voice_input.wake_word.release_smoke import main as _wake_release_smoke
+        from main_logic.voice_identity_service.wake_word_release_smoke import main as _wake_release_smoke
         sys.exit(_wake_release_smoke())
     if os.environ.get("NEKO_MEDIA_RELEASE_SMOKE") == "1":
         from multiprocessing import freeze_support as _media_freeze_support

@@ -70,7 +70,10 @@ def _matches_bundle(directory: Path, hashes: dict[str, str]) -> bool:
 
 def default_cache_root() -> Path:
     """Return a per-user cache path without probing or creating it."""
-    return wake_word_cache_root()
+    try:
+        return wake_word_cache_root()
+    except (OSError, RuntimeError) as exc:
+        raise WakeWordBundleError("resource_storage_unavailable") from exc
 
 
 def _hash(path: Path) -> str:
@@ -175,6 +178,7 @@ def install_bundle(
     cancel: threading.Event | None = None,
     validate=None,
     commit_lock: threading.Lock | None = None,
+    publish: bool = True,
 ) -> Path:
     """Authenticate, stage, validate, then publish the complete fixed bundle."""
     cancel = cancel or threading.Event()
@@ -257,6 +261,8 @@ def install_bundle(
                 if len(existing) >= MAX_VERSIONS:
                     raise WakeWordBundleError("resource_cache_full")
                 bundle_dir.replace(target)
+            if not publish:
+                return target
             pointer = stage / "current.json"
             with pointer.open("w", encoding="utf-8") as handle:
                 json.dump({"schema": 1, "version": target.name, "model": MODEL_NAME}, handle)
@@ -266,3 +272,54 @@ def install_bundle(
                 _check_cancel(cancel)
                 os.replace(pointer, root / "current.json")
             return target
+
+
+def publish_bundle_version(root: Path, version: str) -> None:
+    """Publish a worker-validated immutable version under the deployment lock.
+
+    Only the operation owner calls this after entering its non-cancellable
+    commit boundary. No network, native model work or arbitrary paths run here.
+    """
+    root = _safe_root(root)
+    if not _valid_version_name(version):
+        raise WakeWordBundleError("wake_model_invalid")
+    with _installation_lock(root):
+        directory = root / "versions" / version
+        if _safe_root(directory).parent != root / "versions":
+            raise WakeWordBundleError("wake_model_invalid")
+        manifest = directory / "bundle.json"
+        if manifest.is_symlink() or manifest.stat().st_size > 8192:
+            raise WakeWordBundleError("wake_model_invalid")
+        try:
+            hashes = json.loads(manifest.read_text(encoding="utf-8"))
+        except (ValueError, TypeError) as exc:
+            raise WakeWordBundleError("wake_model_invalid") from exc
+        if (type(hashes) is not dict or set(hashes) != set(ASSETS)
+                or any(not 0 < (directory / name).stat().st_size <= MAX_ASSET_BYTES for name in ASSETS)
+                or not _matches_bundle(directory, hashes)):
+            raise WakeWordBundleError("wake_model_invalid")
+        pointer = root / "current.pending"
+        if pointer.is_symlink() or pointer.exists() and (not pointer.is_file() or pointer.stat().st_size > 4096):
+            raise WakeWordBundleError("resource_cache_unsafe")
+        try:
+            with pointer.open("w", encoding="utf-8") as handle:
+                json.dump({"schema": 1, "version": version, "model": MODEL_NAME}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pointer, root / "current.json")
+        finally:
+            pointer.unlink(missing_ok=True)
+
+
+def is_bundle_version_published(root: Path, version: str) -> bool:
+    """Recover an interrupted publisher's receipt from the atomic pointer."""
+    try:
+        root = _safe_root(root)
+        pointer = root / "current.json"
+        if pointer.is_symlink() or pointer.stat().st_size > 4096:
+            return False
+        data = json.loads(pointer.read_text(encoding="utf-8"))
+        return (type(data) is dict and type(data.get("schema")) is int and
+                data == {"schema": 1, "version": version, "model": MODEL_NAME})
+    except (OSError, ValueError, TypeError, WakeWordBundleError):
+        return False

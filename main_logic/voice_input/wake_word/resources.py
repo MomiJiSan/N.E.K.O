@@ -1,10 +1,7 @@
-"""Resolve deployment preference and immutable installed resources off-loop."""
+"""Neutral wake capability snapshot and unavailable activation authority."""
 
 from dataclasses import dataclass
 
-from config.voice_wake_word import wake_word_model_dir, wake_word_preference
-from .errors import WakeWordFailureReason
-from .model_bundle import WakeWordBundleError, resolve_cached_model_dir
 from .sherpa_backend import WakeWordBackendError
 
 
@@ -13,24 +10,6 @@ class WakeWordResources:
     enabled: bool
     model_dir: str | None = None
     reason: str | None = None
-
-
-def resolve_wake_word_resources() -> WakeWordResources:
-    """Call on a worker thread. Discovery never enables the capability."""
-    preference = wake_word_preference()
-    if preference["reason"]:
-        return WakeWordResources(True, reason=WakeWordFailureReason.PREFERENCE_UNAVAILABLE.value)
-    if not preference["enabled"]:
-        return WakeWordResources(False)
-    explicit = wake_word_model_dir()
-    if explicit:
-        return WakeWordResources(True, explicit)
-    try:
-        cached = resolve_cached_model_dir()
-    except WakeWordBundleError:
-        return WakeWordResources(True, reason=WakeWordFailureReason.MODEL_INVALID.value)
-    return (WakeWordResources(True, str(cached)) if cached is not None else
-            WakeWordResources(True, reason=WakeWordFailureReason.MODEL_MISSING.value))
 
 
 class UnavailableWakeWordDetector:

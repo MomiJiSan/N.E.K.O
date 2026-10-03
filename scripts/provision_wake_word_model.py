@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Allow the documented standalone script entry point.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from main_logic.voice_input.wake_word.model_bundle import (  # noqa: E402,F401
+from main_logic.voice_identity_service.wake_word_bundle import (  # noqa: E402,F401
     ASSETS, MODEL_NAME, MODEL_SHA256, MODEL_URL, install_bundle,
 )
 

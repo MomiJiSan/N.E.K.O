@@ -17,7 +17,7 @@ import pytest
 from config import voice_wake_word
 from main_logic.voice_identity_service import resource_manager
 from main_logic.voice_identity_service.enrollment import EnrollmentAudioError, validate_enrollment_pcm16
-from main_logic.voice_input.wake_word import model_bundle
+from main_logic.voice_identity_service import wake_word_bundle as model_bundle
 
 
 def _archive(tmp_path, value=b"first"):
@@ -624,3 +624,234 @@ async def test_close_physically_cancels_in_progress_trial_and_rejects_late_use(m
         await manager.resources()
     with pytest.raises(resource_manager.VoiceResourceError, match="runtime_degraded"):
         manager.start("prepare")
+
+
+def _staged_download_worker(connection, kind, nr_enabled, wake_path, pcm16):
+    """Real immutable delivery/publication with small authenticated fixtures."""
+    root = Path(wake_path)
+    source = root.parent / "download.tar.bz2"
+    model_bundle.MODEL_SHA256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    if kind == "download":
+        installed = model_bundle.install_bundle(root, source, validate=lambda path: None, publish=False)
+        (root / "staged").write_text(installed.name)
+        if (root.parent / "hold-download").exists():
+            while True:
+                time.sleep(.025)
+        connection.send({"ok": True, "result": {"version": installed.name}})
+        connection.close()
+    elif (root.parent / "drop-publication-reply").exists():
+        model_bundle.publish_bundle_version(root, pcm16.decode("ascii"))
+        import os
+        os._exit(7)
+    else:
+        resource_manager._resource_worker(connection, kind, nr_enabled, wake_path, pcm16)
+
+
+def _prepare_download_fixture(tmp_path, monkeypatch):
+    root, previous = _install(tmp_path, monkeypatch)
+    pointer = (root / "current.json").read_bytes()
+    source = _archive(tmp_path, b"second")
+    source.rename(tmp_path / "download.tar.bz2")
+    monkeypatch.setattr(model_bundle, "MODEL_SHA256", hashlib.sha256((tmp_path / "download.tar.bz2").read_bytes()).hexdigest())
+    monkeypatch.setattr(resource_manager, "_resource_worker", _staged_download_worker)
+    monkeypatch.setattr(resource_manager.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(resource_manager.platform, "machine", lambda: "amd64")
+    return root, previous, pointer
+
+
+@pytest.mark.asyncio
+async def test_actual_download_cancel_before_commit_keeps_previous_pointer(tmp_path, monkeypatch):
+    root, previous, pointer = _prepare_download_fixture(tmp_path, monkeypatch)
+    (tmp_path / "hold-download").touch()
+    refreshed = []
+    async def refresh(operation_id):
+        refreshed.append(operation_id)
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=root, on_ready=refresh)
+    operation = manager.start("download")
+    async def staged():
+        while not (root / "staged").exists():
+            await asyncio.sleep(.025)
+    await asyncio.wait_for(staged(), timeout=8)
+    result = await asyncio.wait_for(manager.cancel(operation["operation_id"]), timeout=3)
+    assert result["state"] == "cancelled" and result["committed"] is False
+    assert (root / "current.json").read_bytes() == pointer
+    assert all((previous / name).read_bytes() == b"first" for name in model_bundle.ASSETS)
+    assert not refreshed
+    await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_fails", [False, True])
+async def test_actual_download_cancel_after_publication_reports_commit_and_refresh(tmp_path, monkeypatch, refresh_fails):
+    root, previous, pointer = _prepare_download_fixture(tmp_path, monkeypatch)
+    refresh_entered = asyncio.Event()
+    refresh_finish = asyncio.Event()
+    calls = []
+    async def refresh(operation_id):
+        calls.append(operation_id)
+        refresh_entered.set()
+        await refresh_finish.wait()
+        if refresh_fails:
+            raise resource_manager.VoiceResourceError("runtime_degraded")
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=root, on_ready=refresh)
+    operation = manager.start("download")
+    await asyncio.wait_for(refresh_entered.wait(), timeout=8)
+    assert (root / "current.json").read_bytes() != pointer
+    assert manager.operation(operation["operation_id"])["committed"] is True
+    cancellation = asyncio.create_task(manager.cancel(operation["operation_id"]))
+    await asyncio.sleep(0)
+    assert not cancellation.done()
+    refresh_finish.set()
+    result = await asyncio.wait_for(cancellation, timeout=3)
+    assert result["state"] == ("failed" if refresh_fails else "succeeded")
+    assert result["committed"] is True and result["result"] == {"installed": True}
+    assert result["reason"] == ("runtime_degraded" if refresh_fails else None)
+    assert calls == [operation["operation_id"]]
+    current = model_bundle.resolve_cached_model_dir(root)
+    assert current != previous and all((current / name).read_bytes() == b"second" for name in model_bundle.ASSETS)
+    assert all((previous / name).read_bytes() == b"first" for name in model_bundle.ASSETS)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_publication_without_ipc_reply_recovers_committed_pointer(tmp_path, monkeypatch):
+    root, previous, pointer = _prepare_download_fixture(tmp_path, monkeypatch)
+    (tmp_path / "drop-publication-reply").touch()
+    refreshed = []
+    async def refresh(operation_id):
+        refreshed.append(operation_id)
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=root, on_ready=refresh)
+    operation = manager.start("download")
+    await asyncio.wait_for(manager._current.task, timeout=8)
+    result = manager.operation(operation["operation_id"])
+    assert result["state"] == "succeeded" and result["committed"] is True
+    assert result["result"] == {"installed": True}
+    assert refreshed == [operation["operation_id"]]
+    assert (root / "current.json").read_bytes() != pointer
+    assert model_bundle.resolve_cached_model_dir(root) != previous
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prepare_refresh_never_publishes_new_ready_snapshot(monkeypatch, tmp_path):
+    ready = {name: {"state": "ready", "reason": None, "required": True}
+             for name in ("campp", "silero", "noise_reduction")}
+    async def prepared(*args):
+        return ready
+    refresh_entered = asyncio.Event()
+    async def refresh(operation_id):
+        refresh_entered.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(resource_manager, "_run_worker", prepared)
+    monkeypatch.setattr(resource_manager, "resolve_verified_campplus_asset", lambda: None)
+    monkeypatch.setattr(resource_manager, "resolve_verified_assets", lambda *args: None)
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=tmp_path, on_ready=refresh)
+    operation = manager.start("prepare")
+    await refresh_entered.wait()
+    assert (await manager.resources())["can_enroll"] is False
+    result = await manager.cancel(operation["operation_id"])
+    assert result["state"] == "cancelled" and result["committed"] is False
+    assert manager._prepared == {} and manager._prepared_noise_reduction is None
+    assert (await manager.resources())["can_enroll"] is False
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_service_close_retires_postpublication_refresh_waiting_on_its_lock(tmp_path, monkeypatch):
+    from tests.support.voice_identity_fakes import _service
+    service, *_ = _service(tmp_path)
+    await service.initialize()
+    await service._resource_manager.close()
+    source = _archive(tmp_path)
+    monkeypatch.setattr(model_bundle, "MODEL_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
+    root = tmp_path / "cache"
+    staged = model_bundle.install_bundle(root, source, publish=False)
+    publish_started = asyncio.Event()
+    close_entered = asyncio.Event()
+    refresh_entered = asyncio.Event()
+    async def work(kind, nr, path, **kwargs):
+        if kind == "download":
+            return {"version": staged.name}
+        publish_started.set()
+        await close_entered.wait()
+        await asyncio.to_thread(model_bundle.publish_bundle_version, root, staged.name)
+        return {"installed": True}
+    async def refresh(operation_id):
+        refresh_entered.set()
+        await service._refresh_after_resource_operation(operation_id)
+    manager = resource_manager.VoiceResourceManager(lambda: True, cache_root=root, on_ready=refresh)
+    service._resource_manager = manager
+    original_close = manager.close
+    async def close_after_waiter_enters():
+        assert service._operation_lock.locked()
+        close_entered.set()
+        await refresh_entered.wait()
+        # refresh's actual service-lock acquisition has yielded by here.
+        await original_close()
+    monkeypatch.setattr(manager, "close", close_after_waiter_enters)
+    monkeypatch.setattr(resource_manager, "_run_worker", work)
+    monkeypatch.setattr(resource_manager.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(resource_manager.platform, "machine", lambda: "amd64")
+    operation = manager.start("download")
+    await publish_started.wait()
+    await asyncio.wait_for(service.close(), timeout=3)
+    result = manager.operation(operation["operation_id"])
+    assert result["committed"] is True and result["state"] == "failed"
+    assert result["reason"] == "runtime_degraded"
+    assert result["result"] == {"installed": True}
+    assert manager._current.refresh_task is None
+    assert model_bundle.resolve_cached_model_dir(root) == staged
+
+
+@pytest.mark.asyncio
+async def test_missing_home_is_stable_closed_preference_without_blocking_primary_snapshot(monkeypatch):
+    from main_logic.voice_identity_service.wake_resources import resolve_wake_word_resources
+    for variable in ("LOCALAPPDATA", "XDG_CACHE_HOME", "NEKO_WAKE_WORD_MODEL_DIR", "NEKO_WAKE_WORD_ENABLED"):
+        monkeypatch.delenv(variable, raising=False)
+    def no_home():
+        raise RuntimeError("Can't determine home directory")
+    monkeypatch.setattr(Path, "home", no_home)
+    assert voice_wake_word.wake_word_preference()["reason"] == "wake_preference_unavailable"
+    assert resolve_wake_word_resources().reason == "WAKE_WORD_PREFERENCE_UNAVAILABLE"
+    with pytest.raises(ValueError, match="wake_preference_unavailable"):
+        voice_wake_word.save_wake_word_preference(True)
+    manager = resource_manager.VoiceResourceManager(lambda: False)
+    snapshot = await manager.resources()
+    assert snapshot["wake_preference_reason"] == "WAKE_WORD_PREFERENCE_UNAVAILABLE"
+    with pytest.raises(resource_manager.VoiceResourceError, match="resource_storage_unavailable"):
+        await manager.save_preference(True)
+    await manager.close()
+
+
+def _locked_pointer_publish_worker(connection, kind, nr_enabled, wake_path, pcm16):
+    if kind == "download":
+        return _staged_download_worker(connection, kind, nr_enabled, wake_path, pcm16)
+    root = Path(wake_path)
+    model_bundle.MODEL_SHA256 = hashlib.sha256((root.parent / "download.tar.bz2").read_bytes()).hexdigest()
+    original_replace = model_bundle.os.replace
+    def locked_replace(source, target):
+        if Path(target).name == "current.json":
+            raise PermissionError("Windows current pointer sharing lock")
+        return original_replace(source, target)
+    model_bundle.os.replace = locked_replace
+    resource_manager._resource_worker(connection, kind, nr_enabled, wake_path, pcm16)
+
+
+@pytest.mark.asyncio
+async def test_actual_parent_publication_failure_keeps_previous_version_and_reports_failure(tmp_path, monkeypatch):
+    root, previous, pointer = _prepare_download_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(resource_manager, "_resource_worker", _locked_pointer_publish_worker)
+    refreshed = []
+    async def refresh(operation_id):
+        refreshed.append(operation_id)
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=root, on_ready=refresh)
+    operation = manager.start("download")
+    await asyncio.wait_for(manager._current.task, timeout=8)
+    result = await manager.cancel(operation["operation_id"])
+    assert result["state"] == "failed" and result["committed"] is False
+    assert result["reason"] == "resource_storage_unavailable"
+    assert (root / "current.json").read_bytes() == pointer
+    assert all((previous / name).read_bytes() == b"first" for name in model_bundle.ASSETS)
+    assert not (root / "current.pending").exists()
+    assert not refreshed
+    await manager.close()

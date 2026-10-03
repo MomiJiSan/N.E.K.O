@@ -38,7 +38,7 @@ uv run --no-sync python scripts\provision_wake_word_model.py --model-dir .wake-w
 在启动 NEKO 的同一个 Python 环境中运行：
 
 ```powershell
-uv run --no-sync python -c 'import sherpa_onnx as s; assert s.__version__ == "1.13.8+neko.kws2"; assert s.version == s.__version__; print("wake-word runtime ready")'
+uv run --no-sync python -c 'import sherpa_onnx as s; from main_logic.voice_input.wake_word.sherpa_backend import SUPPORTED_RUNTIME_VERSION; assert s.__version__ == SUPPORTED_RUNTIME_VERSION; assert s.version == s.__version__; print(s.__version__, s.version)'
 ```
 
 仅在该检查通过且模型实际加载成功时启用唤醒词。未启用唤醒词时，模型或组件缺失不阻止纯声纹激活；已经启用的唤醒能力异常时，统一激活门控保持阻断。页面中的下载不改变启用偏好；页面缓存发现也支持加载已安装版本。

@@ -44,8 +44,8 @@ def wake_word_preference(cache_root: Path | None = None) -> dict:
         valid = override in {"", "0", "1", "false", "true"}
         return {"enabled": bool(explicit) if not override else override in {"1", "true"},
                 "managed": True, "reason": None if valid else "wake_preference_invalid"}
-    path = (cache_root or wake_word_cache_root()) / "preference.json"
     try:
+        path = (cache_root or wake_word_cache_root()) / "preference.json"
         if path.is_symlink():
             raise ValueError
         if not path.exists():
@@ -57,7 +57,7 @@ def wake_word_preference(cache_root: Path | None = None) -> dict:
                 or data["schema"] != 1 or type(data["enabled"]) is not bool):
             raise ValueError
         return {"enabled": data["enabled"], "managed": False, "reason": None}
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RuntimeError):
         # A read failure must never become an implicit write of disabled state.
         return {"enabled": False, "managed": False, "reason": "wake_preference_unavailable"}
 
@@ -66,7 +66,10 @@ def save_wake_word_preference(enabled: bool, cache_root: Path | None = None) -> 
     """Atomic preference write, independent of Owner profile/filter settings."""
     if type(enabled) is not bool:
         raise ValueError("invalid_enabled")
-    root = cache_root or wake_word_cache_root()
+    try:
+        root = cache_root or wake_word_cache_root()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("wake_preference_unavailable") from exc
     before = wake_word_preference(root)
     if before["managed"]:
         raise ValueError("wake_preference_managed")

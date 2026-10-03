@@ -8,7 +8,7 @@ import os
 def main() -> int:
     try:
         import sherpa_onnx
-        from .sherpa_backend import SUPPORTED_RUNTIME_VERSION, SherpaWakeWordConfig, validate_wake_word_resources
+        from main_logic.voice_input.wake_word.sherpa_backend import SUPPORTED_RUNTIME_VERSION, SherpaWakeWordConfig, validate_wake_word_resources
         from config.voice_wake_word import DEFAULT_WAKE_WORD_KEYWORDS
         if sherpa_onnx.__version__ != SUPPORTED_RUNTIME_VERSION or sherpa_onnx.version != SUPPORTED_RUNTIME_VERSION:
             raise ValueError("WAKE_WORD_RUNTIME_FIX_REQUIRED")

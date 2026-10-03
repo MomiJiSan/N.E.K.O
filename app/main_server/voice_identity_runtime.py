@@ -31,7 +31,8 @@ from main_logic.voice_identity_service.registry import (
 )
 from main_logic.voice_identity_service.service import VoiceIdentityService
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
-from main_logic.voice_input.wake_word.resources import WakeWordResources, resolve_wake_word_resources
+from main_logic.voice_input.wake_word.resources import WakeWordResources
+from main_logic.voice_identity_service.wake_resources import resolve_wake_word_resources
 from main_routers.config_router.preferences import (
     configure_voice_identity_audio_contract_callbacks,
 )
