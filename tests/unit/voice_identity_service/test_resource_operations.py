@@ -855,3 +855,62 @@ async def test_actual_parent_publication_failure_keeps_previous_version_and_repo
     assert not (root / "current.pending").exists()
     assert not refreshed
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_download_refresh_timeout_keeps_installation_and_reports_runtime_failure(tmp_path, monkeypatch):
+    from main_logic.voice_identity_service.state import VoiceIdentityEffectiveReason
+    root, previous, pointer = _prepare_download_fixture(tmp_path, monkeypatch)
+    refresh_entered = asyncio.Event()
+    refresh_retired = asyncio.Event()
+    refresh_calls = []
+    async def refresh(operation_id):
+        refresh_calls.append(operation_id)
+        refresh_entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            refresh_retired.set()
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=root, on_ready=refresh)
+    operation = manager.start("download")
+    await asyncio.wait_for(refresh_entered.wait(), timeout=8)
+    assert (root / "current.json").read_bytes() != pointer
+    # Cancellation during refresh resolves the real bounded refresh deadline;
+    # the installed package is neither rolled back nor reported as cancelled.
+    result = await asyncio.wait_for(manager.cancel(operation["operation_id"]), timeout=7)
+    assert result["state"] == "failed" and result["committed"] is True
+    assert result["reason"] == VoiceIdentityEffectiveReason.RUNTIME_DEGRADED.value
+    assert result["reason"] != "resource_prepare_timeout"
+    assert result["result"] == {"installed": True}
+    assert refresh_retired.is_set() and manager._current.refresh_task is None
+    assert refresh_calls == [operation["operation_id"]]
+    assert not manager._prepared
+    current = model_bundle.resolve_cached_model_dir(root)
+    assert current != previous and all((current / name).read_bytes() == b"second" for name in model_bundle.ASSETS)
+    assert all((previous / name).read_bytes() == b"first" for name in model_bundle.ASSETS)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_precommit_resource_worker_timeout_retains_preparation_reason_and_old_pointer(tmp_path, monkeypatch):
+    root, previous = _install(tmp_path, monkeypatch)
+    pointer = (root / "current.json").read_bytes()
+    monkeypatch.setattr(resource_manager, "_resource_worker", _hung_worker)
+    real_worker = resource_manager._run_worker
+    async def short_worker(kind, nr_enabled, wake_path):
+        return await real_worker(kind, nr_enabled, str(tmp_path / "started"), timeout=.5)
+    monkeypatch.setattr(resource_manager, "_run_worker", short_worker)
+    refreshed = []
+    async def refresh(operation_id):
+        refreshed.append(operation_id)
+    before = {child.pid for child in multiprocessing.active_children()}
+    manager = resource_manager.VoiceResourceManager(lambda: False, cache_root=root, on_ready=refresh)
+    operation = manager.start("prepare")
+    await asyncio.wait_for(manager._current.task, timeout=3)
+    result = manager.operation(operation["operation_id"])
+    assert result["state"] == "failed" and result["committed"] is False
+    assert result["reason"] == "resource_prepare_timeout"
+    assert result["result"] is None and not refreshed and not manager._prepared
+    assert (root / "current.json").read_bytes() == pointer and previous.is_dir()
+    assert {child.pid for child in multiprocessing.active_children()} <= before
+    await manager.close()

@@ -233,6 +233,10 @@
                 if (at === epoch) { pending = false; trialActive = false; hooks.pause(); requestAbort = null; render(); }
             }
         }
+        function operationReason(reason) {
+            if (reason === 'runtime_degraded') return t('voiceIdentity.reasonRuntimeDegraded', 'Voice activation is temporarily unavailable; standby audio will not be uploaded.');
+            return t('voiceIdentity.resourceReason_' + reason, t('voiceIdentity.resourceRepair', 'Check or repair this resource.'));
+        }
         async function runResource(kind) {
             if (pending || hooks.enrolling()) return;
             const at = ++epoch;
@@ -251,7 +255,7 @@
                     const result = await hooks.request('/resources/operations/' + encodeURIComponent(id), { method: 'GET', signal: requestAbort.signal });
                     if (at !== epoch || operation !== id) return;
                     el['resource-message'].textContent = t('voiceIdentity.resourceOperation_' + result.state, result.state || '') + (Number.isFinite(result.progress) ? ' ' + Math.round(result.progress * 100) + '%' : '');
-                    if (result.reason) el['resource-message'].textContent += ' — ' + t('voiceIdentity.resourceReason_' + result.reason, t('voiceIdentity.resourceRepair', 'Check or repair this resource.'));
+                    if (result.reason) el['resource-message'].textContent += ' — ' + operationReason(result.reason);
                     if (['succeeded', 'failed', 'cancelled'].includes(result.state)) { operation = null; break; }
                     if (Date.now() >= deadline) throw new Error('resource_operation_timeout');
                     await new Promise(resolve => { pollResolve = resolve; pollTimer = root.setTimeout(resolve, 1000); });
@@ -278,7 +282,7 @@
                 const result = await hooks.request('/resources/operations/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
                 if (at !== epoch) return;
                 el['resource-message'].textContent = t('voiceIdentity.resourceOperation_' + result.state, result.state || '');
-                if (result.reason) el['resource-message'].textContent += ' — ' + t('voiceIdentity.resourceReason_' + result.reason, t('voiceIdentity.resourceRepair', 'Check or repair this resource.'));
+                if (result.reason) el['resource-message'].textContent += ' — ' + operationReason(result.reason);
                 await refreshResources();
                 if (at === epoch) await hooks.status();
             } catch (error) {

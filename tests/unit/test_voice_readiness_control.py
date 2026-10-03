@@ -174,6 +174,76 @@ async def test_actual_core_api_and_frontend_keep_successful_trial_proof(registry
         await cleanup(value)
 
 
+@pytest.mark.parametrize("failure,diagnostic", [
+    ("rpc_rejected", "controlled_transport_failure"),
+    ("callback_throws", "controlled_control_result_failure"),
+    ("missing_confirmation", "protocol_rpc_timeout: control preview_begin id=1"),
+    ("invalid_json", "SyntaxError"),
+    ("unknown_reply", "protocol_unknown_reply: 999"),
+    ("pipe_closed", "protocol_pipe_closed"),
+])
+async def test_protocol_subprocess_routes_transport_failures_through_run(tmp_path, failure, diagnostic):
+    node = shutil.which("node")
+    assert node is not None, "Protocol subprocess validation requires Node.js"
+    args = [node, "--unhandled-rejections=warn"]
+    if failure == "callback_throws":
+        # Inject a callback fault after loading the actual owner controller;
+        # this checks that the success branch's exception also reaches run.
+        preload = tmp_path / "throw_control_result.cjs"
+        preload.write_text("""
+const vm = require('node:vm');
+const execute = vm.runInContext;
+vm.runInContext = function (source, context, options) {
+    const result = execute(source, context, options);
+    if (options.filename === 'static/app/app-voice-readiness.js') {
+        const create = context.createVoiceCaptureReadiness;
+        context.createVoiceCaptureReadiness = function (...args) {
+            const owner = create(...args);
+            owner.controlResult = () => { throw new Error('controlled_control_result_failure'); };
+            return owner;
+        };
+    }
+    return result;
+};
+""", encoding="utf-8")
+        args.extend(["--require", str(preload)])
+    args.append(str(Path(__file__).parents[1] / "frontend" / "voice_preview_protocol.cjs"))
+    process = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        request = json.loads(await asyncio.wait_for(process.stdout.readline(), 3))
+        assert request["channel"] == "control" and request["payload"]["event"] == "preview_begin"
+        if failure == "pipe_closed":
+            process.stdin.close()
+        elif failure != "missing_confirmation":
+            if failure == "invalid_json":
+                reply = "{not-valid-json}\n"
+            elif failure == "unknown_reply":
+                reply = json.dumps({"id": 999, "payload": {}}) + "\n"
+            elif failure == "callback_throws":
+                reply = json.dumps({"id": request["id"], "payload": {
+                    "event": "preview_begin", "request_id": request["payload"]["request_id"],
+                    "ok": True, "token": "controlled-token", "ttl_seconds": 30,
+                    "noise_reduction_enabled": True,
+                }}) + "\n"
+            else:
+                reply = json.dumps({"id": request["id"], "error": diagnostic}) + "\n"
+            process.stdin.write(reply.encode())
+            await process.stdin.drain()
+        # Keep stdin open for the lost-confirmation case. The harness's six-
+        # second deadline must terminate itself before this external watchdog.
+        assert await asyncio.wait_for(process.wait(), 8 if failure == "missing_confirmation" else 3) == 1
+        output, errors = await process.stdout.read(), await process.stderr.read()
+        text = errors.decode()
+        assert "voice_preview_protocol_failed:" in text and diagnostic in text
+        assert "UnhandledPromiseRejection" not in text
+        assert '"channel":"result"' not in output.decode()
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
 async def test_api_consumed_receipt_cannot_release_new_ticket_or_accept_wrong_owner(registry, trial_api):
     value, other = manager(), manager()
     other._set_microphone_route("blocked")

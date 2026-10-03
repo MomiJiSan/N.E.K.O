@@ -32,6 +32,7 @@ from .enrollment import (
     EnrollmentAudioError, SileroEnrollmentSpeechValidator, enrollment_audio_diagnostics,
 )
 from .enrollment_audio import EnrollmentAudioNormalizationError, EnrollmentAudioNormalizer
+from .state import VoiceIdentityEffectiveReason
 
 MAX_TRIAL_PCM_BYTES = 48_000 * 3 * 2
 RESOURCE_STATES = frozenset({"unchecked", "ready", "missing", "unavailable"})
@@ -429,6 +430,10 @@ class VoiceResourceManager:
             operation.refresh_task = refresh
             try:
                 await asyncio.wait_for(refresh, timeout=5)
+            except TimeoutError as exc:
+                # The resource pointer is already committed. A runtime refresh
+                # deadline must not masquerade as preparation/download failure.
+                raise VoiceResourceError(VoiceIdentityEffectiveReason.RUNTIME_DEGRADED.value) from exc
             finally:
                 if operation.refresh_task is refresh:
                     operation.refresh_task = None

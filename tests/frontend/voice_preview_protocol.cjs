@@ -9,17 +9,41 @@ const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
 
 const requests = new Map();
+const timers = new Set();
+const input = readline.createInterface({ input: process.stdin });
 let sequence = 0;
-readline.createInterface({ input: process.stdin }).on('line', line => {
-    const reply = JSON.parse(line);
-    const pending = requests.get(reply.id);
-    requests.delete(reply.id);
-    if (reply.error) pending.reject(new Error(reply.error)); else pending.resolve(reply.payload);
+let closed = false;
+let failProtocol;
+function setTimer(callback, milliseconds) {
+    const timer = setTimeout(() => { timers.delete(timer); callback(); }, milliseconds);
+    timers.add(timer);
+    return timer;
+}
+function clearTimer(timer) { timers.delete(timer); clearTimeout(timer); }
+input.on('line', line => {
+    try {
+        const reply = JSON.parse(line);
+        const pending = requests.get(reply.id);
+        if (!pending) throw new Error('protocol_unknown_reply: ' + reply.id);
+        requests.delete(reply.id);
+        clearTimer(pending.timer);
+        if (reply.error) pending.reject(new Error(reply.error)); else pending.resolve(reply.payload);
+    } catch (error) { failProtocol(error); }
 });
+input.on('close', () => { if (!closed) failProtocol(new Error('protocol_pipe_closed')); });
 function rpc(channel, payload) {
     return new Promise((resolve, reject) => {
+        if (closed) { reject(new Error('protocol_closed')); return; }
         const id = ++sequence;
-        requests.set(id, { resolve, reject });
+        // Core begin has a five-second cleanup budget. Fail this transport
+        // before the owner's eight-second wait and the Python outer watchdog.
+        const timer = setTimer(() => {
+            requests.delete(id);
+            const error = new Error('protocol_rpc_timeout: ' + channel + ' ' + (payload.event || '') + ' id=' + id);
+            reject(error);
+            failProtocol(error);
+        }, 6000);
+        requests.set(id, { resolve, reject, timer });
         process.stdout.write(JSON.stringify({ id, channel, payload }) + '\n');
     });
 }
@@ -39,7 +63,7 @@ function environment() {
         getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
     };
     const root = {
-        document, crypto: { randomUUID }, setTimeout, clearTimeout, AbortController,
+        document, crypto: { randomUUID }, setTimeout: setTimer, clearTimeout: clearTimer, AbortController,
         Uint8Array, Promise, Date, console,
         location: { origin: 'http://localhost', hostname: 'localhost' },
         addEventListener() {}, removeEventListener() {},
@@ -58,6 +82,8 @@ function environment() {
     return { root, elements, load };
 }
 async function run() {
+    const failed = new Promise((_, reject) => { failProtocol = reject; });
+    try { await Promise.race([failed, (async () => {
     const main = environment();
     let identity;
     let prepare;
@@ -68,7 +94,9 @@ async function run() {
     const S = { isRecording: true, stream: null };
     let owner;
     const socket = { readyState: 1, send(json) {
-        rpc('control', JSON.parse(json)).then(details => owner.controlResult(details, socket), error => { throw error; });
+        rpc('control', JSON.parse(json))
+            .then(details => owner.controlResult(details, socket))
+            .catch(failProtocol);
     } };
     S.socket = socket;
     main.load('static/app/app-voice-readiness.js');
@@ -121,5 +149,16 @@ async function run() {
         trackEnded: track.readyState === 'ended', microphoneStops,
         message: child.elements.get('voice-identity-test-result').textContent,
     } }) + '\n');
+    })()]); } finally {
+        closed = true;
+        requests.clear();
+        timers.forEach(clearTimeout);
+        timers.clear();
+        input.close();
+        process.stdin.pause();
+    }
 }
-run().then(() => process.exit(0), error => { console.error(error); process.exit(1); });
+run().catch(error => {
+    console.error('voice_preview_protocol_failed:', error.stack || error.message);
+    process.exitCode = 1;
+});

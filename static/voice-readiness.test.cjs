@@ -17,7 +17,7 @@ function element() {
     const handlers = new Map();
     return { value: '', textContent: '', checked: false, children: [], style: {}, disabled: false, hidden: false, classList: { toggle() {} }, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { handlers.set(name, fn); }, appendChild(child) { this.children.push(child); }, append(...children) { this.children.push(...children); }, replaceChildren() { this.children = []; }, emit(name, event = { target: this }) { return handlers.get(name)?.(event); } };
 }
-function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter } = {}) {
+function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter, translate = (_, fallback) => fallback, status = async () => {} } = {}) {
     const elements = new Map();
     const events = new Map();
     const mediaEvents = new Map();
@@ -30,11 +30,11 @@ function harness({ checkGate, captureGate, accepted = true, resourceReady = true
     if (desktopGate) root.nekoVoiceEnrollment = { prepare: () => desktopGate.promise, release: async () => {} };
     const document = { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, createElement: element };
     const hooks = {
-        translate: (_, fallback) => fallback, render() {}, error: error => error.message,
+        translate, render() {}, error: error => error.message,
         enrolling: () => false, stream: () => stream,
         async microphone() { stream = trackStream(); controller.receivedStream({ ...stream, label: stream.track.label, deviceId: 'actual-device', fallback: false }); },
         async capture() { if (captureGate) await captureGate.promise; return new ArrayBuffer(288000); },
-        pause() {}, stop() { stopped++; if (stream) input.stop(stream); stream = null; }, cancel() {}, status: async () => {},
+        pause() {}, stop() { stopped++; if (stream) input.stop(stream); stream = null; }, cancel() {}, status,
         async request(url, config) {
             calls.push({ url, config });
             if (requestRouter) return requestRouter(url, config);
@@ -259,6 +259,35 @@ for (const state of ['succeeded','failed']) test('resource cancellation displays
     assert.equal(resourceQueries,2);assert.match(h.elements.get('voice-identity-resource-message').textContent,new RegExp('^'+state));
     assert.doesNotMatch(h.elements.get('voice-identity-resource-message').textContent,/cancelled/);
     assert.equal(h.elements.get('voice-identity-resources').children[0].textContent,'campp: ready');assert.equal(h.controller.isPending(),false);
+});
+
+for (const completion of ['poll', 'cancel']) test('committed installation with degraded activation displays its existing eight-language reason through '+completion, async () => {
+    for (const language of ['en','ja','ko','zh-CN','zh-TW','ru','pt','es']) {
+        const locale=JSON.parse(fs.readFileSync(path.join(__dirname,'locales',language+'.json'),'utf8'));
+        const translatedKeys=[];
+        const translate=(key,fallback)=>{translatedKeys.push(key);return key.split('.').reduce((value,part)=>value?.[part],locale)??fallback;};
+        const terminal={operation_id:'installed-degraded',state:'failed',reason:'runtime_degraded',committed:true,result:{installed:true}};
+        const poll=deferred();let resourceQueries=0,statusQueries=0;
+        const h=harness({translate,status:async()=>{statusQueries++;},requestRouter:async url=>{
+            if(url==='/resources'){resourceQueries++;return {can_enroll:false,resources:{wake_model:{state:resourceQueries>1?'ready':'missing'},wake_runtime:{state:'ready'}}};}
+            if(url==='/resources/wake-word/download')return {operation_id:terminal.operation_id,state:'pending'};
+            if(url==='/resources/operations/'+terminal.operation_id){if(completion==='cancel'){await poll.promise;return {state:'running'};}return terminal;}
+            if(url.endsWith('/cancel'))return terminal;
+            throw new Error('unexpected request: '+url);
+        }});
+        await h.controller.refreshResources();const downloading=h.elements.get('voice-identity-download').emit('click');
+        if(completion==='cancel'){
+            while(!h.calls.some(call=>call.url==='/resources/operations/'+terminal.operation_id))await new Promise(resolve=>setImmediate(resolve));
+            await h.elements.get('voice-identity-resource-cancel').emit('click');poll.resolve();
+        }
+        await downloading;
+        assert.equal(h.elements.get('voice-identity-resource-message').textContent,locale.voiceIdentity.resourceOperation_failed+' — '+locale.voiceIdentity.reasonRuntimeDegraded,language);
+        assert.equal(resourceQueries,2);assert.equal(statusQueries,1);assert.equal(h.controller.isPending(),false);
+        assert.equal(h.elements.get('voice-identity-resources').children[0].textContent,locale.voiceIdentity.resource_wake_model+': '+locale.voiceIdentity.resourceState_ready);
+        assert.ok(translatedKeys.includes('voiceIdentity.reasonRuntimeDegraded'));
+        assert.ok(!translatedKeys.includes('voiceIdentity.resourceReason_runtime_degraded'));
+        assert.ok(!h.calls.some(call=>call.url.includes('/preference')));
+    }
 });
 
 test('both real avatar menu entries use the desktop bridge without the main-page microphone helper and recover synchronous IPC failure', async () => {
