@@ -17,7 +17,7 @@ function element() {
     const handlers = new Map();
     return { value: '', textContent: '', checked: false, children: [], style: {}, disabled: false, hidden: false, classList: { toggle() {} }, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { handlers.set(name, fn); }, appendChild(child) { this.children.push(child); }, append(...children) { this.children.push(...children); }, replaceChildren() { this.children = []; }, emit(name, event = { target: this }) { return handlers.get(name)?.(event); } };
 }
-function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter, translate = (_, fallback) => fallback, status = async () => {}, errorFormatter = error => error.message } = {}) {
+function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter, translate = (_, fallback) => fallback, status = async () => {}, errorFormatter = error => error.message, clock = Date, enrolling = () => false, cancel = () => {} } = {}) {
     const elements = new Map();
     const events = new Map();
     const mediaEvents = new Map();
@@ -31,10 +31,10 @@ function harness({ checkGate, captureGate, accepted = true, resourceReady = true
     const document = { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, createElement: element };
     const hooks = {
         translate, render() {}, error: errorFormatter,
-        enrolling: () => false, stream: () => stream,
+        enrolling, stream: () => stream,
         async microphone() { stream = trackStream(); controller.receivedStream({ ...stream, label: stream.track.label, deviceId: 'actual-device', fallback: false }); },
         async capture() { if (captureGate) await captureGate.promise; return new ArrayBuffer(288000); },
-        pause() {}, stop() { stopped++; if (stream) input.stop(stream); stream = null; }, cancel() {}, status,
+        pause() {}, stop() { stopped++; if (stream) input.stop(stream); stream = null; }, cancel, status,
         async request(url, config) {
             calls.push({ url, config });
             if (requestRouter) return requestRouter(url, config);
@@ -44,7 +44,7 @@ function harness({ checkGate, captureGate, accepted = true, resourceReady = true
             return {};
         }
     };
-    vm.runInNewContext(readinessSource, { window: root, document, navigator: { mediaDevices: { enumerateDevices: async () => [], addEventListener(name,fn) { mediaEvents.set(name,fn); } } }, localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) }, crypto, AbortController, Uint8Array, Date, Math, Promise }, { filename: path.join(__dirname, 'js/voice-identity-readiness.js') });
+    vm.runInNewContext(readinessSource, { window: root, document, navigator: { mediaDevices: { enumerateDevices: async () => [], addEventListener(name,fn) { mediaEvents.set(name,fn); } } }, localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) }, crypto, AbortController, Uint8Array, Date: clock, Math, Promise }, { filename: path.join(__dirname, 'js/voice-identity-readiness.js') });
     controller = root.createVoiceIdentityReadiness(hooks);
     return { controller, calls, elements, events, mediaEvents, hooks, root, stopped: () => stopped };
 }
@@ -474,4 +474,38 @@ test('resource repair in a remote browser cannot invoke a local desktop repair a
     h.root.open = value => { url = value; };
     await h.controller.refreshResources(); await h.elements.get('voice-identity-repair').emit('click');
     assert.equal(localRepairs, 0); assert.equal(url, '/api/voice-identity/resources/repair-guide');
+});
+
+test('storage changes invalidate the trial proof without cancelling ongoing enrollment', async () => {
+    let ongoing = false; let cancelled = 0;
+    const h = harness({ enrolling: () => ongoing, cancel: () => { cancelled++; } }); await h.controller.refreshResources();
+    await h.elements.get('voice-identity-test').emit('click');
+    assert.equal(h.controller.canStart(), true);
+    const before = h.stopped();
+    ongoing = true;
+    h.events.get('storage')({ key: 'neko_mic_gain_db' });
+    ongoing = false;
+    assert.equal(cancelled, 0);
+    assert.equal(h.stopped(), before);
+    assert.equal(h.controller.canStart(), false);
+});
+
+test('a download still running after 120 seconds is allowed to finish within the backend budget', async () => {
+    let now = 0; let queries = 0;
+    const h = harness({ clock: { now: () => now }, requestRouter: async url => {
+        if (url === '/resources') return { resources: { wake_runtime: { state: 'ready' } } };
+        if (url === '/resources/operations') return { operation_id: 'slow-download', state: 'reserved' };
+        if (url.endsWith('/start')) return { state: 'pending' };
+        if (url.endsWith('/slow-download')) {
+            now = 130000;
+            return { state: ++queries === 1 ? 'running' : 'succeeded' };
+        }
+        if (url.endsWith('/cancel')) throw new Error('download should not be cancelled');
+        throw new Error('unexpected ' + url);
+    } });
+    h.root.setTimeout = callback => setTimeout(callback, 0);
+    await h.controller.refreshResources();
+    await h.elements.get('voice-identity-download').emit('click');
+    assert.equal(queries, 2);
+    assert.equal(h.calls.some(call => call.url.endsWith('/cancel')), false);
 });

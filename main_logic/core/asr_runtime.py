@@ -2485,9 +2485,6 @@ class AsrRuntimeMixin:
         (Codex P2).
         """
         self._ensure_asr_runtime_state()
-        if preview_isolation_registry.is_manager_isolated(self):
-            self._set_microphone_route("blocked")
-            return
         operation_generation = self._begin_asr_route_operation()
         await self._close_independent_asr(
             next_route_mode="blocked",
@@ -2547,6 +2544,14 @@ class AsrRuntimeMixin:
                     if input_mode == "text"
                     else None
                 ),
+            )
+            return
+        if preview_isolation_registry.is_manager_isolated(self):
+            await self._fail_closed_voice_route(
+                "preview_busy", operation_generation=operation_generation,
+                still_current=core_start_is_current,
+                status=AsrStatusEvent(code="ASR_INDEPENDENT_FAILED", provider=core_type or "unknown",
+                                      session_epoch=session_epoch, reason="preview_busy"),
             )
             return
         try:

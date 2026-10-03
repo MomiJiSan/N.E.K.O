@@ -391,8 +391,10 @@ class VoiceIdentityService:
     def begin_trial_isolation(self, request_id: str):
         from main_logic.voice_input.preview import preview_isolation_registry
         self._require_initialized()
-        if self._enrollment is not None or self._runtime_audio_contract_transition_pending:
+        if self._enrollment is not None:
             raise VoiceResourceError("enrollment_in_progress")
+        if self._runtime_audio_contract_transition_pending:
+            raise VoiceResourceError("audio_contract_changed")
         ticket = preview_isolation_registry.begin_inactive(
             request_id, noise_reduction_enabled=self._runtime_noise_reduction_enabled
         )

@@ -131,3 +131,20 @@ Windows 冻结安装包和定制唤醒组件的源码构建、安装、模型真
 桌面采集与相关 owner 回归 76 项通过，采集协调器行覆盖率 99.31%、桥接 100%；三条实际 Electron 流程通过，覆盖窗口归属、物理停止后隔离失败与修复入口。后端实际 Electron 录入页及 AudioWorklet 回归通过。另以当前两端代码执行真实音轨和原生 IPC 联合场景，旧协调器的突变版本在恢复后的新窗口接管时再次报 owner 歧义，修复版本可打开正确 Session。
 
 以上 Electron 输入使用 Chromium 受控测试设备，不替代物理麦克风和冻结安装包验收。声纹参数、正式录入时限、档案、启用偏好、ASR／Omni 激活门控和不确定音频的失败阻断均保持原合同。旧提交的全量 CI 结果不能代替本轮新 head；桌面全量基线失败及上游 Actions 账户限制仍需单独处理。
+
+## 第三轮逐条评论修复
+
+| 评论 | 核验和修复 |
+|---|---|
+| [spawn 阻塞事件循环](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173418009) | 成立；启动放到线程，取消等待启动取得进程句柄后物理退休。288 KB 参数与受控慢启动证明主循环仍响应，取消无遗留进程 |
+| [隔离期间启动会话](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173418291) | 隔离早退遗漏失败出口和文本撤权成立；现有 started 回执已携带 blocked 路由，追加明确 preview_busy 状态及撤权，文本仍走原失败出口。连接断开仅释放其原票据，不能释放新连接的票据；不自动重开已退休路由 |
+| [双路释放竞态](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173418514) | 成立；未 claim 的取消及 HTTP token 释放也留下绑定原 owner、原期限、最多 32 条的清理回执，随后 preview_end 可幂等确认；旧清理不释放新试录 |
+| [控制消息阻塞接收循环](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173418748) | 成立；两条 WebSocket 控制入口均派发连接拥有的后台任务，先安装 PCM fence，再接收下一帧；并发准备／重试立即拒绝，断开取消任务并释放票据。真实原生／独立 ASR 入口证明等待期间 PCM 被丢弃且停止仍被接收 |
+| [下载前端预算过短](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173418941) | 成立；下载等待 210 秒，覆盖后端 180 秒下载、提交、刷新与退休；准备保持独立 60 秒预算。模拟 130 秒下载未被提前取消 |
+| [清理提前删除 ownership marker](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173419201) | 成立；正常与遗留 stage 清理均在 payload 全部删除后才删除 marker，受控文件锁失败仍保留标记并可重试；无标记的非空目录继续拒绝删除 |
+| [共享输入设置取消录入](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173419441) | 成立；storage 事件在录入期间只使试录证明失效，更新下一次输入设置，不停止当前采集或取消录入；真实设备失效仍走原检查 |
+| [publish 冷启动重依赖](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173419660) | 成立；与 preference 对称使用轻量进程入口，禁止导入音频／资源管理依赖的真实 spawn 测试通过。冻结程序增加五秒内真实模型指针发布检查，使用隔离副本，不修改实际安装目录 |
+| [资源发现异常漏捕获](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173419867) | 成立；路径和 pointer 探测纳入异常边界，manifest 必须为 dict，权限错误和 list manifest 均转换为稳定模型不可用原因 |
+| [DSP 切换误报录入中](https://github.com/Project-N-E-K-O/N.E.K.O/pull/3282#discussion_r4173622033) | 成立；试录隔离与试录检查一致返回 audio_contract_changed，实际录入仍返回 enrollment_in_progress |
+
+ASR 路由、全 voice_input、声纹服务／API、真实 WebSocket 与缓存契约联合回归 1,571 项通过、7 项跳过；最终冻结存储验收 helper 的真实双开关与发布分支另通过 1 项。Node 回归 160 项通过。Ruff、Core 契约、全仓分层与异步阻塞守门通过。冻结安装包的实际执行结果仍须由更新后的发布流水线验证。

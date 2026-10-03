@@ -22,7 +22,7 @@ from main_logic.asr_client.endpointing.asset_manifest import AssetManifestError,
 from main_logic.asr_client.speaker_shadow.asset_manifest import CampPlusAssetError, resolve_verified_campplus_asset
 from .wake_word_bundle import (
     ASSETS, WakeWordBundleError, default_cache_root, install_bundle, resolve_cached_model_dir,
-    publish_bundle_version, is_bundle_version_published,
+    is_bundle_version_published,
 )
 from main_logic.voice_input.wake_word.sherpa_backend import (
     SUPPORTED_RUNTIME_VERSION, SherpaWakeWordConfig, validate_wake_word_resources,
@@ -36,6 +36,7 @@ from .enrollment import (
 from .enrollment_audio import EnrollmentAudioNormalizationError, EnrollmentAudioNormalizer
 from .state import VoiceIdentityEffectiveReason
 from .preference_worker import save_preference_worker
+from .publication_worker import publish_resource_worker
 
 MAX_TRIAL_PCM_BYTES = 48_000 * 3 * 2
 RESOURCE_STATES = frozenset({"unchecked", "ready", "missing", "unavailable"})
@@ -139,10 +140,6 @@ def _resource_worker(connection: Connection, kind: str, nr_enabled: bool, wake_p
                 asyncio.run(_prepare_wake(path))
             directory = install_bundle(Path(wake_path), validate=validate, publish=False)
             result = {"version": directory.name}
-        elif kind == "publish":
-            version = pcm16.decode("ascii")
-            publish_bundle_version(Path(wake_path), version)
-            result = {"installed": True}
         else:
             result = asyncio.run(_check_audio(pcm16, nr_enabled) if kind == "audio" else _prepare_resources(nr_enabled, wake_path))
         connection.send({"ok": True, "result": result})
@@ -170,15 +167,26 @@ async def _stop_process(process) -> None:
 async def _run_worker(kind: str, nr_enabled: bool, wake_path: str | None = None, pcm16: bytes = b"", timeout: float = 30.0) -> dict:
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
-    target = save_preference_worker if kind == "preference" else _resource_worker
+    target = {"preference": save_preference_worker, "publish": publish_resource_worker}.get(kind, _resource_worker)
     process = context.Process(target=target, args=(child, kind, nr_enabled, wake_path, pcm16), daemon=False)
     started = False
     try:
         try:
-            process.start()
+            launch = asyncio.create_task(asyncio.to_thread(process.start))
+            cancelled = None
+            while not launch.done():
+                try:
+                    await asyncio.shield(launch)
+                except asyncio.CancelledError as exc:
+                    # A start thread cannot be killed. Wait for its process
+                    # handle before cleanup, so cancellation never leaks it.
+                    cancelled = exc
+            launch.result()
+            started = True
+            if cancelled is not None:
+                raise cancelled
         except Exception as exc:
             raise VoiceResourceError("resource_worker_start_failed") from exc
-        started = True
         child.close()
         deadline = asyncio.get_running_loop().time() + timeout
         while True:

@@ -319,7 +319,7 @@ async def test_consumed_cleanup_receipts_are_bounded_expiring_and_do_not_retain_
             await cleanup(value)
 
 
-async def test_unclaimed_or_token_cancelled_ticket_does_not_create_consumed_receipt(registry):
+async def test_unclaimed_or_http_released_ticket_keeps_owner_cleanup_receipt(registry):
     value = manager()
     try:
         for claim, by_token in [(False, False), (True, True)]:
@@ -330,11 +330,75 @@ async def test_unclaimed_or_token_cancelled_ticket_does_not_create_consumed_rece
             if claim:
                 registry.claim(ticket.token)
             assert registry.release(ticket.token if by_token else ticket)
-            assert not registry._consumed_releases
+            assert registry._consumed_releases
             retry = await value._handle_voice_identity_control(
                 {"event": "preview_end", "request_id": "repeat", "token": ticket.token}, connection_id="producer-a")
-            assert retry["ok"] is False and retry["reason"] == "preview_invalid"
+            assert retry["ok"] is True
     finally:
+        await cleanup(value)
+
+
+async def test_disconnect_release_is_bound_to_original_connection_and_cannot_release_successor(registry):
+    value = manager()
+    try:
+        first = await value._handle_voice_identity_control(
+            {"event": "preview_begin", "request_id": "first"}, connection_id="producer-a")
+        assert first["ok"]
+        assert not registry.release_connection(value, "other-connection")
+        assert registry.release_connection(value, "producer-a")
+        value._voice_lease_connection_id = "producer-b"
+        second = await value._handle_voice_identity_control(
+            {"event": "preview_begin", "request_id": "second"}, connection_id="producer-b")
+        assert second["ok"]
+        assert not registry.release_connection(value, "producer-a")
+        assert registry._ticket.token == second["token"]
+    finally:
+        registry.release(registry._ticket)
+        await cleanup(value)
+
+
+@pytest.mark.parametrize("input_mode", ["audio", "text"])
+async def test_route_start_during_preview_uses_explicit_failure_and_text_revocation(registry, input_mode):
+    owner, value = manager("blocked"), manager("blocked")
+    for inactive in (owner, value):
+        inactive._voice_lease_synchronized = False
+        inactive._voice_lease_owner = None
+    ticket = registry.begin(owner, "preview", noise_reduction_enabled=True, current=lambda: True)
+    registry.mark_ready(ticket)
+    failed = AsyncMock(return_value=True)
+    value._fail_closed_voice_route = failed
+    try:
+        await value._start_independent_asr_if_enabled(input_mode)
+        assert value._asr_route_mode == "blocked"
+        assert failed.await_args.args[0] == ("preview_busy" if input_mode == "audio" else "text_session_active")
+        if input_mode == "audio":
+            assert failed.await_args.kwargs["status"].reason == "preview_busy"
+    finally:
+        registry.release(ticket)
+        await cleanup(owner)
+        await cleanup(value)
+
+
+async def test_readiness_controls_reject_concurrent_retry_instead_of_queueing(registry, monkeypatch):
+    value = manager()
+    entered, finish = asyncio.Event(), asyncio.Event()
+    async def waiting(manager, message, result, connection_id):
+        entered.set()
+        await finish.wait()
+        return {**result, "ok": True}
+    monkeypatch.setattr(readiness_module.VoiceReadinessControl, "_retry", waiting)
+    first = asyncio.create_task(value._handle_voice_identity_control(
+        {"event": "activation_retry", "request_id": "first"}, connection_id="producer-a"))
+    try:
+        await entered.wait()
+        result = await value._handle_voice_identity_control(
+            {"event": "activation_retry", "request_id": "second"}, connection_id="producer-a")
+        assert result["ok"] is False and result["reason"] == "preview_busy"
+        finish.set()
+        assert (await first)["ok"]
+    finally:
+        finish.set()
+        await asyncio.gather(first, return_exceptions=True)
         await cleanup(value)
 
 
@@ -587,6 +651,41 @@ class EndpointRuntime(_ProtocolManager, _Runtime):
 
 
 @pytest.mark.parametrize("route", ["native", "independent"])
+async def test_websocket_receives_pcm_and_stop_while_activation_retry_waits(registry, monkeypatch, route):
+    value = EndpointRuntime(route)
+    entered, released = asyncio.Event(), asyncio.Event()
+    async def waiting_control(message, *, connection_id):
+        value._voice_session_activation_degraded = True
+        entered.set()
+        await released.wait()
+        return {"event": message["event"], "request_id": message["request_id"], "ok": True}
+    original_control = value._handle_voice_input_control
+    async def stop_control(event, generation, **kwargs):
+        if event == "release":
+            assert entered.is_set()
+            released.set()
+        return await original_control(event, generation, **kwargs)
+    value._handle_voice_identity_control = waiting_control
+    value._handle_voice_input_control = stop_control
+    socket = _EventWebSocket([
+        {"action": "voice_input_control", "event": "sync", "generation": 1,
+         "owner": "core", "hard_muted": False, "focus_suppressed": False},
+        {"action": "voice_identity_control", "event": "activation_retry", "request_id": "retry"},
+        {"action": "stream_data", "input_type": "audio", "sample_rate_hz": 16000, "data": [2000] * 160},
+        {"action": "voice_input_control", "event": "release", "generation": 1},
+    ])
+    _install_protocol_endpoint(monkeypatch, manager=value, websocket=socket)
+    try:
+        await asyncio.wait_for(router.websocket_endpoint(socket, "Lan"), 2)
+        assert released.is_set()
+        assert value._audio_stream_queue.empty()
+        value.session.stream_audio.assert_not_awaited()
+        value._asr_runtime.submit.assert_not_awaited()
+    finally:
+        await cleanup(value)
+
+
+@pytest.mark.parametrize("route", ["native", "independent"])
 @pytest.mark.parametrize("binary", [False, True])
 async def test_actual_endpoint_delivers_pcm_before_preview_and_blocks_after_it(registry, monkeypatch, route, binary):
     value = EndpointRuntime(route)
@@ -743,7 +842,17 @@ async def test_retry_cancel_or_successor_during_prepare_retires_candidate_withou
 @pytest.mark.parametrize("binary", [False, True])
 async def test_actual_websocket_json_and_binary_pcm_are_blocked_after_owner_preview_begin(registry, monkeypatch, route, binary):
     value = EndpointRuntime(route)
-    socket = _EventWebSocket([
+    completed = asyncio.Event()
+    class PreviewSocket(_EventWebSocket):
+        async def receive(self):
+            if self.events[0]["type"] == "websocket.disconnect":
+                await asyncio.wait_for(completed.wait(), 2)
+            return await super().receive()
+        async def send_text(self, payload):
+            await super().send_text(payload)
+            if "VOICE_IDENTITY_CONTROL_RESULT" in payload:
+                completed.set()
+    socket = PreviewSocket([
         {"action": "voice_input_control", "event": "sync", "generation": 1,
          "owner": "core", "hard_muted": False, "focus_suppressed": False},
         {"action": "voice_identity_control", "event": "preview_begin", "request_id": "trial"},

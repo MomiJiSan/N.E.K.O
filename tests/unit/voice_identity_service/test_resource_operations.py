@@ -268,6 +268,66 @@ def _hung_worker(connection, kind, nr_enabled, wake_path, pcm16):
 
 
 @pytest.mark.asyncio
+async def test_slow_spawn_with_large_pcm_keeps_loop_live_and_cancellation_retires_it(monkeypatch, tmp_path):
+    original_start = multiprocessing.process.BaseProcess.start
+    entered = threading.Event()
+    launched = []
+    def slow_start(process):
+        entered.set()
+        time.sleep(.5)
+        original_start(process)
+        launched.append(process.pid)
+    monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", slow_start)
+    monkeypatch.setattr(resource_manager, "_resource_worker", _hung_worker)
+    before = {child.pid for child in multiprocessing.active_children()}
+    task = asyncio.create_task(resource_manager._run_worker("audio", False, str(tmp_path / "started"), b"\0" * 288000))
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.sleep(.05)
+    assert loop.time() - started < .25
+    assert entered.is_set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert launched
+    import psutil
+    assert all(not psutil.pid_exists(pid) for pid in launched)
+    assert {child.pid for child in multiprocessing.active_children()} <= before
+
+
+def test_stage_cleanup_failure_keeps_owner_marker_and_can_retry(tmp_path, monkeypatch):
+    stage = tmp_path / "stage-neko-kws-interrupted"
+    stage.mkdir()
+    (stage / ".owner").write_bytes(model_bundle._STAGE_OWNER)
+    payload = stage / "archive.tar.bz2"
+    payload.write_bytes(b"partial")
+    original_unlink = Path.unlink
+    def locked_payload(path, *args, **kwargs):
+        if path == payload:
+            raise PermissionError("archive is temporarily held")
+        return original_unlink(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", locked_payload)
+        with pytest.raises(PermissionError):
+            model_bundle._remove_abandoned_stages(tmp_path)
+    assert (stage / ".owner").read_bytes() == model_bundle._STAGE_OWNER
+    model_bundle._remove_abandoned_stages(tmp_path)
+    assert not stage.exists()
+
+
+def test_model_discovery_rejects_list_manifest_and_normalizes_path_io_errors(tmp_path, monkeypatch):
+    root, directory = _install(tmp_path, monkeypatch)
+    (directory / "bundle.json").write_text(json.dumps(list(model_bundle.ASSETS)))
+    with pytest.raises(model_bundle.WakeWordBundleError, match="wake_model_invalid"):
+        model_bundle.resolve_cached_model_dir(root)
+    def unavailable(path):
+        raise PermissionError("cache root unavailable")
+    monkeypatch.setattr(model_bundle, "_safe_root", unavailable)
+    with pytest.raises(model_bundle.WakeWordBundleError, match="wake_model_invalid"):
+        model_bundle.resolve_cached_model_dir(root)
+
+
+@pytest.mark.asyncio
 async def test_worker_timeout_physically_retires_spawned_process(tmp_path, monkeypatch):
     monkeypatch.setattr(resource_manager, "_resource_worker", _hung_worker)
     before = {child.pid for child in multiprocessing.active_children()}
@@ -374,7 +434,8 @@ async def test_actual_preference_worker_is_atomic_and_does_not_change_owner_filt
     await manager.close()
 
 
-def test_preference_spawn_never_imports_audio_or_resource_manager(monkeypatch, tmp_path):
+@pytest.mark.parametrize("kind", ["preference", "publish"])
+def test_storage_spawn_never_imports_audio_or_resource_manager(monkeypatch, tmp_path, kind):
     monkeypatch.delenv("NEKO_WAKE_WORD_MODEL_DIR", raising=False)
     monkeypatch.delenv("NEKO_WAKE_WORD_ENABLED", raising=False)
     probe = tmp_path / "preference_probe.py"
@@ -397,23 +458,38 @@ def test_preference_spawn_never_imports_audio_or_resource_manager(monkeypatch, t
             sys.meta_path.insert(0, RejectHeavyImports())
 
         if __name__ == "__main__":
-            from main_logic.voice_identity_service.resource_manager import VoiceResourceManager
+            from main_logic.voice_identity_service.resource_manager import VoiceResourceManager, _run_worker
             async def run():
                 manager = VoiceResourceManager(lambda: False, cache_root=Path(sys.argv[2]))
                 try:
-                    assert (await manager.save_preference(True))["enabled"] is True
+                    if sys.argv[3] == "preference":
+                        assert (await manager.save_preference(True))["enabled"] is True
+                    else:
+                        import hashlib
+                        import json
+                        from main_logic.voice_identity_service.wake_word_bundle import ASSETS, MODEL_SHA256
+                        directory = Path(sys.argv[2]) / "versions" / MODEL_SHA256
+                        directory.mkdir(parents=True)
+                        for name in ASSETS:
+                            (directory / name).write_bytes(b"model-fixture")
+                        digest = hashlib.sha256(b"model-fixture").hexdigest()
+                        (directory / "bundle.json").write_text(json.dumps(dict.fromkeys(ASSETS, digest)))
+                        assert (await _run_worker("publish", False, sys.argv[2], MODEL_SHA256.encode("ascii"), timeout=5))["installed"]
                 finally:
                     await manager.close()
             asyncio.run(run())
             print("LIGHTWEIGHT_PREFERENCE_READY")
     '''), encoding="utf-8")
     result = subprocess.run(
-        ["uv", "run", "--no-sync", "python", str(probe), str(Path(__file__).resolve().parents[3]), str(tmp_path / "cache")],
+        ["uv", "run", "--no-sync", "python", str(probe), str(Path(__file__).resolve().parents[3]), str(tmp_path / "cache"), kind],
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "LIGHTWEIGHT_PREFERENCE_READY" in result.stdout
-    assert voice_wake_word.wake_word_preference(tmp_path / "cache")["enabled"] is True
+    if kind == "preference":
+        assert voice_wake_word.wake_word_preference(tmp_path / "cache")["enabled"] is True
+    else:
+        assert model_bundle.resolve_cached_model_dir(tmp_path / "cache") is not None
 
 
 @pytest.mark.asyncio
@@ -453,15 +529,23 @@ async def test_preference_worker_preserves_managed_and_corrupt_preference_errors
 
 
 @pytest.mark.asyncio
-async def test_frozen_preference_gate_uses_isolated_cache_and_restores_deployment(monkeypatch, capsys):
+async def test_frozen_storage_gate_uses_isolated_cache_and_restores_deployment(monkeypatch, capsys, tmp_path):
     from main_logic.voice_identity_service.wake_word_release_smoke import check_preference_worker
     monkeypatch.setenv("NEKO_WAKE_WORD_MODEL_DIR", "managed-model")
     monkeypatch.setenv("NEKO_WAKE_WORD_ENABLED", "1")
-    await check_preference_worker()
+    source = tmp_path / "fixed-model"
+    source.mkdir()
+    for name in model_bundle.ASSETS:
+        (source / name).write_bytes(b"model-fixture")
+    digest = hashlib.sha256(b"model-fixture").hexdigest()
+    (source / "bundle.json").write_text(json.dumps(dict.fromkeys(model_bundle.ASSETS, digest)))
+    await check_preference_worker(source)
     import os
     assert os.environ["NEKO_WAKE_WORD_MODEL_DIR"] == "managed-model"
     assert os.environ["NEKO_WAKE_WORD_ENABLED"] == "1"
-    assert capsys.readouterr().out.count("WAKE_WORD_PREFERENCE_SMOKE_READY") == 2
+    output = capsys.readouterr().out
+    assert output.count("WAKE_WORD_PREFERENCE_SMOKE_READY") == 2
+    assert output.count("WAKE_WORD_PUBLICATION_SMOKE_READY") == 1
 
 
 def test_repair_corrupt_bundle_publishes_new_directory_and_keeps_owned_old_files(tmp_path, monkeypatch):
@@ -849,7 +933,8 @@ def _staged_download_worker(connection, kind, nr_enabled, wake_path, pcm16):
         import os
         os._exit(7)
     else:
-        resource_manager._resource_worker(connection, kind, nr_enabled, wake_path, pcm16)
+        from main_logic.voice_identity_service.publication_worker import publish_resource_worker
+        publish_resource_worker(connection, kind, nr_enabled, wake_path, pcm16)
 
 
 def _prepare_download_fixture(tmp_path, monkeypatch):
@@ -859,6 +944,7 @@ def _prepare_download_fixture(tmp_path, monkeypatch):
     source.rename(tmp_path / "download.tar.bz2")
     monkeypatch.setattr(model_bundle, "MODEL_SHA256", hashlib.sha256((tmp_path / "download.tar.bz2").read_bytes()).hexdigest())
     monkeypatch.setattr(resource_manager, "_resource_worker", _staged_download_worker)
+    monkeypatch.setattr(resource_manager, "publish_resource_worker", _staged_download_worker)
     monkeypatch.setattr(resource_manager.platform, "system", lambda: "Windows")
     monkeypatch.setattr(resource_manager.platform, "machine", lambda: "amd64")
     return root, previous, pointer
@@ -1039,13 +1125,15 @@ def _locked_pointer_publish_worker(connection, kind, nr_enabled, wake_path, pcm1
             raise PermissionError("Windows current pointer sharing lock")
         return original_replace(source, target)
     model_bundle.os.replace = locked_replace
-    resource_manager._resource_worker(connection, kind, nr_enabled, wake_path, pcm16)
+    from main_logic.voice_identity_service.publication_worker import publish_resource_worker
+    publish_resource_worker(connection, kind, nr_enabled, wake_path, pcm16)
 
 
 @pytest.mark.asyncio
 async def test_actual_parent_publication_failure_keeps_previous_version_and_reports_failure(tmp_path, monkeypatch):
     root, previous, pointer = _prepare_download_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(resource_manager, "_resource_worker", _locked_pointer_publish_worker)
+    monkeypatch.setattr(resource_manager, "publish_resource_worker", _locked_pointer_publish_worker)
     refreshed = []
     async def refresh(operation_id):
         refreshed.append(operation_id)

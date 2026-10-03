@@ -255,7 +255,9 @@
                 render();
                 await hooks.request('/resources/operations/' + encodeURIComponent(operation) + '/start', { method: 'POST', signal: requestAbort.signal });
                 if (at !== epoch) { hooks.request('/resources/operations/' + encodeURIComponent(ownedOperation) + '/cancel', { method: 'POST', keepalive: true }).catch(() => {}); return; }
-                const deadline = Date.now() + 120000;
+                // Include the backend download (180s), commit/refresh and
+                // retirement budgets before the page attempts cancellation.
+                const deadline = Date.now() + (kind === 'download' ? 210000 : 60000);
                 while (at === epoch && operation) {
                     const id = operation;
                     const result = await hooks.request('/resources/operations/' + encodeURIComponent(id), { method: 'GET', signal: requestAbort.signal });
@@ -338,7 +340,9 @@
             if (!['neko_selected_microphone', 'neko_mic_gain_db', 'neko_noise_reduction'].includes(event.key)) return;
             try { selectedId = localStorage.getItem('neko_selected_microphone') || ''; gainDb = root.nekoMicrophoneInput.gain(localStorage.getItem('neko_mic_gain_db')); } catch (_) {}
             el.gain.value = String(gainDb);
-            invalidate('voiceIdentity.inputChanged'); enumerate().catch(() => {});
+            if (hooks.enrolling()) { accepted = null; message('voiceIdentity.inputChanged'); render(); }
+            else invalidate('voiceIdentity.inputChanged');
+            enumerate().catch(() => {});
         });
         root.addEventListener('localechange', () => {
             if (actualLabel) el['actual-device'].textContent = actualLabel;

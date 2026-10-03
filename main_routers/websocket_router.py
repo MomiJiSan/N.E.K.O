@@ -201,8 +201,13 @@ async def _dispatch_voice_identity_control(manager, websocket, message: dict, *,
             preview_isolation_registry.release(token)
         details = {"event": message.get("event"), "request_id": message.get("request_id"),
                    "ok": False, "reason": "preview_owner_changed"}
-    await websocket.send_text(json.dumps({"type": "status", "message": json.dumps({
-        "code": "VOICE_IDENTITY_CONTROL_RESULT", "details": details})}))
+    try:
+        await websocket.send_text(json.dumps({"type": "status", "message": json.dumps({
+            "code": "VOICE_IDENTITY_CONTROL_RESULT", "details": details})}))
+    except Exception:
+        if details.get("token"):
+            from main_logic.voice_input.preview import preview_isolation_registry
+            preview_isolation_registry.release(details["token"])
 
 
 def _is_music_playback_state_message(message: dict) -> bool:
@@ -534,6 +539,7 @@ def _handle_ws_telemetry(message: dict, *, lanlan_name: str) -> None:
 async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
     _config_manager = get_config_manager()
     session_manager = get_session_manager()
+    voice_control_tasks = set()
     await websocket.accept()
     # Telemetry：WS 连接计数。**不带** lanlan_name dim —— 那是用户自定义的
     # character 名（characters_router 接受 user-controlled new_name），直接进
@@ -712,8 +718,11 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
         """
         voice_mgr = session_manager[lanlan_name]
         if message.get("action") == "voice_identity_control":
-            await _dispatch_voice_identity_control(voice_mgr, websocket, message,
-                connection_id=str(this_session_id), owns_voice=_owns_voice_connection)
+            task = _fire_task(_dispatch_voice_identity_control(voice_mgr, websocket, message,
+                connection_id=str(this_session_id), owns_voice=_owns_voice_connection))
+            voice_control_tasks.add(task)
+            task.add_done_callback(voice_control_tasks.discard)
+            await asyncio.sleep(0)  # Install the PCM fence before the next buffered frame.
             return
         if message.get("action") == "pause_session":
             # Codex P2. Lease ownership alone does not prove the live session is
@@ -915,9 +924,12 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
             action = message.get("action")
 
             if action == "voice_identity_control":
-                await _dispatch_voice_identity_control(session_manager[lanlan_name],
+                task = _fire_task(_dispatch_voice_identity_control(session_manager[lanlan_name],
                     websocket, message, connection_id=str(this_session_id),
-                    owns_voice=_owns_voice_connection)
+                    owns_voice=_owns_voice_connection))
+                voice_control_tasks.add(task)
+                task.add_done_callback(voice_control_tasks.discard)
+                await asyncio.sleep(0)
                 continue
 
             # 处理语言设置（可以在任何消息中携带）
@@ -1443,6 +1455,13 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
         # 内只有 break 才到这；break 路径上面都设过 reason；这里兜底防 NameError。
         _ws_disconnect_reason = "normal_break"
     finally:
+        for task in tuple(voice_control_tasks):
+            task.cancel()
+        if voice_control_tasks:
+            await asyncio.gather(*tuple(voice_control_tasks), return_exceptions=True)
+        if lanlan_name in session_manager:
+            from main_logic.voice_input.preview import preview_isolation_registry
+            preview_isolation_registry.release_connection(session_manager[lanlan_name], str(this_session_id))
         # Telemetry：连接生命周期。reason 是低基数 enum，duration 进 histogram
         # 看用户实际停留时长（D2-D7 流失诊断的关键指标之一）。
         # lanlan_name 不进 dim —— 见 accept 处 ws_connect 同样原因（PII + 高基数）。

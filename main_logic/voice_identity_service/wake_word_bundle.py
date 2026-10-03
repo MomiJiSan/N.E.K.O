@@ -121,7 +121,26 @@ def _remove_abandoned_stages(root: Path) -> None:
             elif (not child.is_file() or child.name not in {".owner", "archive.tar.bz2", "current.json"}
                   or child.stat().st_size > MAX_ARCHIVE_BYTES):
                 raise WakeWordBundleError("resource_cache_unsafe")
-        shutil.rmtree(stage)
+        # Retain ownership proof until every payload is gone. Interrupted
+        # cleanup can then be retried without treating our debris as foreign.
+        for child in children:
+            if child == marker:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        marker.unlink()
+        stage.rmdir()
+
+
+@contextmanager
+def _staging_directory(root: Path):
+    stage = Path(tempfile.mkdtemp(prefix=_STAGE_PREFIX, dir=root))
+    try:
+        yield stage
+    finally:
+        _remove_abandoned_stages(root)
 
 
 @contextmanager
@@ -136,13 +155,13 @@ def _installation_lock(root: Path):
 
 def resolve_cached_model_dir(root: Path | None = None) -> Path | None:
     """Validate the published pointer and all asset hashes; never mutate cache."""
-    root = _safe_root(root or default_cache_root())
-    pointer = root / "current.json"
-    if pointer.is_symlink():
-        raise WakeWordBundleError("wake_model_invalid")
-    if not pointer.exists():
-        return None
     try:
+        root = _safe_root(root or default_cache_root())
+        pointer = root / "current.json"
+        if pointer.is_symlink():
+            raise WakeWordBundleError("wake_model_invalid")
+        if not pointer.exists():
+            return None
         if pointer.is_symlink() or pointer.stat().st_size > 4096:
             raise ValueError
         data = json.loads(pointer.read_text(encoding="utf-8"))
@@ -158,7 +177,7 @@ def resolve_cached_model_dir(root: Path | None = None) -> Path | None:
         if manifest_path.stat().st_size > 8192 or manifest_path.is_symlink():
             raise ValueError
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if set(manifest) != set(ASSETS):
+        if type(manifest) is not dict or set(manifest) != set(ASSETS):
             raise ValueError
         for name, digest in manifest.items():
             asset = directory / name
@@ -206,7 +225,7 @@ def install_bundle(
         target = versions / MODEL_SHA256
         if size + MAX_ARCHIVE_BYTES + len(ASSETS) * MAX_ASSET_BYTES > MAX_CACHE_BYTES:
             raise WakeWordBundleError("resource_cache_full")
-        with tempfile.TemporaryDirectory(prefix=_STAGE_PREFIX, dir=root) as temporary:
+        with _staging_directory(root) as temporary:
             stage = Path(temporary)
             with (stage / ".owner").open("wb") as marker:
                 marker.write(_STAGE_OWNER)

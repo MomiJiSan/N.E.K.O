@@ -27,8 +27,18 @@ class VoiceReadinessControl:
                 preview_isolation_registry.release_owned(token, manager)
                 return {**result, "ok": True}
             if event == "preview_begin":
-                return await VoiceReadinessControl._begin(manager, request_id, result, connection_id)
-            return await VoiceReadinessControl._retry(manager, message, result, connection_id)
+                control = VoiceReadinessControl._begin
+                arguments = request_id
+            else:
+                control = VoiceReadinessControl._retry
+                arguments = message
+            if getattr(manager, "_voice_readiness_control_active", False):
+                return {**result, "reason": "preview_busy"}
+            manager._voice_readiness_control_active = True
+            try:
+                return await control(manager, arguments, result, connection_id)
+            finally:
+                manager._voice_readiness_control_active = False
         except VoicePreviewIsolationError as exc:
             return {**result, "reason": exc.code}
         except TimeoutError:
@@ -42,6 +52,7 @@ class VoiceReadinessControl:
         operation = manager._asr_route_operation_generation
         ticket = preview_isolation_registry.begin(
             manager, request_id, noise_reduction_enabled=nr,
+            connection_id=connection_id,
             current=lambda: (manager._voice_lease_connection_id == connection_id
                              and manager.session is session
                              and manager._voice_lease_generation == lease_generation

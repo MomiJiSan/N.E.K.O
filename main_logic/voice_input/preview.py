@@ -31,6 +31,7 @@ class VoicePreviewTicket:
     current: Callable[[], bool] | None = None
     ready: bool = False
     claimed: bool = False
+    connection_id: str | None = None
 
     def as_dict(self) -> dict:
         self.validate_current()
@@ -51,8 +52,8 @@ class VoicePreviewIsolationRegistry:
         self.now = now
         self._managers: weakref.WeakSet = weakref.WeakSet()
         self._ticket: VoicePreviewTicket | None = None
-        # The audio-check finally consumes its ticket before the producer's
-        # matching preview_end arrives. Keep only a bounded cleanup receipt,
+        # HTTP cleanup can release a claimed or cancelled ticket before the
+        # producer's matching preview_end arrives. Keep a bounded cleanup receipt,
         # never the ticket/current callback that would retain its manager.
         self._consumed_releases: dict[str, tuple[weakref.ReferenceType, float]] = {}
 
@@ -108,13 +109,14 @@ class VoicePreviewIsolationRegistry:
 
     def begin(self, manager: object, request_id: str, *,
               noise_reduction_enabled: bool,
-              current: Callable[[], bool]) -> VoicePreviewTicket:
+              current: Callable[[], bool], connection_id: str | None = None) -> VoicePreviewTicket:
         if any(other is not manager and self._active(other)
                for other in tuple(self._managers)):
             raise VoicePreviewIsolationError("preview_owner_active")
         ticket = self._reserve(request_id, noise_reduction_enabled)
         ticket.owner = weakref.ref(manager)
         ticket.current = current
+        ticket.connection_id = connection_id
         return ticket
 
     def mark_ready(self, ticket: VoicePreviewTicket) -> None:
@@ -152,8 +154,7 @@ class VoicePreviewIsolationRegistry:
                    and secrets.compare_digest(ticket.token, ticket_or_token))
         if not matches:
             return False
-        if (isinstance(ticket_or_token, VoicePreviewTicket) and ticket.claimed
-                and ticket.owner is not None and ticket.owner() is not None):
+        if ticket.owner is not None and ticket.owner() is not None:
             self._prune_consumed_releases()
             self._consumed_releases[ticket.token] = (ticket.owner, ticket.deadline)
             while len(self._consumed_releases) > 32:
@@ -161,13 +162,20 @@ class VoicePreviewIsolationRegistry:
         self._ticket = None
         return True
 
+    def release_connection(self, manager: object, connection_id: str) -> bool:
+        ticket = self._live_ticket()
+        if (ticket is None or ticket.owner is None or ticket.owner() is not manager
+                or ticket.connection_id != connection_id):
+            return False
+        return self.release(ticket)
+
     def release_owned(self, token: str, manager: object) -> bool:
         if type(token) is not str or not token.isascii() or len(token) > 128:
             raise VoicePreviewIsolationError("preview_invalid")
         self._prune_consumed_releases()
         receipt = self._consumed_releases.get(token)
         if receipt is not None and receipt[0]() is manager:
-            # Acknowledge only this owner's genuinely consumed ticket. An old
+            # Acknowledge only this owner's genuinely released ticket. An old
             # cleanup must not release a new reservation or restore PCM input.
             return True
         ticket = self._live_ticket()
