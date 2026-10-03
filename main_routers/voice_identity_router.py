@@ -338,7 +338,7 @@ async def get_voice_resource_repair_guide():
     return PlainTextResponse(await asyncio.to_thread(_read_voice_repair_guide))
 
 
-async def _start_resource_operation(request: Request, kind: str):
+async def _start_resource_operation(request: Request, kind: str | None, operation_id: str | None = None):
     rejected = _validate_mutation(request)
     if rejected is not None:
         return rejected
@@ -350,6 +350,8 @@ async def _start_resource_operation(request: Request, kind: str):
     if body not in {b"", b"{}"}:
         return JSONResponse({"error_code": "invalid_resource_operation"}, status_code=400)
     try:
+        if operation_id is not None:
+            return JSONResponse(service.start_reserved_resource_operation(operation_id), status_code=202)
         return JSONResponse(service.start_resource_operation(kind), status_code=202)
     except (VoiceIdentityServiceError, VoiceResourceError) as exc:
         return _resource_error(exc)
@@ -374,6 +376,28 @@ async def get_voice_resource_operation(operation_id: str):
         return service.resource_operation(operation_id)
     except (VoiceIdentityServiceError, VoiceResourceError) as exc:
         return _resource_error(exc)
+
+
+@router.post("/resources/operations")
+async def reserve_voice_resource_operation(request: Request):
+    rejected = _validate_mutation(request)
+    if rejected is not None:
+        return rejected
+    payload = await _read_resource_json(request)
+    if payload is None or set(payload) != {"kind"} or payload["kind"] not in ("prepare", "download"):
+        return JSONResponse({"error_code": "invalid_resource_operation"}, status_code=400)
+    service = _service()
+    if service is None:
+        return _service_unavailable()
+    try:
+        return JSONResponse(service.reserve_resource_operation(payload["kind"]), status_code=201)
+    except (VoiceIdentityServiceError, VoiceResourceError) as exc:
+        return _resource_error(exc)
+
+
+@router.post("/resources/operations/{operation_id}/start")
+async def start_reserved_voice_resource_operation(operation_id: str, request: Request):
+    return await _start_resource_operation(request, None, operation_id)
 
 
 @router.post("/resources/operations/{operation_id}/cancel")

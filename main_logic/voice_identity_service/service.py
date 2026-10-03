@@ -364,6 +364,18 @@ class VoiceIdentityService:
         self._require_initialized()
         return self._resource_manager.operation(operation_id)
 
+    def reserve_resource_operation(self, kind: str) -> dict:
+        self._require_initialized()
+        if self._enrollment is not None:
+            raise VoiceResourceError("enrollment_in_progress")
+        return self._resource_manager.reserve(kind)
+
+    def start_reserved_resource_operation(self, operation_id: str) -> dict:
+        self._require_initialized()
+        if self._enrollment is not None:
+            raise VoiceResourceError("enrollment_in_progress")
+        return self._resource_manager.start_reserved(operation_id)
+
     async def cancel_resource_operation(self, operation_id: str) -> dict:
         self._require_initialized()
         return await self._resource_manager.cancel(operation_id)

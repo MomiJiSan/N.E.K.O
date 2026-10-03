@@ -22,6 +22,119 @@ from main_logic.voice_identity_service.enrollment import EnrollmentAudioError, v
 from main_logic.voice_identity_service import wake_word_bundle as model_bundle
 
 
+@pytest.mark.asyncio
+async def test_reserved_operation_cancel_precedes_start_and_evicted_ids_never_restart(tmp_path, monkeypatch):
+    from main_logic.voice_identity_service import resource_manager as rm
+    manager = rm.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    calls = []
+    async def worker(*args, **kwargs):
+        calls.append(args)
+        return {}
+    monkeypatch.setattr(rm, "_run_worker", worker)
+    reservation = manager.reserve("download")
+    assert manager._current is None and not calls
+    result = await manager.cancel(reservation["operation_id"])
+    assert result["state"] == "cancelled"
+    assert manager.start_reserved(reservation["operation_id"])["state"] == "cancelled"
+    reservations = [manager.reserve("prepare") for _ in range(16)]
+    with pytest.raises(rm.VoiceResourceError, match="invalid_resource_operation"):
+        manager.start_reserved(reservation["operation_id"])
+    with pytest.raises(rm.VoiceResourceError, match="resource_operation_busy"):
+        manager.reserve("prepare")
+    assert len(manager._operations) == 16 and not calls
+    assert manager._current is None
+    for item in reservations:
+        await manager.cancel(item["operation_id"])
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_reservation_cannot_start_and_does_not_hold_capacity(tmp_path):
+    from main_logic.voice_identity_service import resource_manager as rm
+    manager = rm.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    clock = [0.0]; manager._now = lambda: clock[0]
+    reservations = [manager.reserve("prepare") for _ in range(16)]
+    clock[0] = 30.0
+    assert manager.start_reserved(reservations[0]["operation_id"])["state"] == "cancelled"
+    manager.reserve("prepare")
+    assert manager._current is None and len(manager._operations) == 16
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_reserved_start_is_idempotent_and_cancel_retires_accepted_worker(tmp_path, monkeypatch):
+    from main_logic.voice_identity_service import resource_manager as rm
+    entered, retired = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def worker(*args, **kwargs):
+        calls.append(args); entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retired.set()
+    monkeypatch.setattr(rm, "_run_worker", worker)
+    manager = rm.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    owned = manager.reserve("prepare")["operation_id"]
+    other = manager.reserve("prepare")["operation_id"]
+    manager.start_reserved(owned)
+    await asyncio.wait_for(entered.wait(), 2)
+    task = manager._current.task
+    assert manager.start_reserved(owned)["state"] == "running"
+    assert manager._current.task is task and len(calls) == 1
+    with pytest.raises(rm.VoiceResourceError, match="resource_operation_busy"):
+        manager.start_reserved(other)
+    assert (await manager.cancel(owned))["state"] == "cancelled"
+    assert retired.is_set() and task.done()
+    assert manager.start_reserved(owned)["state"] == "cancelled"
+    assert len(calls) == 1
+    await manager.cancel(other); await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_publication_keeps_completed_prepare_result_and_external_snapshot_independent(tmp_path, monkeypatch):
+    from main_logic.voice_identity_service import resource_manager as rm
+    ready = {name: rm._resource("ready", None, True) for name in ("campp", "silero", "noise_reduction", "wake_model", "wake_runtime")}
+    async def worker(kind, *args, **kwargs):
+        return ready if kind == "prepare" else {"installed": True}
+    monkeypatch.setattr(rm, "_run_worker", worker)
+    manager = rm.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    operation = manager.start("prepare")
+    await manager._current.task
+    external = manager.operation(operation["operation_id"])
+    external["result"]["campp"]["state"] = "missing"
+    assert manager.operation(operation["operation_id"])["result"]["campp"]["state"] == "ready"
+    await manager._commit_download(rm._Operation("download", "download"), "fixture-version")
+    assert "wake_model" not in manager._prepared
+    assert manager.operation(operation["operation_id"])["result"]["wake_model"]["state"] == "ready"
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_query_overlapping_publication_cannot_certify_old_readiness(tmp_path, monkeypatch):
+    from main_logic.voice_identity_service import resource_manager as rm
+    paused, resume = threading.Event(), threading.Event()
+    manager = rm.VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    manager._prepared_noise_reduction = False
+    manager._prepared = {name: rm._resource("ready", None, True) for name in ("campp", "silero", "noise_reduction", "wake_model", "wake_runtime")}
+    def assets():
+        paused.set()
+        if not resume.wait(5):
+            raise TimeoutError("query barrier not released")
+    async def publisher(*args, **kwargs):
+        return {"installed": True}
+    monkeypatch.setattr(rm, "resolve_verified_campplus_asset", assets)
+    monkeypatch.setattr(rm, "resolve_verified_assets", lambda *args: None)
+    monkeypatch.setattr(rm, "_run_worker", publisher)
+    query = asyncio.create_task(manager.resources())
+    try:
+        assert await asyncio.to_thread(paused.wait, 5)
+        await manager._commit_download(rm._Operation("publish", "download"), "fixture-version")
+    finally:
+        resume.set()
+    result = await query
+    assert result["can_enroll"] is False and result["resources"]["campp"]["state"] == "unchecked"
+    await manager.close()
+
 def _archive(tmp_path, value=b"first"):
     path = tmp_path / (hashlib.sha256(value).hexdigest() + ".tar.bz2")
     with tarfile.open(path, "w:bz2") as bundle:

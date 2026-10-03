@@ -17,7 +17,7 @@ function element() {
     const handlers = new Map();
     return { value: '', textContent: '', checked: false, children: [], style: {}, disabled: false, hidden: false, classList: { toggle() {} }, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { handlers.set(name, fn); }, appendChild(child) { this.children.push(child); }, append(...children) { this.children.push(...children); }, replaceChildren() { this.children = []; }, emit(name, event = { target: this }) { return handlers.get(name)?.(event); } };
 }
-function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter, translate = (_, fallback) => fallback, status = async () => {} } = {}) {
+function harness({ checkGate, captureGate, accepted = true, resourceReady = true, desktopGate, requestRouter, translate = (_, fallback) => fallback, status = async () => {}, errorFormatter = error => error.message } = {}) {
     const elements = new Map();
     const events = new Map();
     const mediaEvents = new Map();
@@ -30,7 +30,7 @@ function harness({ checkGate, captureGate, accepted = true, resourceReady = true
     if (desktopGate) root.nekoVoiceEnrollment = { prepare: () => desktopGate.promise, release: async () => {} };
     const document = { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, createElement: element };
     const hooks = {
-        translate, render() {}, error: error => error.message,
+        translate, render() {}, error: errorFormatter,
         enrolling: () => false, stream: () => stream,
         async microphone() { stream = trackStream(); controller.receivedStream({ ...stream, label: stream.track.label, deviceId: 'actual-device', fallback: false }); },
         async capture() { if (captureGate) await captureGate.promise; return new ArrayBuffer(288000); },
@@ -204,6 +204,98 @@ function isolationHarness(stopFailure = false) {
     return {controller,receive:request=>receive(request),sent,timers,ack,S,root,document};
 }
 
+test('lost resource start receipt still cancels its reserved ID without adopting another window operation', async () => {
+    let state = 'reserved'; let accepted = false;
+    const h = harness({ requestRouter: async url => {
+        if (url === '/resources') return { resources: {}, operation: { operation_id: 'foreign-operation', state: 'running' } };
+        if (url === '/resources/operations') return { operation_id: 'owned-id', state };
+        if (url === '/resources/operations/owned-id/start') { accepted = true; state = 'running'; throw new Error('lost_receipt'); }
+        if (url === '/resources/operations/owned-id/cancel') { state = 'cancelled'; return { state }; }
+        throw new Error('unexpected: ' + url);
+    } });
+    await h.controller.refreshResources(); await h.elements.get('voice-identity-prepare').emit('click');
+    assert.equal(accepted, true); assert.equal(state, 'cancelled');
+    assert.equal(h.elements.get('voice-identity-resource-cancel').hidden, true);
+    assert.ok(h.calls.some(call => call.url.endsWith('/owned-id/cancel') && call.config.keepalive === true));
+    assert.equal(h.calls.some(call => call.url.includes('foreign-operation')), false);
+});
+
+test('unconfirmed cancellation retains its ID and retry exit without allowing a second resource start', async () => {
+    let cancellations = 0;
+    const h = harness({ requestRouter: async url => {
+        if (url === '/resources') return { resources: {} };
+        if (url === '/resources/operations') return { operation_id: 'owned-id', state: 'reserved' };
+        if (url.endsWith('/start')) throw new Error('lost_receipt');
+        if (url.endsWith('/cancel')) { if (++cancellations === 1) throw new Error('offline'); return { state: 'cancelled' }; }
+        throw new Error('unexpected: ' + url);
+    } });
+    await h.controller.refreshResources(); await h.elements.get('voice-identity-prepare').emit('click');
+    assert.equal(h.elements.get('voice-identity-resource-cancel').hidden, false);
+    assert.equal(h.elements.get('voice-identity-prepare').disabled, true);
+    await h.elements.get('voice-identity-prepare').emit('click');
+    assert.equal(h.calls.filter(call => call.url === '/resources/operations').length, 1);
+    await h.elements.get('voice-identity-resource-cancel').emit('click');
+    assert.equal(cancellations, 2); assert.equal(h.elements.get('voice-identity-resource-cancel').hidden, true);
+    assert.equal(h.elements.get('voice-identity-prepare').disabled, false);
+});
+
+test('pagehide cancels the known operation with keepalive even while start receipt is pending', async () => {
+    const gate = deferred(); let started = false;
+    const h = harness({ requestRouter: async url => {
+        if (url === '/resources') return { resources: {} };
+        if (url === '/resources/operations') return { operation_id: 'owned-id', state: 'reserved' };
+        if (url.endsWith('/start')) { started = true; return gate.promise; }
+        if (url.endsWith('/cancel')) return { state: 'cancelled' };
+        throw new Error('unexpected: ' + url);
+    } });
+    await h.controller.refreshResources(); const pending = h.elements.get('voice-identity-prepare').emit('click');
+    while (!started) await new Promise(resolve => setImmediate(resolve));
+    h.events.get('pagehide')();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(h.calls.some(call => call.url.endsWith('/owned-id/cancel') && call.config.keepalive));
+    gate.resolve({ state: 'cancelled' }); await pending;
+    assert.equal(h.controller.canStart(), false);
+});
+
+test('a retired resource ID exits retry without falsely reporting a successful cancellation', async () => {
+    let cancellations = 0;
+    const h = harness({ requestRouter: async url => {
+        if (url === '/resources') return { resources: {} };
+        if (url === '/resources/operations') return { operation_id: 'retired-id', state: 'reserved' };
+        if (url.endsWith('/start')) throw new Error('lost_receipt');
+        if (url.endsWith('/cancel')) {
+            if (++cancellations === 1) throw new Error('offline');
+            const error = new Error('invalid_resource_operation'); error.status = 400; throw error;
+        }
+        throw new Error('unexpected: ' + url);
+    } });
+    await h.controller.refreshResources(); await h.elements.get('voice-identity-prepare').emit('click');
+    await h.elements.get('voice-identity-resource-cancel').emit('click');
+    assert.equal(h.elements.get('voice-identity-resource-cancel').hidden, true);
+    assert.equal(h.elements.get('voice-identity-prepare').disabled, false);
+    assert.equal(h.elements.get('voice-identity-resource-message').textContent, 'invalid_resource_operation');
+});
+
+test('active-owner preference rejection uses the actual localized error and restores the saved checkbox', async () => {
+    const source = fs.readFileSync(path.join(__dirname, 'js/voice_identity.js'), 'utf8');
+    const errorFunction = source.slice(source.indexOf('    function enrollmentErrorMessage('), source.indexOf('    function enrollmentVerification('));
+    for (const language of ['en','ja','ko','zh-CN','zh-TW','ru','pt','es']) {
+        const locale = JSON.parse(fs.readFileSync(path.join(__dirname, 'locales', language + '.json'), 'utf8'));
+        const format = vm.runInNewContext(errorFunction + '\nenrollmentErrorMessage', { translate: key => key.split('.').reduce((value, part) => value?.[part], locale) });
+        const h = harness({ errorFormatter: format, requestRouter: async url => {
+            if (url === '/resources') return { resources: {}, wake_enabled: false };
+            const error = new Error('preview_owner_active'); error.status = 409; throw error;
+        } });
+        await h.controller.refreshResources();
+        h.elements.get('voice-identity-wake-enable').checked = true;
+        await h.elements.get('voice-identity-wake-enable').emit('change');
+        assert.equal(h.elements.get('voice-identity-resource-message').textContent, locale.voiceIdentity.errorStopMainMicrophone, language);
+        assert.equal(h.elements.get('voice-identity-wake-enable').checked, false);
+        assert.equal(h.stopped(), 0);
+        assert.equal(h.calls.some(call => call.url.includes('/isolation')), false);
+    }
+});
+
 test('an unconfirmed retry timeout fences audio and late control/status until an explicit microphone restart', async () => {
     const h=isolationHarness();h.S.isRecording=true;const actions=[];
     h.root.stopMicCapture=async()=>{actions.push('stop');h.S.isRecording=false;h.controller.reset();};
@@ -248,7 +340,8 @@ for (const state of ['succeeded','failed']) test('resource cancellation displays
     const poll=deferred();let resourceQueries=0;
     const h=harness({requestRouter:async url=>{
         if(url==='/resources'){resourceQueries++;return {can_enroll:resourceQueries>1,resources:{campp:{state:resourceQueries>1?'ready':'missing'}}};}
-        if(url==='/resources/wake-word/download')return {operation_id:'commit-boundary',state:'pending'};
+        if(url==='/resources/operations')return {operation_id:'commit-boundary',state:'reserved'};
+        if(url==='/resources/operations/commit-boundary/start')return {operation_id:'commit-boundary',state:'pending'};
         if(url==='/resources/operations/commit-boundary'){await poll.promise;return {state:'running'};}
         if(url.endsWith('/cancel'))return {operation_id:'commit-boundary',state,committed:true,reason:state==='failed'?'resource_storage_unavailable':null};
         return {};
@@ -270,7 +363,8 @@ for (const completion of ['poll', 'cancel']) test('committed installation with d
         const poll=deferred();let resourceQueries=0,statusQueries=0;
         const h=harness({translate,status:async()=>{statusQueries++;},requestRouter:async url=>{
             if(url==='/resources'){resourceQueries++;return {can_enroll:false,resources:{wake_model:{state:resourceQueries>1?'ready':'missing'},wake_runtime:{state:'ready'}}};}
-            if(url==='/resources/wake-word/download')return {operation_id:terminal.operation_id,state:'pending'};
+            if(url==='/resources/operations')return {operation_id:terminal.operation_id,state:'reserved'};
+            if(url==='/resources/operations/'+terminal.operation_id+'/start')return {operation_id:terminal.operation_id,state:'pending'};
             if(url==='/resources/operations/'+terminal.operation_id){if(completion==='cancel'){await poll.promise;return {state:'running'};}return terminal;}
             if(url.endsWith('/cancel'))return terminal;
             throw new Error('unexpected request: '+url);
@@ -317,14 +411,14 @@ test('a failed actual stop releases only its local isolation fence', async () =>
 test('a confirmed server failure permits an explicit new microphone attempt', async () => {
     const h=isolationHarness(); const pending=h.receive({operationId:'rejected'});
     await new Promise(resolve => setImmediate(resolve)); h.ack(h.sent[0],{ok:false,reason:'preview_unavailable'});
-    await assert.rejects(pending,/preview_unavailable/);
+    const result = await pending; assert.equal(result.stopped,false); assert.equal(result.physicalStopped,true); assert.equal(result.reason,'preview_unavailable');
     assert.equal(h.controller.blocked(),false); assert.equal(h.S.isRecording,false);
 });
 
 test('a lost begin acknowledgement is bounded and its late token is compensated', async () => {
     const h=isolationHarness(); const pending=h.receive({operationId:'late'});
     await new Promise(resolve => setImmediate(resolve)); const timeout=[...h.timers.values()].find(timer=>timer.delay===8000);
-    timeout.fn(); await assert.rejects(pending,/voice_control_timeout/);
+    timeout.fn(); const result = await pending; assert.equal(result.stopped,false); assert.equal(result.physicalStopped,true); assert.equal(result.reason,'voice_control_timeout');
     assert.equal(h.controller.blocked(),true);
     h.ack(h.sent[0]); assert.equal(h.sent[1].event,'preview_end');
     h.ack(h.sent[1]); await Promise.resolve();
@@ -347,7 +441,9 @@ test('resource queries only read snapshots and a cancelled operation targets its
     const gate = deferred();
     const h = harness({ requestRouter: async url => {
         if (url === '/resources') return { can_enroll: false, resources: { campp: { state: 'unchecked' }, wake_runtime: { state: 'missing' } } };
-        if (url === '/resources/prepare') return { operation_id: 'owned-resource', state: 'pending' };
+        if (url === '/resources/operations') return { operation_id: 'owned-resource', state: 'reserved' };
+        if (url === '/resources/operations/owned-resource/start') return { operation_id: 'owned-resource', state: 'pending' };
+        if (url === '/resources/operations/owned-resource/cancel') return { operation_id: 'owned-resource', state: 'cancelled' };
         if (url === '/resources/operations/owned-resource') { await gate.promise; return { operation_id: 'owned-resource', state: 'running' }; }
         return {};
     } });

@@ -31,6 +31,8 @@ def setup(monkeypatch, tmp_path):
     service = SimpleNamespace(
         resources=manager.resources,
         start_resource_operation=MagicMock(return_value={"operation_id": "op-test", "state": "pending"}),
+        reserve_resource_operation=manager.reserve,
+        start_reserved_resource_operation=manager.start_reserved,
         resource_operation=manager.operation,
         cancel_resource_operation=manager.cancel,
         set_wake_word_preference=AsyncMock(return_value={"wake_enabled": True}),
@@ -48,7 +50,7 @@ def setup(monkeypatch, tmp_path):
         yield client, service, registry, manager
 
 
-@pytest.mark.parametrize("path", ["resources/prepare", "resources/wake-word/download", "resources/wake-word/preference", "audio/check", "audio/check/isolation", "audio/check/isolation/release", "resources/operations/id/cancel"])
+@pytest.mark.parametrize("path", ["resources/prepare", "resources/wake-word/download", "resources/wake-word/preference", "audio/check", "audio/check/isolation", "audio/check/isolation/release", "resources/operations/id/cancel", "resources/operations", "resources/operations/id/start"])
 def test_new_mutations_require_csrf_before_service_or_audio_read(setup, path):
     client, service, registry, _ = setup
     client.headers.pop("X-CSRF-Token")
@@ -87,6 +89,74 @@ def test_valid_prepare_returns_operation_not_false_ready(setup):
     assert response.status_code == 202
     assert response.json() == {"operation_id": "op-test", "state": "pending"}
     service.start_resource_operation.assert_called_once_with("prepare")
+
+
+def test_reserve_cancel_and_late_start_use_real_manager_without_starting_worker(setup):
+    client, _, _, manager = setup
+    reserved = client.post(f"{ROOT}/resources/operations", json={"kind": "download"})
+    assert reserved.status_code == 201
+    operation_id = reserved.json()["operation_id"]
+    assert reserved.json()["state"] == "reserved" and manager._current is None
+    cancelled = client.post(f"{ROOT}/resources/operations/{operation_id}/cancel")
+    assert cancelled.status_code == 200 and cancelled.json()["state"] == "cancelled"
+    late = client.post(f"{ROOT}/resources/operations/{operation_id}/start")
+    assert late.status_code == 202 and late.json()["state"] == "cancelled"
+    assert manager._current is None
+    assert client.post(f"{ROOT}/resources/operations/unknown/start").status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_lost_actual_start_receipt_can_cancel_and_retire_the_matching_worker(monkeypatch, tmp_path):
+    import asyncio
+    import httpx
+    from main_logic.voice_identity_service import resource_manager as rm
+    entered, retired = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def worker(*args, **kwargs):
+        calls.append(args); entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retired.set()
+    monkeypatch.setattr(rm, "_run_worker", worker)
+    monkeypatch.setattr(system_router_shared, "AUTOSTART_CSRF_TOKEN", HEADERS["X-CSRF-Token"])
+    manager = VoiceResourceManager(lambda: False, cache_root=tmp_path)
+    service = SimpleNamespace(reserve_resource_operation=manager.reserve, start_reserved_resource_operation=manager.start_reserved,
+                              cancel_resource_operation=manager.cancel, resource_operation=manager.operation)
+    monkeypatch.setattr(voice_identity_router, "get_voice_identity_service_for_router", lambda: service)
+    app = FastAPI(); app.include_router(voice_identity_router.router)
+    actual = httpx.ASGITransport(app=app)
+    class LostStartReceipt(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            response = await actual.handle_async_request(request)
+            if request.url.path.endswith("/start"):
+                await response.aread()
+                if response.json()["state"] == "pending":
+                    await response.aclose()
+                    raise httpx.ReadError("accepted start receipt lost")
+            return response
+    try:
+        async with httpx.AsyncClient(transport=LostStartReceipt(), base_url="http://testserver", headers=HEADERS) as client:
+            operation_id = (await client.post(f"{ROOT}/resources/operations", json={"kind": "prepare"})).json()["operation_id"]
+            with pytest.raises(httpx.ReadError, match="receipt lost"):
+                await client.post(f"{ROOT}/resources/operations/{operation_id}/start")
+            await asyncio.wait_for(entered.wait(), 2)
+            cancelled = await client.post(f"{ROOT}/resources/operations/{operation_id}/cancel")
+            assert cancelled.json()["state"] == "cancelled" and retired.is_set()
+            assert (await client.post(f"{ROOT}/resources/operations/{operation_id}/start")).json()["state"] == "cancelled"
+            assert len(calls) == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.parametrize("payload", [{"kind": "download", "url": "https://attacker.invalid"}, {"kind": "prepare", "path": "../../outside"}, {"kind": []}, {}, {"kind": "install"}])
+def test_reservation_only_accepts_fixed_kind_and_start_rejects_configuration(setup, payload):
+    client, _, _, manager = setup
+    assert client.post(f"{ROOT}/resources/operations", json=payload).status_code == 400
+    assert not manager._operations
+    operation_id = client.post(f"{ROOT}/resources/operations", json={"kind": "prepare"}).json()["operation_id"]
+    assert client.post(f"{ROOT}/resources/operations/{operation_id}/start", json={"path": "outside"}).status_code == 400
+    assert manager._current is None
 
 
 def test_trial_requires_server_isolation_and_releases_consumed_ticket(setup):
