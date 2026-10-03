@@ -1057,6 +1057,12 @@ function createSidePanelMenuItem(manager, prefix, item) {
                 }
                 isOpening = true;
                 dispatchAvatarPopupNavigateEvent(item, finalUrl, windowName, 'sidepanel-navigate');
+                if (finalUrl.startsWith('/voice_identity') && window.nekoVoiceEnrollment) {
+                    window.nekoVoiceEnrollment.open({ operationId: window.nekoMicrophoneInput.operationId() }).catch(() => {
+                        if (typeof window.showStatusToast === 'function') window.showStatusToast(window.t ? window.t('voiceIdentity.inputReason_capture_owner_unavailable') : 'Unable to contact the microphone window.', 5000);
+                    }).finally(() => { isOpening = false; });
+                    return;
+                }
                 if (typeof window.openOrFocusWindow === 'function') {
                     window.openOrFocusWindow(finalUrl, windowName, features);
                 } else {
@@ -3020,6 +3026,12 @@ const AvatarPopupMixin = {
 
                         isOpening = true;
                         dispatchAvatarPopupNavigateEvent(item, finalUrl, windowName, 'settings-navigate');
+                        if (finalUrl.startsWith('/voice_identity') && window.nekoVoiceEnrollment) {
+                            window.nekoVoiceEnrollment.open({ operationId: window.nekoMicrophoneInput.operationId() }).catch(() => {
+                                if (typeof window.showStatusToast === 'function') window.showStatusToast(window.t ? window.t('voiceIdentity.inputReason_capture_owner_unavailable') : 'Unable to contact the microphone window.', 5000);
+                            }).finally(() => { isOpening = false; });
+                            return;
+                        }
                         if (typeof window.openOrFocusWindow === 'function') {
                             window.openOrFocusWindow(finalUrl, windowName, features);
                         } else {
