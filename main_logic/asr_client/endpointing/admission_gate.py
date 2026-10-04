@@ -245,7 +245,11 @@ class AdmissionActivityGate(SileroActivityGate):
                     (evidence.audio_end_sample - evidence.audio_start_sample) / 16,
                 )
             if evidence is not None and evidence.decision is AdmissionDecision.ADMIT:
-                if not self._published and self._admission_config.experimental_short_speech:
+                if not self._published:
+                    # Ordinary admission can accumulate enough speech across
+                    # a low window before raw VAD confirms a continuous onset.
+                    # Every admitted candidate needs activity for endpointing;
+                    # the helper preserves an already-confirmed raw start.
                     raw += self.confirm_admitted_activity(
                         trailing_silence_windows=self._activity_low_windows,
                     )

@@ -465,3 +465,81 @@ async def test_buffered_third_turn_waits_for_already_uploaded_second_turn(
         callbacks.on_failure.assert_not_awaited()
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("optimization", [True, False])
+@pytest.mark.parametrize("smart_turn", [True, False])
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+async def test_ordinary_admission_with_internal_gap_reaches_endpoint_and_final(
+    monkeypatch, optimization, smart_turn, mode,
+):
+    from main_logic.asr_client.endpointing.coordinator import (
+        CoordinatorState, TurnCoordinator,
+    )
+    from main_logic.voice_turn.admission import AdmissionConfig
+    from tests.unit import test_asr_detector_runtime
+    from tests.unit.asr_client.endpointing.test_coordinator import _Predictor
+    from tests.unit.test_asr_voice_turn_adapter import _eventually
+
+    # Only model inference and the provider transport are replaced. Keep the
+    # real coordinator, gate, confirmation timer, queues and final settlement.
+    predictor = _Predictor()
+    coordinator = TurnCoordinator(predictor, SmartTurnConfig(enabled=True))
+    coordinator.on_activity_event = AsyncMock(wraps=coordinator.on_activity_event)
+    monkeypatch.setattr(test_asr_detector_runtime, "_SemanticCoordinator", lambda: coordinator)
+    original_gate = AdmissionActivityGate
+
+    def gate(vad, config):
+        return original_gate(
+            vad, config,
+            admission_config=AdmissionConfig(experimental_short_speech=mode == "enforce"),
+            admission_shadow_config=(
+                AdmissionConfig(experimental_short_speech=True) if mode == "shadow" else None
+            ),
+        )
+
+    monkeypatch.setitem(globals(), "AdmissionActivityGate", gate)
+    runtime, callbacks, session, vad, token = make_runtime(optimization, smart_turn)
+    try:
+        actual_gate = runtime._asr_detector._gate
+        assert actual_gate._admission_config.experimental_short_speech is (mode == "enforce")
+        assert (actual_gate._admission_shadow_config is not None) is (mode == "shadow")
+        first = await send(runtime, vad, token, [.95] * 4 + [.1] + [.95] * 2)
+        callbacks.on_prepare_turn.assert_not_awaited()
+        session.stream_audio.assert_not_awaited()
+        last = await send(runtime, vad, token, [.95])
+        callbacks.on_prepare_turn.assert_awaited_once()
+        if smart_turn:
+            assert coordinator.state is CoordinatorState.SPEECH_ACTIVE
+            assert [call.args[0] for call in coordinator.on_activity_event.await_args_list] == [
+                SpeechActivityEvent.SPEECH_STARTED,
+            ]
+        silence = await send(runtime, vad, token, [.1] * 9)
+        session.signal_user_activity_end.assert_not_awaited()
+        assert predictor.calls == 0
+        silence += await send(runtime, vad, token, [.1])
+        assert b"".join(call.args[0] for call in session.stream_audio.await_args_list) == (
+            first + last + silence
+        )
+        if smart_turn:
+            await _eventually(lambda: session.signal_user_activity_end.await_count == 1, timeout=5)
+            assert predictor.calls >= 1
+            assert [call.args[0] for call in coordinator.on_activity_event.await_args_list] == [
+                SpeechActivityEvent.SPEECH_STARTED, SpeechActivityEvent.CANDIDATE_PAUSE,
+            ]
+        else:
+            await runtime._handle_independent_asr_endpoint(runtime._asr_session_epoch)
+        await runtime._handle_independent_asr_final("sentence", runtime._asr_session_epoch, "qwen")
+        await runtime.wait_transcript_idle()
+        callbacks.on_final.assert_awaited_once()
+        evidence = callbacks.on_final.await_args.args[0].evidence
+        assert evidence.admission_path == "ordinary"
+        assert evidence.voiced_audio_ms == 224
+        await send(runtime, vad, token, [.95])
+        callbacks.on_prepare_turn.assert_awaited_once()
+        callbacks.on_failure.assert_not_awaited()
+    finally:
+        await runtime.close()
+        if not smart_turn:
+            await coordinator.close()

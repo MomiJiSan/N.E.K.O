@@ -66,15 +66,19 @@ def test_continuation_after_short_admission_does_not_duplicate_start():
     assert gate.evidence.decision is AdmissionDecision.PENDING
 
 
-def test_low_internal_window_admitted_ordinary_activity_can_still_pause():
-    _, gate = make_gate()
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_low_internal_window_admitted_ordinary_activity_can_still_pause(mode):
+    _, gate = make_gate(enabled=mode == "enforce", shadow=mode == "shadow")
     # The low internal window resets the original raw minimum duration. The
     # accepted ordinary candidate must still establish activity for SmartTurn.
     assert gate.process_probabilities([.95] * 4 + [.1] + [.95] * 3) == (
         Event.SPEECH_STARTED,
     )
     assert gate.evidence.admission_path == "ordinary"
+    assert gate.process_probabilities([.95] * 3) == ()
     assert gate.process_probabilities([.1] * 10) == (Event.CANDIDATE_PAUSE,)
+    assert gate.process_probabilities([.95]) == (Event.SPEECH_RESUMED,)
+    assert gate.admission_events == ()
 
 
 def test_single_pulse_and_legacy_short_word_never_gain_activity():
