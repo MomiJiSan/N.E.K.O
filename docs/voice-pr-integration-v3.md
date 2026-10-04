@@ -23,7 +23,7 @@
 | 声纹验证结果及激活状态衔接 | `voice_identity_runtime.py`、voice identity service、页面脚本／模板／样式 | 显示验证结果卡片及匹配分数；启动中的 blocked 路由可重试，未完成 DSP／激活转换保持重试资格。主线预检与录入生命周期继续使用 |
 | 采集约束、诊断和恢复提示 | `microphone-input.js`、音频捕获／WebSocket 消费、`audio_processor.py`、激活诊断及八语言文案 | 48k 正式录音和声纹预检／录入关闭浏览器 AGC，使用后端 AGC；16k 正式采集绕过后端 DSP，保留浏览器 AGC。设置试麦遵循正式采集策略，采样率在开麦前固定，设备回退沿用。后端 AGC 按块时长换算。恢复状态绑定归属，READY 不开麦；诊断不记录原始音频或转写 |
 
-上述实现共同约束“采集 → 准入 → ASR → final → Core → 页面反馈”。身份、已接受结果和恢复通知需要在同一整合树验证。当前差异为 105 个文件；排除新增文件、语言包及测试文件后，改动 31 个既有文件，仍是大 PR。请重点 review 跨层身份、取消／退休顺序及未启用路径。
+上述实现共同约束“采集 → 准入 → ASR → final → Core → 页面反馈”。身份、已接受结果和恢复通知需要在同一整合树验证。当前差异为 106 个文件；排除新增文件、语言包及测试文件后，改动 31 个既有文件，仍是大 PR。请重点 review 跨层身份、取消／退休顺序及未启用路径。
 
 详细契约分别见 [候选准入](voice-admission-integration.md)、[短语音实验](short-voice-admission.md)、[采样交接](design/asr-sample-handoff.md)、[故障恢复](design/independent-asr-fault-recovery.md) 和 [输入诊断](voice-input-diagnostics.md)。`benchmarks/` 与 `records/` 中的日期文档是当时基线的实测记录，不代表当前整合验收。
 
@@ -32,6 +32,8 @@
 以 `6366f2279` 为修复基线，对照 main 确认两处前端回归：声纹 runtime off 时仍会启动恢复轮询；16k 正式采集关闭浏览器 AGC 后没有后端增益补偿。本轮在轮询入口和等待后检查运行状态，并让正式采集／设置试麦按固定的目标采样率选择 AGC。设备回退、Worklet 重采样与 NEKO 报头使用同一快照；声纹预检／录入仍使用原 48k 契约。
 
 本轮 Node 回归 357 passed，Python 设置契约及音频处理生命周期回归 50 passed。新增 8 个用例覆盖关闭模式、等待中关闭／关窗、正常恢复，以及采集参数／报头和设备回退。两处生产 JavaScript 的新增行 V8 覆盖为 22／22，不代表整个采集模块覆盖率。移除轮询入口检查、等待后检查或采样率快照的三种变异均被测试检出。以下较大回归报告属于此前后端运行时基线，本轮没有修改 Python 运行时代码，也没有重新执行全量套件。
+
+`44344a237` 的 CI 串行分片暴露了遗漏同步的静态生命周期测试：它仍以旧的四参数签名提取 Worklet 函数体，并要求旧的调用形状。本次同步五参数签名及采样率快照传递，保留取消、选择归属及提交顺序断言；该文件 7 passed，完整串行分片 158 passed。移除入口／提交取消门控或漏传采样率快照的三种变异均被测试检出；Ruff 通过，生产运行时代码未再修改。
 
 此前验证版本 `22a8e7832` 的语音及主线相关回归为 4561 passed／6 skipped，串行回归 158 passed，Node 回归 190 passed。ASR runtime、transcript dispatcher、detector runtime、Qwen worker、声纹 service、voice-input registry 和唤醒转写七个模块合计语句覆盖率 81.12%；Ruff、Core 契约、模块分层、异步阻塞和八语言同步检查通过。本轮重跑上述静态守卫及修改的 Python 测试文件 Ruff，通过。
 
