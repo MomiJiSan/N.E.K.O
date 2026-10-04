@@ -121,6 +121,8 @@ function loadCapture(active, enabled = active) {
     const messages = [];
     const controls = [];
     const frames = [];
+    const mediaConstraintCalls = [];
+    const workletSampleRates = [];
     const send = data => typeof data === 'string' ? controls.push(JSON.parse(data)) : frames.push(data);
     let timerId = 0;
     let S = {
@@ -163,11 +165,12 @@ function loadCapture(active, enabled = active) {
     vm.runInNewContext(stateSource, context);
     Object.assign(window.appState, S);
     S = window.appState;
-    vm.runInNewContext(source, context);
+    vm.runInNewContext(source, context, { filename: path.resolve(__dirname, '../../static/app/app-audio-capture.js') });
     timers.clear(); // Module startup UI timers are outside this test's scope.
     return {
-        window, S, messages, controls, frames, timers,
-        installMicrophone() {
+        window, S, messages, controls, frames, timers, mediaConstraintCalls, workletSampleRates,
+        installMicrophone({ mobile = false, beforeMediaRequest } = {}) {
+            window.appUtils.isMobile = () => mobile;
             const node = extra => Object.assign({ connect() {}, disconnect() {} }, extra);
             class FakeAudioContext {
                 constructor() {
@@ -176,7 +179,7 @@ function loadCapture(active, enabled = active) {
                 }
                 createMediaStreamSource() { return node(); }
                 createGain() { return node({ gain: { value: 1 } }); }
-                createAnalyser() { return node(); }
+                createAnalyser() { return node({ getFloatTimeDomainData(data) { data.fill(0); } }); }
                 async close() { this.state = 'closed'; }
                 async resume() { this.state = 'running'; }
             }
@@ -188,13 +191,20 @@ function loadCapture(active, enabled = active) {
             context.AudioContext = window.AudioContext = FakeAudioContext;
             context.MediaStream = FakeMediaStream;
             context.AudioWorkletNode = class {
-                constructor() { this.port = { onmessage: null, postMessage() {} }; }
+                constructor(_, __, options) {
+                    workletSampleRates.push(options.processorOptions.targetSampleRate);
+                    this.port = { onmessage: null, postMessage() {} };
+                }
                 connect() {}
                 disconnect() {}
             };
             context.fetch = async () => ({ ok: true, json: async () => ({}) });
             context.navigator.mediaDevices = {
-                getUserMedia: async () => new FakeMediaStream(),
+                getUserMedia: async constraints => {
+                    mediaConstraintCalls.push(constraints);
+                    if (beforeMediaRequest) await beforeMediaRequest(constraints, mediaConstraintCalls.length);
+                    return new FakeMediaStream();
+                },
                 enumerateDevices: async () => [],
             };
         },
@@ -212,6 +222,58 @@ function loadCapture(active, enabled = active) {
         },
     };
 }
+
+for (const mobile of [false, true]) {
+    test(`formal capture uses one gain policy and wire rate (mobile=${mobile})`, async () => {
+        const env = loadCapture(false);
+        env.S.isRecording = false;
+        env.window.appUtils.dbToLinear = () => 1;
+        env.installMicrophone({ mobile });
+        env.window.setMicMuted(false);
+        assert.equal(await env.window.startMicCapture(), true);
+        assert.equal(env.mediaConstraintCalls[0].audio.autoGainControl, mobile);
+        assert.deepEqual(env.workletSampleRates, [mobile ? 16000 : 48000]);
+        env.sendFrame();
+        assert.equal(new DataView(env.frames.at(-1)).getUint32(4, true), mobile ? 16000 : 48000);
+    });
+}
+
+test('formal device fallback keeps the gain and sample rate chosen before permission await', async () => {
+    const env = loadCapture(false);
+    env.S.isRecording = false;
+    env.S.selectedMicrophoneId = 'missing-device';
+    env.window.appUtils.dbToLinear = () => 1;
+    env.installMicrophone({ mobile: true, beforeMediaRequest(_, attempt) {
+        env.window.appUtils.isMobile = () => false;
+        if (attempt === 1) throw Object.assign(new Error('missing device'), { name: 'OverconstrainedError' });
+    } });
+    env.window.setMicMuted(false);
+    assert.equal(await env.window.startMicCapture(), true);
+    assert.equal(env.mediaConstraintCalls.length, 2);
+    assert.equal(env.mediaConstraintCalls[0].audio.deviceId.exact, 'missing-device');
+    assert.equal(env.mediaConstraintCalls[1].audio.deviceId, undefined);
+    assert.ok(env.mediaConstraintCalls.every(call => call.audio.autoGainControl === true));
+    assert.deepEqual(env.workletSampleRates, [16000]);
+    env.sendFrame();
+    assert.equal(new DataView(env.frames.at(-1)).getUint32(4, true), 16000);
+});
+
+test('settings device fallback preserves the formal mobile gain policy across permission await', async () => {
+    const env = loadCapture(false);
+    env.S.isRecording = false;
+    env.S.selectedMicrophoneId = 'missing-device';
+    env.installMicrophone({ mobile: true, beforeMediaRequest(_, attempt) {
+        env.window.appUtils.isMobile = () => false;
+        if (attempt === 1) throw Object.assign(new Error('missing device'), { name: 'NotFoundError' });
+    } });
+    const result = await env.window.appAudioCapture.startSettingsMicVolumeTest();
+    assert.equal(result.ok, true);
+    assert.equal(result.fellBack, true);
+    assert.equal(env.mediaConstraintCalls.length, 2);
+    assert.ok(env.mediaConstraintCalls.every(call => call.audio.autoGainControl === true));
+    assert.equal(env.workletSampleRates.length, 0);
+    env.window.appAudioCapture.stopSettingsMicVolumeTest();
+});
 
 test('capture owner rejection unwinds without an AudioWorklet failure notice', async () => {
     const env = loadCapture(false);

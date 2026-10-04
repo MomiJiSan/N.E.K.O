@@ -354,7 +354,8 @@
     }
 
     function routeRecoveryNeeded() {
-        return state.profileAvailable
+        return !state.runtimeDisabled
+            && state.profileAvailable
             && !state.effectiveEnabled
             && ['runtime_degraded', 'unsupported_asr_route'].includes(
                 state.effectiveReason,
@@ -370,7 +371,7 @@
                 await new Promise(function (resolve) {
                     window.setTimeout(resolve, ROUTE_RECOVERY_POLL_INTERVAL_MS);
                 });
-                if (epoch !== state.statusEpoch || state.closeStarted) return;
+                if (epoch !== state.statusEpoch || state.closeStarted || !routeRecoveryNeeded()) return;
                 const status = await reconcileStatus({
                     timeoutMs: FINAL_STATUS_TIMEOUT_MS,
                 });

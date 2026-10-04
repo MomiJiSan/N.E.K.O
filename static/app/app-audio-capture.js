@@ -205,14 +205,14 @@
     }
 
     // 正式录音和设置页试麦共用：试麦要预判正式录音实际能听到什么，两边必须同一套处理。
-    function micCaptureAudioConstraints() {
-        if (window.nekoMicrophoneInput) return { ...window.nekoMicrophoneInput.constraints };
-        return {
+    function micCaptureAudioConstraints(targetSampleRate = window.appUtils.isMobile() ? 16000 : 48000) {
+        const base = window.nekoMicrophoneInput ? window.nekoMicrophoneInput.constraints : {
             noiseSuppression: false,
             echoCancellation: true,
-            autoGainControl: false,
             channelCount: 1
         };
+        // 16k input bypasses backend DSP; 48k input uses backend AGC.
+        return { ...base, autoGainControl: targetSampleRate === 16000 };
     }
 
     function currentVoiceInputControlState() {
@@ -1594,7 +1594,8 @@
         mediaStream,
         startToken,
         selectedMicrophoneIdAtStart,
-        microphoneSelectionGenerationAtStart
+        microphoneSelectionGenerationAtStart,
+        captureTargetSampleRate = window.appUtils.isMobile() ? 16000 : 48000
     ) {
         // Entry gate, before ANY shared state is touched. An attempt can be
         // superseded while it is still in startMicCapture's getUserMedia (a
@@ -1807,9 +1808,8 @@
             await ownContext.audioWorklet.addModule('/static/audio-processor.js');
 
             // 根据连接类型确定目标采样率
-            const isMobile = window.appUtils.isMobile;
-            const targetSampleRate = isMobile() ? 16000 : 48000;
-            console.log(`音频采样率配置: 原始=${ownContext.sampleRate}Hz, 目标=${targetSampleRate}Hz, 移动端=${isMobile()}`);
+            const targetSampleRate = captureTargetSampleRate;
+            console.log(`音频采样率配置: 原始=${ownContext.sampleRate}Hz, 目标=${targetSampleRate}Hz`);
 
             // 创建AudioWorkletNode
             ownWorkletNode = new AudioWorkletNode(ownContext, 'audio-processor', {
@@ -2234,6 +2234,9 @@
         // getUserMedia() half of the window as well.
         micStartGeneration += 1;
         const micStartToken = micStartGeneration;
+        // Bind capture constraints, Worklet output and the wire header before
+        // permission/player awaits or selected-device fallback can interleave.
+        const captureTargetSampleRate = window.appUtils.isMobile() ? 16000 : 48000;
         pendingMicStartUiOwnerToken = micStartToken;
         // 正式录音一开始占设备就让位，不等到提交：独占式采集的驱动上，
         // probe 还开着会让正式录音的 getUserMedia 以 NotReadableError 失败。
@@ -2295,7 +2298,7 @@
             }
 
             // 获取麦克风流，使用选择的麦克风设备ID
-            const baseAudioConstraints = micCaptureAudioConstraints();
+            const baseAudioConstraints = micCaptureAudioConstraints(captureTargetSampleRate);
 
             // Attempt-local, for the same reason the audio graph is: publishing
             // the stream here put it OUTSIDE the single publish point in
@@ -2362,7 +2365,8 @@
                 ownStream,
                 micStartToken,
                 selectedMicrophoneIdAtStart,
-                microphoneSelectionGenerationAtStart
+                microphoneSelectionGenerationAtStart,
+                captureTargetSampleRate
             );
             if (!micStartCommitted) {
                 // Superseded or fail-closed while opening: the hardware is
@@ -2926,14 +2930,15 @@
         }
     }
 
-    function settingsMicTestConstraints(deviceId) {
-        const audio = micCaptureAudioConstraints();
+    function settingsMicTestConstraints(deviceId, targetSampleRate) {
+        const audio = micCaptureAudioConstraints(targetSampleRate);
         if (deviceId) audio.deviceId = { exact: deviceId };
         return { audio };
     }
 
     async function startSettingsMicVolumeTest() {
         const generation = ++settingsMicVolumeGeneration;
+        const captureTargetSampleRate = window.appUtils.isMobile() ? 16000 : 48000;
         const isCurrent = function () { return generation === settingsMicVolumeGeneration; };
         releaseSettingsMicVolumeProbe();
         if (isLiveMicCaptureActiveOrPending()) {
@@ -2951,14 +2956,14 @@
             const selectedMicrophoneId = S.selectedMicrophoneId;
             fellBack = false;
             try {
-                stream = await requestUsableMicrophoneStream(settingsMicTestConstraints(selectedMicrophoneId));
+                stream = await requestUsableMicrophoneStream(settingsMicTestConstraints(selectedMicrophoneId, captureTargetSampleRate));
             } catch (error) {
                 if (!isCurrent()) return { ok: false };
                 if (selectionGeneration !== microphoneSelectionGeneration) continue;
                 if (!selectedMicrophoneId || !isSelectedMicrophoneFallbackEligibleError(error)) throw error;
                 // 回退也可能失败：和首次请求同样先看是否过期、选择是否已变，变了就按新设备重试。
                 try {
-                    stream = await requestUsableMicrophoneStream(settingsMicTestConstraints(null));
+                    stream = await requestUsableMicrophoneStream(settingsMicTestConstraints(null, captureTargetSampleRate));
                 } catch (fallbackError) {
                     if (!isCurrent()) return { ok: false };
                     if (selectionGeneration !== microphoneSelectionGeneration) continue;

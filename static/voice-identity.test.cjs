@@ -149,6 +149,7 @@ function createHarness({
     webCryptoAvailable = true,
     initialEffectiveReason = null,
     routeRecoveryReadyAfter = null,
+    manualRouteRecovery = false,
     audioContextSampleRate = 48000,
     resumeGate,
     initialStatusError = false,
@@ -215,6 +216,7 @@ function createHarness({
     const mediaConstraintCalls = [];
     let timerId = 0;
     const statusTimeouts = new Map();
+    const routeRecoveryTimers = new Map();
     let intervalCallback = null;
     let enrollmentLeaseTimeoutCallback = null;
     let promptPaintFrames = 0;
@@ -225,6 +227,7 @@ function createHarness({
     const statusPayload = () => ({
         requested_enabled: serverRequested,
         effective_enabled: serverProfile && serverRequested
+            && runtimeMode !== 'off'
             && (routeRecoveryReadyAfter === null
                 || statusRequestCount >= routeRecoveryReadyAfter),
         effective_reason: (routeRecoveryReadyAfter !== null
@@ -555,7 +558,8 @@ function createHarness({
             } else if (delay === 400) {
                 // Successful flush acknowledgement clears this watchdog.
             } else if (delay === 600) {
-                Promise.resolve().then(callback);
+                if (manualRouteRecovery) routeRecoveryTimers.set(timerId, callback);
+                else Promise.resolve().then(callback);
             } else if (delay === 1000 || delay === 5000) {
                 // Both status and prompt-paint watchdogs are driven explicitly.
                 statusTimeouts.set(timerId, callback);
@@ -570,7 +574,7 @@ function createHarness({
             }
             return timerId;
         },
-        clearTimeout(id) { statusTimeouts.delete(id); },
+        clearTimeout(id) { statusTimeouts.delete(id); routeRecoveryTimers.delete(id); },
         requestAnimationFrame(callback) {
             promptPaintFrames += 1;
             if (promptPaintGate && promptPaintFrames === 2) {
@@ -641,8 +645,9 @@ function createHarness({
     window.AudioWorkletNode = MockAudioWorkletNode;
     window.performance = context.performance;
     if (readinessController) window.createVoiceIdentityReadiness = () => readinessController;
+    if (manualRouteRecovery) context.Date = { now: () => fakeNow };
 
-    vm.runInNewContext(source, context, { filename: 'voice_identity.js' });
+    vm.runInNewContext(source, context, { filename: path.join(__dirname, 'js/voice_identity.js') });
 
     return {
         elements,
@@ -666,6 +671,14 @@ function createHarness({
             callbacks.forEach(callback => callback());
         },
         mediaConstraintCalls,
+        setRuntimeMode(mode) { runtimeMode = mode; },
+        pendingRouteRecoveryTimers: () => routeRecoveryTimers.size,
+        fireRouteRecoveryTimer() {
+            const [id, callback] = routeRecoveryTimers.entries().next().value;
+            routeRecoveryTimers.delete(id);
+            fakeNow += 600;
+            callback();
+        },
         emitAudio(samples) {
             const chunk = samples instanceof Int16Array
                 ? samples
@@ -2304,6 +2317,61 @@ test('route recovery polling clears a transient unsupported status', async () =>
 
     assert.ok(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length >= 2);
     assert.equal(harness.elements.get('voice-identity-status-dot').className, 'status-dot ready');
+});
+
+test('runtime off with a saved requested profile never starts route recovery polling', async () => {
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        runtimeMode: 'off', initialEffectiveReason: 'runtime_degraded',
+        routeRecoveryReadyAfter: 1000000, manualRouteRecovery: true });
+    await harness.initialize();
+    await flush();
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 1);
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+    assert.equal(harness.mediaRequests, 0);
+});
+
+test('switching runtime off while polling sleeps prevents the next status request', async () => {
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 1000000,
+        manualRouteRecovery: true });
+    await harness.initialize();
+    assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+    harness.setRuntimeMode('off');
+    harness.dispatch('focus');
+    await flush();
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 2);
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 2);
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+    assert.equal(harness.mediaRequests, 0);
+});
+
+test('enabled route polling reaches ready without opening the microphone', async () => {
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 3,
+        manualRouteRecovery: true });
+    await harness.initialize();
+    for (let tick = 0; tick < 2; tick++) {
+        harness.fireRouteRecoveryTimer();
+        await flush();
+    }
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 3);
+    assert.equal(harness.elements.get('voice-identity-status-dot').className, 'status-dot ready');
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+    assert.equal(harness.mediaRequests, 0);
+});
+
+test('closing the window while polling sleeps retires the next status request', async () => {
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 1000000,
+        manualRouteRecovery: true });
+    await harness.initialize();
+    await harness.beforeClose();
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 1);
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
 });
 
 test('the one-click page keeps complete dark-theme overrides', () => {
