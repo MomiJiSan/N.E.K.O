@@ -2136,7 +2136,7 @@ class IndependentAsrRuntime:
                     epoch,
                     candidate_provider,
                     failure_reason=_provider_failure_reason(message),
-                    status_code=getattr(candidate_session, "last_failure_code", None)
+                    status_code=candidate_session.last_failure_code
                     or message.partition(":")[0],
                     failure_source=FailureSource.PROVIDER,
                 )
@@ -2200,7 +2200,7 @@ class IndependentAsrRuntime:
                     asr_session = None
                     raise
                 except Exception:
-                    failure_code = getattr(asr_session, "last_failure_code", None)
+                    failure_code = asr_session.last_failure_code
                     try:
                         await asr_session.close()
                     except Exception:
@@ -4069,7 +4069,7 @@ class IndependentAsrRuntime:
                             failure_reason=last_failure_reason,
                         )
                         return
-                    failure_code = getattr(candidate, "last_failure_code", None)
+                    failure_code = candidate.last_failure_code if candidate is not None else None
                     if candidate is not None:
                         try:
                             cleaned = await self._close_connect_candidate(candidate)
@@ -6080,7 +6080,11 @@ class IndependentAsrRuntime:
         source: FailureSource,
     ) -> bool:
         boundary = time.monotonic()
-        failure_started = getattr(self._asr_session, "failure_started_at", None)
+        failure_started = (
+            self._asr_session.failure_started_at
+            if source is FailureSource.PROVIDER and self._asr_session is not None
+            else None
+        )
         if source is FailureSource.PROVIDER and isinstance(failure_started, (float, int)):
             boundary = min(boundary, failure_started)
         deadline = boundary + self._asr_recovery_budget.total_seconds

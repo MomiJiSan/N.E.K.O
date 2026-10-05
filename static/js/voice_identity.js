@@ -363,10 +363,10 @@
     }
 
     function startRouteRecoveryPolling() {
-        if (!routeRecoveryNeeded() || state.routeRecoveryTask) return;
+        if (!routeRecoveryNeeded() || state.closeStarted || state.cancelPending || state.routeRecoveryTask) return;
         const epoch = state.statusEpoch;
         const deadline = Date.now() + ROUTE_RECOVERY_TIMEOUT_MS;
-        state.routeRecoveryTask = (async function () {
+        const pollTask = (async function () {
             while (Date.now() < deadline) {
                 await new Promise(function (resolve) {
                     window.setTimeout(resolve, ROUTE_RECOVERY_POLL_INTERVAL_MS);
@@ -378,9 +378,14 @@
                 if (status && (state.effectiveEnabled || !routeRecoveryNeeded())) return;
             }
         }()).finally(function () {
+            if (state.routeRecoveryTask !== pollTask) return;
             state.routeRecoveryTask = null;
             render();
+            // A newer status could not claim the occupied slot. Hand it the
+            // task only after retirement; the same epoch keeps its deadline.
+            if (epoch !== state.statusEpoch) startRouteRecoveryPolling();
         });
+        state.routeRecoveryTask = pollTask;
     }
 
     async function reconcileStatus(options) {

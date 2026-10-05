@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
+from ._registry_meta import resolve_provider_failure_rule
+
 
 class FailureSource(str, Enum):
     RUNTIME = "runtime"
@@ -32,10 +34,12 @@ def classify_failure(code: str, *, source: FailureSource) -> RecoveryDisposition
     if (source, code) in {
         (FailureSource.RUNTIME, "ASR_PROVIDER_FINAL_TIMEOUT"),
         (FailureSource.PROVIDER, "ASR_PROVIDER_FINAL_TIMEOUT"),
-        (FailureSource.PROVIDER, "ASR_QWEN_READ_DISCONNECTED"),
     }:
         return RecoveryDisposition.RECOVER
-    if (source, code) == (FailureSource.CONNECT, "ASR_QWEN_CONNECTION_FAILED"):
+    rule = resolve_provider_failure_rule(code)
+    if source is FailureSource.PROVIDER and rule.recover_on_provider_failure:
+        return RecoveryDisposition.RECOVER
+    if source is FailureSource.CONNECT and rule.retry_connect:
         return RecoveryDisposition.RETRY_CONNECT
     return RecoveryDisposition.STOP
 
@@ -62,18 +66,14 @@ def decide_failure(
     """
     disposition = classify_failure(cause_code, source=source)
     notification_code = cause_code
-    if delivery_risk is not None and cause_code in {
-        "ASR_INDEPENDENT_FAILED",
-        "ASR_INDEPENDENT_STREAM_FAILED",
-        "ASR_STREAM_BACKPRESSURE",
-        "ASR_QWEN_CONNECTION_CLOSED",
-        "ASR_QWEN_WORKER_FAILED",
-        "ASR_STEP_CONNECTION_CLOSED",
-        "ASR_STEP_WORKER_FAILED",
-        "ASR_OPENAI_WORKER_FAILED",
-        "ASR_SONIOX_PROTECTED_REPLAY_DISABLED",
-        "ASR_SONIOX_REPLAY_INCOMPLETE",
-    }:
+    if delivery_risk is not None and (
+        cause_code in {
+            "ASR_INDEPENDENT_FAILED",
+            "ASR_INDEPENDENT_STREAM_FAILED",
+            "ASR_STREAM_BACKPRESSURE",
+        }
+        or resolve_provider_failure_rule(cause_code).use_delivery_notice
+    ):
         notification_code = delivery_risk
     return FailureDecision(
         cause_code, source, delivery_risk, disposition, notification_code,

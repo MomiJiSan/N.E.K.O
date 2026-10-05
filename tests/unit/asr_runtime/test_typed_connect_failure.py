@@ -65,3 +65,24 @@ async def test_explicit_connect_code_controls_retry_before_any_input(monkeypatch
         assert owner._asr_session is None
     finally:
         await owner._asr_runtime.close()
+
+
+async def test_factory_failure_before_a_candidate_exists_keeps_owned_cleanup():
+    owner = _Runtime()
+    prior = SimpleNamespace(is_ready=False, close=AsyncMock())
+    owner._asr_session = prior
+    _install_ready_lifecycle(owner, "qwen")
+    owner._asr_transport_selection = _selection("qwen", "provider")
+    factory = MagicMock(side_effect=RuntimeError("opaque construction failure"))
+    owner._asr_session_factory = factory
+    on_failure = AsyncMock()
+    owner._asr_runtime._callbacks = replace(owner._asr_runtime._callbacks, on_failure=on_failure)
+    try:
+        await owner._restart_transport(max_attempts=1)
+        factory.assert_called_once()
+        prior.close.assert_awaited_once()
+        assert owner._asr_session is None
+        on_failure.assert_awaited_once()
+        assert on_failure.await_args.args[0].code == "ASR_INDEPENDENT_FAILED"
+    finally:
+        await owner._asr_runtime.close()

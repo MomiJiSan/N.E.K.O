@@ -140,6 +140,15 @@ class RealtimeAsrSession(Protocol):
     """Stable session surface used by audio-producing callers."""
 
     @property
+    def last_failure_code(self) -> str | None: ...
+
+    @property
+    def failure_started_at(self) -> float | None: ...
+
+    @property
+    def supports_result_preserving_finish(self) -> bool: ...
+
+    @property
     def is_ready(self) -> bool: ...
 
     async def connect(
@@ -164,6 +173,10 @@ class RealtimeAsrSession(Protocol):
     def signal_local_activity_nowait(self, *, speech_active: bool) -> None: ...
 
     async def clear_audio_buffer(self) -> None: ...
+
+    async def finish_and_drain(self, *, deadline: float) -> None:
+        """Finish within an absolute loop-time deadline, or report unsupported."""
+        ...
 
     async def close(self) -> None: ...
 

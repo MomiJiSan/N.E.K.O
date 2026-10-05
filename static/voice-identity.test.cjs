@@ -140,6 +140,7 @@ function createHarness({
     statusFailures = 0,
     focusStatusGate,
     statusGates = {},
+    filterGate,
     segmentGate,
     inconsistentReference = false,
     remainingSeconds = 45,
@@ -364,6 +365,7 @@ function createHarness({
             return jsonResponse(statusPayload());
         }
         if (call.url === `${API_ROOT}/filter`) {
+            if (filterGate) await filterGate.promise;
             serverRequested = JSON.parse(call.options.body).enabled;
             return jsonResponse(statusPayload());
         }
@@ -2371,6 +2373,126 @@ test('closing the window while polling sleeps retires the next status request', 
     harness.fireRouteRecoveryTimer();
     await flush();
     assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 1);
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+});
+
+for (const reason of ['runtime_degraded', 'unsupported_asr_route']) {
+    test('new status epochs take over a sleeping route poll: ' + reason, async () => {
+        const harness = createHarness({ initialProfile: true, initialRequested: true,
+            initialEffectiveReason: reason, routeRecoveryReadyAfter: 3,
+            manualRouteRecovery: true });
+        await harness.initialize();
+        const filter = harness.elements.get('voice-identity-filter');
+        for (let changes = 0; changes < 3; changes += 1) {
+            filter.checked = false;
+            await harness.emit('voice-identity-filter', 'change');
+            filter.checked = true;
+            await harness.emit('voice-identity-filter', 'change');
+        }
+        assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+        harness.fireRouteRecoveryTimer();
+        await flush();
+        assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+        for (let tick = 0; tick < 2; tick += 1) {
+            harness.fireRouteRecoveryTimer();
+            await flush();
+        }
+        assert.equal(harness.elements.get('voice-identity-status-dot').className, 'status-dot ready');
+        assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+        assert.equal(harness.mediaRequests, 0);
+    });
+}
+
+test('a stale in-flight route read hands off without applying its old status', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 3,
+        manualRouteRecovery: true, statusGates: { 2: gate } });
+    await harness.initialize();
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    const filter = harness.elements.get('voice-identity-filter');
+    filter.checked = false;
+    await harness.emit('voice-identity-filter', 'change');
+    filter.checked = true;
+    await harness.emit('voice-identity-filter', 'change');
+    gate.resolve(jsonResponse({ has_profile: true, requested_enabled: false,
+        effective_enabled: false, effective_reason: 'disabled', runtime_mode: 'off' }));
+    await flush();
+    assert.equal(filter.checked, true);
+    assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, 2);
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(harness.elements.get('voice-identity-status-dot').className, 'status-dot ready');
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+});
+
+test('a pending filter write settles before route recovery can reach ready', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 3,
+        manualRouteRecovery: true, filterGate: gate });
+    await harness.initialize();
+    const filter = harness.elements.get('voice-identity-filter');
+    filter.checked = false;
+    const write = harness.emit('voice-identity-filter', 'change');
+    await flush();
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(filter.disabled, true);
+    assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+    gate.resolve();
+    await write;
+    filter.checked = true;
+    await harness.emit('voice-identity-filter', 'change');
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(harness.pendingRouteRecoveryTimers(), 1);
+    for (let tick = 0; tick < 2; tick += 1) {
+        harness.fireRouteRecoveryTimer();
+        await flush();
+    }
+    assert.equal(harness.elements.get('voice-identity-status-dot').className, 'status-dot ready');
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+});
+
+test('route polling does not renew the deadline for the same status epoch', async () => {
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 1000000,
+        manualRouteRecovery: true });
+    await harness.initialize();
+    for (let tick = 0; tick < 14; tick += 1) {
+        harness.fireRouteRecoveryTimer();
+        await flush();
+    }
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+    assert.equal(harness.mediaRequests, 0);
+});
+
+test('pending cancellation prevents route polling from taking over a new epoch', async () => {
+    const gate = deferred();
+    const harness = createHarness({ initialProfile: true, initialRequested: true,
+        initialEffectiveReason: 'runtime_degraded', routeRecoveryReadyAfter: 1000000,
+        manualRouteRecovery: true, autoAdvance: false, explicitCancelGate: gate });
+    await harness.initialize();
+    const enrolling = harness.emit('voice-identity-reenroll');
+    await flush();
+    assert.equal(harness.elements.get('voice-identity-next').hidden, false);
+    harness.emit('voice-identity-cancel');
+    await flush();
+    assert.ok(harness.fetchCalls.some(call => call.url === `${API_ROOT}/enrollment/cancel`));
+    const readsBeforeTick = harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length;
+    harness.fireRouteRecoveryTimer();
+    await flush();
+    assert.equal(harness.pendingRouteRecoveryTimers(), 0);
+    assert.equal(harness.fetchCalls.filter(call => call.url === `${API_ROOT}/status`).length, readsBeforeTick);
+    gate.resolve();
+    await enrolling;
+    await flush();
     assert.equal(harness.pendingRouteRecoveryTimers(), 0);
 });
 

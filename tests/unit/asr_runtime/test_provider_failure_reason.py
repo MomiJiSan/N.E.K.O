@@ -63,6 +63,8 @@ async def _start_with_session(
 
 def _session(*, warming_up: bool, reason: str = ""):
     session = type("Provider", (), {})()
+    session.last_failure_code = None
+    session.failure_started_at = None
     session.connect = AsyncMock()
     session.close = AsyncMock()
     session.provider_warmup_snapshot = (warming_up, None)
@@ -187,6 +189,8 @@ async def test_start_failure_carries_the_provider_code_as_reason(monkeypatch) ->
     runtime = _Runtime()
     runtime.core_api_type = "gemini"
     session = type("Provider", (), {})()
+    session.last_failure_code = "ASR_LOCAL_MODEL_LOAD_FAILED"
+    session.failure_started_at = None
     session.connect = AsyncMock(
         side_effect=RuntimeError(
             "ASR_LOCAL_MODEL_LOAD_FAILED: faster-whisper model could not be loaded"
