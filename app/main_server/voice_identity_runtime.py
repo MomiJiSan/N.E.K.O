@@ -876,8 +876,10 @@ class OwnerVoiceRuntimeRegistry:
         self._interception_pending[manager] = self._interception_factory
         self._ensure_interception_watchdog()
 
-    @staticmethod
-    def _require_manager_interception(manager) -> None:
+    def _require_manager_interception(self, manager) -> None:
+        # Revocation also invalidates the app's successful-install cache, even
+        # when the next request supplies the same factory object.
+        self._interception_manager_factories.pop(manager, None)
         require = getattr(manager, "require_active_session_interception", None)
         if callable(require):
             try:

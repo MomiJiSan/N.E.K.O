@@ -374,6 +374,8 @@ class AsrRuntimeMixin:
         self._active_session_interception_bridge: ActiveSessionInterceptionBridge | None = None
         self._active_session_interception_required = False
         self._active_session_interception_revision = 0
+        self._active_session_interception_retiring_bridge: ActiveSessionInterceptionBridge | None = None
+        self._active_session_interception_retirement: asyncio.Task | None = None
         self._voice_session_activation_factory: VoiceSessionActivationFactory | None = None
         # ``factory is None`` is intentionally not the policy bit.  It can mean
         # either that the user disabled Owner activation or that protection was
@@ -565,6 +567,8 @@ class AsrRuntimeMixin:
             self._active_session_interception_revision = 0
         if not hasattr(self, "_active_session_interception_retirement"):
             self._active_session_interception_retirement = None
+        if not hasattr(self, "_active_session_interception_retiring_bridge"):
+            self._active_session_interception_retiring_bridge = None
         if not hasattr(self, "_voice_session_activation_required"):
             self._voice_session_activation_required = False
         if not hasattr(self, "_voice_session_activation_policy_revision"):
@@ -1293,19 +1297,46 @@ class AsrRuntimeMixin:
 
     def _invalidate_active_session_interception_now(self, reason: str) -> None:
         """Fence ACTIVE PCM synchronously before async runtime retirement."""
+        self._begin_active_session_interception_retirement(reason)
+
+    def _begin_active_session_interception_retirement(
+        self, reason: str, *, required: bool = False,
+    ) -> int:
         self._ensure_asr_runtime_state()
         bridge = self._active_session_interception_bridge
         self._active_session_interception_bridge = None
         self._active_session_interception_revision += 1
+        if required or bridge is not None:
+            self._active_session_interception_required = True
+        if bridge is not None:
+            # Keep the object, not just its close task: a completed failed task
+            # does not prove physical retirement and must be retryable.
+            self._active_session_interception_retiring_bridge = bridge
+            self._active_session_interception_retirement = AsrRuntimeMixin._schedule_core_asr_cleanup(
+                self, bridge.close(reason), name="active-session-interception-retire",
+            )
+        return self._active_session_interception_revision
+
+    async def _wait_active_session_interception_retirement(self) -> bool:
+        bridge = self._active_session_interception_retiring_bridge
         if bridge is None:
-            return
-        self._active_session_interception_required = True
-        retirement = AsrRuntimeMixin._schedule_core_asr_cleanup(
-            self,
-            bridge.close(reason),
-            name="active-session-interception-retire",
-        )
-        self._active_session_interception_retirement = retirement
+            return True
+        task = self._active_session_interception_retirement
+        if task is None or (task.done() and (
+            task.cancelled() or task.exception() is not None
+        )):
+            task = AsrRuntimeMixin._schedule_core_asr_cleanup(
+                self, bridge.close("retirement_retry"), name="active-session-interception-retire",
+            )
+            self._active_session_interception_retirement = task
+        done, _ = await asyncio.wait({task}, timeout=1.0)
+        if not done or task.cancelled() or task.exception() is not None:
+            return False
+        if (self._active_session_interception_retiring_bridge is bridge
+                and self._active_session_interception_retirement is task):
+            self._active_session_interception_retiring_bridge = None
+            self._active_session_interception_retirement = None
+        return True
 
     def _block_realtime_raw_visual_delivery(self) -> None:
         session = getattr(self, "session", None)
@@ -1622,45 +1653,12 @@ class AsrRuntimeMixin:
 
         if type(interception_required) is not bool:
             raise TypeError("interception_required must be bool")
-        self._ensure_asr_runtime_state()
-        self._active_session_interception_revision += 1
-        revision = self._active_session_interception_revision
-        previous = self._active_session_interception_bridge
-        self._active_session_interception_bridge = None
-        # Keep the policy bit even when no factory is available.  A caller can
-        # therefore request protection before model preparation completes; in
-        # that interval the common outlet remains fail-closed.
+        revision = self._begin_active_session_interception_retirement("factory_replaced", required=True)
+        if not await self._wait_active_session_interception_retirement():
+            return False
+        if revision != self._active_session_interception_revision:
+            return False
         self._active_session_interception_required = interception_required
-        retirement_owner = getattr(
-            self, "_active_session_interception_retirement", None
-        )
-        if retirement_owner is not None and not retirement_owner.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(retirement_owner), timeout=1.0)
-            except asyncio.TimeoutError:
-                self._active_session_interception_required = True
-                return False
-            except Exception:
-                self._active_session_interception_required = True
-                return False
-            if revision != self._active_session_interception_revision:
-                return False
-        if previous is not None:
-            retirement = AsrRuntimeMixin._schedule_core_asr_cleanup(
-                self,
-                previous.close("factory_replaced"),
-                name="active-session-interception-retire",
-            )
-            self._active_session_interception_retirement = retirement
-            done, _ = await asyncio.wait({retirement}, timeout=1.0)
-            if not done:
-                self._active_session_interception_required = True
-                return False
-            if retirement.exception() is not None:
-                self._active_session_interception_required = True
-                return False
-            if revision != self._active_session_interception_revision:
-                return False
         if factory is None:
             return True
         try:
@@ -1683,18 +1681,7 @@ class AsrRuntimeMixin:
         the raw outlet while an async close is pending.
         """
 
-        self._ensure_asr_runtime_state()
-        self._active_session_interception_revision += 1
-        self._active_session_interception_required = True
-        previous = self._active_session_interception_bridge
-        self._active_session_interception_bridge = None
-        if previous is not None:
-            AsrRuntimeMixin._schedule_core_asr_cleanup(
-                self,
-                previous.retire("authority_revoked"),
-                name="active-session-interception-revoke",
-            )
-        return self._active_session_interception_revision
+        return self._begin_active_session_interception_retirement("authority_revoked", required=True)
 
     async def _intercept_active_session_frame(
         self,

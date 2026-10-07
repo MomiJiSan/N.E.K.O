@@ -115,6 +115,7 @@ class ActiveSessionInterceptionBridge:
         self._max_inflight = max_inflight
         self._inflight = 0
         self._retirement_task: asyncio.Task[bool] | None = None
+        self._retiring_runtime: ActiveSessionInterceptionRuntime | None = None
         self._retiring = False
         self._closed = False
         self._has_identity = False
@@ -230,28 +231,32 @@ class ActiveSessionInterceptionBridge:
         if runtime is None:
             return
         self._retiring = True
-        previous = self._retirement_task
-        if previous is not None and not previous.done():
-            await self._wait_retirement()
+        self._retiring_runtime = runtime
         self._retirement_task = asyncio.create_task(
             self._close_runtime(runtime, reason),
             name="active-session-interception-retire",
         )
 
     async def _wait_retirement(self) -> bool:
-        task = self._retirement_task
-        if task is None:
+        runtime = self._retiring_runtime
+        if runtime is None:
             return True
-        try:
-            complete = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            complete = False
-        if complete:
+        task = self._retirement_task
+        if task is None or (task.done() and (
+            task.cancelled() or task.exception() is not None or not task.result()
+        )):
+            task = asyncio.create_task(
+                self._close_runtime(runtime, "retirement_retry"),
+                name="active-session-interception-retire",
+            )
+            self._retirement_task = task
+        done, _ = await asyncio.wait({task}, timeout=self._close_timeout_s)
+        complete = bool(done) and not task.cancelled() and task.exception() is None and task.result()
+        if complete and self._retiring_runtime is runtime and self._retirement_task is task:
             self._retirement_task = None
+            self._retiring_runtime = None
             self._retiring = False
-        return complete
+        return bool(complete)
 
     async def _retire_and_wait(self, reason: str) -> bool:
         async with self._lock:
@@ -279,7 +284,7 @@ class ActiveSessionInterceptionBridge:
         try:
             result = close(reason)
             if hasattr(result, "__await__"):
-                result = await asyncio.wait_for(result, timeout=self._close_timeout_s)
+                result = await result
             if result is False or getattr(runtime, "retirement_confirmed", True) is False:
                 return False
             return True
