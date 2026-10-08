@@ -100,6 +100,8 @@ from main_logic.voice_input.interception import (
     ActiveSessionInterceptionBridge,
     ActiveSessionInterceptionFactory,
     InterceptionDecision,
+    InterceptionInstallation,
+    InterceptionInstallationState,
 )
 
 
@@ -374,6 +376,7 @@ class AsrRuntimeMixin:
         self._active_session_interception_bridge: ActiveSessionInterceptionBridge | None = None
         self._active_session_interception_required = False
         self._active_session_interception_revision = 0
+        self._active_session_interception_installation: InterceptionInstallation | None = None
         self._active_session_interception_retiring_bridge: ActiveSessionInterceptionBridge | None = None
         self._active_session_interception_retirement: asyncio.Task | None = None
         self._voice_session_activation_factory: VoiceSessionActivationFactory | None = None
@@ -565,6 +568,8 @@ class AsrRuntimeMixin:
             self._active_session_interception_required = False
         if not hasattr(self, "_active_session_interception_revision"):
             self._active_session_interception_revision = 0
+        if not hasattr(self, "_active_session_interception_installation"):
+            self._active_session_interception_installation = None
         if not hasattr(self, "_active_session_interception_retirement"):
             self._active_session_interception_retirement = None
         if not hasattr(self, "_active_session_interception_retiring_bridge"):
@@ -1264,7 +1269,7 @@ class AsrRuntimeMixin:
         if mode not in {"native", "independent", "blocked"}:
             raise ValueError("MICROPHONE_ROUTE_INVALID")
         if mode != getattr(self, "_asr_route_mode", "blocked"):
-            self._invalidate_active_session_interception_now("route_changed")
+            self._invalidate_active_session_interception_now("route_changed", recoverable=True)
         leaving_blocked = self._asr_route_mode == "blocked" and mode != "blocked"
         if mode != self._asr_route_mode:
             self._microphone_route_generation += 1
@@ -1295,15 +1300,18 @@ class AsrRuntimeMixin:
             # it after restoring the remembered policy on a replacement session.
             self._block_realtime_raw_visual_delivery()
 
-    def _invalidate_active_session_interception_now(self, reason: str) -> None:
+    def _invalidate_active_session_interception_now(self, reason: str, *, recoverable: bool = False) -> None:
         """Fence ACTIVE PCM synchronously before async runtime retirement."""
-        self._begin_active_session_interception_retirement(reason)
+        self._begin_active_session_interception_retirement(reason, recoverable=recoverable)
 
     def _begin_active_session_interception_retirement(
-        self, reason: str, *, required: bool = False,
+        self, reason: str, *, required: bool = False, recoverable: bool = False,
     ) -> int:
         self._ensure_asr_runtime_state()
         bridge = self._active_session_interception_bridge
+        installation = self._active_session_interception_installation
+        # Retain the receipt after temporary invalidation: a later authority
+        # revoke must still cancel a queued recovery while no bridge exists.
         self._active_session_interception_bridge = None
         self._active_session_interception_revision += 1
         if required or bridge is not None:
@@ -1315,6 +1323,9 @@ class AsrRuntimeMixin:
             self._active_session_interception_retirement = AsrRuntimeMixin._schedule_core_asr_cleanup(
                 self, bridge.close(reason), name="active-session-interception-retire",
             )
+        if installation is not None:
+            # Notify only after synchronously fencing PCM and owning cleanup.
+            installation.invalidate(recoverable=recoverable)
         return self._active_session_interception_revision
 
     async def _wait_active_session_interception_retirement(self) -> bool:
@@ -1641,6 +1652,7 @@ class AsrRuntimeMixin:
         factory: ActiveSessionInterceptionFactory | None,
         *,
         interception_required: bool = True,
+        installation: InterceptionInstallation | None = None,
     ) -> bool:
         """Install the fail-closed ACTIVE-session PCM interception bridge.
 
@@ -1654,12 +1666,15 @@ class AsrRuntimeMixin:
         if type(interception_required) is not bool:
             raise TypeError("interception_required must be bool")
         revision = self._begin_active_session_interception_retirement("factory_replaced", required=True)
+        self._active_session_interception_installation = installation
         if not await self._wait_active_session_interception_retirement():
             return False
         if revision != self._active_session_interception_revision:
             return False
         self._active_session_interception_required = interception_required
         if factory is None:
+            if installation is not None:
+                installation.state = InterceptionInstallationState.INSTALLED
             return True
         try:
             self._active_session_interception_bridge = ActiveSessionInterceptionBridge(
@@ -1669,6 +1684,8 @@ class AsrRuntimeMixin:
         except Exception:
             self._active_session_interception_required = True
             return False
+        if installation is not None:
+            installation.state = InterceptionInstallationState.INSTALLED
         return True
 
     def require_active_session_interception(self) -> int:
@@ -5218,7 +5235,7 @@ class AsrRuntimeMixin:
             owner != "core" or hard_muted or focus_suppressed
         ):
             self._invalidate_active_session_interception_now(
-                f"voice_lease_{reason}"
+                f"voice_lease_{reason}", recoverable=True,
             )
         self._invalidate_voice_pcm_sync(reason)
         if (

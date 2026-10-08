@@ -288,8 +288,10 @@ class RegistryManager:
     def require_active_session_interception(self):
         return self.core.require_active_session_interception()
 
-    async def set_active_session_interception_factory(self, factory, *, interception_required):
-        return await self.core.set_active_session_interception_factory(factory, interception_required=interception_required)
+    async def set_active_session_interception_factory(self, factory, *, interception_required, installation=None):
+        return await self.core.set_active_session_interception_factory(
+            factory, interception_required=interception_required, installation=installation,
+        )
 
 
 async def test_same_factory_registration_reinstalls_revoked_core_bridge():

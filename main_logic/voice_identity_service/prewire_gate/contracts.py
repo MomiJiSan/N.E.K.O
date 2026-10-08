@@ -28,6 +28,7 @@ class PrewireCommitStage(str, Enum):
     PENDING = "pending"
     SELECTED = "selected"
     ENQUEUED = "enqueued"
+    LOCAL_CANCELLED = "local-cancelled"
     WRITTEN = "written"
     REMOTE_CONFIRMED = "remote-confirmed"
     UNKNOWN = "unknown"

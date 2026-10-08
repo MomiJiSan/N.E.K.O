@@ -93,6 +93,7 @@ class InterceptionRuntimeConfig:
 class _PendingTargetAudio:
     pcm16: bytes | None = None
     confirmed: bool = False
+    claimed: bool = False
 
 
 class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
@@ -154,6 +155,9 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         self._planned_ranges: deque = deque()
         self._owner_streak = 0
         self._pending_audio: dict[PrewireIntervalIdentity, _PendingTargetAudio] = {}
+        # Drained PCM remains locally owned until process/finish returns. It
+        # shares the same byte/event budgets with pending extraction.
+        self._outgoing_audio: dict[PrewireIntervalIdentity, bytes] = {}
         self._unconfirmed_owner_run: list[PrewireIntervalIdentity] = []
         self._pending_audio_bytes = 0
         self._started = False
@@ -234,6 +238,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
                 output.extend(self._drain_authorized_audio())
                 return self._result(output)
             except asyncio.CancelledError:
+                self._begin_component_retirement()
                 raise
             except Exception as exc:
                 await self._retire_components(f"runtime_failed:{type(exc).__name__}")
@@ -260,11 +265,10 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
                 if self._handle is not None:
                     self._collect_extracted(self._extraction.accept_event(self._handle, end))
                 finish_output.extend(self._drain_authorized_audio())
-                await self._retire_components("capture_finished")
-                if finish_output:
-                    return InterceptionResult(InterceptionDecision.KEEP, b"".join(finish_output), "filtered_target_audio")
-                return InterceptionResult(InterceptionDecision.DROP, reason="capture_finished")
+                await self._retire_components("capture_finished", preserve_output=True)
+                return self._result(finish_output, finished=True)
             except asyncio.CancelledError:
+                self._begin_component_retirement()
                 raise
             except Exception as exc:
                 await self._retire_components(f"finish_failed:{type(exc).__name__}")
@@ -304,8 +308,8 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             planned.decision_range,
             planned.commit_range,
             event_ended,
-            event_ended,
-            event_ended,
+            False,  # Capture finish is not a validated endpoint boundary.
+            False,  # Planner tails are not independent utterances.
         )
         qualities = None
         if self._quality_analyzer is not None:
@@ -323,6 +327,8 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             return [], False
         output, owner = self._accept_plan(plan)
         self._gate.claim(plan)
+        for release in plan.ledger_plan.releases:
+            self._pending_audio[release.identity].claimed = True
         return output, owner
 
     async def _analyze_quality(self, sample_range: SampleRange) -> PrewireQualitySummary:
@@ -351,6 +357,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
 
     def _cancel_unconfirmed_audio(self) -> None:
         for identity in self._unconfirmed_owner_run:
+            self._gate.cancel_local_delivery(identity)
             pending = self._pending_audio.pop(identity)
             self._pending_audio_bytes -= len(pending.pcm16 or b"")
         self._unconfirmed_owner_run.clear()
@@ -380,7 +387,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             if not pending.confirmed or pending.pcm16 is None:
                 break
             output.append(pending.pcm16)
-            self._pending_audio_bytes -= len(pending.pcm16)
+            self._outgoing_audio[identity] = pending.pcm16
             del self._pending_audio[identity]
         return output
 
@@ -415,7 +422,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
                 interrupted = True
             elif event.kind == "audio":
                 owner = True
-                if len(self._pending_audio) >= self._config.extraction_max_pending_events:
+                if len(self._pending_audio) + len(self._outgoing_audio) >= self._config.extraction_max_pending_events:
                     raise InterceptionRuntimeError("authorized_event_capacity")
                 self._pending_audio[event.identity] = _PendingTargetAudio()
                 self._unconfirmed_owner_run.append(event.identity)
@@ -423,29 +430,45 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             self._collect_extracted(events)
         return [], owner and not interrupted
 
-    @staticmethod
-    def _result(output: list[bytes]) -> InterceptionResult:
+    def _result(self, output: list[bytes], *, finished: bool = False) -> InterceptionResult:
         if output:
-            return InterceptionResult(InterceptionDecision.KEEP, b"".join(output), "filtered_target_audio")
+            result = InterceptionResult(InterceptionDecision.KEEP, b"".join(output), "filtered_target_audio")
+            # No await between relinquishing identities and returning PCM.
+            self._pending_audio_bytes -= sum(map(len, self._outgoing_audio.values()))
+            self._outgoing_audio.clear()
+            return result
+        if finished:
+            return InterceptionResult(InterceptionDecision.DROP, reason="capture_finished")
         return InterceptionResult(InterceptionDecision.PENDING, reason="awaiting_identity_evidence")
 
-    async def _retire_components(self, reason: str) -> None:
+    async def _retire_components(self, reason: str, *, preserve_output: bool = False) -> None:
+        task = self._begin_component_retirement(preserve_output=preserve_output)
+        # The runtime owns cleanup even if its process/finish/close waiter dies.
+        await asyncio.shield(task)
+
+    def _begin_component_retirement(self, *, preserve_output: bool = False) -> asyncio.Task[None]:
         self._closed = True
         deadline_task, self._deadline_task = self._deadline_task, None
         if deadline_task is not None and deadline_task is not asyncio.current_task():
             deadline_task.cancel()
         self._extraction.close()
+        identities = tuple(identity for identity, pending in self._pending_audio.items() if pending.claimed)
+        if not preserve_output:
+            identities += tuple(self._outgoing_audio)
+        for identity in identities:
+            self._gate.cancel_local_delivery(identity)
         self._pending_audio.clear()
         self._unconfirmed_owner_run.clear()
-        self._pending_audio_bytes = 0
+        if not preserve_output:
+            self._outgoing_audio.clear()
+        self._pending_audio_bytes = sum(map(len, self._outgoing_audio.values()))
         self._planned_ranges.clear()
         task = self._component_retirement_task
         if task is None or (task.done() and not self._retirement_confirmed):
             self._retirement_confirmed = False
             task = asyncio.create_task(self._close_components(), name="prewire-components-retire")
             self._component_retirement_task = task
-        # The runtime owns cleanup even if its process/finish/close waiter dies.
-        await asyncio.shield(task)
+        return task
 
     async def _close_components(self) -> None:
         gate_closed = False

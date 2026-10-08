@@ -469,6 +469,20 @@ class PrewireGate:
         self._active_plans.pop(stream, None)
         self._discard_consumed_prefix(stream)
 
+    def cancel_local_delivery(self, identity: PrewireIntervalIdentity) -> PrewireIntervalRecord:
+        """Settle audio the caller still owns and has never handed downstream.
+
+        This is not remote evidence. The delivery owner must retain the exact
+        identity until handoff; ENQUEUED alone does not prove local ownership.
+        Identity/stage CAS rejects stale, written and ambiguous deliveries.
+        Reserved mappings and both cursors remain monotonic.
+        """
+        return self._ledger.advance_commit(
+            identity,
+            expected=PrewireCommitStage.ENQUEUED,
+            next_stage=PrewireCommitStage.LOCAL_CANCELLED,
+        )
+
     def advance_delivery(
         self,
         identity: PrewireIntervalIdentity,

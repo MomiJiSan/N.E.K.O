@@ -31,6 +31,10 @@ from main_logic.voice_identity_service.registry import (
 )
 from main_logic.voice_identity_service.service import VoiceIdentityService
 from main_logic.voice_input.suppression import VoiceInputSuppressionController
+from main_logic.voice_input.interception import (
+    InterceptionInstallation,
+    InterceptionInstallationState,
+)
 from main_logic.voice_input.wake_word.resources import WakeWordResources
 from main_logic.voice_identity_service.wake_resources import resolve_wake_word_resources
 from main_routers.config_router.preferences import (
@@ -125,6 +129,7 @@ class OwnerVoiceRuntimeRegistry:
         self._interception_required = False
         self._interception_managers: weakref.WeakSet = weakref.WeakSet()
         self._interception_manager_factories: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._interception_installations: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._interception_pending: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._interception_retry_task: asyncio.Task[None] | None = None
         self._activation: _OwnerActivation | None = None
@@ -165,7 +170,7 @@ class OwnerVoiceRuntimeRegistry:
                     manager in self._detach_pending
                 )
                 if not needs_attach:
-                    return (
+                    return self._with_interception_readiness(manager,
                         VoiceIdentityActivationResult.READY
                         if activation is None
                         else self._manager_activation_result(manager)
@@ -180,7 +185,7 @@ class OwnerVoiceRuntimeRegistry:
                         ),
                     )
                     if result:
-                        return VoiceIdentityActivationResult.READY
+                        return self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
                     self._detach_pending[manager] = str(uuid.uuid4())
                     self._ensure_detach_watchdog()
                     return VoiceIdentityActivationResult.RUNTIME_DEGRADED
@@ -200,7 +205,7 @@ class OwnerVoiceRuntimeRegistry:
                 )
                 if result:
                     self._attach_pending.discard(manager)
-                    return result
+                    return self._with_interception_readiness(manager, result)
                 self._attach_pending.add(manager)
                 self._ensure_attach_watchdog()
                 return VoiceIdentityActivationResult.RUNTIME_DEGRADED
@@ -281,7 +286,7 @@ class OwnerVoiceRuntimeRegistry:
                         return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                     self._attach_pending.discard(manager)
                     self._detach_pending.pop(manager, None)
-                    return result
+                    return self._with_interception_readiness(manager, result)
                 if self._activation_is_required():
                     generation = required_generation or str(uuid.uuid4())
                     if await self._set_empty_manager_authority_bounded(
@@ -289,11 +294,11 @@ class OwnerVoiceRuntimeRegistry:
                         activation_generation=generation,
                     ):
                         self._detach_pending.pop(manager, None)
-                        return VoiceIdentityActivationResult.READY
+                        return self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
                     self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
                     return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                return VoiceIdentityActivationResult.READY
+                return self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
             except asyncio.CancelledError:
                 activation = self._activation
                 if self._suppressed:
@@ -338,6 +343,15 @@ class OwnerVoiceRuntimeRegistry:
                     self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
                 raise
+
+    def _with_interception_readiness(self, manager, result):
+        installation = self._interception_installations.get(manager)
+        if self._interception_enabled() and (
+            self._interception_factory is None or installation is None
+            or installation.state is not InterceptionInstallationState.INSTALLED
+        ):
+            return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        return result
 
     async def unregister_manager(self, manager) -> None:
         async with self._lock:
@@ -790,8 +804,8 @@ class OwnerVoiceRuntimeRegistry:
             getattr(manager, "set_active_session_interception_factory", None)
         )
 
-    @staticmethod
     async def _set_manager_interception_factory(
+        self,
         manager,
         factory,
         *,
@@ -800,11 +814,39 @@ class OwnerVoiceRuntimeRegistry:
         setter = getattr(manager, "set_active_session_interception_factory", None)
         if not callable(setter):
             return False
+        registry_ref, manager_ref = weakref.ref(self), weakref.ref(manager)
+
+        def invalidated(installation: InterceptionInstallation) -> None:
+            registry, target = registry_ref(), manager_ref()
+            if (registry is None or target is None or registry._closed
+                    or target not in registry._managers
+                    or registry._interception_installations.get(target) is not installation):
+                return
+            registry._interception_manager_factories.pop(target, None)
+            if installation.state is InterceptionInstallationState.INVALIDATED:
+                registry._record_interception_pending(target)
+            else:
+                # Revocation cannot be converted into an automatic reinstall,
+                # even if the app has not yet replaced its factory pointer.
+                registry._interception_pending.pop(target, None)
+
+        installation = None
+        if factory is not None or interception_required:
+            installation = InterceptionInstallation(invalidated)
+            self._interception_installations[manager] = installation
+        else:
+            self._interception_installations.pop(manager, None)
         result = await setter(
             factory,
             interception_required=interception_required,
+            installation=installation,
         )
-        return bool(result)
+        return bool(result and (
+            installation is None or (
+                installation.state is InterceptionInstallationState.INSTALLED
+                and self._interception_installations.get(manager) is installation
+            )
+        ))
 
     async def _set_manager_interception_bounded(
         self,
@@ -856,9 +898,14 @@ class OwnerVoiceRuntimeRegistry:
                 self._interception_manager_factories.pop(manager, None)
             return detached
         factory = self._interception_factory
+        installation = self._interception_installations.get(manager)
+        if installation is not None and installation.state is InterceptionInstallationState.REVOKED:
+            return False
         if (
             manager in self._interception_managers
             and self._interception_manager_factories.get(manager) is factory
+            and installation is not None
+            and installation.state is InterceptionInstallationState.INSTALLED
         ):
             return bool(factory is not None)
         updated = await self._set_manager_interception_bounded(
@@ -873,6 +920,10 @@ class OwnerVoiceRuntimeRegistry:
         return bool(updated and factory is not None)
 
     def _record_interception_pending(self, manager) -> None:
+        installation = self._interception_installations.get(manager)
+        if (self._interception_factory is None and self._interception_required
+                or installation is not None and installation.state is InterceptionInstallationState.REVOKED):
+            return
         self._interception_pending[manager] = self._interception_factory
         self._ensure_interception_watchdog()
 
@@ -880,6 +931,7 @@ class OwnerVoiceRuntimeRegistry:
         # Revocation also invalidates the app's successful-install cache, even
         # when the next request supplies the same factory object.
         self._interception_manager_factories.pop(manager, None)
+        self._interception_installations.pop(manager, None)
         require = getattr(manager, "require_active_session_interception", None)
         if callable(require):
             try:
@@ -975,6 +1027,9 @@ class OwnerVoiceRuntimeRegistry:
             # ready even though Core accepted the fail-closed policy bit.
             return all_updated and not (
                 interception_required and factory is None
+            ) and all(
+                self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
+                is VoiceIdentityActivationResult.READY for manager in managers
             )
 
     @staticmethod
@@ -1512,6 +1567,11 @@ class OwnerVoiceRuntimeRegistry:
                     if not targets:
                         return
                     for manager in targets:
+                        installation = self._interception_installations.get(manager)
+                        if (manager in self._managers and installation is not None
+                                and installation.state is InterceptionInstallationState.REVOKED):
+                            self._interception_pending.pop(manager, None)
+                            continue
                         call_timeout = min(
                             _WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
                             deadline - loop.time(),
@@ -1544,7 +1604,7 @@ class OwnerVoiceRuntimeRegistry:
                             continue
                         if updated:
                             self._interception_pending.pop(manager, None)
-                            if required:
+                            if required or factory is not None:
                                 self._interception_managers.add(manager)
                                 self._interception_manager_factories[manager] = factory
                             else:

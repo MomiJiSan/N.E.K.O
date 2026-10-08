@@ -4,6 +4,7 @@ import pytest
 
 from app.main_server.voice_identity_runtime import OwnerVoiceRuntimeRegistry
 from main_logic.asr_client import VoiceIdentityActivationResult
+from main_logic.voice_input.interception import InterceptionInstallationState
 
 
 class _InterceptionRuntime:
@@ -16,8 +17,11 @@ class _InterceptionRuntime:
         factory,
         *,
         interception_required: bool,
+        installation=None,
     ) -> bool:
         self.calls.append((factory, interception_required))
+        if self.result and installation is not None:
+            installation.state = InterceptionInstallationState.INSTALLED
         return self.result
 
 
@@ -26,10 +30,11 @@ class _Manager:
         self._runtime = _InterceptionRuntime(result=result)
         self.revoke_calls = 0
 
-    async def set_active_session_interception_factory(self, factory, *, interception_required):
+    async def set_active_session_interception_factory(self, factory, *, interception_required, installation=None):
         return await self._runtime.set_active_session_interception_factory(
             factory,
             interception_required=interception_required,
+            installation=installation,
         )
 
     def require_active_session_interception(self):

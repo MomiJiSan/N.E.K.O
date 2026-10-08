@@ -13,7 +13,39 @@ import asyncio
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+
+class InterceptionInstallationState(str, Enum):
+    PENDING = "pending"
+    INSTALLED = "installed"
+    INVALIDATED = "invalidated"
+    REVOKED = "revoked"
+
+
+@dataclass(eq=False, slots=True)
+class InterceptionInstallation:
+    """One installation attempt, shared by Core and its application owner.
+
+    Temporary invalidation permits the owner to retry its current authority.
+    Revocation requires an explicit new installation request. Notifications
+    are synchronous, nonblocking and carry this exact attempt identity.
+    """
+
+    on_invalidated: Callable[[InterceptionInstallation], None]
+    state: InterceptionInstallationState = InterceptionInstallationState.PENDING
+
+    def invalidate(self, *, recoverable: bool) -> None:
+        if self.state is InterceptionInstallationState.REVOKED:
+            return
+        state = (
+            InterceptionInstallationState.INVALIDATED if recoverable
+            else InterceptionInstallationState.REVOKED
+        )
+        if self.state is state:
+            return
+        self.state = state
+        self.on_invalidated(self)
 
 
 class InterceptionDecision(str, Enum):

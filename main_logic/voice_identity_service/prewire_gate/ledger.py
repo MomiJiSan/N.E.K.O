@@ -59,6 +59,7 @@ _COMMIT_TRANSITIONS = {
     PrewireCommitStage.ENQUEUED: {
         PrewireCommitStage.WRITTEN,
         PrewireCommitStage.UNKNOWN,
+        PrewireCommitStage.LOCAL_CANCELLED,
     },
     PrewireCommitStage.WRITTEN: {
         PrewireCommitStage.REMOTE_CONFIRMED,
@@ -412,6 +413,7 @@ class PrewireIntervalLedger:
             safe_stage = record.commit_stage in {
                 PrewireCommitStage.PENDING,
                 PrewireCommitStage.REMOTE_CONFIRMED,
+                PrewireCommitStage.LOCAL_CANCELLED,
             }
             if safely_consumed and safe_stage:
                 del self._records[key]
