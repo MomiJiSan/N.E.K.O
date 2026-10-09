@@ -285,8 +285,9 @@ async def test_queued_deadlines_preserve_physical_serialization(abandon_active):
             result = await asyncio.wait_for(scheduler.await_result(queued), 1)
             assert result.status is ScoreResultStatus.TIMED_OUT
             assert result.error_code == "deadline_expired_in_queue"
-            assert scheduler.queued_jobs == scheduler.outstanding_jobs == 0
-            assert scheduler.buffered_pcm_bytes == 0
+            assert scheduler.queued_jobs == 0
+            assert scheduler.outstanding_jobs == 1
+            assert scheduler.buffered_pcm_bytes == 16
             assert backend.calls == 1
         backend.release.set()
         await asyncio.wait_for(asyncio.shield(physical_task), 1)
@@ -314,7 +315,8 @@ async def test_abandon_respects_receipt_identity_and_existing_awaiter():
         await ready
         assert scheduler.abandon(receipt)
         assert (await waiter).status is ScoreResultStatus.CANCELLED
-        assert scheduler.outstanding_jobs == 0
+        assert scheduler.outstanding_jobs == 1
+        assert scheduler.buffered_pcm_bytes == 16
     finally:
         backend.release.set()
         await gate.close()

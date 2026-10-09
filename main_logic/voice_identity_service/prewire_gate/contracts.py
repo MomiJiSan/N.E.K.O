@@ -191,8 +191,9 @@ class PrewireIntervalRecord:
     used_ended_micro_event_rule: bool = False
     commit_stage: PrewireCommitStage = PrewireCommitStage.PENDING
     original_to_asr: OriginalAsrMapping | None = None
-    # An identity outcome is distinct from the bounded audio disposition.
-    # Continuous callers may explicitly finish an uncertain interval as a gap.
+    # Identity judgment and bounded audio disposition are independent.
+    # Raw scoring retains its score; verified output selection may instead
+    # describe a scoreless DROP/UNCERTAIN gap. Neither invents endpoint facts.
     gap_finalized: bool = False
 
     def __post_init__(self) -> None:
@@ -200,10 +201,15 @@ class PrewireIntervalRecord:
             raise PrewireContractError("spec must be PrewireIntervalSpec")
         if type(self.decision) is not PrewireDecisionState:
             raise PrewireContractError("decision must be PrewireDecisionState")
-        if type(self.gap_finalized) is not bool or (
-            self.gap_finalized and self.decision not in {PrewireDecisionState.UNCERTAIN, PrewireDecisionState.DROP}
+        if type(self.gap_finalized) is not bool:
+            raise PrewireContractError("gap_finalized must be bool")
+        if self.gap_finalized and (
+            self.decision not in {PrewireDecisionState.UNCERTAIN, PrewireDecisionState.DROP}
+            or self.commit_stage is not PrewireCommitStage.PENDING
         ):
-            raise PrewireContractError("only a non-owner or uncertain decision can be finalized as a gap")
+            raise PrewireContractError(
+                "only a non-owner or uncertain interval can be finalized as a local gap"
+            )
         if self.score is not None:
             if type(self.score) not in {int, float} or not math.isfinite(self.score):
                 raise PrewireContractError("score must be finite")

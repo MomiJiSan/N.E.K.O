@@ -184,12 +184,20 @@ async def test_late_tail_score_cannot_release_invalidated_stream(cancel_waiter):
             super().__init__()
             self.started = asyncio.Event()
             self.release = asyncio.Event()
+            self.exited = asyncio.Event()
+
+        @property
+        def retirement_confirmed(self):
+            return self.exited.is_set()
 
         async def score_async(self, pcm16, sample_rate_hz):
             self.calls.append(pcm16)
             self.started.set()
-            await self.release.wait()
-            return 0.8
+            try:
+                await self.release.wait()
+                return 0.8
+            finally:
+                self.exited.set()
 
     backend = BlockedBackend()
     gate, scheduler, stream = make_gate(backend)
@@ -198,15 +206,21 @@ async def test_late_tail_score_cannot_release_invalidated_stream(cancel_waiter):
     planner.add_samples(4)
     submission = submit(gate, stream, planner.finish_event()[0], 1)
     waiter = asyncio.create_task(gate.resolve(submission))
+    physical_task = None
     try:
         await asyncio.wait_for(backend.started.wait(), 1)
+        physical_task = scheduler._active_score_task
+        assert physical_task is not None
         if cancel_waiter:
             waiter.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await waiter
         invalidated = gate.invalidate_stream(stream)
         assert all(not isinstance(event, PrewireAudioEvent) for event in invalidated)
+        assert scheduler.outstanding_jobs == 1
         backend.release.set()
+        await asyncio.wait_for(asyncio.gather(physical_task, return_exceptions=True), 1)
+        assert backend.retirement_confirmed
         if not cancel_waiter:
             assert await waiter is None
         assert await gate.resolve(submission) is None
@@ -214,6 +228,9 @@ async def test_late_tail_score_cannot_release_invalidated_stream(cancel_waiter):
         assert gate.held_pcm_bytes == 0
     finally:
         backend.release.set()
+        if physical_task is not None:
+            await asyncio.gather(physical_task, return_exceptions=True)
+        await asyncio.gather(waiter, return_exceptions=True)
         await gate.close()
 
 

@@ -250,17 +250,25 @@ class PrewireIntervalLedger:
         self._revision += 1
         return updated
 
-    def finalize_uncertain(self, identity: PrewireIntervalIdentity) -> PrewireIntervalRecord:
-        """Close completed uncertainty without inventing an utterance endpoint."""
+    def finalize_uncertain(
+        self, identity: PrewireIntervalIdentity
+    ) -> PrewireIntervalRecord:
+        """Finish a scored uncertain interval as a gap without changing identity.
+
+        This local disposition supplies no ASR delivery evidence and does not
+        synthesize an endpoint. A consumed gap cannot be replayed or upgraded.
+        """
         record = self._require_exact(identity)
-        if record.gap_finalized:
-            return record
         if (
             record.decision is not PrewireDecisionState.UNCERTAIN
             or record.commit_stage is not PrewireCommitStage.PENDING
             or self._original_range_is_consumed(record)
         ):
-            raise PrewireTransitionError("only an unconsumed uncertain interval can close as a gap")
+            raise PrewireTransitionError(
+                "only an unconsumed uncertain interval can close as a gap"
+            )
+        if record.gap_finalized:
+            return record
         updated = replace(record, gap_finalized=True)
         self._store(updated)
         self._revision += 1

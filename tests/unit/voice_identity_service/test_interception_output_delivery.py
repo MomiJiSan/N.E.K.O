@@ -10,7 +10,7 @@ import pytest
 from main_logic.voice_identity_service.interception_runtime import (
     InterceptionRuntimeConfig, InterceptionRuntimeError, PrewireInterceptionFactory,
 )
-from main_logic.voice_identity_service.prewire_gate.contracts import PrewireCommitStage
+from main_logic.voice_identity_service.prewire_gate.contracts import PrewireCommitStage, SampleRange
 from main_logic.voice_identity_service.prewire_gate.scheduler import ScorerCapabilities
 from main_logic.voice_input.interception_events import (
     InterceptionDeliveryReceipt, InterceptionDeliveryStage, InterceptionOutputKind,
@@ -150,15 +150,28 @@ async def test_missing_tse_result_has_bounded_deadline_even_with_confirmed_owner
 
 
 @pytest.mark.asyncio
-async def test_idle_confirmed_stream_without_pending_audio_is_not_expired():
-    runtime = factory().create("owner", ingress_token=None)
+async def test_confirmed_stream_with_unsettled_raw_tail_expires_and_can_restart():
+    prepared = factory()
+    runtime = prepared.create("owner", ingress_token=None)
     try:
         await push(runtime, 1600)
         result = await push(runtime, 400)
         assert result.events and not runtime._output_order
-        runtime._capture_deadline = time.monotonic() - 1
-        await runtime._expire_prefix()
-        assert not runtime._closed
+        assert runtime._tse_sample == 2000 and runtime._settled_sample == 800
+        assert runtime._gate.copy_pcm(runtime._stream, SampleRange(800, 2000)) == b"\x00\x20" * 1200
+        assert runtime._ingress_anchors[0][0] == 1600
+        runtime._arm_deadline(time.monotonic())
+        timer = runtime._deadline_task
+        await asyncio.wait_for(timer, 1)
+        assert runtime._output_revoked and runtime.retired
+        late = await push(runtime, 400)
+        assert not late.pcm16 and not late.events
+        successor = prepared.create("owner", ingress_token=None)
+        try:
+            await push(successor, 1600)
+            assert (await push(successor, 400)).pcm16
+        finally:
+            await successor.close()
     finally:
         await runtime.close()
 

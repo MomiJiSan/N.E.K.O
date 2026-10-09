@@ -520,10 +520,13 @@ async def test_missing_tse_factory_or_worker_never_releases_pcm(tse_factory):
     {"prefix_deadline_seconds": float("nan")},
 ])
 async def test_invalid_authorization_policy_cannot_reserve_a_runtime(overrides):
-    factory = make_factory(lambda stream: _Tse(), config=replace(_config(), **overrides))
+    allocated = []
+    def allocate(stream):
+        allocated.append(stream)
+        return _Tse()
     with pytest.raises(ValueError):
-        factory.create("g", ingress_token=None)
-    assert not factory._runtimes
+        make_factory(allocate, config=replace(_config(), **overrides))
+    assert not allocated
 
 
 async def test_core_legacy_state_initializes_retirement_ownership_fields():

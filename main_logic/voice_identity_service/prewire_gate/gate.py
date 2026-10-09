@@ -510,14 +510,22 @@ class PrewireGate:
             return None
         return self._plan_stream(submission.identity.stream)
 
-    def finalize_uncertain(self, submission: PrewireSubmission) -> PrewireGatePlan | None:
-        """Explicit continuous policy: a completed uncertain interval becomes a gap."""
+    def finalize_uncertain(
+        self, submission: PrewireSubmission
+    ) -> PrewireGatePlan | None:
+        """Explicitly settle completed continuous uncertainty as a local gap."""
         pending = self._pending.get(submission.identity)
-        if not self._identity_is_current(submission.identity) or pending is None or pending.emitted:
+        if (
+            pending is None
+            or pending.emitted
+            or not self._identity_is_current(submission.identity)
+        ):
             raise PrewireGateIdentityError("uncertain_interval_is_not_current")
-        if pending.resolver_task is None or not pending.resolver_task.done():
+        task = pending.resolver_task
+        if task is None or not task.done():
             raise PrewireTransitionError("uncertain_resolution_is_not_complete")
-        pending.resolver_task.result()
+        # A failed or cancelled resolver is not a completed identity judgment.
+        task.result()
         self._ledger.finalize_uncertain(submission.identity)
         return self._plan_stream(submission.identity.stream)
 
