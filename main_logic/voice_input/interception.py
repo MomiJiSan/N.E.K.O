@@ -124,6 +124,15 @@ class ActiveSessionInterceptionBridge:
         close_timeout_s: float = 1.0,
         max_inflight: int = 1,
     ) -> None:
+        # A declared availability value is authority evidence, not a model
+        # allocation or a promise that the next runtime will start. Legacy
+        # injected factories need not declare it; known retired authority must
+        # be rejected before Core can publish an installed receipt.
+        availability = getattr(factory, "is_available", True)
+        if type(availability) is not bool:
+            raise TypeError("factory is_available must be bool")
+        if not availability:
+            raise RuntimeError("interception_factory_unavailable")
         self._factory = factory
         self._required = required
         if (isinstance(process_timeout_s, bool)
