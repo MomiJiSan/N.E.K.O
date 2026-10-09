@@ -41,6 +41,7 @@ from .policy import (
     save_storage_policy,
 )
 from .path_rewrite import WORKSHOP_CONFIG_PATH_FIELDS, rebase_runtime_bound_workshop_config_paths
+from .reparse import is_name_surrogate
 
 logger = get_module_logger(__name__)
 
@@ -598,8 +599,7 @@ def _stat_is_reparse(path_stat: os.stat_result) -> bool:
     files and app execution aliases also carry the reparse attribute but are
     ordinary data, so the attribute alone must not reject them.
     """
-    tag = int(getattr(path_stat, "st_reparse_tag", 0) or 0)
-    return bool(tag & _WINDOWS_IO_REPARSE_TAG_NAME_SURROGATE)
+    return is_name_surrogate(path_stat)
 
 
 def _classify_no_follow(path: Path) -> tuple[str, os.stat_result]:

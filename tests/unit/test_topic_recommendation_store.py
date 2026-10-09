@@ -374,7 +374,8 @@ async def test_linked_parent_is_rejected(root, tmp_path):
     except OSError:
         if os.name != "nt":
             raise
-        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "state"), str(outside)], capture_output=True)
+        result = await asyncio.to_thread(subprocess.run,
+            ["cmd", "/c", "mklink", "/J", str(root / "state"), str(outside)], capture_output=True)
         assert result.returncode == 0, result.stderr
     store = RecommendationStore(lambda: root)
     with pytest.raises(RecommendationError, match="store_unavailable"):

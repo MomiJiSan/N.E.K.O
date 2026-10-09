@@ -9,6 +9,7 @@ from fastapi import Response
 
 from main_logic.topic.recommendation.store import RecommendationStore
 from main_logic.topic.recommendation import maintenance
+from config.topic_recommendation_settings import TopicRecommendationSettings
 from main_routers import storage_location_router as routes
 
 
@@ -49,6 +50,7 @@ def bound_owner(tmp_path, monkeypatch):
                               root_state_path=fence, ROOT_STATE_VERSION=1)
     changes = []
     service = SimpleNamespace(store=RecommendationStore.for_config_manager(manager),
+                              settings=TopicRecommendationSettings(),
                               set_maintenance=changes.append,
                               flush_publications=AsyncMock(),
                               recover_after_maintenance=AsyncMock())

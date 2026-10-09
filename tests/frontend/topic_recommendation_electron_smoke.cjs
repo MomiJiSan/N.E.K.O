@@ -15,11 +15,24 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'neko-topic-ui-'));
 const characterId = 'character_' + 'a'.repeat(32);
 const rootGeneration = 'c'.repeat(32);
 let epoch = 'a'.repeat(32);
+let controlsEnabled = true;
+let statusUnavailable = false;
 const writes = [];
+const settingsSource = fs.readFileSync(path.join(root, 'static/app/app-settings.js'), 'utf8');
+const sharedApply = settingsSource.slice(settingsSource.indexOf('    function applySharedRuntimeSettings('),
+  settingsSource.indexOf('    function isManualScreenShareActive('));
+const installSharedApply = `(function(){const S=window.appState;const U={mapRenderQualityToFollowPerf:v=>v};
+  const _SHARED_SETTINGS_KEYS=['proactiveChatEnabled','proactiveTopicRecommendationEnabled'];
+  ${sharedApply};window.applySharedRecommendationFixture=applySharedRuntimeSettings;})()`;
 const scripts = ['/static/app/app-state.js', '/static/avatar/avatar-ui-drag.js',
   '/static/avatar/avatar-ui-popup.js', '/static/app/app-proactive.js'];
 const html = '<!doctype html><meta charset="utf-8"><body><script>window.Live2DManager=function(){};</script>' + scripts.map(src => `<script src="${src}"></script>`).join('');
 const server = http.createServer(async (req, res) => {
+  if (req.url.startsWith('/fixture/status?')) {
+    const mode = new URL(req.url, 'http://127.0.0.1').searchParams.get('mode');
+    controlsEnabled = mode !== 'disabled'; statusUnavailable = mode === 'unavailable';
+    res.end('{}'); return;
+  }
   res.setHeader('Content-Type', 'application/json');
   if (req.url === '/' || req.url === '/chat') {
     res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(html); return;
@@ -35,9 +48,10 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ '猫娘': { Yui: { _reserved: { character_id: characterId } } } })); return;
   }
   if (req.url.startsWith('/api/proactive/recommendation/status')) {
-    res.end(JSON.stringify({ success: true, character_id: characterId, availability: 'ready',
+    if (statusUnavailable) { res.statusCode = 503; res.end(JSON.stringify({ error_code: 'store_unavailable' })); return; }
+    res.end(JSON.stringify({ success: true, character_id: characterId, availability: controlsEnabled ? 'ready' : 'user_disabled',
       reset_generation: rootGeneration, reset_confirmation: 'e'.repeat(64),
-      capability_enabled: true, controls_enabled: true, epoch, revision: 1 })); return;
+      capability_enabled: true, controls_enabled: controlsEnabled, epoch, revision: 1 })); return;
   }
   let body = '';
   for await (const chunk of req) { body += chunk; if (body.length > 8192) throw new Error('Fixture body too large'); }
@@ -63,6 +77,7 @@ const server = http.createServer(async (req, res) => {
 const rendererTest = async function () {
   const check = (condition, message) => { if (!condition) throw new Error(message); };
   const state = window.appState;
+  await fetch('/fixture/status?mode=enabled');
   check(state.proactiveTopicRecommendationEnabled === false, 'Default must be off');
   window.lanlan_config = { lanlan_name: 'Yui' };
   window.nekoLocalMutationSecurity = { getMutationHeaders: async () => ({ 'X-CSRF-Token': 'isolated-test-token' }) };
@@ -118,9 +133,25 @@ const rendererTest = async function () {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
   check(state.proactiveTopicRecommendationEnabled && state.proactiveChatEnabled, 'Reset preserves both switches');
+  async function waitForStatus(key) {
+    const deadline = performance.now() + 3000;
+    while (status.getAttribute('data-i18n') !== `settings.recommendation.${key}`) {
+      check(performance.now() < deadline, 'Status did not settle: ' + status.textContent);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  window.applySharedRecommendationFixture({ proactiveTopicRecommendationEnabled: false });
+  await waitForStatus('saveFailed');
+  await fetch('/fixture/status?mode=disabled');
+  window.applySharedRecommendationFixture({ proactiveTopicRecommendationEnabled: false });
+  await waitForStatus('user_disabled');
+  await fetch('/fixture/status?mode=unavailable');
+  await panel._refreshRecommendationStatus();
+  check(status.getAttribute('data-i18n') === 'settings.recommendation.degraded', 'Unavailable store error mapping');
   beta.checked = false; beta.dispatchEvent(new Event('change', { bubbles: true }));
   check(!window.appProactive.hasAnyChatModeEnabled(), 'Optout disables recommendation-only source');
-  return { route: location.pathname, controls: true, reset: true, defaultOff: true };
+  return { route: location.pathname, controls: true, reset: true, defaultOff: true,
+    sharedIntentConfirmed: true, unavailableStatus: true };
 };
 
 (async () => {
@@ -138,6 +169,7 @@ const rendererTest = async function () {
       currentRoute=route; stage='window-create';
       const win=new BrowserWindow({show:false,width:900,height:750,webPreferences:{contextIsolation:true,nodeIntegration:false}});
       windows.push(win); stage='page-load'; await win.loadURL(${JSON.stringify(url)}+route);
+      await win.webContents.executeJavaScript(${JSON.stringify(installSharedApply)});
       stage='renderer-assertions';
       results.push(await win.webContents.executeJavaScript('('+${JSON.stringify(rendererTest.toString())}+')()'));
       console.log('TOPIC_ELECTRON_STAGE '+JSON.stringify({route,stage:'renderer-verified'}));

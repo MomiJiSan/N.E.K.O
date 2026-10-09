@@ -56,6 +56,57 @@ function harness(options = {}) {
         setAvailability(value) { availability = value; }, get confirms() { return confirms; } };
 }
 
+test('accepted cross-window intents and unchanged confirmations both reread authoritative status', async () => {
+    const h = harness();
+    await h.panel._refreshRecommendationStatus();
+    const source = fs.readFileSync(path.join(root, 'static/app/app-settings.js'), 'utf8');
+    const apply = source.slice(source.indexOf('    function applySharedRuntimeSettings('), source.indexOf('    function isManualScreenShareActive('));
+    vm.runInContext('var S=window.appState; var _SHARED_SETTINGS_KEYS=["proactiveChatEnabled","proactiveTopicRecommendationEnabled"];' + apply, h.sandbox);
+    h.sandbox.applySharedRuntimeSettings({ proactiveTopicRecommendationEnabled: false });
+    await new Promise(r => setImmediate(r));
+    assert.equal(h.ui.status.attrs['data-i18n'], 'settings.recommendation.saveFailed');
+    assert.equal(h.calls.filter(c => c.url.includes('/status?')).length, 2);
+    h.setAvailability('user_disabled');
+    h.sandbox.applySharedRuntimeSettings({ proactiveTopicRecommendationEnabled: false });
+    await new Promise(r => setImmediate(r));
+    assert.equal(h.ui.status.attrs['data-i18n'], 'settings.recommendation.user_disabled');
+    assert.equal(h.calls.filter(c => c.url.includes('/status?')).length, 3);
+    assert.equal(h.calls.some(c => c.request && c.request.method === 'POST'), false);
+});
+
+test('backend unavailable codes have actionable status-read errors and no reset suggestion', async () => {
+    for (const [code, status] of [['store_unavailable', 'degraded'], ['service_unavailable', 'degraded'], ['closing_timeout', 'maintenance']]) {
+        const h = harness({ fetch: async url => url.includes('/status?') ? response({ error_code: code }, 503) : null });
+        await h.panel._refreshRecommendationStatus();
+        assert.equal(h.ui.status.attrs['data-i18n'], `settings.recommendation.${status}`);
+        assert.equal(h.calls.some(c => c.request && c.request.method === 'POST'), false);
+    }
+    const h = harness({ fetch: async url => { if (url.includes('/status?')) throw new Error('read failed'); } });
+    await h.panel._refreshRecommendationStatus();
+    assert.equal(h.ui.status.attrs['data-i18n'], 'settings.recommendation.degraded');
+});
+
+test('a settings confirmation received during a reset is reread when its owner finishes', async () => {
+    const gate = deferred();
+    const h = harness({ fetch: async (url, request) => {
+        if (url.endsWith('/reset')) {
+            await gate.promise;
+            return response({ success: true, character_id: characterId, reset_generation: firstRootGeneration,
+                epoch: 'epoch-b', request_id: JSON.parse(request.body).request_id });
+        }
+    } });
+    const reset = h.ui.reset.click();
+    await new Promise(r => setImmediate(r));
+    h.state.proactiveTopicRecommendationEnabled = false;
+    h.setAvailability('user_disabled');
+    await h.panel._refreshRecommendationStatus();
+    gate.resolve();
+    await reset;
+    await new Promise(r => setImmediate(r));
+    assert.equal(h.ui.status.attrs['data-i18n'], 'settings.recommendation.user_disabled');
+    assert.equal(h.calls.filter(c => c.url.endsWith('/reset')).length, 1);
+});
+
 test('status exposes actual capability and server controls, never equates a checkbox with readiness', async () => {
     const h = harness({ availability: 'capability_disabled' });
     await h.panel._refreshRecommendationStatus();
@@ -265,7 +316,7 @@ test('missing role and route failure remain failures rather than old-server capa
     assert.equal(missing.calls.some(c => c.url.endsWith('/reset')), false);
     const old = harness({ fetch: async url => url.includes('/status?') ? response({ error_code: 'route_not_found' }, 404) : null });
     await old.panel._refreshRecommendationStatus();
-    assert.equal(old.ui.status.attrs['data-i18n'], 'settings.recommendation.requestFailed');
+    assert.equal(old.ui.status.attrs['data-i18n'], 'settings.recommendation.degraded');
 });
 
 test('unloaded state is shown as degraded with unknown counts and cannot submit a made-up epoch', async () => {

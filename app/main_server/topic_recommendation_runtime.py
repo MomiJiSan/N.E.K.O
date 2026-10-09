@@ -91,16 +91,17 @@ async def initialize_topic_recommendation_runtime(config_manager, managers, char
             if name in character_data:
                 bind_topic_recommendation_manager(manager, character_data[name])
     except BaseException:
-        configure_recommendation_service(None)
         await service.close()
+        if service is get_recommendation_service():
+            configure_recommendation_service(None)
         raise
 
 
-async def close_topic_recommendation_runtime() -> None:
+async def close_topic_recommendation_runtime(*, deadline: float | None = None) -> None:
     service = get_recommendation_service()
     if service is None:
         return
     service.pause_controls()
-    await service.close()
+    await service.close(deadline=deadline)
     if service is get_recommendation_service():
         configure_recommendation_service(None)

@@ -1450,10 +1450,11 @@ async def on_shutdown():
         shutdown_cancellation: asyncio.CancelledError | None = None
         cancellation_budget = _ShutdownCancellationBudget()
         from .topic_recommendation_runtime import close_topic_recommendation_runtime
+        recommendation_deadline = time.monotonic() + 5.5
         shutdown_cancellation = await _run_shutdown_step(
-            close_topic_recommendation_runtime,
+            lambda: close_topic_recommendation_runtime(deadline=recommendation_deadline),
             what='topic recommendation cleanup',
-            deadline_monotonic=time.monotonic() + 5.5,
+            deadline_monotonic=recommendation_deadline,
             pending_cancellation=shutdown_cancellation,
             cancellation_budget=cancellation_budget,
         )

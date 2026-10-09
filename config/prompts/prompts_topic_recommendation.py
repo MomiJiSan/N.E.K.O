@@ -1,6 +1,8 @@
 """Eight-language analysis and delivery instructions for topic recommendations."""
 from __future__ import annotations
 
+from config.prompts._locale import normalize_prompt_locale
+
 ANALYSIS_INSTRUCTIONS = {
     "zh-CN": "只整理用户近期明确提过的具体事情、待续话题和偏好。用户热情展开也可以表示感兴趣，不要求固定赞同词。长篇抱怨不等于喜欢。无回应、无关回答和证据不足均为无法判断。拒绝范围尽量窄；不能擅自撤销已有拒绝。AI和检索材料不是用户表达。不要推测敏感身份、健康或财务画像。",
     "zh-TW": "只整理使用者近期明確提過的具體事情、待續話題和偏好。熱情展開也可以表示興趣，不要求固定贊同詞。長篇抱怨不等於喜歡。無回應、無關回答和證據不足均為無法判斷。拒絕範圍盡量窄；不能擅自撤銷既有拒絕。AI與檢索材料不是使用者表達。不要推測敏感身分、健康或財務畫像。",
@@ -43,13 +45,7 @@ Only direct user references may establish or revise preferences/completion/refus
 
 
 def prompt_language(language: str) -> str:
-    raw = (language or "en").lower().replace("_", "-")
-    if raw.startswith(("zh-tw", "zh-hant", "zh-hk")):
-        return "zh-TW"
-    if raw.startswith("zh"):
-        return "zh-CN"
-    base = raw.split("-")[0]
-    return base if base in ANALYSIS_INSTRUCTIONS else "en"
+    return normalize_prompt_locale(language, default="en", simplified="zh-CN", keep_traditional=True)
 
 
 def analysis_prompt(language: str) -> str:

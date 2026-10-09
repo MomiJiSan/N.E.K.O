@@ -38,15 +38,19 @@ class Analyzer:
         self.calls = []
         self.feedback = ()
 
-    async def analyze(self, events, state, memories=()):
+    async def analyze(self, events, state, memories=(), *, on_feedback=None):
         self.calls.append((events, state, memories))
         self.started.set()
         await self.release.wait()
+        feedback = self.feedback
+        if on_feedback is not None:
+            state = await on_feedback(feedback)
+            feedback = ()
         evidence = [e for e in events if e.actor == "user"]
         old = state["subjects"]
         return AnalysisResult(({"subject_id": old[0]["subject_id"] if old else None, "summary": "the blue painting",
                                 "angle": "ask about the palette", "basis": "inferred", "status": "active",
-                                "evidence_refs": [e.ref for e in evidence]},), self.feedback)
+                                "evidence_refs": [e.ref for e in evidence]},), feedback)
 
     async def output_allowed(self, text, restrictions, language):
         return "painting" not in text

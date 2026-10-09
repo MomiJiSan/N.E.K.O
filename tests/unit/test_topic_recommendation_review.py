@@ -27,7 +27,13 @@ def mock_memory_server():
 
 
 @pytest.mark.asyncio
-async def test_permission_arriving_during_refusal_analysis_uses_evidence_time(tmp_path):
+async def test_permission_arriving_during_refusal_analysis_uses_evidence_time(tmp_path, monkeypatch):
+    from tests.unit import test_topic_recommendation_runtime as fixtures
+    from main_logic.topic.recommendation import service as service_module
+    clock = [fixtures.time.time()]
+    local_clock = SimpleNamespace(time=lambda: clock[0], monotonic=fixtures.time.monotonic)
+    monkeypatch.setattr(fixtures, "time", local_clock)
+    monkeypatch.setattr(service_module, "time", local_clock)
     started, release = asyncio.Event(), asyncio.Event()
     async def invoke(**kwargs):
         payload = json.loads(kwargs["messages"][1]["content"])
@@ -60,8 +66,10 @@ async def test_permission_arriving_during_refusal_analysis_uses_evidence_time(tm
         sink.note_turn(refusal)
         task = asyncio.create_task(service.process_pending(CAT))
         await asyncio.wait_for(started.wait(), 5)
+        clock[0] += 1
         permission = turn("I explicitly permit discussing painting again", turn_id="permission")
         sink.note_turn(permission)
+        clock[0] += 1
         release.set()
         await task
         state = await service.store.load(CAT)

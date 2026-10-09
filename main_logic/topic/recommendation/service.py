@@ -211,7 +211,7 @@ class TopicRecommendationService:
         self._enable_generation += 1
         for slot in self._characters.values():
             slot.changed.set()
-            if not active and self._enabled() and (slot.events or slot.captures):
+            if not active and (slot.captures or (self._enabled() and slot.events)):
                 self._wake(slot)
 
     async def recover_after_maintenance(self) -> None:
@@ -420,7 +420,20 @@ class TopicRecommendationService:
                             query=events[-1].text, language=events[-1].language), self.settings.candidate_timeout)
                         if not guard():
                             raise RecommendationError("stale_operation")
-                    result = await self.analyzer.analyze(events, deepcopy(slot.state), memories=memories)
+                    async def commit_feedback(feedback):
+                        if not guard():
+                            raise RecommendationError("stale_operation")
+                        state = self._merge(slot.state, AnalysisResult((), feedback), events)
+                        if state != slot.state:
+                            # Feedback refs are durable idempotency evidence.
+                            # This stage neither consumes candidate input nor
+                            # advances the fully analyzed context watermark.
+                            await self._commit(slot, state, guard)
+                        if not guard():
+                            raise RecommendationError("stale_operation")
+                        return deepcopy(slot.state)
+                    result = await self.analyzer.analyze(events, deepcopy(slot.state), memories=memories,
+                                                         on_feedback=commit_feedback)
             finally:
                 self._semaphore.release()
             if not guard():
@@ -855,7 +868,9 @@ class TopicRecommendationService:
             slot.captures.clear()
             slot.analysis_commit = None
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self.settings.close_timeout
         self._closing = True
         self._enable_generation += 1
         tasks = []
@@ -865,11 +880,15 @@ class TopicRecommendationService:
                 slot.task.cancel()
                 tasks.append(slot.task)
         if tasks:
-            _, pending = await asyncio.wait(tasks, timeout=self.settings.close_timeout)
+            _, pending = await asyncio.wait(tasks, timeout=max(0, deadline - asyncio.get_running_loop().time()))
             if pending:
                 # Retain writer ownership rather than handing it to a successor
                 # while a provider or physical writer is still alive.
                 raise RecommendationError("closing_timeout")
-        async with asyncio.timeout(self.settings.close_timeout):
-            await self.flush_publications(allow_closing=True, allow_maintenance=True)
-        await self.store.close()
+        try:
+            async with asyncio.timeout_at(deadline):
+                await self.flush_publications(allow_closing=True, allow_maintenance=True)
+        finally:
+            # Even a failed flush must seal/join a finished writer. A live
+            # physical task instead causes a bounded error and keeps its lock.
+            await self.store.close(deadline=deadline)

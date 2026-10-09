@@ -149,9 +149,7 @@ class RecommendationAnalyzer:
             raise RecommendationError("invalid_model_output")
         return value
 
-    async def analyze(self, events: tuple[TurnEvidence, ...], state: dict, *, memories: tuple[dict, ...] = ()) -> AnalysisResult:
-        if not events:
-            return AnalysisResult(())
+    async def _prepare_turns(self, events: tuple[TurnEvidence, ...]) -> list[dict]:
         turns = []
         for event in events:
             text = redact_credentials(event.text)
@@ -160,16 +158,14 @@ class RecommendationAnalyzer:
                 raise RecommendationError("evidence_gap")
             turns.append({"ref": event.ref, "actor": event.actor, "text": bounded,
                           "captured_at": event.captured_at, "session_id": event.session_id})
-        allowed = {event.ref for event in events if event.actor == "user"}
-        if not allowed:
-            return AnalysisResult(())
+        return turns
+
+    async def analyze_feedback(self, events: tuple[TurnEvidence, ...], state: dict) -> tuple[dict, ...]:
+        """Bounded public feedback stage, independent of candidate discovery."""
+        if not events or not any(event.actor == "user" for event in events):
+            return ()
+        turns = await self._prepare_turns(events)
         language = events[-1].language
-        # Older memory may explain a matter, but never provides new user evidence.
-        projected_memories = []
-        for memory in memories[:6]:
-            projected_memories.append({"ref": str(memory.get("ref", ""))[:128], "text":
-                                       await atruncate_to_tokens(redact_credentials(str(memory.get("text", ""))), 200),
-                                       "recent_evidence": False, "source": "memory_context"})
         feedbacks = []
         # Limit feedback calls to recent actual publications in this session.
         deliveries = [d for d in state["deliveries"] if d.get("session_id") == events[-1].session_id
@@ -185,6 +181,29 @@ class RecommendationAnalyzer:
                 budget=self.settings.feedback_input_tokens, output=self.settings.feedback_output_tokens, timeout=self.settings.feedback_timeout)
             feedbacks.append(validate_feedback(result, allowed_refs=set(user_refs), delivery_id=delivery["delivery_id"],
                                                 restriction_ids={r["restriction_id"] for r in prior_restrictions}))
+        return tuple(feedbacks)
+
+    async def analyze(self, events: tuple[TurnEvidence, ...], state: dict, *, memories: tuple[dict, ...] = (),
+                      on_feedback: Callable[[tuple[dict, ...]], Awaitable[dict]] | None = None) -> AnalysisResult:
+        if not events:
+            return AnalysisResult(())
+        turns = await self._prepare_turns(events)
+        allowed = {event.ref for event in events if event.actor == "user"}
+        if not allowed:
+            return AnalysisResult(())
+        language = events[-1].language
+        feedbacks = await self.analyze_feedback(events, state)
+        if on_feedback is not None:
+            # The sole service writer confirms this stage before the candidate
+            # model can fail or time out; use its reconciled restrictions next.
+            state = await on_feedback(feedbacks)
+            feedbacks = ()
+        # Older memory explains context but supplies no recent user evidence.
+        projected_memories = []
+        for memory in memories[:6]:
+            projected_memories.append({"ref": str(memory.get("ref", ""))[:128], "text":
+                                       await atruncate_to_tokens(redact_credentials(str(memory.get("text", ""))), 200),
+                                       "recent_evidence": False, "source": "memory_context"})
         existing = sorted(state["subjects"], key=lambda s: s.get("last_evidence_at", 0), reverse=True)[:8]
         existing_projection = []
         for subject in existing:

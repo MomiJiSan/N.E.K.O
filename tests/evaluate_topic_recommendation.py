@@ -43,8 +43,7 @@ async def evaluate(execute: bool) -> dict:
                                           "summary": "do not discuss that painting", "angle": ""}]
             evidence = TurnEvidence("u1", "u1", "evaluation", "user", sample["reply"], sample["language"], now, 1, "evaluation")
             try:
-                result = await analyzer.analyze((evidence,), state)
-                feedback = result.feedback[0]
+                feedback = (await analyzer.analyze_feedback((evidence,), state))[0]
                 scope = feedback["restriction"]["scope"] if feedback["restriction"] else None
                 record.update(actual=feedback["assessment"], actual_related=feedback["related"], actual_scope=scope,
                               reason=feedback["reason"], revocations=feedback["revoke_restriction_ids"],

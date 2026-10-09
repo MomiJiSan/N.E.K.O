@@ -544,12 +544,13 @@ async function resolveTopicRecommendationCharacter(binding, isCurrent) {
     return characterId;
 }
 
-function topicRecommendationErrorKey(error) {
+function topicRecommendationErrorKey(error, mutationSent = false) {
     if (error && ['character_not_found', 'invalid_character_id'].includes(error.code)) return 'roleMissing';
     if (error && ['epoch_conflict', 'request_id_conflict', 'reset_conflict', 'revision_conflict', 'stale_operation'].includes(error.code)) return 'conflict';
-    if (error && ['maintenance', 'closing', 'storage_unavailable', 'storage_changed'].includes(error.code)) return 'maintenance';
+    if (error && ['maintenance', 'closing', 'closing_timeout', 'storage_changed'].includes(error.code)) return 'maintenance';
+    if (error && ['store_unavailable', 'service_unavailable', 'storage_unavailable'].includes(error.code)) return 'degraded';
     if (error && ['csrf_validation_failed', 'access_denied'].includes(error.code)) return 'accessFailed';
-    return 'requestFailed';
+    return mutationSent ? 'requestFailed' : 'degraded';
 }
 
 function attachTopicRecommendationControls(panel, prefix) {
@@ -580,6 +581,7 @@ function attachTopicRecommendationControls(panel, prefix) {
     let operation = 0;
     let busy = false;
     let pendingReset = null;
+    let refreshAfterMutation = false;
     const setStatus = key => {
         status.setAttribute('data-i18n', `settings.recommendation.${key}`);
         status.textContent = topicRecommendationText(`settings.recommendation.${key}`, key);
@@ -605,7 +607,7 @@ function attachTopicRecommendationControls(panel, prefix) {
         return result;
     }
     panel._refreshRecommendationStatus = async (pending) => {
-        if (busy) return;
+        if (busy) { refreshAfterMutation = true; return; }
         if (pending) { operation += 1; setStatus('checking'); return; }
         let task;
         try {
@@ -616,8 +618,8 @@ function attachTopicRecommendationControls(panel, prefix) {
             const states = ['capability_disabled', 'user_disabled', 'waiting_context', 'ready', 'degraded', 'maintenance', 'closing'];
             if (!states.includes(result.availability)) throw new Error('Invalid availability');
             const state = window.appState || {};
-            if (result.capability_enabled === true && result.controls_enabled === false
-                && state.proactiveChatEnabled && state.proactiveTopicRecommendationEnabled) {
+            if (result.capability_enabled === true
+                && result.controls_enabled !== !!(state.proactiveChatEnabled && state.proactiveTopicRecommendationEnabled)) {
                 setStatus('saveFailed');
             } else setStatus(result.availability);
         } catch (error) {
@@ -633,6 +635,7 @@ function attachTopicRecommendationControls(panel, prefix) {
         event.stopPropagation();
         if (busy) return;
         let task;
+        let mutationSent = false;
         busy = true;
         reset.disabled = true;
         recover.disabled = true;
@@ -680,6 +683,7 @@ function attachTopicRecommendationControls(panel, prefix) {
                 throw Object.assign(new Error('Character changed'), { code: 'character_not_found' });
             }
             const submitted = pendingReset;
+            mutationSent = true;
             const result = await topicRecommendationRequest(submitted.url, {
                 method: 'POST', body: JSON.stringify(submitted.body)
             }, task.isCurrent);
@@ -701,11 +705,15 @@ function attachTopicRecommendationControls(panel, prefix) {
             // Uncertain transport/IO failures retain the exact idempotency key.
             // A confirmed conflict permits a fresh reviewed operation next time.
             if (error && error.status === 409) pendingReset = null;
-            setStatus(topicRecommendationErrorKey(error));
+            setStatus(topicRecommendationErrorKey(error, mutationSent));
         } finally {
             busy = false;
             reset.disabled = false;
             recover.disabled = false;
+            if (refreshAfterMutation) {
+                refreshAfterMutation = false;
+                panel._refreshRecommendationStatus();
+            }
         }
     };
     reset.addEventListener('click', contextOperation(false));

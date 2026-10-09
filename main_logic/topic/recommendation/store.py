@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from config.topic_recommendation_settings import TopicRecommendationSettings
+from utils.storage.reparse import is_name_surrogate
 from .contracts import RecommendationError, empty_state, validate_state
 
 MAX_STATE_BYTES = TopicRecommendationSettings().max_state_bytes
@@ -27,7 +28,7 @@ def _real_directory(path: Path) -> bool:
     info = path.lstat()
     return stat.S_ISDIR(info.st_mode) and not (
         stat.S_ISLNK(info.st_mode) or
-        getattr(info, "st_file_attributes", 0) & 0x400
+        is_name_surrogate(info)
     )
 
 
@@ -36,7 +37,7 @@ def _safe_file(path: Path) -> None:
         info = path.lstat()
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or is_name_surrogate(info):
         raise RecommendationError("store_unavailable")
 
 
@@ -60,6 +61,7 @@ class RecommendationStore:
         self._thread_lock = threading.RLock()
         self._lock_file = None
         self._closing = threading.Event()
+        self._paused = threading.Event()
         self._operations: set[asyncio.Task] = set()
 
     @property
@@ -239,13 +241,14 @@ class RecommendationStore:
             except OSError:
                 pass
 
-    async def _run(self, function, *args, guard=None):
-        if self._closing.is_set():
+    async def _run(self, function, *args, guard=None, allow_paused=False):
+        if self._closing.is_set() or (self._paused.is_set() and not allow_paused):
             raise RecommendationError("store_unavailable")
         cancelled = threading.Event()
 
         def owned_guard():
-            return not cancelled.is_set() and (guard is None or guard())
+            return (not cancelled.is_set() and (allow_paused or not self._paused.is_set())
+                    and (guard is None or guard()))
 
         def execute():
             with self._thread_lock:
@@ -282,7 +285,7 @@ class RecommendationStore:
             self._check(guard)
             return True
         try:
-            return await self._run(check_owned)
+            return await self._run(check_owned, allow_paused=True)
         except RecommendationError:
             return False
 
@@ -363,14 +366,32 @@ class RecommendationStore:
             self._missing.pop(identifier, None)
         await self._run(delete_owned, character_id, guard=guard)
 
-    async def close(self) -> None:
-        self._closing.set()
-        # Never hand off the OS writer lock while a to_thread replace is alive.
+    def suspend(self) -> None:
+        """Fence new operations before a root transaction, including queued writes."""
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+
+    async def wait_idle(self, *, deadline: float) -> None:
+        """Join actual physical work without consulting the unavailable root."""
         while self._operations:
-            await asyncio.shield(asyncio.gather(*tuple(self._operations), return_exceptions=True))
+            pending = tuple(self._operations)
+            _, unfinished = await asyncio.wait(pending, timeout=max(0, deadline - asyncio.get_running_loop().time()))
+            if unfinished:
+                raise RecommendationError("closing_timeout")
+            self._operations.difference_update(pending)
+
+    async def close(self, *, deadline: float | None = None) -> None:
+        self._closing.set()
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self.settings.close_timeout
+        # Never hand off the OS writer lock while a to_thread replace is alive.
+        await self.wait_idle(deadline=deadline)
         def release():
             with self._thread_lock:
                 if self._lock_file is not None:
                     self._lock_file.close()
                     self._lock_file = None
-        await asyncio.to_thread(release)
+        async with asyncio.timeout_at(deadline):
+            await asyncio.to_thread(release)

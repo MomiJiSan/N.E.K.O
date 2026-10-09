@@ -1168,12 +1168,14 @@
         if (changed && S.renderQuality) {
             window.cursorFollowPerformanceLevel = U.mapRenderQualityToFollowPerf(S.renderQuality);
         }
-        if (changed && (Object.prototype.hasOwnProperty.call(settings, 'proactiveChatEnabled')
+        if ((Object.prototype.hasOwnProperty.call(settings, 'proactiveChatEnabled')
             || Object.prototype.hasOwnProperty.call(settings, 'proactiveTopicRecommendationEnabled'))
             && typeof window.refreshTopicRecommendationStatus === 'function') {
-            // A cross-window intent or a late merge is not proof of server
-            // readiness. Invalidate the displayed result until it is reread.
-            window.refreshTopicRecommendationStatus(true);
+            // Reread server truth for both an intent and its later confirmed
+            // merge, even when the accepted value is unchanged. An in-flight
+            // write can show saveFailed, but cannot leave checking forever or
+            // advertise readiness inconsistent with the current local gates.
+            window.refreshTopicRecommendationStatus(false);
         }
         return changed;
     }
