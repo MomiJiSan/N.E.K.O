@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from inspect import getattr_static
 import math
 import time
 from typing import Protocol
@@ -20,9 +21,49 @@ class ScoreBackend(Protocol):
 
 
 class AsyncScoreBackend(Protocol):
-    """Async scorer whose implementation owns physical cancellation."""
+    """Async scorer whose implementation owns physical cancellation.
+
+    After cancellation, an async wrapper may have abandoned a native call.
+    Its owner must expose ``retirement_confirmed is True`` to prove that call
+    has exited. Without that evidence the channel remains fenced, including
+    for pure async implementations; a new authority cannot infer retirement
+    merely from the wrapper task completing.
+    A declared owner proof is authoritative on normal completion as well;
+    a normal return cannot override explicit evidence of unfinished work.
+    """
 
     def score_async(self, pcm16: bytes, sample_rate_hz: int) -> Awaitable[float]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ScorerCapabilities:
+    """Declared input support, independent of identity accuracy calibration."""
+
+    sample_rate_hz: int
+    minimum_samples: int
+    supported_sample_counts: tuple[int, ...]
+    model_generation: str
+
+    def __post_init__(self) -> None:
+        if type(self.sample_rate_hz) is not int or self.sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be positive")
+        if type(self.minimum_samples) is not int or self.minimum_samples <= 0:
+            raise ValueError("minimum_samples must be positive")
+        if type(self.model_generation) is not str or not self.model_generation:
+            raise ValueError("model_generation must be nonempty")
+        counts = self.supported_sample_counts
+        if type(counts) is not tuple or not counts:
+            raise ValueError("supported_sample_counts must be a nonempty tuple")
+        if any(type(count) is not int or count < self.minimum_samples for count in counts):
+            raise ValueError("supported lengths must meet the model minimum")
+        if len(set(counts)) != len(counts):
+            raise ValueError("supported lengths must be unique")
+
+    def require_support(self, counts: tuple[int, ...], *, model_generation: str) -> None:
+        if self.sample_rate_hz != 16_000 or self.model_generation != model_generation:
+            raise ValueError("scorer sample rate or model generation does not match runtime")
+        if any(count < self.minimum_samples or count not in self.supported_sample_counts for count in counts):
+            raise ValueError("scoring window is outside declared model support")
 
 
 class SchedulerError(RuntimeError):
@@ -221,6 +262,41 @@ class ControlledScoringScheduler:
         self._active_job_id: int | None = None
         self._active_score_task: asyncio.Task[float] | None = None
         self._active_score_is_async = False
+        self._physical_tasks: set[asyncio.Task[float]] = set()
+        self._execution_reservations: dict[asyncio.Task[float], tuple[int, int, bool]] = {}
+        self._async_cancellation_requires_proof = False
+
+    @property
+    def retirement_confirmed(self) -> bool:
+        """A cancelled wrapper is not evidence its delegated work exited."""
+        return bool(
+            self._closed
+            and (self._worker is None or self._worker.done())
+            and not any(not task.done() for task in self._physical_tasks)
+            and self._async_retirement_proven()
+        )
+
+    def _async_retirement_proven(self) -> bool:
+        undeclared = object()
+        try:
+            proof = getattr(self._backend, "retirement_confirmed")
+        except AttributeError:
+            # A declared descriptor can itself raise AttributeError. Only
+            # actual absence permits the normal-return compatibility rule.
+            try:
+                declared = getattr_static(self._backend, "retirement_confirmed", undeclared)
+            except Exception:
+                return False
+            return declared is undeclared and not self._async_cancellation_requires_proof
+        except Exception:
+            return False
+        return proof is True
+
+    def _request_async_cancellation(self, score_task: asyncio.Task[float]) -> None:
+        if not score_task.done():
+            self._async_cancellation_requires_proof = True
+            if score_task.cancelling() == 0:
+                score_task.cancel()
 
     @property
     def window_plan(self) -> ScoringWindowPlan:
@@ -228,11 +304,31 @@ class ControlledScoringScheduler:
 
     @property
     def buffered_pcm_bytes(self) -> int:
-        return self._buffered_pcm_bytes
+        return self._buffered_pcm_bytes + sum(
+            size for task, (_job_id, size, is_async) in self._execution_reservations.items()
+            if not self._execution_retired(task)
+        )
 
     @property
     def outstanding_jobs(self) -> int:
-        return len(self._jobs)
+        return len(self._jobs) + sum(
+            job_id not in self._jobs
+            for task, (job_id, _size, is_async) in self._execution_reservations.items()
+            if not self._execution_retired(task)
+        )
+
+    def _execution_retired(self, task: asyncio.Task[float]) -> bool:
+        # A synchronous wrapper can also delegate unfinished native work.
+        return task.done() and self._async_retirement_proven()
+
+    def _release_execution(self, task: asyncio.Task[float]) -> None:
+        self._physical_tasks.discard(task)
+        reservation = self._execution_reservations.get(task)
+        if reservation is not None:
+            if task.cancelled() and reservation[2]:
+                self._async_cancellation_requires_proof = True
+            if self._execution_retired(task):
+                self._execution_reservations.pop(task, None)
 
     @property
     def queued_jobs(self) -> int:
@@ -244,10 +340,10 @@ class ControlledScoringScheduler:
             raise SchedulerClosedError("scheduler_closed")
         if request.sample_range.sample_count not in self._window_plan.sample_counts:
             raise SchedulerError("sample_range_not_in_window_plan")
-        if len(self._jobs) >= self._max_outstanding_jobs:
+        if self.outstanding_jobs >= self._max_outstanding_jobs:
             raise SchedulerCapacityError("outstanding_job_capacity")
         size = len(request.pcm16)
-        if self._buffered_pcm_bytes + size > self._max_buffered_pcm_bytes:
+        if self.buffered_pcm_bytes + size > self._max_buffered_pcm_bytes:
             raise SchedulerCapacityError("pcm_buffer_capacity")
         loop = asyncio.get_running_loop()
         now = float(self._clock())
@@ -332,7 +428,7 @@ class ControlledScoringScheduler:
                 and score_task is not None
                 and not score_task.done()
             ):
-                score_task.cancel()
+                self._request_async_cancellation(score_task)
         else:
             try:
                 self._queue.remove(receipt.job_id)
@@ -386,7 +482,9 @@ class ControlledScoringScheduler:
                 )
         self._queue.clear()
         self._wake.set()
-        worker, self._worker = self._worker, None
+        # Retain the worker and physical tasks across repeated close calls.
+        # The caller's bounded wait and actual resource retirement differ.
+        worker = self._worker
         if worker is not None and not worker.done():
             score_task = self._active_score_task
             if (
@@ -394,7 +492,7 @@ class ControlledScoringScheduler:
                 and score_task is not None
                 and not score_task.done()
             ):
-                score_task.cancel()
+                self._request_async_cancellation(score_task)
             worker.cancel()
             done, _pending = await asyncio.wait(
                 {worker}, timeout=self._close_timeout_seconds
@@ -500,6 +598,12 @@ class ControlledScoringScheduler:
             )
         self._active_score_task = score_task
         self._active_score_is_async = use_async
+        self._physical_tasks.add(score_task)
+        self._execution_reservations[score_task] = (job.receipt.job_id, len(pcm16), use_async)
+        # Transfer the PCM reservation from the logical receipt to execution.
+        # Cancelling, consuming or abandoning the receipt cannot release it.
+        self._release_pcm(job)
+        score_task.add_done_callback(self._release_execution)
 
         def consume_late(task: asyncio.Task[float]) -> None:
             if not task.cancelled():
@@ -536,6 +640,21 @@ class ControlledScoringScheduler:
                         await asyncio.shield(score_task)
                     except Exception:
                         pass
+                return
+            if use_async and score_task.cancelled():
+                self._async_cancellation_requires_proof = True
+                if not job.cancelled and not self._closed and generation == self._generation:
+                    self._resolve(
+                        job, ScoreResultStatus.FAILED, error_code="backend_cancelled"
+                    )
+                    if not self._async_retirement_proven():
+                        self._fence_after_unsettled_async_cancellation()
+                    return
+            if not self._async_retirement_proven():
+                self._resolve(
+                    job, ScoreResultStatus.FAILED, error_code="backend_retirement_unconfirmed"
+                )
+                self._fence_after_unsettled_async_cancellation()
                 return
             if job.cancelled or self._closed or generation != self._generation:
                 self._resolve(
@@ -603,14 +722,13 @@ class ControlledScoringScheduler:
     ) -> bool:
         """Request cancellation, then detach an uncooperative host await."""
 
-        if not score_task.done() and score_task.cancelling() == 0:
-            score_task.cancel()
+        self._request_async_cancellation(score_task)
         try:
             done, _pending = await asyncio.wait(
                 {score_task}, timeout=self._close_timeout_seconds
             )
         except asyncio.CancelledError:
-            score_task.cancel()
+            self._request_async_cancellation(score_task)
             raise
         if not done:
             # The shared host manager owns physical termination and serialization.
@@ -620,4 +738,4 @@ class ControlledScoringScheduler:
             score_task.result()
         except (asyncio.CancelledError, Exception):
             pass
-        return True
+        return self._async_retirement_proven()

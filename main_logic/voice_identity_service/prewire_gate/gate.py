@@ -444,6 +444,31 @@ class PrewireGate:
             return None
         return self._plan_stream(submission.identity.stream)
 
+    def finalize_uncertain(
+        self, submission: PrewireSubmission
+    ) -> PrewireGatePlan | None:
+        """Explicitly settle completed continuous uncertainty as a local gap."""
+        pending = self._pending.get(submission.identity)
+        if (
+            pending is None
+            or pending.emitted
+            or not self._identity_is_current(submission.identity)
+        ):
+            raise PrewireGateIdentityError("uncertain_interval_is_not_current")
+        task = pending.resolver_task
+        if task is None or not task.done():
+            raise PrewireTransitionError("uncertain_resolution_is_not_complete")
+        # A failed or cancelled resolver is not a completed identity judgment.
+        task.result()
+        self._ledger.finalize_uncertain(submission.identity)
+        return self._plan_stream(submission.identity.stream)
+
+    def get_interval_record(
+        self, identity: PrewireIntervalIdentity
+    ) -> PrewireIntervalRecord | None:
+        """Read exact, immutable evidence, including after stream retirement."""
+        return self._ledger.get(identity)
+
     def claim(self, plan: PrewireGatePlan) -> None:
         """Commit a plan only after its audio events were actually enqueued."""
         active = self._active_plans.get(plan.ledger_plan.stream)
