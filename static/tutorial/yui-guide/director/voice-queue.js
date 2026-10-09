@@ -195,9 +195,12 @@
             const mouthBridge = window.LanLan1;
             if (typeof mouthBridge.beginLipSync === 'function'
                 && typeof mouthBridge.endLipSync === 'function') {
-                session.mouthOwner = {};
-                session.mouthBridge = mouthBridge;
-                if (!mouthBridge.beginLipSync(session.mouthOwner)) return null;
+                const owner = {};
+                if (mouthBridge.beginLipSync(owner)) {
+                    session.mouthOwner = owner;
+                    session.mouthBridge = mouthBridge;
+                }
+                // 非 Live2D 模型继续走原有的无 owner 口型调度。
             }
 
             try {
