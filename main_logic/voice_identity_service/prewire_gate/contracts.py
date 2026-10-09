@@ -30,6 +30,9 @@ class PrewireCommitStage(str, Enum):
     ENQUEUED = "enqueued"
     LOCAL_CANCELLED = "local-cancelled"
     WRITTEN = "written"
+    # A real writer has accepted the post-write lifecycle and irrevocably
+    # forbidden replay. This transfers local debt; it is not a provider ACK.
+    TRANSPORT_OWNED = "transport-owned"
     REMOTE_CONFIRMED = "remote-confirmed"
     UNKNOWN = "unknown"
 
@@ -188,12 +191,19 @@ class PrewireIntervalRecord:
     used_ended_micro_event_rule: bool = False
     commit_stage: PrewireCommitStage = PrewireCommitStage.PENDING
     original_to_asr: OriginalAsrMapping | None = None
+    # An identity outcome is distinct from the bounded audio disposition.
+    # Continuous callers may explicitly finish an uncertain interval as a gap.
+    gap_finalized: bool = False
 
     def __post_init__(self) -> None:
         if type(self.spec) is not PrewireIntervalSpec:
             raise PrewireContractError("spec must be PrewireIntervalSpec")
         if type(self.decision) is not PrewireDecisionState:
             raise PrewireContractError("decision must be PrewireDecisionState")
+        if type(self.gap_finalized) is not bool or (
+            self.gap_finalized and self.decision not in {PrewireDecisionState.UNCERTAIN, PrewireDecisionState.DROP}
+        ):
+            raise PrewireContractError("only a non-owner or uncertain decision can be finalized as a gap")
         if self.score is not None:
             if type(self.score) not in {int, float} or not math.isfinite(self.score):
                 raise PrewireContractError("score must be finite")
@@ -248,6 +258,7 @@ class PrewireIntervalRecord:
                 PrewireDecisionState.UNCERTAIN,
             }
             and not scoreless_micro_drop
+            and not self.gap_finalized
             and self.score is None
         ):
             raise PrewireContractError(

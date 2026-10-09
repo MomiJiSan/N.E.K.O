@@ -25,6 +25,37 @@ class AsyncScoreBackend(Protocol):
     def score_async(self, pcm16: bytes, sample_rate_hz: int) -> Awaitable[float]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ScorerCapabilities:
+    """Declared model input support; this is not an accuracy calibration."""
+
+    sample_rate_hz: int
+    minimum_samples: int
+    supported_sample_counts: tuple[int, ...]
+    model_generation: str
+
+    def __post_init__(self) -> None:
+        if type(self.sample_rate_hz) is not int or self.sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be positive")
+        if type(self.minimum_samples) is not int or self.minimum_samples <= 0:
+            raise ValueError("minimum_samples must be positive")
+        if not self.model_generation or type(self.model_generation) is not str:
+            raise ValueError("model_generation must be nonempty")
+        if type(self.supported_sample_counts) is not tuple or not self.supported_sample_counts:
+            raise ValueError("supported_sample_counts must be a nonempty tuple")
+        if len(set(self.supported_sample_counts)) != len(self.supported_sample_counts) or any(
+            type(count) is not int or count < self.minimum_samples
+            for count in self.supported_sample_counts
+        ):
+            raise ValueError("supported lengths must be unique and meet the model minimum")
+
+    def require_support(self, counts: tuple[int, ...], *, model_generation: str) -> None:
+        if self.sample_rate_hz != 16_000 or self.model_generation != model_generation:
+            raise ValueError("scorer sample rate or model generation does not match runtime")
+        if any(count < self.minimum_samples or count not in self.supported_sample_counts for count in counts):
+            raise ValueError("scoring window is outside declared model support")
+
+
 class SchedulerError(RuntimeError):
     pass
 
@@ -221,6 +252,8 @@ class ControlledScoringScheduler:
         self._active_job_id: int | None = None
         self._active_score_task: asyncio.Task[float] | None = None
         self._active_score_is_async = False
+        self._physical_tasks: set[asyncio.Task] = set()
+        self._retiring_worker: asyncio.Task | None = None
 
     @property
     def window_plan(self) -> ScoringWindowPlan:
@@ -237,6 +270,15 @@ class ControlledScoringScheduler:
     @property
     def queued_jobs(self) -> int:
         return len(self._queue)
+
+    @property
+    def retirement_confirmed(self) -> bool:
+        """Logical cancellation is not evidence that a native call stopped."""
+        return bool(
+            self._closed
+            and not any(not task.done() for task in self._physical_tasks)
+            and (self._retiring_worker is None or self._retiring_worker.done())
+        )
 
     def submit(self, request: ScoreRequest) -> IdentityReceipt:
         """Queue without awaiting scoring, keeping the receive path non-blocking."""
@@ -387,6 +429,7 @@ class ControlledScoringScheduler:
         self._queue.clear()
         self._wake.set()
         worker, self._worker = self._worker, None
+        self._retiring_worker = worker
         if worker is not None and not worker.done():
             score_task = self._active_score_task
             if (
@@ -500,6 +543,8 @@ class ControlledScoringScheduler:
             )
         self._active_score_task = score_task
         self._active_score_is_async = use_async
+        self._physical_tasks.add(score_task)
+        score_task.add_done_callback(self._physical_tasks.discard)
 
         def consume_late(task: asyncio.Task[float]) -> None:
             if not task.cancelled():
