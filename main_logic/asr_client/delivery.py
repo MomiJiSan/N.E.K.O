@@ -82,6 +82,15 @@ def retire_interval_deliveries(
                 del evidence.pending_intervals[key]
     for span, stage in outcomes:
         span.observe(stage)
+        if span.tag.settled:
+            # A complete NOT_SENT/transport-owned receipt leaves the replay
+            # fence on the tag itself. Retaining another strong reference
+            # here would exhaust a long-lived queue after settled captures.
+            # Partial/unknown or rejected receipts keep their exact tombstone.
+            # Late sends also require membership in pending_intervals, so
+            # removing this duplicate fence cannot resurrect old spans.
+            with evidence.interval_lock:
+                evidence.retired_tags.discard(span.tag)
 
 
 def delivery_evidence(queue: object) -> TransportDeliveryEvidence:

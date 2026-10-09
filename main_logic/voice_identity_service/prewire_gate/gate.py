@@ -488,6 +488,11 @@ class PrewireGate:
         self._validate_ranges(spec, (spec.scoring_range,))
         if selection.decision is PrewireDecisionState.UNAVAILABLE:
             raise PrewireGateError(selection.reason)
+        if selection.decision is PrewireDecisionState.STALE:
+            # Selector retirement is a rejection, not a registered identity
+            # outcome. Validate before adding an otherwise orphaned PENDING
+            # record which has no resolver or delivery owner to settle it.
+            raise PrewireGateIdentityError(selection.reason)
         self._ledger.add(spec)
         self._ledger.record_candidate_decision(
             identity, decision=selection.decision, reason=selection.reason,
