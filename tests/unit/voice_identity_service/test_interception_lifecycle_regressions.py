@@ -354,9 +354,12 @@ async def test_pending_audio_metadata_capacity_fails_closed():
 
 
 async def test_pending_authorized_pcm_capacity_fails_closed_and_releases_budget():
-    config = replace(_config(), max_held_pcm_bytes=6400, owner_streak_required=20)
-    runtime = make_factory(lambda stream: _Tse(), config=config).create("g", ingress_token=None)
-    results = [await process(runtime) for _ in range(12)]
+    # The legal confirmation cache holds 2,000 samples. Delayed extraction
+    # releases several already-confirmed intervals together, exceeding the
+    # runtime's 3,200-sample retained output budget before any public return.
+    config = replace(_config(), max_held_pcm_bytes=6400)
+    runtime = make_factory(lambda stream: BatchedTse(14), config=config).create("g", ingress_token=None)
+    results = [await process(runtime) for _ in range(14)]
     assert all(not result.pcm16 for result in results)
     assert results[-1].decision is InterceptionDecision.UNAVAILABLE
     assert results[-1].reason == "authorized_audio_capacity"
@@ -502,10 +505,13 @@ async def test_missing_tse_factory_or_worker_never_releases_pcm(tse_factory):
     {"prefix_deadline_seconds": float("nan")},
 ])
 async def test_invalid_authorization_policy_cannot_reserve_a_runtime(overrides):
-    factory = make_factory(lambda stream: _Tse(), config=replace(_config(), **overrides))
+    allocated = []
+    def allocate(stream):
+        allocated.append(stream)
+        return _Tse()
     with pytest.raises(ValueError):
-        factory.create("g", ingress_token=None)
-    assert not factory._runtimes
+        make_factory(allocate, config=replace(_config(), **overrides))
+    assert not allocated
 
 
 async def test_core_legacy_state_initializes_retirement_ownership_fields():

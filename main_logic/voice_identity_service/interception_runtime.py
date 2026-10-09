@@ -9,6 +9,7 @@ returns a non-audio result; there is no mixed-PCM fallback.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass
 from collections import deque
 import math
@@ -25,6 +26,7 @@ from main_logic.voice_input.interception import (
 )
 
 from .prewire_gate.contracts import (
+    PrewireDecisionState,
     PrewireIntervalIdentity,
     PrewireIntervalSpec,
     PrewireStreamKey,
@@ -35,8 +37,8 @@ from .prewire_gate.extraction import (
     ExtractedPrewireAudio,
     PrewireExtractionAdapter,
 )
-from .prewire_gate.gate import PrewireGate, PrewireGatePlan, PrewireWindowPlanner
-from .prewire_gate.scheduler import ControlledScoringScheduler, ScoringWindowPlan
+from .prewire_gate.gate import PrewireEndEvent, PrewireGate, PrewireGatePlan, PrewireWindowPlanner
+from .prewire_gate.scheduler import ControlledScoringScheduler, ScorerCapabilities, ScoringWindowPlan
 from .tse.contracts import (
     TseAudioChunk,
     TseExtractionResult,
@@ -64,6 +66,7 @@ class TSEWorker(Protocol):
 
 
 TSEFactory = Callable[[object], TSEWorker]
+_NO_RETIREMENT_EVIDENCE = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +90,11 @@ class InterceptionRuntimeConfig:
     prefix_deadline_seconds: float = 1.0
     extraction_max_buffered_pcm_bytes: int = 2 * 16_000 * 2
     extraction_max_pending_events: int = 128
+    finish_timeout_seconds: float = 1.0
+    # Sampling support and processing are different clocks. None derives only
+    # the necessary live capture support; prefix_deadline_seconds is the
+    # additional processing/jitter budget, never a renewed inactivity timer.
+    capture_support_timeout_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -94,6 +102,49 @@ class _PendingTargetAudio:
     pcm16: bytes | None = None
     confirmed: bool = False
     claimed: bool = False
+
+
+def _validate_config(config: InterceptionRuntimeConfig, score_backend) -> float:
+    """Validate static support before allocating scheduler or model owners."""
+    if type(config.required_consistent_observations) is not int or config.required_consistent_observations != 1:
+        raise ValueError("runtime uses cross-window owner streak; gate required_consistent_observations must be 1")
+    if type(config.owner_streak_required) is not int or config.owner_streak_required <= 0:
+        raise ValueError("owner_streak_required must be positive")
+    ScoringWindowPlan((config.window_samples,))
+    PrewireWindowPlanner(window_samples=config.window_samples, step_samples=config.step_samples, guard_samples=config.guard_samples)
+    stream = PrewireStreamKey(config.session_id, config.ingress_generation)
+    PrewireIntervalIdentity(stream, 1, SampleRange(0, config.window_samples), config.profile_generation,
+                           config.model_generation, config.config_generation)
+    if (type(config.scoring_parameters_digest) is not str or len(config.scoring_parameters_digest) != 64
+            or any(character not in "0123456789abcdef" for character in config.scoring_parameters_digest)):
+        raise ValueError("scoring_parameters_digest must be a lowercase SHA-256 digest")
+    for name in ("prefix_deadline_seconds", "scoring_deadline_seconds", "scoring_close_timeout_seconds", "finish_timeout_seconds"):
+        value = getattr(config, name)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    support_samples = config.window_samples + (config.owner_streak_required - 1) * config.step_samples
+    support_seconds = support_samples / 16_000
+    if config.capture_support_timeout_seconds is not None:
+        value = config.capture_support_timeout_seconds
+        if type(value) not in (int, float) or not math.isfinite(value) or value < support_seconds:
+            raise ValueError("capture_support_timeout_seconds cannot be shorter than confirmation support")
+        support_seconds = value
+    for name in ("max_held_pcm_bytes", "max_buffered_pcm_bytes", "extraction_max_buffered_pcm_bytes"):
+        value = getattr(config, name)
+        if type(value) is not int or value < support_samples * 2:
+            raise ValueError(f"{name} cannot retain confirmation support")
+    for name in ("max_outstanding_jobs", "extraction_max_pending_events"):
+        value = getattr(config, name)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if config.extraction_max_pending_events < config.owner_streak_required:
+        raise ValueError("extraction_max_pending_events cannot retain owner streak")
+    capabilities = getattr(score_backend, "capabilities", None)
+    if capabilities is not None:
+        if type(capabilities) is not ScorerCapabilities:
+            raise ValueError("capabilities must be ScorerCapabilities")
+        capabilities.require_support((config.window_samples,), model_generation=config.model_generation)
+    return support_seconds
 
 
 class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
@@ -111,14 +162,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         ingress_token: object | None = None,
     ) -> None:
         self._config = config
-        if config.required_consistent_observations != 1:
-            raise ValueError(
-                "runtime uses cross-window owner streak; gate required_consistent_observations must be 1"
-            )
-        if type(config.owner_streak_required) is not int or config.owner_streak_required <= 0:
-            raise ValueError("owner_streak_required must be positive")
-        if not math.isfinite(config.prefix_deadline_seconds) or config.prefix_deadline_seconds <= 0:
-            raise ValueError("prefix_deadline_seconds must be finite and positive")
+        self._capture_support_seconds = _validate_config(config, score_backend)
         self._score_backend = score_backend
         self._classifier = classifier
         self._tse_factory = tse_factory
@@ -164,12 +208,24 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         self._closed = False
         self._retirement_confirmed = True
         self._component_retirement_task: asyncio.Task[None] | None = None
+        self._gate_close_task: asyncio.Task | None = None
+        self._tse_close_task: asyncio.Task | None = None
+        self._finish_deadline: float | None = None
+        self._output_revoked = False
         self._deadline_task: asyncio.Task[None] | None = None
         self._capture_deadline: float | None = None
+        self._ingress_anchors: deque[tuple[int, float]] = deque()
+        self._settled_sample = 0
+        self._operations: set[asyncio.Task] = set()
+        self._finish_task: asyncio.Task | None = None
+        self._finish_result_delivered = False
         self._lock = asyncio.Lock()
         self._handle = None
 
     async def _start(self) -> None:
+        self._check_output_authority()
+        if self._capture_deadline is not None and self._capture_deadline <= time.monotonic():
+            raise InterceptionRuntimeError("prefix_deadline_expired")
         if self._started:
             return
         if self._tse_factory is None:
@@ -180,7 +236,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         # Reserve physical ownership before start can fail or be cancelled.
         self._retirement_confirmed = False
         try:
-            await self._tse.start(timeout=self._config.scoring_deadline_seconds)
+            await self._await_operation(lambda: self._tse.start(timeout=self._config.scoring_deadline_seconds))
             self._gate.open_stream(
                 self._stream,
                 profile_generation=self._config.profile_generation,
@@ -216,16 +272,22 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             if self._closed:
                 return InterceptionResult(InterceptionDecision.STALE, reason="runtime_closed")
             try:
-                now = time.time()
-                origin = captured_at if isinstance(captured_at, (int, float)) and math.isfinite(captured_at) else now
-                await self._arm_deadline(min(now, origin) + self._config.prefix_deadline_seconds)
+                now = time.monotonic()
+                # Captured wall timestamps never become monotonic deadlines.
+                # They are useful only as a bounded age observation at ingress.
+                age = 0.0
+                if type(captured_at) in (int, float) and math.isfinite(captured_at):
+                    age = max(0.0, time.time() - captured_at)
+                sample_count = len(pcm16) // 2
+                self._ingress_anchors.append((self._tse_sample + sample_count, now - age))
+                self._refresh_deadline()
                 await self._start()
+                self._check_output_authority()
                 assert self._planner is not None and self._handle is not None and self._tse is not None
                 start = self._tse_sample
-                sample_count = len(pcm16) // 2
                 self._gate.append_pcm(self._stream, start_sample=start, pcm16=pcm16)
                 samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / np.float32(32768)
-                chunks = await self._tse.push(samples, start_sample=start)
+                chunks = await self._await_operation(lambda: self._tse.push(samples, start_sample=start))
                 self._tse_sample += sample_count
                 self._append_tse(chunks)
                 output = []
@@ -234,9 +296,10 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
                     planned = self._planned_ranges[0]
                     self._planned_ranges.popleft()
                     output.extend(await self._submit_with_streak(planned, event_ended=False))
-                    await self._arm_deadline(time.time() + self._config.prefix_deadline_seconds)
                 output.extend(self._drain_authorized_audio())
-                return self._result(output)
+                result = self._result(output)
+                self._refresh_deadline()
+                return result
             except asyncio.CancelledError:
                 self._begin_component_retirement()
                 raise
@@ -247,13 +310,44 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
     async def finish(self) -> InterceptionResult:
         """Close the capture prefix and turn unresolved tails into gaps."""
 
+        deadline = time.monotonic() + self._config.finish_timeout_seconds
+        task = self._finish_task
+        if task is None:
+            task = asyncio.create_task(self._finish_locked(deadline), name="prewire-capture-finish")
+            task.add_done_callback(self._consume_finish_outcome)
+            self._finish_task = task
+        elif task.done():
+            return InterceptionResult(InterceptionDecision.DROP, reason="runtime_finished")
+        try:
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, deadline - time.monotonic()))
+            if task in done:
+                result = task.result()
+                if self._output_revoked:
+                    return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="runtime_output_revoked")
+                if self._finish_result_delivered:
+                    return InterceptionResult(InterceptionDecision.DROP, reason="runtime_finished")
+                self._finish_result_delivered = True
+                self._release_output()
+                return result
+            task.cancel()
+            self._begin_component_retirement()
+            return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="finish_deadline_expired")
+        except asyncio.CancelledError:
+            task.cancel()
+            self._begin_component_retirement()
+            raise
+
+
+    async def _finish_locked(self, deadline: float) -> InterceptionResult:
+
         async with self._lock:
             if self._closed or not self._started or self._planner is None:
                 return InterceptionResult(InterceptionDecision.DROP, reason="runtime_finished")
             try:
+                self._finish_deadline = deadline
                 flush = getattr(self._tse, "flush", None)
                 if callable(flush):
-                    chunks = await flush()
+                    chunks = await self._await_operation(flush)
                     self._append_tse(chunks)
                 for planned in self._planner.finish_event():
                     self._planned_ranges.append(planned)
@@ -261,12 +355,37 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
                 while self._planned_ranges:
                     planned = self._planned_ranges.popleft()
                     finish_output.extend(await self._submit_with_streak(planned, event_ended=True))
-                end = await self._gate.finish_stream(self._stream)
+                self._cancel_unconfirmed_audio()
+                previous_settled_end = -1
+                for _ in range(self._config.extraction_max_pending_events + 1):
+                    end = await asyncio.wait_for(self._gate.finish_stream(self._stream), timeout=self._finish_remaining())
+                    if self._closed:
+                        raise InterceptionRuntimeError("runtime_closed_while_finishing")
+                    if isinstance(end, PrewireEndEvent):
+                        break
+                    if not isinstance(end, PrewireGatePlan) or not end.events:
+                        raise InterceptionRuntimeError("invalid_finish_settlement")
+                    settled_end = end.ledger_plan.original_cursor_end
+                    if settled_end <= previous_settled_end:
+                        raise InterceptionRuntimeError("finish_settlement_no_progress")
+                    previous_settled_end = settled_end
+                    self._accept_plan(end)
+                    self._gate.claim(end)
+                    self._settled_sample = end.ledger_plan.original_cursor_end
+                    for release in end.ledger_plan.releases:
+                        self._pending_audio[release.identity].claimed = True
+                    self._cancel_unconfirmed_audio()
+                    self._owner_streak = 0
+                    finish_output.extend(self._drain_authorized_audio())
+                else:
+                    raise InterceptionRuntimeError("finish_settlement_limit")
                 if self._handle is not None:
                     self._collect_extracted(self._extraction.accept_event(self._handle, end))
                 finish_output.extend(self._drain_authorized_audio())
                 await self._retire_components("capture_finished", preserve_output=True)
-                return self._result(finish_output, finished=True)
+                if self._output_revoked:
+                    return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="runtime_output_revoked")
+                return self._result(finish_output, finished=True, release_output=False)
             except asyncio.CancelledError:
                 self._begin_component_retirement()
                 raise
@@ -274,22 +393,72 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
                 await self._retire_components(f"finish_failed:{type(exc).__name__}")
                 return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason=str(exc))
 
+
+    def _finish_remaining(self) -> float:
+        assert self._finish_deadline is not None
+        remaining = self._finish_deadline - time.monotonic()
+        if remaining <= 0:
+            raise InterceptionRuntimeError("finish_deadline_expired")
+        return remaining
+
+
+    @staticmethod
+    def _consume_finish_outcome(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
     async def _expire_prefix(self) -> None:
         deadline = self._capture_deadline
         if deadline is None:
             return
-        delay = max(0.0, deadline - time.time())
+        delay = max(0.0, deadline - time.monotonic())
         await asyncio.sleep(delay)
-        async with self._lock:
-            if not self._closed and self._owner_streak < self._config.owner_streak_required:
-                await self._retire_components("prefix_deadline_expired")
+        if not self._closed and self._capture_deadline == deadline:
+            await self._retire_components("prefix_deadline_expired")
 
-    async def _arm_deadline(self, deadline: float) -> None:
+    def _arm_deadline(self, deadline: float) -> None:
+        if self._capture_deadline == deadline:
+            return
         self._capture_deadline = deadline
         task, self._deadline_task = self._deadline_task, None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
         self._deadline_task = asyncio.create_task(self._expire_prefix(), name="prewire-prefix-deadline")
+
+    def _refresh_deadline(self) -> None:
+        oldest_sample = min((identity.original_range.start for identity in self._pending_audio), default=self._settled_sample)
+        while self._ingress_anchors and self._ingress_anchors[0][0] <= oldest_sample:
+            self._ingress_anchors.popleft()
+        if self._ingress_anchors:
+            self._arm_deadline(self._ingress_anchors[0][1] + self._capture_support_seconds + self._config.prefix_deadline_seconds)
+
+    def _check_output_authority(self) -> None:
+        if self._closed or self._output_revoked:
+            raise InterceptionRuntimeError("runtime_output_revoked")
+
+    async def _await_operation(self, operation: Callable[[], Awaitable]):
+        """Bound caller waiting while retaining the actual execution owner.
+
+        Shield prevents cancellation of a to_thread wrapper from being mistaken
+        for native exit. Component close must stop delegated work, and the
+        tracked operation must itself return before factory handover.
+        """
+        self._check_output_authority()
+        timeout = self._config.scoring_deadline_seconds
+        if self._capture_deadline is not None:
+            timeout = min(timeout, self._capture_deadline - time.monotonic())
+        if self._finish_deadline is not None:
+            timeout = min(timeout, self._finish_remaining())
+        if timeout <= 0:
+            raise InterceptionRuntimeError("prefix_deadline_expired")
+        # Admission happens before constructing or scheduling model work.
+        task = asyncio.create_task(operation())
+        self._operations.add(task)
+        task.add_done_callback(self._operations.discard)
+        task.add_done_callback(self._consume_finish_outcome)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        self._check_output_authority()
+        return result
 
     async def _submit_planned(self, planned, *, event_ended: bool) -> tuple[list[bytes], bool]:
         self._segment += 1
@@ -319,14 +488,25 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         submission = self._gate.submit_interval(spec, scoring_ranges=scoring_ranges, quality_summaries=qualities)
         timeout = self._config.scoring_deadline_seconds
         if self._capture_deadline is not None:
-            timeout = min(timeout, self._capture_deadline - time.time())
+            timeout = min(timeout, self._capture_deadline - time.monotonic())
+        if self._finish_deadline is not None:
+            timeout = min(timeout, self._finish_remaining())
         if timeout <= 0:
             raise InterceptionRuntimeError("prefix_deadline_expired")
         plan = await asyncio.wait_for(self._gate.resolve(submission), timeout=timeout)
+        if self._closed:
+            raise InterceptionRuntimeError("runtime_closed_while_scoring")
+        record = self._gate.get_interval_record(identity)
+        if record is not None and record.decision is PrewireDecisionState.UNAVAILABLE:
+            if not event_ended or record.decision_reason != "scoring_window_unsupported":
+                raise InterceptionRuntimeError(record.decision_reason or "scoring_unavailable")
+        if record is not None and record.decision is PrewireDecisionState.UNCERTAIN:
+            plan = self._gate.finalize_uncertain(submission)
         if plan is None:
             return [], False
         output, owner = self._accept_plan(plan)
         self._gate.claim(plan)
+        self._settled_sample = plan.ledger_plan.original_cursor_end
         for release in plan.ledger_plan.releases:
             self._pending_audio[release.identity].claimed = True
         return output, owner
@@ -336,10 +516,8 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         pcm16 = self._gate_pcm(sample_range)
         analyze_async = getattr(self._quality_analyzer, "analyze_async", None)
         if callable(analyze_async):
-            return await analyze_async(pcm16, 16_000)
-        return await asyncio.to_thread(
-            self._quality_analyzer.analyze, pcm16, 16_000
-        )
+            return await self._await_operation(lambda: analyze_async(pcm16, 16_000))
+        return await self._await_operation(lambda: asyncio.to_thread(self._quality_analyzer.analyze, pcm16, 16_000))
 
     async def _submit_with_streak(self, planned, *, event_ended: bool) -> list[bytes]:
         """Require two consecutive KEEP windows without duplicating a score."""
@@ -430,16 +608,22 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             self._collect_extracted(events)
         return [], owner and not interrupted
 
-    def _result(self, output: list[bytes], *, finished: bool = False) -> InterceptionResult:
+    def _result(self, output: list[bytes], *, finished: bool = False, release_output: bool = True) -> InterceptionResult:
+        if self._output_revoked:
+            return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="runtime_output_revoked")
         if output:
             result = InterceptionResult(InterceptionDecision.KEEP, b"".join(output), "filtered_target_audio")
-            # No await between relinquishing identities and returning PCM.
-            self._pending_audio_bytes -= sum(map(len, self._outgoing_audio.values()))
-            self._outgoing_audio.clear()
+            if release_output:
+                self._release_output()
             return result
         if finished:
             return InterceptionResult(InterceptionDecision.DROP, reason="capture_finished")
         return InterceptionResult(InterceptionDecision.PENDING, reason="awaiting_identity_evidence")
+
+    def _release_output(self) -> None:
+        # No await between relinquishing identities and the public return.
+        self._pending_audio_bytes -= sum(map(len, self._outgoing_audio.values()))
+        self._outgoing_audio.clear()
 
     async def _retire_components(self, reason: str, *, preserve_output: bool = False) -> None:
         task = self._begin_component_retirement(preserve_output=preserve_output)
@@ -448,6 +632,8 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
 
     def _begin_component_retirement(self, *, preserve_output: bool = False) -> asyncio.Task[None]:
         self._closed = True
+        if not preserve_output:
+            self._output_revoked = True
         deadline_task, self._deadline_task = self._deadline_task, None
         if deadline_task is not None and deadline_task is not asyncio.current_task():
             deadline_task.cancel()
@@ -463,6 +649,7 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
             self._outgoing_audio.clear()
         self._pending_audio_bytes = sum(map(len, self._outgoing_audio.values()))
         self._planned_ranges.clear()
+        self._ingress_anchors.clear()
         task = self._component_retirement_task
         if task is None or (task.done() and not self._retirement_confirmed):
             self._retirement_confirmed = False
@@ -471,43 +658,86 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         return task
 
     async def _close_components(self) -> None:
-        gate_closed = False
-        try:
-            await self._gate.close()
-            gate_closed = True
-        except Exception:
-            pass
+        deadline = time.monotonic() + self._config.scoring_close_timeout_seconds
+        gate_task = self._gate_close_task
+        if gate_task is None:
+            gate_task = asyncio.create_task(self._gate.close(), name="prewire-gate-close")
+            gate_task.add_done_callback(self._consume_finish_outcome)
+            self._gate_close_task = gate_task
         tse = self._tse
-        stopped = tse is None
-        if tse is not None:
+        tse_task = self._tse_close_task
+        if tse is not None and (tse_task is None or (tse_task.done() and not self._close_task_succeeded(tse_task, require_true=True))):
+            tse_task = asyncio.create_task(tse.close(timeout=max(0.0, deadline - time.monotonic())), name="prewire-extractor-close")
+            tse_task.add_done_callback(self._consume_finish_outcome)
+            self._tse_close_task = tse_task
+        tasks = {task for task in (gate_task, tse_task) if task is not None and not task.done()}
+        if tasks:
+            await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
+        self._retirement_confirmed = self._components_stopped()
+        if self._retirement_confirmed:
+            self._tse = None
+
+
+    @staticmethod
+    def _close_task_succeeded(task: asyncio.Task | None, *, require_true: bool = False) -> bool:
+        if task is None or not task.done() or task.cancelled():
+            return False
+        try:
+            result = task.result()
+            return result is True if require_true else True
+        except Exception:
+            return False
+
+
+    def _components_stopped(self) -> bool:
+        return bool(
+            self._close_task_succeeded(self._gate_close_task)
+            and self._scheduler.retirement_confirmed
+            and (self._tse is None or self._close_task_succeeded(self._tse_close_task, require_true=True))
+            and self._explicit_owner_stopped(self._tse)
+            and self._explicit_owner_stopped(self._quality_analyzer)
+            and not any(not task.done() for task in self._operations)
+        )
+
+    @staticmethod
+    def _explicit_owner_stopped(owner) -> bool:
+        # Legacy operations remain bound by awaited completion/close. A model
+        # that additionally declares delegated physical ownership must provide
+        # its affirmative evidence, even after its coroutine returned normally.
+        try:
+            evidence = getattr(owner, "retirement_confirmed")
+        except AttributeError:
             try:
-                stopped = await tse.close(
-                    timeout=self._config.scoring_close_timeout_seconds
-                )
-                if stopped:
-                    self._tse = None
+                declaration = inspect.getattr_static(owner, "retirement_confirmed", _NO_RETIREMENT_EVIDENCE)
+                return declaration is _NO_RETIREMENT_EVIDENCE
             except Exception:
-                stopped = False
-        self._retirement_confirmed = gate_closed and bool(stopped)
+                return False
+        except Exception:
+            return False
+        return evidence is True
 
     @property
     def retirement_confirmed(self) -> bool:
+        if self._closed:
+            self._retirement_confirmed = self._components_stopped()
         return self._retirement_confirmed
 
     @property
     def retired(self) -> bool:
         task = self._component_retirement_task
-        return self._closed and self._retirement_confirmed and (task is None or task.done())
+        return self._closed and self.retirement_confirmed and not self._outgoing_audio and (task is None or task.done())
 
     async def close(self, reason: str = "retired") -> None:
-        async with self._lock:
-            await self._retire_components(reason)
+        # Fence output before waiting for a process that may be stalled in an
+        # injected model await. The owner-local cleanup task has its own budget.
+        await self._retire_components(reason)
 
 
 class PrewireInterceptionFactory(ActiveSessionInterceptionFactory):
     """Factory retaining only injected model dependencies, never model fixtures."""
 
     def __init__(self, config: InterceptionRuntimeConfig, *, score_backend, classifier, tse_factory, quality_analyzer=None):
+        _validate_config(config, score_backend)
         self._config = config
         self._score_backend = score_backend
         self._classifier = classifier
@@ -515,6 +745,11 @@ class PrewireInterceptionFactory(ActiveSessionInterceptionFactory):
         self._quality_analyzer = quality_analyzer
         self._retired = False
         self._runtimes: list[PrewireInterceptionRuntime] = []
+
+    @property
+    def is_available(self) -> bool:
+        """Static authority readiness; does not allocate a model or claim a slot."""
+        return not self._retired
 
     def create(self, generation: object, *, ingress_token: object | None) -> PrewireInterceptionRuntime:
         if self._retired:
