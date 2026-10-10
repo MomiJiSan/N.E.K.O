@@ -186,7 +186,7 @@ async def test_bridge_retries_failed_close_and_recovers_after_physical_exit():
     old = RetiringTse()
     workers = iter([old, _Tse()])
     factory = make_factory(lambda stream: next(workers))
-    bridge = ActiveSessionInterceptionBridge(factory)
+    bridge = ActiveSessionInterceptionBridge(factory, terminal_on_unavailable=True)
     await process(bridge, generation="g1")
     try:
         assert (await process(bridge, generation="g2")).decision is InterceptionDecision.UNAVAILABLE

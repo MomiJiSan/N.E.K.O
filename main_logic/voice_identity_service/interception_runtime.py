@@ -1034,6 +1034,11 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         return evidence is True
 
     @property
+    def is_closed(self) -> bool:
+        """Terminal capture fence; physical retirement remains independent."""
+        return self._closed
+
+    @property
     def retirement_confirmed(self) -> bool:
         if self._closed:
             self._retirement_confirmed = self._components_stopped()

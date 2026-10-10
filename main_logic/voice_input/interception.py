@@ -148,6 +148,7 @@ class ActiveSessionInterceptionBridge:
         process_timeout_s: float = 1.0,
         close_timeout_s: float = 1.0,
         max_inflight: int = 1,
+        terminal_on_unavailable: bool = False,
     ) -> None:
         # A declared availability value is authority evidence, not a model
         # allocation or a promise that the next runtime will start. Legacy
@@ -179,6 +180,9 @@ class ActiveSessionInterceptionBridge:
         self._ingress_token: object | None = None
         self._lock = asyncio.Lock()
         self._max_inflight = max_inflight
+        if type(terminal_on_unavailable) is not bool:
+            raise TypeError("terminal_on_unavailable must be bool")
+        self._terminal_on_unavailable = terminal_on_unavailable
         self._inflight = 0
         self._retirement_task: asyncio.Task[bool] | None = None
         self._retiring_runtime: ActiveSessionInterceptionRuntime | None = None
@@ -215,6 +219,7 @@ class ActiveSessionInterceptionBridge:
         if self._inflight >= self._max_inflight:
             return self._unavailable(generation, ingress_token, "interception_capacity")
         self._inflight += 1
+        runtime = None
         try:
           async with self._lock:
             if self._closed:
@@ -222,7 +227,8 @@ class ActiveSessionInterceptionBridge:
             if self._terminal_identity == (generation, ingress_token):
                 return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason=self._terminal_reason)
             if (not self._has_identity or self._generation != generation
-                    or self._ingress_token != ingress_token):
+                    or self._ingress_token != ingress_token
+                    or getattr(self._runtime, "is_closed", False) is True):
                 if not await self._replace_runtime(generation, ingress_token):
                     return self._unavailable(generation, ingress_token, "interception_runtime_retirement_pending")
             runtime = self._runtime
@@ -237,36 +243,43 @@ class ActiveSessionInterceptionBridge:
           try:
             result = await asyncio.wait_for(asyncio.shield(process_task), timeout=self._process_timeout_s)
           except asyncio.TimeoutError:
-            await self._abort_process(process_task, "interception_process_timeout")
-            return self._unavailable(generation, ingress_token, "interception_process_timeout")
+            failure = (self._unavailable(generation, ingress_token, "interception_process_timeout")
+                       if self._runtime is runtime else InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="interception_process_timeout"))
+            await self._abort_process(process_task, runtime, "interception_process_timeout")
+            return failure
           except asyncio.CancelledError:
-            await self._abort_process(process_task, "interception_process_cancelled")
+            await self._abort_process(process_task, runtime, "interception_process_cancelled")
             raise
           except Exception as exc:
-            await self._retire_and_wait("interception_runtime_failed")
-            return self._unavailable(generation, ingress_token, f"interception_runtime_failed:{type(exc).__name__}")
+            failure = (self._unavailable(generation, ingress_token, f"interception_runtime_failed:{type(exc).__name__}")
+                       if self._runtime is runtime else InterceptionResult(InterceptionDecision.UNAVAILABLE, reason=f"interception_runtime_failed:{type(exc).__name__}"))
+            await self._retire_and_wait("interception_runtime_failed", expected_runtime=runtime)
+            return failure
           if type(result) is not InterceptionResult:
-              await self._retire_and_wait("invalid_interception_result")
-              return self._unavailable(generation, ingress_token, "invalid_interception_result")
-          if self._generation != generation or self._ingress_token != ingress_token:
+              failure = (self._unavailable(generation, ingress_token, "invalid_interception_result")
+                         if self._runtime is runtime else InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="invalid_interception_result"))
+              await self._retire_and_wait("invalid_interception_result", expected_runtime=runtime)
+              return failure
+          if self._closed or self._runtime is not runtime or self._generation != generation or self._ingress_token != ingress_token:
               return InterceptionResult(InterceptionDecision.STALE, reason="stale_generation")
-          if result.decision is InterceptionDecision.UNAVAILABLE:
+          if result.decision is InterceptionDecision.UNAVAILABLE and self._terminal_on_unavailable:
               failure = self._unavailable(generation, ingress_token, result.reason or "interception_runtime_unavailable")
-              await self._retire_and_wait(failure.reason)
+              await self._retire_and_wait(failure.reason, expected_runtime=runtime)
               return failure
           return result
         except asyncio.CancelledError:
             # Cancellation before the runtime task exists (for example while
             # waiting for a generation replacement) still revokes ownership.
-            await self._retire_and_wait("interception_process_cancelled")
+            await self._retire_and_wait("interception_process_cancelled", expected_runtime=runtime)
             raise
         finally:
             self._inflight -= 1
 
     def _unavailable(self, generation: object, ingress_token: object | None, reason: str) -> InterceptionResult:
-        """Keep a failed capture terminal until its explicit identity changes."""
-        self._terminal_identity = (generation, ingress_token)
-        self._terminal_reason = reason
+        """The ASR owner can require a new capture after an explicit failure."""
+        if self._terminal_on_unavailable:
+            self._terminal_identity = (generation, ingress_token)
+            self._terminal_reason = reason
         return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason=reason)
 
     async def finish(
@@ -289,19 +302,19 @@ class ActiveSessionInterceptionBridge:
             try:
                 result = await asyncio.wait_for(asyncio.shield(task), self._process_timeout_s)
             except asyncio.CancelledError:
-                await self._abort_process(task, "interception_finish_cancelled")
+                await self._abort_process(task, runtime, "interception_finish_cancelled")
                 raise
             except asyncio.TimeoutError:
-                await self._abort_process(task, "interception_finish_timeout")
+                await self._abort_process(task, runtime, "interception_finish_timeout")
                 return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="interception_finish_timeout")
             except Exception as exc:
-                await self._retire_and_wait("interception_finish_failed")
+                await self._retire_and_wait("interception_finish_failed", expected_runtime=runtime)
                 return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason=f"interception_finish_failed:{type(exc).__name__}")
             if (self._closed or self._runtime is not runtime
                     or self._generation != generation or self._ingress_token != ingress_token):
                 return InterceptionResult(InterceptionDecision.STALE, reason="stale_generation")
             if type(result) is not InterceptionResult:
-                await self._retire_and_wait("invalid_interception_result")
+                await self._retire_and_wait("invalid_interception_result", expected_runtime=runtime)
                 return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="invalid_interception_result")
             return result
         finally:
@@ -384,6 +397,8 @@ class ActiveSessionInterceptionBridge:
         if self._closed:
             return False
         try:
+            if getattr(self._factory, "is_available", True) is not True:
+                raise RuntimeError("interception_factory_unavailable")
             runtime = self._factory.create(generation, ingress_token=ingress_token)
         except Exception:
             runtime = None
@@ -436,14 +451,17 @@ class ActiveSessionInterceptionBridge:
             self._retiring = False
         return bool(complete)
 
-    async def _retire_and_wait(self, reason: str) -> bool:
+    async def _retire_and_wait(self, reason: str, *, expected_runtime: ActiveSessionInterceptionRuntime | None) -> bool:
         async with self._lock:
+            if self._runtime is not expected_runtime:
+                return False
             await self._retire_runtime(reason)
         return await self._wait_retirement()
 
-    async def _abort_process(self, process_task: asyncio.Task[Any], reason: str) -> None:
+    async def _abort_process(self, process_task: asyncio.Task[Any], runtime: ActiveSessionInterceptionRuntime, reason: str) -> None:
         async with self._lock:
-            await self._retire_runtime(reason)
+            if self._runtime is runtime:
+                await self._retire_runtime(reason)
         process_task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(process_task), timeout=self._close_timeout_s)
