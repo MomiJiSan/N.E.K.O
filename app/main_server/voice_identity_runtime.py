@@ -194,6 +194,8 @@ class OwnerVoiceRuntimeRegistry:
                 manager in self._detach_pending
             )
             if not needs_attach:
+                if bool(getattr(manager, "_voice_session_activation_degraded", False)):
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 return (
                     VoiceIdentityActivationResult.READY
                     if activation is None
@@ -994,6 +996,9 @@ class OwnerVoiceRuntimeRegistry:
             "was_recoverable": installation is not None
             and installation.state is not InterceptionInstallationState.REVOKED,
             "authority_revision": self._authority_request_revision,
+            "activation": self._activation,
+            "required": self._required,
+            "required_intent_revision": self._required_intent_revision,
             "policy_token": policy_token,
             "policy_fenced": callable(getattr(manager, "voice_session_activation_policy_token", None)),
             "interception_token": interception_token,
@@ -1027,19 +1032,29 @@ class OwnerVoiceRuntimeRegistry:
         )
 
     def _authority_preparation_is_current(self, manager, captured) -> bool:
-        """Owner completion does not depend on independent interception permission."""
+        """Fence the committed Owner, not an optional request waiting for _lock.
+
+        A request revision alone does not replace the activation or its grant.
+        Required intent changes synchronously; actual activation replacement
+        changes the identity below. Neither can be adopted by this preparation.
+        """
         if self._closed or manager not in self._managers:
             return False
-        if captured["factory"] is not self._interception_factory:
-            return False
-        if captured["authority_revision"] != self._authority_request_revision:
+        if (
+            captured["activation"] is not self._activation
+            or captured["required"] is not self._required
+            or captured["required_intent_revision"] != self._required_intent_revision
+        ):
             return False
         return self._activation_policy_is_current(manager, captured)
 
     def _interception_preparation_is_current(self, manager, captured) -> bool:
         """Check both permissions without deleting a successor's pending work."""
-        return self._authority_preparation_is_current(manager, captured) and (
-            self._interception_policy_is_current(manager, captured)
+        return (
+            captured["factory"] is self._interception_factory
+            and captured["authority_revision"] == self._authority_request_revision
+            and self._authority_preparation_is_current(manager, captured)
+            and self._interception_policy_is_current(manager, captured)
         )
 
     def _queue_interception_after_authority(self, manager, captured) -> bool:
@@ -1092,6 +1107,11 @@ class OwnerVoiceRuntimeRegistry:
     async def _sync_manager_interception_after_authority(self, manager, captured) -> bool:
         if manager not in self._managers:
             return True
+        if not self._interception_enabled() and manager not in self._interception_managers:
+            # There is no interception publication or retirement to perform.
+            # An optional request cannot degrade completed Owner registration
+            # solely by changing an unused interception request fence.
+            return self._authority_preparation_is_current(manager, captured)
         if not self._queue_interception_after_authority(manager, captured):
             return False
         try:
