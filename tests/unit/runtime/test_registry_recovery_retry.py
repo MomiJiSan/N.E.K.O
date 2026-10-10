@@ -352,7 +352,7 @@ async def test_queued_interception_retry_cannot_outlive_external_policy_revocati
         await registry.restore("voice_identity_enrollment")
         assert manager not in registry._interception_pending
         assert manager not in registry._interception_manager_factories
-        assert manager not in registry._interception_installations
+        assert registry._interception_installations[manager].state is State.REVOKED
         assert factory.is_available and not factory._runtimes
         await _assert_interception_closed(manager)
     finally:
