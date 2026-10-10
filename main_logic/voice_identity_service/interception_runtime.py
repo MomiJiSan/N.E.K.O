@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import deque
 import math
 import time
@@ -717,6 +717,11 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
         return evidence is True
 
     @property
+    def is_closed(self) -> bool:
+        """Terminal capture fence; physical retirement remains independent."""
+        return self._closed
+
+    @property
     def retirement_confirmed(self) -> bool:
         if self._closed:
             self._retirement_confirmed = self._components_stopped()
@@ -745,6 +750,7 @@ class PrewireInterceptionFactory(ActiveSessionInterceptionFactory):
         self._quality_analyzer = quality_analyzer
         self._retired = False
         self._runtimes: list[PrewireInterceptionRuntime] = []
+        self._next_ingress_generation = config.ingress_generation
 
     @property
     def is_available(self) -> bool:
@@ -757,8 +763,12 @@ class PrewireInterceptionFactory(ActiveSessionInterceptionFactory):
         self._runtimes = [existing for existing in self._runtimes if not existing.retired]
         if self._runtimes:
             raise InterceptionRuntimeError("previous_runtime_retirement_pending")
+        # Captures can restart inside one authorized route. A fresh sample axis
+        # must never reuse the previous ledger/delivery identity.
+        config = replace(self._config, ingress_generation=self._next_ingress_generation)
+        self._next_ingress_generation += 1
         runtime = PrewireInterceptionRuntime(
-            self._config,
+            config,
             score_backend=self._score_backend,
             classifier=self._classifier,
             tse_factory=self._tse_factory,

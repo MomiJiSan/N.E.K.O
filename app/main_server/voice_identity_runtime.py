@@ -147,202 +147,215 @@ class OwnerVoiceRuntimeRegistry:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Owner voice runtime registry is closed")
-            if manager in self._managers:
-                if not await self._sync_manager_interception_bounded(manager):
-                    if self._interception_required or self._interception_factory is not None:
-                        self._record_interception_pending(manager)
-                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                if self._required_intent_revision is not None:
-                    generation = self._required_intent_generation or str(uuid.uuid4())
-                    self._require_manager_activation(
-                        manager,
-                        activation_generation=generation,
-                    )
-                    if not await self._set_empty_manager_authority_bounded(
-                        manager,
-                        activation_generation=generation,
-                    ):
-                        self._detach_pending[manager] = generation
-                        self._ensure_detach_watchdog()
-                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                activation = self._activation
-                needs_attach = manager in self._attach_pending or (
-                    manager in self._detach_pending
+            interception = self._capture_manager_interception(manager)
+            if manager not in self._managers and self._interception_enabled():
+                # Close the raw outlet before any activation/suppression await.
+                self._require_manager_interception(manager)
+            result = await self._register_manager_authority(manager, interception)
+            # Activation preparation can revoke a bridge. Publish only after
+            # its final require/setter, even when interception is unavailable.
+            if not await self._sync_manager_interception_after_authority(
+                manager, interception,
+            ):
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            return self._with_interception_readiness(manager, result)
+
+    async def _register_manager_authority(
+        self, manager, interception,
+    ) -> VoiceIdentityActivationResult:
+        """Apply independent Owner and suppression policies under _lock."""
+        if manager in self._managers:
+            if self._required_intent_revision is not None:
+                generation = self._required_intent_generation or str(uuid.uuid4())
+                self._require_manager_activation(
+                    manager,
+                    activation_generation=generation,
+                    preparation=interception,
                 )
-                if not needs_attach:
-                    return self._with_interception_readiness(manager,
-                        VoiceIdentityActivationResult.READY
-                        if activation is None
-                        else self._manager_activation_result(manager)
-                    )
-                if activation is None:
-                    self._attach_pending.discard(manager)
-                    result = await self._set_empty_manager_authority_bounded(
-                        manager,
-                        activation_generation=self._detach_pending.pop(
-                            manager,
-                            str(uuid.uuid4()),
-                        ),
-                    )
-                    if result:
-                        return self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
-                    self._detach_pending[manager] = str(uuid.uuid4())
+                if not await self._set_empty_manager_authority_bounded(
+                    manager,
+                    activation_generation=generation,
+                    preparation=interception,
+                ):
+                    self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
-                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                self._detach_pending.pop(manager, None)
-                policy_token = (
-                    self._require_manager_activation(
-                        manager,
-                        activation_generation=activation.generation,
-                    )
-                    if activation.required
-                    else self._manager_activation_policy_token(manager)
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            activation = self._activation
+            needs_attach = manager in self._attach_pending or (
+                manager in self._detach_pending
+            )
+            if not needs_attach:
+                return (
+                    VoiceIdentityActivationResult.READY
+                    if activation is None
+                    else self._manager_activation_result(manager)
                 )
+            if activation is None:
+                self._attach_pending.discard(manager)
+                result = await self._set_empty_manager_authority_bounded(
+                    manager,
+                    activation_generation=self._detach_pending.pop(
+                        manager,
+                        str(uuid.uuid4()),
+                    ),
+                    preparation=interception,
+                )
+                if result:
+                    return VoiceIdentityActivationResult.READY
+                self._detach_pending[manager] = str(uuid.uuid4())
+                self._ensure_detach_watchdog()
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            self._detach_pending.pop(manager, None)
+            policy_token = (
+                self._require_manager_activation(
+                    manager,
+                    activation_generation=activation.generation,
+                    preparation=interception,
+                )
+                if activation.required
+                else self._manager_activation_policy_token(manager)
+            )
+            result = await self._attach_manager_bounded(
+                manager,
+                activation,
+                expected_policy_revision=policy_token,
+            )
+            if result:
+                self._attach_pending.discard(manager)
+                return result
+            self._attach_pending.add(manager)
+            self._ensure_attach_watchdog()
+            return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+        self._managers.add(manager)
+        required_generation: str | None = None
+        policy_token: int | None = None
+        if self._activation_is_required():
+            activation = self._activation
+            required_generation = (
+                self._required_intent_generation
+                or (
+                    activation.generation
+                    if activation is not None
+                    else str(uuid.uuid4())
+                )
+            )
+            policy_token = self._require_manager_activation(
+                manager,
+                activation_generation=required_generation,
+                preparation=interception,
+            )
+        else:
+            policy_token = self._manager_activation_policy_token(manager)
+        try:
+            if self._suppressed:
+                try:
+                    await asyncio.wait_for(
+                        manager.set_voice_input_suppressed(
+                            "voice_identity_enrollment",
+                            suppressed=True,
+                        ),
+                        timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    self._restore_pending.add(manager)
+                    if self._activation is not None:
+                        self._attach_pending.add(manager)
+                        self._ensure_attach_watchdog()
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                self._restore_pending.discard(manager)
+            elif manager in self._restore_pending:
+                if await self._restore_manager_bounded(
+                    manager,
+                    "voice_identity_enrollment",
+                ):
+                    self._restore_pending.discard(manager)
+                else:
+                    self._ensure_restore_watchdog(
+                        "voice_identity_enrollment"
+                    )
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            activation = self._activation
+            if self._required_intent_revision is not None:
+                generation = required_generation or str(uuid.uuid4())
+                if not await self._set_empty_manager_authority_bounded(
+                    manager,
+                    activation_generation=generation,
+                    preparation=interception,
+                ):
+                    self._detach_pending[manager] = generation
+                    self._ensure_detach_watchdog()
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            if activation is not None:
+                self._detach_pending.pop(manager, None)
                 result = await self._attach_manager_bounded(
                     manager,
                     activation,
                     expected_policy_revision=policy_token,
                 )
-                if result:
-                    self._attach_pending.discard(manager)
-                    return self._with_interception_readiness(manager, result)
-                self._attach_pending.add(manager)
-                self._ensure_attach_watchdog()
-                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-            self._managers.add(manager)
-            if not await self._sync_manager_interception_bounded(manager):
-                # A missing model/factory is intentionally reported as
-                # degraded after installing the required fail-closed bit.  A
-                # timeout remains pending so a later watchdog can retry it.
-                if self._interception_factory is not None:
-                    self._record_interception_pending(manager)
-                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-            required_generation: str | None = None
-            policy_token: int | None = None
-            if self._activation_is_required():
-                activation = self._activation
-                required_generation = (
-                    self._required_intent_generation
-                    or (
-                        activation.generation
-                        if activation is not None
-                        else str(uuid.uuid4())
-                    )
-                )
-                policy_token = self._require_manager_activation(
-                    manager,
-                    activation_generation=required_generation,
-                )
-            else:
-                policy_token = self._manager_activation_policy_token(manager)
-            try:
-                if self._suppressed:
-                    try:
-                        await asyncio.wait_for(
-                            manager.set_voice_input_suppressed(
-                                "voice_identity_enrollment",
-                                suppressed=True,
-                            ),
-                            timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
-                        )
-                    except TimeoutError:
-                        self._restore_pending.add(manager)
-                        if self._activation is not None:
-                            self._attach_pending.add(manager)
-                            self._ensure_attach_watchdog()
-                        return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                    self._restore_pending.discard(manager)
-                elif manager in self._restore_pending:
-                    if await self._restore_manager_bounded(
-                        manager,
-                        "voice_identity_enrollment",
-                    ):
-                        self._restore_pending.discard(manager)
-                    else:
-                        self._ensure_restore_watchdog(
-                            "voice_identity_enrollment"
-                        )
-                        return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                activation = self._activation
-                if self._required_intent_revision is not None:
-                    generation = required_generation or str(uuid.uuid4())
-                    if not await self._set_empty_manager_authority_bounded(
-                        manager,
-                        activation_generation=generation,
-                    ):
-                        self._detach_pending[manager] = generation
-                        self._ensure_detach_watchdog()
-                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                if activation is not None:
-                    self._detach_pending.pop(manager, None)
-                    result = await self._attach_manager_bounded(
-                        manager,
-                        activation,
-                        expected_policy_revision=policy_token,
-                    )
-                    if not result:
-                        self._attach_pending.add(manager)
-                        self._ensure_attach_watchdog()
-                        return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                    self._attach_pending.discard(manager)
-                    self._detach_pending.pop(manager, None)
-                    return self._with_interception_readiness(manager, result)
-                if self._activation_is_required():
-                    generation = required_generation or str(uuid.uuid4())
-                    if await self._set_empty_manager_authority_bounded(
-                        manager,
-                        activation_generation=generation,
-                    ):
-                        self._detach_pending.pop(manager, None)
-                        return self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
-                    self._detach_pending[manager] = generation
-                    self._ensure_detach_watchdog()
-                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
-                return self._with_interception_readiness(manager, VoiceIdentityActivationResult.READY)
-            except asyncio.CancelledError:
-                activation = self._activation
-                if self._suppressed:
-                    # The manager belongs to the active enrollment gate. Keep it
-                    # gated until restore() ends the lease; opening it here would
-                    # admit normal PCM while every existing manager is suppressed.
-                    self._restore_pending.add(manager)
-                    if activation is not None:
-                        self._attach_pending.add(manager)
-                        self._ensure_attach_watchdog()
-                    elif self._activation_is_required():
-                        generation = required_generation or str(uuid.uuid4())
-                        self._detach_pending[manager] = generation
-                        self._ensure_detach_watchdog()
-                elif manager in self._restore_pending:
-                    self._ensure_restore_watchdog("voice_identity_enrollment")
-                    if activation is not None:
-                        self._attach_pending.add(manager)
-                        self._ensure_attach_watchdog()
-                elif activation is not None and manager in self._managers:
+                if not result:
                     self._attach_pending.add(manager)
                     self._ensure_attach_watchdog()
-                elif self._activation_is_required() and manager in self._managers:
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                self._attach_pending.discard(manager)
+                self._detach_pending.pop(manager, None)
+                return result
+            if self._activation_is_required():
+                generation = required_generation or str(uuid.uuid4())
+                if await self._set_empty_manager_authority_bounded(
+                    manager,
+                    activation_generation=generation,
+                    preparation=interception,
+                ):
+                    self._detach_pending.pop(manager, None)
+                    return VoiceIdentityActivationResult.READY
+                self._detach_pending[manager] = generation
+                self._ensure_detach_watchdog()
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            return VoiceIdentityActivationResult.READY
+        except asyncio.CancelledError:
+            activation = self._activation
+            if self._suppressed:
+                # The manager belongs to the active enrollment gate. Keep it
+                # gated until restore() ends the lease; opening it here would
+                # admit normal PCM while every existing manager is suppressed.
+                self._restore_pending.add(manager)
+                if activation is not None:
+                    self._attach_pending.add(manager)
+                    self._ensure_attach_watchdog()
+                elif self._activation_is_required():
                     generation = required_generation or str(uuid.uuid4())
                     self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
-                raise
-            except BaseException:
-                if self._suppressed:
-                    self._restore_pending.add(manager)
-                    if self._activation is not None:
-                        self._attach_pending.add(manager)
-                        self._ensure_attach_watchdog()
-                    elif self._activation_is_required():
-                        generation = required_generation or str(uuid.uuid4())
-                        self._detach_pending[manager] = generation
-                        self._ensure_detach_watchdog()
-                elif manager in self._restore_pending:
-                    self._ensure_restore_watchdog("voice_identity_enrollment")
-                elif self._activation_is_required() and manager in self._managers:
+            elif manager in self._restore_pending:
+                self._ensure_restore_watchdog("voice_identity_enrollment")
+                if activation is not None:
+                    self._attach_pending.add(manager)
+                    self._ensure_attach_watchdog()
+            elif activation is not None and manager in self._managers:
+                self._attach_pending.add(manager)
+                self._ensure_attach_watchdog()
+            elif self._activation_is_required() and manager in self._managers:
+                generation = required_generation or str(uuid.uuid4())
+                self._detach_pending[manager] = generation
+                self._ensure_detach_watchdog()
+            raise
+        except BaseException:
+            if self._suppressed:
+                self._restore_pending.add(manager)
+                if self._activation is not None:
+                    self._attach_pending.add(manager)
+                    self._ensure_attach_watchdog()
+                elif self._activation_is_required():
                     generation = required_generation or str(uuid.uuid4())
                     self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
-                raise
+            elif manager in self._restore_pending:
+                self._ensure_restore_watchdog("voice_identity_enrollment")
+            elif self._activation_is_required() and manager in self._managers:
+                generation = required_generation or str(uuid.uuid4())
+                self._detach_pending[manager] = generation
+                self._ensure_detach_watchdog()
+            raise
 
     def _with_interception_readiness(self, manager, result):
         installation = self._interception_installations.get(manager)
@@ -464,6 +477,12 @@ class OwnerVoiceRuntimeRegistry:
         noise_reduction_enabled: bool | None = None,
         allow_partial: bool = False,
     ) -> VoiceIdentityActivationResult:
+        """Replace app authority, retiring interception even for the same profile.
+
+        DSP or permission evidence may change without a profile-generation
+        change. After this activation completes, the injecting feature must
+        explicitly publish a fresh factory; a retired factory cannot be reused.
+        """
         if type(generation) is not str or not generation.strip():
             return VoiceIdentityActivationResult.RUNTIME_DEGRADED
         if type(activation_required) is not bool:
@@ -919,6 +938,58 @@ class OwnerVoiceRuntimeRegistry:
             self._interception_pending.pop(manager, None)
         return bool(updated and factory is not None)
 
+    def _capture_manager_interception(self, manager):
+        installation = self._interception_installations.get(manager)
+        policy_token = self._manager_activation_policy_token(manager)
+        return {
+            "factory": self._interception_factory,
+            "installation": installation,
+            "was_installed": installation is not None
+            and installation.state is InterceptionInstallationState.INSTALLED,
+            "authority_revision": self._authority_request_revision,
+            "policy_token": policy_token,
+            "policy_fenced": policy_token is not None,
+        }
+
+    async def _sync_manager_interception_after_authority(self, manager, captured) -> bool:
+        """Reinstall only the exact current installation our preparation revoked.
+
+        An already revoked receipt is never a recovery grant. The current
+        factory and authority revision must still be the captured owners;
+        Core's setter remains responsible for physical runtime retirement.
+        """
+        if manager not in self._managers:
+            return True
+        factory, installation = captured["factory"], captured["installation"]
+        policy_token = captured["policy_token"]
+        if captured["policy_fenced"] and policy_token is None:
+            return False
+        if captured["authority_revision"] != self._authority_request_revision:
+            return False
+        if (policy_token is not None
+                and policy_token != self._manager_activation_policy_token(manager)):
+            # A newer external Core require may run outside the registry lock.
+            # It owns the gate; this older preparation must not publish PCM.
+            self._attach_pending.discard(manager)
+            self._detach_pending.pop(manager, None)
+            self._interception_pending.pop(manager, None)
+            return False
+        if (
+            captured["was_installed"]
+            and factory is not None
+            and factory is self._interception_factory
+            and policy_token is not None
+            and manager in self._managers
+            and self._interception_installations.get(manager) is installation
+            and installation.state is InterceptionInstallationState.REVOKED
+            and getattr(factory, "is_available", True) is True
+        ):
+            self._require_manager_interception(manager)
+        ready = await self._sync_manager_interception_bounded(manager)
+        if not ready and self._interception_enabled():
+            self._record_interception_pending(manager)
+        return ready
+
     def _record_interception_pending(self, manager) -> None:
         installation = self._interception_installations.get(manager)
         if (self._interception_factory is None and self._interception_required
@@ -1043,15 +1114,23 @@ class OwnerVoiceRuntimeRegistry:
         manager,
         *,
         activation_generation: str,
+        preparation=None,
     ) -> int | None:
         require = getattr(manager, "require_voice_session_activation", None)
-        if not callable(require):
-            return None
-        try:
-            token = require(activation_generation=activation_generation)
-        except Exception:
-            return None
-        return token if type(token) is int and token >= 0 else None
+        token = None
+        if callable(require):
+            try:
+                token = require(activation_generation=activation_generation)
+            except Exception:
+                token = None
+        token = token if type(token) is int and token >= 0 else None
+        if preparation is not None:
+            preparation["policy_token"] = token
+            preparation["policy_fenced"] = (
+                preparation["policy_fenced"] or token is not None
+                or OwnerVoiceRuntimeRegistry._manager_activation_policy_token(manager) is not None
+            )
+        return token
 
     @staticmethod
     def _manager_activation_policy_token(manager) -> int | None:
@@ -1098,12 +1177,14 @@ class OwnerVoiceRuntimeRegistry:
         manager,
         *,
         activation_generation: str,
+        preparation=None,
     ) -> bool:
         activation_required = self._activation_is_required()
         policy_token = (
             self._require_manager_activation(
                 manager,
                 activation_generation=activation_generation,
+                preparation=preparation,
             )
             if activation_required
             else self._manager_activation_policy_token(manager)
@@ -1279,10 +1360,12 @@ class OwnerVoiceRuntimeRegistry:
                         )
                         if call_timeout <= 0:
                             break
+                        interception = self._capture_manager_interception(manager)
                         policy_token = (
                             self._require_manager_activation(
                                 manager,
                                 activation_generation=activation.generation,
+                                preparation=interception,
                             )
                             if activation.required
                             else self._manager_activation_policy_token(manager)
@@ -1302,7 +1385,17 @@ class OwnerVoiceRuntimeRegistry:
                             if current is not None and current.cancelling():
                                 raise
                             continue
+                        if interception["authority_revision"] != self._authority_request_revision:
+                            continue
+                        if (interception["authority_revision"] == self._authority_request_revision
+                                and policy_token is not None
+                                and policy_token != self._manager_activation_policy_token(manager)):
+                            self._attach_pending.discard(manager)
+                            continue
                         if attached:
+                            await self._sync_manager_interception_after_authority(
+                                manager, interception,
+                            )
                             self._attach_pending.discard(manager)
                             self._detach_pending.pop(manager, None)
             async with self._lock:
@@ -1503,10 +1596,12 @@ class OwnerVoiceRuntimeRegistry:
                         if call_timeout <= 0:
                             break
                         activation_required = self._activation_is_required()
+                        interception = self._capture_manager_interception(manager)
                         policy_token = (
                             self._require_manager_activation(
                                 manager,
                                 activation_generation=generation,
+                                preparation=interception,
                             )
                             if activation_required
                             else self._manager_activation_policy_token(manager)
@@ -1528,7 +1623,17 @@ class OwnerVoiceRuntimeRegistry:
                             continue
                         except Exception:
                             continue
+                        if interception["authority_revision"] != self._authority_request_revision:
+                            continue
+                        if (interception["authority_revision"] == self._authority_request_revision
+                                and policy_token is not None
+                                and policy_token != self._manager_activation_policy_token(manager)):
+                            self._detach_pending.pop(manager, None)
+                            continue
                         if detached:
+                            await self._sync_manager_interception_after_authority(
+                                manager, interception,
+                            )
                             self._detach_pending.pop(manager, None)
             async with self._lock:
                 pending_count = 0 if self._closed else len(self._detach_pending)

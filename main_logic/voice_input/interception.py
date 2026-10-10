@@ -185,12 +185,14 @@ class ActiveSessionInterceptionBridge:
         if self._inflight >= self._max_inflight:
             return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="interception_capacity")
         self._inflight += 1
+        runtime = None
         try:
           async with self._lock:
             if self._closed:
                 return InterceptionResult(InterceptionDecision.STALE, reason="bridge_closed")
             if (not self._has_identity or self._generation != generation
-                    or self._ingress_token != ingress_token):
+                    or self._ingress_token != ingress_token
+                    or getattr(self._runtime, "is_closed", False) is True):
                 if not await self._replace_runtime(generation, ingress_token):
                     return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="interception_runtime_retirement_pending")
             runtime = self._runtime
@@ -203,24 +205,24 @@ class ActiveSessionInterceptionBridge:
           try:
             result = await asyncio.wait_for(asyncio.shield(process_task), timeout=self._process_timeout_s)
           except asyncio.TimeoutError:
-            await self._abort_process(process_task, "interception_process_timeout")
+            await self._abort_process(process_task, runtime, "interception_process_timeout")
             return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="interception_process_timeout")
           except asyncio.CancelledError:
-            await self._abort_process(process_task, "interception_process_cancelled")
+            await self._abort_process(process_task, runtime, "interception_process_cancelled")
             raise
           except Exception as exc:
-            await self._retire_and_wait("interception_runtime_failed")
+            await self._retire_and_wait("interception_runtime_failed", expected_runtime=runtime)
             return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason=f"interception_runtime_failed:{type(exc).__name__}")
           if type(result) is not InterceptionResult:
-              await self._retire_and_wait("invalid_interception_result")
+              await self._retire_and_wait("invalid_interception_result", expected_runtime=runtime)
               return InterceptionResult(InterceptionDecision.UNAVAILABLE, reason="invalid_interception_result")
-          if self._generation != generation or self._ingress_token != ingress_token:
+          if self._closed or self._runtime is not runtime or self._generation != generation or self._ingress_token != ingress_token:
               return InterceptionResult(InterceptionDecision.STALE, reason="stale_generation")
           return result
         except asyncio.CancelledError:
             # Cancellation before the runtime task exists (for example while
             # waiting for a generation replacement) still revokes ownership.
-            await self._retire_and_wait("interception_process_cancelled")
+            await self._retire_and_wait("interception_process_cancelled", expected_runtime=runtime)
             raise
         finally:
             self._inflight -= 1
@@ -248,6 +250,8 @@ class ActiveSessionInterceptionBridge:
         if self._closed:
             return False
         try:
+            if getattr(self._factory, "is_available", True) is not True:
+                raise RuntimeError("interception_factory_unavailable")
             runtime = self._factory.create(generation, ingress_token=ingress_token)
         except Exception:
             runtime = None
@@ -299,14 +303,17 @@ class ActiveSessionInterceptionBridge:
             self._retiring = False
         return bool(complete)
 
-    async def _retire_and_wait(self, reason: str) -> bool:
+    async def _retire_and_wait(self, reason: str, *, expected_runtime: ActiveSessionInterceptionRuntime | None) -> bool:
         async with self._lock:
+            if self._runtime is not expected_runtime:
+                return False
             await self._retire_runtime(reason)
         return await self._wait_retirement()
 
-    async def _abort_process(self, process_task: asyncio.Task[Any], reason: str) -> None:
+    async def _abort_process(self, process_task: asyncio.Task[Any], runtime: ActiveSessionInterceptionRuntime, reason: str) -> None:
         async with self._lock:
-            await self._retire_runtime(reason)
+            if self._runtime is runtime:
+                await self._retire_runtime(reason)
         process_task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(process_task), timeout=self._close_timeout_s)

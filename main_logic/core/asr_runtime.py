@@ -50,6 +50,7 @@ from main_logic.voice_input.activation import (
     ActivationState,
     AudioFrame,
     OutputCommit,
+    OutputOrigin,
 )
 from main_logic.voice_input.preview import preview_isolation_registry
 from .voice_readiness import VoiceReadinessControl
@@ -1723,7 +1724,14 @@ class AsrRuntimeMixin:
             sample_rate_hz=frame.sample_rate,
             generation=generation,
             ingress_token=context.ingress_token,
-            captured_at=context.captured_at,
+            # A current activation lease can replay bounded, already captured
+            # audio. Its processing budget starts at interception admission;
+            # capture age still applies to live input. Keep original capture
+            # metadata on frame/context for ordering and the downstream turn.
+            captured_at=(
+                None if frame.output_origin is OutputOrigin.REPLAY
+                else context.captured_at
+            ),
         )
         if result.decision is not InterceptionDecision.KEEP:
             return None
