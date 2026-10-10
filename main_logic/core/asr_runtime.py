@@ -385,6 +385,7 @@ class AsrRuntimeMixin:
         self._active_session_interception_bridge: ActiveSessionInterceptionBridge | None = None
         self._active_session_interception_required = False
         self._active_session_interception_revision = 0
+        self._active_session_interception_policy_revision = 0
         self._active_session_interception_installation: InterceptionInstallation | None = None
         self._active_session_interception_retiring_bridge: ActiveSessionInterceptionBridge | None = None
         self._active_session_interception_retirement: asyncio.Task | None = None
@@ -582,6 +583,8 @@ class AsrRuntimeMixin:
             self._active_session_interception_required = False
         if not hasattr(self, "_active_session_interception_revision"):
             self._active_session_interception_revision = 0
+        if not hasattr(self, "_active_session_interception_policy_revision"):
+            self._active_session_interception_policy_revision = 0
         if not hasattr(self, "_active_session_interception_installation"):
             self._active_session_interception_installation = None
         if not hasattr(self, "_active_session_interception_retirement"):
@@ -1725,7 +1728,19 @@ class AsrRuntimeMixin:
         the raw outlet while an async close is pending.
         """
 
+        self._ensure_asr_runtime_state()
+        self._active_session_interception_policy_revision += 1
         return self._begin_active_session_interception_retirement("authority_revoked", required=True)
+
+    def active_session_interception_policy_token(self) -> int:
+        """Read the explicit revocation fence, separate from runtime retirement.
+
+        Bridge replacement and temporary route invalidation do not grant or
+        revoke application authority. Both synchronous authority-require
+        interfaces advance this token before they revoke output.
+        """
+        self._ensure_asr_runtime_state()
+        return self._active_session_interception_policy_revision
 
     async def _intercept_active_session_frame(
         self,
@@ -1790,6 +1805,7 @@ class AsrRuntimeMixin:
         self._voice_session_activation_sequence = 0
         self._voice_session_activation_sample_cursor = 0
         self._voice_session_activation_status = None
+        self._active_session_interception_policy_revision += 1
         self._invalidate_active_session_interception_now(
             "voice_session_activation_authority_revoke"
         )

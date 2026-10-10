@@ -47,6 +47,9 @@ class Manager:
     def voice_session_activation_policy_token(self):
         return self.core.voice_session_activation_policy_token()
 
+    def active_session_interception_policy_token(self):
+        return self.core.active_session_interception_policy_token()
+
     async def set_voice_session_activation_factory(self, factory, **kwargs):
         self.authority_calls.append((factory, kwargs))
         self.authority_entered.set()

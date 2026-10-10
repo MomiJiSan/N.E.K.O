@@ -1056,7 +1056,12 @@ class PrewireInterceptionRuntime(ActiveSessionInterceptionRuntime):
 
 
 class PrewireInterceptionFactory(ActiveSessionInterceptionFactory):
-    """Factory retaining only injected model dependencies, never model fixtures."""
+    """One physical slot for an injected backend, reusable only after retirement.
+
+    The application owns this factory and may share it across Core managers.
+    Handover is serial: creating the next runtime remains unavailable while
+    physical retirement is unconfirmed; sharing does not permit concurrency.
+    """
 
     def __init__(self, config: InterceptionRuntimeConfig, *, score_backend, classifier, tse_factory, quality_analyzer=None, candidate_factory=None, candidate_source_factory=None):
         _validate_config(config, score_backend)

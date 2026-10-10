@@ -268,8 +268,8 @@ class ActiveSessionInterceptionBridge:
               return failure
           return result
         except asyncio.CancelledError:
-            # Cancellation before the runtime task exists (for example while
-            # waiting for a generation replacement) still revokes ownership.
+            # Retire only this call's captured runtime. A call cancelled before
+            # acquiring one must not revoke a concurrent successor's owner.
             await self._retire_and_wait("interception_process_cancelled", expected_runtime=runtime)
             raise
         finally:
@@ -386,9 +386,10 @@ class ActiveSessionInterceptionBridge:
             await self._retire_runtime(reason)
             if not await self._wait_retirement():
                 raise RuntimeError("interception_runtime_retirement_timeout")
-            # Factories are application-owned and may be shared by multiple
-            # Core managers.  Their owner closes them after all bridges have
-            # detached; this bridge only retires its session runtime.
+            # The application owns the factory; this bridge retires only its
+            # session runtime. Prewire's single physical slot permits serial
+            # handover between managers, with unavailable output until the
+            # previous runtime has physically retired.
 
     async def _replace_runtime(self, generation: object, ingress_token: object | None) -> bool:
         await self._retire_runtime("generation_replaced")
