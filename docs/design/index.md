@@ -19,7 +19,6 @@ These documents preserve design intent and implementation context. They are grou
 
 ## Implemented design records
 
-- [Optional voice models and offline diagnostics](/design/optional-voice-model-tools)
 - [ASR client phase record](./asr-client-phase1)
 - [Compact chat mode](./compact-chat-mode-design)
 - [Memory event journal](./memory-event-log-rfc)
@@ -36,10 +35,6 @@ These documents preserve design intent and implementation context. They are grou
 - [小剧场设计决策记录](./neko-theater-decisions)：关键取舍、被否决方案及已知风险与未验证范围。
 
 剧本工坊 SDK 的调用、宿主与发布合同见仓库 `theater_workshop/README.md`。
-
-## Research goals and implementation foundations
-
-- [Active-session audio interception before ASR (not wired to production)](/design/active-session-audio-interception)
 
 ## Product-flow and interaction records
 
