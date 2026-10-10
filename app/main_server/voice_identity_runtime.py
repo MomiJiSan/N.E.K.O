@@ -150,8 +150,14 @@ class OwnerVoiceRuntimeRegistry:
             interception = self._capture_manager_interception(manager)
             if manager not in self._managers and self._interception_enabled():
                 # Close the raw outlet before any activation/suppression await.
-                self._require_manager_interception(manager)
-            result = await self._register_manager_authority(manager, interception)
+                self._require_manager_interception(manager, preparation=interception)
+            try:
+                result = await self._register_manager_authority(manager, interception)
+            finally:
+                # Transfer recovery ownership even when the caller cancels.
+                # This is synchronous: cancellation must not lose the receipt
+                # our preparation revoked before another await can run.
+                self._queue_interception_after_authority(manager, interception)
             # Activation preparation can revoke a bridge. Publish only after
             # its final require/setter, even when interception is unavailable.
             if not await self._sync_manager_interception_after_authority(
@@ -829,7 +835,12 @@ class OwnerVoiceRuntimeRegistry:
         factory,
         *,
         interception_required: bool,
+        preparation=None,
     ) -> bool:
+        # wait_for schedules this coroutine separately. Recheck the queued
+        # grant here, immediately before Core's synchronous setter preparation.
+        if preparation is not None and not self._interception_preparation_is_current(manager, preparation):
+            return False
         setter = getattr(manager, "set_active_session_interception_factory", None)
         if not callable(setter):
             return False
@@ -873,6 +884,7 @@ class OwnerVoiceRuntimeRegistry:
         factory,
         *,
         interception_required: bool,
+        preparation=None,
     ) -> bool:
         if not self._manager_supports_interception(manager):
             return False
@@ -882,6 +894,7 @@ class OwnerVoiceRuntimeRegistry:
                     manager,
                     factory,
                     interception_required=interception_required,
+                    preparation=preparation,
                 ),
                 timeout=_WATCHDOG_MANAGER_CALL_TIMEOUT_SECONDS,
             )
@@ -895,7 +908,7 @@ class OwnerVoiceRuntimeRegistry:
     def _interception_enabled(self) -> bool:
         return self._interception_required or self._interception_factory is not None
 
-    async def _sync_manager_interception_bounded(self, manager) -> bool:
+    async def _sync_manager_interception_bounded(self, manager, *, preparation=None) -> bool:
         """Publish the current app interception contract to one manager.
 
         ``factory=None, interception_required=True`` is a valid fail-closed
@@ -911,6 +924,7 @@ class OwnerVoiceRuntimeRegistry:
                 manager,
                 None,
                 interception_required=False,
+                preparation=preparation,
             )
             if detached:
                 self._interception_managers.discard(manager)
@@ -931,6 +945,7 @@ class OwnerVoiceRuntimeRegistry:
             manager,
             factory,
             interception_required=self._interception_required,
+            preparation=preparation,
         )
         if updated:
             self._interception_managers.add(manager)
@@ -941,64 +956,113 @@ class OwnerVoiceRuntimeRegistry:
     def _capture_manager_interception(self, manager):
         installation = self._interception_installations.get(manager)
         policy_token = self._manager_activation_policy_token(manager)
+        interception_token = self._manager_interception_policy_token(manager)
         return {
             "factory": self._interception_factory,
             "installation": installation,
-            "was_installed": installation is not None
-            and installation.state is InterceptionInstallationState.INSTALLED,
+            "was_recoverable": installation is not None
+            and installation.state is not InterceptionInstallationState.REVOKED,
             "authority_revision": self._authority_request_revision,
             "policy_token": policy_token,
             "policy_fenced": policy_token is not None,
+            "interception_token": interception_token,
+            "interception_fenced": callable(getattr(manager, "active_session_interception_policy_token", None)),
         }
 
-    async def _sync_manager_interception_after_authority(self, manager, captured) -> bool:
-        """Reinstall only the exact current installation our preparation revoked.
+    @staticmethod
+    def _manager_interception_policy_token(manager) -> int | None:
+        capture = getattr(manager, "active_session_interception_policy_token", None)
+        if not callable(capture):
+            return None
+        try:
+            token = capture()
+        except Exception:
+            return None
+        return token if type(token) is int and token >= 0 else None
+
+    def _interception_preparation_is_current(self, manager, captured) -> bool:
+        """Check ownership without deleting a successor's pending work."""
+        if self._closed or manager not in self._managers:
+            return False
+        if captured["factory"] is not self._interception_factory:
+            return False
+        if captured["authority_revision"] != self._authority_request_revision:
+            return False
+        interception_token = captured["interception_token"]
+        if captured["interception_fenced"] and (
+            interception_token is None
+            or interception_token != self._manager_interception_policy_token(manager)
+        ):
+            return False
+        token = captured["policy_token"]
+        return (not captured["policy_fenced"] or token is not None) and (
+            token is None or token == self._manager_activation_policy_token(manager)
+        )
+
+    def _queue_interception_after_authority(self, manager, captured) -> bool:
+        """Hand our recoverable receipt to the bounded retry owner on every exit.
 
         An already revoked receipt is never a recovery grant. The current
         factory and authority revision must still be the captured owners;
         Core's setter remains responsible for physical runtime retirement.
         """
-        if manager not in self._managers:
-            return True
+        if not self._interception_preparation_is_current(manager, captured):
+            if (not self._closed and manager in self._managers
+                    and captured["factory"] is self._interception_factory
+                    and captured["authority_revision"] == self._authority_request_revision
+                    and (
+                        captured["policy_token"] is not None
+                        and captured["policy_token"] != self._manager_activation_policy_token(manager)
+                        or captured["interception_token"] is not None
+                        and captured["interception_token"] != self._manager_interception_policy_token(manager)
+                    )):
+                # An external Core revoke supersedes this registry attempt.
+                # A newer registry revision instead keeps its own retry work.
+                self._attach_pending.discard(manager)
+                self._detach_pending.pop(manager, None)
+                self._interception_pending.pop(manager, None)
+            return False
         factory, installation = captured["factory"], captured["installation"]
-        policy_token = captured["policy_token"]
-        if captured["policy_fenced"] and policy_token is None:
-            return False
-        if captured["authority_revision"] != self._authority_request_revision:
-            return False
-        if (policy_token is not None
-                and policy_token != self._manager_activation_policy_token(manager)):
-            # A newer external Core require may run outside the registry lock.
-            # It owns the gate; this older preparation must not publish PCM.
-            self._attach_pending.discard(manager)
-            self._detach_pending.pop(manager, None)
-            self._interception_pending.pop(manager, None)
-            return False
         if (
-            captured["was_installed"]
+            captured["was_recoverable"]
             and factory is not None
-            and factory is self._interception_factory
-            and policy_token is not None
-            and manager in self._managers
+            and captured["policy_token"] is not None
             and self._interception_installations.get(manager) is installation
             and installation.state is InterceptionInstallationState.REVOKED
             and getattr(factory, "is_available", True) is True
         ):
-            self._require_manager_interception(manager)
-        ready = await self._sync_manager_interception_bounded(manager)
-        if not ready and self._interception_enabled():
+            self._require_manager_interception(manager, preparation=captured)
+        current = self._interception_installations.get(manager)
+        if self._interception_enabled() and (
+            current is None or current.state is not InterceptionInstallationState.INSTALLED
+        ):
             self._record_interception_pending(manager)
-        return ready
+        return True
+
+    async def _sync_manager_interception_after_authority(self, manager, captured) -> bool:
+        if manager not in self._managers:
+            return True
+        if not self._queue_interception_after_authority(manager, captured):
+            return False
+        try:
+            ready = await self._sync_manager_interception_bounded(manager, preparation=captured)
+        finally:
+            # A setter timeout/cancellation may leave a new pending receipt.
+            # Recheck the authority after that await before transferring it.
+            self._queue_interception_after_authority(manager, captured)
+        return ready and self._interception_preparation_is_current(manager, captured)
 
     def _record_interception_pending(self, manager) -> None:
         installation = self._interception_installations.get(manager)
         if (self._interception_factory is None and self._interception_required
                 or installation is not None and installation.state is InterceptionInstallationState.REVOKED):
             return
-        self._interception_pending[manager] = self._interception_factory
+        # The retry carries the authority that requested it, not just a model
+        # pointer. A revoke between attempts must invalidate the queued grant.
+        self._interception_pending[manager] = self._capture_manager_interception(manager)
         self._ensure_interception_watchdog()
 
-    def _require_manager_interception(self, manager) -> None:
+    def _require_manager_interception(self, manager, *, preparation=None) -> None:
         # Revocation also invalidates the app's successful-install cache, even
         # when the next request supplies the same factory object.
         self._interception_manager_factories.pop(manager, None)
@@ -1012,6 +1076,10 @@ class OwnerVoiceRuntimeRegistry:
                     "Owner voice interception authority revoke failed",
                     exc_info=True,
                 )
+        if preparation is not None:
+            token = self._manager_interception_policy_token(manager)
+            preparation["interception_token"] = token
+            preparation["interception_fenced"] = preparation["interception_fenced"] or token is not None
 
     def _revoke_interception_authority(self) -> None:
         """Synchronously fence old profile/session audio before activation changes."""
@@ -1126,6 +1194,9 @@ class OwnerVoiceRuntimeRegistry:
         token = token if type(token) is int and token >= 0 else None
         if preparation is not None:
             preparation["policy_token"] = token
+            interception_token = OwnerVoiceRuntimeRegistry._manager_interception_policy_token(manager)
+            preparation["interception_token"] = interception_token
+            preparation["interception_fenced"] = preparation["interception_fenced"] or interception_token is not None
             preparation["policy_fenced"] = (
                 preparation["policy_fenced"] or token is not None
                 or OwnerVoiceRuntimeRegistry._manager_activation_policy_token(manager) is not None
@@ -1385,17 +1456,16 @@ class OwnerVoiceRuntimeRegistry:
                             if current is not None and current.cancelling():
                                 raise
                             continue
-                        if interception["authority_revision"] != self._authority_request_revision:
-                            continue
-                        if (interception["authority_revision"] == self._authority_request_revision
-                                and policy_token is not None
-                                and policy_token != self._manager_activation_policy_token(manager)):
-                            self._attach_pending.discard(manager)
+                        finally:
+                            self._queue_interception_after_authority(manager, interception)
+                        if not self._interception_preparation_is_current(manager, interception):
                             continue
                         if attached:
                             await self._sync_manager_interception_after_authority(
                                 manager, interception,
                             )
+                            if not self._interception_preparation_is_current(manager, interception):
+                                continue
                             self._attach_pending.discard(manager)
                             self._detach_pending.pop(manager, None)
             async with self._lock:
@@ -1623,17 +1693,16 @@ class OwnerVoiceRuntimeRegistry:
                             continue
                         except Exception:
                             continue
-                        if interception["authority_revision"] != self._authority_request_revision:
-                            continue
-                        if (interception["authority_revision"] == self._authority_request_revision
-                                and policy_token is not None
-                                and policy_token != self._manager_activation_policy_token(manager)):
-                            self._detach_pending.pop(manager, None)
+                        finally:
+                            self._queue_interception_after_authority(manager, interception)
+                        if not self._interception_preparation_is_current(manager, interception):
                             continue
                         if detached:
                             await self._sync_manager_interception_after_authority(
                                 manager, interception,
                             )
+                            if not self._interception_preparation_is_current(manager, interception):
+                                continue
                             self._detach_pending.pop(manager, None)
             async with self._lock:
                 pending_count = 0 if self._closed else len(self._detach_pending)
@@ -1668,10 +1737,15 @@ class OwnerVoiceRuntimeRegistry:
                 async with self._lock:
                     if self._closed:
                         return
-                    targets = tuple(self._interception_pending)
+                    targets = tuple(self._interception_pending.items())
                     if not targets:
                         return
-                    for manager in targets:
+                    for manager, pending in targets:
+                        if (manager in self._managers and pending is not None
+                                and not self._interception_preparation_is_current(manager, pending)):
+                            if self._interception_pending.get(manager) is pending:
+                                self._interception_pending.pop(manager, None)
+                            continue
                         installation = self._interception_installations.get(manager)
                         if (manager in self._managers and installation is not None
                                 and installation.state is InterceptionInstallationState.REVOKED):
@@ -1698,6 +1772,7 @@ class OwnerVoiceRuntimeRegistry:
                                     manager,
                                     factory,
                                     interception_required=required,
+                                    preparation=pending if manager in self._managers else None,
                                 ),
                                 timeout=call_timeout,
                             )
@@ -1706,6 +1781,12 @@ class OwnerVoiceRuntimeRegistry:
                                 raise
                             continue
                         except Exception:
+                            continue
+                        if self._interception_pending.get(manager) is not pending:
+                            continue
+                        if (manager in self._managers and pending is not None
+                                and not self._interception_preparation_is_current(manager, pending)):
+                            self._interception_pending.pop(manager, None)
                             continue
                         if updated:
                             self._interception_pending.pop(manager, None)
