@@ -178,11 +178,14 @@ class OwnerVoiceRuntimeRegistry:
                     activation_generation=generation,
                     preparation=interception,
                 )
-                if not await self._set_empty_manager_authority_bounded(
+                detached = await self._set_empty_manager_authority_bounded(
                     manager,
                     activation_generation=generation,
                     preparation=interception,
-                ):
+                )
+                if not self._authority_preparation_is_current(manager, interception):
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                if not detached:
                     self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
                 return VoiceIdentityActivationResult.RUNTIME_DEGRADED
@@ -206,6 +209,8 @@ class OwnerVoiceRuntimeRegistry:
                     ),
                     preparation=interception,
                 )
+                if not self._authority_preparation_is_current(manager, interception):
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 if result:
                     return VoiceIdentityActivationResult.READY
                 self._detach_pending[manager] = str(uuid.uuid4())
@@ -226,6 +231,8 @@ class OwnerVoiceRuntimeRegistry:
                 activation,
                 expected_policy_revision=policy_token,
             )
+            if not self._authority_preparation_is_current(manager, interception):
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
             if result:
                 self._attach_pending.discard(manager)
                 return result
@@ -264,6 +271,8 @@ class OwnerVoiceRuntimeRegistry:
                     )
                 except TimeoutError:
                     self._restore_pending.add(manager)
+                    if not self._authority_preparation_is_current(manager, interception):
+                        return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                     if self._activation is not None:
                         self._attach_pending.add(manager)
                         self._ensure_attach_watchdog()
@@ -280,14 +289,19 @@ class OwnerVoiceRuntimeRegistry:
                         "voice_identity_enrollment"
                     )
                     return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+            if not self._authority_preparation_is_current(manager, interception):
+                return VoiceIdentityActivationResult.RUNTIME_DEGRADED
             activation = self._activation
             if self._required_intent_revision is not None:
                 generation = required_generation or str(uuid.uuid4())
-                if not await self._set_empty_manager_authority_bounded(
+                detached = await self._set_empty_manager_authority_bounded(
                     manager,
                     activation_generation=generation,
                     preparation=interception,
-                ):
+                )
+                if not self._authority_preparation_is_current(manager, interception):
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                if not detached:
                     self._detach_pending[manager] = generation
                     self._ensure_detach_watchdog()
                 return VoiceIdentityActivationResult.RUNTIME_DEGRADED
@@ -298,6 +312,8 @@ class OwnerVoiceRuntimeRegistry:
                     activation,
                     expected_policy_revision=policy_token,
                 )
+                if not self._authority_preparation_is_current(manager, interception):
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
                 if not result:
                     self._attach_pending.add(manager)
                     self._ensure_attach_watchdog()
@@ -307,11 +323,14 @@ class OwnerVoiceRuntimeRegistry:
                 return result
             if self._activation_is_required():
                 generation = required_generation or str(uuid.uuid4())
-                if await self._set_empty_manager_authority_bounded(
+                detached = await self._set_empty_manager_authority_bounded(
                     manager,
                     activation_generation=generation,
                     preparation=interception,
-                ):
+                )
+                if not self._authority_preparation_is_current(manager, interception):
+                    return VoiceIdentityActivationResult.RUNTIME_DEGRADED
+                if detached:
                     self._detach_pending.pop(manager, None)
                     return VoiceIdentityActivationResult.READY
                 self._detach_pending[manager] = generation
@@ -319,6 +338,12 @@ class OwnerVoiceRuntimeRegistry:
                 return VoiceIdentityActivationResult.RUNTIME_DEGRADED
             return VoiceIdentityActivationResult.READY
         except asyncio.CancelledError:
+            if self._suppressed:
+                self._restore_pending.add(manager)
+            elif manager in self._restore_pending:
+                self._ensure_restore_watchdog("voice_identity_enrollment")
+            if not self._authority_preparation_is_current(manager, interception):
+                raise
             activation = self._activation
             if self._suppressed:
                 # The manager belongs to the active enrollment gate. Keep it
@@ -346,6 +371,12 @@ class OwnerVoiceRuntimeRegistry:
                 self._ensure_detach_watchdog()
             raise
         except BaseException:
+            if self._suppressed:
+                self._restore_pending.add(manager)
+            elif manager in self._restore_pending:
+                self._ensure_restore_watchdog("voice_identity_enrollment")
+            if not self._authority_preparation_is_current(manager, interception):
+                raise
             if self._suppressed:
                 self._restore_pending.add(manager)
                 if self._activation is not None:
@@ -964,7 +995,7 @@ class OwnerVoiceRuntimeRegistry:
             and installation.state is not InterceptionInstallationState.REVOKED,
             "authority_revision": self._authority_request_revision,
             "policy_token": policy_token,
-            "policy_fenced": policy_token is not None,
+            "policy_fenced": callable(getattr(manager, "voice_session_activation_policy_token", None)),
             "interception_token": interception_token,
             "interception_fenced": callable(getattr(manager, "active_session_interception_policy_token", None)),
         }
@@ -980,23 +1011,35 @@ class OwnerVoiceRuntimeRegistry:
             return None
         return token if type(token) is int and token >= 0 else None
 
-    def _interception_preparation_is_current(self, manager, captured) -> bool:
-        """Check ownership without deleting a successor's pending work."""
+    @staticmethod
+    def _activation_policy_is_current(manager, captured) -> bool:
+        token = captured["policy_token"]
+        return (not captured["policy_fenced"] or token is not None) and (
+            token is None or token == OwnerVoiceRuntimeRegistry._manager_activation_policy_token(manager)
+        )
+
+    @staticmethod
+    def _interception_policy_is_current(manager, captured) -> bool:
+        token = captured["interception_token"]
+        return not captured["interception_fenced"] or (
+            token is not None
+            and token == OwnerVoiceRuntimeRegistry._manager_interception_policy_token(manager)
+        )
+
+    def _authority_preparation_is_current(self, manager, captured) -> bool:
+        """Owner completion does not depend on independent interception permission."""
         if self._closed or manager not in self._managers:
             return False
         if captured["factory"] is not self._interception_factory:
             return False
         if captured["authority_revision"] != self._authority_request_revision:
             return False
-        interception_token = captured["interception_token"]
-        if captured["interception_fenced"] and (
-            interception_token is None
-            or interception_token != self._manager_interception_policy_token(manager)
-        ):
-            return False
-        token = captured["policy_token"]
-        return (not captured["policy_fenced"] or token is not None) and (
-            token is None or token == self._manager_activation_policy_token(manager)
+        return self._activation_policy_is_current(manager, captured)
+
+    def _interception_preparation_is_current(self, manager, captured) -> bool:
+        """Check both permissions without deleting a successor's pending work."""
+        return self._authority_preparation_is_current(manager, captured) and (
+            self._interception_policy_is_current(manager, captured)
         )
 
     def _queue_interception_after_authority(self, manager, captured) -> bool:
@@ -1010,17 +1053,24 @@ class OwnerVoiceRuntimeRegistry:
             if (not self._closed and manager in self._managers
                     and captured["factory"] is self._interception_factory
                     and captured["authority_revision"] == self._authority_request_revision
-                    and (
-                        captured["policy_token"] is not None
-                        and captured["policy_token"] != self._manager_activation_policy_token(manager)
-                        or captured["interception_token"] is not None
-                        and captured["interception_token"] != self._manager_interception_policy_token(manager)
-                    )):
-                # An external Core revoke supersedes this registry attempt.
-                # A newer registry revision instead keeps its own retry work.
-                self._attach_pending.discard(manager)
-                self._detach_pending.pop(manager, None)
+                    and (not self._activation_policy_is_current(manager, captured)
+                         or not self._interception_policy_is_current(manager, captured))):
+                # Only an Owner revoke cancels Owner recovery. An independent
+                # interception revoke leaves the activation obligation intact.
+                if not self._activation_policy_is_current(manager, captured):
+                    self._attach_pending.discard(manager)
+                    self._detach_pending.pop(manager, None)
                 self._interception_pending.pop(manager, None)
+                current = self._interception_installations.get(manager)
+                if current is None:
+                    # A revoke can precede the first installation. Preserve it
+                    # in the existing receipt ledger so the next Owner retry
+                    # cannot manufacture a grant from an empty ledger entry.
+                    self._interception_installations[manager] = InterceptionInstallation(
+                        lambda _: None, state=InterceptionInstallationState.REVOKED,
+                    )
+                elif current is captured["installation"]:
+                    current.invalidate(recoverable=False)
             return False
         factory, installation = captured["factory"], captured["installation"]
         if (
@@ -1063,6 +1113,12 @@ class OwnerVoiceRuntimeRegistry:
         self._ensure_interception_watchdog()
 
     def _require_manager_interception(self, manager, *, preparation=None) -> None:
+        # Closing the raw outlet is independent of Owner readiness. A missing
+        # Owner token must still allow the first synchronous interception revoke.
+        owned = preparation is None or self._interception_policy_is_current(manager, preparation)
+        if not owned:
+            self._refresh_prepared_interception_token(manager, preparation, owned=False)
+            return
         # Revocation also invalidates the app's successful-install cache, even
         # when the next request supplies the same factory object.
         self._interception_manager_factories.pop(manager, None)
@@ -1077,9 +1133,16 @@ class OwnerVoiceRuntimeRegistry:
                     exc_info=True,
                 )
         if preparation is not None:
-            token = self._manager_interception_policy_token(manager)
-            preparation["interception_token"] = token
-            preparation["interception_fenced"] = preparation["interception_fenced"] or token is not None
+            self._refresh_prepared_interception_token(manager, preparation, owned=True)
+
+    @staticmethod
+    def _refresh_prepared_interception_token(manager, preparation, *, owned: bool) -> None:
+        # Observing the latest token cannot adopt a revoke from another owner.
+        token = OwnerVoiceRuntimeRegistry._manager_interception_policy_token(manager) if owned else None
+        preparation["interception_token"] = token
+        preparation["interception_fenced"] = (
+            preparation["interception_fenced"] or token is not None or not owned
+        )
 
     def _revoke_interception_authority(self) -> None:
         """Synchronously fence old profile/session audio before activation changes."""
@@ -1184,6 +1247,11 @@ class OwnerVoiceRuntimeRegistry:
         activation_generation: str,
         preparation=None,
     ) -> int | None:
+        if preparation is not None and not OwnerVoiceRuntimeRegistry._activation_policy_is_current(manager, preparation):
+            preparation["policy_token"] = None
+            preparation["policy_fenced"] = True
+            return None
+        interception_owned = preparation is None or OwnerVoiceRuntimeRegistry._interception_policy_is_current(manager, preparation)
         require = getattr(manager, "require_voice_session_activation", None)
         token = None
         if callable(require):
@@ -1194,9 +1262,9 @@ class OwnerVoiceRuntimeRegistry:
         token = token if type(token) is int and token >= 0 else None
         if preparation is not None:
             preparation["policy_token"] = token
-            interception_token = OwnerVoiceRuntimeRegistry._manager_interception_policy_token(manager)
-            preparation["interception_token"] = interception_token
-            preparation["interception_fenced"] = preparation["interception_fenced"] or interception_token is not None
+            OwnerVoiceRuntimeRegistry._refresh_prepared_interception_token(
+                manager, preparation, owned=interception_owned,
+            )
             preparation["policy_fenced"] = (
                 preparation["policy_fenced"] or token is not None
                 or OwnerVoiceRuntimeRegistry._manager_activation_policy_token(manager) is not None
@@ -1250,6 +1318,8 @@ class OwnerVoiceRuntimeRegistry:
         activation_generation: str,
         preparation=None,
     ) -> bool:
+        if preparation is not None and not self._authority_preparation_is_current(manager, preparation):
+            return False
         activation_required = self._activation_is_required()
         policy_token = (
             self._require_manager_activation(
@@ -1260,6 +1330,8 @@ class OwnerVoiceRuntimeRegistry:
             if activation_required
             else self._manager_activation_policy_token(manager)
         )
+        if preparation is not None and not self._authority_preparation_is_current(manager, preparation):
+            return False
         try:
             result = await asyncio.wait_for(
                 self._set_manager_activation_factory(
@@ -1458,13 +1530,13 @@ class OwnerVoiceRuntimeRegistry:
                             continue
                         finally:
                             self._queue_interception_after_authority(manager, interception)
-                        if not self._interception_preparation_is_current(manager, interception):
+                        if not self._authority_preparation_is_current(manager, interception):
                             continue
                         if attached:
                             await self._sync_manager_interception_after_authority(
                                 manager, interception,
                             )
-                            if not self._interception_preparation_is_current(manager, interception):
+                            if not self._authority_preparation_is_current(manager, interception):
                                 continue
                             self._attach_pending.discard(manager)
                             self._detach_pending.pop(manager, None)
@@ -1695,13 +1767,13 @@ class OwnerVoiceRuntimeRegistry:
                             continue
                         finally:
                             self._queue_interception_after_authority(manager, interception)
-                        if not self._interception_preparation_is_current(manager, interception):
+                        if not self._authority_preparation_is_current(manager, interception):
                             continue
                         if detached:
                             await self._sync_manager_interception_after_authority(
                                 manager, interception,
                             )
-                            if not self._interception_preparation_is_current(manager, interception):
+                            if not self._authority_preparation_is_current(manager, interception):
                                 continue
                             self._detach_pending.pop(manager, None)
             async with self._lock:
@@ -1744,7 +1816,9 @@ class OwnerVoiceRuntimeRegistry:
                         if (manager in self._managers and pending is not None
                                 and not self._interception_preparation_is_current(manager, pending)):
                             if self._interception_pending.get(manager) is pending:
-                                self._interception_pending.pop(manager, None)
+                                self._queue_interception_after_authority(manager, pending)
+                                if self._interception_pending.get(manager) is pending:
+                                    self._interception_pending.pop(manager, None)
                             continue
                         installation = self._interception_installations.get(manager)
                         if (manager in self._managers and installation is not None
@@ -1786,7 +1860,9 @@ class OwnerVoiceRuntimeRegistry:
                             continue
                         if (manager in self._managers and pending is not None
                                 and not self._interception_preparation_is_current(manager, pending)):
-                            self._interception_pending.pop(manager, None)
+                            self._queue_interception_after_authority(manager, pending)
+                            if self._interception_pending.get(manager) is pending:
+                                self._interception_pending.pop(manager, None)
                             continue
                         if updated:
                             self._interception_pending.pop(manager, None)
