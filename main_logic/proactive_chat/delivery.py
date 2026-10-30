@@ -545,11 +545,5 @@ async def _record_committed_delivery(
             active_channels=active_channels,
             source_links=source_links,
             turn_id=delivery.turn_id,
-            # UI-only content for this committed visual turn. Do not return the
-            # screenshot or infer a screen card from enabled modes alone.
-            **({"screen_observation": {"text": response_text}}
-               if delivery.vision_screenshot_b64 and response_text.strip()
-               and not source_links and primary_channel in {"chat", "vision", "unknown"}
-               else {}),
         )
     )

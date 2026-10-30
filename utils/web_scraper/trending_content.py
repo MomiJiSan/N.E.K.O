@@ -893,7 +893,7 @@ async def fetch_news_content(limit: int = 10) -> Dict[str, Any]:
     
     Chinese region: trending Weibo topics, Tieba community discussions,
     and Xiaoheihe feed
-    non-Chinese region: Twitter trends and Xiaoheihe feed
+    non-Chinese region: Twitter trends only
     
     Args:
         limit: maximum amount of content
@@ -943,33 +943,20 @@ async def fetch_news_content(limit: int = 10) -> Dict[str, Any]:
                 response['error'] = '; '.join(errors) if errors else '暂时无法获取热议话题'
             return response
 
-        logger.info("检测到非中文区域，并行获取 Twitter 与小黑盒内容")
-        twitter_result, xhh_result = await asyncio.gather(
-            fetch_twitter_trending(limit),
-            fetch_xhh_feed_content(limit),
-            return_exceptions=True,
-        )
-        if isinstance(twitter_result, Exception):
-            logger.warning(f"Twitter 热门话题获取失败: {twitter_result}")
-            twitter_result = {'success': False, 'error': str(twitter_result)}
-        if isinstance(xhh_result, Exception):
-            logger.warning(f"小黑盒首页内容获取失败: {xhh_result}")
-            xhh_result = {'success': False, 'error': str(xhh_result), 'posts': []}
-
-        success = bool(twitter_result.get('success') or xhh_result.get('success'))
+        logger.info("检测到非中文区域，获取 Twitter 热门话题")
+        try:
+            twitter_result = await fetch_twitter_trending(limit)
+        except Exception as exc:
+            logger.warning(f"Twitter 热门话题获取失败: {exc}")
+            twitter_result = {'success': False, 'error': str(exc)}
+        success = bool(twitter_result.get('success'))
         response = {
             'success': success,
             'region': region,
             'news': twitter_result,
-            'xhh': xhh_result,
         }
         if not success:
-            errors = [
-                str(item.get('error'))
-                for item in (twitter_result, xhh_result)
-                if item.get('error')
-            ]
-            response['error'] = '; '.join(errors) if errors else 'Unable to fetch trending topics'
+            response['error'] = twitter_result.get('error') or 'Unable to fetch trending topics'
         return response
     except Exception as e:
         logger.error(f"获取热议内容失败: region={region} error={e}")
@@ -1732,7 +1719,7 @@ def format_news_content(news_content: Dict[str, Any]) -> str:
     Formats automatically by region:
     - Chinese region: trending Weibo topics, Tieba community discussions,
       and Xiaoheihe feed
-    - non-Chinese region: Twitter trends and Xiaoheihe feed
+    - non-Chinese region: Twitter trends only
     
     Args:
         news_content: result returned by fetch_news_content

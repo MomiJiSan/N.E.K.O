@@ -58,7 +58,7 @@ def test_real_committed_route_preserves_dialogue_but_grants_only_registered_card
     assert response["source_links"] == body["source_links"]
     cards = response.get("proactive_recommendations", []) + ([response["music_recommendation"]]
             if response.get("music_recommendation") else [])
-    assert len(cards) == (1 if outcome == "normal" else 0)
+    assert len(cards) == (1 if outcome == "normal" and category != "screen" else 0)
     assert all(card["state"] == "pending" for card in cards)
     if outcome == "database":
         assert db_path.read_bytes() == b"Existing unreadable database must be preserved"
@@ -66,4 +66,4 @@ def test_real_committed_route_preserves_dialogue_but_grants_only_registered_card
         def count(store, _owner):
             with store._transaction() as db:
                 return db.execute("SELECT count(*) FROM recommendations").fetchone()[0]
-        assert routes._operate(count) == (1 if outcome in {"normal", "capacity"} else 0)
+        assert routes._operate(count) == (1 if outcome == "capacity" or (outcome == "normal" and category != "screen") else 0)

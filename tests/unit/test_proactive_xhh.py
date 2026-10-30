@@ -1233,33 +1233,37 @@ async def test_news_aggregates_weibo_tieba_and_xhh():
 
 
 @pytest.mark.asyncio
-async def test_news_keeps_xhh_source_outside_china_region():
-    twitter = {
-        "success": True,
-        "trending": [{"word": "#topic", "url": "https://twitter.com/topic"}],
-    }
-    xhh = {"success": True, "posts": normalize_xhh_feed(SAMPLE_PAYLOAD, limit=1)}
-    with patch(
-        "utils.web_scraper.trending_content.is_china_region",
-        return_value=False,
-    ), patch(
-        "utils.web_scraper.trending_content.fetch_twitter_trending",
-        new=AsyncMock(return_value=twitter),
-    ), patch(
-        "utils.web_scraper.trending_content.fetch_xhh_feed_content",
-        new=AsyncMock(return_value=xhh),
-    ), patch(
-        "utils.web_scraper.trending_content.fetch_neko_community_feed",
-        new=AsyncMock(),
+@pytest.mark.parametrize('twitter', [
+    {'success': True, 'trending': [{'word': '#topic', 'url': 'https://twitter.com/topic'}]},
+    {'success': False, 'error': 'Twitter unavailable'},
+    RuntimeError('Twitter failed'),
+])
+async def test_news_never_fetches_xhh_outside_china_region(twitter):
+    fetch_twitter = AsyncMock(**({'side_effect': twitter} if isinstance(twitter, Exception)
+                                 else {'return_value': twitter}))
+    with patch('utils.web_scraper.trending_content.is_china_region', return_value=False), patch(
+        'utils.web_scraper.trending_content.fetch_twitter_trending', fetch_twitter
+    ), patch('utils.web_scraper.trending_content.fetch_xhh_feed_content', new=AsyncMock()) as fetch_xhh, patch(
+        'utils.web_scraper.trending_content.fetch_neko_community_feed', new=AsyncMock()
     ) as fetch_community:
         result = await fetch_news_content(limit=2)
-
-    assert result["region"] == "non-china"
-    assert result["news"] is twitter
-    assert result["xhh"] is xhh
-    formatted = format_news_content(result)
-    assert "Xiaoheihe Home" in formatted
-    fetch_community.assert_not_awaited()
+    fetch_twitter.assert_awaited_once_with(2)
+    fetch_xhh.assert_not_called()
+    fetch_community.assert_not_called()
+    assert result['region'] == 'non-china'
+    assert 'xhh' not in result
+    assert result['success'] is (not isinstance(twitter, Exception) and twitter['success'])
+    if isinstance(twitter, Exception):
+        assert result['error'] == str(twitter)
+        assert result['news'] == {'success': False, 'error': str(twitter)}
+    else:
+        assert result['news'] is twitter
+        formatted = format_news_content(result)
+        assert 'Xiaoheihe Home' not in formatted
+        if twitter['success']:
+            assert '#topic' in formatted
+        else:
+            assert result['error'] == twitter['error']
 
 
 def test_news_links_round_robin_weibo_and_xhh():

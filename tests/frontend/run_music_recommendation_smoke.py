@@ -74,12 +74,14 @@ def main():
             if category == 'vision':
                 body['screen_observation'] = {'text': '哥哥～原来你在偷偷种菜呀！等级都一百二十六级了，地里那些金灿灿的是什么宝贝喵？'}
             await routes.attach_proactive_recommendations(body, owner, 'Neko')
+            if category == 'vision':
+                assert body['proactive_recommendations'] == []
             result.extend(body['proactive_recommendations'])
             if category == 'vision':
                 skipped_screen = {'success': True, 'action': 'chat', 'source_mode': 'chat', 'turn_id': 'screen-skip',
                                   'screen_observation': {'text': '这轮屏幕话题先略过。'}}
                 await routes.attach_proactive_recommendations(skipped_screen, owner, 'Neko')
-                result.extend(skipped_screen['proactive_recommendations'])
+                assert skipped_screen['proactive_recommendations'] == []
         return result
     content_seeds = asyncio.run(content_recommendations())
     meme_requests = []

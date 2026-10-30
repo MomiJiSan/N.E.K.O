@@ -21,7 +21,7 @@ async function click(win,selector){
     win.webContents.sendInputEvent({type:'mouseDown',button:'left',clickCount:1,...point});
     win.webContents.sendInputEvent({type:'mouseUp',button:'left',clickCount:1,...point});
 }
-async function capture(win, selector, file){
+async function capture(win, selector, file, minBlue=30){
     const deadline=Date.now()+5000;
     while(Date.now()<deadline){
         const region=await win.webContents.executeJavaScript(`({r:document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect().toJSON(),width:innerWidth})`);
@@ -31,7 +31,7 @@ async function capture(win, selector, file){
             const p=(y*size.width+x)*4;if(pixels[p]>pixels[p+2]+40 && pixels[p+2]<180)blue++;
             if(Math.max(pixels[p],pixels[p+1],pixels[p+2])<190)dark++;
         }
-        if(blue>30 && dark>15){fs.writeFileSync(path.join(output,file),capture.toPNG());return;}
+        if(blue>minBlue && dark>15){fs.writeFileSync(path.join(output,file),capture.toPNG());return;}
     }
     throw Error('Recommendation did not paint in the expected region');
 }
@@ -51,14 +51,23 @@ async function run(){
     await follower.loadURL(url+'?follower=1');await waitFor(follower,'window.smokeReady');
     await owner.loadURL(url+'?follower=1');await waitFor(owner,'window.smokeReady');
     await owner.webContents.executeJavaScript("for(const item of [...window.smokeContentRecommendations].reverse()){if(item.category==='meme'){item.content.title='表情包_2';item.content.source='斗图啦';}window.nekoRecommendations.offer(item,'content-'+item.category)}");
+    await owner.webContents.executeJavaScript(`window.__nekoMirrorChatAppend(window.reactChatWindowHost,{
+        id:'screen-dialogue',role:'assistant',author:'Neko',time:'',turnId:'content-vision',
+        blocks:[{type:'text',text:'Screen dialogue delivered once'}]});`);
+    for(const win of windows){
+        await waitFor(win,"document.querySelectorAll('[data-message-id=screen-dialogue]').length===1");
+        assert.equal(await win.webContents.executeJavaScript("!!document.querySelector('[data-proactive-category=vision]')"),false);
+    }
+    await follower.webContents.executeJavaScript("document.querySelector('[data-message-id=screen-dialogue]').scrollIntoView({block:'center',behavior:'instant'})");
+    await capture(follower,'[data-message-id=screen-dialogue]','screen-dialogue-only.png',-1);
     stage='all-source-cards-mirror';
-    await waitFor(follower,"document.querySelectorAll('.proactive-recommendation-card').length===8");
+    await waitFor(follower,"document.querySelectorAll('.proactive-recommendation-card').length===6");
     stage='retired-placeholder-replay';
     await owner.webContents.executeJavaScript(`for(const category of ['chat','news'])window.__nekoMirrorChatAppend(window.reactChatWindowHost,{
         id:'retired-'+category,role:'assistant',author:'Neko',time:'',blocks:[{
             type:'proactive_recommendation',recommendationId:crypto.randomUUID(),category,
             state:category==='chat'?'accepted':'pending',content:{title:'',source:'',url:''}}]});`);
-    await waitFor(follower,"document.querySelectorAll('.proactive-recommendation-card').length===8");
+    await waitFor(follower,"document.querySelectorAll('.proactive-recommendation-card').length===6");
     assert.equal(await follower.webContents.executeJavaScript("!!document.querySelector('[data-proactive-category=chat]')"),false);
     assert.equal(await follower.webContents.executeJavaScript("!!document.querySelector('[data-message-id^=retired-]')"),false,'retired cards do not leave empty history rows');
     await follower.webContents.executeJavaScript("document.querySelector('[data-proactive-category=\"news\"]').scrollIntoView({block:'start',behavior:'instant'})");
@@ -66,7 +75,7 @@ async function run(){
     assert.equal(await owner.webContents.executeJavaScript("fetch('/api/proactive/recommendations/events',{headers:{'X-CSRF-Token':'smoke-token'}}).then(r=>r.json()).then(x=>x.events.some(e=>e.kind==='accepted'))"),false,'direct delivery must not fabricate acceptance');
     stage='late-window-replay';
     await follower.loadURL(url+'?follower=1&late=1');
-    await waitFor(follower,"window.smokeReady && document.querySelectorAll('.proactive-recommendation-card').length===8");
+    await waitFor(follower,"window.smokeReady && document.querySelectorAll('.proactive-recommendation-card').length===6");
     await owner.webContents.executeJavaScript("window.setSmokeSurfaceMode('compact')");
     await waitFor(owner,"!!document.querySelector('.compact-proactive-recommendation-prompt [data-proactive-category=\"news\"]')");
     await capture(owner,'.compact-proactive-recommendation-prompt','content-compact-bubble.png');
@@ -81,16 +90,12 @@ async function run(){
         const selector=`[data-recommendation-id="${item.id}"]`;
         await follower.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center',behavior:'instant'})`);
         await waitFor(follower,`fetch('/api/proactive/recommendations/events',{headers:{'X-CSRF-Token':'smoke-token'}}).then(r=>r.json()).then(x=>x.events.some(e=>e.recommendation_id===${JSON.stringify(item.id)}&&e.kind==='shown'))`);
-        if(item.category==='meme' || (item.category==='vision' && !item.content.url)){
+        if(item.category==='meme'){
             assert.equal(await follower.webContents.executeJavaScript(`!!document.querySelector('${selector} .proactive-recommendation-actions')`),false,'direct material has no acceptance step');
-            if(item.category==='meme'){
-                await waitFor(follower,`document.querySelector('${selector} img')?.complete && document.querySelector('${selector} img')?.naturalWidth>0`);
-                await capture(follower,selector,'content-meme-direct.png');
-                await click(follower,selector+' .proactive-recommendation-preview-toggle');
-                await waitFor(owner,`!document.querySelector('${selector} img')`);
-            }else{
-                await capture(follower,selector,'screen-full-direct.png');
-            }
+            await waitFor(follower,`document.querySelector('${selector} img')?.complete && document.querySelector('${selector} img')?.naturalWidth>0`);
+            await capture(follower,selector,'content-meme-direct.png');
+            await click(follower,selector+' .proactive-recommendation-preview-toggle');
+            await waitFor(owner,`!document.querySelector('${selector} img')`);
             continue;
         }
         const decision=skip.has(item.category)?'skipped':'accepted';
@@ -102,10 +107,10 @@ async function run(){
     stage='durable-categorized-evidence';
     const data=await follower.webContents.executeJavaScript("fetch('/api/proactive/recommendations/events',{headers:{'X-CSRF-Token':'smoke-token'}}).then(r=>r.json())");
     assert.equal(data.events.filter(e=>e.kind==='accepted').length,3);
-    assert.equal(data.events.filter(e=>e.kind==='shown').length,8);
+    assert.equal(data.events.filter(e=>e.kind==='shown').length,6);
     assert.equal(data.events.filter(e=>e.kind==='skipped').length,2);
     assert.equal(external.length,3,'concurrent acceptance opens community once; video and web open once');
-    assert.equal(new Set(data.events.map(e=>e.category)).size,7);
+    assert.equal(new Set(data.events.map(e=>e.category)).size,6);
     assert.equal(data.events.some(e=>['playing','paused','ended'].includes(e.kind)),false);
     for(const win of windows)assert.equal(await win.webContents.executeJavaScript("document.querySelectorAll('audio').length"),0);
     stage='narrow-dark';
@@ -115,7 +120,7 @@ async function run(){
     assert.equal(await follower.webContents.executeJavaScript("[...document.querySelectorAll('.proactive-recommendation')].some(e=>e.scrollWidth>e.clientWidth+1)"),false);
     fs.writeFileSync(path.join(output,'content-narrow-dark.png'),(await follower.webContents.capturePage()).toPNG());
     assert.equal(errors.length,0,errors.join('\n'));
-    fs.writeFileSync(path.join(output,'result.json'),JSON.stringify({ok:true,electron:process.versions.electron,productionDesktopIPC:true,isolatedSessions:true,categories:7,directMaterialWithoutAcceptance:true,retiredPlaceholdersHidden:true,external,events:data.events.map(e=>({category:e.category,kind:e.kind})),errors},null,2));
+    fs.writeFileSync(path.join(output,'result.json'),JSON.stringify({ok:true,electron:process.versions.electron,productionDesktopIPC:true,isolatedSessions:true,categories:6,directMaterialWithoutAcceptance:true,retiredPlaceholdersHidden:true,external,events:data.events.map(e=>({category:e.category,kind:e.kind})),errors},null,2));
 }
 app.whenReady().then(run).then(()=>{for(const win of windows)win.destroy();app.exit(0);}).catch(async error=>{
     for(const [index,win] of windows.entries())try{fs.writeFileSync(path.join(output,'content-failure-'+index+'.png'),(await win.webContents.capturePage()).toPNG());}catch{}

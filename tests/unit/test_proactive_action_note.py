@@ -194,14 +194,14 @@ def test_action_note_unknown_channel_falls_back_to_source_links():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('screenshot', 'links', 'text', 'expected'), [
-    ('private-image', [], 'You are tending a farm.', True),
-    (None, [], 'Ordinary dialogue', False),
-    ('private-image', [{'url': 'https://example.com/news'}], 'A link', False),
-    ('private-image', [], '  ', False),
+@pytest.mark.parametrize(('screenshot', 'links', 'text'), [
+    ('private-image', [], 'You are tending a farm.'),
+    (None, [], 'Ordinary dialogue'),
+    ('private-image', [{'url': 'https://example.com/news'}], 'A link'),
+    ('private-image', [], '  '),
 ])
 @pytest.mark.parametrize(('primary_channel', 'source_tag'), [('chat', 'CHAT'), ('unknown', ''), ('vision', 'CHAT')])
-async def test_only_committed_visual_content_carries_a_screen_presentation(monkeypatch, screenshot, links, text, expected, primary_channel, source_tag):
+async def test_committed_visual_dialogue_does_not_create_another_screen_presentation(monkeypatch, screenshot, links, text, primary_channel, source_tag):
     for name in ('_record_proactive_chat', '_record_proactive_material', '_mini_game_invite_count_post_response_chat'):
         monkeypatch.setattr(proactive_delivery, name, MagicMock())
     monkeypatch.setattr(proactive_delivery, '_increment_proactive_chat_total', AsyncMock())
@@ -216,9 +216,9 @@ async def test_only_committed_visual_content_carries_a_screen_presentation(monke
         selected_music_topic_key=None, selected_meme_link=None, selected_meme_topic_key=None,
         meme_content=None,
     )
-    assert ('screen_observation' in result.body) is expected
-    if expected:
-        assert result.body['screen_observation'] == {'text': text}
+    assert 'screen_observation' not in result.body
+    assert result.body['source_links'] == links
+    assert result.body['turn_id'] == 'visual-turn'
     assert 'private-image' not in str(result.body)
 
 

@@ -88,7 +88,7 @@ async def attach_music_recommendation(body: dict, expected_owner: dict, characte
 
 
 async def attach_proactive_recommendations(body: dict, expected_owner: dict, character: str):
-    """Register committed content; screen text is UI-only, never evidence."""
+    """Register linked content; dialogue is already delivered by the chat stream."""
     if not body.get("success") or body.get("action") != "chat":
         return
     channel = body.get("channel")
@@ -119,13 +119,6 @@ async def attach_proactive_recommendations(body: dict, expected_owner: dict, cha
                             "artist": str(link.get("source") or parsed.hostname)[:120], "url": raw_url, "cover": ""}))
         if len(candidates) == 3:
             break
-    observation = body.get("screen_observation")
-    screen_text = observation.get("text") if isinstance(observation, dict) else None
-    if not candidates and isinstance(screen_text, str) and screen_text.strip():
-        candidates.append(("vision", {"name": screen_text.strip()[:240],
-                                     "artist": "", "url": "", "cover": ""}))
-    # Unmarked ordinary dialogue still has no card. A committed visual turn
-    # carries explicit display text, but the ledger retains only its category.
 
     def create(store, owner):
         if owner != expected_owner:
@@ -134,8 +127,7 @@ async def attach_proactive_recommendations(body: dict, expected_owner: dict, cha
                     if key.startswith("proactive") and isinstance(value, (bool, int))}
         result = []
         for category, content in candidates:
-            metadata = {"name": "", "artist": "", "url": ""} if category == "vision" and not content["url"] else content
-            record = store.create(owner, character, str(body.get("turn_id") or ""), metadata, settings, category=category, control=_control(owner))
+            record = store.create(owner, character, str(body.get("turn_id") or ""), content, settings, category=category, control=_control(owner))
             result.append({"id": record["id"], "category": category, "state": record["state"],
                            "expires_at": record["expires_at"], "content": {
                                "title": content["name"], "source": content["artist"], "url": content["url"],

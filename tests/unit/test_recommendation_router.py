@@ -213,32 +213,18 @@ async def test_unclassified_real_link_uses_web_instead_of_generic_topic(client):
 
 
 @pytest.mark.asyncio
-async def test_committed_screen_observation_has_feedback_without_retaining_screen_text(client, monkeypatch):
-    http, snapshot = client
-    body = {'success': True, 'action': 'chat', 'source_mode': 'chat', 'turn_id': 'visual-turn',
+@pytest.mark.parametrize('mode', ['chat', 'vision'])
+async def test_screen_dialogue_does_not_register_a_duplicate_card(client, mode):
+    http, _ = client
+    body = {'success': True, 'action': 'chat', 'source_mode': mode, 'turn_id': 'visual-turn',
             'screen_observation': {'text': 'Private screen observation'}, 'source_links': []}
-    owner = await routes.capture_owner()
-    await routes.attach_proactive_recommendations(body, owner, 'Neko')
-    rec = body['proactive_recommendations'][0]
-    assert rec['category'] == 'vision'
-    assert rec['content'] == {'title': 'Private screen observation', 'source': '', 'url': ''}
-    endpoint = f"/api/proactive/recommendations/{rec['id']}/events"
-    assert http.post(endpoint, json={'event_id': 'visual-shown', 'kind': 'shown'}).status_code == 200
-    monkeypatch.setattr(routes, 'load_global_conversation_settings', lambda: {'proactiveVisionEnabled': False})
-    assert http.post(endpoint, json={'event_id': 'visual-choice', 'kind': 'accepted'}).json()['error_code'] == 'recommendation_disabled'
-    monkeypatch.setattr(routes, 'load_global_conversation_settings', lambda: {'proactiveVisionEnabled': True})
-    accepted = http.post(endpoint, json={'event_id': 'visual-choice', 'kind': 'accepted'}).json()
-    assert accepted['state'] == 'accepted' and not accepted['playback_grant']
-    events = http.get('/api/proactive/recommendations/events').json()['events']
-    assert [event['kind'] for event in events] == ['shown', 'accepted']
-    assert all(event['category'] == 'vision' for event in events)
-    def stored(store, owner):
-        with store._transaction() as db:
-            return str([tuple(row) for row in db.execute('SELECT * FROM recommendations')])
-    assert 'Private screen observation' not in await routes.asyncio.to_thread(routes._operate, stored)
-    snapshot['local_user_id'] = 'replacement'
-    await routes.attach_proactive_recommendations(body, owner, 'Neko')
+    await routes.attach_proactive_recommendations(body, await routes.capture_owner(), 'Neko')
     assert body['proactive_recommendations'] == []
+    def stored_count(store, owner):
+        with store._transaction() as db:
+            return db.execute('SELECT count(*) FROM recommendations').fetchone()[0]
+    assert await routes.asyncio.to_thread(routes._operate, stored_count) == 0
+    assert http.get('/api/proactive/recommendations/events').json()['events'] == []
 
 
 @pytest.mark.asyncio
