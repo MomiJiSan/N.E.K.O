@@ -52,6 +52,12 @@ from .workers.grok import (
     _normalize_grok_language,
     grok_asr_worker as _grok_asr_worker,
 )
+from .workers.local_streaming import (
+    configuration_is_available as is_local_streaming_asr_configured,
+    local_streaming_asr_worker as _local_streaming_asr_worker,
+    normalize_language as _normalize_local_streaming_language,
+)
+from .local_service import retain_ready as _retain_local_service
 from .workers.openai import (
     _normalize_openai_language,
     openai_asr_worker as _openai_asr_worker,
@@ -113,6 +119,7 @@ _PROVIDER_LANGUAGE_VALIDATORS: dict[str, Callable[[str], str | None]] = {
     "step": _step_language_code,
     "grok": _normalize_grok_language,
     "faster_whisper": _whisper_language_code,
+    "local_streaming": _normalize_local_streaming_language,
 }
 
 
@@ -155,7 +162,10 @@ _IMPLEMENTED_WORKERS: dict[str, _AsrWorkerFn] = {
     "gemini": _gemini_asr_worker,
     "soniox": _soniox_asr_worker,
     "faster_whisper": _faster_whisper_asr_worker,
+    "local_streaming": _local_streaming_asr_worker,
 }
+
+_RESOURCE_LEASE_FACTORIES = {"local_streaming": _retain_local_service}
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +180,9 @@ class _AsrSelection:
         compare=False,
     )
     _api_key: str = field(default="", repr=False, compare=False)
+    _resource_lease_factory: Callable[[], object | None] | None = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 def _load_core_config() -> dict:
@@ -221,18 +234,17 @@ def _optional_dependency_available(module_name: str | None) -> bool:
 
 
 def is_local_asr_available() -> bool:
-    """Return whether a user-selectable local ASR provider can start here.
+    """Keep the legacy UI flag specific to the faster-whisper dependency.
 
     Uses the same dependency probe as provider selection, so the UI and the
     resolver cannot disagree. The probe consults the import system, which may
     touch the filesystem: call it via ``asyncio.to_thread`` from async code.
     """
 
-    return any(
-        meta.user_selectable
-        and meta.availability is _AsrProviderAvailability.IMPLEMENTED
+    meta = _ASR_PROVIDER_REGISTRY["faster_whisper"]
+    return (
+        meta.availability is _AsrProviderAvailability.IMPLEMENTED
         and _optional_dependency_available(meta.optional_dependency)
-        for meta in _ASR_PROVIDER_REGISTRY.values()
     )
 
 
@@ -279,6 +291,7 @@ def _resolve_user_selected_provider(
         provider_key=preference,
         endpointing_mode=endpointing_mode,
         _worker_fn=worker_fn,
+        _resource_lease_factory=_RESOURCE_LEASE_FACTORIES.get(preference),
     )
 
 

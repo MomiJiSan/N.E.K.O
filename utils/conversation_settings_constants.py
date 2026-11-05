@@ -53,7 +53,7 @@ ALLOWED_CONVERSATION_SETTINGS = frozenset({
 # Core route; every other value must be a user-selectable provider key in
 # main_logic/asr_client/_registry_meta.py (kept in sync by a unit test, since
 # utils must not import main_logic).
-INDEPENDENT_ASR_PROVIDER_PREFERENCES = frozenset({"auto", "faster_whisper"})
+INDEPENDENT_ASR_PROVIDER_PREFERENCES = frozenset({"auto", "faster_whisper", "local_streaming"})
 
 
 def normalize_independent_asr_provider_preference_handshake(

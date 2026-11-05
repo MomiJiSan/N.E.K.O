@@ -19,7 +19,7 @@ from enum import Enum
 from typing import Literal
 
 
-AsrProviderCategory = Literal["dummy", "ws_streaming", "segmented_request"]
+AsrProviderCategory = Literal["dummy", "ws_streaming", "local_streaming", "segmented_request"]
 AsrEndpointingMode = Literal["manual", "provider"]
 AsrImplementationStatus = Literal[
     "implemented",
@@ -310,9 +310,35 @@ ASR_PROVIDER_REGISTRY: dict[str, AsrProviderMeta] = {
             ("ASR_SONIOX_REPLAY_INCOMPLETE", AsrFailureRule(use_delivery_notice=True)),
         ),
     ),
-    # Local faster-whisper. It is never a Core route: users opt in through the
+    # Local recognizers are never Core routes: users opt in through the
     # voice-recognition settings, and Core capability (``free`` disables
     # independent ASR entirely) is still checked before this preference.
+    "local_streaming": AsrProviderMeta(
+        provider_key="local_streaming",
+        category="local_streaming",
+        worker_input_sample_rate_hz=16_000,
+        wire_sample_rate_hz=16_000,
+        supported_endpointing_modes=frozenset({"manual"}),
+        implementation_status="implemented",
+        requires_smart_turn=True,
+        requires_credential=False,
+        user_selectable=True,
+        replay_policy="none",
+        provider_final_timeout_ms=10_000,
+        supports_result_preserving_finish=True,
+        supports_interception_delivery=True,
+        failure_rules=tuple(
+            (code, AsrFailureRule(use_delivery_notice=True))
+            for code in (
+                "ASR_LOCAL_CONFIG_INVALID",
+                "ASR_LOCAL_NOT_PREPARED",
+                "ASR_LOCAL_SERVICE_UNAVAILABLE",
+                "ASR_LOCAL_PROTOCOL_ERROR",
+                "ASR_LOCAL_SERVICE_TIMEOUT",
+                "ASR_LOCAL_WORKER_FAILED",
+            )
+        ),
+    ),
     "faster_whisper": AsrProviderMeta(
         provider_key="faster_whisper",
         category="segmented_request",

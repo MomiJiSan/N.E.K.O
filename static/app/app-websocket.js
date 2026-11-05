@@ -1733,27 +1733,25 @@
     // 一致；抽成共享 helper 防止下次又单边演进。
     function flushRealisticBufferOnTurnEnd() {
         var endingTurnId = resolveAssistantLifecycleTurnId();
-        if (endingTurnId) {
-            emitAssistantLifecycleEvent('neko-assistant-turn-ending', {
-                turnId: endingTurnId,
-                source: 'turn_end_flush'
-            });
+        var endingQueueVersion = window._realisticGeminiVersion || 0;
+        var endingBubbles = Array.isArray(window.currentTurnGeminiBubbles)
+            ? window.currentTurnGeminiBubbles.slice() : [];
+        if (window.currentGeminiMessage && endingBubbles.indexOf(window.currentGeminiMessage) === -1) {
+            endingBubbles.push(window.currentGeminiMessage);
         }
-        if (typeof window.setReactMessageStatus === 'function' && window.currentGeminiMessage) {
-            window.setReactMessageStatus(window.currentGeminiMessage, 'assistant', 'sent');
-        }
+        // Completion belongs to this response segment, not a dialog turn ID
+        // (one dialog may contain multiple segments). Delayed/synchronous queue
+        // drains must create its trailing bubbles as sent, even before mount.
+        window._realisticGeminiCompletedVersion = endingQueueVersion;
         window._geminiTurnEndSealed = true;
         window._pendingMusicCommand = '';
-        if (window._structuredGeminiStreaming) {
-            window._realisticGeminiBuffer = '';
-            window._structuredGeminiStreaming = false;
-            return;
-        }
-        var rest = typeof window._realisticGeminiBuffer === 'string'
+        var wasStructured = window._structuredGeminiStreaming;
+        var rest = !wasStructured && typeof window._realisticGeminiBuffer === 'string'
             ? window._realisticGeminiBuffer.replace(/\[play_music:[^\]]*(\]|$)/g, '')
             : '';
         rest = rest.replace(/\[play_music:[^\]]*(\]|$)/g, '');
         window._realisticGeminiBuffer = '';
+        window._structuredGeminiStreaming = false;
         var trimmed = rest.replace(/^\s+/, '').replace(/\s+$/, '');
         if (trimmed) {
             window._realisticGeminiQueue = window._realisticGeminiQueue || [];
@@ -1761,9 +1759,23 @@
                 text: trimmed,
                 turnId: endingTurnId || null
             });
-            if (typeof window.processRealisticQueue === 'function') {
-                window.processRealisticQueue(window._realisticGeminiVersion || 0);
-            }
+        }
+        if (endingTurnId) {
+            emitAssistantLifecycleEvent('neko-assistant-turn-ending', {
+                turnId: endingTurnId,
+                source: 'turn_end_flush'
+            });
+        }
+        // Listeners/host updates can re-enter the renderer. Only patch the
+        // captured old refs, and never drain a successor's global queue.
+        if (typeof window.setReactMessageStatus === 'function') {
+            endingBubbles.forEach(function (bubble) {
+                window.setReactMessageStatus(bubble, 'assistant', 'sent');
+            });
+        }
+        if (!wasStructured && (window._realisticGeminiVersion || 0) === endingQueueVersion
+                && typeof window.processRealisticQueue === 'function') {
+            window.processRealisticQueue(endingQueueVersion);
         }
     }
 
@@ -2531,19 +2543,24 @@
      * only bypasses completed cache data; the generation fence remains a
      * defensive guard around request publication.
      */
-    function publishCoreApiCapability(provider, capability, localAsrAvailable) {
+    function publishCoreApiCapability(provider, capability, localAsrAvailable, localStreamingAsrConfigured) {
         var previousProvider = S.coreApiProvider || '';
         var previousCapability = S.coreApiSupportsIndependentAsr;
         var previousLocalAsrAvailable = S.localAsrAvailable;
+        var previousLocalStreamingConfigured = S.localStreamingAsrConfigured;
         S.coreApiProvider = typeof provider === 'string' ? provider : '';
         S.coreApiSupportsIndependentAsr =
             typeof capability === 'boolean' ? capability : null;
         S.localAsrAvailable =
             typeof localAsrAvailable === 'boolean' ? localAsrAvailable : null;
+        S.localStreamingAsrConfigured =
+            typeof localStreamingAsrConfigured === 'boolean'
+                ? localStreamingAsrConfigured : null;
         if (
             previousProvider !== S.coreApiProvider
             || previousCapability !== S.coreApiSupportsIndependentAsr
             || previousLocalAsrAvailable !== S.localAsrAvailable
+            || previousLocalStreamingConfigured !== S.localStreamingAsrConfigured
         ) {
             try {
                 window.dispatchEvent(new CustomEvent(
@@ -2612,7 +2629,8 @@
                     ? data.effectiveCoreApi
                     : data.coreApi,
                 data.supportsIndependentAsr,
-                data.localAsrAvailable
+                data.localAsrAvailable,
+                data.localStreamingAsrConfigured
             );
         }).catch(function (error) {
             console.warn('[Core API] Failed to refresh ASR capability:', error);
@@ -2661,6 +2679,137 @@
      * @param {number} timeoutMs  timeout in ms (default 5000)
      * @returns {Promise<void>}
      */
+    async function prepareLocalStreamingAsr(isCurrent, options) {
+        if (S.independentAsrEnabled !== true
+                || S.independentAsrProviderPreference !== 'local_streaming'
+                || S.coreApiSupportsIndependentAsr === false) {
+            return { release: async function () {} };
+        }
+        var epoch = S.voiceSessionStartEpoch;
+        var random = window.crypto;
+        if (!random) throw new Error('ASR_LOCAL_PREPARE_SECURITY_UNAVAILABLE');
+        var requestId;
+        if (typeof random.randomUUID === 'function') {
+            requestId = random.randomUUID();
+        } else {
+            // getRandomValues also works on the existing HTTP/LAN frontend.
+            var bytes = random.getRandomValues(new Uint8Array(16));
+            bytes[6] = (bytes[6] & 15) | 64;
+            bytes[8] = (bytes[8] & 63) | 128;
+            var hex = Array.from(bytes, function (value) { return value.toString(16).padStart(2, '0'); }).join('');
+            requestId = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+        }
+        var controller = new AbortController();
+        var timeoutMs = options && options.timeoutMs || 20000;
+        var timedOut = false;
+        var cancelled = false;
+        var released = false;
+        var headers = null;
+        function current() {
+            return S.voiceSessionStartEpoch === epoch && isCurrent()
+                && S.independentAsrEnabled === true
+                && S.independentAsrProviderPreference === 'local_streaming'
+                && S.coreApiSupportsIndependentAsr !== false;
+        }
+        function abortError() {
+            var error = new Error(timedOut ? 'ASR_LOCAL_PREPARE_TIMEOUT' : 'ASR_LOCAL_PREPARE_CANCELLED');
+            error.voiceStartCancelled = !timedOut;
+            error.microphoneStartCancelled = !timedOut;
+            return error;
+        }
+        async function bounded(promise) {
+            promise = Promise.resolve(promise);
+            if (controller.signal.aborted) {
+                promise.catch(function () {});
+                throw abortError();
+            }
+            var rejectAbort;
+            var aborted = new Promise(function (_, reject) {
+                rejectAbort = function () { reject(abortError()); };
+                controller.signal.addEventListener('abort', rejectAbort, { once: true });
+            });
+            try { return await Promise.race([promise, aborted]); }
+            finally { controller.signal.removeEventListener('abort', rejectAbort); }
+        }
+        async function release() {
+            if (released) return;
+            released = true;
+            if (!headers) return;
+            var cleanup = new AbortController();
+            var stop = setTimeout(function () { cleanup.abort(); }, 2000);
+            try {
+                await window.fetch('/api/config/local-asr/prepare/' + requestId, {
+                    method: 'DELETE', credentials: 'same-origin', headers: headers,
+                    signal: cleanup.signal, keepalive: true,
+                });
+            } catch (_) { /* The bounded server lease remains a final fallback. */ }
+            finally { clearTimeout(stop); }
+        }
+        var timer = setTimeout(function () { timedOut = true; controller.abort(); }, timeoutMs);
+        var watch = setInterval(function () {
+            if (!current()) { cancelled = true; controller.abort(); }
+        }, 50);
+        try {
+            if (!current()) throw abortError();
+            var security = window.nekoLocalMutationSecurity;
+            if (!security || typeof security.getMutationHeaders !== 'function') {
+                throw new Error('ASR_LOCAL_PREPARE_SECURITY_UNAVAILABLE');
+            }
+            headers = Object.assign({ 'Content-Type': 'application/json' },
+                await bounded(security.getMutationHeaders()));
+            if (!current()) throw abortError();
+            if (typeof window.showVoicePreparingToast === 'function') {
+                window.showVoicePreparingToast(window.t ? window.t('microphone.localAsrServicePreparing') : 'Preparing local speech recognition…', {
+                    owner: requestId,
+                    cancelLabel: window.t ? window.t('microphone.localAsrPrepareCancel') : 'Cancel',
+                    onCancel: function () {
+                        if (current()) { cancelled = true; controller.abort(); }
+                    },
+                });
+            }
+            var response = await bounded(window.fetch('/api/config/local-asr/prepare', {
+                method: 'POST', credentials: 'same-origin', headers: headers,
+                body: JSON.stringify({ request_id: requestId, enabled: true, provider: 'local_streaming' }),
+                signal: controller.signal,
+            }));
+            var value = await bounded(response.json());
+            while (true) {
+                if (!current()) throw abortError();
+                if (!response.ok || value.success !== true
+                        || ['failed', 'cancelled', 'expired', 'stopped'].indexOf(value.state) !== -1) {
+                    var code = value.error_code || value.code || 'ASR_LOCAL_PREPARE_FAILED';
+                    throw new Error(window.t ? window.t('microphone.localAsrServicePrepareFailed', { code: code }) : 'Local ASR preparation failed: ' + code);
+                }
+                if (value.ready === true && value.state === 'ready') return { release: release };
+                if (typeof value.operation_id !== 'string'
+                        || !/^[0-9a-f-]{36}$/.test(value.operation_id)) {
+                    throw new Error('ASR_LOCAL_PREPARE_PROTOCOL_ERROR');
+                }
+                await bounded(new Promise(function (resolve) { setTimeout(resolve, 150); }));
+                if (!current()) throw abortError();
+                response = await bounded(window.fetch('/api/config/local-asr/operations/' + value.operation_id, {
+                    credentials: 'same-origin', headers: headers, signal: controller.signal,
+                }));
+                value = await bounded(response.json());
+            }
+        } catch (error) {
+            await release();
+            if (cancelled || !current() || controller.signal.aborted) throw abortError();
+            throw error;
+        } finally {
+            clearTimeout(timer);
+            clearInterval(watch);
+            // Remove only this operation's cancel control, leaving other toast
+            // owners free to publish their own preparation state.
+            if (typeof document !== 'undefined') {
+                var cancel = document.getElementById('voice-preparing-cancel');
+                if (cancel && cancel._voicePrepareOwner === requestId) cancel.remove();
+            }
+        }
+    }
+    window.prepareLocalStreamingAsr = prepareLocalStreamingAsr;
+    mod.prepareLocalStreamingAsr = prepareLocalStreamingAsr;
+
     function ensureWebSocketOpen(timeoutMs = 5000) {
         // Settings-sync gate: toggling independent ASR publishes its in-flight
         // settings POST as S.pendingSettingsSyncPromise (app-audio-capture.js).
@@ -2855,8 +3004,9 @@
                     if (msg && msg.action === 'start_session' && S.settingsHydrated === true
                             && S.independentAsrProviderPreferenceAuthoritative === true) {
                         msg.independent_asr_provider_preference =
-                            S.independentAsrProviderPreference === 'faster_whisper'
-                                ? 'faster_whisper' : 'auto';
+                            ['faster_whisper', 'local_streaming'].indexOf(
+                                S.independentAsrProviderPreference
+                            ) !== -1 ? S.independentAsrProviderPreference : 'auto';
                         handshakeStamped = true;
                     }
                     if (msg && msg.action === 'start_session') {
@@ -4635,6 +4785,7 @@
 
                             setTimeout(async function () {
                                 var restartStartOwner = null;
+                                var restartLocalAsrPreparation = null;
 
                                 // Every point where this flow resumes from an await asks the
                                 // same question, and asking only part of it is how round
@@ -4746,6 +4897,11 @@
                                     // stand-down runs. Hence the check between the two lines
                                     // that follow (codex P2).
                                     await ensureWebSocketOpen();
+                                    if (restartMustStandDown()) return;
+                                    restartLocalAsrPreparation = await prepareLocalStreamingAsr(function () {
+                                        return window.voiceStartEpochIsCurrent(restartVoiceEpoch)
+                                            && window.sessionStartIsCurrent(restartStartOwner);
+                                    });
                                     if (restartMustStandDown()) return;
                                     S.socket.send(JSON.stringify({
                                         action: 'start_session',
@@ -4945,6 +5101,8 @@
                                     var tia = document.getElementById('text-input-area');
                                     if (tia) tia.classList.remove('hidden');
                                     if (typeof window.syncVoiceChatComposerHidden === 'function') window.syncVoiceChatComposerHidden(false);
+                                } finally {
+                                    if (restartLocalAsrPreparation) await restartLocalAsrPreparation.release();
                                 }
                             }, 7500);
                         }

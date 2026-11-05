@@ -8,6 +8,23 @@ const source = fs.readFileSync(path.join(__dirname, '../../static/app/app-audio-
 const websocketSource = fs.readFileSync(path.join(__dirname, '../../static/app/app-websocket.js'), 'utf8');
 const stateSource = fs.readFileSync(path.join(__dirname, '../../static/app/app-state.js'), 'utf8');
 
+test('normal stop during an owned microphone start emits capture_end before recording commits', () => {
+    const env = loadCapture(true);
+    env.S.isRecording = false;
+    env.window.isMicStarting = true;
+    env.window.stopRecording({ normalEnd: true });
+    assert.equal(env.controls.filter(item => item.event === 'capture_end').length, 1);
+});
+
+test('an auxiliary window with only shared voiceChatActive emits no capture_end', () => {
+    const env = loadCapture(true);
+    env.S.isRecording = false;
+    env.S.voiceChatActive = true;
+    env.window.isMicStarting = false;
+    env.window.stopRecording({ normalEnd: true });
+    assert.equal(env.controls.filter(item => item.event === 'capture_end').length, 0);
+});
+
 async function automaticRecoveryFixture(buffering = true) {
     const env = loadCapture(true);
     env.installMicrophone();

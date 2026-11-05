@@ -79,9 +79,7 @@ def test_lifecycle_blocked_clears_independent_asr_and_shows_failure_toast():
 
 def test_core_capability_refresh_failures_fail_open_and_coalesce_requests_harness():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
-    start = source.index(
-        "function publishCoreApiCapability(provider, capability, localAsrAvailable)"
-    )
+    start = source.index("function publishCoreApiCapability(")
     end = source.index("// Prime the capability once", start)
     refresh_source = source[start:end]
     harness = (

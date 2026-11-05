@@ -2252,6 +2252,7 @@
             window.showVoicePreparingToast(window.t ? window.t('app.connectingToServer') : '\u6B63\u5728\u8FDE\u63A5\u670D\u52A1\u5668...');
 
             var micStartOwner = null;
+            var localAsrPreparation = null;
 
             // Every point this handler resumes from an await asks the same
             // question, and each await is wide open: on mobile the composer
@@ -2384,6 +2385,14 @@
                 // early because it is no longer current, so none of the
                 // stand-downs further down are ever reached (codex P2).
                 await window.ensureWebSocketOpen();
+                ensureVoiceStartCurrent();
+                if (micStartMustStandDown()) return;
+                if (typeof window.prepareLocalStreamingAsr === 'function') {
+                    localAsrPreparation = await window.prepareLocalStreamingAsr(function () {
+                        return S.voiceSessionStartEpoch === voiceStartEpoch
+                            && window.sessionStartIsCurrent(micStartOwner);
+                    });
+                }
                 ensureVoiceStartCurrent();
                 if (micStartMustStandDown()) return;
                 S.socket.send(JSON.stringify({
@@ -2661,6 +2670,8 @@
                 }
 
                 screenButton.classList.remove('active');
+            } finally {
+                if (localAsrPreparation) await localAsrPreparation.release();
             }
         });
 

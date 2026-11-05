@@ -698,16 +698,17 @@ class VoiceInputLifecycleController:
         self.last_drained_spans = spans
         return payload
 
-    def buffer_active_start_audio(self, pcm16: bytes, *, start_sample: int) -> AudioDecision:
-        """Append to an admitted prefix awaiting preparation, without eviction."""
-        if not isinstance(pcm16, bytes) or len(pcm16) % 2 or start_sample < 0:
+    def buffer_active_start_audio(self, pcm16: bytes, *, start_sample: int | None) -> AudioDecision:
+        """Retain unsent preparation audio without mixing ranged and legacy PCM."""
+        if (not isinstance(pcm16, bytes) or len(pcm16) % 2
+                or (start_sample is not None and (type(start_sample) is not int or start_sample < 0))):
             raise ValueError("active prefix requires PCM16 and a valid sample range")
         if self._state is not VoiceLifecycleState.ACTIVE or self._route_mode is VoiceRouteMode.BLOCKED:
             return AudioDecision(AudioDisposition.BLOCK)
         spans = self._active_start_spans
         self.admission_range_diagnostics = {
             "requested_start": start_sample,
-            "requested_end": start_sample + len(pcm16) // 2,
+            "requested_end": None if start_sample is None else start_sample + len(pcm16) // 2,
             "retained_start": spans[0].start if spans else None,
             "retained_end": spans[-1].end if spans else None,
             "retained_bytes": len(self._active_start_audio),
@@ -721,7 +722,7 @@ class VoiceInputLifecycleController:
             return AudioDecision(AudioDisposition.BLOCK, backpressure=True)
         if pcm16:
             self._active_start_audio += pcm16
-            if spans and spans[-1].start is not None:
+            if spans:
                 tail = spans[-1]
                 self._active_start_spans = spans[:-1] + (
                     AudioSampleSpan(tail.start, tail.samples + len(pcm16) // 2),

@@ -702,13 +702,13 @@ def test_registry_meta_and_policy_for_local_provider() -> None:
     assert meta.requires_credential is False
     assert meta.user_selectable is True
     assert meta.optional_dependency == "faster_whisper"
-    # Only the local provider is selectable by users; cloud providers stay on
+    # Only local providers are selectable by users; cloud providers stay on
     # Core routes and keep requiring credentials.
     assert {
         key for key, value in ASR_PROVIDER_REGISTRY.items() if value.user_selectable
-    } == {"faster_whisper"}
+    } == {"faster_whisper", "local_streaming"}
     for key, value in ASR_PROVIDER_REGISTRY.items():
-        if key not in {"faster_whisper"}:
+        if key not in {"faster_whisper", "local_streaming"}:
             assert value.requires_credential is True, key
 
     policy = resolve_provider_policy("faster_whisper", "manual")

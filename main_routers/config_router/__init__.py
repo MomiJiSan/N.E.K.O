@@ -106,3 +106,4 @@ from .model_catalog import (  # noqa: F401
     ModelListRequest,
     list_models,
 )
+from . import local_asr as _local_asr  # noqa: F401 - register preparation routes

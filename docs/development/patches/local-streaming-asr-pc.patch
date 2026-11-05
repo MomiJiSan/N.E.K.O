@@ -1,0 +1,201 @@
+diff --git a/src/electron-entry.js b/src/electron-entry.js
+--- a/src/electron-entry.js
++++ b/src/electron-entry.js
+@@ -1,4 +1,8 @@
+ 'use strict';
++
++if (process.env.NEKO_OFFLINE_ACCEPTANCE === '1') {
++  require('./acceptance-safety').arm(require('electron'));
++}
+
+ const {
+   HELPER_FLAG,
+diff --git a/src/main/backend-runtime.js b/src/main/backend-runtime.js
+--- a/src/main/backend-runtime.js
++++ b/src/main/backend-runtime.js
+@@ -1271,6 +1271,9 @@
+     // memory_dir 推导路径，在开发态/打包态可能与 app.getPath('userData') 分叉，导致登录后
+     // dropper/SSE 看不到新 token。显式下发宿主 userData 目录作为唯一权威路径。
+     pythonEnv['NEKO_USER_DATA_DIR'] = app.getPath('userData');
++    require('./bundled-asr-runtime').configureBundledAsrEnvironment(pythonEnv, {
++      isPackaged: app.isPackaged, resourcesPath: process.resourcesPath, userData: app.getPath('userData')
++    });
+     // 注入自定义端口环境变量，供 Python _read_port_env() 读取
+     pythonEnv['NEKO_MAIN_SERVER_PORT'] = String(NEKO_DEFAULT_PORTS.MAIN_SERVER_PORT);
+     pythonEnv['NEKO_MEMORY_SERVER_PORT'] = String(NEKO_DEFAULT_PORTS.MEMORY_SERVER_PORT);
+diff --git a/src/main/bundled-asr-runtime.js b/src/main/bundled-asr-runtime.js
+new file mode 100644
+--- /dev/null
++++ b/src/main/bundled-asr-runtime.js
+@@ -0,0 +1,31 @@
++'use strict';
++
++const path = require('node:path');
++const fs = require('node:fs');
++
++// Only a packaged desktop installs defaults. Any explicit managed/external
++// operator configuration remains authoritative, including incomplete settings
++// that the host will reject rather than silently replacing them.
++function configureBundledAsrEnvironment(env, { isPackaged, resourcesPath, userData,
++  platform = process.platform, existsSync = fs.existsSync }) {
++  const overrides = ['NEKO_ASR_SERVICE_EXE','NEKO_ASR_SERVICE_PYTHON','NEKO_ASR_SERVICE_ROOT',
++    'NEKO_ASR_MODEL_DIR','NEKO_ASR_SMOKE_WAV','NEKO_ASR_URL','NEKO_ASR_TOKEN',
++    'NEKO_ASR_CATALOG','NEKO_ASR_STATE_DIR'];
++  if (!isPackaged || platform !== 'win32' || overrides.some(key => env[key])) return env;
++  const root = path.join(resourcesPath,'bin','asr');
++  const models = path.join(resourcesPath,'models','asr');
++  env.NEKO_ASR_SERVICE_EXE = path.join(root,'neko-asr.exe');
++  env.NEKO_ASR_SERVICE_ROOT = root;
++  env.NEKO_ASR_MODEL_DIR = path.join(models,'paraformer');
++  env.NEKO_ASR_SMOKE_WAV = path.join(models,'public-speech.wav');
++  const catalog = path.join(models,'catalog.json');
++  if (existsSync(catalog)) {
++    env.NEKO_ASR_CATALOG = catalog;
++    env.NEKO_ASR_STATE_DIR = path.join(userData,'local-asr-state');
++  }
++  delete env.PYTHONPATH;
++  delete env.PYTHONHOME;
++  return env;
++}
++
++module.exports = { configureBundledAsrEnvironment };
+diff --git a/src/acceptance-safety.js b/src/acceptance-safety.js
+new file mode 100644
+--- /dev/null
++++ b/src/acceptance-safety.js
+@@ -0,0 +1,60 @@
++'use strict';
++// Explicit process-only protections for an unsigned QA build. No substitute
++// media, fake providers or business inputs. Nothing changes without the flag.
++const fs = require('node:fs');
++const path = require('node:path');
++function arm(electron) {
++  const {app,session,webContents,ipcMain,desktopCapturer}=electron;
++  const state={qa_guard:true,microphone_tested:false,audible_playback_tested:false,
++    desktop_capture_denied:0,screen_ipc_denied:0,media_denied:0,display_denied:0};
++  const denied=()=>Object.assign(new Error('QA capture disabled'),{name:'NotAllowedError'});
++  app.commandLine.appendSwitch('mute-audio');
++  desktopCapturer.getSources=async()=>{state.desktop_capture_denied++;throw denied();};
++  const screenChannel=channel=>typeof channel==='string' && (
++    /screenshot|^capture-(source|computer-use|desktop)|^computer-use-stream|^set-computer-use-stream/.test(channel)
++    || ['get-desktop-sources','set-selected-screen-source'].includes(channel));
++  for(const method of ['handle','on']) {
++    const original=ipcMain[method];
++    ipcMain[method]=function(channel,handler) {
++      const guarded=screenChannel(channel)?()=>{state.screen_ipc_denied++;if(method==='handle') return Promise.reject(denied());}:handler;
++      return Reflect.apply(original,this,[channel,guarded]);
++    };
++  }
++  const seen=new WeakSet();
++  const blocked=new Set(['media','microphone','camera','audioCapture','videoCapture','display-capture','displayCapture']);
++  function protect(value) {
++    if(seen.has(value)) return;
++    seen.add(value);
++    const request=value.setPermissionRequestHandler.bind(value),check=value.setPermissionCheckHandler.bind(value);
++    value.setPermissionRequestHandler=handler=>request((contents,permission,callback,details)=>{
++      if(blocked.has(permission)){state.media_denied++;callback(false);}
++      else if(typeof handler==='function') handler(contents,permission,callback,details); else callback(false);
++    });
++    value.setPermissionCheckHandler=handler=>check((contents,permission,origin,details)=>{
++      if(blocked.has(permission)){state.media_denied++;return false;}
++      return typeof handler==='function'?handler(contents,permission,origin,details):false;
++    });
++    value.setPermissionRequestHandler(null); value.setPermissionCheckHandler(null);
++    const display=value.setDisplayMediaRequestHandler.bind(value);
++    value.setDisplayMediaRequestHandler=()=>display((_request,callback)=>{state.display_denied++;callback({});},{useSystemPicker:false});
++    value.setDisplayMediaRequestHandler(null);
++    value.registerPreloadScript({type:'frame',filePath:path.join(__dirname,'acceptance-preferences.cjs')});
++  }
++  app.on('session-created',protect);
++  app.on('web-contents-created',(_event,contents)=>{
++    protect(contents.session); contents.setAudioMuted(true);
++    contents.on('did-start-navigation',()=>{if(!contents.isDestroyed()) contents.setAudioMuted(true);});
++    contents.on('audio-state-changed',()=>{if(!contents.isDestroyed()&&!contents.isAudioMuted()) contents.setAudioMuted(true);});
++  });
++  function snapshot() {
++    try {
++      const contents=webContents.getAllWebContents().filter(value=>!value.isDestroyed()).map(value=>({id:value.id,muted:value.isAudioMuted()}));
++      const report={...state,is_packaged:app.isPackaged,contents,all_live_contents_muted:contents.every(value=>value.muted)};
++      const target=path.join(app.getPath('userData'),'qa-safety.json');
++      fs.mkdirSync(path.dirname(target),{recursive:true}); fs.writeFileSync(target,JSON.stringify(report,null,2));
++    } catch (_) {}
++  }
++  app.whenReady().then(()=>{protect(session.defaultSession);snapshot();const timer=setInterval(snapshot,1000);timer.unref();});
++  app.on('before-quit',snapshot);
++}
++module.exports={arm};
+diff --git a/src/acceptance-preferences.cjs b/src/acceptance-preferences.cjs
+new file mode 100644
+--- /dev/null
++++ b/src/acceptance-preferences.cjs
+@@ -0,0 +1,13 @@
++'use strict';
++// QA package only: this file is registered only by the explicit acceptance flag.
++if (['127.0.0.1','localhost','[::1]'].includes(location.hostname)) {
++  let value = {};
++  try { value=JSON.parse(localStorage.getItem('project_neko_settings') || '{}'); } catch (_) {}
++  if (!value || typeof value!=='object' || Array.isArray(value)) value={};
++  for (const key of ['proactiveChatEnabled','proactiveVisionEnabled','proactiveVisionChatEnabled',
++    'proactiveVideoChatEnabled','proactiveMusicEnabled','proactiveMemeEnabled','proactiveMiniGameInviteEnabled',
++    'proactiveNewsChatEnabled','proactiveCommunityChatEnabled','proactivePersonalChatEnabled',
++    'focusCognitionEnabled','focusModeEnabled']) value[key]=false;
++  localStorage.setItem('project_neko_settings',JSON.stringify(value));
++  localStorage.setItem('neko_voice_auto_screen','0');
++}
+diff --git a/test/bundled-asr-runtime.test.cjs b/test/bundled-asr-runtime.test.cjs
+new file mode 100644
+--- /dev/null
++++ b/test/bundled-asr-runtime.test.cjs
+@@ -0,0 +1,24 @@
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const path = require('node:path');
++const {configureBundledAsrEnvironment: configure} = require('../src/main/bundled-asr-runtime');
++const options = {isPackaged:true,resourcesPath:'C:\\App With Space\\resources',userData:'C:\\Profile',platform:'win32',existsSync:()=>true};
++test('packaged defaults are resource-relative with independent writable state',()=>{
++  const env={PYTHONHOME:'C:\\developer',PYTHONPATH:'C:\\developer'};
++  assert.equal(configure(env,options),env);
++  assert.equal(env.NEKO_ASR_SERVICE_EXE,path.join(options.resourcesPath,'bin','asr','neko-asr.exe'));
++  assert.equal(env.NEKO_ASR_STATE_DIR,path.join(options.userData,'local-asr-state'));
++  assert.equal(env.PYTHONPATH,undefined); assert.equal(env.PYTHONHOME,undefined);
++});
++for(const key of ['NEKO_ASR_SERVICE_EXE','NEKO_ASR_SERVICE_PYTHON','NEKO_ASR_MODEL_DIR','NEKO_ASR_URL','NEKO_ASR_TOKEN','NEKO_ASR_CATALOG','NEKO_ASR_STATE_DIR']) {
++  test('explicit operator setting preserved: '+key,()=>{
++    const env={[key]:'explicit'}; configure(env,options); assert.deepEqual(env,{[key]:'explicit'});
++  });
++}
++test('development execution is unchanged',()=>{
++  const env={PYTHONPATH:'source'}; configure(env,{...options,isPackaged:false}); assert.deepEqual(env,{PYTHONPATH:'source'});
++});
++test('missing optional catalog never injects a half pair',()=>{
++  const env={}; configure(env,{...options,existsSync:()=>false});
++  assert.equal(env.NEKO_ASR_CATALOG,undefined); assert.equal(env.NEKO_ASR_STATE_DIR,undefined);
++});
+diff --git a/test/qa-safety.test.cjs b/test/qa-safety.test.cjs
+new file mode 100644
+--- /dev/null
++++ b/test/qa-safety.test.cjs
+@@ -0,0 +1,23 @@
++const test=require('node:test');
++const assert=require('node:assert/strict');
++const fs=require('node:fs');
++const vm=require('node:vm');
++const path=require('node:path');
++test('QA guard refuses capture, retains text IPC and keeps every content muted',async()=>{
++  const appEvents={},events={},handlers=new Map(),switches=[]; let check,request,display,snapshot;
++  const session={setPermissionRequestHandler(fn){request=fn;},setPermissionCheckHandler(fn){check=fn;},setDisplayMediaRequestHandler(fn){display=fn;},registerPreloadScript(){}};
++  const contents={id:1,session,muted:false,isDestroyed:()=>false,setAudioMuted(v){this.muted=v;},isAudioMuted(){return this.muted;},on(n,f){events[n]=f;}};
++  const electron={app:{isPackaged:true,commandLine:{appendSwitch(v){switches.push(v);}},on(n,f){appEvents[n]=f;},whenReady:()=>Promise.resolve(),getPath:()=>'/qa-profile'},session:{defaultSession:session},desktopCapturer:{getSources(){assert.fail('real capture reached');}},webContents:{getAllWebContents:()=>[contents]},ipcMain:{handle(n,f){handlers.set(n,f);},on(){}}};
++  const context={__dirname:path.join(__dirname,'../src'),module:{exports:{}},require(n){return n==='node:fs'?{mkdirSync(){},writeFileSync(_p,text){snapshot=JSON.parse(text);}}:require(n);},setInterval(){return {unref(){}};}};
++  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/acceptance-safety.js'),'utf8'),context);
++  context.module.exports.arm(electron); await Promise.resolve();
++  appEvents['web-contents-created'](null,contents);
++  assert.deepEqual(switches,['mute-audio']); assert.equal(contents.muted,true);
++  assert.equal(check(null,'media'),false); let accepted; request(null,'media',v=>accepted=v); assert.equal(accepted,false);
++  display({},value=>assert.deepEqual(JSON.parse(JSON.stringify(value)),{}));
++  await assert.rejects(electron.desktopCapturer.getSources(),{name:'NotAllowedError'});
++  electron.ipcMain.handle('capture-desktop',()=>assert.fail('screen IPC reached'));
++  await assert.rejects(handlers.get('capture-desktop')(),{name:'NotAllowedError'});
++  const textHandler=value=>value; electron.ipcMain.handle('text-submit',textHandler); assert.equal(handlers.get('text-submit'),textHandler);
++  assert.equal(snapshot.is_packaged,true);
++});

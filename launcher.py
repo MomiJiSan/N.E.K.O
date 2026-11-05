@@ -32,6 +32,13 @@ if __name__ == "__main__":
 
     _load_dotenv(_Path(__file__).resolve().with_name(".env"), override=False)
     _ensure_utf8_filesystem_encoding()
+    if os.environ.get("NEKO_ASR_RELEASE_SMOKE") == "1":
+        from multiprocessing import freeze_support as _asr_freeze_support
+
+        _asr_freeze_support()
+        from main_logic.asr_client.release_smoke import main as _asr_release_smoke
+
+        sys.exit(_asr_release_smoke())
     if os.environ.get("NEKO_WAKE_WORD_RELEASE_SMOKE") == "1":
         from multiprocessing import freeze_support as _wake_freeze_support
         _wake_freeze_support()

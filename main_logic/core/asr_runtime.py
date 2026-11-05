@@ -5930,7 +5930,14 @@ class AsrRuntimeMixin:
         }:
             return False
         if normalized_event == "capture_end":
-            return await self._finish_normal_microphone_capture()
+            resource = self._asr_runtime.capture_resource_lease()
+            try:
+                return await self._finish_normal_microphone_capture()
+            finally:
+                # Ordinary microphone stop ends its resource ownership even
+                # when no LLM session is ended. Recoverable mute/focus/game
+                # transitions intentionally retain the voice resource.
+                await self._asr_runtime.release_resource_lease(resource)
         self._normal_capture_end_owner = None
         if normalized_event == "lease_sync":
             normalized_owner = str(owner or "").strip().lower()

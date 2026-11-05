@@ -101,7 +101,8 @@
         coreApiSupportsIndependentAsr: null,
         voiceInputResourceOptimizationEnabled: true,
         // Persisted independent-ASR provider choice: 'auto' follows the Core
-        // route, 'faster_whisper' runs local recognition. Distinct from
+        // route, 'faster_whisper' runs local recognition, 'local_streaming'
+        // connects to a separately started local ASR service. Distinct from
         // independentAsrProvider below, which is the provider the backend
         // actually reported for the running session.
         independentAsrProviderPreference: 'auto',
@@ -109,6 +110,9 @@
         // /api/config/core_api. Tri-state like coreApiSupportsIndependentAsr;
         // only an explicit true offers the local-recognition option.
         localAsrAvailable: null,
+        // Valid local service configuration, not a readiness/network probe.
+        // The backend authenticates and validates capabilities at connection.
+        localStreamingAsrConfigured: null,
         // 设置是否已"水合"：server GET 合并成功或用户显式改过设置后才为 true。
         // 在此之前两个 true 都只是启动默认值，不代表服务器权威偏好；
         // independentAsrEnabled 尤其不能提前进入会话握手，

@@ -648,7 +648,7 @@ I.mod = window.appUi;
     }
 
     // --- showVoicePreparingToast ---
-    I.showVoicePreparingToast = function showVoicePreparingToast(message) {
+    I.showVoicePreparingToast = function showVoicePreparingToast(message, options) {
         // 检查是否已存在提示框，避免重复创建
         let toast = document.getElementById('voice-preparing-toast');
         if (!toast) {
@@ -719,6 +719,21 @@ I.mod = window.appUi;
         msgSpan.textContent = normalizeVoiceToastMessage(message);
         toast.appendChild(spinner);
         toast.appendChild(msgSpan);
+        if (options && typeof options.onCancel === 'function') {
+            toast.style.flexWrap = 'wrap';
+            spinner.style.flexShrink = '0';
+            msgSpan.style.flex = '1 1 160px';
+            msgSpan.style.minWidth = '0';
+            var cancel = document.createElement('button');
+            cancel.id = 'voice-preparing-cancel';
+            cancel.type = 'button';
+            cancel.textContent = options.cancelLabel || '';
+            cancel.style.cssText = 'pointer-events:auto;cursor:pointer;flex-shrink:0;color:inherit;background:transparent;border:1px solid currentColor;border-radius:6px;padding:4px 8px;';
+            cancel.style.marginLeft = 'auto';
+            cancel.addEventListener('click', options.onCancel);
+            cancel._voicePrepareOwner = options.owner;
+            toast.appendChild(cancel);
+        }
 
         // 添加旋转动画
         const spinStyle = document.createElement('style');

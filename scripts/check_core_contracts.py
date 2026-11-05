@@ -3327,6 +3327,10 @@ def run(root: Path) -> list[Violation]:
                 "supports_interception_delivery",
                 "close",
                 "capture_ingress_token",
+                # Core releases the captured voice-mode resource owner only
+                # after its existing audio-capture shutdown has completed.
+                "capture_resource_lease",
+                "release_resource_lease",
                 "suspend",
                 "resume",
                 "abort",

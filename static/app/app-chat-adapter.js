@@ -537,7 +537,8 @@
             window._nekoAssistantTurnId = explicitTurnId;
         }
         try {
-            msg = buildMessage(msgId, 'assistant', getCurrentAssistantName(), timeStr, cleanSentence, 'streaming');
+            msg = buildMessage(msgId, 'assistant', getCurrentAssistantName(), timeStr, cleanSentence,
+                options.textComplete === true ? 'sent' : 'streaming');
         } finally {
             if (explicitTurnId) {
                 window._nekoAssistantTurnId = previousTurnId || null;
@@ -616,7 +617,8 @@
                 var itemText = getRealisticQueueItemText(item);
                 if (itemText && (window._realisticGeminiVersion || 0) === queueVersion) {
                     createGeminiBubble(itemText, {
-                        turnId: getRealisticQueueItemTurnId(item)
+                        turnId: getRealisticQueueItemTurnId(item),
+                        textComplete: window._realisticGeminiCompletedVersion === queueVersion
                     });
                     window._lastBubbleTime = Date.now();
                 }
@@ -699,12 +701,14 @@
         window._isProcessingRealisticQueue = false;
         window._realisticProcessingOwner = null;
         var queue = window._realisticGeminiQueue;
+        var textComplete = window._realisticGeminiCompletedVersion === (window._realisticGeminiVersion || 0);
         if (!Array.isArray(queue) || queue.length === 0) return;
         // 同步创建所有待排队的 bubble
         for (var i = 0; i < queue.length; i++) {
             try {
                 createGeminiBubble(getRealisticQueueItemText(queue[i]), {
-                    turnId: getRealisticQueueItemTurnId(queue[i])
+                    turnId: getRealisticQueueItemTurnId(queue[i]),
+                    textComplete: textComplete
                 });
             } catch (_) {}
         }

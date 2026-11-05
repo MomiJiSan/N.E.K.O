@@ -24,6 +24,9 @@ datas = []
 binaries = []
 hiddenimports = []
 hiddenimports += collect_submodules('plugin.sdk', on_error='raise')
+# ASR providers are resolved from string registry entries at runtime. Include
+# their modules so the managed streaming provider survives frozen packaging.
+hiddenimports += collect_submodules('main_logic.asr_client', on_error='raise')
 
 # 收集关键包的所有内容（根据实际 import 检查）
 critical_packages = [

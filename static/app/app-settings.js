@@ -573,7 +573,7 @@
         // Accepted values mirror INDEPENDENT_ASR_PROVIDER_PREFERENCES in
         // utils/conversation_settings_constants.py; anything else follows the
         // Core route.
-        return ['auto', 'faster_whisper'].indexOf(value) !== -1
+        return ['auto', 'faster_whisper', 'local_streaming'].indexOf(value) !== -1
             ? value
             : 'auto';
     }

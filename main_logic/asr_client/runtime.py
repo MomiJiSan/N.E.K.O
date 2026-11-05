@@ -741,6 +741,7 @@ class IndependentAsrRuntime:
         self._asr_lifecycle: VoiceInputLifecycleController | None = None
         self._asr_detector: DetectorRuntime | None = None
         self._asr_smart_turn_lease: SmartTurnLease | None = None
+        self._asr_resource_lease: object | None = None
         self._asr_smart_turn_prepare_lock = asyncio.Lock()
         self._asr_smart_turn_prepare_scope: tuple[int, int, int] | None = None
         self._asr_session_factory = None
@@ -2191,8 +2192,16 @@ class IndependentAsrRuntime:
 
         asr_session = None
         detector_ref: DetectorRuntime | None = None
+        resource_lease = None
+        resource_adopted = False
         connect_started_at = time.monotonic()
         try:
+            # Preparation runs before start_session. Retaining an already-ready
+            # resource is synchronous and never starts or loads a model here.
+            resource_factory = getattr(selection, "_resource_lease_factory", None)
+            if resource_factory is not None:
+                resource_lease = resource_factory()
+                self._asr_resource_lease = resource_lease
             max_attempts = policy.connect_max_attempts
             for attempt in range(max_attempts):
                 if not operation_is_current():
@@ -2389,6 +2398,7 @@ class IndependentAsrRuntime:
                 or not self._runtime_identity_matches(start_identity)
             ):
                 return stale_result(provider)
+            resource_adopted = True
             return AsrStartResult(
                 AsrStartStatus.READY,
                 provider=provider,
@@ -2403,6 +2413,7 @@ class IndependentAsrRuntime:
                     pass
             if asr_session is not None:
                 await self._close_asr_session(asr_session)
+            await self._release_resource_lease(resource_lease)
             raise
         except Exception as exc:
             if detector_ref is not None and self._asr_detector is detector_ref:
@@ -2413,6 +2424,7 @@ class IndependentAsrRuntime:
                     pass
             if asr_session is not None:
                 await self._close_asr_session(asr_session)
+            await self._release_resource_lease(resource_lease)
             if operation_is_current():
                 self._asr_session = None
                 self._asr_provider = None
@@ -2442,6 +2454,26 @@ class IndependentAsrRuntime:
                     session_epoch=epoch,
                 )
             return stale_result(provider)
+
+        finally:
+            if not resource_adopted:
+                await self._release_resource_lease(resource_lease)
+
+    def capture_resource_lease(self):
+        """Capture a resource owner before awaiting normal capture shutdown."""
+        return getattr(self, "_asr_resource_lease", None)
+
+    async def release_resource_lease(self, lease) -> None:
+        await self._release_resource_lease(lease)
+
+    async def _release_resource_lease(self, lease) -> None:
+        if lease is None or getattr(self, "_asr_resource_lease", None) is not lease:
+            return
+        self._asr_resource_lease = None
+        try:
+            await asyncio.wait_for(lease.close(), 5)
+        except Exception:
+            logger.warning("[%s] ASR resource lease close failed", self.display_name)
 
     def _create_speaker_shadow(
         self,
@@ -2930,6 +2962,8 @@ class IndependentAsrRuntime:
         lifecycle, self._asr_lifecycle = self._asr_lifecycle, None
         detector, self._asr_detector = self._asr_detector, None
         lease, self._asr_smart_turn_lease = self._asr_smart_turn_lease, None
+        resource_lease = getattr(self, "_asr_resource_lease", None)
+        self._asr_resource_lease = None
         detached_tasks: list[asyncio.Task[Any]] = []
         for task_name in (
             "_asr_transport_task",
@@ -2984,6 +3018,11 @@ class IndependentAsrRuntime:
                         "[%s] independent ASR close failed",
                         self.display_name,
                     )
+            if resource_lease is not None:
+                try:
+                    await asyncio.wait_for(resource_lease.close(), 5)
+                except Exception:
+                    logger.warning("[%s] ASR resource lease close failed", self.display_name)
             wait_tasks = (*detached_tasks, *close_tasks, *rejection_tasks)
             if wait_tasks:
                 await asyncio.gather(*wait_tasks, return_exceptions=True)
@@ -3252,8 +3291,11 @@ class IndependentAsrRuntime:
                     self._asr_input_delivery.register(source_start, source_end, frame.delivery)
                     lifecycle.set_audio_discard_observer(self._asr_input_delivery.discard)
             buffered_before_detection = False
+            # A pending turn becomes ACTIVE before its Smart Turn preparation
+            # completes. Retain concurrent, still-unsent PCM for every route;
+            # speaker admission is independent of this activation fence.
             buffered_for_activation = bool(
-                admission_enabled
+                self._asr_pending_activation_turn is not None
                 and self._asr_pending_activation_turn == self._capture_turn_token(lifecycle)
             )
             pending_only = bool(admission_enabled and lifecycle.has_pending_turn and (
@@ -5947,6 +5989,7 @@ class IndependentAsrRuntime:
         detector, self._asr_detector = self._asr_detector, None
         lease, self._asr_smart_turn_lease = self._asr_smart_turn_lease, None
         self._asr_provider = None
+        resource_lease, self._asr_resource_lease = getattr(self, "_asr_resource_lease", None), None
         self._asr_session_factory = None
         self._asr_transport_selection = None
         self._settle_discarded_prepared_turn(self._reset_asr_turn_state())
@@ -5974,6 +6017,11 @@ class IndependentAsrRuntime:
             task = asyncio.create_task(self._close_asr_session(asr_session))
             self._asr_close_tasks.add(task)
             task.add_done_callback(self._asr_close_tasks.discard)
+        if resource_lease is not None:
+            task = asyncio.create_task(asyncio.wait_for(resource_lease.close(), 5))
+            self._asr_close_tasks.add(task)
+            task.add_done_callback(self._asr_close_tasks.discard)
+            task.add_done_callback(self._log_asr_background_task_failure)
         failure_identity = self._capture_runtime_identity()
         failure_ingress_token = None
         capture_ingress_token = self._callbacks.capture_ingress_token

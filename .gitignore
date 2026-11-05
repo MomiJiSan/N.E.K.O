@@ -281,3 +281,5 @@ plugin/plugins/data/user_profile_cache.json
 /docs/**/*after*.jpeg
 /docs/**/*before*.webp
 /docs/**/*after*.webp
+# Local ASR validation logs, coverage, and public-sample smoke reports.
+/artifacts/

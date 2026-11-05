@@ -268,6 +268,30 @@ def test_get_reports_local_asr_availability_off_the_event_loop(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize('configured', [False, True])
+def test_local_streaming_probe_is_config_only_and_never_discloses_token(
+    monkeypatch, config_manager, core_config_router, configured,
+):
+    import json
+    import websockets
+
+    token = 'local-test-secret-token-' + 'x' * 32
+    if configured:
+        monkeypatch.setenv('NEKO_ASR_TOKEN', token)
+    else:
+        monkeypatch.delenv('NEKO_ASR_TOKEN', raising=False)
+    monkeypatch.delenv('NEKO_ASR_URL', raising=False)
+    def forbidden_connection(*args, **kwargs):
+        raise AssertionError('Core configuration must not connect to the ASR service')
+    monkeypatch.setattr(websockets, 'connect', forbidden_connection)
+    _write_core_config(config_manager, {'coreApi': 'qwen', 'assistApi': 'qwen'})
+    response = asyncio.run(core_config_router.get_core_config_api())
+    assert response['success'] is True
+    assert response['localStreamingAsrConfigured'] is configured
+    assert token not in json.dumps(response)
+
+
+@pytest.mark.unit
 def test_post_sentinel_preserves_every_secret_and_never_persists_it(
     config_manager,
     core_config_router,

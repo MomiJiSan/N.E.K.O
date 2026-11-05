@@ -165,6 +165,8 @@ def test_voice_recognition_popover_keys_match_across_all_locales() -> None:
         "voiceResourceOptimizationHintOff",
         "localAsr",
         "localAsrHint",
+        "localStreamingAsr",
+        "localStreamingAsrHint",
         "localAsrDependencyMissing",
     }
 
@@ -261,25 +263,26 @@ def test_local_asr_toggle_follows_the_independent_asr_gate() -> None:
     )[1].split("async function openMicDeviceSubwindow()", maxsplit=1)[0]
 
     local_setting = source.split(
-        "function createLocalAsrSetting(panelBody, beforeNode)", maxsplit=1
+        "function createLocalAsrSetting(panelBody, beforeNode, setting)", maxsplit=1
     )[1].split("function reconcileLocalAsrSetting()", maxsplit=1)[0]
-    offer_gate = source.split("function shouldOfferLocalAsr()", maxsplit=1)[1].split(
+    offer_gate = source.split("function shouldOfferLocalAsr(setting)", maxsplit=1)[1].split(
         "function createLocalAsrSetting", maxsplit=1
     )[0]
     capability_listener = source.split(
         "function onCoreApiCapabilityChanged()", maxsplit=1
     )[1].split("}", maxsplit=1)[0]
 
-    assert "if (shouldOfferLocalAsr())" in voice_panel
-    assert "'microphone.localAsr'" in local_setting
-    assert "'microphone.localAsrHint'" in local_setting
-    assert "? 'faster_whisper'" in local_setting
-    assert "localAsrToggle.setDisabled(!enabled && !localAsrChosen);" in source
+    assert "if (shouldOfferLocalAsr(setting))" in voice_panel
+    assert "'microphone.localAsr'" in source
+    assert "'microphone.localAsrHint'" in source
+    assert "'microphone.localStreamingAsr'" in source
+    assert "'microphone.localStreamingAsrHint'" in source
+    assert "? setting.provider" in local_setting
     # A saved "on" choice can always be switched off.
-    assert "if (enabled && !localAsrChoiceActionable())" in local_setting
+    assert "if (enabled && (!localAsrChoiceActionable() || !setting.available()))" in local_setting
     # Hidden unless the dependency is installed or the preference is already on.
-    assert "S.localAsrAvailable === true" in offer_gate
-    assert "|| S.independentAsrProviderPreference === 'faster_whisper'" in offer_gate
+    assert "setting.available()" in offer_gate
+    assert "|| S.independentAsrProviderPreference === setting.provider" in offer_gate
     # A capability refresh that lands while the panel is open re-reconciles it.
     assert "reconcileLocalAsrSetting();" in capability_listener
     assert "localAsrAvailable: null" in APP_STATE.read_text(encoding="utf-8")
@@ -287,6 +290,7 @@ def test_local_asr_toggle_follows_the_independent_asr_gate() -> None:
         encoding="utf-8"
     )
     assert "data.localAsrAvailable" in websocket
+    assert "data.localStreamingAsrConfigured" in websocket
     assert "faster_whisper: 'faster-whisper'" in source
 
 
